@@ -15,9 +15,19 @@ from unittest import mock
 
 from ameesh import guard
 
+from .test_l159a_capacity_guard import errors as schema_errors
+from .test_l159a_capacity_guard import schema
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = os.path.join(HERE, "dore", "capacity_guard", "levels.json")
 GIB = 1024 ** 3
+#: the three caps every offer must carry (contract §3), large enough to
+#: leave the computations alone
+CAPS = {"cpu_max": 8, "memory_max": "1TiB", "disk_max": "10TiB"}
+
+
+def lend(**fields) -> dict:
+    return dict(CAPS, **fields)
 
 
 def _epoch(text: str) -> float:
@@ -66,17 +76,52 @@ class OfferTest(unittest.TestCase):
         self.assertEqual(len(offer.windows), 2)
 
     def test_invalid_offers(self):
-        for lend in (None, {}, {"cpu_max": -1}, {"cpu_max": 1, "memory_max": "lots"},
-                     {"cpu_weight": 0}, {"reclaim": {"cpu_pressure_max": "120%"}},
-                     {"reclaim": {"busy_units": "x"}}, {"reclaim": {"busy_max": -1}},
-                     {"windows": ["someday"]}, {"windows": ["mon 25:00-26:00"]},
-                     {"drain_seconds": 0},
-                     # codex #211 r5: non-finite times kept the guard draining forever
-                     {"drain_seconds": 1e309}, {"drain_seconds": float("nan")},
-                     {"calm_seconds": float("inf")}, {"calm_seconds": 10 ** 400},
-                     {"cpu_max": float("nan")}, {"drain_seconds": True}):
-            with self.assertRaises(guard.GuardError, msg=lend):
-                guard.parse_offer(lend)
+        bad = [{"cpu_max": -1}, {"memory_max": "lots"},
+               {"cpu_weight": 0}, {"reclaim": {"cpu_pressure_max": "120%"}},
+               {"reclaim": {"busy_units": 3}}, {"reclaim": {"busy_max": -1}},
+               {"windows": ["someday"]}, {"windows": ["mon 25:00-26:00"]},
+               {"drain_seconds": 0},
+               # codex #211 r5: non-finite times kept the guard draining forever
+               {"drain_seconds": 1e309}, {"drain_seconds": float("nan")},
+               {"calm_seconds": float("inf")}, {"calm_seconds": 10 ** 400},
+               {"cpu_max": float("nan")}, {"drain_seconds": True},
+               {"reclaim": {"io_pressure_max": "120%"}},
+               {"reclaim": {"disk_paths": "/"}}]
+        for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
+            with self.assertRaises(guard.GuardError, msg=offer):
+                guard.parse_offer(offer)
+
+    def test_exactly_the_offers_of_the_contract(self):
+        # codex #211 r6: the guard reads the offer with the contract's reader;
+        # every golden offer the canon accepts, the guard accepts, and the
+        # other way round
+        with open(os.path.join(HERE, "dore", "capacity_guard", "offer.json")) as fh:
+            cases = json.load(fh)["cases"]
+        for case in cases:
+            with self.subTest(case["why"]):
+                if "offer" in case:
+                    offer = guard.parse_offer(case["lend"])
+                    self.assertEqual(offer.published, case["offer"])
+                else:
+                    with self.assertRaises(guard.GuardError):
+                        guard.parse_offer(case["lend"])
+        # overnight windows on a list of days, a calm of 0, a zone
+        offer = guard.parse_offer(lend(windows=["mon,wed 18:00-14:00 UTC",
+                                                "sun 18:00-20:00 Europe/Paris"],
+                                       calm_seconds=0))
+        self.assertEqual(offer.calm_seconds, 0.0)
+        # Wednesday 2026-10-14 23:00 UTC: Wednesday's night runs to Thursday 14:00
+        self.assertEqual(guard.window_end(offer, _epoch("2026-10-14T23:00:00")),
+                         (True, _epoch("2026-10-15T14:00:00")))
+        self.assertEqual(guard.window_end(offer, _epoch("2026-10-13T15:00:00"))[0], False)
+        # Sunday 17:00 UTC is 19:00 in Paris (summer time): open until 18:00 UTC
+        self.assertEqual(guard.window_end(offer, _epoch("2026-10-18T17:00:00")),
+                         (True, _epoch("2026-10-18T18:00:00")))
+        # the guard's own reclaim keys are published with the offer
+        offer = guard.parse_offer(lend(reclaim={"io_pressure_max": "20%",
+                                                "disk_free_min": "2GiB"}))
+        self.assertEqual(offer.published["reclaim"],
+                         {"io_pressure_max": 20.0, "disk_free_min": 2 * GIB})
 
     def test_windows(self):
         night = guard.parse_window("mon-fri 18:00-14:00 UTC")
@@ -96,12 +141,12 @@ class OfferTest(unittest.TestCase):
         self.assertEqual(weekend.end_if_open(_epoch("2026-10-17T10:00:00")),
                          _epoch("2026-10-19T00:00:00"))
         self.assertIsNone(weekend.end_if_open(_epoch("2026-10-16T10:00:00")))
-        offer = guard.parse_offer({"windows": ["mon-fri 18:00-14:00 UTC", "sat-sun"]})
+        offer = guard.parse_offer(lend(windows=["mon-fri 18:00-14:00 UTC", "sat-sun"]))
         self.assertEqual(guard.raw_level(offer, {}, _epoch("2026-10-12T15:00:00")),
                          (3, "window_end"))
         self.assertEqual(guard.raw_level(offer, {}, _epoch("2026-10-12T19:00:00")),
                          (0, "idle"))
-        self.assertEqual(guard.window_end(guard.parse_offer({"cpu_max": 1}), 0.0),
+        self.assertEqual(guard.window_end(guard.parse_offer(lend()), 0.0),
                          (True, None))
 
 
@@ -111,7 +156,7 @@ class StateTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = guard.GuardConfig(
             host="vm-test", max_agents=3,
-            offer=guard.parse_offer({"cpu_max": 3, "memory_max": "14GiB",
+            offer=guard.parse_offer({"cpu_max": 3, "memory_max": "14GiB", "disk_max": "10TiB",
                                      "agent_memory_max": "4GiB",
                                      "reclaim": {"memory_available_min": "6GiB",
                                                  "cpu_pressure_max": "20%"}}),
@@ -152,6 +197,33 @@ class StateTest(unittest.TestCase):
             stop = guard.build_state(self.cfg, guard.Decision(4, "app_memory", 50.0), 11,
                                      100.0, reading=self.reading)
             self.assertEqual((stop["state"], stop["drain_deadline_ts"]), ("stopped", None))
+
+    def test_states_match_the_schema(self):
+        # codex #211 r6: the published offer in bytes, cpu_share > 0; every
+        # level checked against docs/schemas/ameesh-host-state-1.schema.json
+        doc = schema("ameesh-host-state-1.schema.json")
+        with mock.patch.object(guard.resources, "lendable", None, create=True), \
+                mock.patch.object(guard.resources, "measure", None, create=True):
+            for level in range(5):
+                with self.subTest(level=level):
+                    state = guard.build_state(self.cfg, guard.Decision(level, "app_cpu", 50.0),
+                                              7, 100.0, reading=self.reading, in_turn=1)
+                    self.assertEqual(schema_errors(doc, state), [])
+            self.assertEqual(set(guard.MEASURE_KEYS) | {"lendable"},
+                             set(doc["properties"]["measure"]["required"]))
+            self.assertEqual((state["offer"]["memory_max"], state["offer"]["disk_max"]),
+                             (14 * GIB, 10 * 1024 * GIB))
+            # 0.001 CPU of 64: the smallest share, not 0.0
+            cfg = dataclasses.replace(self.cfg, offer=guard.parse_offer(lend(cpu_max=0.001)))
+            reading = dict(self.reading, cpu_count=64)
+            for level in (0, 1):
+                state = guard.build_state(cfg, guard.Decision(level, "idle", 0.0), 1, 100.0,
+                                          reading=reading)
+                self.assertEqual(state["caps"]["cpu_share"], guard.CPU_SHARE_MIN)
+                self.assertEqual(schema_errors(doc, state), [])
+        self.assertEqual(guard.cpu_share(0.125), 0.125)
+        self.assertEqual(guard.cpu_share(0.33333), 0.3334)
+        self.assertEqual(guard.cpu_share(3.0), 1.0)
 
     def test_lendable_capped_by_the_offer(self):
         # the measure (L159d, or the warm-up) never lends more than the offer
@@ -429,7 +501,7 @@ class SignalsTest(unittest.TestCase):
         # codex #211 r4: the guard measured no disk (sample() without a path),
         # so the lendable disk and caps.disk_mb never appeared
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer({"cpu_max": 1}),
+            cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer(lend()),
                                     work_path=tmp)
             reading = guard.read_signals(cfg, 100.0, psi=lambda avg: {},
                                          busy=lambda units: None)
@@ -443,7 +515,7 @@ class EnforcerTest(unittest.TestCase):
     UNIT = "ameesh-guard-freeze-ameesh-guest.service"
 
     def setUp(self):
-        self.cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer({"cpu_max": 1}))
+        self.cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer(lend(cpu_max=1)))
         self.calls = []
         self.failing = set()     # verbs that fail without acting
         self.lying = set()       # verbs that act, then report a failure (timeout)
@@ -455,8 +527,18 @@ class EnforcerTest(unittest.TestCase):
         self.cost = {}           # seconds a command takes before it acts: verb -> s
         self.frozen = set()      # frozen slices
         self.services = {}       # freezing service -> [slice, thaw at, backstop at] (mono)
-        self.enforcer = guard.Enforcer(self.cfg, run=self.fake, log=self.logged.append,
-                                       clock=lambda: self.now[0])
+        self.freeze_fails = False  # the service's `systemctl freeze` fails
+        self.enforcer = self.make(self.cfg)
+
+    def make(self, cfg, **kw):
+        """An enforcer on the fake systemd: the guard runs in system.slice,
+        the boot clock is systemd's, its sleep lets time pass."""
+        options = dict(run=self.fake, log=self.logged.append, clock=lambda: self.now[0],
+                       cgroup="/system.slice/ameesh-guard.service",
+                       boottime=lambda: self.mono[0], boot_id=lambda: "boot-1",
+                       sleep=self.tick)
+        options.update(kw)
+        return guard.Enforcer(cfg, **options)
 
     def at(self, now):
         self.now[0] = now
@@ -482,6 +564,8 @@ class EnforcerTest(unittest.TestCase):
         out, code = "", 0
         if verb == "list-units":
             out = self.units
+        elif verb == "show":
+            out = "frozen\n" if argv[-1] in self.frozen else "running\n"
         elif verb == "systemd-run":
             unit = argv[1].split("=", 1)[1]
             props = dict(a.split("=", 1)[1].split("=", 1) for a in argv
@@ -489,8 +573,11 @@ class EnforcerTest(unittest.TestCase):
             name, seconds = argv[-2], int(argv[-1])
             self.assertEqual(argv[-5:-2], ["/bin/sh", "-c", guard.FREEZE_SCRIPT])
             self.assertEqual(props["ExecStopPost"], "systemctl thaw " + name)
+            self.assertIn("--slice=" + guard.HELPER_SLICE, argv)
             if unit in self.services:
                 code = 1                              # the unit already exists
+            elif self.freeze_fails:
+                pass                                  # freeze fails, the thaw loop exits 0
             else:
                 self.frozen.add(name)                 # the script freezes, then sleeps
                 self.services[unit] = [name, self.mono[0] + seconds,
@@ -590,8 +677,8 @@ class EnforcerTest(unittest.TestCase):
         self.assertIn("freeze", self.at(1010.0).apply(frozen, 4))
         run = self.runs()
         self.assertEqual(run, [[
-            "systemd-run", "--unit=" + self.UNIT, "--collect", "--quiet",
-            "--property=RuntimeMaxSec=80",
+            "systemd-run", "--unit=" + self.UNIT, "--slice=ameesh-guard-helper.slice",
+            "--collect", "--quiet", "--property=RuntimeMaxSec=80",
             "--property=ExecStopPost=systemctl thaw ameesh-guest.slice",
             "/bin/sh", "-c", guard.FREEZE_SCRIPT, "ameesh-guest.slice", "50"]])
         self.assertNotIn("freeze", [c[1] for c in self.calls if c[0] == "systemctl"])
@@ -601,8 +688,7 @@ class EnforcerTest(unittest.TestCase):
         self.tick(1)
         self.assertEqual((self.frozen, self.services), (set(), {}))
         # past the bound, or under a second left: no freeze
-        fresh = guard.Enforcer(self.cfg, run=self.fake, log=self.logged.append,
-                               clock=lambda: self.now[0])
+        fresh = self.make(self.cfg)
         self.calls.clear()
         self.now[0] = 1059.5
         self.assertNotIn("freeze", fresh.apply(frozen, 4))
@@ -620,10 +706,11 @@ class EnforcerTest(unittest.TestCase):
         self.tick(5)
         self.assertEqual((self.frozen, self.services), (set(), {}))
         # (P1) the wall clock goes back: the freeze lasts what systemd's
-        # clock says, and never more than the longest freeze
+        # clock says, and never more than the longest freeze (a new episode)
         self.cost = {}
         self.calls.clear()
         self.at(0.0).apply({"caps": {}}, 4)
+        frozen = {"caps": {}, "freeze": {"since_ts": 0.0, "until_ts": 1060.0}}
         self.at(0.0).apply(frozen, 4)
         self.assertEqual(self.runs()[0][-1], "60")
         self.assertIn("--property=RuntimeMaxSec=90", self.runs()[0])
@@ -638,8 +725,7 @@ class EnforcerTest(unittest.TestCase):
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
         self.at(1000.0).apply(frozen, 4)
         other = dataclasses.replace(self.cfg, slice="guest-b.slice")
-        b = guard.Enforcer(other, run=self.fake, log=self.logged.append,
-                           clock=lambda: self.now[0])
+        b = self.make(other)
         self.calls.clear()
         b.thaw_at_start()
         b.apply(frozen, 4)
@@ -656,12 +742,120 @@ class EnforcerTest(unittest.TestCase):
                     "%i.slice", "a;b.slice", "x\\y.slice", "", None):
             with self.subTest(bad):
                 self.assertIsNone(guard.freeze_unit(bad))
-        broken = guard.Enforcer(dataclasses.replace(self.cfg, slice="a b.slice"),
-                                run=self.fake, log=self.logged.append,
-                                clock=lambda: self.now[0])
+        broken = self.make(dataclasses.replace(self.cfg, slice="a b.slice"))
         self.assertNotIn("freeze", broken.apply(
             {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}, 4))
         self.assertEqual(self.runs(), [])
+
+    def test_slices_that_hold_the_helper_or_the_guard_are_refused(self):
+        # codex #237 r5 (P1): freezing system.slice (or any slice above the
+        # helper or the guard) would freeze what has to thaw it
+        self.assertEqual(guard.slice_ancestors("a-b-c.slice"),
+                         ["-.slice", "a.slice", "a-b.slice", "a-b-c.slice"])
+        own = "/apps.slice/apps-ops.slice/ameesh-guard.service"
+        for name in ("-.slice", "system.slice", "user.slice", "ameesh.slice",
+                     "ameesh-guard.slice", "ameesh-guard-helper.slice", "apps.slice",
+                     "apps-ops.slice", "a b.slice"):
+            with self.subTest(name):
+                self.assertIsNotNone(guard.refused_slice(name, own))
+        for name in ("ameesh-guest.slice", "apps-ops-x.slice", "ameesh-guard-helper-x.slice"):
+            with self.subTest(name):
+                self.assertIsNone(guard.refused_slice(name, own))
+        # the guard in a user's manager: its user slice is refused too
+        self.assertIsNotNone(guard.refused_slice(
+            "user-1000.slice", "/user.slice/user-1000.slice/user@1000.service/x.service"))
+        # a refused slice is never touched: no cap, no freeze, no thaw
+        for name in ("system.slice", "ameesh-guard.slice"):
+            refused = self.make(dataclasses.replace(self.cfg, slice=name))
+            refused.thaw_at_start()
+            self.assertEqual(refused.apply(
+                {"caps": {"cpu_weight": 10},
+                 "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}, 4), [])
+            self.assertEqual(self.calls, [])
+        self.assertTrue(any("refused" in line for line in self.logged))
+
+    def test_freeze_counted_only_when_the_slice_reads_frozen(self):
+        # codex #237 r5 (P2): the service starts, its freeze fails, the shell
+        # exits 0: not enforced, and retried at the next evaluation
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.freeze_fails = True
+        self.assertNotIn("freeze", self.at(1000.0).apply(frozen, 4))
+        self.assertTrue(any(c[1] == "show" and "--property=FreezerState" in c
+                            for c in self.calls))
+        self.freeze_fails = False
+        self.tick(5)
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual(len(self.runs()), 2)
+        # thawed behind the guard's back: started again, for what is left
+        self.frozen.clear()
+        self.tick(5)
+        left = int(60 - self.mono[0])     # the failed attempt polled 2.2 s
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], str(left))
+        self.assertLess(left, 50)
+
+    def test_retries_and_restarts_keep_the_episode_bound(self):
+        # codex #237 r5 (P2): a retry, or a restarted guard, gets what is
+        # left of the episode on the boot clock, never a fresh 60 s
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.assertIn("freeze", self.at(1000.0).apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "60")
+        self.tick(20)
+        self.services.clear()           # the service dies, the slice thaws
+        self.frozen.clear()
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "40")
+        # a new guard, the wall clock 100 s back: the published episode holds
+        self.tick(10, wall=-110)
+        restarted = self.make(self.cfg)
+        restarted.restore_episode(json.loads(json.dumps(self.enforcer.episode)))
+        restarted.thaw_at_start()
+        self.assertIn("freeze", restarted.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "30")
+        # another boot: the old episode means nothing, the wall clock decides
+        other = self.make(self.cfg, boot_id=lambda: "boot-2")
+        other.restore_episode(self.enforcer.episode)
+        other.thaw_at_start()
+        self.at(1050.0)
+        self.assertIn("freeze", other.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "10")
+        # ill-typed records are ignored
+        for bad in (None, 3, {"since_ts": "x", "boot_id": "b", "boot_deadline": 1},
+                    {"since_ts": 1, "boot_id": 2, "boot_deadline": 1},
+                    {"since_ts": 1, "boot_id": "b", "boot_deadline": float("inf")}):
+            fresh = self.make(self.cfg)
+            fresh.restore_episode(bad)
+            self.assertIsNone(fresh.episode, bad)
+
+    def test_guard_publishes_the_freeze_and_its_episode(self):
+        # the schema's caps.enforced lists caps only: the freeze reports
+        # itself (freeze.enforced); the episode is published for a restart
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = dataclasses.replace(
+                self.cfg, offer=guard.parse_offer(lend(reclaim={"cpu_pressure_max": "20%"})),
+                state_path=os.path.join(tmp, "state.json"),
+                ack_path=os.path.join(tmp, "ack.json"))
+            reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                       "mem_available_bytes": 12 * GIB, "disk_free_bytes": 50 * GIB,
+                       "psi_cpu_10": 50.0}
+            g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
+                            clock=lambda: self.now[0], enforcer=self.make(cfg))
+            state = g.step()
+            self.assertEqual(state["level"], 2)
+            self.assertNotIn("freeze", state["caps"]["enforced"])
+            self.assertTrue(state["freeze"]["enforced"])
+            self.assertEqual(state["guard"]["freeze"],
+                             {"since_ts": 1000.0, "boot_id": "boot-1",
+                              "boot_deadline": 60.0})
+            self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
+                                           state), [])
+            # restarted 20 s later: the slice thawed at start, frozen again
+            # for the 40 s the episode has left
+            self.tick(20)
+            g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
+                            clock=lambda: self.now[0], enforcer=self.make(cfg))
+            self.assertEqual(g.step()["freeze"]["enforced"], True)
+            self.assertEqual(self.runs()[-1][-1], "40")
 
     def test_restart_takes_over_the_service(self):
         # an earlier guard's service still holds the slice: the new guard
@@ -676,7 +870,8 @@ class EnforcerTest(unittest.TestCase):
         self.assertNotIn("freeze", self.at(1000.0).apply(frozen, 4))
         self.lying = set()
         self.calls.clear()
-        self.assertIn("freeze", self.at(1005.0).apply(frozen, 4))
+        self.tick(5)
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
         self.assertEqual([c[1:] for c in self.calls if c[0] == "systemctl"][:2],
                          [["stop", self.UNIT], ["reset-failed", self.UNIT]])
         self.assertEqual(self.services[self.UNIT][1], self.mono[0] + 55)
@@ -724,7 +919,7 @@ class EnforcerTest(unittest.TestCase):
     def test_guard_thaws_at_start_and_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = dataclasses.replace(
-                self.cfg, offer=guard.parse_offer({"cpu_max": 2}),
+                self.cfg, offer=guard.parse_offer(lend(cpu_max=2)),
                 state_path=os.path.join(tmp, "state.json"),
                 ack_path=os.path.join(tmp, "ack.json"))
             reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
@@ -733,8 +928,7 @@ class EnforcerTest(unittest.TestCase):
                     mock.patch.object(guard.resources, "measure", None, create=True):
                 g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
                                 clock=lambda: 1000.0,
-                                enforcer=guard.Enforcer(cfg, run=self.fake,
-                                                        log=self.logged.append))
+                                enforcer=self.make(cfg))
                 self.assertEqual(self.calls[:2], [["systemctl", "stop", self.UNIT],
                                                   ["systemctl", "thaw", "ameesh-guest.slice"]])
                 state = g.step()
@@ -765,7 +959,7 @@ class DrainStopTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = guard.GuardConfig(
             host="vm-test", max_agents=2,
-            offer=guard.parse_offer({"cpu_max": 2, "drain_seconds": 100,
+            offer=guard.parse_offer({**CAPS, "cpu_max": 2, "drain_seconds": 100,
                                      "reclaim": {"memory_available_min": "4GiB"}}),
             state_path=os.path.join(self.tmp, "state.json"),
             ack_path=os.path.join(self.tmp, "ack.json"),
@@ -1006,6 +1200,10 @@ class CliTest(unittest.TestCase):
             self.assertEqual(json.loads(printed)["schema"], "ameesh-host-state/1")
             # codex #211 r4: the disk of work_path, measured through sample()
             self.assertEqual(json.loads(printed)["caps"].get("disk_mb"), 1)
+            # codex #211 r6: the offer as published, in bytes, and the schema
+            self.assertEqual(json.loads(printed)["offer"]["memory_max"], 4 * GIB)
+            self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
+                                           json.loads(printed)), [])
             calls = []
 
             def run(argv, **kw):

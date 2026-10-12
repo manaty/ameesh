@@ -78,7 +78,7 @@ import sys
 import time
 from typing import Any, Callable
 
-from . import resources
+from . import capacity_guard, resources
 from .platform import host
 
 SCHEMA_HOST_STATE = "ameesh-host-state/1"
@@ -129,12 +129,19 @@ class GuardError(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Window:
-    """A lending window: days, and optionally a time range in UTC (an end
-    before the start runs past midnight, into the next day)."""
+    """A lending window: days, and optionally a time range in its zone (an
+    end before the start runs past midnight, into the next day)."""
 
     days: frozenset
     start_min: int | None = None
     end_min: int | None = None
+    tz: str = "UTC"
+
+    def _zone(self) -> dt.tzinfo:
+        if self.tz == "UTC":
+            return dt.timezone.utc
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(self.tz)
 
     def _span(self, day_start: dt.datetime) -> tuple[dt.datetime, dt.datetime] | None:
         if DAYS[day_start.weekday()] not in self.days:
@@ -149,7 +156,7 @@ class Window:
 
     def end_if_open(self, now: float) -> float | None:
         """The end of the window if it is open at `now` (epoch), else None."""
-        at = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+        at = dt.datetime.fromtimestamp(now, self._zone())
         today = at.replace(hour=0, minute=0, second=0, microsecond=0)
         for day in (today - dt.timedelta(days=1), today):
             span = self._span(day)
@@ -164,35 +171,14 @@ class Window:
         return None
 
 
-_WINDOW_RE = re.compile(r"^\s*(?P<days>[a-z]{3}(?:-[a-z]{3})?|daily)"
-                        r"(?:\s+(?P<start>\d{2}:\d{2})-(?P<end>\d{2}:\d{2}))?"
-                        r"(?:\s+(?P<tz>UTC))?\s*$")
-
-
 def parse_window(text: Any) -> Window:
-    """"mon-fri 18:00-14:00 UTC", "sat-sun", "daily 20:00-06:00" (UTC only)."""
-    match = _WINDOW_RE.match(str(text).lower().replace("utc", "UTC")) \
-        if isinstance(text, str) else None
-    if not match:
-        raise GuardError("window %r: expected 'mon-fri 18:00-14:00 UTC', 'sat-sun'" % (text,))
-    spec = match.group("days")
-    if spec == "daily":
-        days = frozenset(DAYS)
-    else:
-        first, _, last = spec.partition("-")
-        if first not in DAYS or (last and last not in DAYS):
-            raise GuardError("window %r: unknown day" % text)
-        i, j = DAYS.index(first), DAYS.index(last or first)
-        days = frozenset(DAYS[(i + k) % 7] for k in range((j - i) % 7 + 1))
-
-    def minutes(hhmm: str | None) -> int | None:
-        if hhmm is None:
-            return None
-        hours, mins = int(hhmm[:2]), int(hhmm[3:])
-        if hours > 24 or mins > 59 or (hours == 24 and mins):
-            raise GuardError("window %r: invalid time %s" % (text, hhmm))
-        return hours * 60 + mins
-    return Window(days, minutes(match.group("start")), minutes(match.group("end")))
+    """A window as the contract reads it (`capacity_guard.parse_window`):
+    "mon-fri 18:00-14:00 UTC", "sat-sun", "mon,wed 18:00-14:00 Europe/Paris"."""
+    found = capacity_guard.parse_window(text)
+    if found is None:
+        raise GuardError("window %r: expected '<days> [HH:MM-HH:MM] [zone]', e.g. "
+                         "'mon-fri 18:00-14:00 UTC', 'sat-sun'" % (text,))
+    return Window(frozenset(found["days"]), found["start"], found["end"], found["tz"])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,7 +201,8 @@ class Offer:
     disk_paths: tuple = ("/",)
     drain_seconds: float = DEFAULT_DRAIN_S
     calm_seconds: float = DEFAULT_CALM_S
-    raw: dict = dataclasses.field(default_factory=dict, compare=False)
+    #: the offer as published in the state (`offer`): sizes in bytes
+    published: dict = dataclasses.field(default_factory=dict, compare=False)
 
 
 def _percent(value: Any, key: str) -> float | None:
@@ -236,59 +223,47 @@ def _bytes(value: Any, key: str) -> int | None:
     return number
 
 
-def _positive(value: Any, key: str, default: float | None = None) -> float | None:
-    if value is None:
-        return default
-    # finite: drain_seconds of 1e309 (inf) or nan kept the guard draining
-    # forever (codex #211 r5)
-    number = resources.finite_float(value) if isinstance(value, (int, float)) else None
-    if number is None or number <= 0:
-        raise GuardError("lend.%s: positive finite number expected, got %r" % (key, value))
-    return number
+#: reclaim keys only the guard reads; the contract's reader reports them as
+#: unknown and ignores them
+GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
 
 
 def parse_offer(lend: Any) -> Offer:
-    """`Offer` from the `lend` object; `GuardError` on any unreadable key."""
-    if not isinstance(lend, dict) or not lend:
-        raise GuardError("lend: object expected (no offer: the host lends nothing)")
-    reclaim = lend.get("reclaim") or {}
-    if not isinstance(reclaim, dict):
-        raise GuardError("lend.reclaim: object expected")
-    weight = lend.get("cpu_weight", 10)
-    if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10000:
-        raise GuardError("lend.cpu_weight: integer from 1 to 10000 expected")
-    units = reclaim.get("busy_units") or []
-    if not isinstance(units, list) or not all(isinstance(u, str) and u for u in units):
-        raise GuardError("lend.reclaim.busy_units: list of unit patterns expected")
-    busy_max = reclaim.get("busy_max")
-    if busy_max is not None and (isinstance(busy_max, bool) or not isinstance(busy_max, int)
-                                 or busy_max < 0):
-        raise GuardError("lend.reclaim.busy_max: integer >= 0 expected")
-    paths = reclaim.get("disk_paths") or ["/"]
+    """`Offer` from the `lend` object, read by the contract's own reader
+    (`capacity_guard.parse_lend`): the guard accepts exactly the offers the
+    canon accepts (codex #211 r6), plus the reclaim keys of
+    `GUARD_RECLAIM_KEYS`. `GuardError` on any problem."""
+    parsed, problems, _unknown = capacity_guard.parse_lend(lend)
+    if problems or parsed is None:
+        raise GuardError("lend: %s" % "; ".join(problems or ["unreadable"]))
+    reclaim = parsed.get("reclaim") or {}
+    extra = lend.get("reclaim") or {}
+    paths = extra.get("disk_paths") or ["/"]
     if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
         raise GuardError("lend.reclaim.disk_paths: list of paths expected")
-    windows = lend.get("windows") or []
-    if not isinstance(windows, list):
-        raise GuardError("lend.windows: list expected")
-    disk_min = _bytes(reclaim.get("disk_free_min"), "reclaim.disk_free_min")
+    io = _percent(extra.get("io_pressure_max"), "io_pressure_max")
+    disk_min = _bytes(extra.get("disk_free_min"), "reclaim.disk_free_min")
+    published = dict(parsed)
+    guard_keys = {"io_pressure_max": io, "disk_free_min": disk_min,
+                  "disk_paths": paths if "disk_paths" in extra else None}
+    guard_keys = {k: v for k, v in guard_keys.items() if v is not None}
+    if guard_keys:
+        published["reclaim"] = dict(reclaim, **guard_keys)
     return Offer(
-        cpu_max=_positive(lend.get("cpu_max"), "cpu_max"), cpu_weight=weight,
-        memory_max=_bytes(lend.get("memory_max"), "memory_max"),
-        agent_memory_max=_bytes(lend.get("agent_memory_max"), "agent_memory_max"),
-        disk_max=_bytes(lend.get("disk_max"), "disk_max"),
-        windows=tuple(parse_window(w) for w in windows),
-        memory_available_min=_bytes(reclaim.get("memory_available_min"),
-                                    "reclaim.memory_available_min"),
-        cpu_pressure_max=_percent(reclaim.get("cpu_pressure_max"), "cpu_pressure_max"),
-        memory_pressure_max=_percent(reclaim.get("memory_pressure_max"),
-                                     "memory_pressure_max"),
-        io_pressure_max=_percent(reclaim.get("io_pressure_max"), "io_pressure_max"),
-        busy_units=tuple(units), busy_max=busy_max,
+        cpu_max=parsed["cpu_max"], cpu_weight=parsed.get("cpu_weight", 10),
+        memory_max=parsed["memory_max"], agent_memory_max=parsed.get("agent_memory_max"),
+        disk_max=parsed["disk_max"],
+        windows=tuple(parse_window(w) for w in parsed.get("windows", ())),
+        memory_available_min=reclaim.get("memory_available_min"),
+        cpu_pressure_max=reclaim.get("cpu_pressure_max"),
+        memory_pressure_max=reclaim.get("memory_pressure_max"),
+        io_pressure_max=io,
+        busy_units=tuple(reclaim.get("busy_units", ())), busy_max=reclaim.get("busy_max"),
         disk_free_min=DEFAULT_DISK_FREE_MIN if disk_min is None else disk_min,
         disk_paths=tuple(paths),
-        drain_seconds=_positive(lend.get("drain_seconds"), "drain_seconds", DEFAULT_DRAIN_S),
-        calm_seconds=_positive(lend.get("calm_seconds"), "calm_seconds", DEFAULT_CALM_S),
-        raw=dict(lend))
+        drain_seconds=float(parsed["drain_seconds"]),
+        calm_seconds=float(parsed["calm_seconds"]),
+        published=published)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -321,9 +296,9 @@ def load_config(path: str | None = None) -> GuardConfig:
     if isinstance(agents, bool) or not isinstance(agents, int) or agents < 0:
         raise GuardError("max_agents: integer >= 0 expected")
     slice_name = raw.get("slice") or DEFAULT_SLICE
-    if freeze_unit(slice_name) is None:
-        raise GuardError("slice: a systemd slice name expected (letters, digits, "
-                         "':_.-', ending in .slice), got %r" % (slice_name,))
+    refused = refused_slice(slice_name)
+    if refused:
+        raise GuardError("slice %r refused: %s" % (slice_name, refused))
     return GuardConfig(host=str(host), offer=parse_offer(raw.get("lend")), max_agents=agents,
                        state_path=str(raw.get("state_path") or DEFAULT_STATE_PATH),
                        ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
@@ -533,6 +508,17 @@ def lendable(offer: Offer, reading: dict) -> dict:
     return out
 
 
+#: the smallest CPU share published (4 decimals): the schema wants > 0
+CPU_SHARE_MIN = 0.0001
+
+
+def cpu_share(share: float) -> float:
+    """A share of the host's CPUs as published: rounded up to 4 decimals,
+    at least `CPU_SHARE_MIN`, at most 1 (0.001 CPU of 64 is not 0.0, which
+    the schema refuses and a reader could take for no cap; codex #211 r6)."""
+    return min(1.0, max(CPU_SHARE_MIN, math.ceil(round(share * 10000, 6)) / 10000))
+
+
 def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,
              in_turn: int | None) -> dict:
     """The `caps` of the state for a level (§1.5, §1.6)."""
@@ -542,7 +528,7 @@ def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,
     caps: dict = {"max_concurrent": cfg.max_agents, "cpu_weight": offer.cpu_weight,
                   "io_weight": offer.cpu_weight, "enforced": []}
     if cpu is not None and count:
-        caps["cpu_share"] = round(cpu / count, 4)
+        caps["cpu_share"] = cpu_share(cpu / count)
     if lend.get("memory_bytes") is not None:
         caps["memory_mb"] = int(lend["memory_bytes"] // 2 ** 20)
         caps["memory_high_mb"] = caps["memory_mb"]
@@ -555,13 +541,21 @@ def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,
         # memory brought back to its use (the kernel reclaims its cache)
         caps["max_concurrent"] = min(cfg.max_agents, in_turn or 0)
         if "cpu_share" in caps:
-            caps["cpu_share"] = round(caps["cpu_share"] / 2, 4)
+            caps["cpu_share"] = cpu_share(caps["cpu_share"] / 2)
         guest = reading.get("guest_mem_bytes")
         if guest is not None and "memory_high_mb" in caps:
             caps["memory_high_mb"] = min(caps["memory_high_mb"], int(guest // 2 ** 20))
     if level >= 3:
         caps["max_concurrent"] = 0
     return caps
+
+
+#: the keys of `measure` (contract §4): all present, null when unknown
+MEASURE_KEYS = ("ts", "window_s", "cpu_count", "app_cpu", "guest_cpu", "mem_total_bytes",
+                "mem_available_bytes", "swap_used_bytes", "guest_mem_bytes", "psi", "app_psi",
+                "disk_free_bytes", "app_disk_free_bytes", "tmp_path", "tmp_fstype",
+                "tmp_size_bytes", "tmp_used_bytes", "on_ac", "battery_percent", "metered",
+                "user_idle_s", "busy")
 
 
 def measure_of(reading: dict) -> dict:
@@ -586,7 +580,9 @@ def measure_of(reading: dict) -> dict:
     out = {"ts": reading.get("ts"), "window_s": 60}
     out.update({k: reading.get(k) for k in keys if k in reading})
     out["psi"] = {"cpu_some": reading.get("psi_cpu_60"), "mem_some": reading.get("psi_mem_60"),
-                  "io_some": reading.get("psi_io_60")}
+                  "mem_full": None, "io_some": reading.get("psi_io_60")}
+    # every key the schema requires, null when not measured
+    out.update({k: None for k in MEASURE_KEYS if k not in out})
     return out
 
 
@@ -602,7 +598,7 @@ def build_state(cfg: GuardConfig, decision: Decision, seq: int, now: float, *,
         "caps": caps_for(cfg, decision.level, lend, reading, in_turn),
         "reason": decision.reason, "expires_ts": now + ttl,
         "level": decision.level,
-        "offer": cfg.offer.raw, "measure": dict(measure_of(reading), lendable=lend),
+        "offer": cfg.offer.published, "measure": dict(measure_of(reading), lendable=lend),
         "guard": {"kind": GUARD_KIND, "version": version(), "host_kind": "vm",
                   "mode": "observe" if observe else "enforce"},
     }
@@ -753,12 +749,50 @@ FREEZE_SCRIPT = ('systemctl freeze "$0" && sleep "$1"; '
                  'until systemctl thaw "$0"; do sleep 2; done')
 
 
+#: the slice the freezing services run in: a freeze never reaches its own
+#: helper (codex #237 r5)
+HELPER_SLICE = "ameesh-guard-helper.slice"
+#: slices never capped nor frozen: the root and those of the system
+SYSTEM_SLICES = ("-.slice", "system.slice", "user.slice")
+#: how long the guard waits for the slice to read `frozen` after starting
+#: its freezing service, and how often it looks
+FREEZE_CONFIRM_S, FREEZE_POLL_S = 2.0, 0.2
+
+
 def freeze_unit(slice_name: str) -> str | None:
     """The freezing unit of a slice (`ameesh-guard-freeze-<slice>.service`),
     None for a slice name the guard refuses."""
     if not isinstance(slice_name, str) or not SLICE_RE.fullmatch(slice_name):
         return None
     return "%s-%s.service" % (FREEZE_UNIT, slice_name[:-len(".slice")])
+
+
+def slice_ancestors(name: str) -> list[str]:
+    """`a-b.slice` and the slices that hold it: `-.slice`, `a.slice`,
+    `a-b.slice` (systemd nests slices along the dashes of their names)."""
+    if name == "-.slice":
+        return [name]
+    parts = name[:-len(".slice")].split("-")
+    return ["-.slice"] + ["-".join(parts[:i + 1]) + ".slice" for i in range(len(parts))]
+
+
+def refused_slice(name: Any, cgroup: str | None = None) -> str | None:
+    """Why the guard refuses to cap or freeze the slice `name`, None if it
+    may: not a plain slice name, a system slice, or a slice that holds the
+    guard's helper or the guard itself (`cgroup`: its own cgroup path;
+    frozen, nothing would ever thaw it)."""
+    if freeze_unit(name) is None:
+        return "not a plain systemd slice name (letters, digits, ':_.-', ending in .slice)"
+    if name in SYSTEM_SLICES:
+        return "a system slice"
+    if name in slice_ancestors(HELPER_SLICE):
+        return "it holds the guard's helper (%s)" % HELPER_SLICE
+    own = host.own_cgroup() if cgroup is None else cgroup
+    for part in (own or "").split("/"):
+        if part.endswith(".slice") and SLICE_RE.fullmatch(part) \
+                and name in slice_ancestors(part):
+            return "it holds the guard itself (%s)" % own
+    return None
 
 
 #: which `caps` key each property enforces
@@ -783,17 +817,25 @@ class Enforcer:
     does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
-                 log: Callable | None = None, clock: Callable = time.time):
+                 log: Callable | None = None, clock: Callable = time.time, *,
+                 cgroup: str | None = None, boottime: Callable = host.boottime,
+                 boot_id: Callable = host.boot_id, sleep: Callable = time.sleep):
         self.cfg = cfg
         self.run = run or subprocess.run
         self.clock = clock
+        self.boottime, self.boot_id, self.sleep = boottime, boot_id, sleep
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
-        self.freeze_done = False         # the freezing service was started
+        self.freeze_done = False         # the slice read `frozen` after a start
         self.freeze_unit = freeze_unit(cfg.slice)
         self.jobs_stopped = False        # the drain's deadline is past: jobs stopped
         self.guest_stopped = False       # level 4: slice killed and stopped
+        #: why this slice is never touched (system slice, holds the guard)
+        self.refused = refused_slice(cfg.slice, cgroup)
+        #: the freeze episode: its since_ts, the boot, and its bound on the
+        #: boot clock, kept across retries and restarts (codex #237 r5)
+        self.episode: dict | None = None
 
     def _command(self, argv: list[str]) -> bool:
         try:
@@ -849,9 +891,54 @@ class Enforcer:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def freeze(self, on: bool, until: float | None = None) -> bool:
+    def _freezer_state(self) -> str | None:
+        """The slice's FreezerState (`running`, `freezing`, `frozen`,
+        `thawing`), None when unreadable."""
+        try:
+            proc = self.run(["systemctl", "show", "--property=FreezerState", "--value",
+                             self.cfg.slice], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (proc.stdout or "").strip() or None if proc.returncode == 0 else None
+
+    def _confirmed(self) -> bool:
+        """The slice reads `frozen` within `FREEZE_CONFIRM_S`: a service
+        started is no proof (its freeze may fail, the shell still exits 0)."""
+        for _ in range(int(FREEZE_CONFIRM_S / FREEZE_POLL_S) + 1):
+            state = self._freezer_state()
+            if state == "frozen":
+                return True
+            if state not in ("freezing", "running"):
+                return False
+            self.sleep(FREEZE_POLL_S)
+        return False
+
+    def restore_episode(self, record: Any) -> None:
+        """The freeze episode a previous guard published (`guard.freeze`)."""
+        if isinstance(record, dict) and isinstance(record.get("boot_id"), str) \
+                and _number(record.get("since_ts")) and _number(record.get("boot_deadline")):
+            self.episode = {k: record[k] for k in ("since_ts", "boot_id", "boot_deadline")}
+
+    def _seconds_left(self, until: float, since: float | None) -> int | None:
+        """Whole seconds the freeze may still last: on the boot clock, from
+        the episode's bound when this episode already started a freeze (a
+        retry, a restart), else from `until` (at most `FREEZE_MAX_S`)."""
+        boot, now = self.boot_id(), self.boottime()
+        episode = self.episode
+        if boot is None or now is None:
+            left = min(FREEZE_MAX_S, until - self.clock())
+        elif episode and episode["since_ts"] == since and episode["boot_id"] == boot:
+            left = episode["boot_deadline"] - now
+        else:
+            left = min(FREEZE_MAX_S, until - self.clock())
+            self.episode = {"since_ts": since, "boot_id": boot, "boot_deadline": now + left}
+        return int(left) if left >= 1 else None
+
+    def freeze(self, on: bool, until: float | None = None,
+               since: float | None = None) -> bool:
         """Freezes the guest's slice until `until` through its freezing
-        service, or thaws it; True if the slice is as asked."""
+        service (`since`: the episode's start), or thaws it; True if the
+        slice is as asked."""
         if not on:
             if not self.frozen:
                 return True
@@ -862,32 +949,36 @@ class Enforcer:
             self.frozen = self.freeze_done = False
             return True
         if self.freeze_done:
-            return True
-        now = self.clock()
-        if self.freeze_unit is None or until is None or until - now < 1:
-            self.log("freeze refused: %s" % ("slice name %r refused" % self.cfg.slice
-                                             if self.freeze_unit is None else "bound past"))
+            if self._freezer_state() == "frozen":
+                return True
+            self.log("slice %s no longer frozen: freeze started again" % self.cfg.slice)
+            self.freeze_done = False
+        seconds = None if until is None or self.refused else self._seconds_left(until, since)
+        if seconds is None:
+            self.log("freeze refused: %s" % (self.refused or "bound past"))
             self.freeze(False)
             return False
-        # never more than the longest freeze, whatever the wall clock says
-        seconds = min(int(FREEZE_MAX_S), int(math.ceil(until - now)))
         # a service left by a failed attempt or an earlier guard: stopped
-        # (it thaws), forgotten, then started anew
+        # (it thaws), forgotten, then started anew for what is left
         self._quiet("stop", self.freeze_unit)
         self._quiet("reset-failed", self.freeze_unit)
         # started: possibly in force even if systemd-run does not return
         self.frozen = True
-        self.freeze_done = self._command([
-            "systemd-run", "--unit=%s" % self.freeze_unit, "--collect", "--quiet",
+        started = self._command([
+            "systemd-run", "--unit=%s" % self.freeze_unit, "--slice=%s" % HELPER_SLICE,
+            "--collect", "--quiet",
             "--property=RuntimeMaxSec=%d" % (seconds + FREEZE_BACKSTOP_S),
             "--property=ExecStopPost=systemctl thaw %s" % self.cfg.slice,
             "/bin/sh", "-c", FREEZE_SCRIPT, self.cfg.slice, str(seconds)])
+        self.freeze_done = started and self._confirmed()
         return self.freeze_done
 
     def thaw_at_start(self) -> None:
         """A guard that died during a freeze must not leave the guest frozen:
         the slice counts as possibly frozen until a thaw succeeds (retried
-        at every evaluation below level 2)."""
+        at every evaluation below level 2). A refused slice is never touched."""
+        if self.refused:
+            return
         self.frozen = True
         self.freeze(False)
 
@@ -910,11 +1001,15 @@ class Enforcer:
         """Enforces `state`: caps at every level, freeze at level 2; a drain
         thaws, and stops the jobs at its deadline; a stop kills and stops the
         guest's slice. Each is done once, retried while it fails. The `caps`
-        keys actually enforced.
+        keys actually enforced, and `freeze` when the slice reads frozen. A
+        refused slice is never touched.
 
         `now` is the instant `state` was decided at: the deadline is judged
         on the same clock as the decision (a manual request's expiry
         included), never on a later one (codex #238 r4)."""
+        if self.refused:
+            self.log("slice %s refused: %s; nothing enforced" % (self.cfg.slice, self.refused))
+            return []
         now = self.clock() if now is None else now
         caps = state.get("caps") or {}
         level = state.get("level", 0)
@@ -937,7 +1032,7 @@ class Enforcer:
                 enforced.add("agent_memory_mb")
         freeze = state.get("freeze")
         if freeze:
-            if self.freeze(True, freeze.get("until_ts")):
+            if self.freeze(True, freeze.get("until_ts"), freeze.get("since_ts")):
                 enforced.add("freeze")
         else:
             self.freeze(False)
@@ -992,6 +1087,9 @@ class Guard:
         self.clock = clock
         self.signals = signals or (lambda now: read_signals(cfg, now))
         previous = read_json(cfg.state_path) or {}
+        if self.enforcer is not None and isinstance(previous.get("guard"), dict):
+            # a freeze retried after a restart gets only what its episode has left
+            self.enforcer.restore_episode(previous["guard"].get("freeze"))
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
         # so do the level, the freeze bound and the drain deadline
@@ -1026,8 +1124,13 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"),
-                                                            now)
+            enforced = self.enforcer.apply(state, reading.get("cpu_count"), now)
+            # the schema's caps.enforced lists caps only: the freeze says it itself
+            state["caps"]["enforced"] = [k for k in enforced if k != "freeze"]
+            if state.get("freeze") is not None:
+                state["freeze"]["enforced"] = "freeze" in enforced
+            if self.enforcer.episode is not None:
+                state["guard"]["freeze"] = dict(self.enforcer.episode)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
