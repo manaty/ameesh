@@ -786,9 +786,9 @@ class OnceTurnTest(PgTestCase):
         self.assertEqual(self.events[-1], ("tick", False))
         self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
 
-    def test_a_detached_renewal_is_awaited_before_the_expiry_is_fixed(self):
-        # r3 P2: the renewal committed but answered after `call_budget()`:
-        # the heartbeat has ended, its detached call still extends the bound
+    def _detached_renewal(self, answer, release):
+        """A turn whose renewal outlives `call_budget()`: `answer()` is its
+        late outcome (an expiry, or an exception); `release` the return."""
         import threading
         from unittest import mock
         from ameesh import runner as runner_mod
@@ -801,25 +801,63 @@ class OnceTurnTest(PgTestCase):
             bounds["start"] = time.monotonic()
             worker.lease_held_until = bounds["start"] + 0.05
             worker.lease_deadline = time.time() + 60
-            answer = threading.Event()
-
-            def renew(*_args):
-                answer.wait(0.2)  # committed; the answer comes late
-                return time.time() + 60
-            with mock.patch.object(runner_mod.registry, "renew", renew), \
+            with mock.patch.object(runner_mod.registry, "renew", lambda *_a: answer()), \
                     mock.patch.object(worker, "call_budget", return_value=0.01):
                 self.assertEqual(worker._renew_call(), (False, None, None))
             return True
 
+        guard = threading.Timer(10, runner.stop.set)  # a wait that never ends fails
+        guard.start()
+        self.addCleanup(guard.cancel)
         with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
-                mock.patch.object(runner_mod.AgentWorker, "release_lease",
-                                  return_value=False):
+                mock.patch.object(runner_mod.AgentWorker, "release_lease", release):
             runner.sweep()
-            freed = time.monotonic()
+        bounds["freed"] = time.monotonic()
+        return bounds
+
+    def _late(self, outcome):
+        def answer():
+            time.sleep(0.2)  # committed; the answer comes late
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return answer
+
+    def _held_until_the_late_bound(self, bounds):
         # the late answer (after 0.2 s) holds the lease 0.3 s more
-        self.assertGreaterEqual(freed, bounds["start"] + 0.5)
+        self.assertGreaterEqual(bounds["freed"], bounds["start"] + 0.5)
         self.assertEqual(self.events[-1], ("tick", False))
         self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
+    def test_a_detached_renewal_is_awaited_before_the_expiry_is_fixed(self):
+        # r3 P2: the renewal committed but answered after `call_budget()`:
+        # the heartbeat has ended, its detached call still extends the bound
+        self._held_until_the_late_bound(self._detached_renewal(
+            self._late(time.time() + 60), lambda _w: False))
+
+    def test_a_detached_renewal_answering_an_error_may_have_committed(self):
+        # r4 P2: committed, then its answer is lost (`Unavailable`): the
+        # bound is extended all the same
+        from ameesh import db as db_mod
+        self._held_until_the_late_bound(self._detached_renewal(
+            self._late(db_mod.Unavailable("connection lost")), lambda _w: False))
+
+    def test_a_stuck_renewal_does_not_stop_the_release_retries(self):
+        # r4 P2: the detached renewal never answers; the base comes back and
+        # takes the return at its third try: the part is freed then
+        import threading
+        stuck = threading.Event()
+        self.addCleanup(stuck.set)
+        calls = []
+
+        def release(_worker):
+            calls.append(time.monotonic())
+            return len(calls) >= 3
+
+        bounds = self._detached_renewal(lambda: stuck.wait(), release)
+        self.assertEqual(len(calls), 3)
+        self.assertLess(bounds["freed"] - bounds["start"], 5)
+        self.assertEqual(self.events[-1], ("tick", False))
 
     def test_release_is_tried_even_after_renewal_failures(self):
         # r1 P2: three generic DbErrors at renewal set `lease_lost` before the
