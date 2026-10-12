@@ -1917,14 +1917,17 @@ class AgentWorker(threading.Thread):
         """
         self._account = None
         if self.runner.budget_limits(self.db).per_hour <= 0:
-            account_turn.choose(self, None, pause=False)  # L30 : bascule sans pause
-            return True
-        # Réparation d'abord : un travail comptable en attente (marqueur
-        # persistant) doit être écrit avant d'autoriser le moindre tour ; un
-        # marqueur corrompu suspend au lieu d'autoriser.
-        self._compta_repare()
-        raison = ("comptabilité des tours indisponible" if self._compta_en_echec
-                  else self.budget_reason())
+            # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
+            # overage ou au-dessus d'un plafond fixe, quels que soient les
+            # réglages de budget — sans autre compte, pas de tour
+            raison = account_turn.choose(self, None, pause=False) or ""
+        else:
+            # Réparation d'abord : un travail comptable en attente (marqueur
+            # persistant) doit être écrit avant d'autoriser le moindre tour ;
+            # un marqueur corrompu suspend au lieu d'autoriser.
+            self._compta_repare()
+            raison = ("comptabilité des tours indisponible" if self._compta_en_echec
+                      else self.budget_reason())
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""

@@ -648,16 +648,16 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={row["name"]: harness})
     # L74 (0034 §4) : la session garde son compte d'origine tant qu'il est sous
     # son seuil
-    origine = previous or next((p.name for p in items if p.home() == accounts.Profile(
-        harness=harness, name="(défaut)").home()), None)
+    # (session d'avant L30 : le compte déclaré du dossier par défaut, L226b)
+    legacy = account_turn.legacy_profile(harness, items)
+    origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("tous les comptes %s sont au seuil (%s) : l'agent reprendra "
                                "à la remise à zéro" % (harness, choice.reason))
-    old = accounts.by_name(items, previous) if previous else \
-        accounts.Profile(harness=harness, name="(défaut)")
+    old = accounts.by_name(items, previous) if previous else legacy
     out.update(previous=previous, next=nxt.name, old=old)
     if previous == nxt.name or (previous is None and old.home() == nxt.home()):
         out.update(keep=True, deterministic=False,
@@ -666,7 +666,7 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     if accounts.session_portable(harness, old, nxt):
         out.update(keep=True, deterministic=False,
                    why="la session %s (compte %s) est portable vers le compte %s : reprise"
-                   % (session, previous or "(défaut)", nxt.name))
+                   % (session, previous or old.name, nxt.name))
         return out
     try:
         sick = auth_failure.failing(db, cfg.host, harness)
@@ -677,8 +677,8 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
         out.update(keep=True, deterministic=False,
                    why="la session %s (compte %s) n'est pas portable vers %s ; l'ancien "
                        "compte reste utilisable : l'exécuteur la résumera sous %s puis "
-                       "tournera (rotation 0027)" % (session, previous or "(défaut)",
-                                                     nxt.name, previous or "(défaut)"))
+                       "tournera (rotation 0027)" % (
+                           session, previous or old.name, nxt.name, previous or old.name))
         return out
     out["why"] = ("compte d'origine %s inutilisable (%s) et session %s non portable vers %s : "
                   "session oubliée, brief de reprise déterministe"

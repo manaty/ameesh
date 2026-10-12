@@ -691,5 +691,142 @@ class RunnerReviewR2Test(_AuthBase):
             worker.watchdog_stop.set()
 
 
+class LegacySessionTest(_CapsBase):
+    """Codex review r3 (P1): a session from before L30 (no account recorded)
+    ran on the harness's default folder; the failover reads health and gauges
+    under the declared account of that folder, never under '(défaut)'."""
+
+    def _worker(self, items):
+        worker = mock.Mock()
+        worker.name = "legacy"
+        worker.agent = {"harness": "claude"}
+        worker.cfg.state_dir = self.tmp
+        worker.cfg.host = "h"
+        worker._account_override = None
+        worker._account = items[1]
+        worker._compte_session = None
+        worker.current_session.return_value = "sess-1"
+        worker.peek.return_value = True
+        return worker
+
+    def _continuity(self, items, failing=None, gauges=None):
+        worker = self._worker(items)
+        quiet = self._gauges(0.10, 0.10, 1_800_000_000.0)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}), \
+                mock.patch.object(accounts, "profiles", return_value=items), \
+                mock.patch.object(auth_failure, "failing", return_value=failing or {}), \
+                mock.patch.object(accounts, "gauges_of", side_effect=lambda _b, p, _i: (
+                    gauges or {}).get(p.name, quiet)), \
+                mock.patch.object(registry, "clear_session", return_value=False):
+            account_turn.continuity(worker)
+        return worker
+
+    def test_legacy_session_resolves_to_the_declared_primary(self):
+        items = self._items()
+        self.assertEqual(account_turn.legacy_profile("claude", items), items[0])
+        worker = self._worker(items)
+        with mock.patch.object(accounts, "profiles", return_value=items):
+            self.assertEqual(account_turn.session_account(worker, items), "primaire")
+        # nothing declared on the default folder: the synthetic profile
+        other = items[1:]
+        self.assertEqual(account_turn.legacy_profile("claude", other).name, "(défaut)")
+
+    def test_no_summary_on_a_failing_primary(self):
+        items = self._items()
+        worker = self._continuity(items, failing={"primaire": {"reason": "http 401"}})
+        worker.run_turn.assert_not_called()
+
+    def test_no_summary_on_a_primary_in_overage(self):
+        items = self._items()
+        now = time.time()
+        overage = self._gauges(0.10, 0.10, now, cost.Overage(capable=True, in_use=True))
+        worker = self._continuity(items, gauges={"primaire": overage})
+        worker.run_turn.assert_not_called()
+
+    def test_summary_on_a_healthy_primary(self):
+        worker = self._continuity(self._items())
+        worker.run_turn.assert_called_once()
+
+
+class UnpacedChoiceTest(_AuthBase):
+    """Codex review r3 (P1): with the budget guard off the pace no longer
+    holds, but an account in overage or past a fixed cap is never chosen."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = time.time()
+        self.overage = cost.Gauges([cost.Gauge(
+            "claude", "five_hour", 0.10, self.now + HOUR, 5 * HOUR)],
+            cost.Overage(capable=True, in_use=True))
+        # past its pace only (95 % at a third of the window)
+        self.paced = cost.Gauges([cost.Gauge(
+            "claude", "five_hour", 0.95, self.now + 3.5 * HOUR, 5 * HOUR)])
+
+    def _choose(self, items, gauges, **kwargs):
+        return accounts.choose(self.db, self.cfg.host, "claude", items, _Book(gauges),
+                               now=self.now, **kwargs)
+
+    def test_pace_lifted_absolute_rules_kept(self):
+        items = accounts.parse({"claude": self._claude_comptes()})["claude"]
+        gauges = {"primaire": self.overage, "secondaire": self.paced}
+        self.assertTrue(self._ev_hard(items[0], items, gauges))
+        self.assertFalse(self._ev_hard(items[1], items, gauges))
+        self.assertIsNone(self._choose(items, gauges).profile)
+        choix = self._choose(items, gauges, paced=False)
+        self.assertEqual(choix.profile.name, "secondaire")
+        # both held by an absolute rule: no account, whatever the guard
+        gauges["secondaire"] = self.overage
+        choix = self._choose(items, gauges, paced=False)
+        self.assertIsNone(choix.profile)
+        self.assertIn("in overage", choix.reason)
+
+    def test_forced_account_in_overage_is_not_launched(self):
+        items = accounts.parse({"claude": self._claude_comptes()})["claude"]
+        storage.of(self.db).accounts.init_active(self.cfg.host, "claude", "primaire")
+        self.db.execute("UPDATE account_active SET forced = TRUE")
+        gauges = {"primaire": self.overage, "secondaire": self.paced}
+        self.assertIsNone(self._choose(items, gauges, paced=False).profile)
+        gauges["primaire"] = self.paced
+        self.assertEqual(self._choose(items, gauges, paced=False).profile.name, "primaire")
+
+    def test_fixed_cap_is_hard_even_below_a_lower_pace_cap(self):
+        items = accounts.parse({"claude": [{"name": "primaire"}]})["claude"]
+        # 60 % at a tenth of the window: the pace cap is lower than 50 %, but
+        # the primary cap is what holds it
+        reading = cost.Gauges([cost.Gauge(
+            "claude", "five_hour", 0.60, self.now + 4.5 * HOUR, 5 * HOUR)])
+        result = accounts.evaluate(_Book({"primaire": reading}), items[0], items, self.now)
+        self.assertTrue(result.hard)
+        self.assertIn("primary cap 50", result.reason)
+
+    def test_guard_off_no_turn_and_no_rotation_on_an_account_in_overage(self):
+        comptes = self._claude_comptes()
+        runner, worker = self._worker("ovr", "claude", {"claude": comptes})
+        runner.budget_usd_per_hour = 0.0
+        try:
+            worker.rotation_forcee = "test"
+            with mock.patch.object(accounts, "gauges_of",
+                                   side_effect=lambda _b, _p, _i: self.overage), \
+                    mock.patch.object(worker, "current_session", return_value="sess-1"), \
+                    mock.patch.object(worker, "run_turn", return_value=False) as tour:
+                self.assertFalse(worker.budget_ok())
+                self.assertFalse(worker.maybe_rotate())
+                tour.assert_not_called()
+                ligne = registry.get(self.db, "ovr")
+                self.assertEqual(ligne["status"], "blocked")
+                self.assertIn("in overage", ligne["status_text"])
+            # out of overage: the guard lets it through, the pause is lifted
+            worker.agent = registry.get(self.db, "ovr")  # as `pick` reloads it
+            with mock.patch.object(accounts, "gauges_of",
+                                   side_effect=lambda _b, _p, _i: self.paced):
+                self.assertTrue(worker.budget_ok())
+            self.assertEqual(registry.get(self.db, "ovr")["status"], "idle")
+        finally:
+            worker.watchdog_stop.set()
+
+    def _ev_hard(self, profile, items, gauges):
+        return accounts.evaluate(_Book(gauges), profile, items, self.now).hard
+
+
 if __name__ == "__main__":
     unittest.main()

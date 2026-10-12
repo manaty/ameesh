@@ -542,10 +542,19 @@ class Evaluation:
     problems: list = field(default_factory=list)
     #: L226b: {gauge key: (cap, label)}, the cap each window is held to
     limits: dict = field(default_factory=dict)
+    #: L226b: held back by an absolute rule (in overage, past a fixed cap),
+    #: not only by its pace: no budget setting lifts it
+    hard: bool = False
 
     @property
     def ok(self) -> bool:
         return not self.reason
+
+    @property
+    def unpaced_ok(self) -> bool:
+        """Usable when the pace does not hold (budget guard off, L30): only
+        the absolute rules of L226b keep the account out."""
+        return not self.hard
 
 
 def gauges_of(book, profile: Profile, items: list[Profile]) -> list:
@@ -637,6 +646,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if in_overage(result.gauges, now):
         # L226b: an account in overage is never chosen (no spending beyond the plan)
         result.reason = "%s plan: in overage (billed beyond the plan)" % profile.harness
+        result.hard = True
         # eligible again once the windows that ran out have reset
         spent = result.gauges.spent()
         resets = [g.resets_at for g in spent if g.resets_at]
@@ -651,8 +661,13 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         if gauge.used_at(now) >= result.limits[gauge.key][0]:
             depasses.append(gauge)
     if depasses:
-        gauge = depasses[0]
-        cap, label = result.limits[gauge.key]
+        fixed = fixed_caps(profile, result.gauges)
+        hard = [(g, pair) for g in depasses for pair in fixed if g.used_at(now) >= pair[0]]
+        result.hard = bool(hard)
+        # an absolute cap first in the reason: the pace may be lower, it is
+        # not what holds the account
+        gauge, (cap, label) = hard[0] if hard else (depasses[0],
+                                                    result.limits[depasses[0].key])
         if label == "pace cap":
             result.reason = ("forfait %s %s : %.0f%% utilisé pour %.0f%% de la fenêtre écoulée "
                              "(plafond de rythme %.0f%%)" % (
@@ -781,13 +796,18 @@ def explain(result: Evaluation, now: float) -> str:
     return "%s %.0f %% utilisé (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
-def rank(items: list[Profile], evaluations: dict, now: float) -> list[Profile]:
+def rank(items: list[Profile], evaluations: dict, now: float, *,
+         paced: bool = True) -> list[Profile]:
     """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
     Clé : L226b, the failover order first (`priority`: the default account
     last, owner decision 2026-10-07), then le retard sur le rythme (`lag`, le
     plus petit rapport d'abord), puis l'échéance de la capacité inutilisée (la
-    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré."""
+    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré.
+
+    `paced=False` (garde de budget désactivée) : un compte au seuil de son
+    rythme reste utilisable, jamais un compte écarté par une règle absolue
+    (`Evaluation.hard`)."""
     def key(pair):
         index, profile = pair
         result = evaluations[profile.name]
@@ -795,7 +815,8 @@ def rank(items: list[Profile], evaluations: dict, now: float) -> list[Profile]:
         found = expiry(gauges, now)
         return (priority(profile), round(lag(gauges, now, result.limits)[0], 6),
                 found[0] if found is not None else float("inf"), index)
-    usable = [(i, p) for i, p in enumerate(items) if evaluations[p.name].ok]
+    usable = [(i, p) for i, p in enumerate(items)
+              if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
     return [p for _i, p in sorted(usable, key=key)]
 
 
@@ -818,7 +839,8 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
 
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
-           simulate: bool = False, session_account: str | None = None) -> Choice:
+           simulate: bool = False, session_account: str | None = None,
+           paced: bool = True) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -832,6 +854,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     `simulate=True` (L39, `ameesh resume`) : le compte que choisirait le
     prochain tour, SANS AUCUNE écriture (ni bascule, ni historique des
     jauges) ; `switched` dit la bascule qui aurait lieu.
+
+    `paced=False` (garde de budget désactivée, L30) : quand aucun compte
+    n'est sous son seuil, le rythme est levé — mais jamais les règles
+    absolues de L226b (overage, plafonds fixes : décision du propriétaire du
+    2026-10-07). Aucun compte hors de ces règles : pause, comme avec la garde.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -868,7 +895,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # bloque l'agent, elle ne bascule pas contre un geste humain)
     def forced(profile: Profile) -> Choice:
         current = ev(profile)
-        if current.ok:
+        if current.ok or (not paced and current.unpaced_ok):
             return Choice(profile, profile, forced=True,
                           why="forcé (ameesh accounts use)")
         return Choice(None, profile, reason="compte %s forcé (ameesh accounts use) : %s"
@@ -887,8 +914,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         ev(profile)
     # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
     ranked = rank(candidates, cache, now)
+    if not ranked and not paced:
+        # L226b: past its pace a healthy account stays usable, never past an
+        # absolute rule
+        ranked = rank(candidates, cache, now, paced=False)
     if not ranked:
-        blocked = [p for p in items if p.name in sick and cache[p.name].ok]
+        blocked = [p for p in items if p.name in sick
+                   and (cache[p.name].ok if paced else cache[p.name].unpaced_ok)]
         if blocked:
             # L226b : des comptes sous leur seuil, mais aucun sain — jamais de
             # repli payé en plus : le compte en panne est rendu, la garde de

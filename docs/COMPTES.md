@@ -218,6 +218,14 @@ spent window with no reset date keeps it out). The caps apply to session
 continuity too: a session on the primary leaves it once the primary is above
 50 % of a window. A manual force posted while a worker switches accounts is
 evaluated the same way: a forced account past its caps is not launched.
+With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
+pauses, but these rules still hold: an account in overage or past `cap` /
+`overage_cap` is never chosen, and with no other account the agent is
+paused (`budget : …`) rather than launched on it.
+
+A session opened before L30 (no account recorded) ran on the harness's
+default folder: its health, gauges and caps are read under the declared
+account of that folder (the primary), not under `(défaut)`.
 
 The summary of a rotation (§ 3) runs on the **old** account only if that
 account could still be chosen apart from its pace: not `failing` (§ 5), under

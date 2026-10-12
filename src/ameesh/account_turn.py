@@ -52,8 +52,9 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
 
     Rend '' quand un compte est retenu (posé dans `worker._account`), la raison
     de pause sinon. `pause=False` (garde de budget désactivée) : on bascule
-    quand même, mais on ne s'arrête jamais — tous au seuil, on reste sur le
-    compte actif.
+    quand même, et le rythme ne met jamais en pause — mais L226b : un compte
+    en overage ou au-dessus d'un plafond fixe n'est jamais retenu ; s'il n'en
+    reste pas d'autre, la raison est rendue et le tour ne part pas.
     """
     harness = _harness(worker)
     try:
@@ -67,7 +68,7 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
                                  tools={worker.name: harness})
     try:
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
-                                 agent=worker.name,
+                                 agent=worker.name, paced=pause,
                                  session_account=session_account(worker, items))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
@@ -81,10 +82,10 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     if choice.switched:
         journal(worker, harness, choice.switched)
     if choice.profile is None:
-        if pause:
-            return choice.reason
-        worker._account = choice.active
-        return None
+        # garde de budget désactivée (`pause=False`) : `accounts.choose` a déjà
+        # levé le rythme ; il ne reste que des comptes en overage ou au-dessus
+        # d'un plafond fixe (L226b) — pas de tour, quels que soient les réglages
+        return choice.reason
     log_choice(worker, harness, choice)
     worker._account = choice.profile
     return ""
@@ -105,11 +106,20 @@ def session_account(worker, items) -> str | None:
     name = _session_account(worker)
     if name:
         return name
-    default = accounts.Profile(harness=items[0].harness, name="(défaut)")
+    legacy = legacy_profile(items[0].harness, items)
+    return legacy.name if legacy in items else None
+
+
+def legacy_profile(harness: str, items):
+    """Le compte d'une session d'avant L30 (aucun compte noté) : elle a été
+    ouverte avec le dossier par défaut du harnais. L226b : le compte déclaré
+    qui a ce dossier, pour que sa santé, ses jauges et ses plafonds soient lus
+    sous son nom ; sinon le profil synthétique « (défaut) »."""
+    default = accounts.Profile(harness=harness, name="(défaut)")
     for profile in items:
         if profile.home() == default.home():
-            return profile.name
-    return None
+            return profile
+    return default
 
 
 def log_choice(worker, harness: str, choice) -> None:
@@ -280,8 +290,9 @@ def continuity(worker) -> None:
     if previous == new.name:
         return
     if previous is None:
-        # session d'avant L30 : ouverte avec le dossier par défaut du harnais
-        old = accounts.Profile(harness=harness, name="(défaut)")
+        # session d'avant L30 : ouverte avec le dossier par défaut du harnais,
+        # résolu en son compte déclaré (L226b : santé et jauges sous son nom)
+        old = legacy_profile(harness, items)
         if old.home() == new.home():
             return
     else:
