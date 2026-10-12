@@ -531,6 +531,25 @@ class ReviewR5RacesTest(unittest.TestCase):
             v = sentinel.probe_claude(profile, NOW, run=run)
             self.assertEqual((v.state, v.fingerprint), ("failing", sentinel._digest("B")))
 
+    def test_r2_claude_expiry_and_fingerprint_from_one_read(self):
+        # #313 r2: A (refresh token expired) is replaced by a valid B after the
+        # expiry is read — B must never be recorded failing as "expired"
+        home = _claude_dir(self.tmp, "e", refreshToken="A",
+                           refreshTokenExpiresAt=(NOW - 60) * 1000)
+        profile = accounts.Profile("claude", "e", path=home)
+        later = mock.Mock(return_value=sentinel._digest("B"))   # every later read sees B
+        ok = lambda argv, env=None, whole=False: (0, json.dumps({"loggedIn": True}))
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"), \
+                mock.patch.object(sentinel, "fingerprint", later):
+            v = sentinel.probe_claude(profile, NOW, run=ok)
+        self.assertEqual((v.state, v.reason, v.fingerprint),
+                         ("unknown", sentinel.REPLACED, None))
+        # unchanged: expired, recorded against A, read with its expiry
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            v = sentinel.probe_claude(profile, NOW, run=ok)
+        self.assertEqual((v.state, v.fingerprint), ("failing", sentinel._digest("A")))
+        self.assertEqual(sentinel.fingerprint("claude", profile), sentinel._digest("A"))
+
     def test_p2_1_cli_and_gcloud_store_replaced_during_the_probe(self):
         store = os.path.join(self.tmp, "hosts.yml")
         self._write(store, "A")

@@ -179,17 +179,8 @@ def file_fingerprint(path: str | None) -> str | None:
         return None
 
 
-def _json_secret(path: str, *keys) -> str | None:
-    """The string at `keys` in a JSON file (None if absent or unreadable)."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            node = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return _secret_at(node, *keys)
-
-
 def _secret_at(node, *keys) -> str | None:
+    """The string at `keys` in a parsed JSON file (None if absent)."""
     for key in keys:
         node = node.get(key) if isinstance(node, dict) else None
     return node if isinstance(node, str) and node else None
@@ -216,8 +207,11 @@ def fingerprint(harness: str, profile=None, environ=None) -> str | None:
         return _digest(str(environ.get(name) or "").strip()) if name else None
     home = profile.home(environ)
     if harness == "claude":
-        return _digest(_json_secret(os.path.join(home, ".credentials.json"),
-                                    "claudeAiOauth", "refreshToken"))
+        try:
+            with open(os.path.join(home, ".credentials.json"), encoding="utf-8") as fh:
+                return _claude_fingerprint(json.load(fh))
+        except (OSError, ValueError):
+            return None
     if harness == "codex":
         try:
             with open(os.path.join(home, "auth.json"), encoding="utf-8") as fh:
@@ -225,6 +219,10 @@ def fingerprint(harness: str, profile=None, environ=None) -> str | None:
         except (OSError, ValueError):
             return None
     return None
+
+
+def _claude_fingerprint(node) -> str | None:
+    return _digest(_secret_at(node, "claudeAiOauth", "refreshToken"))
 
 
 def _codex_fingerprint(auth) -> str | None:
@@ -293,20 +291,21 @@ def probe_claude(profile, now: float, environ=None, run=None,
     fix = "CLAUDE_CONFIG_DIR=%s claude auth login" % shlex.quote(home)
     if not os.path.exists(path) and not profile.name and not profile.path:
         return None                   # no Claude credential here: not used on this host
-    expires = None
+    # #210 r5: the credential is read before the probe; a store replaced
+    # while `claude auth status` runs proves nothing about either credential.
+    # #313 r2: its expiry and its fingerprint come from the same read
+    expires = held = None
     try:
         with open(path, encoding="utf-8") as fh:
-            refresh_ms = ((json.load(fh) or {}).get("claudeAiOauth") or {}).get(
-                "refreshTokenExpiresAt")
+            node = json.load(fh)
+        held = _claude_fingerprint(node)
+        refresh_ms = ((node or {}).get("claudeAiOauth") or {}).get("refreshTokenExpiresAt")
         if isinstance(refresh_ms, (int, float)):
             expires = float(refresh_ms) / 1000
     except (OSError, ValueError, AttributeError):
         pass
     if not shutil.which("claude", path=environ.get("PATH")):
         return Verdict("claude", name, "unknown", "claude binary not found", expires)
-    # #210 r5: the credential is read before the probe; a store replaced
-    # while `claude auth status` runs proves nothing about either credential
-    held = fingerprint("claude", profile, environ)
     code, out = run(["claude", "auth", "status"],
                     env=_probe_env(environ, declared, profile,
                                    accounts_mod.config_env_of("claude") or "CLAUDE_CONFIG_DIR",
