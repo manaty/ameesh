@@ -218,6 +218,12 @@ class Agents(Domain):
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
 
     @abc.abstractmethod
+    def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
+        """Une écriture groupée, à l'heure de la base, pour les personas execute
+        placées sur host, limitées par names si fourni. Aucun test de bail ou
+        d'éligibilité. Ne modifie ni placement, ni statut, ni last_seen."""
+
+    @abc.abstractmethod
     def mark_event_wake(self, name: str) -> None:
         """Note l'instant du dernier réveil d'événements."""
 

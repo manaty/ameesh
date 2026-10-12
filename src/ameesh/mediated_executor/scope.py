@@ -167,6 +167,16 @@ class HostScopeRules(ScopeRules):
             raise Immediate([])
         kw["names"] = wanted
 
+    def _apply_agents_runner_seen(self, principal, kw, fence):
+        if not str(kw.get("owner") or "").startswith("exec:%s:" % principal.executor_id):
+            raise ScopeError("forbidden_scope", "owner non préfixé par l'exécuteur authentifié")
+        admitted = self.admitted_agents(principal)
+        names = kw.get("names")
+        wanted = sorted(admitted if names is None else set(names) & admitted)
+        if not wanted:
+            raise Immediate(None)
+        kw["names"] = wanted
+
     def _apply_agents_cwd_used(self, principal, kw, fence):
         # réponse limitée aux agents de l'hôte : le pilote regarde tout le
         # registre, la règle restreint la même question à l'hôte

@@ -122,6 +122,11 @@ def overview(db: Db) -> list[dict]:
     return storage.of(db).agents.overview()
 
 
+def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> None:
+    """Preuve de vie du runner, indépendante du bail (#508)."""
+    storage.of(db).agents.runner_seen(host, owner, names)
+
+
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 

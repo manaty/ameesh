@@ -4507,6 +4507,7 @@ class Runner:
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
+        self._runner_seen_next = 0.0
         self.event_coalesce = max(0.0, cfg.event_coalesce)
         #: L125 : fenêtre de regroupement du courrier, défaut de l'hôte
         self.mail_batch = max(0.0, cfg.mail_batch)
@@ -4899,7 +4900,21 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    def report_liveness(self) -> None:
+        """#508 : une passe vivante, même sans bail ni admission ; au plus
+        une requête par intervalle, indépendamment des réveils de courrier."""
+        if self.stop.is_set() or self.dry_run:
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_runner_seen_next", 0.0):
+            return
+        # Borne aussi les échecs : une panne ne multiplie pas les écritures.
+        self._runner_seen_next = now + max(
+            60.0, self.poll, self.cfg.runner_liveness_interval)
+        registry.runner_seen(self.db, self.host, self.runner_id, self.agents_filter)
+
     def sweep(self) -> None:
+        self.report_liveness()
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))

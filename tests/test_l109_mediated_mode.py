@@ -58,6 +58,7 @@ class MedieBase(unittest.TestCase):
             db_retry_max=0.2, resource_interval=0.0, worktree_roots=(self.tmp,))
         self.transport = GoldenTransport()
         self.responder = self.transport.responder
+        self.responder.script["agents.runner_seen"] = None  # owner choisi par le runner
         self.db = make_db(self.transport, cfg=self.cfg)
         relay_health = mock.patch("ameesh.relay.credential_ready", return_value=True)
         self.relay_health = relay_health.start()
@@ -132,6 +133,7 @@ class GardesTest(MedieBase):
         runner.host_gate.gate = mock.Mock(state=lambda: gate.GateState("draining", 3))
         self.responder.script["leases.reap"] = []
         runner.sweep()
+        self.assertIn("agents.runner_seen", self.transport.ops())
         self.assertNotIn("agents.claimable", self.transport.ops())
         self.assertNotIn("leases.claim", self.transport.ops())
 

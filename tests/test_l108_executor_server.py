@@ -187,6 +187,25 @@ class ServeurExecTest(PgTestCase):
                            C.Fence(*fence) if fence else None).to_json()
         return self.request("POST", route, body, token=token, key=key)
 
+    def test_runner_seen_without_lease_or_availability_is_scoped(self):
+        self.availability("stopped", 2)
+        self.db.execute("UPDATE agent_registry SET lease_owner = NULL, lease_expires_at = NULL")
+        result = self.op("agents.runner_seen", ["wrong-host", OWNER, ["inge-front", "tresorier"]])
+        self.assertEqual(result.status, 200, result.body)
+        row = self.row("inge-front")
+        self.assertIsNotNone(row["runner_seen_at"])
+        self.assertEqual(row["runner_seen_host"], HOST)
+        self.assertEqual(row["runner_seen_owner"], OWNER)
+        self.assertIsNone(self.row("tresorier")["runner_seen_at"])
+        self.assertIsNone(row["lease_owner"])
+
+    def test_runner_seen_refuses_foreign_owner_and_session(self):
+        result = self.op("agents.runner_seen", [HOST, "host:123", None])
+        self.assertEqual(result.status, 403, result.body)
+        result = self.op("agents.runner_seen", [HOST, OWNER, None], token=SESSION)
+        self.assertEqual(result.status, 401, result.body)
+        self.assertIsNone(self.row("inge-front")["runner_seen_at"])
+
     def golden(self, case, **overrides):
         req = case["request"]
         sub = req["path"][len(C.PREFIX):]

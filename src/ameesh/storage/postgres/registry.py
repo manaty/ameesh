@@ -34,7 +34,8 @@ LINEAGE_MAX = 32
 AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
-    lease_owner, lease_epoch,
+    lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
+    extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
@@ -269,6 +270,12 @@ class Agents(interface.Agents):
                    responsible, team, provider, credential_mode, capabilities, canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
+                   (SELECT extract(epoch from r.runner_seen_at)::float8
+                      FROM agent_registry r WHERE r.name = o.name) AS runner_seen_ts,
+                   (SELECT r.runner_seen_host FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_host,
+                   (SELECT r.runner_seen_owner FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_owner,
                    __GOVERNED__ AS canon_governed,
                    (SELECT s.status FROM canon_state s WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_status,
@@ -305,6 +312,18 @@ class Agents(interface.Agents):
             sql += " AND name IN (%s)" % name_list(names)
         sql += " ORDER BY last_seen"
         return self.db.query(sql, tuple(params))
+
+    def runner_seen(self, host, owner, names) -> None:
+        sql = """UPDATE agent_registry
+                    SET runner_seen_at = clock_timestamp(),
+                        runner_seen_host = %s, runner_seen_owner = %s
+                  WHERE host = %s AND mode = 'execute' AND status <> 'stopped'"""
+        params = [host, owner, host]
+        if names is not None:
+            if not names:
+                return
+            sql += " AND name IN (%s)" % name_list(names)
+        self.db.execute(sql, tuple(params))
 
     def mark_event_wake(self, name) -> None:
         self.db.execute(
