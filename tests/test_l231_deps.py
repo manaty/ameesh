@@ -17,6 +17,9 @@ from ameesh import deps, menage
 
 from . import support  # noqa: F401  (isolated environment, L142)
 
+# the real ones, before _Base patches them
+node_version, node_bin = deps.node_version, deps.node_bin
+
 LOCK = {"name": "app", "lockfileVersion": 3,
         "packages": {"": {"name": "app", "dependencies": {"left-pad": "^1.0.0"}},
                      "node_modules/left-pad": {"version": "1.3.0"}}}
@@ -79,6 +82,7 @@ class _Base(unittest.TestCase):
         self.cache = os.path.join(self.base, "cache")
         os.makedirs(self.cache)
         self.patches = [mock.patch.object(deps, "node_version", return_value="v26"),
+                        mock.patch.object(deps, "node_bin", return_value=""),
                         mock.patch.object(deps, "_say")]
         for patch in self.patches:
             patch.start()
@@ -598,7 +602,8 @@ class ReviewR2Tests(_Base):
                "npm_config_omit": "dev", "AMEESH_CACHE_DIR": "/a"}
         self.assertEqual(deps.fill_env(env), {"PATH": "/bin", "HOME": "/h",
                                               "LANG": "C.UTF-8", "LC_ALL": "C",
-                                              "TMPDIR": "/t", "npm_config_cache": "/c"})
+                                              "TMPDIR": "/t", "npm_config_cache": "/c",
+                                              "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"})
 
     def test_2_fill_works_in_a_temporary_directory_renamed_into_place(self):
         pkg = _package(os.path.join(self.base, "w1"))
@@ -713,6 +718,51 @@ class ReviewR2Tests(_Base):
                               (["-C", "app", "--foo", "bar", "update"], "update"),
                               (["--fetch-retries", "2"], None)):
             self.assertEqual(deps._npm_words(args)[0], command, args)
+
+
+class NexlinkVerificationTests(_Base):
+    """#249, the real check on nexlink: one test per fix."""
+
+    def test_1_fill_forces_sharp_to_its_prebuilt_libvips(self):
+        env = {"PATH": "/bin", "SHARP_IGNORE_GLOBAL_LIBVIPS": ""}
+        self.assertEqual(deps.fill_env(env)["SHARP_IGNORE_GLOBAL_LIBVIPS"], "1")
+        self.assertEqual(deps.fill_env({})["SHARP_IGNORE_GLOBAL_LIBVIPS"], "1")
+
+    def test_2_key_and_fill_use_the_node_the_package_pins(self):
+        # a version manager stand-in: `node` answers by the directory it runs in
+        fakebin = os.path.join(self.base, "fakebin")
+        os.makedirs(fakebin)
+        node = os.path.join(fakebin, "node")
+        with open(node, "w") as fh:
+            fh.write('#!/bin/sh\nif [ -f .pin ]; then v=v22; d=%s/node22/bin; '
+                     'else v=v26; d=%s/node26/bin; fi\n'
+                     'case "$1" in --version) echo $v;; -p) echo $d/node;; esac\n'
+                     % (self.base, self.base))
+        os.chmod(node, 0o755)
+        pinned = _package(os.path.join(self.base, "main"))
+        open(os.path.join(pinned, ".pin"), "w").close()
+        loose = _package(os.path.join(self.base, "wt"))
+        for fn in (node_version, deps.node_bin, deps.npm_version):
+            fn.cache_clear()
+        self.addCleanup(lambda: [fn.cache_clear() for fn in
+                                 (node_version, deps.node_bin, deps.npm_version)])
+        seen = []
+
+        def installer(directory, env=None, *, lock_fd=None):
+            seen.append(env["PATH"].split(os.pathsep)[0])
+            os.makedirs(os.path.join(directory, deps.NODE_MODULES))
+
+        with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}), \
+                mock.patch.object(deps, "node_version", node_version), \
+                mock.patch.object(deps, "node_bin", node_bin), \
+                mock.patch.object(deps, "npm_version", return_value="11"):
+            self.assertEqual((deps.node_version(pinned), deps.node_version(loose)),
+                             ("v22", "v26"))
+            self.assertNotEqual(deps.cache_key(pinned), deps.cache_key(loose))
+            root = deps.nm_root(self.cache)
+            marker = deps.fill(pinned, root, deps.cache_key(pinned), installer=installer)
+        self.assertEqual(seen, [os.path.join(self.base, "node22", "bin")])
+        self.assertEqual(marker["node"], "v22")
 
 
 class _Cfg:

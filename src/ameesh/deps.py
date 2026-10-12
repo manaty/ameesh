@@ -90,6 +90,11 @@ FILL_OPTIONS = ("--prefer-offline", "--no-audit", "--no-fund")
 #: npm setting than its download cache, nothing a postinstall could read
 FILL_ENV = ("PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TMP", "TEMP",
             "npm_config_cache", "NPM_CONFIG_CACHE")
+#: set in every fill, whatever the environment says: sharp uses its prebuilt
+#: libvips even where the host has one (pc-smichea: libvips 8.18.6), else it
+#: builds from source and the fill fails (#249); not in the key: without a
+#: global libvips it changes nothing, with one a fill never succeeded
+FILL_FIXED_ENV = {"SHARP_IGNORE_GLOBAL_LIBVIPS": "1"}
 #: an abandoned temporary fill (`<key>.tmp-<pid>-<random>`) is deleted after
 #: this long, if no process uses it and its key's lock is free
 TMP_SEP = ".tmp-"
@@ -158,27 +163,39 @@ def nm_root(cache_root: str) -> str:
     return os.path.join(cache_root, NM_DIR)
 
 
-def _version(command: list[str]) -> str:
+def _version(command: list[str], cwd: str | None = None) -> str:
     try:
-        return subprocess.run(command, capture_output=True, text=True,
+        return subprocess.run(command, capture_output=True, text=True, cwd=cwd,
                               timeout=20).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 
 
-@functools.lru_cache(maxsize=1)
-def node_version() -> str:
-    """Version of the `node` on PATH (`v26.8.1`), "" without node. Native
-    modules are built for it."""
-    return _version(["node", "--version"])
+@functools.lru_cache(maxsize=64)
+def node_version(pkg_dir: str | None = None) -> str:
+    """Version of the `node` the package runs with (`v26.8.1`), "" without
+    node: asked from the package's directory, where a version manager (mise,
+    asdf) picks it. Native modules are built for it."""
+    return _version(["node", "--version"], pkg_dir)
 
 
-@functools.lru_cache(maxsize=1)
-def npm_version() -> str:
-    """Version of the real npm (`11.19.0`), "" without npm: it decides the
-    layout of the tree."""
+@functools.lru_cache(maxsize=64)
+def node_bin(pkg_dir: str) -> str:
+    """Directory of the `node` binary the package runs with, "" if unknown.
+    The fill puts it first on PATH: run from the cache, a version manager
+    would pick the machine default, not the package's pin (#249: nexlink's
+    main checkout pins node 22 in an untracked mise.local.toml, the machine
+    default is 26)."""
+    path = _version(["node", "-p", "process.execPath"], pkg_dir)
+    return os.path.dirname(path) if os.path.isabs(path) else ""
+
+
+@functools.lru_cache(maxsize=64)
+def npm_version(pkg_dir: str | None = None) -> str:
+    """Version of the real npm (`11.19.0`) the package runs with, "" without
+    npm: it decides the layout of the tree."""
     real = real_npm()
-    return _version([real, "--version"]) if real else ""
+    return _version([real, "--version"], pkg_dir) if real else ""
 
 
 def _lifecycle(pkg_dir: str) -> dict:
@@ -264,8 +281,8 @@ def cache_key(pkg_dir: str, *, node: str | None = None, npm: str | None = None,
         digest.update(label.encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
 
     feed("version", KEY_VERSION.encode())
-    feed("node", (node_version() if node is None else node).encode())
-    feed("npm", (npm_version() if npm is None else npm).encode())
+    feed("node", (node_version(pkg_dir) if node is None else node).encode())
+    feed("npm", (npm_version(pkg_dir) if npm is None else npm).encode())
     feed("platform", ("%s/%s" % (platform.SYSTEM, platform.machine())).encode())
     feed("label", (package_label(pkg_dir) if label is None else label).encode())
     feed("mode", " ".join(INSTALL_ARGS).encode())
@@ -449,11 +466,13 @@ def real_npm(env: dict | None = None) -> str | None:
 def fill_env(env: dict | None = None) -> dict:
     """The environment of a fill: a WHITELIST only (FILL_ENV, `LC_*`), so
     that nothing outside the key (NODE_ENV, `npm_config_*`, a variable a
-    postinstall reads) can change the tree; INSTALL_ARGS say the mode."""
+    postinstall reads) can change the tree; INSTALL_ARGS say the mode,
+    FILL_FIXED_ENV the variables every fill gets."""
     out = {}
     for name, value in (os.environ if env is None else env).items():
         if name in FILL_ENV or name.startswith("LC_"):
             out[name] = value
+    out.update(FILL_FIXED_ENV)
     return out
 
 
@@ -510,6 +529,10 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
             dest = os.path.join(stage, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy2(os.path.join(pkg_dir, rel), dest)
+        bindir = node_bin(pkg_dir)
+        if bindir:                          # the package's node, not the cache's
+            env = dict(os.environ if env is None else env)
+            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         started = time.time()
         try:
             installer(stage, env, lock_fd=lock.fileno())
@@ -527,8 +550,8 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
                     os.rmdir(current)
             files, size = _seal(modules)
             marker = {"schema": SCHEMA, "key": key, "package": name, "label": name,
-                      "source": os.path.abspath(pkg_dir), "node": node_version(),
-                      "npm": npm_version(), "mode": " ".join(INSTALL_ARGS),
+                      "source": os.path.abspath(pkg_dir), "node": node_version(pkg_dir),
+                      "npm": npm_version(pkg_dir), "mode": " ".join(INSTALL_ARGS),
                       "created": time.time(),
                       "install_s": round(time.time() - started, 1),
                       "files": files, "bytes": size}
