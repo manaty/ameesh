@@ -33,19 +33,24 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
 * **The guest's volume: the owner's decision** (it costs money and changes
   the infrastructure). `/srv/ameesh-guest` is not a mount point today: one
   local 150 GB disk (`l_ssd`), 109 GB free; the VM is a GP1-S in `fr-par-1`.
-  - **Recommended** (study §4.1): a 40 GB Block Storage volume, 5K IOPS,
-    mounted on `/srv/ameesh-guest`. A guest that fills it never reaches the
-    system nor the host's own agents. Its size **is** the offer's `disk_max
-    40GiB`: nothing else enforces it (no filesystem quota; the guard's reclaim
-    watches `/`). A bigger volume needs a bigger `disk_max` in the offer and
-    the canon. Cost: €0.000130/GB/hour excluding VAT
-    (scaleway.com/en/pricing/storage, read on 2026-10-12), so about
-    **€3.80 per month** for 40 GB (730 h), snapshots not included; €9.50 for
-    100 GB. From a workstation with the `scw` CLI configured for the ameesh
-    project:
+  - **Recommended** (study §4.1): a Block Storage volume, 5K IOPS, mounted
+    on `/srv/ameesh-guest`. A guest that fills it never reaches the system
+    nor the host's own agents. Only the volume's size holds the offer's
+    `disk_max` (no filesystem quota; the guard's reclaim watches `/`), so
+    the owner picks one of two sizes. Cost: €0.000130/GB/hour excluding VAT
+    (scaleway.com/en/pricing/storage, read on 2026-10-12), 730 h a month,
+    snapshots not included:
+
+    | Size | Cost | `disk_max` |
+    |---|---|---|
+    | 40 GB | about **€3.80 per month** | `40GiB`, the offer as validated: held by the volume |
+    | 100 GB | about **€9.50 per month** | raised to `100GiB`, in the offer (`--lend`) and the canon (manaty/home#24), else the script warns that it is not held |
+
+    From a workstation with the `scw` CLI configured for the ameesh project,
+    `<size>` being `40GB` or `100GB`:
 
     ```sh
-    scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB zone=fr-par-1
+    scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=<size> zone=fr-par-1
     scw block volume wait <volume-id> zone=fr-par-1          # until "available"
     scw instance server list name=ameesh-agents-1 zone=fr-par-1
     scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
@@ -62,7 +67,7 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
     echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
       | sudo tee -a /etc/fstab
     sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
-    findmnt /srv/ameesh-guest                                # the volume, 40 GB
+    findmnt /srv/ameesh-guest                                # the volume, of the chosen size
     ```
 
     `nofail`: the host boots even without the volume. The guest's runners
