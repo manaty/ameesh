@@ -28,6 +28,7 @@ Le SQL est dans le stockage (`storage.of(db).work`, spec §10).
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from typing import Sequence
@@ -131,6 +132,12 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
 
     text = (explicit or "").strip()
     binding = identity.resolve_binding(cfg, db)
+    # A rejected runner/session identity must never fall back to the human
+    # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("correction refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
     refus = ("correction refusée : %s n'est ni un humain, ni un orchestrateur, ni un agent "
              "de conception (rôle orchestrateur ou conception de sa fiche Agent au canon, "
              "AMEESH_ALERT_ORCHESTRATORS) — demandez-la à l'orchestrateur ou au responsable")
