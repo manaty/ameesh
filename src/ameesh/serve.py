@@ -29,6 +29,18 @@ only, never the query string).
 
 `GET /.well-known/ameesh` (discovery) and `GET /api/v1/openapi.json` need no
 token: they say nothing about the mesh's state.
+
+`GET /api/v1/events` (L85) streams the event log (`events`, migration 0396)
+as Server-Sent Events, read through `fetch` (the client carries the
+`Authorization` header). One `LISTEN ameesh_events` connection per process
+(`Hub`) wakes the streams; each stream rereads the log after its own place,
+keeps what its human may see (`Context.sees`), and sends `id: <position>`,
+`event: <type>`, `data: <json>`. `Last-Event-ID` resumes after a cut (replay
+from the table, at least once: `data.id` tells a repeated event apart);
+`event: reset` says that events were lost (retention, or a rebuilt base):
+the client reloads its views. A comment every 20 s keeps the connection
+alive; a stream ends after an hour (the client resumes); at most
+`MAX_STREAMS` streams at once, the others are 503 with `Retry-After`.
 """
 from __future__ import annotations
 
@@ -41,10 +53,12 @@ import logging
 import os
 import re
 import sys
+import threading
+import time
 import urllib.parse
 from typing import Callable
 
-from . import __version__, httpkit
+from . import __version__, events, httpkit, storage
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -68,6 +82,17 @@ _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
 CSP = "default-src 'none'; frame-ancestors 'none'"
+#: event stream (L85): streams at once (below MAX_CONNECTIONS: the other
+#: routes stay reachable), heartbeat, lifetime, events read per query, the
+#: client's reconnection delay, the poll without LISTEN
+EVENTS_PATH = API + "/events"
+MAX_STREAMS = 8
+HEARTBEAT_S = 20.0
+STREAM_MAX_S = 3600.0
+EVENTS_BATCH = 200
+RETRY_MS = 3000
+POLL_S = 5.0
+_EVENT_ID_RE = re.compile(r"^[0-9]{1,18}$")
 
 log = logging.getLogger("ameesh.serve")
 
@@ -89,6 +114,11 @@ class Context:
     human: str
     organisation: str | None = None
 
+    def sees(self, event: dict) -> bool:
+        """Whether this human may see `event` (local mode: the owner sees
+        everything; L86 filters by project and role)."""
+        return True
+
 
 # --------------------------------------------------------------------------
 # routes
@@ -103,6 +133,7 @@ class Route:
     query: tuple = ()               # (name, OpenAPI schema, description)
     db: bool = True                 # reads the database
     auth: bool = True
+    stream: bool = False            # Server-Sent Events (L85), `build` unused
 
     @property
     def regex(self) -> re.Pattern:
@@ -242,6 +273,17 @@ def _openapi(ctx: Context, db, params, query) -> dict:
     return openapi()
 
 
+def event_message(event: dict, position: int) -> str:
+    """One SSE message: `id` is the place to resume from (the cursor), not
+    the event's id, which is in `data`."""
+    data = {"id": int(event["id"]), "type": event["type"], "object": event["object"],
+            "project": event.get("project"), "ts": event.get("ts"),
+            "data": event.get("data") or {}}
+    return "id: %d\nevent: %s\ndata: %s\n\n" % (
+        position, event["type"], json.dumps(data, ensure_ascii=False, sort_keys=True,
+                                            default=str))
+
+
 _LIMIT = ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_LOTS},
           "lots listed at most (default 100)")
 ROUTES = (
@@ -275,6 +317,9 @@ ROUTES = (
     Route(API + "/threads/{project}/{lot}", "ameesh-thread/1",
           "Lot thread (`ameesh fil show PROJECT LOT`)", _thread, db=False,
           query=(("since", {"type": "string"}, "entries after this entry id"),)),
+    Route(EVENTS_PATH, "ameesh-event/1",
+          "Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts",
+          None, stream=True),
     Route(OPENAPI_PATH, "openapi", "This document", _openapi, db=False, auth=False),
 )
 _PARAM_RE = {"id": _LOT_RE}
@@ -365,6 +410,10 @@ SCHEMAS = {
                                mode=_STR, oidc_issuer=_STR_NULL, approve_url=_STR_NULL,
                                languages={"type": "array", "items": _STR}, openapi=_STR),
     "ameesh-error/1": _obj("ameesh-error/1", ["error", "message"], error=_STR, message=_STR),
+    # the `data` of one SSE message of /events (not a JSON response)
+    "ameesh-event/1": _obj(None, ["id", "type", "object", "project", "ts", "data"],
+                           id={"type": "integer"}, type={"enum": list(events.TYPES)},
+                           object=_STR, project=_STR_NULL, ts=_NUM, data=_OBJ),
 }
 
 
@@ -401,6 +450,20 @@ def openapi() -> dict:
                      "503": _response("database unavailable", "ameesh-error/1")}
         if "{" in route.path:
             responses["404"] = _response("not found", "ameesh-error/1")
+        if route.stream:
+            responses["200"] = {
+                "description": "text/event-stream: `id: <position>`, `event: <type>`, "
+                               "`data:` an ameesh-event/1 object; `event: reset` (events "
+                               "lost: reload), `event: error` (stream ended); a comment "
+                               "every %d s" % HEARTBEAT_S,
+                "content": {"text/event-stream": {"schema": {"type": "string"},
+                                                  "x-ameesh-data": _ref(route.schema)}}}
+            responses["503"] = _response("database unavailable, or too many streams "
+                                         "(Retry-After)", "ameesh-error/1")
+            params.append({"name": "Last-Event-ID", "in": "header", "required": False,
+                           "schema": {"type": "string", "pattern": "^[0-9]{1,18}$"},
+                           "description": "resume after this position (the last `id:` "
+                                          "received); without it, the new events only"})
         operation = {"operationId": re.sub(r"[^A-Za-z0-9]+", "_",
                                            route.path[len(API) + 1:]).strip("_"),
                      "summary": route.summary, "responses": responses}
@@ -412,7 +475,8 @@ def openapi() -> dict:
         "info": {"title": "ameesh API", "version": "1",
                  "description": "Read API of an ameesh mesh, local mode (L84). Each response "
                                 "is the serialisation of the matching `--json` output of the "
-                                "CLI; `schema` names it.",
+                                "CLI; `schema` names it. `/events` streams the event log "
+                                "(L85).",
                  "license": {"name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only"}},
         "servers": [{"url": "http://127.0.0.1:%d" % DEFAULT_PORT}],
         "security": [{"bearer": []}],
@@ -442,6 +506,98 @@ def db_reader(cfg) -> Callable:
     return read
 
 
+class Hub:
+    """The process's single `LISTEN ameesh_events` connection: each
+    notification (or, without LISTEN, each poll that sees a new event) moves
+    `generation` on and wakes the streams, which reread the log themselves.
+
+    The connection is reopened after a cut (the streams then reread, in case
+    a notification was lost); without LISTEN (driver or base refusing it),
+    the last id is polled every `poll_s` seconds."""
+
+    def __init__(self, cfg, read: Callable, *, poll_s: float = POLL_S, listen: bool = True):
+        self.cfg = cfg
+        self.read = read
+        self.poll_s = poll_s
+        self.listen = listen
+        #: whether the LISTEN connection is up (otherwise: polling)
+        self.listening = False
+        self.generation = 0
+        self._last = None
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ameesh-serve-events",
+                                        daemon=True)
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def start(self) -> "Hub":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.wake()
+        self._thread.join(5)
+
+    def wake(self) -> None:
+        with self._cond:
+            self.generation += 1
+            self._cond.notify_all()
+
+    def wait(self, generation: int, timeout: float) -> int:
+        """The generation, once it differs from `generation` (or at `timeout`)."""
+        with self._cond:
+            self._cond.wait_for(lambda: self.generation != generation or self.stopped,
+                                timeout)
+            return self.generation
+
+    def _poll(self) -> None:
+        last = self.read(lambda db: storage.of(db).events.bounds()["last"])
+        if last != self._last:
+            self._last = last
+            self.wake()
+
+    def _run(self) -> None:
+        while not self.stopped:
+            db = listener = None
+            try:
+                if self.listen:
+                    db = db_mod.connect(self.cfg)
+                    listener = db_mod.listener(db, [events.CHANNEL])
+                self.listening = listener is not None
+                self.wake()   # (re)connected: what came meanwhile is reread
+                started = time.monotonic()
+                while not self.stopped:
+                    if listener is None:
+                        self._poll()
+                        if self._stop.wait(self.poll_s):
+                            break
+                        if self.listen and time.monotonic() - started > 60:
+                            break   # LISTEN tried again every minute
+                        continue
+                    message = listener.wait(1.0)
+                    if message is None:
+                        continue
+                    if message.get("event") == "down":
+                        log.warning("event listener down: polling, then reconnecting")
+                        break
+                    self.wake()
+            except (db_mod.DbError, OSError) as exc:
+                log.warning("event listener: %s", type(exc).__name__)
+            finally:
+                self.listening = False
+                for closable in (listener, db):
+                    if closable is not None:
+                        try:
+                            closable.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+            self._stop.wait(self.poll_s)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Read-only: GET and HEAD; anything else is 405."""
 
@@ -452,6 +608,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     ctx: Context
     token: str
     read: Callable
+    hub: "Hub | None"
 
     def version_string(self) -> str:
         return self.server_version
@@ -539,11 +696,108 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for name, values in query.items():
             if len(values) > 1:
                 raise ApiError(400, "bad_query", "%s given more than once" % name)
+        if route.stream:
+            self._stream()
+            return
         if route.db:
             data = self.read(lambda db: route.build(self.ctx, db, params, query))
         else:
             data = route.build(self.ctx, None, params, query)
         self._json(200, data)
+
+    # -- event stream (L85) --------------------------------------------------
+
+    def _stream(self) -> None:
+        last = self.headers.get_all("Last-Event-ID") or []
+        if len(last) > 1 or (last and not _EVENT_ID_RE.match(last[0].strip())):
+            raise ApiError(400, "bad_header", "Last-Event-ID: a position (digits) expected")
+        resume = int(last[0].strip()) if last else None
+        if self.hub is None:
+            raise ApiError(503, "unavailable", "event stream unavailable")
+        if not self.server.streams.acquire(blocking=False):
+            self._error(503, "too_many_streams", "too many event streams",
+                        (("Retry-After", "10"),))
+            return
+        try:
+            bounds = self.read(lambda db: storage.of(db).events.bounds())
+            reset = None
+            if resume is None:
+                position = bounds["last"]
+            elif resume > bounds["last"]:
+                # a position this base never gave: rebuilt, or another mesh
+                position, reset = bounds["last"], "unknown position"
+            else:
+                position = resume
+                if bounds["first"] is not None and resume < bounds["first"] - 1:
+                    reset = "events lost (retention)"
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            for name, value in httpkit.BASE_HEADERS + (("Content-Security-Policy", CSP),
+                                                       ("X-Accel-Buffering", "no")):
+                self.send_header(name, value)
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            head = "retry: %d\n\n" % RETRY_MS
+            if reset:
+                head += "id: %d\nevent: reset\ndata: %s\n\n" % (position, json.dumps(
+                    {"reason": reset, "first": bounds["first"], "last": bounds["last"]}))
+            try:
+                self._write(head)
+                self._follow(events.Cursor(position))
+            except OSError:
+                pass   # the client left (or stopped reading: socket timeout)
+        finally:
+            self.server.streams.release()
+
+    def _write(self, text: str) -> None:
+        self.wfile.write(text.encode("utf-8"))
+        self.wfile.flush()
+
+    def _drain(self, cursor) -> bool:
+        """Sends the events after the cursor; whether anything was written."""
+        after, wrote = cursor.position, False
+        while True:
+            rows = self.read(lambda db: storage.of(db).events.after(after, EVENTS_BATCH))
+            fresh = cursor.take(rows)
+            out = "".join(event_message(row, cursor.position) for row in fresh
+                          if self.ctx.sees(row))
+            if out:
+                self._write(out)
+                wrote = True
+            if len(rows) < EVENTS_BATCH:
+                return wrote
+            after = int(rows[-1]["id"])
+
+    def _follow(self, cursor) -> None:
+        hub = self.hub
+        start = written = time.monotonic()
+        generation = hub.generation
+        pending = True
+        while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
+            if pending or cursor.stalled:
+                try:
+                    wrote = self._drain(cursor)
+                except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
+                    log.warning("event stream: database unavailable: %s", type(exc).__name__)
+                    self._write("event: error\ndata: %s\n\n" % json.dumps(
+                        {"error": "unavailable", "message": "database unavailable"}))
+                    return
+                if wrote:
+                    written = time.monotonic()
+                pending = False
+            idle = time.monotonic() - written
+            if idle >= HEARTBEAT_S:
+                self._write(": heartbeat\n\n")
+                written = time.monotonic()
+                continue
+            timeout = HEARTBEAT_S - idle
+            if cursor.stalled:
+                timeout = min(timeout, 1.0)
+            current = hub.wait(generation, timeout)
+            if current != generation:
+                generation, pending = current, True
 
     def send_error(self, code, message=None, explain=None) -> None:
         # never the request in the error page nor in the log
@@ -566,18 +820,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class ServeHTTPServer(httpkit.BoundedHTTPServer):
     log = log
+    hub: "Hub | None" = None
+
+    def server_close(self) -> None:
+        if self.hub is not None:
+            self.hub.stop()
+        super().server_close()
 
 
 def make_server(ctx: Context, *, token: str, read: Callable, port: int = DEFAULT_PORT,
                 max_connections: int = MAX_CONNECTIONS,
-                rate_per_minute: int = RATE_PER_MINUTE) -> ServeHTTPServer:
-    """The server, bound to 127.0.0.1 (port 0: a free port)."""
+                rate_per_minute: int = RATE_PER_MINUTE, hub: Hub | None = None,
+                max_streams: int = MAX_STREAMS) -> ServeHTTPServer:
+    """The server, bound to 127.0.0.1 (port 0: a free port). Without `hub`,
+    `/events` answers 503; the server stops the hub when closed."""
     if not token:
         raise ValueError("a token is required")
     handler = type("ServeHandler", (Handler,), {"ctx": ctx, "token": token,
-                                                "read": staticmethod(read)})
+                                                "read": staticmethod(read), "hub": hub})
     server = ServeHTTPServer((BIND, int(port)), handler, max_connections=max_connections)
     server.limiter = httpkit.RateLimiter(rate_per_minute)
+    server.streams = threading.BoundedSemaphore(max_streams)
+    server.hub = hub
     return server
 
 
@@ -657,12 +921,14 @@ def main(argv: list[str] | None = None) -> int:
     except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
         print("ameesh serve: database unavailable: %s" % exc, file=sys.stderr)
         return 1
+    hub = Hub(ctx.cfg, read)
     try:
-        server = make_server(ctx, token=token, read=read, port=args.port)
+        server = make_server(ctx, token=token, read=read, port=args.port, hub=hub)
     except OSError as exc:
         print("ameesh serve: port %s unavailable on %s: %s"
               % (args.port, BIND, exc.strerror or exc), file=sys.stderr)
         return 1
+    hub.start()
     print("ameesh serve: http://%s:%d%s for %s (Bearer token in %s)"
           % (BIND, server.server_address[1], API, human, path), flush=True)
     try:
@@ -674,5 +940,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["API", "BIND", "Context", "DEFAULT_PORT", "ROUTES", "SCHEMAS", "discovery",
+__all__ = ["API", "BIND", "Context", "DEFAULT_PORT", "EVENTS_PATH", "Hub", "ROUTES", "SCHEMAS", "discovery",
            "main", "make_server", "openapi", "owner"]

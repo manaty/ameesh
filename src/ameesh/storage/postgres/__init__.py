@@ -22,6 +22,7 @@ from .decisions import Decisions
 from .costs import TurnCosts
 from .conversations import Conversations
 from .credentials import Credentials
+from .events import Events
 from .grants import Grants
 from .handoffs import Handoffs
 from .hosts import Hosts, TurnResources, Visibility
@@ -57,6 +58,7 @@ class PostgresStorage(interface.Storage):
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
         self.watches = Watches(db)
+        self.events = Events(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)

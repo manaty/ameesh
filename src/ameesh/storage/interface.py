@@ -101,6 +101,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
    watches         put delete list deliver
+   events          record after bounds count_before prune
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
@@ -589,6 +590,43 @@ class Watches(Domain):
         a disable from another host waits for the end of the firing. The row
         read (with `sent` true or false), None if there is no watch; `send`
         raising rolls the transaction back."""
+
+
+# --------------------------------------------------------------------------
+# event log of the mesh (L85, migration 0396)
+# --------------------------------------------------------------------------
+
+class Events(Domain):
+    """The append-only `ameesh_events` log, source of `GET /api/v1/events`.
+
+    The rows are written by triggers on the tables they describe (same
+    transaction as the change); `record` is for what has no table (an alert
+    raised or resolved). A row: id, type, object, project, data, ts."""
+
+    @abc.abstractmethod
+    def record(self, type: str, object: str, project: str | None, data: dict) -> int:
+        """Appends one event; its id. Without `project`, the project of
+        `data["agent"]` if any."""
+
+    @abc.abstractmethod
+    def after(self, after_id: int, limit: int) -> list[dict]:
+        """The events of id greater than `after_id`, by increasing id, at
+        most `limit`."""
+
+    @abc.abstractmethod
+    def bounds(self) -> dict:
+        """`{"first": id or None, "last": id or 0}`: the oldest kept event and
+        the last one written (the sequence, not the table: 0 before any)."""
+
+    @abc.abstractmethod
+    def count_before(self, before_ts: float) -> int:
+        """The number of events older than `before_ts`."""
+
+    @abc.abstractmethod
+    def prune(self, before_ts: float, limit: int) -> int:
+        """Deletes at most `limit` events older than `before_ts` (the oldest
+        first); the number deleted. The table refuses an event younger than
+        30 days."""
 
 
 # --------------------------------------------------------------------------
@@ -2695,6 +2733,7 @@ class Storage(abc.ABC):
     credentials: Credentials
     budgets: Budgets
     watches: Watches
+    events: Events
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys

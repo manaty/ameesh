@@ -165,6 +165,8 @@ LIVE_REVIEW_IDLE_S = 600.0
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
 LIVE_REVIEW_START_SLACK_S = 300.0
+#: L85 : rétention du journal d'événements, au plus une fois par heure
+EVENTS_PRUNE_EVERY_S = 3600.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -4188,6 +4190,9 @@ class Runner:
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
+        #: L85 : dernière rétention du journal d'événements (monotone), son erreur
+        self._events_pruned_at: float | None = None
+        self._events_prune_error: str | None = None
         #: L159f : porte d'hôte — None sans porte (hôte classique : rien ne
         #: change). Celle de la configuration dès maintenant ; celle d'un hôte
         #: prêteur (fiche Host avec `policy.lend`) au premier `canon sync`,
@@ -4365,8 +4370,33 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    def prune_events_once(self, now: float | None = None) -> int | None:
+        """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
+        fois par heure et par exécuteur ; rien en dry-run. Une erreur (base,
+        réglage) est journalisée une fois, jamais fatale à la passe."""
+        from . import events as events_mod
+
+        now = time.monotonic() if now is None else now
+        if self.dry_run or (self._events_pruned_at is not None
+                            and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
+            return None
+        self._events_pruned_at = now
+        try:
+            gone = events_mod.prune(self.db)
+        except (db_mod.DbError, ValueError) as exc:
+            message = "event log retention not applied (%s)" % exc
+            if message != self._events_prune_error:
+                log_async(message)
+            self._events_prune_error = message
+            return None
+        self._events_prune_error = None
+        if gone:
+            log_async("event log: %d event(s) past retention deleted" % gone)
+        return gone
+
     def sweep(self) -> None:
         self.expire_delegations_once()
+        self.prune_events_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
         finished = []

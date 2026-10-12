@@ -378,6 +378,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('budget_events', ARRAY[
         'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
     ]),
+    -- L85 (0396): the event log, identifiers and states only, never free text
+    ('ameesh_events', ARRAY[
+        'id', 'type', 'object', 'project', 'data', 'created_at'
+    ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[
         'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'

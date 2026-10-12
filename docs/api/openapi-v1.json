@@ -220,6 +220,54 @@
         ],
         "type": "object"
       },
+      "ameesh-event-1": {
+        "properties": {
+          "data": {
+            "type": "object"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "object": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "type": "number"
+          },
+          "type": {
+            "enum": [
+              "lot.updated",
+              "turn.started",
+              "turn.ended",
+              "agent.updated",
+              "cost.recorded",
+              "thread.entry",
+              "decision.created",
+              "decision.closed",
+              "action.updated",
+              "receipt.attached",
+              "approval.recorded",
+              "alert.raised",
+              "alert.resolved"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "object",
+          "project",
+          "ts",
+          "data"
+        ],
+        "type": "object"
+      },
       "ameesh-host-1": {
         "properties": {
           "history": {
@@ -537,7 +585,7 @@
     }
   },
   "info": {
-    "description": "Read API of an ameesh mesh, local mode (L84). Each response is the serialisation of the matching `--json` output of the CLI; `schema` names it.",
+    "description": "Read API of an ameesh mesh, local mode (L84). Each response is the serialisation of the matching `--json` output of the CLI; `schema` names it. `/events` streams the event log (L85).",
     "license": {
       "identifier": "AGPL-3.0-only",
       "name": "AGPL-3.0-only"
@@ -839,6 +887,69 @@
           }
         },
         "summary": "Decisions waiting for the human (`ameesh decisions --for --json`)"
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "events",
+        "parameters": [
+          {
+            "description": "resume after this position (the last `id:` received); without it, the new events only",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "pattern": "^[0-9]{1,18}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "x-ameesh-data": {
+                  "$ref": "#/components/schemas/ameesh-event-1"
+                }
+              }
+            },
+            "description": "text/event-stream: `id: <position>`, `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended); a comment every 20 s"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable, or too many streams (Retry-After)"
+          }
+        },
+        "summary": "Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts"
       }
     },
     "/api/v1/hosts": {
