@@ -64,10 +64,15 @@ class VolumeScriptTest(unittest.TestCase):
         self.bin = os.path.join(d, "bin")
         os.mkdir(self.bin)
         self.stub("scw", SCW)
-        # the disk tools read the stub's state in the environment
-        self.stub("lsblk", '#!/bin/sh\ncase "$*" in *TYPE*) echo disk ;; '
-                           '*) printf "%s" "$STUB_LSBLK" ;; esac\n')
-        self.stub("blockdev", '#!/bin/sh\necho "$STUB_SIZE"\n')
+        # the disk tools read the stub's state in the environment;
+        # STUB_FAIL=<tool> makes that one fail, its output empty
+        fail = '[ "$STUB_FAIL" != %s ] || { echo "%s: I/O error" >&2; exit 1; }\n'
+        self.stub("lsblk", '#!/bin/sh\n' + fail % ("lsblk", "lsblk")
+                  + 'case "$*" in *TYPE*) echo disk ;; *) printf "%s" "$STUB_LSBLK" ;; esac\n')
+        self.stub("blockdev", '#!/bin/sh\n' + fail % ("blockdev", "blockdev") + 'echo "$STUB_SIZE"\n')
+        # systemctl list-units: the active guest runners, STUB_RUNNERS
+        self.stub("systemctl", '#!/bin/sh\n' + fail % ("systemctl", "systemctl")
+                  + 'printf "%s" "$STUB_RUNNERS"\n')
         # blkid -p -o export: STUB_BLKID_RC forces a failure; no type, exit 2
         # blkid -c /dev/null -o device -t LABEL=…: the disks in STUB_LABELDEVS
         self.stub("blkid", '#!/bin/sh\n'
@@ -79,8 +84,11 @@ class VolumeScriptTest(unittest.TestCase):
                            '[ -z "$STUB_LABEL" ] || echo "LABEL=$STUB_LABEL"\n'
                            'echo "TYPE=$STUB_TYPE"\n')
         self.stub("wipefs", '#!/bin/sh\nprintf "%s" "$STUB_WIPEFS"\nexit "${STUB_WIPEFS_RC:-0}"\n')
-        # findmnt --mountpoint: nothing mounted unless STUB_SRC
-        self.stub("findmnt", '#!/bin/sh\n[ -n "$STUB_SRC" ] || exit 1\n'
+        # findmnt: the table holds / and, with STUB_SRC, the mount point
+        self.stub("findmnt", '#!/bin/sh\n' + fail % ("findmnt", "findmnt")
+                             + 'case "$*" in *TARGET*) echo /; [ -z "$STUB_SRC" ] '
+                             '|| echo /srv/ameesh-guest; exit 0 ;; esac\n'
+                             '[ -n "$STUB_SRC" ] || exit 1\n'
                              'case "$*" in *FSTYPE*) echo "ext4 37.1G" ;; *SOURCE*) echo "$STUB_SRC" ;;\n'
                              '  *UUID*) echo "$STUB_MUUID" ;; *LABEL*) echo "$STUB_MLABEL" ;;\n'
                              '  *SIZE*) echo 40000000000 ;; esac\n')
@@ -114,7 +122,7 @@ class VolumeScriptTest(unittest.TestCase):
                    STUB_LSBLK="sdb\n", STUB_SIZE=str(40 * 10 ** 9), STUB_TYPE="",
                    STUB_LABEL="", STUB_UUID="", STUB_WIPEFS="", STUB_WIPEFS_RC="0",
                    STUB_BLKID_RC="", STUB_SRC="", STUB_MUUID="", STUB_MLABEL="",
-                   STUB_LABELDEVS=self.disk + "\n",
+                   STUB_LABELDEVS=self.disk + "\n", STUB_FAIL="", STUB_RUNNERS="",
                    VOLUME_TEST_DIR=self.root)
         env.update({"STUB_" + k.upper(): v for k, v in disk.items()})
         if args[0] in ("create", "detach") and project and "--project-id" not in args:
@@ -299,6 +307,67 @@ class VolumeScriptTest(unittest.TestCase):
             self.assertIn("refused", p.stderr)
             self.assertEqual(self.cmds(p), [], disk)
             self.assertNotIn("--- " + self.fstab, p.stdout)
+
+    def test_every_probe_must_succeed(self):
+        # codex #436 r2 P1: a probe that fails (its output empty) is never
+        # read as "nothing there": refused, nothing run, fstab untouched
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        self.our_line("u")
+        for mode, tool, disk in (("mount", "lsblk", {}), ("mount", "blockdev", {}),
+                                 ("mount", "findmnt", {}), ("mount", "findmnt", ours),
+                                 ("unmount", "findmnt", ours), ("unmount", "systemctl", ours),
+                                 ("check", "findmnt", {})):
+            args = (mode, "--volume-id", VOL)
+            p = self.run_script(*args, fail=tool, **disk)
+            self.assertNotEqual(p.returncode, 0, (mode, tool))
+            self.assertIn("failed", p.stderr, (mode, tool))
+            self.assertEqual(self.cmds(p), [], (mode, tool))
+            self.assertNotIn("--- " + self.fstab, p.stdout, (mode, tool))
+        # an fstab that cannot be read is not an empty one
+        os.remove(self.fstab)
+        for mode in ("mount", "unmount", "check"):
+            p = self.run_script(mode, "--volume-id", VOL, **ours)
+            self.assertNotEqual(p.returncode, 0, mode)
+            self.assertIn("unread or empty: refused", p.stderr)
+            self.assertNotIn("--- " + self.fstab, p.stdout)
+
+    def test_a_mount_point_that_cannot_be_listed_is_refused(self):
+        # codex #436 r2 P1: a failed listing of /srv/ameesh-guest is not an
+        # empty directory: no mkfs, no fstab, no mount (work there would be
+        # hidden under the volume)
+        blocker = os.path.join(self.tmp.name, "srv")
+        os.makedirs(blocker)
+        with open(os.path.join(blocker, "file"), "w") as fh:
+            fh.write("x")
+        roots = [os.path.join(blocker, "file", "ameesh-guest")]   # ENOTDIR, not ENOENT
+        if os.geteuid() != 0:                                      # EACCES (root reads it)
+            locked = os.path.join(blocker, "locked")
+            os.makedirs(locked)
+            os.chmod(locked, 0)
+            self.addCleanup(os.chmod, locked, 0o700)
+            roots.append(locked)
+        for root in roots:
+            self.root = root
+            for disk in ({}, {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}):
+                p = self.run_script("mount", "--volume-id", VOL, **disk)
+                self.assertNotEqual(p.returncode, 0, (root, disk))
+                self.assertIn("not listed: refused", p.stderr)
+                self.assertEqual(self.cmds(p), [], (root, disk))
+                self.assertNotIn("--- " + self.fstab, p.stdout)
+        # a file where the mount point goes: refused too
+        self.root = os.path.join(blocker, "file")
+        p = self.run_script("mount", "--volume-id", VOL)
+        self.assertIn("is not a directory", p.stderr)
+        self.assertEqual(self.cmds(p), [])
+
+    def test_unmount_leaves_a_mount_point_that_cannot_be_listed(self):
+        self.our_line("u")
+        self.root = os.path.join(self.fstab, "ameesh-guest")       # under a file
+        p = self.run_script("unmount", "--volume-id", VOL, type="ext4", label="ameesh-guest",
+                            uuid="u", src=self.disk, muuid="u")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not listed: refused", p.stderr)
+        self.assertNotIn("rmdir", p.stdout)
 
     def test_mount_refuses_the_wrong_disk(self):
         p = self.run_script("mount", "--volume-id", VOL, size=str(150 * 10 ** 9))

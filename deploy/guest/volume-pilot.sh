@@ -41,9 +41,12 @@
 # is written last, once every check passed. A volume mounted by hand before
 # (its line LABEL=ameesh-guest, our options) is adopted as it is, line
 # included, once that label is shown to name this volume and no other disk,
-# and the filesystem mounted is the volume's (its UUID). `unmount` and `detach --delete`
-# act only on the pilot's volume: its name, project and size checked first,
-# the mounted filesystem's source and UUID too.
+# and the filesystem mounted is the volume's (its UUID). `unmount` and
+# `detach --delete` act only on the pilot's volume: its name, project and
+# size checked first, the mounted filesystem's source and UUID too.
+# Every probe (findmnt, the mount point's listing, lsblk, blockdev, blkid,
+# wipefs, systemctl, the read of /etc/fstab) must succeed: one that fails
+# refuses, never read as "nothing there".
 # `disk_max` is not changed here: 40GiB is already install-pilot.sh's default
 # offer and the canon's (manaty/home#24); `check` compares it with the size.
 set -euo pipefail
@@ -246,8 +249,8 @@ not_ours() {
   awk -v u="UUID=$1" -v l="LABEL=$NAME" -v p="$ROOT" -v o="$OPTS" \
     '!(($1 == u || $1 == l) && $2 == p && $3 == "ext4" && $4 == o)'
 }
-# the fstab lines that mount something on $ROOT
-fstab_root() { awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p' "$FSTAB" 2>/dev/null || true; }
+# the fstab lines that mount something on $ROOT ($FSTAB_TEXT, read once)
+fstab_root() { printf '%s\n' "$FSTAB_TEXT" | awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p'; }
 # write_fstab < content: /etc/fstab replaced atomically, the first original
 # kept once in $FSTAB.ameesh-guest.orig
 write_fstab() {
@@ -261,10 +264,36 @@ write_fstab() {
   chmod --reference="$FSTAB" "$FSTAB.tmp"
   mv -f "$FSTAB.tmp" "$FSTAB"
 }
-mounted_source() { findmnt -n -o SOURCE --mountpoint "$ROOT" 2>/dev/null || true; }
-# the UUID of the filesystem mounted on $ROOT; empty when none
-mounted_uuid() { findmnt -n -o UUID --mountpoint "$ROOT" 2>/dev/null || true; }
-mounted_label() { findmnt -n -o LABEL --mountpoint "$ROOT" 2>/dev/null || true; }
+# Every probe below must succeed: a probe that fails refuses, it never
+# reads as "nothing there" (codex #436 r2 P1). Called as VAR=$(f …) || exit 1.
+# mount_of FIELD: FIELD (SOURCE, UUID, LABEL…) of the filesystem mounted on
+# $ROOT; empty when none is (the whole table read first, / always in it)
+mount_of() {
+  local all
+  all=$(findmnt -rn -o TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
+  printf '%s\n' "$all" | grep -qxF "$ROOT" || return 0
+  findmnt -n -o "$1" --mountpoint "$ROOT" || die "findmnt $ROOT failed: refused"
+}
+# dir_state DIR: absent, empty or full; not a directory, or a listing that
+# fails (an I/O error, a permission): refused
+dir_state() {
+  python3 -I - "$1" <<'EOF' || die "$1: not listed: refused"
+import os, stat, sys
+p = sys.argv[1]
+try:
+    st = os.lstat(p)
+except FileNotFoundError:
+    print("absent"); sys.exit(0)
+except OSError as exc:
+    sys.exit("volume-pilot: %s: %s" % (p, exc))
+if not stat.S_ISDIR(st.st_mode):
+    sys.exit("volume-pilot: %s is not a directory" % p)
+try:
+    print("full" if os.listdir(p) else "empty")
+except OSError as exc:
+    sys.exit("volume-pilot: %s: %s" % (p, exc))
+EOF
+}
 # probe DEV: sets fstype, label and uuid from blkid's low-level probe; all
 # empty only when blkid says it found nothing (exit 2). Any other failure
 # (I/O error, ambiguous signatures, blkid missing) stops the script.
@@ -287,6 +316,8 @@ volume_dev() { printf '%s\n' "$BYID/scsi-0SCW_sbs_volume-$VOLID"; }
 
 if [ "$MODE" != create ] && [ "$MODE" != detach ]; then
   [ "$MODE" = check ] || [ -n "$VOLID" ] || die "--volume-id ID (printed by create)"
+  # read once: a failed read never reads as an empty fstab (nor gets written)
+  FSTAB_TEXT=$(cat -- "$FSTAB") && [ -n "$FSTAB_TEXT" ] || die "$FSTAB unread or empty: refused"
 fi
 
 if [ "$MODE" = mount ]; then
@@ -295,9 +326,12 @@ if [ "$MODE" = mount ]; then
   for _ in $(seq 30); do [ -e "$link" ] && break; sleep 1; done
   [ -e "$link" ] || die "$link absent: is the volume attached (volume-pilot.sh create)?"
   dev=$(realpath -- "$link")
-  [ "$(lsblk -dno TYPE "$dev")" = disk ] || die "$dev is not a disk"
-  [ "$(lsblk -no NAME "$dev" | wc -l)" = 1 ] || die "$dev has partitions: refused"
-  size=$(blockdev --getsize64 "$dev")
+  dtype=$(lsblk -dno TYPE "$dev") || die "$dev: lsblk failed: refused"
+  [ "$dtype" = disk ] || die "$dev is not a disk"
+  parts=$(lsblk -no NAME "$dev") && [ -n "$parts" ] || die "$dev: lsblk failed: refused"
+  [ "$(printf '%s\n' "$parts" | wc -l)" = 1 ] || die "$dev has partitions: refused"
+  size=$(blockdev --getsize64 "$dev") || die "$dev: blockdev failed: refused"
+  case "$size" in ''|*[!0-9]*) die "$dev: no size from blockdev ($size): refused" ;; esac
   [ "$size" -ge $((SIZE_GB * 1000 ** 3 * 95 / 100)) ] && [ "$size" -le $((SIZE_GB * 1000 ** 3 * 105 / 100)) ] \
     || die "$dev holds $size bytes, ${SIZE_GB} GB expected: refused"
   probe "$dev"
@@ -314,13 +348,15 @@ if [ "$MODE" = mount ]; then
   fi
   # every check before anything changes: the mount point, its directory, fstab
   have=$(fstab_root)
-  src=$(mounted_source)
+  src=$(mount_of SOURCE) || exit 1
   if [ -n "$src" ]; then
     [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is already a mount point of $src"
-    [ "$format" = 1 ] || [ "$(mounted_uuid)" = "$uuid" ] \
-      || die "$ROOT: mounted UUID $(mounted_uuid), not the volume's $uuid: refused"
-  elif [ -d "$DIR" ] && [ -n "$(ls -A -- "$DIR")" ]; then
-    die "$ROOT is not empty on the root disk: the volume would hide it; move it first"
+    muuid=$(mount_of UUID) || exit 1
+    [ "$format" = 1 ] || [ "$muuid" = "$uuid" ] \
+      || die "$ROOT: mounted UUID $muuid, not the volume's $uuid: refused"
+  else
+    dstate=$(dir_state "$DIR") || exit 1
+    [ "$dstate" != full ] || die "$ROOT is not empty on the root disk: the volume would hide it; move it first"
   fi
   if [ "$format" = 1 ]; then
     [ -z "$have" ] || die "$FSTAB already mounts something on $ROOT: $have"
@@ -346,7 +382,7 @@ if [ "$MODE" = mount ]; then
     die "$FSTAB already mounts something else on $ROOT: $have"
   fi
   # fstab last, then the mount
-  [ "$have" = "$want" ] || { cat "$FSTAB"; printf '%s\n' "$want"; } | write_fstab
+  [ "$have" = "$want" ] || printf '%s\n%s\n' "$FSTAB_TEXT" "$want" | write_fstab
   if [ -n "$src" ]; then
     echo "$ROOT: already mounted"
   else
@@ -360,16 +396,18 @@ fi
 
 if [ "$MODE" = check ]; then
   ok=1
-  src=$(mounted_source)
-  muuid=
+  src=$(mount_of SOURCE) || exit 1
+  muuid= mlabel=
   if [ -z "$src" ]; then
     echo "$ROOT: NOT mounted"; ok=0
   else
-    echo "$ROOT: mounted, $src, $(findmnt -n -o FSTYPE,SIZE --mountpoint "$ROOT")"
+    fs=$(mount_of FSTYPE,SIZE) || exit 1
+    echo "$ROOT: mounted, $src, $fs"
     if [ -n "$VOLID" ] && [ "$(realpath -- "$src")" != "$(realpath -m -- "$(volume_dev)")" ]; then
       echo "$ROOT: NOT the volume $VOLID"; ok=0
     fi
-    muuid=$(mounted_uuid)
+    muuid=$(mount_of UUID) || exit 1
+    mlabel=$(mount_of LABEL) || exit 1
     [ -n "$muuid" ] || { echo "$ROOT: NO filesystem UUID"; ok=0; }
   fi
   lines=$(fstab_root)
@@ -382,10 +420,10 @@ if [ "$MODE" = check ]; then
     vdev=$(realpath -m -- "$(volume_dev)")
     if [ -z "$VOLID" ]; then
       echo "$FSTAB: LABEL=$NAME NOT checked: give --volume-id"; ok=0
-    elif [ "$(mounted_label)" = "$NAME" ] && label_is "$vdev" && uuid_is "$muuid" "$vdev"; then
+    elif [ "$mlabel" = "$NAME" ] && label_is "$vdev" && uuid_is "$muuid" "$vdev"; then
       echo "$FSTAB: LABEL=$NAME is the volume $VOLID (UUID $muuid)"
     else
-      echo "$FSTAB: LABEL=$NAME NOT the volume $VOLID's (mounted label '$(mounted_label)', UUID $muuid)"; ok=0
+      echo "$FSTAB: LABEL=$NAME NOT the volume $VOLID's (mounted label '$mlabel', UUID $muuid)"; ok=0
     fi
   elif [ -n "$muuid" ] && [ "$lines" != "$(fstab_line "$muuid")" ]; then
     # the line must mount the filesystem mounted now, with our options
@@ -395,7 +433,7 @@ if [ "$MODE" = check ]; then
     echo "$FSTAB: $lines"
   fi
   if [ -r "$GUARD" ] && [ -n "$src" ]; then
-    size=$(findmnt -bn -o SIZE --mountpoint "$ROOT")
+    size=$(findmnt -bn -o SIZE --mountpoint "$ROOT") || die "findmnt $ROOT failed"
     python3 -I - "$GUARD" "$size" <<'EOF' || ok=0
 import json, re, sys
 raw = str(json.load(open(sys.argv[1]))["disk_max"])
@@ -414,7 +452,8 @@ fi
 
 if [ "$MODE" = unmount ]; then
   need_root
-  active=$(systemctl list-units 'ameesh-guest-runner@*' --state=active --no-legend 2>/dev/null || true)
+  active=$(systemctl list-units 'ameesh-guest-runner@*' --state=active --no-legend) \
+    || die "systemctl list-units failed: the guest runners unknown, nothing touched"
   [ -z "$active" ] || die "guest runners still active (install-pilot.sh --uninstall first): $active"
   # the volume's filesystem, by its disk: what is mounted on $ROOT and the
   # fstab line must be that one, or nothing is touched
@@ -424,13 +463,14 @@ if [ "$MODE" = unmount ]; then
   probe "$dev"
   [ "$fstype" = ext4 ] && [ "$label" = "$NAME" ] && [ -n "$uuid" ] \
     || die "$dev is not the ext4 $NAME (${fstype:-no signature}, label '${label}'): nothing touched"
-  src=$(mounted_source)
+  src=$(mount_of SOURCE) || exit 1
   if [ -n "$src" ]; then
     [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is a mount point of $src, not of the volume $VOLID: nothing touched"
-    [ "$(mounted_uuid)" = "$uuid" ] || die "$ROOT: mounted UUID $(mounted_uuid), not $uuid: nothing touched"
+    muuid=$(mount_of UUID) || exit 1
+    [ "$muuid" = "$uuid" ] || die "$ROOT: mounted UUID $muuid, not $uuid: nothing touched"
   fi
   # the fstab lines on $ROOT must all be ours before anything changes
-  others=$(not_ours "$uuid" < "$FSTAB" | awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p')
+  others=$(printf '%s\n' "$FSTAB_TEXT" | not_ours "$uuid" | awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p')
   [ -z "$others" ] || die "$FSTAB mounts something else on $ROOT: $others; nothing touched"
   if fstab_root | grep -qxF "$(label_line)"; then
     label_only "$dev" \
@@ -438,9 +478,11 @@ if [ "$MODE" = unmount ]; then
   fi
   if [ -n "$src" ]; then run umount "$ROOT"; else echo "$ROOT: not mounted"; fi
   if [ -n "$(fstab_root)" ]; then
-    not_ours "$uuid" < "$FSTAB" | write_fstab
+    printf '%s\n' "$FSTAB_TEXT" | not_ours "$uuid" | write_fstab
     run systemctl daemon-reload
   fi
-  if [ -d "$DIR" ] && [ -z "$(ls -A -- "$DIR")" ]; then run rmdir "$ROOT"; fi
+  # (a dry run reads the directory as it is, still mounted)
+  dstate=$(dir_state "$DIR") || exit 1
+  [ "$dstate" != empty ] || run rmdir "$ROOT"
   echo "next, from the workstation: deploy/guest/volume-pilot.sh detach --project-id P [--delete]"
 fi
