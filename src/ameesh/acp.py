@@ -163,15 +163,19 @@ def stoppable_lines(fd: int, max_chars: int, stop: threading.Event,
     L75 (codex r2, #325): a resident harness may leave a child that keeps its
     output open after it is stopped; a blocking `readline` would then never
     return, and closing the stream under it waits for its lock. Here the
-    reader waits with `select` and checks `stop` at each `poll`: the owner
-    sets it, the reader returns, and the stream can be closed. A line longer
-    than `max_chars` bytes is yielded as it stands (the caller refuses it).
-    POSIX only (the resident processes)."""
+    reader waits with `poll` (any descriptor number, codex r3) and checks
+    `stop` at each `poll` seconds: the owner sets it, the reader returns, and
+    the stream can be closed. Lines are decoded whole (UTF-8). The callers
+    count characters: a partial line is cut only past `max_chars` characters
+    for sure (4 bytes each at most) and yielded as it stands, for the caller
+    to refuse. POSIX only (the resident processes)."""
     import select
+    poller = select.poll()
+    poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    limit = 4 * max_chars
     buffer = b""
     while not stop.is_set():
-        ready, _, _ = select.select([fd], [], [], poll)
-        if not ready:
+        if not poller.poll(poll * 1000):
             continue
         chunk = os.read(fd, 65536)
         if not chunk:
@@ -188,7 +192,7 @@ def stoppable_lines(fd: int, max_chars: int, stop: threading.Event,
             yield buffer[start:end + 1].decode("utf-8")
             start = end + 1
         buffer = buffer[start:]
-        if len(buffer) > max_chars:
+        if len(buffer) > limit:
             yield buffer.decode("utf-8", "replace")
             return
 

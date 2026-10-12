@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 
-from ameesh import adapters, harnesses, resident
+from ameesh import acp, adapters, harnesses, resident
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_RESIDENT = os.path.join(HERE, "fake_resident_harness.py")
@@ -140,6 +140,49 @@ class DescriptorBlockTest(unittest.TestCase):
         plain = document("plain", protocol="cli", stream="text")
         self.assertIn("no resident protocol",
                       resident.availability(harnesses._build(plain, "p", "t"), "9"))
+
+
+class StoppableLinesTest(unittest.TestCase):
+    """`acp.stoppable_lines`, the reader of the resident harnesses."""
+
+    def lines(self, data: bytes, max_chars: int = 4 * 1024 * 1024, *, fd_at: int = 0):
+        read, write = os.pipe()
+        if fd_at:
+            os.dup2(read, fd_at)
+            os.close(read)
+            read = fd_at
+        self.addCleanup(os.close, read)
+
+        def feed():
+            os.write(write, data)
+            os.close(write)
+        threading.Thread(target=feed, daemon=True).start()
+        return list(acp.stoppable_lines(read, max_chars, threading.Event(), 0.05))
+
+    def test_a_descriptor_past_1024(self):
+        # codex r3 (#325): select() refuses a descriptor >= FD_SETSIZE
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < 1600:
+            if hard != resource.RLIM_INFINITY and hard < 1600:
+                self.skipTest("descriptor limit %s" % hard)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1600, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        self.assertEqual(self.lines(b'{"a": 1}\n{"b": 2}\n', fd_at=1500),
+                         ['{"a": 1}\n', '{"b": 2}\n'])
+
+    def test_the_bound_counts_characters(self):
+        # codex r3 (#325): 3 000 000 « é » (6 MB) under a 4 Mi-character bound
+        line = json.dumps({"x": "é" * 3_000_000}, ensure_ascii=False) + "\n"
+        [got] = self.lines(line.encode("utf-8"))
+        self.assertEqual(got, line)
+        self.assertEqual(json.loads(got)["x"], "é" * 3_000_000)
+
+    def test_an_endless_line_is_yielded_for_refusal(self):
+        got = self.lines(b"x" * 200, max_chars=10)
+        self.assertEqual(len(got), 1)
+        self.assertGreater(len(got[0]), 10)
+        self.assertEqual(self.lines(b"no newline"), ["no newline"])
 
 
 class DriverCase(unittest.TestCase):
