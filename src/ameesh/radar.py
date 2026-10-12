@@ -58,7 +58,10 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method")
+PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
+                "lease_ref")
+#: #194 r6: where the lease of a target lives on the remote (local mode)
+LEASE_REF_DEFAULT = "refs/ameesh/land/"
 #: L160e2: who merges the head of the queue — nobody (`off`: the agent or the
 #: orchestrator), ameesh by a local merge pushed to the target, or ameesh
 #: through the PR (target merged into the lot branch, CI, PR merged by the API)
@@ -92,6 +95,10 @@ class Project:
     land: str = "off"
     gates: tuple = ()
     merge_method: str = "merge"
+    #: #194 r6: prefix of the remote lease ref (`refs/ameesh/land/` by default;
+    #: a branch prefix such as `ameesh-land/` when the remote refuses custom
+    #: namespaces) — the lease of target T is `<prefix>T`
+    lease_ref: str = LEASE_REF_DEFAULT
 
 
 @dataclass
@@ -156,10 +163,23 @@ def parse_settings(raw) -> Settings:
         if land != "off" and not gates:
             raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
                                 "its gates, run on the merged tree" % (where, land))
+        lease_ref = value.get("lease_ref") or LEASE_REF_DEFAULT
+        if not isinstance(lease_ref, str) or not lease_ref.strip().endswith("/"):
+            raise SettingsError("%s.lease_ref: a ref prefix ending with / expected "
+                                "(refs/ameesh/land/, or a branch prefix such as ameesh-land/)"
+                                % where)
+        lease_ref = lease_ref.strip()
+        if not lease_ref.startswith("refs/"):
+            lease_ref = "refs/heads/" + lease_ref
+        try:
+            plan_git.check_ref(lease_ref + "main", "lease_ref")
+        except ValueError as exc:
+            raise SettingsError("%s.lease_ref: %s" % (where, exc)) from exc
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"], land=land,
-                                 gates=tuple(g.strip() for g in gates), merge_method=method)
+                                 gates=tuple(g.strip() for g in gates), merge_method=method,
+                                 lease_ref=lease_ref)
     return Settings(projects=projects)
 
 

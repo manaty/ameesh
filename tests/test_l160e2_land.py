@@ -543,6 +543,21 @@ class EpochFenceTest(_Land):
         self.assertIn("NOT main", self.fake.queue_rows[4]["reason"])
         self.assertTrue(any("merged into develop, not main" in body for _, body, _ in self.sent))
 
+    def test_lease_ref_as_a_branch_prefix(self):
+        settings = radar.parse_settings({"projects": {"p": {
+            "repo": self.repo, "land": "local", "gates": ["true"],
+            "lease_ref": "ameesh-land/"}}})
+        self.assertEqual(settings.projects["p"].lease_ref, "refs/heads/ameesh-land/")
+        for bad in ("ameesh-land", "refs/ameesh/../x/", 3):
+            with self.assertRaises(radar.SettingsError):
+                radar.parse_settings({"projects": {"p": {
+                    "repo": self.repo, "land": "local", "gates": ["true"], "lease_ref": bad}}})
+        self.project = dataclasses.replace(self.project, lease_ref="refs/heads/ameesh-land/")
+        self.queued(4)
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertTrue(_git(self.origin, "rev-parse", "refs/heads/ameesh-land/main"))
+
     def test_lease_ref_not_moved_nothing_written(self):
         self.queued(4)
         hook = os.path.join(self.origin, "hooks", "pre-receive")
@@ -553,6 +568,7 @@ class EpochFenceTest(_Land):
         out = self.land(4)
         self.assertEqual(out["result"], "error", out)
         self.assertIn("lease ref", out["error"])
+        self.assertIn("radar.projects.p.lease_ref", out["error"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
         self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
         self.assertIsNone(self.locks.held["p:main"][0])        # lease released

@@ -348,7 +348,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     replayer.ensure()
     url = _origin(project) or project.repo
     branch = _branch_of(row["target"])
-    lease_ref = LEASE_REF + branch
+    lease_ref = (getattr(project, "lease_ref", "") or LEASE_REF) + branch
     mine = None
     if project.land == "local":
         # #194 r5: the lease on the remote, moved BEFORE any write of this
@@ -358,8 +358,11 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
                                 url, "%s:%s" % (mine, lease_ref), timeout=FETCH_TIMEOUT)
         if proc.returncode != 0:
             landing.release = True
-            raise LandError("lease ref %s not moved (%s): nothing written, retried"
-                            % (lease_ref, resolutions._err(proc)[-200:]))
+            # fail closed: no lease on the remote, no landing
+            raise LandError("lease ref %s not moved (%s): nothing written, retried; if the "
+                            "remote refuses this namespace, set radar.projects.%s.lease_ref "
+                            "to a branch prefix (e.g. ameesh-land/)"
+                            % (lease_ref, resolutions._err(proc)[-200:], project.name))
     # land: local — a lot left `landing` (lease lost or runner gone) is
     # landed again from the start: the push to the target is never forced
     if not landing.write(state="landing", note="merge queue of %s: landing (%s)"
