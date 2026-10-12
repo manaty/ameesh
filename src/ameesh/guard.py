@@ -51,6 +51,7 @@ Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
      "slice": "ameesh-guest.slice", "agent_units": "ameesh-guest-runner@*.service",
      "job_units": "ameesh-job-*.scope",
      "drain_request_path": "/run/ameesh-gate/drain.json",
+     "work_path": "/srv/ameesh-guest",
      "lend": {"cpu_max": 3, "cpu_weight": 10, "memory_max": "14GiB",
               "agent_memory_max": "4.5GiB", "disk_max": "80GiB",
               "windows": ["mon-fri 18:00-14:00 UTC", "sat-sun"],
@@ -92,6 +93,8 @@ DEFAULT_AGENT_UNITS = "ameesh-guest-runner@*.service"
 #: the offloaded jobs (mode b, study §1.8) and the manual drain request
 DEFAULT_JOB_UNITS = "ameesh-job-*.scope"
 DEFAULT_DRAIN_REQUEST_PATH = "/run/ameesh-gate/drain.json"
+#: the guest's work directory (study §3): its free disk is what the guest uses
+DEFAULT_WORK_PATH = "/srv/ameesh-guest"
 
 #: evaluation period, state lifetime, longest freeze, grace after the drain
 #: deadline before the stop (seconds, study §1.5 and §1.6)
@@ -295,6 +298,7 @@ class GuardConfig:
     agent_units: str = DEFAULT_AGENT_UNITS
     job_units: str = DEFAULT_JOB_UNITS
     drain_request_path: str = DEFAULT_DRAIN_REQUEST_PATH
+    work_path: str = DEFAULT_WORK_PATH
 
 
 def load_config(path: str | None = None) -> GuardConfig:
@@ -319,7 +323,8 @@ def load_config(path: str | None = None) -> GuardConfig:
                        agent_units=str(raw.get("agent_units") or DEFAULT_AGENT_UNITS),
                        job_units=str(raw.get("job_units") or DEFAULT_JOB_UNITS),
                        drain_request_path=str(raw.get("drain_request_path")
-                                              or DEFAULT_DRAIN_REQUEST_PATH))
+                                              or DEFAULT_DRAIN_REQUEST_PATH),
+                       work_path=str(raw.get("work_path") or DEFAULT_WORK_PATH))
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +380,7 @@ def _mem_total() -> int | None:
 def read_signals(cfg: GuardConfig, now: float, *, sample: Callable | None = None,
                  psi: Callable = read_psi, busy: Callable = busy_count) -> dict:
     """One flat reading of what the decision looks at."""
-    sample = sample or (lambda: resources.sample(cfg.host, now=now))
+    sample = sample or (lambda: resources.sample(cfg.host, path=cfg.work_path, now=now))
     reading = dict(sample())
     if reading.get("mem_total_bytes") is None:
         reading["mem_total_bytes"] = _mem_total()
@@ -656,7 +661,8 @@ def read_guest_json(path: str, limit: int = ACK_MAX_BYTES) -> dict | None:
         return None
     try:
         doc = json.loads(data.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: 64 KiB of nested arrays (codex #211 r4)
         return None
     return doc if isinstance(doc, dict) else None
 
@@ -731,6 +737,10 @@ THAW_UNIT = "ameesh-guard-thaw"
 THAW_RETRY_S, THAW_RETRIES = 2, 300
 THAW_SCRIPT = ('i=0; until systemctl thaw "$0"; do i=$((i+1)); '
                '[ "$i" -ge %d ] && exit 1; sleep %d; done' % (THAW_RETRIES, THAW_RETRY_S))
+#: the least time left on the thaw timer, read on the clock right before the
+#: freeze command (arming the timer, stopping the older ones and the caps
+#: before can take seconds): less, and the timer may thaw before the freeze
+FREEZE_MARGIN_S = 2.0
 
 #: which `caps` key each property enforces
 PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
@@ -748,14 +758,17 @@ class Enforcer:
     transient systemd timer (`THAW_UNIT-…`) is armed to thaw the slice at
     the freeze bound, its service retrying a failed thaw by itself; only
     then are the older timers stopped, so there is never a moment without
-    one. No timer, no freeze. A freeze attempted counts as possibly in force
-    until a thaw succeeds: every evaluation below level 2, and the guard's
-    exit, thaw again until it does."""
+    one. No timer, no freeze, and no freeze either when the timer would fire
+    less than `FREEZE_MARGIN_S` after the clock read right before the freeze
+    command (never the evaluation's instant). A freeze attempted counts as
+    possibly in force until a thaw succeeds: every evaluation below level 2,
+    and the guard's exit, thaw again until it does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
-                 log: Callable | None = None):
+                 log: Callable | None = None, clock: Callable = time.time):
         self.cfg = cfg
         self.run = run or subprocess.run
+        self.clock = clock
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
@@ -835,20 +848,24 @@ class Enforcer:
                 except (OSError, subprocess.SubprocessError):
                     pass
 
-    def _arm_thaw(self, until: float, now: float) -> bool:
-        """Arms a new thaw timer at `until`, then stops the older ones; True
-        if armed (never trusts a timer armed before: it may have fired)."""
+    def _arm_thaw(self, until: float) -> float | None:
+        """Arms a new thaw timer at `until`, then stops the older ones; the
+        earliest instant it fires, None if not armed (never trusts a timer
+        armed before: it may have fired)."""
+        now = self.clock()
+        if until - now < FREEZE_MARGIN_S:
+            return None
         self.thaw_count += 1
         unit = "%s-%d-%d-%d" % (THAW_UNIT, int(now), os.getpid(), self.thaw_count)
         seconds = max(1, int(math.ceil(until - now)))
         if not self._command(["systemd-run", "--unit=%s" % unit, "--collect", "--quiet",
                               "--on-active=%ds" % seconds, "--timer-property=AccuracySec=1s",
                               "/bin/sh", "-c", THAW_SCRIPT, self.cfg.slice]):
-            return False
+            return None
         self._stop_thaw_units(keep=unit)
-        return True
+        return now + seconds
 
-    def freeze(self, on: bool, until: float | None = None, now: float | None = None) -> bool:
+    def freeze(self, on: bool, until: float | None = None) -> bool:
         """Freezes the guest's slice until `until` (a new thaw timer armed
         first), or thaws it; True if the slice is as asked."""
         if not on:
@@ -861,8 +878,9 @@ class Enforcer:
             return True
         if self.freeze_done:
             return True
-        now = time.time() if now is None else now
-        if until is None or now >= until or not self._arm_thaw(until, now):
+        fires = None if until is None else self._arm_thaw(until)
+        # codex #237 r3: the clock read again, after the timer and the cleanup
+        if fires is None or fires - self.clock() < FREEZE_MARGIN_S:
             self.log("freeze refused: no thaw timer to bound it")
             self.freeze(False)
             return False
@@ -892,18 +910,19 @@ class Enforcer:
         stopped = self._systemctl("stop", self.cfg.slice)
         return killed and stopped
 
-    def apply(self, state: dict, cpu_count: int | None, now: float | None = None) -> list[str]:
+    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
         """Enforces `state`: caps at every level, freeze at level 2; a drain
         thaws, and stops the jobs at its deadline; a stop kills and stops the
         guest's slice. Each is done once, retried while it fails. The `caps`
         keys actually enforced."""
+        now = self.clock()
         caps = state.get("caps") or {}
         level = state.get("level", 0)
         deadline = state.get("drain_deadline_ts")
         if level < 3:
             self.jobs_stopped = self.guest_stopped = False
         elif not self.jobs_stopped and (level == 4 or (
-                deadline is not None and now is not None and now >= deadline)):
+                deadline is not None and now >= deadline)):
             self.jobs_stopped = self.stop_jobs()
         if level == 4 and not self.guest_stopped:
             self.guest_stopped = self.stop_guest()
@@ -918,7 +937,7 @@ class Enforcer:
                 enforced.add("agent_memory_mb")
         freeze = state.get("freeze")
         if freeze:
-            if self.freeze(True, freeze.get("until_ts"), now):
+            if self.freeze(True, freeze.get("until_ts")):
                 enforced.add("freeze")
         else:
             self.freeze(False)
@@ -967,7 +986,7 @@ class Guard:
                  enforcer: Enforcer | None = None):
         self.cfg = cfg
         self.observe = observe
-        self.enforcer = None if observe else (enforcer or Enforcer(cfg))
+        self.enforcer = None if observe else (enforcer or Enforcer(cfg, clock=clock))
         if self.enforcer is not None:
             self.enforcer.thaw_at_start()
         self.clock = clock
@@ -1004,8 +1023,7 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"),
-                                                            now)
+            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"))
         key = _key(state)
         if key != self.last_key:
             self.seq += 1

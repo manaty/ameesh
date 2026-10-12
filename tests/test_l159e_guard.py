@@ -337,6 +337,14 @@ class StateTest(unittest.TestCase):
             json.dump({"schema": "ameesh-host-ack/1", "seq": 3,
                        "in_turn": ["x" * 1000] * 100}, fh)
         self.assertIsNone(guard.read_ack(self.cfg.ack_path))
+        # codex #211 r4: 64 KiB of nested arrays raise a RecursionError on the
+        # Pythons whose decoder counts depth (forced here: 3.14 parses them)
+        os.remove(self.cfg.ack_path)
+        with open(self.cfg.ack_path, "w") as fh:
+            fh.write("[" * 32000 + "]" * 32000)
+        self.assertIsNone(guard.read_ack(self.cfg.ack_path))
+        with mock.patch.object(guard.json, "loads", side_effect=RecursionError):
+            self.assertIsNone(guard.read_ack(self.cfg.ack_path))
         self._ack(seq=3, drained=True)
         self.assertEqual(guard.read_ack(self.cfg.ack_path)["seq"], 3)
 
@@ -406,6 +414,18 @@ class SignalsTest(unittest.TestCase):
             OSError("no systemctl"))))
 
 
+    def test_disk_of_the_guest_work_path(self):
+        # codex #211 r4: the guard measured no disk (sample() without a path),
+        # so the lendable disk and caps.disk_mb never appeared
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer({"cpu_max": 1}),
+                                    work_path=tmp)
+            reading = guard.read_signals(cfg, 100.0, psi=lambda avg: {},
+                                         busy=lambda units: None)
+            self.assertIsNotNone(reading["disk_free_bytes"])
+            self.assertEqual(reading["disk_path"], tmp)
+
+
 class EnforcerTest(unittest.TestCase):
     """Tranche 2: the caps become slice and unit properties, level 2 freezes."""
 
@@ -417,7 +437,14 @@ class EnforcerTest(unittest.TestCase):
                      "\u25cf ameesh-guest-runner@b.service loaded failed failed b\n"
         self.logged = []
         self.armed = []      # thaw timers armed, in order (none ever stopped here)
-        self.enforcer = guard.Enforcer(self.cfg, run=self.fake, log=self.logged.append)
+        self.now = [1000.0]  # the fake clock, advanced by the fake commands
+        self.cost = {}       # seconds a command takes: verb -> s
+        self.enforcer = guard.Enforcer(self.cfg, run=self.fake, log=self.logged.append,
+                                       clock=lambda: self.now[0])
+
+    def at(self, now):
+        self.now[0] = now
+        return self.enforcer
 
     def thaw_units(self):
         stopped = {c[2] for c in self.calls if c[:2] == ["systemctl", "stop"]}
@@ -426,6 +453,7 @@ class EnforcerTest(unittest.TestCase):
 
     def fake(self, argv, **kw):
         self.calls.append(argv)
+        self.now[0] += self.cost.get(self.verb(argv), 0)
         failed = self.verb(argv) in self.failing
         out = ""
         if argv[1] == "list-units":
@@ -469,19 +497,19 @@ class EnforcerTest(unittest.TestCase):
         # level 1: only the changed properties are sent
         self.calls.clear()
         reduced = dict(caps, cpu_share=0.125, memory_high_mb=1024)
-        self.enforcer.apply({"caps": reduced}, 4, 10.0)
+        self.at(10.0).apply({"caps": reduced}, 4)
         self.assertEqual(self.sets(), [["ameesh-guest.slice", "CPUQuota=50%",
                                         "MemoryHigh=1024M"]])
         # level 2: freeze, once
         self.calls.clear()
         frozen = {"caps": reduced, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
-        self.assertIn("freeze", self.enforcer.apply(frozen, 4, 10.0))
-        self.enforcer.apply(frozen, 4, 10.0)
+        self.assertIn("freeze", self.at(10.0).apply(frozen, 4))
+        self.at(10.0).apply(frozen, 4)
         self.assertEqual([c for c in self.calls if c[1] in ("freeze", "thaw")],
                          [["systemctl", "freeze", "ameesh-guest.slice"]])
         # the level drops: thawed
         self.calls.clear()
-        self.assertNotIn("freeze", self.enforcer.apply({"caps": reduced}, 4, 10.0))
+        self.assertNotIn("freeze", self.at(10.0).apply({"caps": reduced}, 4))
         self.assertEqual([c for c in self.calls if c[1] in ("freeze", "thaw")],
                          [["systemctl", "thaw", "ameesh-guest.slice"]])
 
@@ -489,27 +517,27 @@ class EnforcerTest(unittest.TestCase):
         self.failing = {"set-property", "freeze"}
         caps = {"cpu_weight": 10, "agent_memory_mb": 1024}
         state = {"caps": caps, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
-        self.assertEqual(self.enforcer.apply(state, 4, 10.0), [])
+        self.assertEqual(self.at(10.0).apply(state, 4), [])
         self.assertTrue(any("denied" in line for line in self.logged))
         # retried at the next evaluation, and in force once it works
         self.failing = set()
         self.calls.clear()
-        self.assertEqual(self.enforcer.apply(state, 4, 10.0),
+        self.assertEqual(self.at(10.0).apply(state, 4),
                          ["agent_memory_mb", "cpu_weight", "freeze"])
         self.assertIn(["ameesh-guest.slice", "CPUWeight=10"], self.sets())
         # no agent unit loaded: the per-agent cap is not in force
         self.units = ""
-        self.assertNotIn("agent_memory_mb", self.enforcer.apply({"caps": caps}, 4, 10.0))
+        self.assertNotIn("agent_memory_mb", self.at(10.0).apply({"caps": caps}, 4))
         # systemctl missing: nothing in force, nothing raised
-        broken = guard.Enforcer(self.cfg, log=self.logged.append,
+        broken = guard.Enforcer(self.cfg, log=self.logged.append, clock=lambda: 10.0,
                                 run=lambda *a, **k: (_ for _ in ()).throw(OSError("none")))
-        self.assertEqual(broken.apply(state, 4, 10.0), [])
+        self.assertEqual(broken.apply(state, 4), [])
 
     def test_freeze_bounded_without_the_guard(self):
         # codex #237 r1/r2: a new thaw timer before every freeze attempt, its
         # service retrying the thaw; the older ones stopped only after it
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
-        self.assertIn("freeze", self.enforcer.apply(frozen, 4, 1010.0))
+        self.assertIn("freeze", self.at(1010.0).apply(frozen, 4))
         run = [c for c in self.calls if c[0] == "systemd-run"]
         self.assertEqual(len(run), 1)
         self.assertTrue(run[0][1].startswith("--unit=ameesh-guard-thaw-1010-"))
@@ -520,29 +548,55 @@ class EnforcerTest(unittest.TestCase):
         self.assertLess(self.calls.index(run[0]),
                         self.calls.index(["systemctl", "freeze", "ameesh-guest.slice"]))
         self.calls.clear()
-        self.enforcer.apply(frozen, 4, 1015.0)              # frozen: nothing more
+        self.at(1015.0).apply(frozen, 4)              # frozen: nothing more
         self.assertEqual([c for c in self.calls if c[0] == "systemd-run"], [])
-        self.enforcer.apply({"caps": {}}, 4, 1020.0)
+        self.at(1020.0).apply({"caps": {}}, 4)
         self.assertEqual(self.freezes(), [["systemctl", "thaw", "ameesh-guest.slice"]])
         self.assertIn(["systemctl", "stop", self.armed[0] + ".timer"], self.calls)
         # the timer cannot be armed: no freeze
         self.calls.clear()
         self.failing = {"systemd-run"}
-        self.assertNotIn("freeze", self.enforcer.apply(frozen, 4, 1030.0))
+        self.assertNotIn("freeze", self.at(1030.0).apply(frozen, 4))
         self.assertEqual(self.freezes(), [])
         # past the bound: no freeze either
         self.failing = set()
-        self.assertNotIn("freeze", self.enforcer.apply(frozen, 4, 1060.0))
+        self.assertNotIn("freeze", self.at(1060.0).apply(frozen, 4))
         self.assertEqual(self.freezes(), [])
+
+    def test_freeze_decided_on_the_clock_of_the_freeze(self):
+        # codex #237 r3: bound 1060, evaluation at 1055, a 5 s timer armed,
+        # the cleanup takes 7 s: the timer thaws at 1060, a freeze at 1062
+        # would have none left
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.cost = {"list-units": 7}
+        self.assertNotIn("freeze", self.at(1055.0).apply(frozen, 4))
+        self.assertEqual(len(self.armed), 1)
+        self.assertEqual(self.freezes(), [])
+        self.assertFalse(self.enforcer.frozen)
+        # slow cap updates: 1059 when the timer would be armed, 1 s left
+        self.calls.clear()
+        self.cost = {"set-property": 4}
+        state = dict(frozen, caps={"cpu_weight": 20})
+        self.assertNotIn("freeze", self.at(1055.0).apply(state, 4))
+        self.assertEqual([c for c in self.calls if c[0] == "systemd-run"], [])
+        self.assertEqual(self.freezes(), [])
+        # enough margin: the timer counts from the clock, not the evaluation
+        self.calls.clear()
+        self.cost = {"set-property": 4, "list-units": 3}
+        state = dict(frozen, caps={"cpu_weight": 30})
+        self.assertIn("freeze", self.at(1010.0).apply(state, 4))
+        run = [c for c in self.calls if c[0] == "systemd-run"]
+        self.assertEqual(run[0][4], "--on-active=46s")
+        self.assertEqual(self.freezes(), [["systemctl", "freeze", "ameesh-guest.slice"]])
 
     def test_every_freeze_attempt_arms_a_new_timer_first(self):
         # codex #237 r2: the first freeze fails, its timer fires; the retry
         # arms a new timer before freezing, and the old one is stopped after
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
         self.failing = {"freeze"}
-        self.enforcer.apply(frozen, 4, 1000.0)
+        self.at(1000.0).apply(frozen, 4)
         self.failing = set()
-        self.enforcer.apply(frozen, 4, 1055.0)
+        self.at(1055.0).apply(frozen, 4)
         self.assertEqual(len(self.armed), 2)
         second = self.calls.index([c for c in self.calls if c[0] == "systemd-run"][1])
         stop_old = self.calls.index(["systemctl", "stop", self.armed[0] + ".timer"])
@@ -560,7 +614,7 @@ class EnforcerTest(unittest.TestCase):
         self.enforcer.thaw_at_start()
         self.assertEqual([c for c in self.calls if c[1] == "stop"], [])
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
-        self.enforcer.apply(frozen, 4, 1000.0)
+        self.at(1000.0).apply(frozen, 4)
         arm = self.calls.index([c for c in self.calls if c[0] == "systemd-run"][0])
         stop = self.calls.index(["systemctl", "stop", "ameesh-guard-thaw-900-1-1.timer"])
         self.assertLess(arm, stop)
@@ -570,13 +624,13 @@ class EnforcerTest(unittest.TestCase):
         # systemd froze the slice: the drop of the level and stop() thaw
         self.failing = {"freeze"}
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
-        self.assertNotIn("freeze", self.enforcer.apply(frozen, 4, 1000.0))
+        self.assertNotIn("freeze", self.at(1000.0).apply(frozen, 4))
         self.failing = set()
         self.calls.clear()
-        self.enforcer.apply({"caps": {}}, 4, 1000.0)
+        self.at(1000.0).apply({"caps": {}}, 4)
         self.assertEqual(self.freezes(), [["systemctl", "thaw", "ameesh-guest.slice"]])
         self.failing = {"freeze"}
-        self.enforcer.apply(frozen, 4, 1000.0)
+        self.at(1000.0).apply(frozen, 4)
         self.calls.clear()
         self.failing = set()
         self.enforcer.freeze(False)                          # Guard.stop
@@ -667,10 +721,15 @@ class DrainStopTest(unittest.TestCase):
         self.calls.append(argv)
         return mock.Mock(returncode=0, stdout="", stderr="")
 
+    def at(self, enforcer, now):
+        self.clock[0] = now
+        return enforcer
+
     def guard(self, observe=False):
         return guard.Guard(self.cfg, observe=observe, signals=lambda now: dict(self.reading),
                            clock=lambda: self.clock[0],
-                           enforcer=guard.Enforcer(self.cfg, run=self.fake, log=lambda t: None))
+                           enforcer=guard.Enforcer(self.cfg, run=self.fake, log=lambda t: None,
+                                   clock=lambda: self.clock[0]))
 
     def stops(self):
         return [c[1:] for c in self.calls if c[1] in ("stop", "kill")
@@ -716,21 +775,23 @@ class DrainStopTest(unittest.TestCase):
             self.calls.append(argv)
             bad = failing[0] and argv[1] == "stop" and argv[2] == "ameesh-guest.slice"
             return mock.Mock(returncode=1 if bad else 0, stdout="", stderr="")
-        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None)
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                   clock=lambda: self.clock[0])
         state = {"level": 4, "caps": {}, "drain_deadline_ts": None}
-        enforcer.apply(state, 4, 2000.0)
+        self.at(enforcer, 2000.0).apply(state, 4)
         failing[0] = False
-        enforcer.apply(state, 4, 2005.0)
-        enforcer.apply(state, 4, 2010.0)
+        self.at(enforcer, 2005.0).apply(state, 4)
+        self.at(enforcer, 2010.0).apply(state, 4)
         self.assertEqual([c[2] for c in self.calls if c[1] == "stop"],
                          ["ameesh-job-*.scope", "ameesh-guest.slice", "ameesh-guest.slice"])
         # back to level 0, then a new stop: done again
-        enforcer.apply({"level": 0, "caps": {}}, 4, 3000.0)
+        self.at(enforcer, 3000.0).apply({"level": 0, "caps": {}}, 4)
         self.calls.clear()
-        enforcer.apply(state, 4, 4000.0)
+        self.at(enforcer, 4000.0).apply(state, 4)
         self.assertEqual(len([c for c in self.calls if c[1] == "stop"]), 2)
         # observing: the levels are decided, nothing is stopped
         self.calls.clear()
+        self.clock[0] = 1000.0
         g = self.guard(observe=True)
         self.reading["mem_available_bytes"] = 1 * GIB
         g.step()
@@ -747,12 +808,13 @@ class DrainStopTest(unittest.TestCase):
             self.calls.append(argv)
             bad = failing[0] and argv[1] == "kill"
             return mock.Mock(returncode=1 if bad else 0, stdout="", stderr="")
-        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None)
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                   clock=lambda: self.clock[0])
         state = {"level": 4, "caps": {}, "drain_deadline_ts": None}
-        enforcer.apply(state, 4, 2000.0)
+        self.at(enforcer, 2000.0).apply(state, 4)
         failing[0] = False
-        enforcer.apply(state, 4, 2005.0)
-        enforcer.apply(state, 4, 2010.0)
+        self.at(enforcer, 2005.0).apply(state, 4)
+        self.at(enforcer, 2010.0).apply(state, 4)
         self.assertEqual(len([c for c in self.calls if c[1] == "kill"]), 2)
 
     def test_ended_manual_drain_never_escalates(self):
@@ -795,7 +857,8 @@ class DrainStopTest(unittest.TestCase):
         guard.request_drain(self.cfg.drain_request_path, 1000.0, None)
         g = guard.Guard(self.cfg, observe=False, signals=lambda now: dict(self.reading),
                         clock=lambda: self.clock[0],
-                        enforcer=guard.Enforcer(self.cfg, run=run, log=lambda t: None))
+                        enforcer=guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                   clock=lambda: self.clock[0]))
         self.assertEqual(g.step()["level"], 3)
         self.clock[0] = 1130.0
         self.assertEqual(g.step()["level"], 4)
@@ -834,11 +897,15 @@ class CliTest(unittest.TestCase):
                 json.dump({"host": "vm-test", "max_agents": 2,
                            "state_path": os.path.join(tmp, "s", "state.json"),
                            "ack_path": os.path.join(tmp, "a", "ack.json"),
-                           "lend": {"cpu_max": 2, "memory_max": "4GiB"}}, fh)
+                           "work_path": tmp,
+                           "lend": {"cpu_max": 2, "memory_max": "4GiB",
+                                    "disk_max": "1MiB"}}, fh)
             with mock.patch("sys.stdout") as out:
                 self.assertEqual(guard.main(["check", "--config", config, "--json"]), 0)
             printed = "".join(c.args[0] for c in out.write.call_args_list)
             self.assertEqual(json.loads(printed)["schema"], "ameesh-host-state/1")
+            # codex #211 r4: the disk of work_path, measured through sample()
+            self.assertEqual(json.loads(printed)["caps"].get("disk_mb"), 1)
             calls = []
 
             def run(argv, **kw):
