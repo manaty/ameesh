@@ -223,6 +223,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'name', 'holder', 'public_key_fingerprint', 'key_role',
         'key_updated_at', 'key_revoked_at'
     ]),
+    -- #326 r2 (0364) : journal des clés, sans la clé (l'empreinte suffit)
+    ('key_events', ARRAY[
+        'id', 'at', 'name', 'holder', 'event', 'key_role', 'fingerprint',
+        'db_user', 'owner_gesture'
+    ]),
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'approval_id', 'consumed_by', 'consumed_at'
     ]),

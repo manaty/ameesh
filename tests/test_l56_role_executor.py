@@ -154,6 +154,26 @@ class RoleExecutorTest(PgTestCase):
         proc = self.as_host("UPDATE key_holders SET key_revoked_at = now() "
                             "WHERE name = 'l56-owner'")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # #326 r2: nor an owner key on an agent; an agent key is free, and
+        # its event is journaled under the executor's role
+        self.db.execute("INSERT INTO agent_registry (name) VALUES ('l56-agent') "
+                        "ON CONFLICT (name) DO NOTHING")
+        for sql in ("SET ameesh.owner_gesture = 'on'; UPDATE agent_registry "
+                    "SET public_key = 'k3', key_role = 'owner' WHERE name = 'l56-agent'",
+                    "INSERT INTO agent_registry (name, public_key, key_role) "
+                    "VALUES ('l56-agent2', 'k4', 'owner')",
+                    "DELETE FROM key_events",
+                    "UPDATE key_events SET at = now() - interval '30 days'",
+                    "INSERT INTO key_events (name, holder, event) "
+                    "VALUES ('x', 'human', 'revoked')"):
+            proc = self.as_host(sql)
+            self.assertNotEqual(proc.returncode, 0, sql)
+        proc = self.as_host("UPDATE agent_registry SET public_key = 'k5', key_role = 'agent' "
+                            "WHERE name = 'l56-agent'")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.db.query(
+            "SELECT event, db_user FROM key_events WHERE name = 'l56-agent'"),
+            [{"event": "registered", "db_user": self.login}])
 
     def test_public_schema_create_rolls_back(self):
         """PUBLIC schema CREATE makes the script roll back the new role."""

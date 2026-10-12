@@ -177,6 +177,20 @@ def key_info(db: Db, agent: str) -> dict | None:
     return storage.of(db).keys.info(agent)
 
 
+def _refused(exc: DbError) -> None:
+    """A refusal of the key guards of 0364 is an AuthorityError; any other
+    database error goes up as is."""
+    if "key_holders_one_owner" in str(exc):
+        raise AuthorityError(
+            "an owner key holder already exists: one at a time — replace its key "
+            "(key register --human <its id> --replace, with the owner's database "
+            "role)") from exc
+    refused = _GUARD_RE.search(str(exc))
+    if not refused:
+        raise exc
+    raise AuthorityError(refused.group(0).strip()) from exc
+
+
 def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_ROLE,
                  note: str | None = None) -> dict:
     """Enregistre la clé PUBLIQUE d'un agent.
@@ -185,7 +199,9 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
     `role='agent'` (défaut) n'authentifie qu'un agent et ne donne aucune
     autorité. Enregistrer une clé propriétaire pour un agent revient à lui
     déléguer l'autorité du propriétaire : à ne faire qu'en connaissance de cause.
-    """
+    C'est le geste du propriétaire (#326 r2) : la base (0364) le refuse hors
+    de son rôle de base, comme toute pose, tout changement ou tout retour
+    d'une clé owner sur un agent ; une clé `agent` reste libre."""
     if len(public) != 32:
         raise AuthorityError("Ed25519 public key: 32 bytes expected")
     if role not in KEY_ROLES:
@@ -196,7 +212,10 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
         raise AuthorityError(
             "%s holds a human's key: ameesh key register --human %s --public-key … "
             "--role %s" % (agent, agent, role))
-    found = keys.register(agent, b64(public), fingerprint, role, note)
+    try:
+        found = keys.register(agent, b64(public), fingerprint, role, note)
+    except DbError as exc:
+        _refused(exc)
     if not found:
         raise AuthorityError(
             "agent %s not in the registry: declare it before registering its key; "
@@ -234,10 +253,7 @@ def register_human_key(db: Db, human: str, public: bytes, *,
         status = storage.of(db).keys.register_human(
             name, "human:" + name, b64(public), fingerprint, role, replace=replace)
     except DbError as exc:
-        refused = _GUARD_RE.search(str(exc))
-        if not refused:
-            raise
-        raise AuthorityError(refused.group(0).strip()) from exc
+        _refused(exc)
     if status == "agent":
         raise AuthorityError(
             "an agent is named %s: a human's key never sits on an agent's identity "

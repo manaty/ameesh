@@ -14,6 +14,7 @@ holder's name."""
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 from ameesh import authority, decisions, exploitation, registry, signing, storage
@@ -224,14 +225,15 @@ class OwnerKeyGuardTest(_Keys):
         self.assertEqual(proc.returncode, 2)
 
     def test_alert_and_note_on_a_first_owner_key(self):
-        alerts = [a for a in exploitation._owner_key_registered(self.db, time.time())]
-        self.assertEqual([(a["type"], a["reason"], a["agent"]) for a in alerts],
-                         [("owner_key_registered", "alice", None)])
+        alerts = exploitation._owner_key_registered(self.db, time.time())
+        self.assertEqual([(a["type"], a["reason"], a["agent"], a["holder"]) for a in alerts],
+                         [("owner_key_registered", "alice#1", None, "human")])
         self.assertIsNone(alerts[0].get("responsible"))
         self.assertEqual(exploitation._owner_key_registered(self.db, time.time() + 8 * 86400),
                          [])
+        # #326 r2: a revocation right after use does not erase it
         authority.revoke_key(self.db, "alice")
-        self.assertEqual(exploitation._owner_key_registered(self.db, time.time()), [])
+        self.assertEqual(len(exploitation._owner_key_registered(self.db, time.time())), 1)
         # the CLI writes to the owner's chat, if it exists
         registry.upsert(self.db, "chat-dave", harness="claude", host=self.cfg.host)
         _private, public = self.keypair("dave")
@@ -247,3 +249,88 @@ class OwnerKeyGuardTest(_Keys):
         rows = self.db.query("SELECT body FROM agent_mailbox WHERE recipient = 'chat-dave'")
         self.assertEqual(len(rows), 1)
         self.assertIn("An owner key was created for human:dave", rows[0]["body"])
+
+    def test_owner_key_on_an_agent_is_the_owner_gesture(self):
+        # #326 r2: straight SQL, as any agent could — no GUC
+        registry.upsert(self.db, "mallory", harness="claude", host=self.cfg.host)
+        fingerprint = signing.fingerprint(signing.read_public(self.other))
+        for sql in ("UPDATE agent_registry SET public_key = 'k', public_key_fingerprint = "
+                    "'%s', key_role = 'owner' WHERE name = 'mallory'" % fingerprint,
+                    "INSERT INTO agent_registry (name, public_key, key_role) "
+                    "VALUES ('mallory2', 'k', 'owner')"):
+            with self.assertRaises(DbError, msg=sql) as ctx:
+                self.db.execute(sql)
+            self.assertIn("own gesture", str(ctx.exception))
+        # an agent key stays free; turning it owner, or renaming an owner, is not
+        authority.register_key(self.db, "mallory", signing.read_public(self.other))
+        with self.assertRaises(DbError):
+            self.db.execute("UPDATE agent_registry SET key_role = 'owner' "
+                            "WHERE name = 'mallory'")
+        # the owner's gesture: `key register <agent> --role owner` with its role
+        authority.register_key(self.db, "orch", signing.read_public(self.other), role="owner")
+        self.assertEqual(authority.key_info(self.db, "orch")["key_role"], "owner")
+        with self.assertRaises(DbError):
+            self.db.execute("UPDATE agent_registry SET name = 'orch2' WHERE name = 'orch'")
+        self.assertTrue(authority.revoke_key(self.db, "orch"))
+        with self.assertRaises(DbError):
+            self.db.execute("UPDATE agent_registry SET key_revoked_at = NULL "
+                            "WHERE name = 'orch'")
+        events = [(r["name"], r["holder"], r["event"])
+                  for r in self.db.query("SELECT * FROM key_events ORDER BY id")]
+        self.assertEqual(events, [("alice", "human", "registered"),
+                                  ("mallory", "agent", "registered"),
+                                  ("orch", "agent", "registered"),
+                                  ("orch", "agent", "revoked")])
+        self.assertEqual([a["reason"] for a in
+                          exploitation._owner_key_registered(self.db, time.time())],
+                         ["alice#1", "orch#3"])
+
+    def test_dates_are_the_servers_and_the_journal_is_untouchable(self):
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("DELETE FROM key_holders")
+        self.db.execute("INSERT INTO key_holders (name, human, public_key, key_role, "
+                        "key_updated_at, created_at) VALUES ('mallory', 'human:mallory', "
+                        "'k', 'owner', now() - interval '30 days', "
+                        "now() - interval '30 days')")
+        self.assertLess(time.time() - authority.key_info(self.db, "mallory")["key_updated_ts"],
+                        60)
+        self.assertEqual([a["reason"] for a in
+                          exploitation._owner_key_registered(self.db, time.time())],
+                         ["alice#1", "mallory#3"])
+        for sql in ("UPDATE key_events SET at = now() - interval '30 days'",
+                    "DELETE FROM key_events",
+                    "INSERT INTO key_events (name, holder, event) "
+                    "VALUES ('x', 'human', 'revoked')"):
+            with self.assertRaises(DbError, msg=sql):
+                self.db.execute(sql)
+        self.assertEqual(len(self.db.query("SELECT 1 FROM key_events")), 3)
+
+    def test_two_first_owner_keys_at_once(self):
+        # #326 r2: two transactions, neither seeing the other's owner key
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("DELETE FROM key_holders")
+        first = self.db.transaction()
+        first.__enter__()
+        first.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
+                      "VALUES ('bootstrap', 'human:bootstrap', 'k1', 'owner')")
+        outcome = {}
+
+        def second():
+            try:
+                with self.db.transaction() as tx:
+                    tx.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
+                               "VALUES ('mallory', 'human:mallory', 'k2', 'owner')")
+                outcome["second"] = "committed"
+            except DbError as exc:
+                outcome["second"] = str(exc)
+
+        thread = threading.Thread(target=second)
+        thread.start()
+        thread.join(2)              # blocked on the unique index until the first ends
+        first.__exit__(None, None, None)
+        thread.join(30)
+        self.assertIn("key_holders_one_owner", outcome["second"])
+        self.assertEqual([r["name"] for r in self.db.query(
+            "SELECT name FROM key_holders WHERE key_role = 'owner'")], ["bootstrap"])

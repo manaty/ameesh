@@ -31,21 +31,26 @@ class Keys(interface.Keys):
         return rows[0] if rows else None
 
     def register(self, agent, public_key, fingerprint, role, note) -> bool:
-        rows = self.db.query(
-            """
-            UPDATE agent_registry
-               SET public_key = %s,
-                   public_key_fingerprint = %s,
-                   key_role = %s,
-                   key_updated_at = now(),
-                   key_revoked_at = NULL,
-                   status_text = coalesce(%s, status_text),
-                   updated_at = now()
-             WHERE name = %s
-            RETURNING name
-            """,
-            (public_key, fingerprint, role, note, agent),
-        )
+        with self.db.transaction() as tx:
+            if role == "owner":
+                # the owner's authority on an agent: the owner's own gesture,
+                # refused by the guard of 0364 outside the owner's role (#326 r2)
+                tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            rows = tx.query(
+                """
+                UPDATE agent_registry
+                   SET public_key = %s,
+                       public_key_fingerprint = %s,
+                       key_role = %s,
+                       key_updated_at = now(),
+                       key_revoked_at = NULL,
+                       status_text = coalesce(%s, status_text),
+                       updated_at = now()
+                 WHERE name = %s
+                RETURNING name
+                """,
+                (public_key, fingerprint, role, note, agent),
+            )
         return bool(rows)
 
     def register_human(self, name, human, public_key, fingerprint, role, *,
@@ -117,6 +122,19 @@ class Keys(interface.Keys):
             (agent,),
         )
         return bool(rows)
+
+    def owner_registrations(self, since) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT id, name, holder, event, fingerprint, db_user, owner_gesture,
+                   extract(epoch from at)::float8 as at_ts
+              FROM key_events
+             WHERE key_role = 'owner' AND event IN ('registered', 'replaced')
+               AND at >= to_timestamp(%s)
+             ORDER BY id
+            """,
+            (since,),
+        )
 
     def registered(self) -> list[dict]:
         return self.db.query(

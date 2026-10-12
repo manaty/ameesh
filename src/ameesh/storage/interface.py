@@ -830,6 +830,12 @@ class Keys(Domain):
         """Révoque la clé active ; faux s'il n'y en avait pas."""
 
     @abc.abstractmethod
+    def owner_registrations(self, since: float) -> list[dict]:
+        """Clés owner enregistrées ou remplacées depuis `since` (#326 r2), lues
+        dans le journal `key_events`, qu'aucune révocation n'efface : id,
+        name, holder, event, fingerprint, db_user, owner_gesture, at_ts."""
+
+    @abc.abstractmethod
     def registered(self) -> list[dict]:
         """Détenteurs d'une clé publique (révoquée comprise), par nom : name,
         holder (`human` ou `agent`), public_key_fingerprint, key_role,

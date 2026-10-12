@@ -135,22 +135,35 @@ base64 of the 32-byte seed or key). Rules:
   no `TRIGGER` right — `deploy/sql/role-executor.sql` audits both):
   * a **first** key only: an existing key, live or revoked, is never
     overwritten; a first `owner` key only while no owner key exists at all
-    (revoked ones count). `ameesh alerts` then raises `owner_key_registered`
-    for 7 days, pushed to `notify.default_human` (urgent), and the CLI
-    writes a note to the owner's chat (`chat-<id>`) if it exists — whoever
-    registered it;
+    (revoked ones count), and a unique index keeps `key_holders` to one
+    owner key holder — two transactions registering one at once cannot both
+    commit, whatever their isolation level. The CLI writes a note to the
+    owner's chat (`chat-<id>`) if it exists;
   * a **revocation** (`key revoke`) is open to all: it only removes
     authority;
-  * replacing or rotating a key, re-registering after a revocation, a
-    second owner key, removing a holder: the **owner's own gesture**,
+  * replacing or rotating a key, re-registering after a revocation,
+    removing a holder: the **owner's own gesture**,
     `ameesh key register --human <id> --public-key … --role owner --replace`
     run with the owner's database role (a member of the role owning the
     tables, the one that runs the migrations — never the executor's). The
     CLI sets `ameesh.owner_gesture` in its transaction and the trigger also
     checks the role: the setting alone, from the executor, is refused;
+  * an **owner key on an agent** (`key register <agent> --role owner`, the
+    owner's authority delegated) is the same gesture (#326 r2): setting,
+    changing, renaming or un-revoking it is refused outside the owner's
+    role; an `agent` key stays free;
   * no agent is created under a key holder's name (trigger on
     `agent_registry`): a holder's rotation is never blocked by an agent
-    that took its name meanwhile.
+    that took its name meanwhile;
+  * dates are the server's: `key_updated_at`, `created_at` and
+    `key_revoked_at` are set by the triggers to `now()`, whatever the
+    writer sends. Every key event (registered, replaced, revoked, removed;
+    holder or agent; the database role; whether it was the owner's gesture)
+    goes to `key_events`, append-only and written by the triggers only (no
+    update, no delete, no direct insert). `ameesh alerts` raises
+    `owner_key_registered` from it for 7 days, pushed to
+    `notify.default_human` (urgent): a backdated row or a revocation right
+    after use hides nothing.
 
   A rotation signed by the current owner key was considered and left out:
   a rotation is rare, and the owner holds the owner database role anyway;

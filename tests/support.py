@@ -332,7 +332,7 @@ class PgTestCase(unittest.TestCase):
     def setUp(self) -> None:
         """Chaque test part d'une base et d'un disque propres."""
         self.db.execute(
-            "TRUNCATE agent_registry, key_holders, agent_mailbox, mesh_approvals, "
+            "TRUNCATE agent_registry, key_holders, key_events, agent_mailbox, mesh_approvals, "
             "work_items, work_item_events, work_item_milestones, work_packages, "
             "thread_index "
             "RESTART IDENTITY CASCADE")
