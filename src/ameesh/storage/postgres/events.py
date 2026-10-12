@@ -25,20 +25,21 @@ class Events(interface.Events):
             "select " + _COLUMNS + " from ameesh_events where id > %s order by id limit %s",
             (int(after_id), int(limit)))
 
-    def readable(self, position, limit) -> list:
+    def readable(self, position, limit) -> tuple:
+        # ONE statement, so ONE snapshot: the rows and `waiting` agree (with
+        # two snapshots, a transaction ending in between hid both)
         tx, last_id = position
-        return self.db.query(
-            "select " + _COLUMNS + ", tx::text as tx from ameesh_events"
-            " where (tx, id) > (%s::text::xid8, %s)"
-            " and tx < pg_snapshot_xmin(pg_current_snapshot())"
-            " order by tx, id limit %s", (str(int(tx)), int(last_id), int(limit)))
-
-    def waiting(self, position) -> bool:
-        tx, last_id = position
-        return bool(self.db.query(
-            "select exists (select 1 from ameesh_events where (tx, id) > (%s::text::xid8, %s)"
-            " and tx >= pg_snapshot_xmin(pg_current_snapshot())) as w",
-            (str(int(tx)), int(last_id)))[0]["w"])
+        pos = (str(int(tx)), int(last_id))
+        rows = self.db.query(
+            "with s as materialized (select pg_snapshot_xmin(pg_current_snapshot()) as x),"
+            " r as (select " + _COLUMNS + ", tx::text as tx from ameesh_events, s"
+            "   where (tx, id) > (%s::text::xid8, %s) and tx < s.x order by tx, id limit %s)"
+            " select w.waiting, r.* from (select exists (select 1 from ameesh_events, s"
+            "   where (tx, id) > (%s::text::xid8, %s) and tx >= s.x) as waiting) w"
+            " left join r on true order by r.tx::xid8, r.id", pos + (int(limit),) + pos)
+        waiting = bool(rows[0]["waiting"]) if rows else False
+        return ([{k: v for k, v in row.items() if k != "waiting"}
+                 for row in rows if row["id"] is not None], waiting)
 
     def bounds(self) -> dict:
         row = self.db.query(
@@ -63,8 +64,17 @@ class Events(interface.Events):
                                  " where created_at < to_timestamp(%s)",
                                  (float(before_ts),))[0]["n"])
 
-    def prune(self, before_ts, limit) -> int:
-        return len(self.db.query(
-            "delete from ameesh_events where id in ("
-            " select id from ameesh_events where created_at < to_timestamp(%s)"
-            " order by id limit %s) returning id", (float(before_ts), int(limit))))
+    def prune(self, before_ts, limit, timeout_s=None) -> int:
+        sql = ("delete from ameesh_events where id in ("
+               " select id from ameesh_events where created_at < to_timestamp(%s)"
+               " order by id limit %s for update skip locked) returning id")
+        params = (float(before_ts), int(limit))
+        if timeout_s is None:
+            return len(self.db.query(sql, params))
+        ms = "%dms" % max(1, int(timeout_s * 1000))
+        with self.db.transaction() as tx:
+            # local to this transaction: a lock or a slow delete never
+            # outlasts the caller's budget (the statement fails instead)
+            tx.query("select set_config('lock_timeout', %s, true),"
+                     " set_config('statement_timeout', %s, true)", (ms, ms))
+            return len(tx.query(sql, params))

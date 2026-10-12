@@ -771,9 +771,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         anything was written, whether events wait for an open transaction)."""
         wrote = False
         while True:
-            rows, waiting = self.read(lambda db: (
-                storage.of(db).events.readable(position, EVENTS_BATCH),
-                storage.of(db).events.waiting(position)))
+            rows, waiting = self.read(
+                lambda db: storage.of(db).events.readable(position, EVENTS_BATCH))
             for row in rows:
                 row["tx"] = int(row["tx"])
             out = "".join(event_message(row) for row in rows if self.ctx.sees(row))

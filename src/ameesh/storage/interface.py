@@ -622,16 +622,13 @@ class Events(Domain):
         most `limit` (a listing for humans: ids are not in commit order)."""
 
     @abc.abstractmethod
-    def readable(self, position: tuple, limit: int) -> list[dict]:
-        """The reader's order: the events after `position` = (tx, id) whose
+    def readable(self, position: tuple, limit: int) -> tuple[list[dict], bool]:
+        """The reader's order: (the events after `position` = (tx, id) whose
         transaction is over for good (`tx` below the snapshot's xmin), by
-        (tx, id), at most `limit`; each row also carries `tx`. Such a
-        transaction can no longer add an event before the last one read."""
-
-    @abc.abstractmethod
-    def waiting(self, position: tuple) -> bool:
-        """Whether events after `position` wait for an older open transaction
-        to end (they are not readable yet)."""
+        (tx, id), at most `limit`, each row also carrying `tx`; whether
+        events after `position` wait for an older open transaction to end).
+        Both from ONE snapshot. Such a transaction can no longer add an event
+        before the last one read."""
 
     @abc.abstractmethod
     def bounds(self) -> dict:
@@ -645,10 +642,11 @@ class Events(Domain):
         """The number of events older than `before_ts`."""
 
     @abc.abstractmethod
-    def prune(self, before_ts: float, limit: int) -> int:
+    def prune(self, before_ts: float, limit: int, timeout_s: float | None = None) -> int:
         """Deletes at most `limit` events older than `before_ts` (the oldest
-        first); the number deleted. The table refuses an event younger than
-        30 days."""
+        first, skipping the rows another pruner holds); the number deleted.
+        `timeout_s`: lock and statement timeout of the deletion (DbError past
+        it). The table refuses an event younger than 30 days."""
 
 
 # --------------------------------------------------------------------------

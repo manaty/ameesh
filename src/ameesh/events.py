@@ -67,6 +67,8 @@ PRUNE_MAX_BATCHES = 10
 PRUNE_MAX_S = 5.0
 _TYPE_RE = re.compile(r"^[a-z]+\.[a-z_]+$")
 _POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})$")
+_XID8_MAX = 2 ** 64 - 1
+_BIGINT_MAX = 2 ** 63 - 1
 
 
 def format_position(position: tuple) -> str:
@@ -77,7 +79,10 @@ def format_position(position: tuple) -> str:
 def parse_position(text: str) -> tuple | None:
     """The position of a `Last-Event-ID`, None if it is not one."""
     match = _POSITION_RE.match(text.strip())
-    return (int(match.group(1)), int(match.group(2))) if match else None
+    if not match:
+        return None
+    tx, last_id = int(match.group(1)), int(match.group(2))
+    return (tx, last_id) if tx <= _XID8_MAX and last_id <= _BIGINT_MAX else None
 
 
 def record(db, type: str, object: str, *, project: str | None = None, **data) -> int:
@@ -108,7 +113,8 @@ def prune(db, *, days: int | None = None, now: float | None = None,
           max_s: float | None = None, clock=time.monotonic) -> int:
     """Deletes the events older than `days` (default `retention_days()`), by
     batches, `max_batches` batches and `max_s` seconds at most (None: until
-    done); the number deleted."""
+    done); the number deleted. A deletion that would outlast `max_s` (a lock,
+    a slow statement) fails with DbError: the batches before it stay done."""
     days = retention_days() if days is None else int(days)
     if days < MIN_RETENTION_DAYS:
         raise ValueError("retention: at least %d days" % MIN_RETENTION_DAYS)
@@ -116,11 +122,17 @@ def prune(db, *, days: int | None = None, now: float | None = None,
     store = storage.of(db).events
     total, batches, start = 0, 0, clock()
     while True:
-        n = store.prune(before, batch)
+        timeout = None
+        if max_s is not None:
+            # the rest of the budget bounds each deletion itself (lock and
+            # statement timeout): a blocked query never outlasts `max_s`
+            timeout = max_s - (clock() - start)
+            if timeout <= 0:
+                return total
+        n = store.prune(before, batch, timeout)
         total += n
         batches += 1
-        if n < batch or (max_batches is not None and batches >= max_batches) \
-                or (max_s is not None and clock() - start >= max_s):
+        if n < batch or (max_batches is not None and batches >= max_batches):
             return total
 
 

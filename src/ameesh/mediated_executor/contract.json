@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 361,
+  "interface_total": 360,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3854,8 +3854,7 @@
     "count_before",
     "prune",
     "readable",
-    "record",
-    "waiting"
+    "record"
    ],
    "grants": [
     "candidates",

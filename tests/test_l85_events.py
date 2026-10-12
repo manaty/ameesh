@@ -40,6 +40,13 @@ class PositionTest(unittest.TestCase):
         for bad in ("12", "a-1", "1-", "-1", "1-2-3", ""):
             self.assertIsNone(events.parse_position(bad), bad)
 
+    def test_out_of_range_is_refused(self):
+        """Codex P3 r2: the digit counts allow values beyond xid8 and bigint."""
+        top = "%d-%d" % (2 ** 64 - 1, 2 ** 63 - 1)
+        self.assertEqual(events.parse_position(top), (2 ** 64 - 1, 2 ** 63 - 1))
+        for bad in ("%d-1" % 2 ** 64, "1-%d" % 2 ** 63, "99999999999999999999-1"):
+            self.assertIsNone(events.parse_position(bad), bad)
+
 
 class RetentionSettingTest(unittest.TestCase):
     def test_default_and_override(self):
@@ -190,10 +197,42 @@ class EventLogPgTest(PgTestCase):
             self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
                             " VALUES ('alert.resolved', 'alert:b', now() - interval '400 days')")
         self.assertEqual(events.prune(self.db, days=365, batch=2, max_batches=2), 4)
-        ticks = iter([0.0, 10.0])
+        ticks = iter([0.0, 1.0, 10.0])
         self.assertEqual(events.prune(self.db, days=365, batch=1, max_s=5.0,
                                       clock=lambda: next(ticks)), 1)
         self.assertEqual(events.prune(self.db, days=365), 0)
+
+    def test_prune_budget_bounds_each_deletion(self):
+        """Codex P2 r2: the budget was checked only after a deletion returned.
+        Each deletion now gets the rest of `max_s` as lock and statement timeout."""
+        store = mock.Mock()
+        store.prune.return_value = 1
+        ticks = iter([0.0, 1.0, 4.5, 6.0])
+        with mock.patch.object(storage, "of", return_value=types.SimpleNamespace(events=store)):
+            self.assertEqual(events.prune(self.db, days=365, batch=1, max_s=5.0,
+                                          clock=lambda: next(ticks)), 2)
+        self.assertEqual([c.args[2] for c in store.prune.call_args_list], [4.0, 0.5])
+
+    def test_prune_skips_locked_rows_and_never_outlasts_its_budget(self):
+        for name in ("alert:l", "alert:m"):
+            self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
+                            " VALUES ('alert.resolved', %s, now() - interval '400 days')",
+                            (name,))
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        with other.transaction() as tx:
+            # a competing pruner holds one row: the other one goes, no wait
+            tx.query("select id from ameesh_events where object = 'alert:l' for update")
+            start = time.monotonic()
+            self.assertEqual(events.prune(self.db, days=365, max_s=30.0), 1)
+            self.assertLess(time.monotonic() - start, 5.0)
+        self.assertEqual(events.prune(self.db, days=365), 1)
+        with other.transaction() as tx:
+            tx.execute("lock table ameesh_events in access exclusive mode")
+            start = time.monotonic()
+            with self.assertRaises(db_mod.DbError):
+                events.prune(self.db, days=365, max_s=1.0)
+            self.assertLess(time.monotonic() - start, 5.0)
 
     def test_a_long_project_name_never_refuses_the_thread_write(self):
         project = "p" * 301
@@ -215,11 +254,11 @@ class EventLogPgTest(PgTestCase):
             a = storage.of(tx_a).events.record("alert.raised", "alert:a", None, {})
             b = events.record(self.db, "alert.raised", "alert:b")
             self.assertGreater(b, a)
-            self.assertEqual(store.readable(position, 100), [])   # held back by A
-            self.assertTrue(store.waiting(position))
-        rows = store.readable(position, 100)
+            self.assertEqual(store.readable(position, 100), ([], True))   # held back by A
+        rows, waiting = store.readable(position, 100)
         self.assertEqual([r["object"] for r in rows], ["alert:a", "alert:b"])
-        self.assertFalse(store.waiting((int(rows[-1]["tx"]), int(rows[-1]["id"]))))
+        self.assertFalse(waiting)
+        self.assertFalse(store.readable((int(rows[-1]["tx"]), int(rows[-1]["id"])), 100)[1])
         # a rolled-back transaction leaves nothing to wait for
         after = (int(rows[-1]["tx"]), int(rows[-1]["id"]))
         try:
@@ -229,7 +268,24 @@ class EventLogPgTest(PgTestCase):
         except KeyError:
             pass
         events.record(self.db, "alert.raised", "alert:d")
-        self.assertEqual([r["object"] for r in store.readable(after, 100)], ["alert:d"])
+        self.assertEqual([r["object"] for r in store.readable(after, 100)[0]], ["alert:d"])
+
+    def test_readable_and_waiting_share_one_snapshot(self):
+        """Codex P2 r2: A holds B back, then ends WITHOUT writing an event
+        between two reads on two snapshots: `[]` then `waiting` False, and B
+        undelivered with no notification to come. One statement, one snapshot."""
+        store = storage.of(self.db).events
+        position = store.bounds()["head"]
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        with other.transaction() as tx_a:
+            tx_a.query("select pg_current_xact_id()")      # A: an xid, no event
+            events.record(self.db, "alert.raised", "alert:b")
+            with mock.patch.object(self.db, "query", wraps=self.db.query) as query:
+                self.assertEqual(store.readable(position, 100), ([], True))
+            self.assertEqual(query.call_count, 1)
+        rows, waiting = store.readable(position, 100)        # A over, no event of its own
+        self.assertEqual(([r["object"] for r in rows], waiting), (["alert:b"], False))
 
     def test_notify_carries_the_id_alone(self):
         listener = db_mod.listener(self.db, [events.CHANNEL])
