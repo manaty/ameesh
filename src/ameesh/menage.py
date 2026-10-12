@@ -179,7 +179,8 @@ KEPT_MERGED_GRACE_S = 24 * 3600.0
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
-               "artifact_idle", "unreadable_ok")
+               "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
+               "docker_build_cache_alert")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -196,6 +197,8 @@ class Policy:
     tmp_quota: int = DEFAULT_TMP_QUOTA
     cache_quota: int = DEFAULT_CACHE_QUOTA
     tmpfs_alert: float = DEFAULT_TMPFS_ALERT
+    docker_orphan_volumes_alert: int = 100
+    docker_build_cache_alert: int = 20 * 1024 ** 3
     redirect: bool = True
     xdg_cache: bool = False
     worktrees: bool = True
@@ -251,7 +254,7 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`%s`: %s" % (key, problem))
         else:
             parsed[key] = raw[key].strip()
-    for key in ("tmp_quota", "cache_quota", "orphan_min_size"):
+    for key in ("tmp_quota", "cache_quota", "orphan_min_size", "docker_build_cache_alert"):
         if raw.get(key) is None:
             continue
         octets = resources_mod.parse_bytes(raw[key])
@@ -259,6 +262,12 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`%s`: size in bytes expected (e.g. 4GiB)" % key)
         else:
             parsed[key] = octets
+    if raw.get("docker_orphan_volumes_alert") is not None:
+        count = raw["docker_orphan_volumes_alert"]
+        if type(count) is not int or count <= 0:
+            problems.append("`docker_orphan_volumes_alert`: positive integer expected")
+        else:
+            parsed["docker_orphan_volumes_alert"] = count
     if raw.get("tmpfs_alert") is not None:
         part = resources_mod.parse_fraction(raw["tmpfs_alert"])
         if part is None:
@@ -330,7 +339,8 @@ def effective(canons, host: str) -> Policy:
                 continue
             if key not in values:
                 values[key], origin[key] = value, label
-            elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert") \
+            elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert",
+                         "docker_orphan_volumes_alert", "docker_build_cache_alert") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle") and value > values[key]) or \
@@ -2372,6 +2382,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         top["command"] = "rm -rf -- %s" % shlex.quote(top["path"])
     report_measure["containers"] = {
         "ameesh": conteneurs["ameesh"], "others": conteneurs["others"]}
+    from . import docker_storage
+    report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
     if not dry_run:
         entries.append({"kind": "mesure", "action": "measured", "path": troot,
                         "bytes": report_measure["tmp_bytes"] + report_measure["cache_bytes"],
@@ -2449,6 +2461,13 @@ def print_report(report: dict) -> None:
     for note in report.get("skipped") or ():
         print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
+    docker = (report.get("measure") or {}).get("docker_storage")
+    if docker:
+        print("  Docker storage (reported only, cleanup requires owner approval): "
+              "%s orphan volumes; %s private reclaimable build cache" % (
+                  docker.get("orphan_volumes"), _fmt(docker.get("build_cache_reclaimable_bytes"))))
+        for error in docker.get("errors") or ():
+            print("    %s" % error)
     for c in conteneurs.get("ameesh") or ():
         if c["action"] != "suppression":
             print("  container %-12s %s — %s" % (action_label(c["action"]), c["path"],
