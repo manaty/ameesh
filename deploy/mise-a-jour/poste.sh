@@ -86,6 +86,36 @@ ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
 dsn_de() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
 # DSN sans mot de passe éventuel (postgresql://u:secret@h → postgresql://u@h)
 sans_secret() { sed -E 's#(://[^:/@]+):[^@]*@#\1@#'; }
+# #518: a DSN's password never goes on a command line, which every process of
+# the host can read (ps, /proc/<pid>/cmdline). `dsn_sans_mdp CONFIG` is the DSN
+# of CONFIG without its password, for argv; `avec_mdp CONFIG cmd…` runs cmd
+# with that password in PGPASSWORD, which libpq reads. The split is the one of
+# ameesh's psql driver (db.split_password), kept here because this script runs
+# before ameesh is installed.
+partie_dsn() {  # CONFIG 0|1 → 0: the DSN's password, 1: the DSN without it
+  python3 -c 'import json, re, sys
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+dsn, password = json.load(open(sys.argv[1]))["dsn"], ""
+if "://" in dsn:
+    parts = urlsplit(dsn)
+    if parts.netloc and "@" in parts.netloc:
+        creds, host = parts.netloc.rsplit("@", 1)
+        user, _, pwd = creds.partition(":")
+        password = unquote(pwd)
+        dsn = urlunsplit((parts.scheme, "%s@%s" % (quote(user), host), parts.path,
+                          parts.query, parts.fragment))
+else:
+    match = re.search(r"(?:^|\s)password=(\S+)", dsn)
+    if match:
+        password = match.group(1).strip("\x27\"")
+        dsn = (dsn[: match.start()] + " " + dsn[match.end():]).strip()
+print((password, dsn)[int(sys.argv[2])])' "$1" "$2"
+}
+dsn_sans_mdp() { partie_dsn "$1" 1; }
+avec_mdp() {
+  local mdp; mdp=$(partie_dsn "$1" 0); shift
+  if [ -n "$mdp" ]; then PGPASSWORD=$mdp "$@"; else "$@"; fi
+}
 ancienne() { [ -f "$CONFIG_RESTE" ]; }
 ameesh_ancienne() { AMEESH_CONFIG="$CONFIG_RESTE" "$AMEESH" "$@"; }
 
@@ -125,13 +155,15 @@ verifier() {
 sauvegarder() {
   local jour; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
-  pg_dump -Fc "$(dsn_de "$CONFIG")" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  avec_mdp "$CONFIG" pg_dump -Fc -d "$(dsn_sans_mdp "$CONFIG")" \
+    -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
   ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
   if ancienne; then
     etape "ancienne base"
-    pg_dump -Fc "$(dsn_de "$CONFIG_RESTE")" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$(dsn_sans_mdp "$CONFIG_RESTE")" \
+      -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
 }
@@ -242,7 +274,8 @@ SQL
     echo "Executor role absent: initial provisioning requires a separate owner decision."
   fi
   if ancienne; then
-    "$DEPOT/deploy/mise-a-jour/role-executor.sh" "$(dsn_de "$CONFIG_RESTE")" "$EXECUTOR_ROLE"
+    avec_mdp "$CONFIG_RESTE" "$DEPOT/deploy/mise-a-jour/role-executor.sh" \
+      "$(dsn_sans_mdp "$CONFIG_RESTE")" "$EXECUTOR_ROLE"
   fi
 }
 
@@ -260,9 +293,11 @@ role() {
   fi
   if ancienne; then
     etape "rôle $ROLE, ancienne base"
-    existe=$(psql -X -At "$(dsn_de "$CONFIG_RESTE")" -c "SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'")
+    existe=$(avec_mdp "$CONFIG_RESTE" psql -X -At -d "$(dsn_sans_mdp "$CONFIG_RESTE")" \
+      -c "SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'")
     if [ "$existe" = 1 ]; then
-      psql -X -q "$(dsn_de "$CONFIG_RESTE")" -v ON_ERROR_STOP=1 -v role="$ROLE" \
+      avec_mdp "$CONFIG_RESTE" psql -X -q -d "$(dsn_sans_mdp "$CONFIG_RESTE")" \
+        -v ON_ERROR_STOP=1 -v role="$ROLE" \
         -f "$DEPOT/deploy/sql/role-superviseur.sql"
       echo "rôle réappliqué"
     else
