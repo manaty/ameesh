@@ -230,13 +230,14 @@ class AuditEvidenceTest(PgTestCase):
     def test_recipient_lock_blocks_reassignment_until_mailbox_commit(self):
         notifier = self.scoped_notifier()
         other = db_mod.connect(self.cfg)
-        other.execute("SET lock_timeout = '100ms'")
         alert = dict(self.findings()[0], orchestrators=["orch"])
         send = mail.send
 
         def concurrent_send(*args, **kwargs):
             with self.assertRaisesRegex(db_mod.DbError, "lock timeout"):
-                other.execute("UPDATE agent_registry SET chantier = 'other' WHERE name = 'orch'")
+                with other.transaction() as contender:
+                    contender.execute("SET LOCAL lock_timeout = '100ms'")
+                    contender.execute("UPDATE agent_registry SET chantier = 'other' WHERE name = 'orch'")
             return send(*args, **kwargs)
 
         try:
