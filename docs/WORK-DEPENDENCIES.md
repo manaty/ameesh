@@ -14,7 +14,7 @@ are mutually exclusive. The actor follows the normal `work` session identity
 rules; `--actor` has the same meaning as in other work commands.
 
 Both lots must exist and be open for a new link. A lot cannot block itself.
-Cycles, including transitive cycles, are refused. Graph edits serialize in
+Cycles in the direct prerequisite graph, including transitive cycles, are refused. Graph edits serialize in
 one transaction, so concurrent opposite links cannot both commit. Each
 successful edit records its actor, updates activity on the waiting lot and
 adds an audit event. Repeating an existing addition or absent removal leaves
