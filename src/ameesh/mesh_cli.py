@@ -239,19 +239,86 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         db.close()
 
 
+def _print_hold(hold: dict | None) -> None:
+    if hold:
+        print("  ON HOLD    until %s, by %s: %s (alerts about its agents muted; "
+              "ameesh hosts %s --release)" % (
+                  time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hold["until_ts"]))),
+                  hold["author"], hold["reason"], hold["host"]))
+
+
+def _host_hold(cfg: Config, args: argparse.Namespace) -> int:
+    """#254 : `ameesh hosts HOST --hold --until … --reason …` / `--release`."""
+    from . import host_holds
+
+    if not args.host:
+        print("ameesh hosts: --hold and --release name a host", file=sys.stderr)
+        return 2
+    if args.hold and args.release:
+        print("ameesh hosts: --hold or --release, not both", file=sys.stderr)
+        return 2
+    now = time.time()
+    if args.hold:
+        if not args.until or not (args.reason or "").strip():
+            print("ameesh hosts: --hold needs --until (a hold always ends) and --reason",
+                  file=sys.stderr)
+            return 2
+        try:
+            until = host_holds.parse_until(args.until, now)
+        except host_holds.HoldError as exc:
+            print("ameesh hosts: %s" % exc, file=sys.stderr)
+            return 2
+    db = _open(cfg)
+    try:
+        # as for `work set-app`: a human, an orchestrator or a design agent
+        try:
+            author = work.corrector(cfg, db, args.actor)
+        except work.WorkError as exc:
+            print("ameesh hosts: %s" % str(exc).replace("correction refused",
+                                                        "hold refused").replace(
+                      "correction: say who corrects", "hold: say who holds"),
+                  file=sys.stderr)
+            return 1
+        hosts = storage.of(db).hosts
+        if args.hold:
+            hold = hosts.hold(args.host, until_ts=until, reason=args.reason.strip(),
+                              author=author)
+            text = "host %s on hold until %s: %s — alerts about its agents muted" % (
+                args.host, time.strftime("%Y-%m-%d %H:%M", time.localtime(until)),
+                hold["reason"])
+            if args.json:
+                print(json.dumps(dict(hold, action="hold"), ensure_ascii=False))
+        else:
+            if not hosts.release(args.host):
+                print("ameesh hosts: %s is not on hold" % args.host, file=sys.stderr)
+                return 1
+            text = "host %s: hold lifted — its alerts are back" % args.host
+            if args.json:
+                print(json.dumps({"host": args.host, "action": "release"}))
+        if not args.json:
+            print(text)
+        # the readable thread of the project keeps the gesture
+        fil.record(cfg, db, sender=author, recipients=(), text=text)
+        return 0
+    finally:
+        db.close()
+
+
 def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list[dict]:
     """What `ameesh hosts` shows of each host (all, or `only`), by name."""
     from . import canon as canon_mod
+    from . import host_holds
     from . import menage as menage_mod
     from . import placement as placement_mod
     from . import resources as res
 
+    holds = host_holds.live(db)
     latest_by_host = {row["host"]: row for row in res.current(db)}
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping
     measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
-    names = set(latest_by_host) | set(measure_by_host)
+    names = set(latest_by_host) | set(measure_by_host) | set(holds)
     for canon in canons:
         names |= {h.title for h in canon.hosts}
     if only:
@@ -275,6 +342,8 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
             "history": res.history(db, name, history),
             "menage": _host_menage(hk, name, menage_mod.effective(canons, name),
                                    measure_by_host.get(name), latest),
+            # #254: the owner's hold on the host, if any
+            "hold": holds.get(name),
         })
     return parts
 
@@ -309,6 +378,7 @@ def _host_json(part: dict) -> dict:
         "unmeasured": res.unmeasured(latest),
         "history": part["history"],
         "housekeeping": part["menage"],
+        "hold": part["hold"],
     }
 
 
@@ -334,6 +404,11 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     from . import canon as canon_mod
     from . import resources as res
 
+    if args.hold or args.release:
+        return _host_hold(cfg, args)
+    if args.until or args.reason:
+        print("ameesh hosts: --until and --reason go with --hold", file=sys.stderr)
+        return 2
     db = _open(cfg)
     try:
         # L42 (0031) : les fiches Host de tous les canons configurés (le canon
@@ -361,11 +436,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 else "host without a Host card" if host is None else "responsible unknown"
             if latest is None:
                 print("%s — %s; no published measurement" % (name, resp))
+                _print_hold(part["hold"])
                 _print_host_fiches(fiches, physical, admissions, many=many)
                 _print_host_menage(menage)
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s; measured %s" % (name, resp, age))
+            _print_hold(part["hold"])
             _print_host_fiches(fiches, physical, admissions, many=many)
 
             def tag(key: str) -> str:
@@ -1907,6 +1984,16 @@ def build_parser() -> argparse.ArgumentParser:
                               "turns, lendable capacity, per day (L159g)")
     p_hosts.add_argument("--days", type=float, default=7.0,
                          help="window of --report, in days (default 7)")
+    p_hosts.add_argument("--hold", action="store_true",
+                         help="hold HOST on purpose (#254): alerts and nudges about its "
+                              "agents stay quiet until --until (required, 24 h at most)")
+    p_hosts.add_argument("--release", action="store_true", help="lift the hold of HOST")
+    p_hosts.add_argument("--until", default=None,
+                         help="end of the hold: a span (90m, 2h) or an ISO date")
+    p_hosts.add_argument("--reason", default=None, help="why the host is held (required)")
+    p_hosts.add_argument("--actor", default=None,
+                         help="who holds or releases, without a session identity "
+                              "(human:<id>); a human, an orchestrator or a design agent")
     p_hosts.set_defaults(func=cmd_hosts)
 
     p_menage = sub.add_parser(

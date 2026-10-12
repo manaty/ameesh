@@ -99,6 +99,9 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh hosts HOST --hold --until 2h --reason R | --release
+                                        the owner holds a host on purpose: its
+                                        agents' alerts stay quiet (#254);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);

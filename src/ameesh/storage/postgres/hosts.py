@@ -86,7 +86,30 @@ TURN_COLUMNS = (
 )
 
 
+_HOLD_COLUMNS = ("host, reason, author, extract(epoch from created_at)::float8 AS created_ts, "
+                 "extract(epoch from until)::float8 AS until_ts")
+
+
 class Hosts(interface.HostResources):
+
+    def holds(self) -> list[dict]:
+        return self.db.query("SELECT " + _HOLD_COLUMNS + " FROM host_holds "
+                             "WHERE until > now() ORDER BY host")
+
+    def hold(self, host, *, until_ts, reason, author) -> dict:
+        return self.db.query(
+            """
+            INSERT INTO host_holds (host, reason, author, until)
+            VALUES (%s, %s, %s, to_timestamp(%s))
+            ON CONFLICT (host) DO UPDATE SET
+                reason = excluded.reason, author = excluded.author,
+                created_at = now(), until = excluded.until
+            RETURNING """ + _HOLD_COLUMNS,
+            (host, reason, author, float(until_ts)))[0]
+
+    def release(self, host) -> bool:
+        return bool(self.db.query("DELETE FROM host_holds WHERE host = %s RETURNING host",
+                                  (host,)))
 
     def record(self, reading) -> dict:
         rows = self.db.query(

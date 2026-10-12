@@ -2213,12 +2213,27 @@ class Operations(Domain):
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
 
+    #254 : la pause d'un hôte voulue par le propriétaire (`host_holds`, 0392).
+
     Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
     1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
     tours en cours ; L159d: PSI, application and guest shares, lendable
     capacity. Les mesures illisibles sont NULL : on ne devine pas.
     Instants rendus en secondes epoch (`sampled_ts`).
     """
+
+    @abc.abstractmethod
+    def holds(self) -> list[dict]:
+        """#254 : les pauses en cours (`until` pas encore passé, heure de la
+        base) : host, reason, author, created_ts, until_ts."""
+
+    @abc.abstractmethod
+    def hold(self, host: str, *, until_ts: float, reason: str, author: str) -> dict:
+        """#254 : pose (ou remplace) la pause de `host` jusqu'à `until_ts`."""
+
+    @abc.abstractmethod
+    def release(self, host: str) -> bool:
+        """#254 : lève la pause de `host` ; faux s'il n'y en avait pas."""
 
     @abc.abstractmethod
     def record(self, reading: dict) -> dict:
