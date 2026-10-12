@@ -24,6 +24,11 @@ start time, human). `ameesh decide`, run inside the session, checks that this
 process is indeed its ANCESTOR: the answer is then the human's, channel `chat`
 (`decisions.chat_session`). The chat is launched from the human's terminal,
 never from an agent's session (refused).
+
+L233: the chat also shows decisions that agents wrote in prose in mail to
+bureau or to the human (`decisions.prose_decisions`, listed by `ameesh
+decisions`) and offers to have them filed as requests by their author
+(`ameesh decide ask --from-mail <id>`); the chat itself never files one.
 """
 from __future__ import annotations
 
@@ -216,6 +221,9 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
         cwd = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd \
             else os.path.join(session_dir(cfg), name)
         waiting = decisions.pending(db, human=human)
+        # L233: decisions written in prose in mail, to offer converting them
+        prose = [p for p in decisions.prose_decisions(db)
+                 if p["recipient"] in decisions.PROSE_RECIPIENTS + (human, decisions.OWNER_ANY)]
         prompt = consigne(human, name)
         pid = os.getpid()
         env = chat_env(cfg, name, pid)
@@ -233,6 +241,7 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
             print("identity: AGENT_MAIL_NAME=%s, %s=%s, %s=%d; no runner variable"
                   % (name, decisions.CHAT_ENV, name, decisions.CHAT_PID_ENV, pid))
             print("pending decisions for %s: %d" % (human, len(waiting)))
+            print("decisions written in prose in mail (not requests): %d" % len(prose))
             return 0
         row = storage.of(db).decisions.register_chat(
             name, human=human, host=cfg.host, harness=args.harness, cwd=cwd,
@@ -248,8 +257,11 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
               "started_at": platform.start_time(pid), "harness": args.harness,
               "host": cfg.host, "cwd": cwd, "ts": round(time.time(), 3)}
     path = write_session(cfg, record)
-    print("ameesh chat: %s, conversation of %s (%d pending decision(s)) — quitting the "
-          "harness ends the conversation" % (name, human, len(waiting)), flush=True)
+    print("ameesh chat: %s, conversation of %s (%d pending decision(s)%s) — quitting the "
+          "harness ends the conversation" % (
+              name, human, len(waiting),
+              "; %d decision(s) written in prose in mail, to convert" % len(prose)
+              if prose else ""), flush=True)
     code = 1
     try:
         proc = (popen or subprocess.Popen)(command, cwd=cwd, env=env)

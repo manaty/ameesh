@@ -19,7 +19,8 @@ from __future__ import annotations
 from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
-BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias")
+BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
+                 "waiting_without_question")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -94,6 +95,19 @@ def _estimate_bias(alert: dict) -> str:
                                  sens))
 
 
+def _waiting_without_question(alert: dict) -> str:
+    """L233: to the assignee and the orchestrators of its team."""
+    lot = int(alert["lot"])
+    title = alert.get("title")
+    return ("Lot #%d%s is in waiting_human but no decision request is open: the owner sees "
+            "a lot waiting for them and has no question to answer. Expected action: ask the "
+            "owner through the queue — ameesh decide ask --lot %d --question \"…\" "
+            "--option a=\"…\" [--recommend a --why \"…\"] — or, if nothing is expected from "
+            "him, move the lot back: ameesh work move %d <state>. A decision written in a "
+            "mail (to bureau or anyone) never counts." % (
+                lot, " « %s »" % title if title else "", lot, lot))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte."""
     return "Idle capacity: %s." % (alert.get("detail") or "?")
@@ -123,12 +137,16 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+        elif kind == "waiting_without_question":
+            text = _waiting_without_question(alert)
+            teams = {_team(by_name, alert.get("agent"))} - {""}
         else:
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
         out = {o: text for o in _of_teams(orchestras, by_name, teams)}
-        if kind == "estimate_bias" and alert.get("agent") in by_name:
-            out.setdefault(alert["agent"], text)       # l'estimateur lui-même
+        if kind in ("estimate_bias", "waiting_without_question") \
+                and alert.get("agent") in by_name:
+            out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même
         audit_text = text
     for name in auditor_names or ():
         out.setdefault(name, audit_text)

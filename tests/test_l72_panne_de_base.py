@@ -266,7 +266,8 @@ class PanneDeBaseTest(PgTestCase):
                 mock.patch.object(runner, "_listen_loop"), \
                 mock.patch.object(runner, "start_canon_sync"), \
                 mock.patch.object(runner, "start_balance_poll"), \
-                mock.patch.object(runner, "start_resource_poll"):
+                mock.patch.object(runner, "start_resource_poll"), \
+                mock.patch.object(runner, "start_version_poll"):
             self.assertEqual(runner.run(), 0)
         self.assertEqual(len(passes), 4)
 

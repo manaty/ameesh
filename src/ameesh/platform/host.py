@@ -10,6 +10,7 @@ l'appelant sache que rien n'a été lu.
 from __future__ import annotations
 
 import os
+import time
 
 from . import NotAvailable, is_linux
 from .process import PROC, _proc_ok, _psutil
@@ -428,3 +429,41 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
     out["btrfs_metadata_headroom_bytes"] = (max(0, meta[0] - sum(meta[1:]) - zone)
                                             + unallocated * meta[0] // max(disk_total, meta[0]))
     return out
+
+
+# --------------------------------------------------------------------------
+# the process's own cgroup and the boot (L159e: the capacity guard's freeze)
+# --------------------------------------------------------------------------
+
+#: identifier of the current boot, new at every boot
+BOOT_ID = os.path.join(PROC, "sys", "kernel", "random", "boot_id")
+
+
+def own_cgroup(path: str | None = None) -> str | None:
+    """The cgroup v2 path of this process (`/system.slice/x.service`), None
+    when unknown. `path`: a file in the format of /proc/self/cgroup."""
+    if path is None and not is_linux():
+        return None
+    for line in (_read(path or os.path.join(PROC, "self", "cgroup")) or "").splitlines():
+        if line.startswith("0::"):
+            return line[3:] or "/"
+    return None
+
+
+def boot_id(path: str | None = None) -> str | None:
+    """The identifier of the current boot, None when unknown."""
+    if path is None and not is_linux():
+        return None
+    return _read(path or BOOT_ID) or None
+
+
+def boottime() -> float | None:
+    """Seconds since the boot, on a clock the wall clock never moves
+    (CLOCK_BOOTTIME); None where it does not exist."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    if clock is None:
+        return None
+    try:
+        return time.clock_gettime(clock)
+    except OSError:
+        return None

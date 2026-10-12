@@ -29,6 +29,8 @@
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
         | unset [--per-hour] [--per-day] [--agent A]
         mesh budget caps, stored in the database, reloaded live (L70);
+  ameesh heavy [--nice N] -- <command> | --status [--json]
+        heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
         context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
         turn_grace_seconds=20m|0
@@ -66,11 +68,13 @@
         gated actions (spec §7);
   ameesh decisions [--all] [--for human:ID] [--json]
         decisions waiting for a human, across all projects: agent requests
-        (L124, oldest first), gated actions, work items waiting (C10);
+        (L124, oldest first), gated actions; apart, decisions written in prose
+        in mail and work items waiting with no question (L233, not requests);
   ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
         --option a="…" [--option b="…"] [--recommend a --why "…"] [--urgent]
-        [--by 2h] [--needs-signature]
-        an agent asks the owner for a decision (work item in waiting_human);
+        [--by 2h] [--needs-signature] [--from-mail <id>]
+        an agent asks the owner for a decision (work item in waiting_human,
+        the only way in — L233);
   ameesh decide <id> <option | "free text"> [--key FILE | --signed]
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
@@ -84,12 +88,13 @@
   ameesh import-v0 | export-v0          switch from/to the v0 file mailbox;
   ameesh migrate | doctor     schema and diagnostics;
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
-  ameesh harness list|show|check        harness descriptors (L16);
+  ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
   ameesh deps link|local|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
+  ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
 
 The human approval service (spec §9) is a separate command,
@@ -125,6 +130,8 @@ MESH_COMMANDS = (
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     "budget",
+    # L131 : suites lourdes plafonnées par hôte (`ameesh heavy -- <commande>`)
+    "heavy",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
@@ -238,6 +245,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command in ACTION_COMMANDS:
         from . import actions_cli
         return actions_cli.main(argv)
+    if command == "guard":
+        # L159e : garde de capacité d'une VM prêteuse (service système, sans base)
+        from . import guard
+        return guard.main(rest)
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)

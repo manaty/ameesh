@@ -51,6 +51,7 @@ from typing import Callable, Iterable, Sequence
 from . import config as config_mod
 from . import harnesses
 from . import storage
+from .gauge_cache import CLAUDE_GAUGES
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
@@ -460,8 +461,9 @@ class CostBook:
         #: L95 : dossiers Codex des comptes déclarés (`CODEX_HOME`), où chercher
         #: le journal d'un fil (modèle, total avant le tour) en plus du défaut
         self.codex_homes = [h for h in (codex_homes or []) if h]
-        # One compact reading map per journal, shared by all account lookups.
-        self._claude_gauge_cache: dict = {}
+        # Workers create a CostBook each poll: reuse verified observations,
+        # not account selection or budget decisions, across those instances.
+        self._claude_gauge_cache = CLAUDE_GAUGES
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -589,7 +591,7 @@ class CostBook:
         for agent in self.agents():
             if not self._claude_candidate(agent):
                 continue
-            path = os.path.join(self.agent_dir(agent), "events.jsonl")
+            path = os.path.abspath(os.path.join(self.agent_dir(agent), "events.jsonl"))
             try:
                 signature = _journal_signature(os.stat(path))
                 cached = self._claude_gauge_cache.get(path)
@@ -610,7 +612,8 @@ class CostBook:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
-        return best[1] if best else []
+        # A caller must not mutate the cached list seen by another CostBook.
+        return list(best[1]) if best else []
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.

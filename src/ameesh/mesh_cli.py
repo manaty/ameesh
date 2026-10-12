@@ -231,6 +231,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         # L42 (0031) : les fiches Host de tous les canons configurés (le canon
         # par défaut d'abord)
         canons = canon_mod.load_configured(cfg)
+        if getattr(args, "report", False):
+            return _host_report(cfg, db, canons, args)
         latest_by_host = {row["host"]: row for row in res.current(db)}
         # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
         # worktrees suivis)
@@ -364,6 +366,31 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _host_report(cfg: Config, db, canons, args: argparse.Namespace) -> int:
+    """`ameesh hosts HOST --report [--days N]` (L159g): the pilot report of
+    a host over its last N days of readings (study L159 §4.4)."""
+    from . import pilot
+    from . import resources as res
+
+    if not args.host:
+        print("ameesh hosts --report: name the host", file=sys.stderr)
+        return 2
+    days = float(args.days)
+    if not 0 < days <= res.HISTORY_RETENTION_S / 86400.0:
+        print("ameesh hosts --report: --days between 0 and %g (readings are kept "
+              "%g days)" % ((res.HISTORY_RETENTION_S / 86400.0,) * 2), file=sys.stderr)
+        return 2
+    readings = storage.of(db).hosts.since(args.host, days * 86400.0)
+    limits = res.host_limits(canons, args.host)["limits"]
+    rep = pilot.report(args.host, readings, limits, days=days)
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False, sort_keys=True))
+    else:
+        for line in pilot.format_report(rep):
+            print(line)
+    return 0
 
 
 def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
@@ -1681,6 +1708,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hosts.add_argument("--history", type=int, default=10,
                          help="number of readings in the short history (default 10)")
     p_hosts.add_argument("--json", action="store_true", help="one JSON object per host")
+    p_hosts.add_argument("--report", action="store_true",
+                         help="pilot report of HOST: pressure, load, tmpfs, PSI, hosted "
+                              "turns, lendable capacity, per day (L159g)")
+    p_hosts.add_argument("--days", type=float, default=7.0,
+                         help="window of --report, in days (default 7)")
     p_hosts.set_defaults(func=cmd_hosts)
 
     p_menage = sub.add_parser(
@@ -1990,6 +2022,9 @@ def build_parser() -> argparse.ArgumentParser:
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     from . import budget as budget_mod
     budget_mod.add_parsers(sub)
+    # L131 : suites lourdes plafonnées par hôte
+    from . import heavy as heavy_mod
+    heavy_mod.add_parser(sub)
 
     p_set = sub.add_parser("set", help="settings of an agent, effective at the next turn (L13, L26)")
     p_set.add_argument("agent")

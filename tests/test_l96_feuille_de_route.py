@@ -18,7 +18,7 @@ import unittest
 from ameesh import (exploitation, mail, notify, progress, projects, registry, roadmap,
                     roadmap_dev, roadmap_propose, storage, work)
 
-from .support import PgTestCase
+from .support import PgTestCase, hold_for_owner
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src",
                    "ameesh")
@@ -412,7 +412,7 @@ class RoadmapPgTest(PgTestCase):
         work.move(self.db, late["id"], "build")
         roadmap.plan(self.db, late["id"], start="2026-10-01", delivery="2026-10-05")
         waiting = self._lot("Choisir le mot par défaut")
-        work.move(self.db, waiting["id"], "waiting_human")
+        hold_for_owner(self.db, waiting["id"])
         roadmap.add_commitment(self.db, "Comptes séparés", due="2026-10-12", lot=late["id"],
                                source_ref="conversation 2026-10-10", now=NOW)
         now = time.time()

@@ -27,7 +27,7 @@ from unittest import mock
 from ameesh import (assignments, exploitation, mail, plan_git, projects, registry,
                     sous_utilisation, work)
 
-from .support import PgTestCase
+from .support import PgTestCase, hold_for_owner
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 #: l'identité de la session qui lance les tests ne doit pas fuir dans ceux qui
@@ -77,7 +77,10 @@ class MergedCommandTest(_Base):
             lot = work.add(self.db, title="lot %s" % state, actor="orch")
             if state == "qa":
                 work.move(self.db, lot["id"], "build")
-            if state != "intake":
+            if state == "waiting_human":
+                # L233 : waiting_human only behind an open owner request
+                hold_for_owner(self.db, lot["id"])
+            elif state != "intake":
                 work.move(self.db, lot["id"], state)
             done = work.merged(self.db, lot["id"], sha=SHA.upper(), actor="claude1",
                                note="fusion locale sur develop")

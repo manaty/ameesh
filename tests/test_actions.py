@@ -1563,9 +1563,10 @@ class ActionsCliTest(ActionsBase):
         self.approve(lost)
         self.assertEqual(self.execute(lost)["state"], "unknown")
         mine = work.add(self.db, title="choisir le transporteur", assignee=ALICE)
-        work.move(self.db, mine["id"], "waiting_human")
         theirs = work.add(self.db, title="valider la maquette", assignee="human:carol")
-        work.move(self.db, theirs["id"], "waiting_human")
+        # rows that predate L233 (waiting_human with no open request)
+        self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id IN (%s, %s)",
+                        (mine["id"], theirs["id"]))
 
         queue = json.loads(self.run_cli("decisions", "--json").stdout)
         self.assertEqual([r["action_id"] for r in queue["approvals"]],
@@ -1583,7 +1584,8 @@ class ActionsCliTest(ActionsBase):
         proc = self.run_cli("decisions")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for text in ("actions to approve", "unknown outcomes to settle",
-                     "work items waiting for a human", "choisir le transporteur"):
+                     "lots in waiting_human with no question asked",
+                     "choisir le transporteur"):
             self.assertIn(text, proc.stdout)
         proc = self.run_cli("decisions", "--for", "alice")
         self.assertEqual(proc.returncode, 1)

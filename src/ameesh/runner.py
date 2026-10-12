@@ -4038,6 +4038,27 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="ressources").start()
 
+    #: L120: how often the version thread wakes; the probe itself runs at
+    #: most every `harness_versions.PROBE_INTERVAL_S`
+    VERSIONS_WAKE_S = 600.0
+
+    def start_version_poll(self) -> threading.Thread | None:
+        """L120: harness versions read at startup, then every 6 h — on their
+        own thread, whatever `AMEESH_RESOURCE_INTERVAL` says (0 disables the
+        resource poll, not this). Not in `--once` mode."""
+        if self.once:
+            return None
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.harness_versions_once()
+                if self.stop.wait(self.VERSIONS_WAKE_S):
+                    return
+
+        thread = threading.Thread(target=boucle, daemon=True, name="versions")
+        thread.start()
+        return thread
+
     # -- ménage (L73) -----------------------------------------------------
     def housekeeping_policy(self):
         """Politique de ménage de l'hôte (L73) ; défauts sans canon."""
@@ -4492,16 +4513,45 @@ class Runner:
         log_async("power: %d agent(s) stopped cleanly, leases returned; "
                   "resuming when mains power returns" % len(workers))
 
+    def served_rows(self, db) -> list[dict]:
+        """The agents this runner leads: this host, mode `execute`, not
+        stopped, within `--agents`."""
+        return [r for r in registry.overview(db)
+                if (r.get("host") or "") == self.host
+                and (r.get("mode") or "execute") == "execute"
+                and r.get("status") != "stopped"
+                and (not self.agents_filter or r["name"] in self.agents_filter)]
+
+    def harness_versions_once(self, now: float | None = None) -> list[dict] | None:
+        """L120: read and record the version of the harnesses this runner
+        serves, at most every `PROBE_INTERVAL_S`; never raises. Read only:
+        a harness is never updated here."""
+        from . import harness_versions as versions_mod
+        now = time.monotonic() if now is None else now
+        if now < getattr(self, "_versions_due", 0.0):
+            return None
+        self._versions_due = now + versions_mod.PROBE_INTERVAL_S
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            served = {r.get("harness") for r in self.served_rows(db)} - {None, ""}
+            return versions_mod.probe_and_record(db, self.host, served)
+        except Exception as exc:  # never fatal for the runner
+            log_async("harness versions: not read (%s)" % type(exc).__name__)
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
     def log_harnesses(self) -> None:
         """Au démarrage (L106) : le binaire de chaque harnais servi, résolu et
         journalisé avec son chemin absolu — ou « hôte non prêt » tout de suite,
         sans attendre le premier tour. Ne lève jamais."""
         try:
-            rows = [r for r in registry.overview(self.db)
-                    if (r.get("host") or "") == self.host
-                    and (r.get("mode") or "execute") == "execute"
-                    and r.get("status") != "stopped"
-                    and (not self.agents_filter or r["name"] in self.agents_filter)]
+            rows = self.served_rows(self.db)
         except db_mod.DbError:
             return
         par_harnais: dict[str, list[str]] = {}
@@ -4658,6 +4708,7 @@ class Runner:
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()
+        self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
         if self.once:

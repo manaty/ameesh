@@ -381,6 +381,34 @@ class ResumeTest(_Base):
             reprise.resume(self.cfg, self.db, "repos")
         self.assertIn("turn in progress", str(ctx.exception))
 
+    def test_resume_without_live_runner_warns(self):
+        # #293: an agent that is not stopped (here paused by host pressure,
+        # "blocked") but whose runner is gone holds no live lease: the
+        # instruction waits for a runner, and resume must say so.
+        self.register("orphelin", "codex", cwd=self.travail)
+        registry.set_session(self.db, "orphelin", "sess-o")
+        self.db.execute("UPDATE agent_registry SET status = 'blocked', lease_owner = 'r-mort', "
+                        "lease_expires_at = now() - interval '1 hour' "
+                        "WHERE name = 'orphelin'")
+        avertissements: list[str] = []
+        out = reprise.resume(self.cfg, self.db, "orphelin", warn=avertissements.append)
+        self.assertFalse(out["runner_live"])
+        self.assertTrue(any("no runner" in a for a in avertissements), avertissements)
+
+    def test_resume_warns_only_without_runner(self):
+        # under a live runner, or for a stopped agent (its runner returned the
+        # lease), the missing lease is normal: no warning about the runner
+        self.register("vivant", "codex", cwd=self.travail)
+        registry.set_session(self.db, "vivant", "sess-v")
+        registry.claim(self.db, "vivant", "r1", 3600)
+        avertissements: list[str] = []
+        out = reprise.resume(self.cfg, self.db, "vivant", warn=avertissements.append)
+        self.assertTrue(out["runner_live"])
+        self._arrete("arrete", "sess-a", None)
+        out = reprise.resume(self.cfg, self.db, "arrete", warn=avertissements.append)
+        self.assertFalse(out["runner_live"])
+        self.assertFalse(any("no runner" in a for a in avertissements), avertissements)
+
 
 # --------------------------------------------------------------------------
 # session_account : écrit et effacé par l'exécuteur (faux harnais)
