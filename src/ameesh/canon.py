@@ -2545,9 +2545,16 @@ class _Loader:
             # whole (fail closed: the host lends nothing)
             if raw.get("lend") is not None:
                 from . import capacity_guard  # late import: no cycle
-                offer, problems, unknown = capacity_guard.parse_lend(raw["lend"])
+                # L479 : les formes héritées de `disk_paths` que main
+                # acceptait sont normalisées, pas refusées — un avertissement
+                # dit à l'opérateur de corriger la fiche (codex #459 r3)
+                legacy: list[str] = []
+                offer, problems, unknown = capacity_guard.parse_lend(raw["lend"], legacy)
                 for problem in problems:
                     self.add("host-policy-invalid", ERROR, "`policy.lend`: %s" % problem,
+                             **where, **subject)
+                for warning in legacy:
+                    self.add("host-lend-legacy", WARNING, "`policy.lend`: %s" % warning,
                              **where, **subject)
                 for key in unknown:
                     self.add("host-lend-unknown", WARNING,

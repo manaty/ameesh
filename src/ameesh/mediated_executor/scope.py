@@ -31,9 +31,11 @@ dans la transaction de l'opération (`dispatcher`).
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Optional
 
 from ..storage.postgres.mailbox import PROJECT_SQL
+from ..storage.postgres.hosts import TURN_COLUMNS
 from ..storage.postgres.registry import canon_governed_sql, placement_admitted_sql
 from .contract import Fence, Operation, agent_name
 from .interfaces import Principal, ScopeError, ScopeRules
@@ -296,6 +298,22 @@ class HostScopeRules(ScopeRules):
             "SELECT agent, host FROM turn_resources WHERE turn_id = %s", (kw.get("turn_id"),))
         if rows and (rows[0]["agent"] != fence.agent or rows[0]["host"] != principal.host):
             raise ScopeError("forbidden_scope", "tour d'un autre agent")
+
+    def _apply_turn_resources_running_started_before(self, principal, kw, fence):
+        # Filter before LIMIT so hidden agents cannot truncate a visible page.
+        agents = sorted(self.admitted_agents(principal))
+        if not agents:
+            raise ScopeError("forbidden_scope", "ownership registry has no admitted agents")
+        limit = self._bound_limit(kw.get("limit"))
+        rows = self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s"
+            "   AND agent = ANY(ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)))"
+            "   AND status = 'running'"
+            "   AND coalesce(ended_at, started_at) < to_timestamp(%s)"
+            "   AND id > %s ORDER BY id LIMIT %s",
+            (principal.host, json.dumps(agents), kw["before_ts"], kw["after_id"], limit))
+        raise Immediate(rows)
 
     def _apply_hosts_record(self, principal, kw, fence):
         reading = kw.get("reading")
