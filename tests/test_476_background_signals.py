@@ -122,6 +122,33 @@ class BackgroundSignalTest(unittest.TestCase):
             self.tracker._release_resource(self.entry)
         self.assertTrue(store.return_value.turn_resources.close_turn.call_args.kwargs["orphan"])
 
+    def test_uncaptured_child_after_leader_exit_keeps_resource_orphaned(self):
+        leader = mock.Mock()
+        leader.live.return_value = True
+        with mock.patch.object(background.ProcessHandle, "open", return_value=leader), \
+                mock.patch.object(platform, "command_line", return_value="fixture"), \
+                mock.patch.object(platform, "reap", return_value=None), \
+                mock.patch.object(background.storage, "of") as store, \
+                mock.patch.object(os, "killpg") as killpg:
+            entry = self.tracker.start(agent="test", turn_id="unknown-child",
+                                       pgid=7000, members=[row()], containers=[],
+                                       grace_s=1, now=0)
+            self.assertFalse(entry.unverified)
+            self.assertEqual(entry.handles, {7001: leader})
+            # The leader dies between passes; this child was never captured.
+            leader.live.return_value = False
+            child = row(pid=7002)
+            child["ppid"] = 1
+            self.tracker._refresh(entry, [child], now=2)
+        killpg.assert_not_called()
+        leader.send.assert_not_called()
+        leader.close.assert_called_once()
+        self.assertIsNone(entry.pgid)
+        self.assertEqual(entry.handles, {})
+        self.assertTrue(entry.unverified)
+        store.return_value.turn_resources.close_turn.assert_called_once_with(
+            "unknown-child", orphan=True, containers=None)
+
     def test_handle_rejects_snapshot_start_mismatch_and_closes_fd(self):
         with mock.patch.object(os, "pidfd_open", return_value=42, create=True), \
                 mock.patch("ameesh.platform.signals.start_time", return_value=11.0), \

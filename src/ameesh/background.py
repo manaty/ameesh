@@ -359,8 +359,10 @@ class Tracker:
             if not membres:
                 # Empty, zombie-only or no retained ownership proof. A
                 # remaining container never authorizes a later group signal.
-                if not any(p["pgid"] == entry.pgid and not p["zombie"] for p in table):
-                    entry.unverified = False
+                # A live member without ownership proof is uncertain, not
+                # evidence of successful cleanup. Preserve it as orphaned.
+                entry.unverified = any(p["pgid"] == entry.pgid and not p["zombie"]
+                                       for p in table)
                 entry.pgid = None
                 self._drop_handles(entry)
             else:
