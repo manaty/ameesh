@@ -101,6 +101,32 @@ class LeaderPopenTest(unittest.TestCase):
         self.assertIsNotNone(proc.returncode)
         self.assertEqual(_state(pid), "")
 
+    def test_a_finalizer_never_blocks_on_the_reap_lock(self):
+        # codex r4: cleanup from __del__/_cleanup while another thread holds
+        # the lock (and waits for the GC) must not block — it is deferred
+        import gc
+        import threading
+        proc = resident.spawn_leader([sys.executable, "-c", "pass"], start_new_session=True)
+        proc.wait(5)
+        pid, lock = proc.pid, proc._reap_lock
+        lock.acquire()
+        try:
+            box = []
+            fil = threading.Thread(target=lambda: box.append(
+                proc._internal_poll(_deadstate=sys.maxsize)), daemon=True)
+            fil.start()
+            fil.join(2)
+            self.assertFalse(fil.is_alive(), "orphan cleanup blocked on the reap lock")
+            self.assertEqual(box, [0])
+            self.assertIsNone(proc.returncode)          # deferred, not dropped
+            del proc, box
+            gc.collect()                                # __del__ under the held lock
+            self.assertEqual(_state(pid), "Z")          # its number still reserved
+        finally:
+            lock.release()
+        subprocess._cleanup()                           # CPython's retry
+        self.assertEqual(_state(pid), "")
+
     def test_kill_group_signals_under_the_reap_lock(self):
         # codex r3: a reap between poll() and the signal never lets it out
         proc = self._leader("import time; time.sleep(30)")

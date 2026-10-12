@@ -218,8 +218,15 @@ class LeaderPopen(subprocess.Popen):
         code = self._peek()
         if code is not None and _deadstate is not None and self.returncode is None:
             # an orphaned object (`__del__`, `_cleanup`): nobody will close it —
-            # its group is killed while its number is ours, then it is reaped
-            self.reap(timeout=0.0)
+            # its group is killed while its number is ours, then it is reaped.
+            # Never blocking in a finalizer (codex r4): lock taken elsewhere,
+            # `returncode` stays None and CPython keeps the object in
+            # `subprocess._active`, whose next `_cleanup()` retries.
+            if self._reap_lock.acquire(blocking=False):
+                try:
+                    self._reap_locked(0.0)
+                finally:
+                    self._reap_lock.release()
         return code
 
     def _wait(self, timeout=None):
@@ -252,25 +259,28 @@ class LeaderPopen(subprocess.Popen):
         """SIGKILL to the whole group, then the leader is reaped. A leader
         still not dead after `timeout` stays unreaped (its number with it)."""
         with self._reap_lock:
-            if self.returncode is not None:
-                return self.returncode
+            return self._reap_locked(timeout)
+
+    def _reap_locked(self, timeout: float) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        deadline = time.monotonic() + timeout
+        while True:
             try:
-                os.killpg(self.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    pid, status = os.waitpid(self.pid, os.WNOHANG)
-                except ChildProcessError:
-                    self.returncode = self._exit if self._exit is not None else -1
-                    return self.returncode
-                if pid:
-                    self.returncode = os.waitstatus_to_exitcode(status)
-                    return self.returncode
-                if time.monotonic() >= deadline:
-                    return None
-                time.sleep(0.01)
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = self._exit if self._exit is not None else -1
+                return self.returncode
+            if pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+                return self.returncode
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
 
 
 def spawn_leader(*args, **kwargs) -> subprocess.Popen:
