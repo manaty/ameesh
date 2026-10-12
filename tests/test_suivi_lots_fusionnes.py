@@ -527,8 +527,31 @@ class MergeSweepTest(_Base):
         _git(self.repo, "merge", "-q", "--ff-only", "develop")
         self.commit("la-suite")
         _git(self.repo, "checkout", "-q", "develop")
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")   # vue en avance
         _git(self.repo, "merge", "-q", "--ff-only", branch)
         self.assertEqual(self.sync()["merged"], 1)
+
+    def test_l118d_avance_jusqu_a_la_cible_sans_travail_nouveau(self):
+        # #312 r3 : après une fusion partielle, la branche est avancée jusqu'à
+        # develop sans travail nouveau (et develop a avancé entre-temps) : le
+        # lot reste ouvert
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        branch = "lot/%d-un" % n
+        self.merge(branch, "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n))
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")      # la fusion elle-même
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.commit("travail-d-un-autre")                         # develop avance
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
 
     def test_cited_lots(self):
         cas = {

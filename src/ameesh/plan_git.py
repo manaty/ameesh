@@ -614,13 +614,23 @@ def gh_pr_body(repo: str, number: int) -> str:
     return (data or {}).get("body") or ""
 
 
-def _moved_past(repo: str, tip: str, merge: dict) -> bool:
-    """#312 r2 : la pointe fusionnée `tip` va-t-elle au-delà de la branche
-    qu'avait fusionnée `merge` (son second parent) ?"""
+def _moved_past(repo: str, seen: str | None, tip: str, merge: dict) -> bool:
+    """#312 r2, L118d : la branche a-t-elle livré du travail au-delà de la
+    fusion partielle `merge` ? Il faut que le relevé l'ait vue en avance sur
+    sa cible avec une pointe `seen` (`branch_head`) qui n'était pas dans la
+    branche fusionnée (second parent de `merge`), et que cette pointe soit
+    entrée dans la cible (ancêtre de la pointe fusionnée `tip`). Une branche
+    seulement avancée jusqu'à la cible, sans travail nouveau, n'y suffit pas :
+    son nouveau sommet est la fusion partielle elle-même ou la suite de la
+    cible."""
     parents = merge.get("parents") or []
-    if len(parents) < 2:
+    if len(parents) < 2 or not seen:
         return False
-    return _git(repo, "merge-base", "--is-ancestor", tip, parents[1]).returncode != 0
+    if _git(repo, "merge-base", "--is-ancestor", seen, parents[1]).returncode == 0:
+        return False                         # vue avant la fusion partielle
+    if _git(repo, "merge-base", "--is-ancestor", seen, merge["sha"]).returncode == 0:
+        return False                         # rien de plus que la cible d'alors
+    return _git(repo, "merge-base", "--is-ancestor", seen, tip).returncode == 0
 
 
 def _read_pr_body(pr_body, repo: str, number: int, sweep: dict):
@@ -798,9 +808,10 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # implicite attend de savoir ; une fusion partielle retient toujours
             proven = bool(found and found["merged"] and row.get("branch"))
             if partial and found and found["merged"] and found["tip"] \
-                    and _moved_past(repo, found["tip"], partial[0]):
+                    and _moved_past(repo, row.get("branch_head"), found["tip"], partial[0]):
                 # #312 r2 : seule la dernière fusion de la branche compte ; la
-                # branche fusionnée depuis au-delà (avance rapide) a livré la suite
+                # branche vue depuis en avance, puis fusionnée (avance rapide),
+                # a livré la suite (L118d : pas une simple avance jusqu'à la cible)
                 partial = None
             held = partial[1] if partial else unreadable
             if held and cited is None and (partial or not proven):
