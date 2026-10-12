@@ -68,6 +68,18 @@ _WINDOW = re.compile(
     r"(?:\s+(?P<tz>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*))?\s*$" % ((_DAY,) * 4), re.I)
 
 
+def _finite(value) -> float | None:
+    """`value` as a finite float; None for a bool, a non-number, inf, nan, or
+    an integer too large for a float (YAML or JSON digits: no OverflowError)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def gate_state(doc, now: float, *, lending: bool) -> str:
     """The state a guest obeys, given the state document it read (None:
     absent or unreadable) at `now` (section 5.3 of the contract).
@@ -88,8 +100,8 @@ def gate_state(doc, now: float, *, lending: bool) -> str:
         return fallback
     if expires is None and not lending:
         return doc["state"]
-    if isinstance(expires, bool) or not isinstance(expires, (int, float)) \
-            or not math.isfinite(expires) or not now < expires <= now + MAX_STATE_TTL_S:
+    expires = _finite(expires)
+    if expires is None or not now < expires <= now + MAX_STATE_TTL_S:
         return fallback
     return doc["state"]
 
@@ -156,11 +168,10 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
                             % key)
     cpu = raw.get("cpu_max")
     if cpu is not None:
-        if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) \
-                or not math.isfinite(cpu) or cpu <= 0:
+        if _finite(cpu) is None or cpu <= 0:
             problems.append("`cpu_max`: finite number of CPUs > 0 expected")
         else:
-            offer["cpu_max"] = float(cpu)
+            offer["cpu_max"] = _finite(cpu)
     for key in LEND_SIZES:
         if raw.get(key) is None:
             continue

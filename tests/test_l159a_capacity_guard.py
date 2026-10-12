@@ -162,7 +162,8 @@ class FreshnessTest(unittest.TestCase):
 
     def test_non_finite_expiry(self):
         doc = {"schema": "ameesh-host-state/1", "state": "available", "seq": 1}
-        for value in (float("inf"), float("nan"), True):
+        # codex #212 r3: JSON digits too large for a float (10**400)
+        for value in (float("inf"), float("nan"), True, 10 ** 400):
             with self.subTest(value):
                 self.assertEqual(capacity_guard.gate_state(dict(doc, expires_ts=value), 0.0,
                                                            lending=True), "stopped")
@@ -229,7 +230,9 @@ class CanonTest(_Canons, unittest.TestCase):
         # codex #212 r2: YAML .inf / .nan, and a size too large for a float,
         # drop the offer through host-policy-invalid (never an OverflowError,
         # never an unbounded cap)
+        # codex #212 r3: an integer too large for a float (1 and 400 zeros)
         for n, (key, value) in enumerate((("cpu_max", ".inf"), ("cpu_max", ".nan"),
+                                          ("cpu_max", "1" + "0" * 400),
                                           ("memory_max", ".inf"), ("disk_max", ".nan"),
                                           ("memory_max", "9" * 400 + "GiB"))):
             with self.subTest(key=key, value=value[:6]):

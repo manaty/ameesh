@@ -206,7 +206,8 @@ state it read at `now` only if all of these hold, and counts it as
 
 - the document is readable, of schema `ameesh-host-state/1`, with a known
   `state` and an integer `seq`;
-- `expires_ts` is a finite number: **missing or `null` is stale**;
+- `expires_ts` is a finite number: **missing or `null` is stale**, and so
+  is a number with more digits than a float holds;
 - `now < expires_ts`: a state expiring at `now` is expired;
 - `expires_ts ≤ now + 300 s`: further ahead, a dead guard's `available`
   would outlive it. A guard writes `now + 90 s` by default.
