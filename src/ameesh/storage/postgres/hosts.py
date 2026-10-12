@@ -201,6 +201,27 @@ class TurnResources(interface.TurnResources):
             (_array(containers), turn_id),
         )
 
+    def settle(self, turn_id) -> None:
+        self.db.query(
+            "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = %s AND status <> 'done' RETURNING id", (turn_id,))
+
+    def settle_many(self, turn_ids) -> int:
+        if not turn_ids:
+            return 0
+        return len(self.db.query(
+            "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status <> 'done' RETURNING id",
+            (_array(turn_ids),)))
+
+    def mark_orphan_many(self, turn_ids) -> int:
+        if not turn_ids:
+            return 0
+        return len(self.db.query(
+            "UPDATE turn_resources SET status = 'orphan', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status NOT IN ('done', 'orphan')"
+            " RETURNING id", (_array(turn_ids),)))
+
     def get(self, turn_id) -> dict | None:
         rows = self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources WHERE turn_id = %s",
@@ -223,6 +244,13 @@ class TurnResources(interface.TurnResources):
             "SELECT " + TURN_COLUMNS + " FROM turn_resources" + where +
             (" AND" if where else " WHERE") + " status = 'orphan'"
             " ORDER BY started_at DESC, id DESC LIMIT %s", tuple(params))
+
+    def orphans_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND status = 'orphan' AND started_at < to_timestamp(%s)"
+            "   AND id > %s ORDER BY id LIMIT %s",
+            (host, float(before_ts), int(after_id), int(limit)))
 
     def stale_running(self, older_than_s, host=None) -> list[dict]:
         where, params = "", [float(older_than_s)]
