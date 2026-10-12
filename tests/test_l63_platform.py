@@ -187,57 +187,129 @@ class PlatformTest(unittest.TestCase):
             with self.assertRaises(platform.NotAvailable):
                 platform.holders(__file__, "x")
 
-    def _faux_proc(self, comm: str, cmdline: str | None, uids: str) -> str:
-        """Un /proc minimal : ce processus-ci (lisible) et le pid 4242, du
-        même utilisateur ou non (`uids` : réel effectif …), dont `fd` refuse
-        la lecture (non dumpable) et `cmdline` aussi si None."""
+    def _faux_proc(self, comm: str, uids: str, *, state: str = "S",
+                   lien_refuse: bool = False, status_illisible: bool = False) -> str:
+        """Un /proc minimal : ce processus-ci (lisible) et le pid 4242
+        (`uids` : réel effectif …), dont `fd` refuse la lecture (non
+        dumpable) ou, avec `lien_refuse`, se liste mais pas ses liens."""
         import tempfile
         racine = tempfile.mkdtemp()
-        self.addCleanup(lambda: (os.chmod(os.path.join(racine, "4242", "fd"), 0o700),
+        autre = os.path.join(racine, "4242")
+        self.addCleanup(lambda: (subprocess.run(["chmod", "-R", "u+rwx", racine]),
                                  subprocess.run(["rm", "-rf", racine])))
         moi = os.path.join(racine, str(os.getpid()))
         os.makedirs(os.path.join(moi, "fd"))
         os.symlink(moi, os.path.join(racine, "self"))
-        autre = os.path.join(racine, "4242")
         os.makedirs(os.path.join(autre, "fd"))
         with open(os.path.join(autre, "comm"), "w") as fh:
             fh.write(comm + "\n")
         with open(os.path.join(autre, "status"), "w") as fh:
-            fh.write("Name:\t%s\nUid:\t%s\n" % (comm, uids))
+            fh.write("Name:\t%s\nState:\t%s (x)\nUid:\t%s\n" % (comm, state, uids))
         with open(os.path.join(autre, "cmdline"), "w") as fh:
-            fh.write((cmdline or "") + "\0")
-        if cmdline is None:
-            os.chmod(os.path.join(autre, "cmdline"), 0)
-        os.chmod(os.path.join(autre, "fd"), 0)
+            fh.write(comm + "\0")
+        if status_illisible:
+            os.chmod(os.path.join(autre, "status"), 0)
+        if lien_refuse:   # readlink d'un fichier ordinaire : EINVAL, pas de cible
+            open(os.path.join(autre, "fd", "3"), "w").close()
+        else:
+            os.chmod(os.path.join(autre, "fd"), 0)
         return racine
 
     def test_detenteur_du_meme_utilisateur_illisible(self):
-        """L63b : un processus de l'utilisateur, non dumpable, dont ni les
-        fichiers ouverts ni la ligne de commande ne se lisent, n'est pas une
-        observation vide : NotAvailable (repli /proc, psutil retiré)."""
+        """L63b : un processus de l'utilisateur dont les fichiers ouverts se
+        refusent n'est pas une observation vide : NotAvailable (repli /proc,
+        psutil retiré). Revue #377 r2 : le gestionnaire de services se
+        reconnaît à son PID, pas à son nom ; un refus sur un lien compte ; un
+        status illisible vaut « inconnu ». CI : un processus qui se termine
+        (zombie) ou une aide setuid (sudo) ne compte pas."""
         if os.geteuid() == 0:
             self.skipTest("root lit tout : pas de refus de lecture à simuler")
         moi = "%d %d %d %d" % ((os.getuid(),) * 4)
-        cas = (("harnais muet", "node", None, moi, True),
-               ("gestionnaire de services", "(sd-pam)", "(sd-pam)", moi, False),
-               ("aide setuid (sudo)", "sudo", "sudo ls", "%d 0 0 0" % os.getuid(), False),
-               ("autre utilisateur", "node", None, "0 0 0 0", False))
-        for nom, comm, cmdline, uids, refus in cas:
+        cas = (("harnais muet", "node", moi, {}, (), True),
+               ("nom emprunté au gestionnaire", "systemd", moi, {}, (), True),
+               ("gestionnaire, par son PID", "systemd", moi, {}, {4242}, False),
+               ("refus sur un lien", "node", moi, {"lien_refuse": True}, (), True),
+               ("status illisible", "node", moi, {"status_illisible": True}, (), True),
+               ("zombie", "git", moi, {"state": "Z"}, (), False),
+               ("aide setuid (sudo)", "sudo", "%d 0 0 0" % os.getuid(), {}, (), False),
+               ("autre utilisateur", "node", "0 0 0 0", {}, (), False))
+        for nom, comm, uids, options, gestionnaires, refus in cas:
             with self.subTest(nom):
-                racine = self._faux_proc(comm, cmdline, uids)
+                racine = self._faux_proc(comm, uids, **options)
                 with mock.patch.object(platform, "psutil", None), \
                         mock.patch.object(platform.process, "PROC", racine), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                        mock.patch.object(platform.process, "service_managers",
+                                          return_value=frozenset(gestionnaires)), \
                         mock.patch.object(platform, "SYSTEM", "linux"):
                     if refus:
                         with self.assertRaises(platform.NotAvailable) as ctx:
                             platform.holders(__file__, "x")
-                        self.assertIn("4242 node", str(ctx.exception))
+                        self.assertIn("4242", str(ctx.exception))
                     else:
                         self.assertEqual(platform.holders(__file__, "x"), [])
 
+    def test_un_processus_qui_se_termine_n_est_pas_un_doute(self):
+        """CI #377 r2 : un `git` en fin de vie refuse son `fd` avant d'être
+        zombie ; relu, il est zombie ou parti. Un détenteur vivant, lui,
+        reste un doute à chaque relecture."""
+        uid = str(os.getuid())
+        vivant = {"Name": ["git"], "State": ["R"], "Uid": [uid, uid]}
+        process = platform.process
+        for nom, suite, refus in (("se termine", [vivant, dict(vivant, State=["Z"])], False),
+                                  ("disparaît", [vivant, None], False),
+                                  ("reste vivant", [vivant] * 10, True)):
+            with self.subTest(nom), \
+                    mock.patch.object(process, "_proc_status", side_effect=suite), \
+                    mock.patch.object(process, "DOUBT_RETRY_S", 0):
+                doutes = {"4242": process._doubt_proc("4242", os.getuid(), lambda: ())}
+                again = lambda pid: process._doubt_proc(pid, os.getuid(), lambda: ())
+                if refus:
+                    with self.assertRaises(platform.NotAvailable):
+                        process._settle(doutes, again)
+                else:
+                    process._settle(doutes, again)
+
+    def test_gestionnaire_de_services_par_pid(self):
+        """Le MainPID de user@<uid>.service (demandé à systemd) et son enfant
+        démarré le premier, s'il s'appelle (sd-pam) ; un autre enfant nommé
+        (sd-pam) ou systemd ne l'est pas."""
+        import tempfile
+        racine = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", racine])
+
+        def proc(pid, comm, ppid, start):
+            os.makedirs(os.path.join(racine, str(pid)))
+            with open(os.path.join(racine, str(pid), "comm"), "w") as fh:
+                fh.write(comm + "\n")
+            champs = ["S", str(ppid)] + ["0"] * 17 + [str(start)] + ["0"] * 10
+            with open(os.path.join(racine, str(pid), "stat"), "w") as fh:
+                fh.write("%d (%s) %s\n" % (pid, comm, " ".join(champs)))
+
+        proc(100, "systemd", 1, 10)
+        proc(102, "systemd", 100, 30)
+        proc(103, "(sd-pam)", 100, 40)
+        os.makedirs(os.path.join(racine, "self"))
+        fait = subprocess.CompletedProcess([], 0, stdout="100\n", stderr="")
+        process = platform.process
+        with mock.patch.object(process, "PROC", racine), \
+                mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch("subprocess.run", return_value=fait):
+            # le premier enfant n'est pas (sd-pam) : seul le gestionnaire
+            self.assertEqual(process.service_managers(1000), frozenset({100}))
+            proc(101, "(sd-pam)", 100, 11)
+            self.assertEqual(process.service_managers(1000), frozenset({100, 101}))
+        sans = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        with mock.patch.object(process, "PROC", racine), \
+                mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch("subprocess.run", return_value=sans):
+            self.assertEqual(process.service_managers(1000), frozenset())
+
     def test_detenteur_du_meme_utilisateur_refuse_psutil(self):
-        """L63b, voie psutil : AccessDenied sur un processus de l'utilisateur
-        (réel et effectif) est un doute ; sur une aide setuid, non."""
+        """L63b, voie psutil hors Linux : AccessDenied sur un processus de
+        l'utilisateur (uid effectif) est un doute ; sur une aide setuid, un
+        zombie ou un exécutable système (macOS : ContextStoreAgent sous
+        /System, CI #377 r2), non."""
         class AccessDenied(Exception):
             pass
 
@@ -245,8 +317,8 @@ class PlatformTest(unittest.TestCase):
             pass
 
         class Proc:
-            def __init__(self, pid, effective, name="node"):
-                self.pid, self._eff, self._name = pid, effective, name
+            def __init__(self, pid, effective, exe="/opt/node", status="sleeping"):
+                self.pid, self._eff, self._exe, self._status = pid, effective, exe, status
 
             def oneshot(self):
                 return contextlib.nullcontext()
@@ -260,18 +332,33 @@ class PlatformTest(unittest.TestCase):
                 raise AccessDenied()
 
             def name(self):
-                return self._name
+                return "x"
+
+            def exe(self):
+                return self._exe
+
+            def status(self):
+                return self._status
 
             def uids(self):
                 return mock.Mock(real=os.getuid(), effective=self._eff)
 
-        for nom, eff, refus in (("harnais", os.getuid(), True), ("setuid", 0, False)):
+        cas = (("harnais", Proc(4242, os.getuid()), True),
+               ("setuid", Proc(4242, 0), False),
+               ("zombie", Proc(4242, os.getuid(), status="zombie"), False),
+               ("système", Proc(4242, os.getuid(),
+                                exe="/System/Library/PrivateFrameworks/X/ContextStoreAgent"),
+                False))
+        for nom, autre, refus in cas:
             with self.subTest(nom):
                 faux = mock.MagicMock(AccessDenied=AccessDenied, NoSuchProcess=NoSuchProcess,
-                                      ZombieProcess=NoSuchProcess)
-                faux.Process.side_effect = lambda pid: Proc(pid, os.getuid())
-                faux.process_iter.return_value = [Proc(4242, eff)]
-                with mock.patch.object(platform, "psutil", faux):
+                                      ZombieProcess=NoSuchProcess, STATUS_ZOMBIE="zombie")
+                faux.Process.side_effect = lambda pid, autre=autre: (
+                    autre if pid == autre.pid else Proc(pid, os.getuid()))
+                faux.process_iter.return_value = [autre]
+                with mock.patch.object(platform, "psutil", faux), \
+                        mock.patch.object(platform.process, "_proc_ok", return_value=False), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0):
                     if refus:
                         with self.assertRaises(platform.NotAvailable):
                             platform.holders(__file__, "x")
