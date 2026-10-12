@@ -12,8 +12,10 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   9GiB`, `agent_memory_max 4.5GiB`, `disk_max 40GiB`; reclaim at 6 GiB
   available, CPU pressure 20 %, memory 2 %, I/O 20 %, 10 GiB free on `/`;
   drain 120 s, calm 600 s;
-* the host's own agents keep `max_agents: 6`, to be reviewed with the report
-  of 20/10.
+* the host's own agents stay six, to be reviewed with the report of 20/10;
+  the canon's `max_agents` goes from 6 to 8 because it counts every
+  placement of the host, the guests' included (6 would make the fiche
+  invalid).
 
 ## Before
 
@@ -92,9 +94,9 @@ sudo deploy/guest/install-pilot.sh --check # every line "ok"
 
 ## Enable the two guests
 
-Only once the canon PR is merged: the Host fiche gets `policy.lend` (the
-offer above, the one in `/etc/ameesh/guard.json`) and keeps `max_agents: 6`
-for its own agents, without `volatile`; `policy.work_dirs` puts the guests'
+Only once the canon PR (manaty/home#24, a draft until that day) is merged: the Host fiche gets `policy.lend` (the
+offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 8` (6
+own agents + 2 guests), without `volatile`; `policy.work_dirs` puts the guests'
 work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek5 and
 deepseek6 move from manaty-mesh-1 to ameesh-agents-1. Their runners on manaty-mesh-1 are
 stopped first: an agent runs on one host at a time.
