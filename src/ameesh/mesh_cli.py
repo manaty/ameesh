@@ -358,7 +358,6 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     or volume.get("btrfs_metadata_headroom_bytes") is not None else "",
                     " (also %s)" % ", ".join(others) if others else ""))
 
-
             for line in _host_measure_lines(latest, limits.get("lend")):
                 print(line)
 
@@ -2332,7 +2331,6 @@ def cmd_accounts(cfg: Config, args) -> int:
             texte = ("Account %s/%s declared healthy on %s by %s: the agents auth_blocked "
                      "on this account resume." % (args.harness, args.account or "(default)",
                                                   cfg.host, qui))
-
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                        meta={"action": "compte", "type": "sain", "harnais": args.harness,
                              "compte": args.account, "audit": "accounts"})

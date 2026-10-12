@@ -34,7 +34,6 @@ qu'il ne fait jamais, et comment il en rend compte.
   « Forfait sous-employé », « Capacité au repos », « Relance »). La commande
   citée est le geste de l'orchestrateur ; l'auditeur vérifie au passage court
   suivant qu'il a été fait, et sinon le nomme dans son
-
   rapport (une relance reçue veut dire que rien n'a bougé en 6 h) ;
 * le courrier « Déploiement … », envoyé par l'unité de redémarrage qu'il a
   lancée hors de son tour (voir « Déployer ») ;
@@ -394,7 +393,6 @@ par lui-même (une lecture, pas un sous-agent) :
 journalctl --user -u 'ameesh-runner-agent@*' -u ameesh-notify --since '-24h' \
   --no-pager -o short-iso \
   | grep -E 'rotation|harnais arrêté|harness stopped|SIGKILL|hôte non prêt|host not ready|bail perdu|lease lost|orphelin|orphan|pression|pressure|échec|fail|arrêté|stopped'
-
 # exécuteurs d'un serveur du mesh (unités système), par l'accès que l'hôte donne
 journalctl -u 'ameesh-runner@*' --since '-24h' --no-pager -o short-iso
 

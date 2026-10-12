@@ -2423,7 +2423,6 @@ class AgentWorker(threading.Thread):
         log_async("[%s] %s lifted: healthy account — resuming" % (self.name, texte))
         self._fil_note("Block %s lifted: a healthy account is available again, "
                        "the agent resumes." % texte, meta={"action": "auth_reprise"})
-
         return True
 
     def pick(self) -> dict | None:
@@ -3140,7 +3139,6 @@ class AgentWorker(threading.Thread):
                                  or proc.stdout.readline().strip() != audit_guard.READY):
                 raise _LancementImpossible("auditor scope not validated: memory cap "
                                            "missing or scope creation refused")
-
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)

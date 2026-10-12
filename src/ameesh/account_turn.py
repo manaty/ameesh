@@ -386,7 +386,6 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
             possible, raison = False, "state of the old account unreadable (%s)" % exc
         if not possible:
             _log("[%s] no summary under account %s: %s" % (worker.name, nom_ancien, raison))
-
     if possible:
         # le résumé se fait sous l'ANCIEN compte, qui seul peut reprendre la session
         worker._account_override = old
