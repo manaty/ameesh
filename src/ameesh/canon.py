@@ -818,6 +818,12 @@ class HostPolicy:
     #: tmpfs_alert, redirect, xdg_cache, worktrees, orphan_min_size}` validé
     #: par `ameesh.menage.parse_policy` ; None = valeurs par défaut.
     housekeeping: dict | None = None
+    #: hôte volatil (L112) : appareil prêté qui peut disparaître à tout
+    #: moment (VM Compute) ; son bail est court, 90 s par défaut
+    volatile: bool = False
+    #: durée du bail des agents de cet hôte (secondes, L112) ; None = 90 s
+    #: pour un hôte volatil, sinon la configuration de l'exécuteur
+    lease_ttl: float | None = None
     #: offer of a lending host (L159a, docs/GARDE-DE-CAPACITE.md): `{cpu_max,
     #: memory_max, disk_max, …}` validated by `ameesh.capacity_guard.parse_lend`
     #: (sizes in bytes); None = the host lends nothing (absent or unreadable).
@@ -917,6 +923,13 @@ class Host:
     #: sont eux qui doivent avoir accès au dépôt de mémoire d'une persona pour
     #: qu'elle tourne ici.
     admins: list[str] | None = None
+    #: humains qui ont l'ACCÈS PHYSIQUE à la machine (L110, 0029), distincts
+    #: des `admins` : un enfant qui utilise le portable prêté ne l'administre
+    #: pas, mais peut tout lire dans la VM. Ils comptent dans `H(hôte)` comme
+    #: le responsable et les admins. Absent : aucun occupant au-delà du
+    #: responsable et des admins — seules les personas lisibles par eux
+    #: partent sur la machine (défaut sûr : rien n'est supposé de plus).
+    occupants: list[str] | None = None
 
 
 @dataclass
@@ -1132,7 +1145,7 @@ class Canon:
                              superiors=m.superiors, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
-                           admins=h.admins,
+                           admins=h.admins, occupants=h.occupants,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, type=a.fiche.type, responsible=a.responsible, team=a.team,
@@ -2169,6 +2182,23 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.max_agents`: positive integer expected", **where, **subject)
                     policy.max_agents = 0
+            # L112 : hôte volatil et durée de son bail
+            if raw.get("volatile") is not None:
+                if isinstance(raw["volatile"], bool):
+                    policy.volatile = raw["volatile"]
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.volatile` : booléen attendu", **where, **subject)
+                    policy.volatile = True  # prudence : bail court
+            if raw.get("lease_ttl") is not None:
+                value = raw["lease_ttl"]
+                if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                        and 10 <= value <= 3600:
+                    policy.lease_ttl = float(value)
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.lease_ttl` : nombre de secondes entre 10 et 3600 "
+                             "attendu", **where, **subject)
             # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
             # validée ici ; une clé illisible est une erreur (fail closed sur le
             # seuil, qui retombe alors sur sa valeur par défaut prudente).
@@ -2235,9 +2265,11 @@ class _Loader:
                     setattr(policy, key, kept)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
+        occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
-                                     policy=policy, tags=tags, admins=admins, fiche=fiche))
+                                     policy=policy, tags=tags, admins=admins,
+                                     occupants=occupants, fiche=fiche))
 
     def _host_resources(self, raw, where: dict, subject: dict) -> dict | None:
         """Seuils `policy.resources` validés, ou None si rien n'est déclaré.
@@ -2752,6 +2784,13 @@ def validate(canon: Canon) -> list[Finding]:
             add("host-responsible-unresolved", ERROR,
                 "responsible %r of host %s does not resolve to a human Member"
                 % (host.responsible, host.title), host.fiche, host=host.title)
+        for ref in host.occupants or []:
+            # L110 (0029) : un occupant qui ne résout pas rend la règle de
+            # visibilité illisible pour cet hôte (refus) ; autant le dire ici
+            if canon.resolve_human(ref) is None:
+                add("host-occupant-unresolved", ERROR,
+                    "occupant %r de l'hôte %s ne résout pas vers un Member humain"
+                    % (ref, host.title), host.fiche, host=host.title)
         for name in host.policy.harnesses or []:
             if name not in known_harnesses:
                 add("host-harness-unknown", ERROR,
