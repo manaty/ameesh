@@ -450,7 +450,7 @@ class DisponibiliteTest(unittest.TestCase):
             self.assertIn(kind, notify.DEFAULT_TYPES)
             self.assertIn(kind, notify.TYPE_LABELS)
         msg = notify.render(out[0], "raised", 1000.0 + D.DEFAULT_UNAVAILABLE_ALERT_S)
-        self.assertIn("hôte", msg.title)
+        self.assertIn("host", msg.title)
 
 
 # ==========================================================================

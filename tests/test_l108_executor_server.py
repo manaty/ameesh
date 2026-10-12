@@ -503,7 +503,7 @@ class FencingTest(ServeurExecTest):
 
     def test_expiry_during_row_lock_wait_uses_the_database_clock_after_lock(self):
         from ameesh.mediated_executor.dispatcher import fence_holds, session_lease_holds
-        self.hold("inge-front", OWNER, 42, seconds=2)
+        self.hold("inge-front", OWNER, 42, seconds=10)
         result, errors = [], []
         def contender():
             try:
@@ -521,6 +521,9 @@ class FencingTest(ServeurExecTest):
                 thread.start()
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
+                    # PostgreSQL caches activity snapshots within a transaction.
+                    # The psql connection can open after our first observation.
+                    tx.query("SELECT pg_stat_clear_snapshot()")
                     blocked = tx.query(
                         "SELECT 1 FROM pg_stat_activity WHERE %s = ANY(pg_blocking_pids(pid))", (pid,))
                     if blocked:

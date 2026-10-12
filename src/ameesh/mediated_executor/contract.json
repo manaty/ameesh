@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 314,
+  "interface_total": 315,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3972,6 +3972,7 @@
     "open_by_agent",
     "orphans",
     "orphans_started_before",
+    "running_started_before",
     "settle",
     "settle_many",
     "stale_running"

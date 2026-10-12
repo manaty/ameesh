@@ -63,7 +63,7 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (314
+signature et les mêmes types. Il vérifie aussi que l'interface entière (315
 opérations après intégration de main le 12/10) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
