@@ -109,8 +109,16 @@ def _waiting_without_question(alert: dict) -> str:
 
 
 def _for_auditor(alert: dict) -> str:
-    """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte."""
-    return "Idle capacity: %s." % (alert.get("detail") or "?")
+    """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
+    des lots ouverts sans agent, l'écart est le sien (L165b, niveau 1)."""
+    text = "Idle capacity: %s." % (alert.get("detail") or "?")
+    if alert.get("lots"):
+        text += (" Lots are waiting with idle agents: if this still holds at your next "
+                 "pass, 30 min or more after this mail, fix it yourself (level 1, reversible): ameesh "
+                 "work assign <lot> <agent> (an idle agent of the lot's team, highest "
+                 "priority first), then agent-mail send <agent> \"…\" --lot <lot> to "
+                 "wake it; name it in your report.")
+    return text
 
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
