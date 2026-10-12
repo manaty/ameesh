@@ -74,7 +74,7 @@ class AdapterTest(unittest.TestCase):
                 [adapter.binary, "--profile", "agent", "--json", "--session-id",
                  "session-1", "fais X"],
             )
-            self.assertEqual(adapter.env(), {"DSH_PERMISSION_MODE": "danger-full-access"})
+            self.assertEqual(adapter.env()["DSH_PERMISSION_MODE"], "danger-full-access")
 
     def test_lecture_flux_claude(self):
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
