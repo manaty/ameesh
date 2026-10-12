@@ -298,12 +298,15 @@ class Tracker:
         entry.others = len(members) - len(entry.jobs)
         with self.lock:
             self.entries.append(entry)
-        try:
-            storage.of(self.runner.db).turn_resources.begin_grace(
-                turn_id, [c["id"] for c in containers] or None)
-        except Exception as exc:  # la grâce ne casse jamais la fin d'un tour
-            self.log("[%s] resource of turn %s not marked as in grace (%s)"
-                     % (agent, turn_id[:8], exc))
+        # Path B: `turn_resources.begin_grace` is not in contract 1.1; on a
+        # mediated executor the grace is tracked here only, not in the base.
+        if not getattr(self.runner, "mediated", False):
+            try:
+                storage.of(self.runner.db).turn_resources.begin_grace(
+                    turn_id, [c["id"] for c in containers] or None)
+            except Exception as exc:  # la grâce ne casse jamais la fin d'un tour
+                self.log("[%s] resource of turn %s not marked as in grace (%s)"
+                         % (agent, turn_id[:8], exc))
         self.log("[%s] background work of turn %s: %s — grace period of %s, then "
                  "cleanup if still running"
                  % (agent, turn_id[:8], self._what(entry, running_only=True),
@@ -440,7 +443,8 @@ class Tracker:
             if runtime is not None and not menage_mod.disabled():
                 lignes = menage_mod.reap_containers(runtime, db, self.runner.host,
                                                     only_turn=entry.turn_id)["entries"]
-                if lignes:
+                if lignes and not getattr(self.runner, "mediated", False):
+                    # path B: `housekeeping.log` is not in contract 1.1
                     storage.of(db).housekeeping.log(
                         self.runner.host, lignes, actor="runner:%s" % self.runner.runner_id)
         except Exception as exc:  # jamais fatal au fil de suivi
