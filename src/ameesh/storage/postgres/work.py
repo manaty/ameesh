@@ -36,7 +36,7 @@ ITEM_COLUMNS = """
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
     q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
-    q.queued_by,
+    q.queued_by, q.source,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -656,21 +656,23 @@ class WorkItems(interface.WorkItems):
                         " WHERE q.work_item_id = %%s" % QUEUE_COLUMNS, (int(item_id),))
         return rows[0] if rows else None
 
-    def queue_add(self, item_id, *, target, frozen_sha, note, actor) -> dict | None:
+    def queue_add(self, item_id, *, target, frozen_sha, note, actor,
+                  source="") -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
             if not lot:
                 return None
             tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by)"
-                " VALUES (%s, %s, %s, %s)"
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source)"
+                " VALUES (%s, %s, %s, %s, %s)"
                 " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
+                "   source = excluded.source,"
                 "   landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
                 "   updated_at = now()",
-                (int(item_id), target, frozen_sha, actor or ""))
+                (int(item_id), target, frozen_sha, actor or "", source or ""))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return self._queue_row(tx, item_id)
 

@@ -41,14 +41,15 @@ class FakeQueue(FakeWork):
                     item_state=item.get("state"), branch=item.get("branch"),
                     assignee=item.get("assignee"))
 
-    def queue_add(self, item_id, *, target, frozen_sha, note, actor):
+    def queue_add(self, item_id, *, target, frozen_sha, note, actor, source=""):
         if self.lots[item_id]["state"] in ("merged", "promoted", "closed"):
             return None
         self.clock += 1
         self.queue_rows[item_id] = {"work_item_id": item_id, "target": target,
                                     "frozen_sha": frozen_sha, "state": "queued", "rank": None,
                                     "landing_sha": None,
-                                    "reason": "", "queued_by": actor, "queued_ts": self.clock}
+                                    "reason": "", "queued_by": actor, "queued_ts": self.clock,
+                                    "source": source}
         self.notes.append((item_id, note, actor))
         return self._row(item_id)
 
@@ -395,7 +396,10 @@ class PassTest(_Base):
         self.assertEqual(self.fake.queue_rows[1]["rank"], 1)
         # the remote does not answer: neither ejected nor ranked, the next pass
         # decides; its rank is cleared, so that no other lot shares it
-        _git(agents, "remote", "set-url", "origin", os.path.join(self.tmp, "nowhere"))
+        # (the same origin, gone for a while: its URL still names the source)
+        os.rename(self.repo, self.repo + ".away")
+        self.addCleanup(lambda: os.path.isdir(self.repo + ".away")
+                        and os.rename(self.repo + ".away", self.repo))
         report = self.run_pass(repo=agents)
         self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
         self.assertIsNone(self.fake.queue_rows[1]["rank"])
@@ -452,6 +456,80 @@ class PassTest(_Base):
         self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
         self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
         self.assertEqual([to for to, _, _ in self.sent], ["a1"])
+
+    def test_an_unrelated_push_with_checkouts_recreated_ejects(self):
+        """Codex #188 r5: the branch is force-pushed to an unrelated B (no
+        common base: the scan skips it) and every checkout is recreated
+        without the frozen A; the lot is still this project's (its source),
+        so it is ejected, not left with its rank."""
+        agents = self.agents_queue(1)
+        _git(self.repo, "checkout", "-q", "--orphan", "unrelated")
+        _git(self.repo, "rm", "-rqf", ".")
+        with open(os.path.join(self.repo, "b.txt"), "w") as fh:
+            fh.write("b\n")
+        _git(self.repo, "add", "b.txt")
+        _git(self.repo, "commit", "-qm", "B, unrelated")
+        _git(self.repo, "branch", "-f", "lot/1-a", "unrelated")
+        _git(self.repo, "checkout", "-q", "main")
+        frozen = self.fake.queue_rows[1]["frozen_sha"]
+        _git(self.repo, "reflog", "expire", "--expire=now", "--all")
+        _git(self.repo, "gc", "-q", "--prune=now")
+        shutil.rmtree(agents)
+        shutil.rmtree(radar.clone_dir(self.cfg, "p"), True)
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        report = self.run_pass(repo=agents)
+        for repo in (self.repo, agents, radar.clone_dir(self.cfg, "p")):
+            self.assertNotEqual(subprocess.run(["git", "cat-file", "-e", frozen + "^{commit}"],
+                                               cwd=repo, capture_output=True).returncode, 0)
+        self.assertNotIn(1, [b["work_item"] for b in report["branches"]])
+        self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
+        self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
+
+    def test_another_project_sharing_the_commit_leaves_the_lot_alone(self):
+        """Codex #188 r5: a second project whose repository holds the frozen
+        commit (a fork) does not own the lot: its pass keeps the rank."""
+        self.queue(1)
+        self.run_pass()
+        self.assertEqual(self.fake.queue_rows[1]["rank"], 1)
+        fork = os.path.join(self.tmp, "fork")
+        _git(self.tmp, "clone", "-q", self.repo, fork)
+        _git(fork, "remote", "remove", "origin")
+        self.assertTrue(_git(fork, "cat-file", "-t", self.fake.queue_rows[1]["frozen_sha"]))
+        self.project = radar.Project(name="q", repo=fork, migrations=MIG)
+        report = self.run_pass(repo=fork)
+        self.assertEqual(report["queue"]["targets"], {})
+        self.assertEqual((self.fake.queue_rows[1]["state"], self.fake.queue_rows[1]["rank"],
+                          self.fake.queue_rows[1]["reason"]),
+                         ("queued", 1, self.fake.queue_rows[1]["reason"]))
+        self.assertNotIn("deferred", self.fake.queue_rows[1]["reason"])
+
+    def test_a_conflict_with_the_cached_target_only_does_not_eject(self):
+        """Codex #188 r5: the radar finds a conflict against the agents'
+        cached target T; origin's target U merges cleanly: the lot stays,
+        tried on U."""
+        agents = self.agents_queue(1)
+        _git(agents, "checkout", "-q", "-b", "stale", "origin/main")
+        with open(os.path.join(agents, "shared.py"), "w") as fh:
+            fh.write("Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n")
+        _git(agents, "commit", "-qam", "T, only in the agents' cache")
+        _git(agents, "update-ref", "refs/remotes/origin/main", "stale")
+        report = self.run_pass(repo=agents)
+        self.assertEqual([a["state"] for a in report["against_target"]
+                          if int(a["work_item"]) == 1], ["conflict"])
+        self.assertEqual((self.fake.queue_rows[1]["state"], self.fake.queue_rows[1]["rank"]),
+                         ("queued", 1))
+        self.assertEqual([(o["lot"], o["state"], o["stack"]["state"])
+                          for o in report["queue"]["targets"]["origin/main"]],
+                         [(1, "queued", "clean")])
+
+    def test_source_of_a_repository(self):
+        self.assertEqual(merge_queue.source_of(self.repo), os.path.realpath(self.repo))
+        for url in ("git@github.com:Manaty/ameesh.git", "https://github.com/Manaty/ameesh",
+                    "ssh://git@GitHub.com:22/Manaty/ameesh.git/"):
+            with self.subTest(url):
+                _git(self.repo, "remote", "add", "origin", url)
+                self.assertEqual(merge_queue.source_of(self.repo), "github.com/Manaty/ameesh")
+                _git(self.repo, "remote", "remove", "origin")
 
     def test_the_stacked_trial_runs_on_the_fresh_target(self):
         """Codex #188 r4: origin's main moves to a conflicting commit while

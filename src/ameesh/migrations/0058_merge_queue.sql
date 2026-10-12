@@ -28,6 +28,10 @@ create table if not exists merge_queue (
     landing_sha  text check (landing_sha ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
     -- why the lot is where it is (order, ejection)
     reason       text not null default '',
+    -- the repository the lot was queued from (`merge_queue.source_of`: its
+    -- origin, host and path, else its own path): a radar pass only handles
+    -- the lots of its project's source, whatever commits two projects share
+    source       text not null default '',
     queued_by    text not null,
     queued_at    timestamptz not null default now(),
     updated_at   timestamptz not null default now()

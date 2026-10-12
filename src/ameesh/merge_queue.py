@@ -95,6 +95,28 @@ def _remote_branch(name: str) -> str:
     return name
 
 
+_SCP = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
+_URL = re.compile(r"^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$", re.I)
+
+
+def source_of(repo: str) -> str:
+    """The repository a lot is queued from, as a radar pass compares it: its
+    origin as `host/path` (`git@github.com:o/r.git` and
+    `https://github.com/o/r` are one source; a checkout recreated keeps it),
+    else the real path of the origin or of `repo` itself. Two projects that
+    share commits (a fork) are two sources."""
+    url = (plan_git._out(repo, "remote", "get-url", "origin") or "").strip()
+    if not url:
+        return os.path.realpath(repo)
+    found = _URL.match(url) or (None if url.startswith(("/", ".")) else _SCP.match(url))
+    if found is None:
+        local = url[len("file://"):] if url.startswith("file://") else url
+        return os.path.realpath(os.path.join(repo, local))
+    path = found.group(2).strip("/")
+    path = path[:-len(".git")] if path.endswith(".git") else path
+    return "%s/%s" % (found.group(1).lower(), path)
+
+
 def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     """({name: commit, or None if there is no such branch}, repository holding
     them) of the branches `names` (lot branches or targets), read fresh. With
@@ -219,7 +241,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     ready = readiness(db, lot, repo, ci=ci, clone=clone)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
-        note="merge queue of %s: queued at %s%s" % (
+        source=source_of(repo), note="merge queue of %s: queued at %s%s" % (
             ready["target"], ready["frozen_sha"][:12],
             ", PR #%s green" % ready["pr"] if ready["pr"] else ""), actor=actor)
     if row is None:
@@ -412,7 +434,19 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         out["error"] = "%s: %s" % (type(exc).__name__, exc)
         return out
     branches = {b["work_item"]: b for b in report.get("branches") or ()}
-    mine = [r for r in rows if r["state"] in ("queued", "landing")]
+    source = source_of(project.repo)
+
+    def ours(row: dict) -> bool:
+        """A lot of this project: queued from its source (the queue holds
+        every project's lots). Neither the commits a repository holds (two
+        projects may share one; a checkout recreated may lack it) nor the
+        scan decide it; only a row with no source, if any, falls back on the
+        scan."""
+        if row.get("source"):
+            return row["source"] == source
+        return int(row["work_item_id"]) in branches
+
+    mine = [r for r in rows if r["state"] in ("queued", "landing") and ours(r)]
     if not mine:
         return out
     notified = _read_notified(cfg, project.name)
@@ -448,13 +482,6 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             failed = exc
             where = replayer.path
 
-    def ours(row: dict) -> bool:
-        """A lot of this project: scanned here, or its frozen commit is in
-        the repository the queue reads (the queue holds every project's
-        lots)."""
-        return int(row["work_item_id"]) in branches \
-            or bool(plan_git._commit(where, row["frozen_sha"]))
-
     def defer(row: dict, why: str) -> None:
         # neither ejected nor ranked on a guess: out of the order until the
         # next pass, its rank cleared so that no other lot shares it
@@ -467,8 +494,6 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
 
     for row in live:
         lot = int(row["work_item_id"])
-        if not ours(row):
-            continue  # another project's lot
         tip, head = tips.get(row.get("branch")), tips.get(row["target"])
         if failed is not None:
             defer(row, str(failed))
@@ -492,8 +517,12 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                 {"project": project.name, "target": row["target"], "kind": "ejected"}))
             continue
         clash = against.get(lot)
+        # the radar tried the target its checkout had: only a conflict with
+        # the target fetched now ejects; otherwise the stacked trial below,
+        # on that target, decides
         if clash and clash.get("target") == row["target"] \
-                and _same(clash.get("tip"), row["frozen_sha"]):
+                and _same(clash.get("tip"), row["frozen_sha"]) \
+                and _same(clash.get("target_head"), head):
             # no resolution is prepared against the target: the agent integrates it
             reason = "conflict with %s on %s" % (row["target"], ", ".join(
                 clash["files"][:6] or ["?"]))

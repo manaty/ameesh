@@ -1036,10 +1036,11 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str) -> dict | None:
+                  actor: str, source: str = "") -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
-        `target`, state `queued`, with a journal line. None if the lot is no
-        longer open."""
+        `target`, state `queued`, with a journal line; `source`: the
+        repository it was queued from (`merge_queue.source_of`). None if the
+        lot is no longer open."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
