@@ -30,54 +30,44 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   cd /root/ameesh && git log -1 --oneline                        # the reviewed commit of main
   ```
 
-* **The guest's volume: the owner's decision** (it costs money and changes
-  the infrastructure). `/srv/ameesh-guest` is not a mount point today: one
-  local 150 GB disk (`l_ssd`), 109 GB free; the VM is a GP1-S in `fr-par-1`.
-  - **Recommended** (study §4.1): a Block Storage volume, 5K IOPS, mounted
-    on `/srv/ameesh-guest`. A guest that fills it never reaches the system
-    nor the host's own agents. Only the volume's size holds the offer's
-    `disk_max` (no filesystem quota; the guard's reclaim watches `/`), so
-    the owner picks one of two sizes. Cost: €0.000130/GB/hour excluding VAT
-    (scaleway.com/en/pricing/storage, read on 2026-10-12), 730 h a month,
-    snapshots not included:
+* **The guest's volume: a 40 GB Block Storage volume** (the owner's
+  decision 10408, 2026-10-12, option a). `/srv/ameesh-guest` is not a
+  mount point today: one local 150 GB disk (`l_ssd`), 109 GB free; the VM
+  is a GP1-S in `fr-par-1`. The volume, 5K IOPS, is mounted on
+  `/srv/ameesh-guest`: a guest that fills it never reaches the system nor
+  the host's own agents (study §4.1). Its size holds the offer's `disk_max
+  40GiB` (no filesystem quota; the guard's reclaim watches `/`). Cost:
+  €0.000130/GB/hour excluding VAT (scaleway.com/en/pricing/storage, read on
+  2026-10-12), about **€3.80 per month** (730 h), snapshots not included.
+  From a workstation with the `scw` CLI configured for the ameesh project:
 
-    | Size | Cost | `disk_max` |
-    |---|---|---|
-    | 40 GB | about **€3.80 per month** | `40GiB`, the offer as validated: held by the volume |
-    | 100 GB | about **€9.50 per month** | raised to `100GiB`, in the offer (`--lend`) and the canon (manaty/home#24), else the script warns that it is not held |
+  ```sh
+  scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB zone=fr-par-1
+  scw block volume wait <volume-id> zone=fr-par-1          # until "available"
+  scw instance server list name=ameesh-agents-1 zone=fr-par-1
+  scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
+    volume-type=sbs_volume zone=fr-par-1
+  ```
 
-    From a workstation with the `scw` CLI configured for the ameesh project,
-    `<size>` being `40GB` or `100GB`:
+  Then on the host (the new disk is the one `lsblk` did not list before,
+  without partitions; check its size):
 
-    ```sh
-    scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=<size> zone=fr-par-1
-    scw block volume wait <volume-id> zone=fr-par-1          # until "available"
-    scw instance server list name=ameesh-agents-1 zone=fr-par-1
-    scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
-      volume-type=sbs_volume zone=fr-par-1
-    ```
+  ```sh
+  lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+  sudo mkfs.ext4 -L ameesh-guest /dev/<new disk>
+  sudo mkdir -p /srv/ameesh-guest
+  echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
+    | sudo tee -a /etc/fstab
+  sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
+  findmnt /srv/ameesh-guest                                # the volume, 40 GB
+  ```
 
-    Then on the host (the new disk is the one `lsblk` did not list before,
-    without partitions; check its size):
+  `nofail`: the host boots even without the volume. The guest's runners
+  do not start then (`RequiresMountsFor=/srv/ameesh-guest`): they never
+  write on the root disk instead; the host's agents are not affected.
 
-    ```sh
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
-    sudo mkfs.ext4 -L ameesh-guest /dev/<new disk>
-    sudo mkdir -p /srv/ameesh-guest
-    echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
-      | sudo tee -a /etc/fstab
-    sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
-    findmnt /srv/ameesh-guest                                # the volume, of the chosen size
-    ```
-
-    `nofail`: the host boots even without the volume. The guest's runners
-    do not start then (`RequiresMountsFor=/srv/ameesh-guest`): they never
-    write on the root disk instead; the host's agents are not affected.
-  - **Without a volume**: `--allow-rootfs` on the two install commands below.
-    The guest then shares `/` with the host's agents: `disk_max` is
-    indicative only (the script says so), and only the guard's reclaim (under
-    10 GiB free on `/`) holds the guest back. Not to be used while the owner
-    has not chosen.
+  `--allow-rootfs` (the guest on `/`, `disk_max` indicative only) is not
+  used on this host.
 
 ## Install (guard in observation, no guest runner started)
 
