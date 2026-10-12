@@ -11,6 +11,7 @@ cost ledger (`turn_costs`). Neither git nor the board is read.
 ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # text, narrow terminal
 ameesh progress --json [--project P] [--since 24h]   # this schema
 ameesh progress --html FICHIER [--project P] [--since 24h]
+ameesh progress --serve [--port 8765] [--project P] [--since 24h]   # local page (L304)
 ameesh progress … --no-gantt                         # without the roadmap (L96)
 ```
 
@@ -33,10 +34,37 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
   embedded data, `default-src 'none'` policy: no network
   request, no font or CDN), readable on a phone. No server:
   open the file, or copy it wherever you want. Atomic write (temporary
-  file then rename); to regenerate, rerun the command.
+  file then rename); to regenerate, rerun the command. Its Refresh button is
+  disabled ("open with --serve to refresh").
+* `--serve [--port 8765]` (L304): serves the same page and this JSON from
+  a local server, **read-only**, until Ctrl-C. See "Local server" below.
 
 Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
-2 (unreadable option).
+2 (unreadable option, `--port` without `--serve`, `--serve` with `--html` or
+`--json`, port unavailable).
+
+## Local server (`--serve`, L304)
+
+| Path | Response |
+|---|---|
+| `/` | the page with the current snapshot embedded; its **Refresh** button reloads it, optionally every 60 s (`#auto` in the URL); "data as of HH:MM" is `generated_ts` |
+| `/api/progress.json` | this schema; `?project=P` takes a project known to the unfiltered snapshot (400 otherwise), empty = all projects |
+
+* **Bound to `127.0.0.1` only**; no option changes the address. The `Host`
+  header must be `127.0.0.1:<port>` or `localhost:<port>` (403 otherwise:
+  DNS rebinding).
+* **Read-only**: `GET` and `HEAD` only (405 with `Allow: GET, HEAD`
+  otherwise), and every snapshot is read through a database session opened
+  with `default_transaction_read_only=on`.
+* **Token**: the host is shared by several agents and Unix accounts, which
+  `127.0.0.1` does not keep out. Each start draws a random token, printed
+  **only on the command's output**: `http://127.0.0.1:<port>/?t=<token>`.
+  The first visit stores it in an `HttpOnly; SameSite=Strict` cookie named
+  `ameesh_progress_<port>` and redirects to the URL without it; it is compared
+  in constant time; a restart draws a new one (old links and cookies stop
+  working). Request lines are logged on stderr without their query string.
+* A snapshot is kept 5 s per project: an open tab does not hammer the
+  database. Responses carry `Cache-Control: no-store`.
 
 ## Conventions
 
@@ -57,6 +85,8 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 | `host` | text | host that produced the snapshot |
 | `project` | text \| null | `--project` filter |
 | `window` | `{from_ts, to_ts}` | timeline window |
+| `overview` | list | (L304) one card per entry of `projects`, same order: `{project, active, lots_open, lots_merged_in_window, agents_active, agents_working, spend_24h_usd, decisions_pending, milestone, warnings}`; `milestone` = the next unreached plan milestone carrying a lot of the project (earliest dated first, undated last) `{id, title, date, progress, lots_merged, lots_total}`, or null |
+| `decisions` | list | (L304) pending decision requests, oldest first, `ameesh-decision/1` items (`ameesh decisions --json`); filtered by `--project` on their `project` |
 | `roadmap` | object \| null | (L96) the roadmap, `ameesh-roadmap/1` schema ([EXPLOITATION.md](EXPLOITATION.md), "Feuille de route" (roadmap) section); `null` with `--no-gantt` |
 | `projects` | list | (L62) the per-project view of `ameesh projects` (item schema: `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)); filtered by `--project` on the project name; at the top of the text and the page |
 | `lots` | list | see below, oldest to newest |

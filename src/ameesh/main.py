@@ -47,8 +47,9 @@
         restarts a stopped, dead or idle agent: same session if the next
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh interrupt <agent> <message…>   direct interruption (authorized senders);
-  ameesh progress [--json] [--html FILE] [--project P] [--since 24h]
+  ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
+        --serve: the page served locally, read-only, with a Refresh button (L304);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);

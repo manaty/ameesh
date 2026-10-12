@@ -1694,8 +1694,8 @@ class Progress(Domain):
     @abc.abstractmethod
     def package_items(self) -> list[dict]:
         """TOUS les lots rattachés à une fiche (id, package_id, state,
-        close_reason, updated_ts) : la progression d'un epic ne dépend pas de
-        la fenêtre."""
+        close_reason, app, updated_ts) : la progression d'un epic ne dépend
+        pas de la fenêtre ; `app` (L304) rattache un jalon à ses projets."""
 
     @abc.abstractmethod
     def lot_actions(self, item_ids: Sequence[int]) -> list[dict]:
