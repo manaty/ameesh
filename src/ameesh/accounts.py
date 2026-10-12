@@ -902,7 +902,19 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                       % (profile.name, current.reason), forced=True)
 
     if row.get("forced"):
-        return forced(active)
+        held = forced(active)
+        if held.profile is not None:
+            return held
+        # L226b (bureau, 2026-10-12): a forced account at its threshold does
+        # not hold the agent while another healthy account is under its own —
+        # the force is lifted (journaled `auto`) and the automatic choice runs
+        free = [p for p in candidates if p.name != active.name
+                and (ev(p).ok if paced else ev(p).unpaced_ok)]
+        if not free:
+            return held
+        if not simulate:
+            store.set_auto(host, harness, reason="compte forcé %s au seuil (%s) ; %s libre"
+                           % (active.name, cache[active.name].reason, free[0].name))
 
     # 2. continuité : la session garde son compte tant qu'il est sous son seuil
     # (les autres comptes ne sont alors pas relus : rien à choisir)

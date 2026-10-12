@@ -784,10 +784,17 @@ class UnpacedChoiceTest(_AuthBase):
         items = accounts.parse({"claude": self._claude_comptes()})["claude"]
         storage.of(self.db).accounts.init_active(self.cfg.host, "claude", "primaire")
         self.db.execute("UPDATE account_active SET forced = TRUE")
-        gauges = {"primaire": self.overage, "secondaire": self.paced}
+        # no other account free: the force holds, the account in overage is not launched
+        gauges = {"primaire": self.overage, "secondaire": self.overage}
         self.assertIsNone(self._choose(items, gauges, paced=False).profile)
         gauges["primaire"] = self.paced
         self.assertEqual(self._choose(items, gauges, paced=False).profile.name, "primaire")
+        # another account free (bureau, 2026-10-12): the force is lifted, never
+        # a turn on the account in overage
+        gauges = {"primaire": self.overage, "secondaire": self.paced}
+        choix = self._choose(items, gauges, paced=False)
+        self.assertEqual(choix.profile.name, "secondaire")
+        self.assertFalse(storage.of(self.db).accounts.active(self.cfg.host, "claude")["forced"])
 
     def test_fixed_cap_is_hard_even_below_a_lower_pace_cap(self):
         items = accounts.parse({"claude": [{"name": "primaire"}]})["claude"]

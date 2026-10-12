@@ -134,7 +134,7 @@ dans le canon :
 
 ```sh
 ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
-ameesh accounts use claude secondaire  # forçage manuel (plus de choix automatique)
+ameesh accounts use claude secondaire  # forçage manuel (levé seul au seuil si un autre compte est libre)
 ameesh accounts auto [claude]          # retour au choix automatique (0034)
 ameesh accounts healthy claude secondaire  # compte reconnecté : déclaré sain (L226b)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
@@ -218,6 +218,10 @@ spent window with no reset date keeps it out). The caps apply to session
 continuity too: a session on the primary leaves it once the primary is above
 50 % of a window. A manual force posted while a worker switches accounts is
 evaluated the same way: a forced account past its caps is not launched.
+A forced account at its threshold (pace, caps or overage) does not hold the
+agents while another healthy account is under its own: the force is lifted
+(journaled `auto`) and the automatic choice runs (bureau, 2026-10-12). With
+no other account free, the force holds and the agents pause.
 With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
 pauses, but these rules still hold: an account in overage or past `cap` /
 `overage_cap` is never chosen, and with no other account the agent is
@@ -247,8 +251,8 @@ primary" on a host that declared `primaire, secondaire, tertiaire`:
 ```
 
 Bureau's local sprint patch of 2026-10-11 (`~/.config/ameesh/sprint.json`,
-`short_window_cap` 0.80 for the non-default accounts) is the setting
-`"short_window_cap": 0.8` on those accounts.
+`short_window_cap` 0.75 for the non-default accounts, bureau 2026-10-12) is the setting
+`"short_window_cap": 0.75` on those accounts.
 
 `ameesh accounts list --json` shows `priority`, `overage` (setting, capable,
 in use) and, per gauge, the `cap` the window is held to.
