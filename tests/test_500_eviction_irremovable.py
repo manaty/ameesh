@@ -57,6 +57,16 @@ def _git(*args: str, cwd: str) -> None:
                             GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
 
 
+class _ForeignDev:
+    """#500 r3: an `os.stat` result whose `st_dev` is another filesystem."""
+
+    def __init__(self, st, dev: int):
+        self._st, self._dev = st, dev
+
+    def __getattr__(self, name):
+        return self._dev if name == "st_dev" else getattr(self._st, name)
+
+
 class EvictionTest(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -194,7 +204,7 @@ class EvictionTest(unittest.TestCase):
         for i, path in enumerate(ours):
             _write(path, age_s=(10 - i) * HOUR)          # o0 is the oldest
 
-        def refuse(path, root):
+        def refuse(path, root, **kw):
             raise OSError(1, "operation not permitted", path)
 
         with mock.patch.object(menage, "_unlink_in_root", refuse):
@@ -258,11 +268,11 @@ class EvictionTest(unittest.TestCase):
         _write(os.path.join(inside, "f"))
         real = menage._unlink_in_root
 
-        def swapping(path, root):
+        def swapping(path, root, **kw):
             os.unlink(os.path.join(inside, "f"))
             os.rmdir(inside)
             os.symlink(outside, inside)
-            return real(path, root)
+            return real(path, root, **kw)
 
         with mock.patch.object(menage, "_unlink_in_root", swapping):
             result = menage.evict_lru([self.mine], self.root, 0)
@@ -270,6 +280,110 @@ class EvictionTest(unittest.TestCase):
         self.assertEqual(result["files"], 0)
         self.assertEqual(result["unremovable"], B)
         self.assertEqual(result["failed"], [os.path.join(inside, "f")])
+
+    def test_candidate_replaced_between_the_scan_and_the_unlink_is_skipped(self):
+        # r3 (codex P1): the candidate is re-verified just before its unlink
+        # ((st_dev, st_ino, st_mtime_ns, st_size) against the scan); a file
+        # replaced by a fresh one is skipped, not counted, and the pass goes on
+        ours = [os.path.join(self.mine, "o%d" % i) for i in range(2)]
+        for i, path in enumerate(ours):
+            _write(path, age_s=(10 - i) * HOUR)          # o0 is the oldest
+        real = menage._unlink_in_root
+
+        def replacing(path, root, **kw):
+            if path == ours[0]:
+                os.unlink(path)
+                _write(path, size=B, age_s=0)            # a fresh file, same name
+            return real(path, root, **kw)
+
+        with mock.patch.object(menage, "_unlink_in_root", replacing):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertTrue(os.path.exists(ours[0]))         # the replacement stays
+        self.assertFalse(os.path.exists(ours[1]))        # the next one goes
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(result["evicted"], B)
+        self.assertEqual(result["unremovable"], 0)
+        self.assertEqual(result["failed"], [])
+
+    def test_git_marker_appearing_before_the_unlink_protects_the_subtree(self):
+        # r3 (codex P1): a `.git` that appears in a directory opened on the way
+        # to the unlink leaves that whole subtree out of the eviction
+        repo = os.path.join(self.mine, "repo")
+        files = [os.path.join(repo, "f%d" % i) for i in range(2)]
+        for i, path in enumerate(files):
+            _write(path, age_s=(10 - i) * HOUR)
+        loose = os.path.join(self.mine, "loose")
+        _write(loose, age_s=2 * HOUR)                    # newer than the repo's
+        real = menage._unlink_in_root
+
+        def appearing(path, root, **kw):
+            marker = os.path.join(repo, ".git")
+            if not os.path.exists(marker):
+                os.mkdir(marker)                      # a clone appears
+            return real(path, root, **kw)
+
+        with mock.patch.object(menage, "_unlink_in_root", appearing):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertTrue(all(os.path.exists(path) for path in files))
+        self.assertFalse(os.path.exists(loose))
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(result["evicted"], B)
+
+    def test_scan_and_unlink_refuse_a_foreign_filesystem(self):
+        # r3 (codex P1): every opened directory must be on the managed root's
+        # filesystem; the scan does not cross a mount point, the unlink
+        # refuses one, and the prune neither opens nor removes one
+        outside = os.path.join(self.mine, "f")
+        _write(outside)
+        empty = os.path.join(self.mine, "empty")
+        sub = os.path.join(empty, "sub")
+        os.makedirs(sub)
+        dev = os.lstat(self.mine).st_dev
+        self.assertEqual(list(menage._files(self.mine, device=dev + 1)), [])
+        with self.assertRaises(menage.StaleCandidate) as caught:
+            menage._unlink_in_root(outside, self.root, device=dev + 1)
+        self.assertEqual(caught.exception.reason, "mount point")
+        self.assertEqual(caught.exception.path, self.root)
+        menage._prune_empty_dirs(empty, dev + 1)
+        self.assertTrue(os.path.isdir(sub))
+        menage._prune_empty_dirs(empty, dev)
+        self.assertFalse(os.path.exists(sub))
+
+        real_stat = os.stat
+
+        def foreign(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            if isinstance(path, (str, bytes, os.PathLike)) \
+                    and os.fspath(path) == self.root:
+                return _ForeignDev(st, st.st_dev + 1)
+            return st
+
+        with mock.patch.object(menage.os, "stat", foreign):
+            result = menage.evict_lru([self.mine], self.root, 0)
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["before"], 0)
+        self.assertTrue(os.path.exists(outside))
+
+    def test_sparse_file_counts_only_the_blocks_it_occupies(self):
+        # r3 (codex P2): st_blocks*512 always, 0 meaning 0 — a 1 TB sparse file
+        # no longer counts its logical size and no longer evicts the others
+        sparse = os.path.join(self.mine, "sparse")
+        os.makedirs(self.mine, exist_ok=True)
+        with open(sparse, "wb") as fh:
+            fh.truncate(1 << 40)
+        old = time.time() - 3 * HOUR
+        os.utime(sparse, (old, old))
+        real = os.path.join(self.mine, "real")
+        _write(real, size=B, age_s=2 * HOUR)
+        self.assertLess(menage.size_of(sparse), 4096)    # blocks, not 1 TB
+        found = {os.path.basename(path): size
+                 for path, size, _m, _st in menage._files(self.mine)}
+        self.assertLess(found["sparse"], 4096)           # blocks, not 1 TB
+        self.assertEqual(found["real"], B)
+        result = menage.evict_lru([self.mine], self.root, 0)
+        self.assertEqual(result["before"], B)
+        self.assertEqual(result["evicted"], B)
+        self.assertEqual(result["files"], 2)
 
     def test_git_marker_symlink_protects_the_subtree_and_is_signaled(self):
         # r2 (codex P2): a `.git` that is a symbolic link is not followed; the

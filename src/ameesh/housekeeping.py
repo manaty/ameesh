@@ -757,23 +757,44 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
 # tailles, éviction et suppression sûre
 # --------------------------------------------------------------------------
 
-def _files(top: str, limit: int | None = None, *, state: dict | None = None,
-           protect_git: bool = False):
-    """(chemin, taille, mtime) des fichiers sous `top`, sans suivre les liens
-    ni changer de système de fichiers ; s'arrête à `limit` fichiers (défaut
-    `WALK_LIMIT`) et le dit alors dans `state["truncated"]` si `state` est
-    fourni.
+def _used_bytes(st) -> int:
+    """#500 r3 (codex P2) : octets qu'un fichier occupe réellement.
 
-    #500 : les octets d'un même inode (liens durs) ne comptent qu'une fois.
+    Toujours `st_blocks * 512` : un 0 rapporté veut dire 0 (fichier vide ou
+    entièrement creux), jamais « inconnu » — l'ancien repli sur `st_size`
+    comptait un fichier creux d'1 To à sa taille logique, le faisait évincer
+    lui et tout ce qui le suivait. Sur une plateforme qui ne rapporte pas
+    `st_blocks` (Windows), la taille logique est la seule mesure."""
+    blocks = getattr(st, "st_blocks", None)
+    if blocks is None or platform.is_windows():
+        return st.st_size
+    return blocks * 512
+
+
+def _files(top: str, limit: int | None = None, *, state: dict | None = None,
+           protect_git: bool = False, device: int | None = None):
+    """(chemin, taille, mtime, stat) des fichiers sous `top`, sans suivre les
+    liens ni changer de système de fichiers ; s'arrête à `limit` fichiers
+    (défaut `WALK_LIMIT`) et le dit alors dans `state["truncated"]` si `state`
+    est fourni.
+
+    #500 : les octets d'un même inode (liens durs) ne comptent qu'une fois ;
+    la taille est celle des blocs occupés (`_used_bytes`).
     Avec `protect_git`, un dossier qui porte un marqueur git est reconnu AVANT
     d'en lister les fichiers et n'est pas parcouru : sa racine est ajoutée à
     `state["protected"]`, donc le sous-arbre n'est jamais évincé, même quand
-    la marche s'arrête à `limit` avant de l'avoir atteint."""
+    la marche s'arrête à `limit` avant de l'avoir atteint.
+
+    #500 r3 (codex P1) : `device` (le `st_dev` de la racine gérée) est exigé
+    pour chaque entrée — un point de montage apparu dans le dossier n'est ni
+    parcouru ni compté. Le `stat` de l'entrée est rendu avec la taille, pour
+    que l'éviction le revérifie juste avant l'unlink."""
     limit = WALK_LIMIT if limit is None else limit
-    try:
-        device = os.lstat(top).st_dev
-    except OSError:
-        return
+    if device is None:
+        try:
+            device = os.lstat(top).st_dev
+        except OSError:
+            return
     count = 0
     seen: set = set()
     stack = [top]
@@ -793,17 +814,17 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
                         st = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
+                    if st.st_dev != device:  # #500 r3: mount point, never crossed
+                        continue
                     if stat.S_ISDIR(st.st_mode):
-                        if st.st_dev == device:
-                            stack.append(entry.path)
+                        stack.append(entry.path)
                         continue
                     inode = (st.st_dev, st.st_ino)
                     if inode in seen:            # #500: hard link, counted once
                         continue
                     seen.add(inode)
                     count += 1
-                    yield entry.path, st.st_blocks * 512 if st.st_blocks else st.st_size, \
-                        st.st_mtime
+                    yield entry.path, _used_bytes(st), st.st_mtime, st
                     if count >= limit:
                         if state is not None:
                             state["truncated"] = True
@@ -821,8 +842,8 @@ def size_of(path: str, limit: int = WALK_LIMIT) -> int:
     except OSError:
         return 0
     if not stat.S_ISDIR(st.st_mode):
-        return st.st_blocks * 512 if st.st_blocks else st.st_size
-    return sum(size for _p, size, _m in _files(path, limit))
+        return _used_bytes(st)
+    return sum(size for _p, size, _m, _st in _files(path, limit))
 
 
 def _located_in(path: str, root: str) -> bool:
@@ -838,6 +859,19 @@ def _located_in(path: str, root: str) -> bool:
 
 class RefusedDeletion(RuntimeError):
     """Suppression refusée : hors des dossiers gérés."""
+
+
+class StaleCandidate(Exception):
+    """#500 r3 : le candidat n'est plus ce que l'énumération a vu — contenu
+    remplacé ou disparu, marqueur `.git` apparu dans un dossier ouvert, ou
+    dossier sorti du système de fichiers de la racine. Il est sauté, sans être
+    compté (ni évincé, ni irrécupérable). `path` est le dossier à protéger
+    (marqueur git, montage) ou le candidat lui-même ; `reason` dit lequel."""
+
+    def __init__(self, path: str, reason: str):
+        super().__init__("%s: %s" % (reason, path))
+        self.path = path
+        self.reason = reason
 
 
 def _safe_rmtree(path: str, root: str) -> int:
@@ -871,13 +905,40 @@ def _clear_dir(directory: str, root: str) -> int:
     return freed
 
 
-def _prune_empty_dirs(top: str) -> None:
-    for current, dirs, files in os.walk(top, topdown=False):
-        if current != top and not dirs and not files:
+def _prune_empty_dirs(top: str, device: int | None = None) -> None:
+    """#500 r3 : retire les dossiers vidés par une éviction, du plus profond au
+    plus haut, sans traverser un point de montage. Un dossier dont le `st_dev`
+    n'est pas celui de la racine gérée (`device`) est laissé en place, lui et
+    son sous-arbre : `os.rmdir` échoue de toute façon sur un point de montage,
+    mais on ne l'ouvre même pas."""
+    if device is None:
+        try:
+            device = os.lstat(top).st_dev
+        except OSError:
+            return
+    stack = [(top, False)]
+    while stack:
+        current, post = stack.pop()
+        if post:
+            if current != top:
+                try:
+                    os.rmdir(current)    # échoue si le dossier n'est pas vide
+                except OSError:
+                    pass
+            continue
+        stack.append((current, True))
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
             try:
-                os.rmdir(current)
+                st = entry.stat(follow_symlinks=False)
             except OSError:
-                pass
+                continue
+            if stat.S_ISDIR(st.st_mode) and st.st_dev == device:
+                stack.append((entry.path, False))
 
 
 def _git_marker(directory: str) -> tuple[str, str] | None:
@@ -886,36 +947,91 @@ def _git_marker(directory: str) -> tuple[str, str] | None:
     lié (`.git` est un fichier dont le `gitdir:` existe) ; `("symlink",
     dossier)` pour un `.git` qui est un lien symbolique — jamais suivi, le
     sous-arbre est protégé par prudence et signalé ; None sinon, dont un
-    worktree dont le gitdir a disparu (il est évincable, comme avant)."""
-    marker = os.path.join(directory, ".git")
+    worktree dont le gitdir a disparu (il est évincable, comme avant).
+    La règle est celle de `_git_marker_at`, lue ici relativement au chemin."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        st = os.lstat(marker)
+        fd = os.open(directory, flags)
     except OSError:
         return None
+    try:
+        marker = _git_marker_at(fd, directory)
+    finally:
+        os.close(fd)
+    return (marker, directory) if marker else None
+
+
+def _git_marker_at(fd: int, directory: str) -> str | None:
+    """#500 r3 : le marqueur git du dossier ouvert `fd` (« root », « symlink »,
+    ou None), avec la MÊME règle que le scan : un `.git` régulier dont le
+    `gitdir:` a disparu n'est pas un marqueur (le worktree mort reste
+    évincable), un `.git` illisible est protecteur (fail-closed). Lu
+    relativement au descripteur, sans repasser par le chemin : un dossier
+    remplacé entre le scan et l'unlink ne peut pas tromper ce contrôle."""
+    try:
+        st = os.stat(".git", dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "symlink"               # illisible : protecteur, jamais suivi
     if stat.S_ISLNK(st.st_mode):
-        return ("symlink", directory)
+        return "symlink"
     if stat.S_ISDIR(st.st_mode):
-        return ("root", directory)
+        return "root"
     if not stat.S_ISREG(st.st_mode):
         return None
+    marker_fd = None
     try:
-        with open(marker, encoding="utf-8", errors="replace") as fh:
+        marker_fd = os.open(".git", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=fd)
+        with os.fdopen(marker_fd, encoding="utf-8", errors="replace") as fh:
+            marker_fd = None           # fdopen owns it from here
             line = fh.readline(4096).strip()
     except OSError:
-        return None
+        return "symlink"               # illisible : protecteur
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
     if not line.startswith("gitdir:"):
         return None
     gitdir = os.path.join(directory, line[len("gitdir:"):].strip())
-    return ("root", directory) if os.path.isdir(gitdir) else None
+    return "root" if os.path.isdir(gitdir) else None
 
 
-def _unlink_in_root(path: str, root: str) -> None:
+def _check_open_dir(fd: int, directory: str, device: int | None) -> None:
+    """#500 r3 : le dossier ouvert `fd` est-il encore dans la racine gérée —
+    même système de fichiers (`device`), aucun marqueur `.git` apparu ? Sinon
+    `StaleCandidate` : on n'évince rien dans ce sous-arbre."""
+    if device is not None:
+        try:
+            current = os.fstat(fd).st_dev
+        except OSError:
+            current = None
+        if current != device:
+            raise StaleCandidate(directory, "mount point")
+    if _git_marker_at(fd, directory):
+        raise StaleCandidate(directory, "git marker")
+
+
+def _unlink_in_root(path: str, root: str, *, expected=None,
+                    device: int | None = None) -> None:
     """#500 : retire `path` relativement à `root` : chaque composant est ouvert
     avec `O_DIRECTORY|O_NOFOLLOW`, puis `os.unlink(nom, dir_fd=fd)`. Un dossier
     parent remplacé par un lien symbolique entre la vérification `_located_in`
     et la suppression ne peut donc plus faire sortir la suppression de la
     racine gérée (ELOOP/ENOTDIR, l'appelant reclasse le fichier). Lève OSError
-    aussi si `path` n'est pas sous `root`."""
+    aussi si `path` n'est pas sous `root`.
+
+    #500 r3 (codex P1) : juste avant l'unlink, `os.stat(nom, dir_fd=fd,
+    follow_symlinks=False)` est comparé à `expected` (`(st_dev, st_ino,
+    st_mtime_ns, st_size)` du scan) ; toute différence, un `.git` apparu dans
+    un dossier ouvert, ou un dossier dont le `st_dev` n'est plus celui de la
+    racine (`device`) lève `StaleCandidate` au lieu de supprimer.
+
+    Résiduels, hors modèle de menace : un montage substitué APRÈS ce contrôle
+    demanderait des droits de montage ; un dossier parent déplacé hors de la
+    racine après son ouverture demanderait un processus malveillant de même
+    UID dans le TMPDIR de l'agent (comme #414)."""
     rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
     parts = [part for part in rel.split(os.sep) if part]
     if not parts or any(part == os.pardir for part in parts):
@@ -923,10 +1039,24 @@ def _unlink_in_root(path: str, root: str) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(root, flags)
     try:
+        opened = root
+        _check_open_dir(fd, opened, device)
         for part in parts[:-1]:
             following = os.open(part, flags, dir_fd=fd)
             os.close(fd)
             fd = following
+            opened = os.path.join(opened, part)
+            _check_open_dir(fd, opened, device)
+        if expected is not None:
+            target = os.path.join(root, *parts)
+            try:
+                st = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                raise StaleCandidate(target, "gone") from None
+            if (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size) != (
+                    expected.st_dev, expected.st_ino, expected.st_mtime_ns,
+                    expected.st_size):
+                raise StaleCandidate(target, "changed")
         os.unlink(parts[-1], dir_fd=fd)
     finally:
         os.close(fd)
@@ -965,16 +1095,27 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     `WALK_LIMIT`, nothing is evicted at all (`truncated`, alerted): the pass
     cannot prove what is removable. Rend `{before, after, evicted, files,
     over_quota, unremovable, worktrees, worktree_symlinks, truncated,
-    truncated_paths, failed, blocked}`."""
+    truncated_paths, failed, blocked}`.
+
+    #500 r3 (codex P1): the scan never leaves the managed root's filesystem
+    (`device`), and every candidate is re-verified just before its unlink
+    (`_unlink_in_root`) — replaced, gone, under a `.git` marker that appeared,
+    or on another filesystem: skipped, counted neither as evicted nor as
+    unremovable, and a git marker or a mount leaves its whole subtree alone."""
     now = time.time() if now is None else float(now)
+    try:
+        root_dev = os.stat(root).st_dev
+    except OSError:
+        root_dev = None
     scan: dict = {}
     found = []
     for directory in directories:
         if scan.get("truncated"):
             break                      # the listing is partial: no eviction (below)
         if os.path.isdir(directory) and not os.path.islink(directory):
-            found.extend(_files(directory, state=scan, protect_git=True))
-    before = sum(size for _p, size, _m in found)
+            found.extend(_files(directory, state=scan, protect_git=True,
+                                device=root_dev))
+    before = sum(size for _p, size, _m, _st in found)
     total, evicted, files = before, 0, 0
     unremovable = 0
     blocked = False
@@ -1001,9 +1142,13 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 candidates.append(item)
         counted = before - unremovable
         blocked = unremovable > quota
-        for path, size, mtime in sorted(candidates, key=lambda item: item[2]):
+        protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
+        for path, size, mtime, st in sorted(candidates, key=lambda item: item[2]):
             if blocked or counted <= quota:
                 break
+            if any(path == d or path.startswith(d.rstrip("/") + os.sep)
+                   for d in protected):
+                continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
                 continue
             # #500: a candidate whose deletion is refused (path no longer in
@@ -1018,7 +1163,14 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 break
             if not dry_run:
                 try:
-                    _unlink_in_root(path, root)
+                    _unlink_in_root(path, root, expected=st, device=root_dev)
+                except StaleCandidate as exc:
+                    # #500 r3: the candidate changed between the scan and the
+                    # unlink: skipped, without being counted. A git marker or a
+                    # mount protects every candidate of that subtree.
+                    if exc.reason in ("git marker", "mount point"):
+                        protected.append(exc.path)
+                    continue
                 except OSError:
                     unremovable += size
                     counted -= size
@@ -1031,7 +1183,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             files += 1
         if not dry_run and files:
             for directory in directories:
-                _prune_empty_dirs(directory)
+                _prune_empty_dirs(directory, root_dev)
     return {"before": before, "after": total, "evicted": evicted, "files": files,
             "over_quota": counted > quota, "unremovable": unremovable,
             "worktrees": worktrees, "worktree_symlinks": symlinks,
