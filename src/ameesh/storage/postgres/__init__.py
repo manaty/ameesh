@@ -20,6 +20,7 @@ from .catalog import Catalog
 from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
+from .credentials import Credentials
 from .grants import Grants
 from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
@@ -49,6 +50,7 @@ class PostgresStorage(interface.Storage):
         self.pending_spend = PendingSpend(db)
         self.turn_costs = TurnCosts(db)
         self.accounts = Accounts(db)
+        self.credentials = Credentials(db)
         self.budgets = Budgets(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)

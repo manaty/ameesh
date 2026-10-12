@@ -33,6 +33,7 @@ import getpass
 import json
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -40,7 +41,8 @@ import threading
 import time
 import uuid
 
-from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
+from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
+from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, mail, registry, storage
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
@@ -424,6 +426,13 @@ class AgentWorker(threading.Thread):
         self._host_reason = ""
         self._host_delay = 0.0
         self._host_next = 0.0
+        #: L226b : `status_text` du blocage « auth_blocked » posé (ou hérité
+        #: d'un exécuteur précédent), '' hors blocage
+        self._auth_status = (agent.get("status_text") or "") if (
+            agent.get("status") == "blocked"
+            and str(agent.get("status_text") or "").startswith(auth_failure.STATUS_PREFIX)
+            and str(agent.get("last_error") or "").startswith(auth_failure.STATUS_PREFIX)) \
+            else ""
         #: dernière résolution du binaire journalisée (L106)
         self.resolution_seen = ""
         #: L106 : arrêt propre demandé par la garde d'alimentation (texte de la
@@ -935,6 +944,17 @@ class AgentWorker(threading.Thread):
                 self.stop_group_now("restart requested", grace=1.0)
                 return
 
+    def _audit_deadline_monitor(self, done: threading.Event, deadline: float) -> None:
+        """L234 : échéance monotone indépendante du flux et de la base.
+
+        Le scope a aussi RuntimeMaxSec : il arrête les descendants qui ont
+        quitté le groupe POSIX, même si l'exécuteur meurt.
+        """
+        if done.wait(max(0.0, deadline - time.monotonic())) or done.is_set():
+            return
+        self._audit_guard_error = "hard cap of the auditor turn reached"
+        self.stop_group_now(self._audit_guard_error, grace=0, hard=True)
+
     def request_restart(self) -> None:
         """`ameesh restart` (L26) : arrêter le tour en cours, puis appliquer."""
         self.restarting.set()
@@ -1129,6 +1149,8 @@ class AgentWorker(threading.Thread):
             if self._held_by_pressure(self.runner.host_pressure()):
                 self.runner.pressure_delayed(self.name, rotation=True)
                 return False
+            if not self._rotation_allowed():
+                return False
         if self.rotation_forcee and self.proc is None:
             raison, self.rotation_forcee = self.rotation_forcee, None
             if self.session_policy() != "jamais" and self.current_session():
@@ -1141,6 +1163,19 @@ class AgentWorker(threading.Thread):
             return False
         return self._rotate("turns=%d, tokens=%.0f, last turn=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
+
+    def _rotation_allowed(self) -> bool:
+        """L226b : le tour de résumé d'une rotation est un appel de modèle. Il
+        passe les gardes d'un tour (budget et plafonds du compte, santé de
+        l'authentification) et tourne sous le compte de la session ; sinon la
+        rotation attend : la bascule du prochain tour (`continuity`) résume
+        sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
+        if not self.budget_ok() or not self.auth_ready():
+            return False
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return False
+        return account_turn.session_on(self, compte)
 
     def turn_summary(self) -> str:
         """Le résumé rendu par le dernier tour de résumé (L218) : sa réponse
@@ -1920,14 +1955,17 @@ class AgentWorker(threading.Thread):
         """
         self._account = None
         if self.runner.budget_limits(self.db).per_hour <= 0:
-            account_turn.choose(self, None, pause=False)  # L30 : bascule sans pause
-            return True
-        # Réparation d'abord : un travail comptable en attente (marqueur
-        # persistant) doit être écrit avant d'autoriser le moindre tour ; un
-        # marqueur corrompu suspend au lieu d'autoriser.
-        self._compta_repare()
-        raison = ("turn accounting unavailable" if self._compta_en_echec
-                  else self.budget_reason())
+            # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
+            # overage ou au-dessus d'un plafond fixe, quels que soient les
+            # réglages de budget — sans autre compte, pas de tour
+            raison = account_turn.choose(self, None, pause=False) or ""
+        else:
+            # Réparation d'abord : un travail comptable en attente (marqueur
+            # persistant) doit être écrit avant d'autoriser le moindre tour ;
+            # un marqueur corrompu suspend au lieu d'autoriser.
+            self._compta_repare()
+            raison = ("turn accounting unavailable" if self._compta_en_echec
+                      else self.budget_reason())
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
@@ -2187,9 +2225,14 @@ class AgentWorker(threading.Thread):
         orchestrateur sous une pression NON critique et hors batterie basse :
         ses tours sont courts, et c'est lui qui distribue le travail des autres
         (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
-        le sien, et personne pour répartir)."""
+        le sien, et personne pour répartir). L234 exempte les auditeurs,
+        y compris sous pression critique ; leur harnais a une priorité réduite."""
         if not pressure.get("blocked"):
             return False
+        # L234 : la surveillance reste active, même sous pression critique.
+        if self.runner.is_auditor(self.name, self.agent):
+            from .platform import audit_guard
+            return not audit_guard.available()
         if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
             return True
         return any(b.get("power") for b in pressure.get("breaches") or ())
@@ -2286,6 +2329,103 @@ class AgentWorker(threading.Thread):
             if agent is not None:
                 self.agent = agent
 
+    # -- échec d'authentification (L226b) ------------------------------------
+    def auth_ready(self) -> bool:
+        """Garde de `pick()` : le compte du prochain tour est-il sain ?
+
+        Le compte est celui que la garde de budget vient de choisir (L30 : un
+        compte en échec d'authentification n'est choisi que s'il n'en reste
+        aucun sain), ou le compte par défaut du harnais ('') sans comptes
+        déclarés. En échec : blocage `auth_blocked` (fencé), pas de tour, pas
+        d'échec rapide. Sain de nouveau : blocage levé, le tour part."""
+        if self.runner.dry_run:
+            return True
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return True  # `account_turn.apply` refusera le tour, avec sa raison
+        harness = self.agent.get("harness") or ""
+        account = auth_failure.account_name(compte)
+        sick = auth_failure.failing(self.db, self.cfg.host, harness).get(account)
+        if sick is None:
+            return self._auth_release()
+        self._auth_block(harness, account, sick.get("reason") or "authentication failing")
+        return False
+
+    def _auth_block(self, harness: str, account: str, reason: str) -> None:
+        """Pose (fencé) le blocage `auth_blocked` d'un agent qui n'a pas de tour
+        en cours ; journal et fil une fois par blocage."""
+        texte = auth_failure.status_text(harness, account)
+        agent = self.agent or {}
+        if texte == self._auth_status and agent.get("status") == "blocked" \
+                and agent.get("status_text") == texte:
+            return
+        if self._auth_status and self._auth_status != texte:
+            # autre compte en échec (bascule vers un compte lui aussi en panne) :
+            # l'ancienne marque est levée pour poser la nouvelle
+            registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                        self.epoch, self._auth_status,
+                                        auth_failure.STATUS_PREFIX)
+            self._auth_status = ""
+        issue = registry.set_marked_block(
+            self.db, self.name, self.runner.runner_id, self.epoch, texte,
+            "%s %s" % (auth_failure.STATUS_PREFIX, reason), auth_failure.STATUS_PREFIX)
+        if issue == "lease":
+            self.lease_lost.set()
+            return
+        if issue == "kept":
+            return  # un autre statut (arrêt, blocage) tient : réessai au sondage suivant
+        self._auth_note(harness, account, reason, texte)
+
+    def _auth_note(self, harness: str, account: str, reason: str, texte: str,
+                   turn: bool = False) -> None:
+        self._auth_status = texte
+        if turn:
+            log_async("[%s] turn failed authentication on %s/%s: %s — account "
+                      "marked failing; switching to a healthy account if there is one, "
+                      "otherwise auth_blocked" % (self.name, harness, account or "(default)",
+                                                  reason))
+            self._fil_note(
+                "Turn failed authentication on %s/%s (%s): the instruction goes back to "
+                "the queue, with no retry loop. The account is marked failing; the next "
+                "turn runs on a healthy %s account if there is one, otherwise the agent "
+                "stays auth_blocked until a healthy account is back."
+                % (harness, account or "(default)", reason, harness),
+                meta={"action": "auth_blocked", "harnais": harness, "compte": account,
+                      "raison": reason, "source": "tour"})
+            return
+        log_async("[%s] %s: %s — no turn until a %s account is healthy "
+                  "(sentinel, or `ameesh accounts healthy`)"
+                  % (self.name, texte, reason, harness))
+        self._fil_note(
+            "Authentication failing on %s/%s (%s) and no other healthy %s account: "
+            "the agent stays auth_blocked, with no retry; it resumes on its own as soon "
+            "as an account is healthy again. Never a pay-per-token fallback."
+            % (harness, account or "(default)", reason, harness),
+            meta={"action": "auth_blocked", "harnais": harness, "compte": account,
+                  "raison": reason})
+
+    def _auth_release(self) -> bool:
+        """Compte sain : le blocage `auth_blocked` encore posé est levé (fencé)."""
+        if not self._auth_status:
+            return True
+        texte = self._auth_status
+        issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                            self.epoch, texte, auth_failure.STATUS_PREFIX)
+        if issue == "lease":
+            self.lease_lost.set()
+            return False
+        self._auth_status = ""
+        if issue == "kept":
+            row = registry.get(self.db, self.name)
+            if row is not None:
+                self.agent = row
+            return False
+        log_async("[%s] %s lifted: healthy account — resuming" % (self.name, texte))
+        self._fil_note("Block %s lifted: a healthy account is available again, "
+                       "the agent resumes." % texte, meta={"action": "auth_reprise"})
+
+        return True
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
@@ -2324,7 +2464,7 @@ class AgentWorker(threading.Thread):
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
         # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
-        # (l'orchestrateur excepté, sous une pression non critique).
+        # (auditeur excepté ; orchestrateur sous pression non critique).
         pressure = self.runner.host_pressure()
         if self._held_by_pressure(pressure):
             if self.maybe_relocate(pressure):
@@ -2339,6 +2479,11 @@ class AgentWorker(threading.Thread):
         # Dossier de travail absent (L35) : ni consigne ni courrier consommés,
         # pas de tour tenté à chaque sondage.
         if not self.workdir_ready():
+            return None
+        # L226b : le compte du tour est en échec d'authentification — ni
+        # consigne ni courrier consommés, aucune relance ; reprise dès qu'il
+        # (ou un autre, par la bascule de `budget_ok`) est sain.
+        if not self.auth_ready():
             return None
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
@@ -2573,7 +2718,7 @@ class AgentWorker(threading.Thread):
             self._host_pressure_note(pression)
             return False
         if pression.get("blocked"):
-            self.runner.pressure_bypassed(self.name)  # orchestrateur, non critique
+            self.runner.pressure_bypassed(self.name)  # orchestrateur ou auditeur
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -2941,23 +3086,41 @@ class AgentWorker(threading.Thread):
             self.preempting.clear()
         threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
                          daemon=True).start()
+        from .platform import audit_guard
+        audit_exempt = (self.runner.is_auditor(self.name, self.agent)
+                        and self.runner.host_pressure().get("blocked"))
+        self._audit_guard_error = ""
+        audit_seconds = min(audit_guard.WALL_SECONDS,
+                            self.turn_max_seconds() or audit_guard.WALL_SECONDS)
+        if audit_exempt:
+            threading.Thread(target=self._audit_deadline_monitor,
+                             args=(preempt_done, time.monotonic() + audit_seconds),
+                             daemon=True).start()
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
         lignes = 0
         proc = None
+        #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
+        #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
+        stderr_debut = None
         try:
             with open(stderr_path, "ab") as stderr:
+                stderr_debut = stderr.tell()
                 try:
                     # Le moissonneur de l'exécuteur ne touche jamais un harnais,
                     # même pas pendant son lancement (voir `background`).
                     with self.runner.launch_lock:
                         proc = subprocess.Popen(
-                            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                            self.runner.audit_command(self.name, argv, self.agent,
+                                                      exempt=audit_exempt, seconds=audit_seconds),
+                            cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                             text=True, bufsize=1, env=env,
                             start_new_session=True,  # son groupe : on peut le tuer en entier
                         )
                         self.runner.harness_pids.add(proc.pid)
+                except RuntimeError as exc:
+                    raise _LancementImpossible(str(exc)) from exc
                 except OSError as exc:
                     raise _LancementImpossible("could not launch %s: %s"
                                                % (argv[0], exc.strerror or exc)) from exc
@@ -2967,6 +3130,14 @@ class AgentWorker(threading.Thread):
             # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
             # tour, pour repérer ce qui survivrait à sa fin.
             self._open_turn_resource(turn_id, proc.pid)
+            # Le trampoline valide le cgroup AVANT de lancer le harnais.
+            # L'attente de ce signal est bornée par le minuteur indépendant.
+            # Un scope refusé ne consomme aucun courrier.
+            if audit_exempt and (proc.stdout is None
+                                 or proc.stdout.readline().strip() != audit_guard.READY):
+                raise _LancementImpossible("auditor scope not validated: memory cap "
+                                           "missing or scope creation refused")
+
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
@@ -3129,6 +3300,8 @@ class AgentWorker(threading.Thread):
             # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
             # le code de sortie est celui de l'arrêt demandé.
             result_code, error = 0, None
+        if self._audit_guard_error:
+            result_code, error = 124, self._audit_guard_error
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "the harness returned code %d" % result_code
@@ -3190,6 +3363,30 @@ class AgentWorker(threading.Thread):
                 self.last_activity = time.monotonic()
                 if not self._power_texte:
                     self._host_not_ready(hote)
+                return False
+            raison_auth = auth_failure.classify(
+                error, self.last_final, auth_failure.stderr_tail(stderr_path, start=stderr_debut))
+            if raison_auth:
+                # L226b : le compte n'est plus authentifié — ni échec rapide ni
+                # relance en boucle : le compte est noté en échec, le tour
+                # suivant bascule vers un compte sain, sinon l'agent reste
+                # `auth_blocked` jusqu'au retour d'un compte sain.
+                self.fast_failure = False
+                nom_harnais = self.agent.get("harness") or ""
+                account = auth_failure.account_name(compte)
+                self._avec_reprise("account health", auth_failure.report, self.db,
+                                   self.cfg.host, nom_harnais, account, "failing",
+                                   reason=raison_auth, source="turn")
+                if self._session_en_attente is not None:
+                    self._avec_reprise("turn session", self._enregistre_session)
+                texte = auth_failure.status_text(nom_harnais, account)
+                self._avec_reprise(
+                    "end of turn", registry.end_turn,
+                    self.db, self.name, self.runner.runner_id, self.epoch,
+                    status="blocked", status_text=texte,
+                    error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost)
+                self.last_activity = time.monotonic()
+                self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
             if session and adapters.child_session_refused(error):
                 # L166 : la session reprise était une session fille ; la
@@ -4373,9 +4570,47 @@ class Runner:
                 or name in getattr(self, "_orchestrators_roles", ()))
 
     def refresh_orchestrators(self, *canons) -> None:
-        """Après chaque `canon sync` : les agents au rôle d'orchestrateur."""
+        """Après chaque `canon sync` : les rôles orchestrateur et auditeur."""
         from . import sous_utilisation as su
         self._orchestrators_roles = frozenset(su.role_orchestrators(canons))
+        self._audit_canons = tuple(canons)
+
+    def is_auditor(self, name: str, agent=None) -> bool:
+        """L234 : persona auditeur ou rôle auditeur/auditor au canon."""
+        from . import alert_briefs
+        if name == alert_briefs.AUDITOR_NAME:
+            return True
+        canons = getattr(self, "_audit_canons", ())
+        from . import auditor as auditor_mod, sous_utilisation as su
+        # Ne consulte le registre que pour un nom candidat ; le worker passe
+        # sa ligne fraîche, ce qui évite une requête sur le chemin de lancement.
+        if name not in su.role_orchestrators(
+                canons, alert_briefs.AUDITOR_ROLES):
+            return False
+        row = agent if agent is not None else registry.get(self.db, name)
+        return bool(row and name in auditor_mod.cards([row], canons))
+
+    def audit_command(self, name: str, argv: list, agent=None, *,
+                      exempt: bool = False, seconds: float = 300) -> list:
+        """L234 : faible priorité CPU et I/O, héritée par les sous-processus.
+
+        Les wrappers sont facultatifs sur les plateformes qui ne les ont pas.
+        Aucun preexec_fn dans cet exécuteur multithreadé.
+        """
+        if not self.is_auditor(name, agent):
+            return argv
+        prefix = []
+        ionice = shutil.which("ionice")
+        nice = shutil.which("nice")
+        if ionice:
+            prefix.extend([ionice, "-t", "-c", "3"])
+        if nice:
+            prefix.extend([nice, "-n", "10"])
+        bounded = prefix + list(argv)
+        if exempt:
+            from .platform import audit_guard
+            return audit_guard.command(bounded, seconds)
+        return bounded
 
     def _pressure_episode_update(self, verdict: dict) -> None:
         """À chaque verdict FRAIS, sous `_pressure_lock` : une ligne de journal
@@ -4389,9 +4624,10 @@ class Runner:
                 self._pressure_episode = episode = {
                     "since": time.time(), "critical": bool(verdict.get("critical")),
                     "delayed": set(), "rotations": set(), "orchestrator_turns": 0,
+                    "auditor_turns": 0,
                     "tmpfs": False}
                 batterie = any(b.get("power") for b in verdict.get("breaches") or ())
-                log_async("pressure on host %s: start — %s; no new turn%s"
+                log_async("pressure on host %s: start — %s; except auditors, no new turn%s"
                           % (self.host, resources_mod.describe(verdict.get("breaches"))
                              or "threshold",
                              " (critical pressure)" if verdict.get("critical") else
@@ -4422,7 +4658,9 @@ class Runner:
                       "; session rotation postponed: %s"
                       % ", ".join(sorted(episode["rotations"])) if episode["rotations"] else "",
                       "; %d orchestrator turn(s) let through" % episode["orchestrator_turns"]
-                      if episode["orchestrator_turns"] else ""))
+                      if episode["orchestrator_turns"] else "")
+                  + ("; %d auditor turn(s) let through" % episode.get("auditor_turns", 0)
+                     if episode.get("auditor_turns") else ""))
 
     def pressure_delayed(self, agent: str, *, rotation: bool = False) -> None:
         """Un tour (ou une rotation de session) de `agent` attend la fin de
@@ -4433,11 +4671,12 @@ class Runner:
                 episode["rotations" if rotation else "delayed"].add(agent)
 
     def pressure_bypassed(self, agent: str) -> None:
-        """Un tour d'orchestrateur part malgré la pression (non critique)."""
+        """Un tour d'orchestrateur ou d'auditeur part malgré la pression."""
         with self._pressure_lock:
             episode = getattr(self, "_pressure_episode", None)
             if episode is not None:
-                episode["orchestrator_turns"] += 1
+                key = "auditor_turns" if self.is_auditor(agent) else "orchestrator_turns"
+                episode[key] = episode.get(key, 0) + 1
 
     def power_reading(self) -> dict:
         """Alimentation de l'hôte (L106) ; surchargée par les tests."""

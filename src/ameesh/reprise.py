@@ -27,7 +27,7 @@ import stat
 import sys
 import time
 
-from . import accounts, account_turn, fil, identity, mail, platform, registry, stagnation, storage
+from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -648,16 +648,16 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={row["name"]: harness})
     # L74 (0034 §4) : la session garde son compte d'origine tant qu'il est sous
     # son seuil
-    origine = previous or next((p.name for p in items if p.home() == accounts.Profile(
-        harness=harness, name="(défaut)").home()), None)
+    # (session d'avant L30 : le compte déclaré du dossier par défaut, L226b)
+    legacy = account_turn.legacy_profile(harness, items)
+    origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
                                "resume at the reset" % (harness, choice.reason))
-    old = accounts.by_name(items, previous) if previous else \
-        accounts.Profile(harness=harness, name="(défaut)")
+    old = accounts.by_name(items, previous) if previous else legacy
     out.update(previous=previous, next=nxt.name, old=old)
     if previous == nxt.name or (previous is None and old.home() == nxt.home()):
         out.update(keep=True, deterministic=False,
@@ -666,15 +666,19 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     if accounts.session_portable(harness, old, nxt):
         out.update(keep=True, deterministic=False,
                    why="session %s (account %s) is portable to account %s: resumed"
-                   % (session, previous or "(default)", nxt.name))
+                   % (session, previous or old.name, nxt.name))
         return out
-    usable, raison = account_turn.summary_possible(old, book, items)
+    try:
+        sick = auth_failure.failing(db, cfg.host, harness)
+    except db_mod.DbError:
+        sick = {}
+    usable, raison = account_turn.summary_possible(old, book, items, sick=sick)
     if usable:
         out.update(keep=True, deterministic=False,
                    why="session %s (account %s) is not portable to %s; the old "
                        "account is still usable: the runner will summarize it under %s then "
-                       "rotate (rotation 0027)" % (session, previous or "(default)",
-                                                   nxt.name, previous or "(default)"))
+                       "rotate (rotation 0027)" % (
+                           session, previous or old.name, nxt.name, previous or old.name))
         return out
     out["why"] = ("original account %s unusable (%s) and session %s not portable to %s: "
                   "session forgotten, deterministic resume brief"
