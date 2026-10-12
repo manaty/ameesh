@@ -470,7 +470,7 @@ class PsqlDriver:
             return []
         if len(items) == 1:
             return [self.query(*items[0])]
-        if any(not pure_read(sql) or ";" in sql.strip().rstrip(";") for sql, _ in items):
+        if any(not pure_read(sql) or not single_statement(sql) for sql, _ in items):
             return [self.query(sql, params) for sql, params in items]
         out: list[list[dict]] = []
         for start in range(0, len(items), 90):  # json_build_array : 100 arguments au plus
@@ -937,7 +937,7 @@ class PsycopgDriver:
             raise SchemaMissing(_schema_message(self))
         if not self._schema_pending:
             return False
-        if (";" in sql.strip().rstrip(";") or not self._pipeline_ok()
+        if (not single_statement(sql) or not self._pipeline_ok()
                 or self.conn.info.transaction_status != self._psycopg.pq.TransactionStatus.IDLE):
             # plusieurs instructions (interdit en pipeline), ou transaction
             # ouverte : la sonde passe seule, d'abord
@@ -977,13 +977,13 @@ class PsycopgDriver:
             raise SchemaMissing(_schema_message(self))
         probe = False
         if self._schema_pending:
-            if any(";" in sql.strip().rstrip(";") for sql, _ in items):
+            if any(not single_statement(sql) for sql, _ in items):
                 self._settle_schema()
             else:
                 probe = self._deferred(items[0][0])
         if len(items) == 1 and not probe:
             return [self.query(*items[0])]
-        if not self._pipeline_ok() or any(";" in sql.strip().rstrip(";") for sql, _ in items):
+        if not self._pipeline_ok() or any(not single_statement(sql) for sql, _ in items):
             if probe:
                 self._schema_pending = True
                 self._settle_schema()
@@ -1253,6 +1253,68 @@ class _Abort(Exception):
 def pure_read(sql: str) -> bool:
     """SELECT sans effet : peut être regroupé et rejoué depuis le cache."""
     return bool(_READ_RE.match(sql)) and not _UNSAFE_RE.search(sql)
+
+
+#: dollar-quoted string opening (`$$`, `$tag$`) — rare here, but a `;` inside
+#: one is not a separator either
+_DOLLAR_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+
+def _skip_trivia(sql: str, index: int) -> int:
+    """Index after whitespace and comments, starting at `index`."""
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char.isspace():
+            index += 1
+        elif sql.startswith("--", index):
+            newline = sql.find("\n", index)
+            index = length if newline < 0 else newline + 1
+        elif sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+        else:
+            break
+    return index
+
+
+def single_statement(sql: str) -> bool:
+    """True when `sql` holds at most one statement (a trailing `;` allowed).
+
+    A pipeline carries a single statement: `query_batch` therefore falls back
+    to one query per item as soon as it sees a `;`. Scanning the raw text made
+    that test fire on a `;` written inside a `--` comment, which turned a
+    whole batch into one round trip per query (L521: `alerts` paid 33 trips
+    for 31 statements, ~7 s from a laptop). Comments, string literals, quoted
+    identifiers and dollar-quoted strings are skipped here.
+    """
+    index, length = 0, len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "'" or char == '"':
+            index += 1
+            while index < length:
+                if sql[index] == char:
+                    if index + 1 < length and sql[index + 1] == char:
+                        index += 2  # doubled quote: escaped, stay inside
+                        continue
+                    break
+                index += 1
+            index += 1
+        elif sql.startswith("--", index) or sql.startswith("/*", index):
+            index = _skip_trivia(sql, index)
+        elif char == "$":
+            match = _DOLLAR_RE.match(sql, index)
+            if match is None:
+                index += 1
+                continue
+            end = sql.find(match.group(0), match.end())
+            index = length if end < 0 else end + len(match.group(0))
+        elif char == ";":
+            return _skip_trivia(sql, index + 1) >= length
+        else:
+            index += 1
+    return True
 
 
 def _same_params(left: tuple, right: tuple) -> bool:

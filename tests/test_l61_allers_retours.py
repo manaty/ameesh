@@ -31,6 +31,14 @@ BORNES = {
     "cost report": 3,
     #: hook sous bail, sans courrier (PostToolUse) : contrôle du bail, réservation
     "hook": 2,
+    #: L521 : une lecture par section auparavant (23 allers-retours)
+    "work show": 4,
+    "mail whoami": 1,
+    "mail inbox": 2,
+    "projects": 2,
+    #: L521 : 34 allers-retours avant, un `;` dans un commentaire SQL
+    #: désactivait le pipeline de tout le lot
+    "alerts": 6,
 }
 
 
@@ -41,8 +49,11 @@ class TestAllersRetours(PgTestCase):
         self.trace_path = os.path.join(self.tmp, "trace.jsonl")
         for name in ("alpha", "beta"):
             registry.upsert(self.db, name, harness="claude", host="h1", cwd="/tmp")
+        self.lot = 0
         for index in range(4):
-            work.add(self.db, title="lot %d" % index, assignee="alpha" if index % 2 else "beta")
+            item = work.add(self.db, title="lot %d" % index,
+                            assignee="alpha" if index % 2 else "beta")
+            self.lot = self.lot or item["id"]
         mail.send(self.db, "beta", "alpha", "bonjour")
 
     # -- outillage ---------------------------------------------------------
@@ -90,6 +101,35 @@ class TestAllersRetours(PgTestCase):
         trace = self._trace(self.mesh, "work", "list")
         self.assertIn("lot 3", trace["stdout"])
         self._borne(trace, BORNES["work list"])
+
+    def test_work_show(self):
+        trace = self._trace(self.mesh, "work", "show", str(self.lot))
+        self.assertIn("lot 0", trace["stdout"])
+        self._borne(trace, BORNES["work show"])
+
+    def test_mail_whoami(self):
+        owner = "runner-l61-who"
+        lease = registry.claim(self.db, "alpha", owner, 3600)
+        self.assertIsNotNone(lease)
+        env = dict(AGENT_MAIL_NAME="alpha", AMEESH_RUNNER_ID=owner,
+                   AMEESH_LEASE_EPOCH=str(lease["lease_epoch"]))
+        trace = self._trace(self.cli, "whoami", **env)
+        self.assertIn("alpha", trace["stdout"])
+        self._borne(trace, BORNES["mail whoami"])
+
+    def test_mail_inbox(self):
+        trace = self._trace(self.cli, "inbox", "alpha")
+        self.assertIn("bonjour", trace["stdout"])
+        self._borne(trace, BORNES["mail inbox"])
+
+    def test_projects(self):
+        trace = self._trace(self.mesh, "projects")
+        self.assertIn("alpha", trace["stdout"])
+        self._borne(trace, BORNES["projects"])
+
+    def test_alerts(self):
+        trace = self._trace(self.mesh, "alerts")
+        self._borne(trace, BORNES["alerts"])
 
     def test_progress(self):
         trace = self._trace(self.mesh, "progress", "--json")
@@ -218,6 +258,54 @@ class TestLectureGroupee(unittest.TestCase):
                     "SELECT * FROM t FOR SHARE", "SELECT pg_advisory_xact_lock(1)",
                     "SELECT pg_notify('c', 'x')", "SELECT nextval('s')"):
             self.assertFalse(db_mod.pure_read(sql), sql)
+
+    def test_single_statement_ignores_comments_and_literals(self):
+        """L521: a `;` in a comment, a literal or a quoted identifier is not a
+        statement separator — it used to disable the pipeline of a whole
+        batch (`alerts`: 33 round trips instead of 3)."""
+        for sql in ("SELECT 1 -- un ; dans un commentaire\n",
+                    "SELECT ';' AS c",
+                    'SELECT ";" FROM t',
+                    "SELECT 1;  -- fin\n",
+                    "/* a ; b */ SELECT 1",
+                    "SELECT $$a ; b$$",
+                    "SELECT 1"):
+            self.assertTrue(db_mod.single_statement(sql), sql)
+        for sql in ("SELECT 1; SELECT 2",
+                    "SELECT 1;\nSELECT 2",
+                    "SELECT 1; /* puis */ SELECT 2"):
+            self.assertFalse(db_mod.single_statement(sql), sql)
+
+
+class TestCacheCanon(unittest.TestCase):
+    """`canon.configured_cache`: one read per command, not one per dry pass."""
+
+    def test_read_once_inside_the_block(self):
+        from types import SimpleNamespace
+
+        from ameesh import canon as canon_mod
+
+        calls = []
+
+        def fake_load(root, **kwargs):
+            calls.append(root)
+            return SimpleNamespace(id="home", root=root)
+
+        cfg = SimpleNamespace(canon="/tmp/canon", canon_ref="", canon_untrusted=False,
+                              canon_entries=None)
+        original = canon_mod.load
+        canon_mod.load = fake_load
+        try:
+            with canon_mod.configured_cache():
+                canon_mod.load_configured(cfg)
+                canon_mod.load_configured(cfg)
+            # outside the block, the cache is gone: each call reads again
+            self.assertEqual(len(calls), 1)
+            canon_mod.load_configured(cfg)
+            canon_mod.load_configured(cfg)
+            self.assertEqual(len(calls), 3)
+        finally:
+            canon_mod.load = original
 
 
 if __name__ == "__main__":

@@ -1079,47 +1079,55 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 
 def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import plan
-    item = work.get(db, lot_id)
-    if item is None:
-        return None
-    item["events"] = work.events(db, lot_id)
-    item["milestones"] = work.milestones(db, lot_id)
-    from .modules.storage import ModuleStore
-    item["module_milestones"] = ModuleStore(db).milestones(lot_id)
-    item["delays"] = work.timeline(db, lot_id)
-    plan.annotate(db, [item])
-    # L96 : dates prévues (feuille de route)
-    planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
-    item["planned"] = {k: planned.get("planned_" + k)
-                       for k in ("start", "end", "delivery", "source", "by")}
-    # L157 : durée estimée, réel mesuré, écart ; historique des estimations
-    from . import estimates
-    item["estimate"] = estimates.view(
-        item, merged_ts=(item["delays"] or {}).get("merged_ts"))
-    item["estimates"] = storage.of(db).work.estimates(lot_id)
-    # L157b : estimation de référence (lecture de la table publiée)
-    item["estimate_reference"] = estimates.proposal(
-        db, type=item.get("type"), size=item.get("change_size"),
-        assignee=item.get("assignee"))
-    # L160d : résolutions préparées où le lot est l'un des deux côtés
-    from . import resolutions
-    item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
-    if error:  # e.g. a database without migration 0057
-        item["resolutions_error"] = error
-    # L160e : place du lot dans la file de fusion de sa cible
-    try:
-        item["queue"] = next((r for r in storage.of(db).work.queue()
-                              if int(r["work_item_id"]) == lot_id), None)
-    except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
-        item["queue"] = None
-    # L157c: actual time by phase and merged diff size, once delivered
-    from . import lot_measures
-    item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
-    # L317c: the auditor's automatic deep analysis and its measured delay
-    from . import deep_analysis
-    item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
-    return item
+    from . import canon as canon_mod, plan
+
+    def lire(db):
+        item = work.get(db, lot_id)
+        if item is None:
+            return None
+        item["events"] = work.events(db, lot_id)
+        item["milestones"] = work.milestones(db, lot_id)
+        from .modules.storage import ModuleStore
+        item["module_milestones"] = ModuleStore(db).milestones(lot_id)
+        item["delays"] = work.timeline(db, lot_id)
+        plan.annotate(db, [item])
+        # L96 : dates prévues (feuille de route)
+        planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
+        item["planned"] = {k: planned.get("planned_" + k)
+                           for k in ("start", "end", "delivery", "source", "by")}
+        # L157 : durée estimée, réel mesuré, écart ; historique des estimations
+        from . import estimates
+        item["estimate"] = estimates.view(
+            item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+        item["estimates"] = storage.of(db).work.estimates(lot_id)
+        # L157b : estimation de référence (lecture de la table publiée)
+        item["estimate_reference"] = estimates.proposal(
+            db, type=item.get("type"), size=item.get("change_size"),
+            assignee=item.get("assignee"))
+        # L160d : résolutions préparées où le lot est l'un des deux côtés
+        from . import resolutions
+        item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
+        if error:  # e.g. a database without migration 0057
+            item["resolutions_error"] = error
+        # L160e : place du lot dans la file de fusion de sa cible
+        try:
+            item["queue"] = next((r for r in storage.of(db).work.queue()
+                                  if int(r["work_item_id"]) == lot_id), None)
+        except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
+            item["queue"] = None
+        # L157c: actual time by phase and merged diff size, once delivered
+        from . import lot_measures
+        item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
+        # L317c: the auditor's automatic deep analysis and its measured delay
+        from . import deep_analysis
+        item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
+        return item
+
+    # L61/L521: the detail's independent reads travel together (one query per
+    # section before: 23 round trips, ~7 s from a laptop), and the canon read
+    # by the sub-calls is read once per command, not once per dry pass.
+    with canon_mod.configured_cache():
+        return db_mod.batched(db, lire)
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:

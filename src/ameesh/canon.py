@@ -42,6 +42,7 @@ simples, blocs `|`/`>`).
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as _dt
 import fnmatch
@@ -50,6 +51,7 @@ import os
 import posixpath
 import re
 import subprocess
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
@@ -2894,10 +2896,41 @@ def check_identities(canons: list[Canon]) -> None:
         seen[canon.id] = canon
 
 
+#: Canons read inside an explicit, short-lived window (`configured_cache`).
+#: A read command asks for them several times — once per alert family, and
+#: once per dry pass of `db.batched` — and every `load_configured` re-reads
+#: git and the fiches, which dominated `alerts` (L521).
+_CANONS = threading.local()
+
+
+@contextlib.contextmanager
+def configured_cache():
+    """Read the configured canons once inside the block.
+
+    The cache never outlives the block: a long-lived process (`alerts
+    --follow`, the runner) must see canon changes at its next read."""
+    previous = getattr(_CANONS, "loaded", None)
+    _CANONS.loaded = {}
+    try:
+        yield
+    finally:
+        _CANONS.loaded = previous
+
+
+def _configured_key(cfg, fetch: bool) -> tuple:
+    return (tuple((entry.path, getattr(entry, "ref", ""),
+                   bool(getattr(entry, "untrusted", False)))
+                  for entry in configured(cfg)), bool(fetch))
+
+
 def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
     """Les canons configurés qui se laissent charger, le canon par défaut
     d'abord (lecture seule : seuils, hôtes). Une configuration fautive d'un
     canon ne masque pas les autres ; un identifiant en double est écarté."""
+    cache = getattr(_CANONS, "loaded", None)
+    key = _configured_key(cfg, fetch) if cache is not None else None
+    if cache is not None and key in cache:
+        return list(cache[key])
     out: list[Canon] = []
     for index, entry in enumerate(configured(cfg)):
         try:
@@ -2908,6 +2941,8 @@ def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
         if any(c.id == canon.id for c in out):
             continue
         out.append(canon)
+    if cache is not None:
+        cache[key] = out
     return out
 
 
