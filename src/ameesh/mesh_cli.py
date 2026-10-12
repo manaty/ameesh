@@ -349,6 +349,11 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 # #253: each filesystem the guard watches; the lines above are
                 # the worst of them
                 others = [p for p in volume.get("paths") or [] if p != volume.get("path")]
+                if volume.get("unreadable"):  # #306: mount out of reach
+                    print("  volume     %s: unreadable (mount point out of reach)%s"
+                          % (volume.get("path"),
+                             " (also %s)" % ", ".join(others) if others else ""))
+                    continue
                 print("  volume     %s: free %s%s%s" % (
                     volume.get("path"), _fmt_bytes(volume.get("disk_free_bytes")),
                     "; btrfs unallocated %s, metadata headroom %s" % (

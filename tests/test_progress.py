@@ -226,8 +226,11 @@ class RenderTest(unittest.TestCase):
         # aucune ressource externe : ni src/href distants, ni import, ni CDN
         self.assertIsNone(re.search(r"(src|href)\s*=\s*[\"']?(https?:)?//", html, re.I))
         self.assertNotIn("@import", html)
-        self.assertNotIn("fetch(", html)
-        self.assertIn("default-src 'none'", html)
+        # L304 : le code de rafraîchissement existe, mais la page statique ne
+        # peut rien demander au réseau (aucun connect-src)
+        csp = re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', html).group(1)
+        self.assertTrue(csp.startswith("default-src 'none';"), csp)
+        self.assertNotIn("connect-src", csp)
         self.assertIn('name="viewport"', html)
         # les données embarquées se relisent à l'identique
         blob = re.search(r'<script type="application/json" id="data">(.*?)</script>',
