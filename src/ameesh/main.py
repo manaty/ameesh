@@ -60,11 +60,11 @@
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
-  ameesh plan add "what" --pour DATE [--projet P] [--lot N] [--source S] | list
+  ameesh plan add "what" --due DATE [--project P] [--lot N] [--source S] | list
         | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
         roadmap: dated commitments, proposals drawn from decisions,
         text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
-        task or a card: `ameesh work plan <id> --debut DATE --fin DATE --livraison DATE`;
+        task or a card: `ameesh work plan <id> --start DATE --end DATE --delivery DATE`;
   ameesh work estimates [--app P] [--json]
         L157: actual/estimated gaps of delivered work items (median, p80) by
         type and by estimate author; every work item carries an estimated
@@ -90,7 +90,7 @@
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
         mail; withdrawal by the requester; detail and proof (L124);
-  ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
+  ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
@@ -109,7 +109,7 @@
         durable withdrawal, return and lost-host recovery (L232e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
-  ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
+  ameesh housekeeping [--apply] [--json]  cleanup of what agents create (L73);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
@@ -145,7 +145,9 @@ MESH_COMMANDS = (
     "review-class", "handoff",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
-    # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
+    # L73 : ménage de ce que les agents créent (`ameesh housekeeping [--apply]`)
+    "housekeeping",
+    # L148 : `ameesh menage` reste accepté (alias déprécié, retiré au stage 7)
     "menage",
     # L160b : radar de conflits entre lots (`ameesh conflicts [--json]`)
     "conflicts",

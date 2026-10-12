@@ -139,8 +139,8 @@ def parse_since(text: str | None, now: float) -> float:
 # lots
 # --------------------------------------------------------------------------
 
-def _jalons_de_lot(item: dict, events: Iterable[dict], actions: Iterable[dict],
-                   declared: Iterable[dict] | None = None) -> dict:
+def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
+                          declared: Iterable[dict] | None = None) -> dict:
     """Les jalons d'un lot : requested / frozen / verdict / merged.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
@@ -262,14 +262,19 @@ def lot_state(work_state: str, jalons: dict) -> str:
     return "active"
 
 
-def _jalons_declares(st, ids: list[int]) -> dict:
+def _declared_milestones(st, ids: list[int]) -> dict:
     """Les jalons de ces lots dans la table de L10 (`work_item_milestones`),
-    par lot ; `_jalons_de_lot` les préfère à la déduction dès qu'un gel ou un
+    par lot ; `_work_item_milestones` les préfère à la déduction dès qu'un gel ou un
     verdict y est déclaré."""
     out: dict = {}
     for row in st.lot_milestones(ids):
         out.setdefault(int(row["work_item_id"]), []).append(row)
     return out
+
+
+#: L148 (stage 2c): old spellings kept for the callers not yet renamed.
+_jalons_de_lot = _work_item_milestones
+_jalons_declares = _declared_milestones
 
 
 def _round(ts):
@@ -285,7 +290,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
               agent_externals: dict[str, str | None] | None = None) -> dict:
-    jalons = _jalons_de_lot(item, events, actions, declared)
+    jalons = _work_item_milestones(item, events, actions, declared)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
@@ -628,7 +633,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     by_item: dict = {}
     for row in st.lot_actions(ids):
         by_item.setdefault(int(row["work_item"]), []).append(row)
-    declared = _jalons_declares(st, ids)
+    declared = _declared_milestones(st, ids)
     package_rows = st.packages()
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
