@@ -896,10 +896,14 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             "au propriétaire : ameesh decide ask --lot %s --question \"…\""
             % (MAX_QA_LOOPS, item_id))
 
+    held = state == "waiting_human"
     row = storage.of(db).work.move(
         item_id, state, current=current, loops=1 if returning_loop else 0,
-        note=note or ("%s → %s" % (current, state)), actor=actor)
+        note=note or ("%s → %s" % (current, state)), actor=actor, held=held)
     if row is None:
+        if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
+            # the request was answered or withdrawn meanwhile
+            raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
         raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
     return row
 

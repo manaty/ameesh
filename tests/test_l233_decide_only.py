@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import unittest
+from unittest import mock
 
 from ameesh import alert_briefs, chat, decisions, exploitation, mail, notify, work
 
@@ -82,6 +84,55 @@ class WaitingHumanTest(_Base):
         self.answer(view["id"], "a")
         self.assertEqual(self.lot_state(), "waiting_human")
         self.assertEqual([a["lot"] for a in self._without_question()], [self.lot["id"]])
+
+    def test_move_and_open_request_checked_together(self):
+        # r1: a request answered between the check and the update — the
+        # conditional UPDATE (request row locked) refuses the move
+        view = self.ask()
+        self.answer(view["id"], "a")
+        self.assertEqual(self.lot_state(), "build")
+        from ameesh import storage
+        real = storage.of(self.db).decisions.pending_for_lot
+        stale = [{"id": view["id"]}]
+        calls = []
+
+        def first_call_stale(lot):
+            calls.append(lot)
+            return stale if len(calls) == 1 else real(lot)
+
+        with mock.patch.object(type(storage.of(self.db).decisions), "pending_for_lot",
+                               side_effect=first_call_stale):
+            with self.assertRaises(work.WorkError) as ctx:
+                work.move(self.db, self.lot["id"], "waiting_human")
+        self.assertIn("only through an open owner decision request", str(ctx.exception))
+        self.assertEqual(self.lot_state(), "build")
+        self.assertEqual(len(calls), 2)
+        # the storage statement alone: no open request, nothing written
+        self.assertIsNone(storage.of(self.db).work.move(
+            self.lot["id"], "waiting_human", current="build", loops=0, note="x",
+            actor="t", held=True))
+        self.assertEqual(self.lot_state(), "build")
+
+    def test_alert_key_stable_across_notes(self):
+        hold_for_owner(self.db, self.lot["id"], requester="orch")
+        # the request closes without releasing the lot (legacy-like)
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = now() WHERE kind = 'request'")
+        first = self._without_question()
+        self.assertEqual(len(first), 1)
+        time.sleep(1.1)
+        work.note(self.db, self.lot["id"], "still thinking", actor="dev1")
+        again = self._without_question()
+        self.assertEqual([notify.key_of(a) for a in again], [notify.key_of(first[0])])
+        # a new waiting episode is a new alert
+        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
+                        (self.lot["id"],))
+        time.sleep(1.1)
+        work.note(self.db, self.lot["id"], "back to build", actor="dev1")
+        hold_for_owner(self.db, self.lot["id"], requester="orch")
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = now() WHERE kind = 'request'")
+        third = self._without_question()
+        self.assertEqual(len(third), 1)
+        self.assertNotEqual(notify.key_of(third[0]), notify.key_of(first[0]))
 
     def test_decisions_queue_does_not_count_unasked_lots(self):
         self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
@@ -211,6 +262,22 @@ class ProseTest(_Base):
         queue = json.loads(self.mesh("decisions", "--json", env=self.mesh_env()).stdout)
         self.assertEqual([p["recipient"] for p in queue["prose"]], ["human:bob"])
         self.assertEqual(len(queue["requests"]), 1)
+
+    def test_chat_shows_only_its_human_prose(self):
+        # r1: in the chat (plain `ameesh decisions`), no excerpt of mail
+        # addressed to another human
+        mine = self.send("Decision: which carrier?", recipient=ALICE)
+        desk = self.send(self.REPORT)
+        self.send("Decision for bob: carrier?", recipient="human:bob")
+        env = self.mesh_env(AMEESH_CHAT="chat-alice")
+        proc = self.mesh("decisions", "--json", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([p["id"] for p in json.loads(proc.stdout)["prose"]], [mine, desk])
+        texte = self.mesh("decisions", env=env).stdout
+        self.assertNotIn("Decision for bob", texte)
+        # outside the chat, without --for, everything (the owner's terminal)
+        queue = json.loads(self.mesh("decisions", "--json", env=self.mesh_env()).stdout)
+        self.assertEqual(len(queue["prose"]), 3)
 
     def test_chat_consigne_offers_conversion(self):
         text = chat.consigne("human:alice", "chat-alice")

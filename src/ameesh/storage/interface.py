@@ -958,9 +958,22 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
-             actor: str) -> dict | None:
+             actor: str, held: bool = False) -> dict | None:
         """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et
-        journalise ; None (rien d'écrit) s'il n'est plus en `current`."""
+        journalise ; None (rien d'écrit) s'il n'est plus en `current`.
+
+        `held` (L233): also require an open decision request for the lot, in
+        the same statement, the request row locked: an answer closing it
+        concurrently waits for this move (then releases the lot) or makes it
+        fail (None) — the lot never ends waiting with no request."""
+
+    @abc.abstractmethod
+    def waiting_episodes(self, item_ids: Sequence[int]) -> dict[int, dict]:
+        """L233: for each lot, its current waiting episode, stable across
+        notes: `{id: {start_ts, first_ts}}` — `start_ts`, the time of the
+        lot's last journal line in another state than `waiting_human` (its
+        creation if none), `first_ts`, the first `waiting_human` line after
+        it (None if the state was set without a journal line)."""
 
     @abc.abstractmethod
     def note(self, item_id: int, state: str, text: str, actor: str) -> None:

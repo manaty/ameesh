@@ -37,6 +37,16 @@ RESOLUTION_COLUMNS = """
     extract(epoch from created_at)::float8 as created_ts
 """
 
+#: L233: an open decision request holds the lot — row locked, so that an
+#: answer closing it (`decisions.close`, conditional on `delivered_at IS
+#: NULL`) is serialized with the move into waiting_human
+_HELD = """
+               AND EXISTS (SELECT 1 FROM agent_mailbox r
+                            WHERE r.delivered_at IS NULL AND r.kind = 'request'
+                              AND (r.payload -> 'decision') IS NOT NULL
+                              AND btrim(r.work_item_id) = %s
+                              FOR UPDATE)"""
+
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
 
@@ -176,9 +186,12 @@ class WorkItems(interface.WorkItems):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
-    def move(self, item_id, state, *, current, loops, note, actor) -> dict | None:
+    def move(self, item_id, state, *, current, loops, note, actor,
+             held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
-        d'écrit), puis journalise la transition."""
+        d'écrit), puis journalise la transition. `held` (L233) : et si une
+        demande de décision ouverte le tient — vérifiée dans la même
+        instruction, la demande verrouillée (voir l'interface)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
         rows = self.db.query(
             """
@@ -189,10 +202,11 @@ class WorkItems(interface.WorkItems):
                    closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
                    started_at = CASE WHEN %s IN ('build', 'qa')
                                      THEN coalesce(started_at, now()) ELSE started_at END
-             WHERE id = %s AND state = %s
+             WHERE id = %s AND state = %s __HELD__
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", ITEM_COLUMNS),
-            (state, loops, state, state, int(item_id), current),
+            """.replace("__COLUMNS__", ITEM_COLUMNS).replace("__HELD__", _HELD if held else ""),
+            (state, loops, state, state, int(item_id), current)
+            + ((str(int(item_id)),) if held else ()),
         )
         if not rows:
             return None
@@ -398,6 +412,29 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
+
+    def waiting_episodes(self, item_ids) -> dict:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return {}
+        rows = self.db.query(
+            """
+            SELECT w.id,
+                   extract(epoch from coalesce(b.created_at, w.created_at))::float8
+                       AS start_ts,
+                   extract(epoch from (
+                       SELECT min(e.created_at) FROM work_item_events e
+                        WHERE e.work_item_id = w.id AND e.state = 'waiting_human'
+                          AND e.id > coalesce(b.id, 0)))::float8 AS first_ts
+              FROM work_items w
+              LEFT JOIN LATERAL (
+                   SELECT e.id, e.created_at FROM work_item_events e
+                    WHERE e.work_item_id = w.id AND e.state <> 'waiting_human'
+                    ORDER BY e.id DESC LIMIT 1) b ON true
+             WHERE w.id IN (SELECT jsonb_array_elements_text(%s::jsonb)::bigint)
+            """, (json.dumps(ids),))
+        return {int(r["id"]): {"start_ts": r["start_ts"], "first_ts": r["first_ts"]}
+                for r in rows}
 
     def events(self, item_id, limit) -> list[dict]:
         return self.db.query(

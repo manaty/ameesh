@@ -485,9 +485,14 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         prose = decisions_mod.prose_decisions(db, now)
     finally:
         db.close()
-    if args.for_human:
+    # whose mail may be shown: --for, and in the owner's chat (L123) its human
+    # by default — a chat never shows excerpts of mail addressed to another
+    viewer = args.for_human or (decisions_mod.current_human()
+                                if os.environ.get(decisions_mod.CHAT_ENV) else None)
+    if viewer:
         prose = [p for p in prose
-                 if p["recipient"] in decisions_mod.PROSE_RECIPIENTS + (args.for_human,)]
+                 if p["recipient"] in decisions_mod.PROSE_RECIPIENTS
+                 + (viewer, decisions_mod.OWNER_ANY)]
     queue["requests"] = requests["pending"]
     queue["prose"] = prose
     if args.all:
