@@ -498,28 +498,20 @@ class InstallPilotTest(unittest.TestCase):
         cred("approve", got + "\n")
         self.assertFalse(os.path.exists(store))
         # the clone and ls-remote: the environment's config unset, every
-        # file's helpers reset on the command line, the token on fd 3
+        # file's helpers reset on the command line
         for cmd in ("ls-remote --exit-code", "clone --quiet"):
             line = next(l for l in fresh.splitlines() if cmd in l)
             self.assertIn("-- env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN "
                           "GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=!f()",
                           line)
-        # that inline helper, run: github.com only, from fd 3
-        line = next(l for l in fresh.splitlines() if "ls-remote --exit-code" in l)
-        inline = line.split(" -c credential.helper=", 2)[2].split(" ls-remote ")[0]
-        fd3 = ["bash", "-c", 'exec 3< <(printf %s "$PILOT_T"); exec "$@"', "fd3"]
+        # that inline helper, run: the store set by the environment unset
+        inline = self.inline_helper(fresh)
         for extra in ({}, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
                            "GIT_CONFIG_VALUE_0": "store --file " + store}):
-            res = subprocess.run([*fd3, "env", "-u", "GIT_CONFIG_COUNT", "git", "-c", "credential.helper=",
+            res = subprocess.run(["env", "-u", "GIT_CONFIG_COUNT", "git", "-c", "credential.helper=",
                                   "-c", "credential.helper=" + inline, "credential", "fill"],
-                                 input=req, capture_output=True, text=True,
-                                 env=dict(env, PILOT_T=self.TOKEN, **extra))
+                                 input=req, capture_output=True, text=True, env=dict(env, **extra))
             self.assertIn("password=%s" % self.TOKEN, res.stdout)
-        res = subprocess.run([*fd3, "git", "-c", "credential.helper=", "-c", "credential.helper=" + inline,
-                              "credential", "fill"],
-                             input=req.replace("github.com", "evil.example"),
-                             capture_output=True, text=True, env=dict(env, PILOT_T=self.TOKEN))
-        self.assertNotIn(self.TOKEN, res.stdout)
         # --check sees a store after the clone's reset (its own include)
         self.on_host("/srv/ameesh-guest/work/deepseek6/.git/store.inc",
                      "[credential]\n\thelper = store\n")
@@ -529,22 +521,50 @@ class InstallPilotTest(unittest.TestCase):
                       "%s, store, not" % helper, out)
         self.assertFalse(os.path.exists(store))
 
+    def inline_helper(self, out):
+        """The inline helper of --enable's ls-remote, reading the test's
+        host's /etc/ameesh/guest-deepseek6.env."""
+        line = next(l for l in out.splitlines() if "ls-remote --exit-code" in l)
+        inline = line.split(" -c credential.helper=", 2)[2].split(" ls-remote ")[0]
+        self.assertIn(" /etc/ameesh/guest-deepseek6.env ", inline)
+        return inline.replace(" /etc/ameesh/", " %s/etc/ameesh/" % self.host)
+
     def test_the_token_is_in_no_environment(self):
         # codex #457 r2 P2: the token reaches no process's environment;
-        # r3 P2: nor any file (a SIGKILL would leave it): a pipe on fd 3
+        # r3 P2: nor any file (a SIGKILL would leave it); r4 P2: nor a
+        # descriptor git's children inherit (a hook): root hands git
+        # nothing, the guest's helper reads the guest's own file
         with open(self.SCRIPT, encoding="utf-8") as fh:
             script = fh.read()
         self.assertNotRegex(script, r"GH_TOKEN=\$")
         self.assertNotIn("mktemp", script)
+        self.assertNotRegex(script, r"<&3|3<&|3<")
         self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
         out = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout
-        self.assertNotIn("GH_TOKEN=", out)
+        self.assertNotRegex(out, r'GH_TOKEN=(?!//p")')    # (but the helper's sed)
         self.assertNotIn("/token", out)
-        pipe = "+ (GH_TOKEN of /etc/ameesh/guest-deepseek6.env, through a pipe on fd 3 of)\n" \
-               "+ runuser -u ameesh-guest -- env "
-        self.assertEqual(out.count(pipe), 2)
-        self.assertLess(out.index(pipe), out.index("ls-remote"))
+        self.assertNotIn("token_of", out)
+        self.assertEqual(out.count("+ runuser -u ameesh-guest -- env -u GIT_CONFIG_COUNT"), 2)
         self.assertNotIn(self.TOKEN, out)
+
+    def test_the_inline_helper_asks_for_https_and_answers_again(self):
+        # codex #457 r4 P2: protocol=http got the token; a second request
+        # (a retry, a redirect) got nothing once fd 3 was read
+        self.on_host("/etc/ameesh/guest-deepseek6.env",
+                     "DEEPSEEK_API_KEY=k\nGH_TOKEN='%s'\n" % self.TOKEN)
+        inline = self.inline_helper(self.dry("--enable", "deepseek6", *self.workspace_args()).stdout)
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_NOSYSTEM="1")
+        def fill(protocol="https", host="github.com"):
+            return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + inline,
+                                   "credential", "fill"],
+                                  input="protocol=%s\nhost=%s\n\n" % (protocol, host),
+                                  capture_output=True, text=True, env=env).stdout
+        for _ in range(3):
+            self.assertIn("username=x-access-token\npassword=%s\n" % self.TOKEN, fill())
+        self.assertNotIn(self.TOKEN, fill("http"))
+        self.assertNotIn(self.TOKEN, fill(host="evil.example"))
+        self.assertNotIn(self.TOKEN, fill(host="github.com.evil.example"))
 
     def test_a_profile_swapped_while_read_is_refused(self):
         # codex #457 r2 P1 (TOCTOU): agent/ swapped for a link to elsewhere

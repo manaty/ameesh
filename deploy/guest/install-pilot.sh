@@ -651,21 +651,18 @@ EOF
 
 # git_cred AGENT CMD…: git as the guest, with an inline helper alone (the
 # helpers of every config file reset on the command line, read after them
-# all; the config of the environment unset). AGENT's GH_TOKEN reaches it
-# through a pipe on fd 3, read once: never in a file, an argument or an
-# environment, gone with the processes (codex #457 r3)
-GIT_CRED_HELPER='!f() { [ "$1" = get ] || return 0; h=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in host=*) h=${l#host=} ;; esac; done; t=$(cat <&3 2>/dev/null); [ "$h" = github.com ] && [ -n "$t" ] && printf "username=x-access-token\npassword=%s\n" "$t"; }; f'
+# all; the config of the environment unset). The helper reads AGENT's
+# GH_TOKEN itself, as the guest, in /etc/ameesh/guest-AGENT.env (0640
+# root:ameesh-guest: the guest's to read, as its runner does), on each
+# request, for https://github.com only: root hands it nothing (no file, no
+# pipe, no descriptor a child of git inherits: codex #457 r4)
 git_cred() {
-  local a=$1 rc=0
+  local a=$1 helper
   shift
-  [ "$DRY" = 0 ] || echo "+ (GH_TOKEN of $ETC/guest-$a.env, through a pipe on fd 3 of)"
-  { quiet; } 2>/dev/null
-  # (a git that never asks closes fd 3 unread: no SIGPIPE taken for a failure)
-  (trap '' PIPE; token_of "$a" 2>/dev/null || true) | as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN \
-    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c "credential.helper=$GIT_CRED_HELPER" "$@" \
-    3<&0 </dev/null || rc=$?
-  unquiet
-  return $rc
+  helper=$(printf '!f() { [ "$1" = get ] || return 0; p= h=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in protocol=*) p=${l#protocol=} ;; host=*) h=${l#host=} ;; esac; done; [ "$p" = https ] && [ "$h" = github.com ] || return 0; t=$(sed -n "s/^[[:space:]]*GH_TOKEN=//p" %s | tail -n 1 | sed "s/^[\\"\\x27]//; s/[\\"\\x27]\\$//"); [ -n "$t" ] && printf "username=x-access-token\\npassword=%%s\\n" "$t"; }; f' \
+    "$ETC/guest-$a.env")
+  as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN GIT_TERMINAL_PROMPT=0 \
+    git -c credential.helper= -c "credential.helper=$helper" "$@"
 }
 # cred_audit DIR before|after: what in the clone in DIR's config, as git
 # reads it there for the guest (its home; every scope, worktree too, includes

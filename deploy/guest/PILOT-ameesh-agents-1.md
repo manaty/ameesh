@@ -181,10 +181,12 @@ runners. Everything is checked before anything is done:
   for one, anywhere, the guest's `~/.gitconfig` included; a
   `credential.helper` in `config.worktree` or in an include) is refused:
   remove it first, `--enable` says where it is. For the clone itself (and
-  the branch asked first), the token goes from root to git's helper
-  through a pipe, read once: never in a file, an argument or an
-  environment, never printed. A clone without `GH_TOKEN` in the agent's
-  file is refused;
+  the branch asked first), git, run as the guest, is given an inline
+  helper that reads `GH_TOKEN` in the agent's file itself (the guest's to
+  read, as its runner does), on each request, for `https://github.com`
+  only: root hands git no token (no file, argument, environment or open
+  descriptor), and nothing is printed. A clone without `GH_TOKEN` in the
+  agent's file is refused;
 * **the dsh profile**: `hooks.json` and the plain files of
   `~/.dsh/profiles/*/` from `--dsh-from` (by default the `sudo` user's
   `~/.dsh`), never its sessions, keys, logs or modules; refused if a file
