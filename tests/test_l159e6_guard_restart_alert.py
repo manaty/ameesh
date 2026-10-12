@@ -83,17 +83,29 @@ class AlertTest(unittest.TestCase):
             self.assertEqual(self.alerts({"guard_restart": old, "sampled_ts": 9995.0},
                                          10000.0), [], skew)
 
+    def test_an_ill_typed_age_raises_nothing(self):
+        # codex #288 r2: an age that is huge, negative, infinite, not a
+        # number or missing: no alert (and no comparison of the two clocks),
+        # the other host alerts still computed
+        for age in (10 ** 400, -1.0, float("inf"), float("nan"), True, "10", None):
+            record = dict(RESTART, age_s=age)
+            if age is None:
+                del record["age_s"]
+            self.assertEqual(self.alerts({"guard_restart": record}, 1060.0), [], age)
+
     def test_raised_for_a_day_one_alert_per_restart(self):
-        [alert] = self.alerts({"guard_restart": RESTART}, 1060.0)
+        [alert] = self.alerts({"guard_restart": dict(RESTART, age_s=60.0)}, 1060.0)
         self.assertEqual((alert["host"], alert["since"], alert["value"]), ("vm", 1000.0, 1))
         self.assertEqual((alert["started"], alert["skipped"]), ([UNIT_A], {UNIT_B: "stopped_by_owner"}))
         self.assertIn("started again %s" % UNIT_A, alert["detail"])
         self.assertIn("%s (stopped_by_owner)" % UNIT_B, alert["detail"])
-        [later] = self.alerts({"guard_restart": RESTART}, 1000.0 + 86399)
+        [later] = self.alerts({"guard_restart": dict(RESTART, age_s=86399.0)},
+                              1000.0 + 86399)
         self.assertEqual(exploitation.alert_key(alert), exploitation.alert_key(later))
-        [other] = self.alerts({"guard_restart": dict(RESTART, ts=5000.0)}, 5001.0)
+        [other] = self.alerts({"guard_restart": dict(RESTART, ts=5000.0, age_s=1.0)}, 5001.0)
         self.assertNotEqual(exploitation.alert_key(alert), exploitation.alert_key(other))
-        self.assertEqual(self.alerts({"guard_restart": RESTART}, 1000.0 + 86400), [])
+        self.assertEqual(self.alerts({"guard_restart": dict(RESTART, age_s=86400.0)},
+                                     1000.0 + 86400), [])
         self.assertEqual(self.alerts({"guard_restart": None}, 1060.0), [])
         self.assertEqual(self.alerts({}, 1060.0), [])
 
