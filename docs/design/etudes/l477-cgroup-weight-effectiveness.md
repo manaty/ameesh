@@ -42,8 +42,10 @@ generated: { by: "mty-amh-impl-02", at: "2026-10-12" }
 - **Any host change (enabling iocost, loading BFQ, moving the scopes, setting
   unit weights) needs the owner's separate authorization**, preceded by the
   controlled measurement proposed below. This audit changed nothing and
-  generated no load: the only recurring read was one registry `SELECT` every
-  ~5 s for ~3.6 min (§7).
+  generated no load: the only recurring access was a read-only
+  `ameesh list --json` every ~5 s for ~3.6 min (§7) — a handful of SELECTs,
+  not a single one — and the rerun command disables `AMEESH_DB_TRACE` and
+  Python bytecode writing so the sampler itself writes nothing (§7, block 6).
 
 # Scope and method
 
@@ -60,11 +62,16 @@ reads of `/sys/fs/cgroup/**` (`cgroup.controllers`, `cgroup.subtree_control`,
 `cpu.weight`, `cpu.max`, `io.weight`, root `io.cost.qos`/`io.cost.model`),
 `/sys/block/*/queue/scheduler`, `lsblk`, `docker ps`, `/proc/<pid>/cgroup`,
 `/proc/pressure/*`, `lsmod`, `dpkg -L`, `strings`/byte reads of the installed
-`libsystemd-core-255.so`, `ameesh list --json` (SELECTs on
-`agent_mesh_overview` only), read-only `cat` of the `.heavy` slot files, and
-`journalctl`. **`ameesh heavy --status` is deliberately not used**: it is not
-passive (§6). No unit, cgroup, scheduler, mount or configuration was modified,
-and no load was generated on purpose.
+`libsystemd-core-255.so`, `ameesh list --json` (SELECTs: `registry.overview`
+on `agent_mesh_overview`, `work.delays` for up to 500 lots, then the placement
+and exploitation annotations — see `mesh_cli.cmd_list`), read-only `cat` of
+the `.heavy` slot files, and `journalctl`. **`ameesh heavy --status` is
+deliberately not used**: it is not passive (§6). No unit, cgroup, scheduler,
+mount or configuration was modified, and no load was generated on purpose.
+The lease sampler is read-only on the database but is still a process: it must
+run with `AMEESH_DB_TRACE` unset — otherwise each call appends a JSON line to
+that file (`db.py:142-153`) — and with bytecode writing off, as block 6 of the
+rerun section does.
 
 Not audited: **pc-smichea** and the mesh server. Neither is reachable from this
 host (no `~/.ssh`, `pc-smichea` does not resolve), so the findings below cover
@@ -151,8 +158,10 @@ CPUQuotaPerSecUSec=2s
 
 So `cpu` is enabled into the guest subtree, `cpu.weight=10` is in effect at
 both the guest and parent levels, and the guest runner units
-(`ameesh-guest-runner@deepseek1/6.service`, `MemoryMax=4.5G`) share that slice
-weight and quota without a weight of their own.
+(`ameesh-guest-runner@deepseek1/6.service`, `MemoryMax=4.5G`) have no `cpu`
+interface of their own — the guest slice enables only `memory pids` for its
+children — so their CPU is accounted in the slice's single entity, under its
+weight 10 and its `CPUQuota=200%`.
 
 What that does and does not mean: a CPU weight is a *relative share*, and only
 among eligible sibling workloads competing for the same CPUs. With no sibling
@@ -162,8 +171,11 @@ nor caps. What actually bounds this guest is `cpu.max=200000 100000`
 qualified: guest tasks are accounted under `/ameesh.slice` for CPU (its
 `cgroup.subtree_control` enables `cpu` for its children), and that slice
 competes at the root against `system.slice` and `user.slice`, both weight 100.
-Within the guest, `ameesh-guest.slice` carries the same weight 10 and no
-`CPUQuota` of its own, so its runners share the parent's cap and weight.
+Within the guest, `ameesh-guest.slice` itself carries `CPUQuota=200%` (the
+`cpu.max=200000 100000` and `CPUQuotaPerSecUSec=2s` read on it above;
+`deploy/guest/ameesh-guest.slice:26`), and its runners set no `CPUWeight` or
+`CPUQuota` of their own: that quota caps the whole slice subtree, and the
+slice's weight 10 ranks that subtree as one entity against its siblings.
 
 The I/O half has no effect. On this host (r2 reads are identical to r1):
 
@@ -400,60 +412,74 @@ turn's group immediately on four other paths:
    the renewal write lands** (`registry.py:530-552`): the turn is stopped at
    once ("lease lost (epoch N)").
 
-A read-only sample of `agent_registry` took 40 points every ~5.1 s
-(2026-10-12 20:44:54Z → 20:48:30Z, ~216 s) for the 13 agents of this host
-holding a lease. The exact command is block 6 of the rerun section below
-(`ameesh list --json` issues SELECTs only); first and last points:
+A read-only sample of the lease state (`ameesh list --json`) took 40 points
+every ~5.05 s. Two windows were taken: the r2 window (2026-10-12 20:44:54Z →
+20:48:30Z, ~216 s, 13 agents holding a lease) and the r3 window used for the
+raw evidence below (2026-10-12 21:28:32Z → 21:32:09Z, ~217 s, 28 agents
+holding a lease in the shared registry — the sample lists every leased agent,
+not only this host's). The exact command is block 6 of the rerun section
+below; it issues SELECTs only and, run as written, writes nothing. The r3
+renewals, on both sides of the write, with the lowest remaining TTL of the
+window:
 
 ```
-=== 2026-10-12T20:44:54Z sample 1
-  deepseek5          ttl= 289.4 last_seen_age=  10.6
-  mty-amh-impl-02    ttl= 280.0 last_seen_age=  20.0
-  deepseek4          ttl= 240.9 last_seen_age=  59.1
-  …
-=== 2026-10-12T20:48:30Z sample 40
-  mty-amh-impl-01    ttl= 211.0 last_seen_age=  89.0
-  …
+21:29:45Z  deepseek2      ttl= 202.0  last_seen_age= 98.0
+21:29:50Z  deepseek2      ttl= 296.5  last_seen_age=  3.5  <- renewed
+21:31:25Z  deepseek2      ttl= 202.0  last_seen_age= 98.0
+21:31:30Z  deepseek2      ttl= 296.4  last_seen_age=  3.6  <- renewed, 100.0 s later
+21:31:36Z  ameesh-cx2     ttl= 188.8  last_seen_age= 21.4  <- lowest TTL seen before a renewal
+21:31:41Z  ameesh-cx2     ttl= 295.3  last_seen_age=  4.7  <- renewed
+21:28:44Z  mty-amh-qa-01  ttl= 201.3  last_seen_age= 98.7
+21:28:49Z  mty-amh-qa-01  ttl= 295.7  last_seen_age=  4.3  <- renewed
+21:30:23Z  mty-amh-qa-01  ttl= 201.4  last_seen_age= 98.6
+21:30:29Z  mty-amh-qa-01  ttl= 295.9  last_seen_age=  4.1  <- renewed, 100.0 s later
+21:32:03Z  mty-amh-qa-01  ttl= 201.3  last_seen_age= 98.7
+21:32:09Z  mty-amh-qa-01  ttl= 295.8  last_seen_age=  4.2  <- renewed, 100.0 s later
 ```
 
-Summary of the 40 points:
+Summary of the r3 window (the r2 window had the same shape, with a minimum of
+200.3 s):
 
-- six agents stayed pinned at 295–300 s for the whole window (idle agents,
-  renewed on each poll);
-- seven agents ran a turn during the window and showed the sawtooth
-  300 → 200 s; the **minimum remaining TTL observed was 200.3 s** (deepseek5;
-  202.0 s for deepseek4), i.e. the renewal landed at the nominal 200 s floor
-  within one ~5 s sample, while the slowest of the seven bottomed at 213.3 s;
-  measured cadence **100.0 s** on the three agents that completed two renewal
-  cycles inside the window, against 100 s nominal;
-- `last_seen` was up to 99.7 s old for busy agents (updated on heartbeat) and
-  ≤5 s for idle ones;
-- no remaining TTL below zero: no lease expired during the sample. (The
+- the heartbeat renews every `lease_ttl/3` (`runner.py:940`), so 100 s on the
+  300 s TTL: on schedule a renewal leaves ~200 s; 15 agents renewed at least
+  once, `deepseek2` twice and `mty-amh-qa-01` three times, **100.0 s apart**;
+- the **lowest remaining TTL observed before a renewal was 188.8 s**
+  (`ameesh-cx2`, 21:31:36Z, renewed between that sample and the next): the
+  renewal landed ~11 s below the nominal 200 s, not within one ~5 s sample;
+- `last_seen` was up to 98.7 s old for busy agents and ≤5 s for idle ones;
+- no remaining TTL below zero: no lease expired during either sample. (The
   timestamps are server epochs compared to the local clock; a clock skew would
   shift all absolute values equally and leaves the cadence unchanged.)
 
-Journal check over the last 6 hours (the sample window and before), with the
-exact filter for the runner's own stop lines (format
-`[<agent>] harness stopped (<reason>)`, `runner.py:818`):
+A positive TTL at every sample does not by itself exclude a lease stop and a
+re-acquisition between two samples; the journal check below is what covers
+stops, and the ~5 s spacing bounds what the sample can see.
+
+Journal check over the last 6 hours (the sample windows and before), anchored
+on the runner's own message format (`[<agent>] harness stopped (<reason>)`,
+`runner.py:818`; heartbeat lines at `runner.py:610-640`). `-o cat` drops the
+journal prefix and `^` anchors the match at the start of the message, so the
+same text quoted inside a longer line of agent output is not counted:
 
 ```
-$ journalctl --user -u 'ameesh-runner-agent@*' --since '6 hours ago' --no-pager \
-  | grep -cE 'harness stopped \((lease deadline reached|renewal unanswered past the lease|database unreachable|lease lost)'
+$ journalctl --user -u 'ameesh-runner-agent@*' --since '6 hours ago' --no-pager -o cat \
+  | grep -cE '^\[[^]]+\] harness stopped \((lease deadline reached|renewal unanswered past the lease|database unreachable|lease lost)\)'
 0
-$ journalctl --user -u 'ameesh-runner-agent@*' --since '6 hours ago' --no-pager \
-  | grep -cE '\] heartbeat:'
+$ journalctl --user -u 'ameesh-runner-agent@*' --since '6 hours ago' --no-pager -o cat \
+  | grep -cE '^\[[^]]+\] heartbeat:'
 0
 ```
 
-The journal does contain agent turn output quoting text (mail, commit messages);
-the filter above targets the runner's own stop/heartbeat lines, so those quoted
-texts are not counted.
+The journal does contain agent turn output quoting text (mail, commit
+messages). A quoted line that itself started with the exact runner format
+would still be counted; neither filter matched anything in the window, so the
+0 stands.
 
 So, under this load and with this database, a lease is lost only through the
-paths above; the observed lateness is at most about one sample (≈5 s), and the
-≈200 s margin is conditional on renewals eventually succeeding. The heartbeat's
-database round-trip is the thing to watch if weights are ever enabled, because
-it shares the DB/I/O path.
+paths above; the tightest margin seen was 188.8 s (r3 window), and that
+≥188 s margin is conditional on renewals eventually succeeding. The
+heartbeat's database round-trip is the thing to watch if weights are ever
+enabled, because it shares the DB/I/O path.
 
 # What would have to be true before weighting anything
 
@@ -463,14 +489,20 @@ it shares the DB/I/O path.
 2. **Controller** — `cpu` enabled along `ameesh-agents.slice` (or the chosen
    parent); `io` enabled under `user@1001.service` if user units are to carry
    `IOWeight`. This is not a neutral read: enabling a controller rewrites the
-   `cgroup.subtree_control` of ancestors and can move which cgroup owns the
-   CPU scheduling group of existing processes. Enabling `cpu` under
-   `ameesh-agents.slice`, for instance, makes all runner units one sibling
-   group at that level instead of flat members of the user `ameesh.slice`;
-   that changes the effective hierarchy for live workloads and must be
-   measured before/after. cgroup v2 also forbids a cgroup with member
-   processes from enabling controllers for its children (systemd moves its own
-   processes when it needs to); a write can therefore fail with `EBUSY`.
+   `cgroup.subtree_control` of ancestors and changes the CPU scheduling
+   entities of existing processes. Enabling `cpu` under `ameesh-agents.slice`,
+   for instance, gives `ameesh-agents.slice` a scheduling group of its own
+   under the user slice, and each of its children — each runner unit — a
+   separate sibling group; before that, with `cpu` enabled only further up,
+   those units' processes were accounted as one entity at the nearest ancestor
+   that had it enabled. That changes the effective hierarchy for live
+   workloads and must be measured before/after. cgroup v2's no-internal-process
+   constraint also applies: a non-root domain cgroup with member processes
+   cannot enable domain controllers for its children (systemd moves its own
+   processes when it needs to), so a write can fail with `EBUSY`. The root
+   cgroup is exempt, and so is a threaded subtree: the `cpu` controller is
+   threaded and admits member processes there (Linux v6.8, cgroup-v2.rst,
+   "No Internal Process Constraint").
 3. **Privileges** — system-manager changes (`/ameesh.slice`,
    `/ameesh-guest.slice`, guest runner units, system `io.cost.*`, scheduler
    selection) require root on the host; user-manager changes
@@ -527,8 +559,10 @@ it shares the DB/I/O path.
   arbitrate the physical I/O of competing guests. This is a privileged,
   host-wide change: require explicit host authorization, a before/after
   database-latency and throughput measurement, and a written rollback plan
-  (restore `mq-deadline`, clear `io.cost.*`) before touching a device. Never
-  include the PostgreSQL containers in a lowering.
+  (capture the scheduler before the change and restore it — it is `[none]`
+  here, not `mq-deadline` — and disable iocost by writing `enable=0` for the
+  device in `io.cost.qos`, never by "clearing" `io.cost.*`) before touching a
+  device. Never include the PostgreSQL containers in a lowering.
 - **P6 — Measurement protocol.** On a canary agent: record baseline lease
   jitter, DB round-trip and heavy-test wall time; then run a CPU hog and an I/O
   hog with and without the weights; decide on the delta. This generates load
@@ -567,8 +601,9 @@ it shares the DB/I/O path.
 Read-only: nothing below writes a property, a cgroup or a scheduler, and no
 load is generated. Run it on the target host, note the UTC time, and paste the
 output here or in a comment. Run it while the host is under load — PSI and
-lease jitter say nothing on an idle host. Except for the lease sampler (one
-`SELECT` every 5 s), no command creates or locks anything.
+lease jitter say nothing on an idle host. Except for the lease sampler (a
+handful of SELECTs every 5 s, with tracing and bytecode writing off, block 6),
+no command creates or locks anything.
 
 ```bash
 # 0 — host, kernel, systemd, CPU/memory, RT-group-sched support
@@ -659,9 +694,13 @@ cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory
 st="${AMEESH_STATE_DIR:-$HOME/.local/state/ameesh}/.heavy"
 ls -la "$st" 2>&1
 for f in "$st"/slot-*; do [ -e "$f" ] || continue; printf '%s: ' "$f"; cat "$f"; echo; done
+#     the sampler is read-only on the database, but it is a process: with
+#     AMEESH_DB_TRACE set, each call appends a JSON line to that file
+#     (db.py:142-153), and Python writes bytecode next to the sources unless
+#     disabled. Unset the trace and disable bytecode writing explicitly:
 for i in $(seq 1 40); do
   date -u +%T
-  ameesh list --json | python3 -c '
+  env -u AMEESH_DB_TRACE PYTHONDONTWRITEBYTECODE=1 ameesh list --json | python3 -c '
 import json, sys, time
 now = time.time()
 for a in json.load(sys.stdin):
@@ -673,9 +712,9 @@ done
 ```
 
 ```bash
-# 7 — runner journal: any stop caused by the lease? (§7 filter)
-journalctl --user -u 'ameesh-runner-agent@*' --since '6 hours ago' --no-pager \
-  | grep -E 'harness stopped \((lease deadline reached|renewal unanswered past the lease|database unreachable|lease lost)|\] heartbeat:'
+# 7 — runner journal: any stop caused by the lease? (§7 filter, anchored)
+journalctl --user -u 'ameesh-runner-agent@*' --since '6 hours ago' --no-pager -o cat \
+  | grep -E '^\[[^]]+\] (harness stopped \((lease deadline reached|renewal unanswered past the lease|database unreachable|lease lost)\)|heartbeat:)'
 ```
 
 The comparison frame is the table in §1: a host whose root `io.cost.qos` /
