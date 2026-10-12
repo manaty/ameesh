@@ -1,0 +1,7 @@
+merges 100, conflicting 35, fully resolved by mergiraf 3, partly 9, merged with markers left 0
+mergiraf replay time: 276.0 s
+  *.html         {'still': 1}
+  *.md           {'resolved/differs': 1, 'resolved/same': 4, 'still': 30}
+  *.py           {'resolved/differs': 4, 'resolved/same': 5, 'still': 70}
+  -              {'still': 7}
+  pyproject.toml {'still': 1}
