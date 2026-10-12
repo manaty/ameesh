@@ -1509,16 +1509,17 @@ class Canon(Domain):
     @abc.abstractmethod
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:
         """Agents de l'hôte (et ceux nommés) avec colonnes déclaratives, statut,
-        `profile_fresh` et `in_turn`."""
+        `lease_epoch`, `profile_fresh` et `in_turn`."""
 
     @abc.abstractmethod
     def lot_projects(self) -> list[str]:
         """L243 : les projets des lots (`app`), distincts."""
 
     @abc.abstractmethod
-    def write_declared(self, name: str, values: dict) -> None:
+    def write_declared(self, name: str, values: dict) -> bool:
         """Écrit les colonnes déclaratives (crée l'agent au besoin) et le profil
-        évalué des valeurs écrites, dans la même instruction."""
+        évalué des valeurs écrites, dans la même instruction. Retourne False
+        si le CAS refuse une lecture périmée : la politique n'est pas appliquée."""
 
     @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,

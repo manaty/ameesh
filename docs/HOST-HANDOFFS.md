@@ -75,6 +75,12 @@ enabling a destination. Canon writes compare the lease epoch read during
 synchronization, so a write from before the switch is refused even after
 the handoff reaches `verified`.
 
+A refused canon write reports the policy update as deferred and records
+`canon-sync-incomplete`. The affected host's canon state becomes `invalid`,
+closing new claims until a later synchronization reads the current placement
+and lease epoch and successfully applies the policy. It never reports an
+unapplied capability revocation as updated or marks that synchronization `ok`.
+
 L232a is tested with simulated adapters and local Git repositories. It does
 not install a real host adapter, enable production agents, copy secrets,
 perform root operations or authorise spending. L232b/c and provider login

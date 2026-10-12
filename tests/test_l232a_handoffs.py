@@ -453,7 +453,7 @@ class HandoffTest(PgTestCase):
         op = self.request()
         for _ in range(6): op = self.advance(op)
         self.assertEqual(op["state"], "switched")
-        self.api.canon.write_declared("dev", values)
+        self.assertFalse(self.api.canon.write_declared("dev", values))
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
         self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/agent")
 
@@ -463,12 +463,12 @@ class HandoffTest(PgTestCase):
         op = self.request()
         for _ in range(8): op = self.advance(op)
         self.assertEqual(op["state"], "verified")
-        self.api.canon.write_declared("dev", values)
+        self.assertFalse(self.api.canon.write_declared("dev", values))
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
         self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/agent")
         # The epoch also closes an ABA placement race on the same host.
         self.db.execute("UPDATE agent_registry SET host='source',cwd='/work/new' WHERE name='dev'")
-        self.api.canon.write_declared("dev", values)
+        self.assertFalse(self.api.canon.write_declared("dev", values))
         self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/new")
 
     def test_changed_release_and_unauthenticated_turn_hold_operation(self):

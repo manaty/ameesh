@@ -201,15 +201,16 @@ class Canon(interface.Canon):
         return [row["app"] for row in self.db.query(
             "SELECT DISTINCT app FROM work_items WHERE coalesce(app, '') <> '' ORDER BY app")]
 
-    def write_declared(self, name, values) -> None:
+    def write_declared(self, name, values) -> bool:
         """Le profil évalué (`placement_profile`) est celui des valeurs écrites
         (celles que `placement.evaluate` a jugées), calculé par
-        `ameesh_placement_profile` dans la même instruction."""
+        `ameesh_placement_profile` dans la même instruction. False signifie
+        que le CAS a refusé l'écriture : aucune politique n'a été appliquée."""
         caps = _caps_param(values["capabilities"])
         ahosts = _caps_param(values.get("admitted_hosts"))
         atags = _caps_param(values.get("admitted_tags"))
         projects = _caps_param(values.get("projects"))
-        self.db.query(
+        rows = self.db.query(
             """
             INSERT INTO agent_registry
                 (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
@@ -268,6 +269,7 @@ class Canon(interface.Canon):
             + profile_params(values) + (values.get("canon"), projects, projects,
                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
+        return bool(rows)
 
     def clear_responsible(self, name, host, owner=None) -> None:
         guard, params = _owner(owner)
