@@ -39,7 +39,19 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   40GiB` (no filesystem quota; the guard's reclaim watches `/`). Cost:
   €0.000130/GB/hour excluding VAT (scaleway.com/en/pricing/storage, read on
   2026-10-12), about **€3.80 per month** (730 h), snapshots not included.
-  From a workstation with the `scw` CLI configured for the ameesh project:
+  `deploy/guest/volume-pilot.sh` does the steps below, idempotent, with
+  its rollback (`unmount`, then `detach [--delete]`); read its `--dry-run`
+  first:
+
+  ```sh
+  deploy/guest/volume-pilot.sh create                     # workstation, scw
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>   # host
+  sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
+  ```
+
+  It finds the disk by the volume's id, formats it only when blank, and
+  writes the fstab line with the filesystem's UUID. By hand, from a
+  workstation with the `scw` CLI configured for the ameesh project:
 
   ```sh
   scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB zone=fr-par-1
@@ -142,5 +154,7 @@ the user too when `userdel` fails (its processes still running). A `--root`
 through a symbolic link is refused: give the resolved path. The install refuses a volume bigger than `disk_max` (nothing else
 holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
 deepseek5 and deepseek6 back on manaty-mesh-1 and removes `policy.lend`, and
-the host's login role (L56) is dropped. A mounted volume is unmounted and
-detached by hand.
+the host's login role (L56) is dropped. The volume: `sudo
+deploy/guest/volume-pilot.sh unmount` on the host, then
+`deploy/guest/volume-pilot.sh detach [--delete]` from the workstation
+(`--delete`: its data lost, its billing stopped).
