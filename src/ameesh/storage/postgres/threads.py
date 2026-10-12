@@ -64,3 +64,17 @@ class Threads(interface.Threads):
               FROM thread_index
              ORDER BY last_at DESC NULLS LAST, project, lot
             """)
+
+    def expired(self, *, project, lot, transport, host, dropped, kept, before_ts) -> None:
+        gone = (int(kept), float(before_ts))
+        self.db.execute(
+            """
+            UPDATE thread_index
+               SET entries       = greatest(entries - %s, 0),
+                   last_entry_id = CASE WHEN %s = 0 AND last_at < to_timestamp(%s)
+                                        THEN NULL ELSE last_entry_id END,
+                   last_excerpt  = CASE WHEN %s = 0 AND last_at < to_timestamp(%s)
+                                        THEN '' ELSE last_excerpt END,
+                   updated_at    = now()
+             WHERE project = %s AND lot = %s AND transport = %s AND host = %s
+            """, (int(dropped),) + gone + gone + (project, lot, transport, host))

@@ -295,6 +295,10 @@ class Config:
     worktree_roots: tuple[str, ...] = (_expand("~/development"),)
     #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
     threads_dir: str = ""
+    #: rétention des fils lisibles, en jours (L361 ; 0033 §9 : un an par
+    #: défaut) : les entrées plus anciennes sont retirées par le ménage de
+    #: l'exécuteur ; 0 = aucune expiration
+    thread_retention_days: int = 365
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
     #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
     project: str = ""
@@ -585,6 +589,8 @@ def load(env: dict | None = None) -> Config:
                 pick("AMEESH_WORKTREE_ROOTS", "AGENT_MESH_WORKTREE_ROOTS"))
         ) or cfg.worktree_roots,
         threads_dir=_expand(threads_brut) if threads_brut else "",
+        thread_retention_days=_as_count(pick("AMEESH_THREAD_RETENTION_DAYS"),
+                                        cfg.thread_retention_days),
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),

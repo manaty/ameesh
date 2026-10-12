@@ -1805,6 +1805,13 @@ class Threads(Domain):
     def indexed(self) -> list[dict]:
         """Fils indexés, du plus récemment écrit au plus ancien."""
 
+    @abc.abstractmethod
+    def expired(self, *, project: str, lot: str, transport: str, host: str,
+                dropped: int, kept: int, before_ts: float) -> None:
+        """Après une expiration (L361) : `dropped` entrées de moins (un ajout
+        concurrent reste compté) ; fil vidé : sa dernière entrée, d'avant
+        `before_ts`, a expiré, son id et son extrait ne sont plus cités."""
+
 
 # --------------------------------------------------------------------------
 # placement gouverné (colonnes de `agent_registry`, 0022)

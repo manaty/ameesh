@@ -109,10 +109,43 @@ contains the same agent/sequence/turn for auditing. The full thread copy
 is bounded at 100,000 characters; truncation is explicit.
 
 Detail defaults to 90 days (0033 §9). `Log.prune(days=90)` removes older
-entries, retaining any undelivered R12 copy and the sequence head. Recorder
-startup drains pending copies then prunes its agent's detail. A deployment
-can call the same API periodically for dormant agents or choose a longer
-canon retention. This lot does not prune shared, append-only R12 files.
-The transport currently retains them indefinitely;
-automatic one-year thread expiry from 0033 is not implemented by this
-detail-store change. L79 supplies the terminal client and L83 the web input.
+entries, retaining the sequence head and any undelivered R12 copy younger
+than thread retention. Recorder startup prunes its agent's detail, then
+drains pending copies. A deployment can call the same API periodically for
+dormant agents or choose a longer canon retention.
+
+### Thread expiry (L361)
+
+Shared threads keep **one year** of entries by default (0033 §9):
+`thread_retention_days` in the host configuration, or
+`AMEESH_THREAD_RETENTION_DAYS`; `0` keeps them forever.
+
+* **Who**: the runner's housekeeping pass (`AMEESH_HOUSEKEEPING_INTERVAL`)
+  expires this host's thread files at most once a day and logs each thread
+  it shortens. `ameesh fil expire [--days N] [--dry-run]` does the same by
+  hand.
+* **What**: the oldest run of entries dated before the cut-off. The scan
+  stops at the first newer entry, or the first entry without a readable
+  date, so the file stays in append order; an R12 copy delivered late with
+  an old date leaves with its neighbours. Everything after the cut is kept
+  byte for byte, including a torn last entry.
+* **How**: under the thread's exclusive lock, the kept part is written to a
+  new file in the same directory (never through a symbolic link), synced,
+  then renamed over the thread: a crash leaves the old file or the new one.
+  A writer or reader that locked the replaced file notices it no longer
+  carries the thread's name and reopens: no append is lost.
+* **Ids**: entry ids (`<project>/<lot>#<offset>`) are logical offsets and do
+  not change. The header holds the shift between logical and physical
+  offsets, so `fil tail` cursors, `thread_index.last_entry_id`, mailbox
+  traces and `conversation_log.thread_entry` keep pointing at the same
+  entry. A cursor on an expired entry reads from the oldest kept one.
+* **Audit**: the header says, in plain text and in an `ameesh` comment,
+  the cut-off date, the date of the last expiry and how many entries have
+  been removed in total. `thread_index.entries` loses the expired
+  entries; an emptied thread loses its last excerpt, which quoted an expired
+  entry.
+* **R12 outbox**: an undelivered copy older than thread retention is
+  deleted by `Log.prune` (its thread entry would expire on arrival);
+  younger ones still wait for delivery, past detail retention.
+
+L79 supplies the terminal client and L83 the web input.

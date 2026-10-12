@@ -5652,6 +5652,7 @@ class Runner:
                 runtime=self.container_runtime(),
                 # L230: the worktrees are walked at most every few hours
                 artifact_scan=build_artifacts.due(time.time()))
+            self.expire_threads_once(db)
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("cleanup: %s" % "; ".join(
@@ -5684,6 +5685,29 @@ class Runner:
                 log_async("[%s] session %s of lot #%s forgotten (lot finished or reassigned)"
                           % (row["agent"], row["session_id"], row["work_item_id"]))
         return purges
+
+    def expire_threads_once(self, db, now: float | None = None) -> list | None:
+        """L361: thread retention (0033 §9), at most once a day, from the
+        housekeeping pass: entries older than `thread_retention_days` leave
+        this host's thread files. Never raises."""
+        now = time.time() if now is None else now
+        if now < getattr(self, "_threads_expire_next", 0.0):
+            return None
+        self._threads_expire_next = now + 86400.0
+        try:
+            reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
+        except Exception as exc:  # never fatal for the runner
+            log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        for report in reports:
+            if report.get("error"):
+                log_async("thread expiry %s: %s" % (report["thread"], report["error"]))
+            if report["dropped"]:
+                log_async("thread %s: %d entr%s before %s %s, %d kept" % (
+                    report["thread"], report["dropped"],
+                    "y" if report["dropped"] == 1 else "ies", report["before"],
+                    "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
+        return reports
 
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur

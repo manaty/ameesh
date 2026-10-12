@@ -15,6 +15,18 @@ humans, including agent-to-agent exchanges (decision 0006).
   trusted; below it, every directory and file is opened through a
   descriptor anchored on its parent, never following a symbolic link.
 
+Retention (L361, 0033 §9): entries older than one year
+(`thread_retention_days`, 0 = never) are removed by `expire`, run daily by
+the runner's housekeeping and by `ameesh fil expire`. Only the oldest run
+of entries goes (the file stays in append order); the file is rewritten
+whole under the thread's exclusive lock, then renamed over the old one. A
+writer or reader that locked the replaced file sees it is no longer the
+named one and reopens: no append is lost. Entry ids stay valid: they are
+logical offsets, and the header keeps the shift between logical and
+physical offsets in its `expired` note, with the cut-off date and the
+number of entries removed so far (the audit trace of the expiry). An id
+that has expired reads as "from the oldest kept entry".
+
 A failed thread write NEVER loses the message: `record()` does not raise,
 it reports on stderr, and the message stays in the mailbox.
 
@@ -35,6 +47,7 @@ text.
   ameesh fil list                                known threads (index + disk)
   ameesh fil show <project> [<lot>] [--last N]   read a thread
   ameesh fil tail <project> [<lot>] [--last N]   follow a thread (Ctrl-C to quit)
+  ameesh fil expire [--days N] [--dry-run]       remove entries past retention
 
 The thread index (`thread_index`) is written and read by storage
 (`storage.of(db).threads`, spec §10).
@@ -67,9 +80,16 @@ MAX_BLOB = 200
 #: `xxd -p`) ; les mots d'un texte n'atteignent presque jamais 16 caractères
 FOLD_MIN = 16
 SEGMENT_MAX = 64
+#: rétention par défaut des fils (0033 §9), en jours
+THREAD_DAYS = 365
+#: la note d'expiration est dans l'en-tête, avant la première entrée
+HEADER_SCAN = 8192
+#: réouvertures d'un fil remplacé par une expiration pendant qu'on l'ouvrait
+_REOPEN_MAX = 8
 
 _HEADING_RE = re.compile(r"^### (\S+) — (.+?) → (.*)$")
 _META_RE = re.compile(r"^<!-- ameesh (\{.*\}) -->$")
+_EXPIRED_B = re.compile(rb"^<!-- ameesh (\{\"expired\": .*\}) -->$", re.M)
 _BACKTICKS_RE = re.compile(r"`+")
 # lecture d'un fil : sur les octets, pour sauter les corps sans les décoder
 _HEADING_B = re.compile(_HEADING_RE.pattern.encode("utf-8"), re.M)
@@ -363,6 +383,37 @@ def header(thread: ThreadRef) -> str:
     )
 
 
+def _expiry_of(head: bytes) -> tuple[int, dict]:
+    """La note d'expiration d'un en-tête de fil : (décalage, note).
+
+    Le décalage est ajouté à la position physique d'une entrée pour donner son
+    id (position logique, stable d'une expiration à l'autre). Sans note, ou
+    note illisible : 0, le fil n'a jamais expiré.
+    """
+    first = _HEADING_B.search(head)
+    found = _EXPIRED_B.search(head, 0, first.start() if first else len(head))
+    if not found:
+        return 0, {}
+    try:
+        note = json.loads(found.group(1))["expired"]
+    except (ValueError, KeyError, TypeError):
+        return 0, {}
+    shift = note.get("shift") if isinstance(note, dict) else None
+    if not isinstance(shift, int) or isinstance(shift, bool):
+        return 0, {}
+    return shift, note
+
+
+def _expiry_header(thread: ThreadRef, note: dict) -> bytes:
+    """L'en-tête d'un fil expiré : l'en-tête habituel, la date de coupure et
+    le nombre d'entrées retirées, lisibles, puis la note pour les outils."""
+    return (header(thread) + (
+        "Entries before %s have expired (retention of %d days): %d removed so far,"
+        " last expiry on %s.\n\n<!-- ameesh %s -->\n\n"
+        % (note["before"], note["days"], note["entries"], note["at"],
+           json.dumps({"expired": note}, ensure_ascii=False)))).encode("utf-8")
+
+
 def _meta_of(line: str) -> dict | None:
     found = _META_RE.match(line)
     if not found:
@@ -592,12 +643,16 @@ class FileTransport:
             dir_fd = self._dir_fd(root_fd, thread.project, create=write)
         finally:
             os.close(root_fd)
-        flags = (os.O_RDWR | os.O_APPEND | os.O_CREAT) if write \
-            else (os.O_RDONLY | os.O_NONBLOCK)
         try:
-            fd = _open_at(dir_fd, thread.stem + ".md", flags, self.location(thread))
+            return self._open_file(dir_fd, thread, write)
         finally:
             os.close(dir_fd)
+
+    def _open_file(self, dir_fd: int, thread: ThreadRef, write: bool) -> int:
+        """Le fichier du fil dans le dossier `dir_fd` (voir `_open`)."""
+        flags = (os.O_RDWR | os.O_APPEND | os.O_CREAT) if write \
+            else (os.O_RDONLY | os.O_NONBLOCK)
+        fd = _open_at(dir_fd, thread.stem + ".md", flags, self.location(thread))
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ThreadError("%s: not a regular file, refused" % self.location(thread))
@@ -605,6 +660,49 @@ class FileTransport:
             os.close(fd)
             raise
         return fd
+
+    def _locked(self, thread: ThreadRef, mode: int, *, write: bool,
+                keep_dir: bool = False) -> tuple[int, int | None]:
+        """`_open` puis `flock(mode)`, sur le fichier qui porte ENCORE le nom du fil.
+
+        `expire` remplace le fichier par renommage sous son verrou exclusif :
+        un descripteur pris sur l'ancien fichier avant le renommage obtient le
+        verrou ensuite, sur un fichier détaché. On compare donc le fichier
+        verrouillé au nom (même dossier, sans suivre de lien) et on rouvre s'il
+        a changé : aucune entrée n'est écrite dans un fichier remplacé.
+        Rend (fichier, dossier) ; le dossier n'est gardé ouvert qu'avec
+        `keep_dir` (sinon None).
+        """
+        name = thread.stem + ".md"
+        for _ in range(_REOPEN_MAX):
+            root_fd = self._root_fd(create=write)
+            try:
+                dir_fd = self._dir_fd(root_fd, thread.project, create=write)
+            finally:
+                os.close(root_fd)
+            fd = -1
+            try:
+                fd = self._open_file(dir_fd, thread, write)
+                fcntl.flock(fd, mode)
+                held = os.fstat(fd)
+                try:
+                    named = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    named = None
+                if named is not None and (named.st_dev, named.st_ino) \
+                        == (held.st_dev, held.st_ino):
+                    found, fd = fd, -1
+                    if keep_dir:
+                        found_dir, dir_fd = dir_fd, -1
+                        return found, found_dir
+                    return found, None
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                if dir_fd >= 0:
+                    os.close(dir_fd)
+        raise ThreadError("%s: replaced again and again while opening, refused"
+                          % self.location(thread))
 
     def exists(self, thread: ThreadRef) -> bool:
         try:
@@ -615,15 +713,17 @@ class FileTransport:
 
     def post(self, thread: ThreadRef, entry: Entry) -> str:
         data = format_entry(entry).encode("utf-8")
-        fd = self._open(thread, write=True)
+        fd, _ = self._locked(thread, fcntl.LOCK_EX, write=True)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
             size = os.fstat(fd).st_size
+            shift = 0
             if size == 0:
                 prefix = header(thread).encode("utf-8")
             else:
                 # une écriture précédente interrompue (arrêt brutal) : la clore
-                prefix = _repair(_pread_all(fd, size))
+                current = _pread_all(fd, size)
+                prefix = _repair(current)
+                shift = _expiry_of(current[:HEADER_SCAN])[0]
             try:
                 _write_all(fd, prefix + data)
                 os.fsync(fd)
@@ -636,7 +736,7 @@ class FileTransport:
                 raise
         finally:
             os.close(fd)  # libère le verrou
-        entry.id = "%s#%d" % (thread.key, size + len(prefix))
+        entry.id = "%s#%d" % (thread.key, size + len(prefix) + shift)
         return entry.id
 
     def _offset(self, thread: ThreadRef, since: str) -> int:
@@ -649,17 +749,99 @@ class FileTransport:
         """Les entrées du fil, ou celles postérieures à l'id `since`."""
         start = self._offset(thread, since) if since else 0
         try:
-            fd = self._open(thread, write=False)
+            # verrou partagé : jamais une entrée en cours d'écriture
+            fd, _ = self._locked(thread, fcntl.LOCK_SH, write=False)
         except FileNotFoundError:
             return []
         with open(fd, "rb") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_SH)  # jamais une entrée en cours d'écriture
-            fh.seek(start)
+            head = fh.read(HEADER_SCAN)
+            shift = _expiry_of(head)[0]
+            # `since` logique ; avant la première entrée gardée (expirée) :
+            # tout le fil, l'en-tête n'a pas d'entrée
+            first = _HEADING_B.search(head)
+            physical = start - shift
+            if physical < (first.start() if first else len(head)):
+                physical = 0
+            fh.seek(physical)
             data = fh.read()
-        entries = parse(data, base=start, key=thread.key)
+        entries = parse(data, base=physical + shift, key=thread.key)
         if since:
             entries = [e for e in entries if int(e.id.rpartition("#")[2]) > start]
         return entries
+
+    def expire(self, thread: ThreadRef, before_ts: float, *, days: int,
+               now: float | None = None, dry_run: bool = False) -> dict:
+        """Retire du fil la plus longue suite d'entrées, depuis la première,
+        écrites avant `before_ts` (L361).
+
+        S'arrête à la première entrée plus récente, ou sans date lisible : le
+        fil reste dans l'ordre d'ajout, et une entrée arrivée en retard avec
+        une date ancienne (file R12) part avec ses voisines. Le reste est
+        recopié à l'identique dans un fichier neuf du même dossier, synchronisé,
+        puis renommé sur l'ancien, le tout sous le verrou exclusif du fil :
+        un arrêt brutal laisse l'ancien fichier ou le nouveau, jamais un
+        mélange. Rend {"dropped", "kept", "shift"} ; un fil absent ou à jour
+        n'est pas touché.
+        """
+        report = {"thread": thread.key, "dropped": 0, "kept": 0, "shift": 0}
+        try:
+            fd, dir_fd = self._locked(thread, fcntl.LOCK_EX, write=False, keep_dir=True)
+        except FileNotFoundError:
+            return report
+        tmp = "." + thread.stem + ".expire.tmp"
+        try:
+            data = _pread_all(fd, os.fstat(fd).st_size)
+            shift, note = _expiry_of(data[:HEADER_SCAN])
+            found = _walk(data)[0]
+            dropped = 0
+            for start, heading, *_ in found:
+                ts = _parse_iso(heading.group(1).decode("utf-8", "replace"))
+                if not 0 < ts < before_ts:
+                    break
+                dropped += 1
+            report.update(kept=len(found) - dropped, shift=shift)
+            if not dropped:
+                return report
+            cut = found[dropped][0] if dropped < len(found) else len(data)
+            total = note.get("entries") if isinstance(note.get("entries"), int) else 0
+            note = {"before": iso_local(before_ts),
+                    "at": iso_local(time.time() if now is None else now),
+                    "days": int(days), "entries": total + dropped, "shift": 0}
+            # l'id d'une entrée gardée ne change pas : sa position logique
+            # (cut + shift) devient la fin du nouvel en-tête plus le décalage,
+            # écrit dans cet en-tête (point fixe : sa largeur compte)
+            for _ in range(4):
+                head = _expiry_header(thread, note)
+                if len(head) + note["shift"] == cut + shift:
+                    break
+                note["shift"] = cut + shift - len(head)
+            else:
+                raise ThreadError("%s: expiry offset does not settle" % thread.key)
+            report.update(dropped=dropped, shift=note["shift"], before=note["before"])
+            if dry_run:
+                return report
+            out = _open_at(dir_fd, tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                           os.path.join(self.root, thread.project, tmp))
+            try:
+                if not stat.S_ISREG(os.fstat(out).st_mode):
+                    raise ThreadError("%s: not a regular file, refused" % tmp)
+                os.fchmod(out, 0o600)
+                _write_all(out, head + data[cut:])
+                os.fsync(out)
+            finally:
+                os.close(out)
+            os.rename(tmp, thread.stem + ".md", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.fsync(dir_fd)
+            return report
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(fd)  # libère le verrou, après le renommage
+            os.close(dir_fd)
 
     def threads(self) -> list[ThreadRef]:
         """Les fils présents sur disque (liens symboliques ignorés, jamais suivis)."""
@@ -805,6 +987,45 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
         trace={"fil": {"transport": transport.name, "id": external_id, "host": host}})
 
 
+def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None,
+           dry_run: bool = False, transport: FileTransport | None = None) -> list[dict]:
+    """Expiration de tous les fils de cet hôte (L361, 0033 §9).
+
+    `days` : `thread_retention_days` par défaut ; 0 = rien. L'index
+    (`thread_index.entries`) perd les entrées expirées ; un fil vidé y perd
+    son extrait, qui citait une entrée expirée. Un fil en erreur est
+    signalé dans son rapport (`error`), les autres expirent quand même.
+    """
+    days = cfg.thread_retention_days if days is None else days
+    if not isinstance(days, int) or isinstance(days, bool) or days < 0:
+        raise ValueError("thread retention must be a whole number of days, >= 0")
+    if days == 0:
+        return []
+    now = time.time() if now is None else float(now)
+    transport = transport or transport_for(cfg)
+    reports = []
+    for thread in transport.threads():
+        try:
+            report = transport.expire(thread, now - days * 86400, days=days, now=now,
+                                      dry_run=dry_run)
+        except (OSError, ThreadError) as exc:
+            reports.append({"thread": thread.key, "dropped": 0,
+                            "error": " ".join(str(exc).split())[:200]})
+            continue
+        reports.append(report)
+        if report["dropped"] and db is not None and not dry_run:
+            try:
+                storage.of(db).threads.expired(
+                    project=thread.project, lot=thread.lot or "", transport=transport.name,
+                    host=cfg.host if transport.name == "file" else "",
+                    dropped=report["dropped"], kept=report["kept"],
+                    before_ts=now - days * 86400)
+            except Exception as exc:
+                from . import db as db_mod
+                report["error"] = "index not updated: %s" % db_mod.explain(exc, 200)
+    return reports
+
+
 def v0_recorded(cfg: Config) -> set[str]:
     """Messages du repli fichier déjà écrits dans un fil (`<dest>/<fichier v0>`).
 
@@ -920,6 +1141,39 @@ def cmd_tail(cfg: Config, args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
+    from . import db as db_mod
+    days = cfg.thread_retention_days if args.days is None else args.days
+    if not days:
+        print("thread retention is 0: nothing expires")
+        return 0
+    db = None
+    if not args.dry_run:
+        try:
+            db = db_mod.connect(cfg)
+        except db_mod.DbError as exc:
+            print("thread index unavailable (%s): threads expire, the index is not updated"
+                  % " ".join(str(exc).split())[:200], file=sys.stderr)
+    try:
+        reports = expire(cfg, db, days=days, dry_run=args.dry_run)
+    finally:
+        if db is not None:
+            db.close()
+    failed = 0
+    for report in reports:
+        if report.get("error"):
+            failed += 1
+            print("%s: %s" % (report["thread"], report["error"]), file=sys.stderr)
+        if report["dropped"]:
+            print("%s: %d entr%s %s before %s, %d kept" % (
+                report["thread"], report["dropped"], "y" if report["dropped"] == 1 else "ies",
+                "would expire" if args.dry_run else "expired", report["before"],
+                report["kept"]))
+    if not any(r["dropped"] for r in reports):
+        print("no entry older than %d days in %d thread(s)" % (days, len(reports)))
+    return 1 if failed else 0
+
+
 def _positive(text: str) -> int:
     try:
         value = int(text)
@@ -951,6 +1205,13 @@ def build_parser() -> argparse.ArgumentParser:
             p_cmd.add_argument("--interval", type=float, default=0.5,
                                help="polling period in seconds (default 0.5)")
         p_cmd.set_defaults(func=func)
+    p_expire = sub.add_parser("expire", help="remove entries past retention (L361)")
+    p_expire.add_argument("--days", type=_positive, default=None,
+                          help="retention in days (default: thread_retention_days, 365;"
+                               " 0 = nothing expires)")
+    p_expire.add_argument("--dry-run", action="store_true",
+                          help="say what would expire, change nothing")
+    p_expire.set_defaults(func=cmd_expire)
     return parser
 
 
