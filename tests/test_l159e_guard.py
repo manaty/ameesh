@@ -1543,6 +1543,23 @@ class RestartTest(unittest.TestCase):
         self.at(g, 5000.0)
         self.assertEqual(len(self.starts), 2)
 
+    def test_a_restarted_guard_keeps_the_last_restart(self):
+        # codex #288 r1: the guard restarted after a restart of units keeps
+        # publishing it (the source of the `guard_restart` alert)
+        g = self.stop_then_clear(self.guard())
+        restart = self.at(g, 1100.0)["guard"]["restart"]
+        g = self.guard()
+        self.assertEqual(self.at(g, 1105.0)["guard"]["restart"], restart)
+        with open(self.cfg.state_path) as fh:
+            self.assertEqual(json.load(fh)["guard"]["restart"], restart)
+        # an ill-typed record is not taken back
+        with open(self.cfg.state_path) as fh:
+            saved = json.load(fh)
+        saved["guard"]["restart"] = {"ts": "soon", "started": [], "skipped": {}}
+        with open(self.cfg.state_path, "w") as fh:
+            json.dump(saved, fh)
+        self.assertNotIn("restart", self.at(self.guard(), 1110.0)["guard"])
+
     def test_never_a_unit_stopped_since_by_someone_else(self):
         g = self.stop_then_clear(self.guard())
         # the owner started @2 and stopped it again; @1 is running again
@@ -1587,6 +1604,47 @@ class RestartTest(unittest.TestCase):
         self.assertEqual(self.starts, [self.UNITS[1]])
         self.assertEqual(state["guard"]["restart"]["skipped"],
                          {self.UNITS[0]: "stopped_by_owner"})
+
+    def test_restart_kept_from_the_format_before_r1(self):
+        # codex #267 r2: a state written before {unit: instant} ({units:
+        # [unit…], mono}) keeps its pending restart across the upgrade
+        g = self.guard()
+        self.at(g, 0.0)
+        record = self.at(g, 130.0)["guard"]["stopped"]
+        with open(self.cfg.state_path) as fh:
+            saved = json.load(fh)
+        saved["guard"]["stopped"] = dict(record, units=sorted(record["units"]),
+                                         mono=max(record["units"].values()))
+        with open(self.cfg.state_path, "w") as fh:
+            json.dump(saved, fh)
+        g = self.guard()
+        self.assertEqual(g.enforcer.stopped["units"], record["units"])
+        self.reading["mem_available_bytes"] = 12 * GIB
+        self.at(g, 200.0)
+        self.assertEqual(self.at(g, 800.0)["level"], 0)
+        self.at(g, 1100.0)
+        self.assertEqual(self.starts, list(self.UNITS[:2]))
+
+    def test_a_stop_in_a_new_boot_records_that_boot(self):
+        # codex #267 r2: the record of boot A survives a reboot in the state;
+        # systemd starts the units, the guard stops them again in boot B:
+        # the record is boot B's, the restart is not skipped as `reboot`
+        g = self.guard()
+        self.at(g, 0.0)
+        self.assertEqual(self.at(g, 130.0)["guard"]["stopped"]["boot_id"], "boot-a")
+        self.boot[0], self.mono[0] = "boot-b", 50.0
+        for unit in self.UNITS[:2]:
+            self.units[unit] = ["active", 0]
+        g = self.guard()
+        state = self.at(g, 140.0)
+        self.assertEqual(state["state"], "stopped")
+        self.assertEqual(state["guard"]["stopped"]["boot_id"], "boot-b")
+        self.reading["mem_available_bytes"] = 12 * GIB
+        self.at(g, 200.0)
+        self.assertEqual(self.at(g, 800.0)["level"], 0)
+        state = self.at(g, 1100.0)
+        self.assertEqual(self.starts, list(self.UNITS[:2]))
+        self.assertEqual(state["guard"]["restart"]["skipped"], {})
 
     def test_a_manual_drain_after_the_stop_keeps_it(self):
         # codex #267 r1: a manual drain asked while stopped, or cancelled

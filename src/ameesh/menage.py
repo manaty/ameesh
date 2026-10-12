@@ -1607,8 +1607,10 @@ class Turn:
             try:
                 for done in deps_mod.link_ready(cwd, cache_root(cfg, policy)):
                     turn.entries.append({
-                        "kind": "deps", "action": "linked", "path": done["package"],
-                        "agent": agent, "detail": "node_modules -> %s" % done["target"]})
+                        "kind": "deps", "action": done["status"], "path": done["package"],
+                        "agent": agent, "detail": ("node_modules -> %s" % done["target"]
+                            if done["status"] == "linked" else
+                            done.get("reason") or done.get("error"))})
             except Exception:
                 pass                       # never blocks a turn
         turn.tmp_before = tmp_names()
