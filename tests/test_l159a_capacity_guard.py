@@ -199,6 +199,23 @@ class CanonTest(_Canons, unittest.TestCase):
         self.assertIsNone(loaded.host(HOST).policy.lend)
         self.assertIn("host-policy-invalid", codes(found, canon.ERROR))
 
+    def test_non_finite_offer_lends_nothing(self):
+        # codex #212 r2: YAML .inf / .nan, and a size too large for a float,
+        # drop the offer through host-policy-invalid (never an OverflowError,
+        # never an unbounded cap)
+        for n, (key, value) in enumerate((("cpu_max", ".inf"), ("cpu_max", ".nan"),
+                                          ("memory_max", ".inf"), ("disk_max", ".nan"),
+                                          ("memory_max", "9" * 400 + "GiB"))):
+            with self.subTest(key=key, value=value[:6]):
+                caps = {"cpu_max": "3", "memory_max": "14GiB", "disk_max": "80GiB"}
+                caps[key] = value
+                text = host("bob", harnesses=("codex",), resources_yaml=(
+                    "  lend:\n" + "".join("    %s: %s\n" % kv for kv in caps.items())))
+                loaded = canon.load(self.acme(host_text=text, name="t%d" % n), default=False)
+                found = canon.validate(loaded)
+                self.assertIsNone(loaded.host(HOST).policy.lend)
+                self.assertIn("host-policy-invalid", codes(found, canon.ERROR))
+
     def test_no_offer(self):
         loaded = canon.load(self.acme(host_text=host("bob", harnesses=("codex",))),
                             default=False)

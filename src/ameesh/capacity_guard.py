@@ -20,6 +20,7 @@ The guard itself (`ameesh guard`, L159e) and the common measure
 """
 from __future__ import annotations
 
+import math
 import re
 
 from . import resources as resources_mod
@@ -121,8 +122,9 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
                             % key)
     cpu = raw.get("cpu_max")
     if cpu is not None:
-        if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) or cpu <= 0:
-            problems.append("`cpu_max`: number of CPUs > 0 expected")
+        if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) \
+                or not math.isfinite(cpu) or cpu <= 0:
+            problems.append("`cpu_max`: finite number of CPUs > 0 expected")
         else:
             offer["cpu_max"] = float(cpu)
     for key in LEND_SIZES:

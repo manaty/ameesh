@@ -19,6 +19,7 @@ sont des plafonds.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -119,7 +120,8 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     if isinstance(value, int):
         return value if value >= 0 else None
     if isinstance(value, float):
-        if not decimal_ok or value < 0:
+        # .inf, .nan (YAML): no size, never an unbounded one
+        if not decimal_ok or not math.isfinite(value) or value < 0:
             return None
         return int(value)
     if not isinstance(value, str):
@@ -133,7 +135,8 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     factor = _UNITS[unit]
     if not decimal_ok and "." in number and factor == 1:
         return None
-    return int(float(number) * factor)
+    size = float(number) * factor
+    return int(size) if math.isfinite(size) else None
 
 
 def parse_fraction(value) -> float | None:
