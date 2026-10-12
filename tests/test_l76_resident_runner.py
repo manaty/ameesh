@@ -338,7 +338,7 @@ class ResidentRunnerTest(PgTestCase):
         self.assertIsNone(worker.resident)
         self.assertEqual(len(launched), 1)        # the turn's own harness
         self.assertGreater(worker._resident_refused_until, time.monotonic())
-        self.assertIn("resident start failed",
+        self.assertIn("resident failed recently",
                       worker._resident_refusal(self.adapter, False))
 
     def test_a_relayed_turn_never_uses_the_resident(self):
@@ -428,6 +428,65 @@ class ResidentRunnerTest(PgTestCase):
         self.assertIsNot(worker.resident, premier)
         self.assertEqual(len(self._starts()), 2)
         self.assertEqual(worker.resident.driver.extra_env["AMEESH_TURN_MAIL_MAX"], "1")
+
+    # T2
+
+    def test_failures_double_the_wait_and_a_turn_resets_it(self):
+        _runner, worker = self._worker()
+        attentes = []
+        for _ in range(3):
+            avant = time.monotonic()
+            worker._resident_failed("test")
+            attentes.append(round(worker._resident_refused_until - avant))
+        self.assertEqual(attentes, [60, 120, 240])
+        for _ in range(10):
+            worker._resident_failed("test")
+        self.assertLessEqual(worker._resident_refused_until - time.monotonic(),
+                             runner_mod.RESIDENT_RETRY_MAX_S)
+        worker._resident_refused_until = 0.0
+        self.assertTrue(self._turn(worker, "un"))
+        self.assertEqual(worker._resident_failures, 0)
+
+    def test_a_death_counts_and_falls_back(self):
+        _runner, worker = self._worker()
+        self.assertFalse(self._turn(worker, "CRASH"))
+        self.assertEqual(worker._resident_failures, 1)
+        self.assertIn("1 in a row", worker._resident_refusal(self.adapter, False))
+        # between turns too
+        worker._resident_refused_until = 0.0
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        rp.kill_now()
+        deadline = time.monotonic() + 5
+        while rp.alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+        worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertEqual(worker._resident_failures, 1)   # reset by the turn, then 1
+
+    def test_dormant_after_sleep_and_under_pressure(self):
+        runner, worker = self._worker(resident_sleep="60")
+        self.assertTrue(self._turn(worker, "un"))
+        worker.resident.last_used -= 61
+        worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        agent = registry.get(self.db, "res1")
+        self.assertEqual(agent["status"], "idle")
+        self.assertTrue(agent["status_text"].startswith("dormant: asleep after 60s"))
+        self.assertEqual(worker._resident_failures, 0)     # a sleep is no failure
+        self.assertTrue(self._turn(worker, "deux"))
+        rp = worker.resident
+        with mock.patch.object(runner, "host_pressure", return_value={"blocked": True}):
+            worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertIn("host under pressure", registry.get(self.db, "res1")["status_text"])
+
+    def test_dormant_never_hides_a_blocked_agent(self):
+        _runner, worker = self._worker()
+        registry.set_status(self.db, "res1", "blocked", status_text="turn failed")
+        worker._note_dormant("asleep")
+        self.assertEqual(registry.get(self.db, "res1")["status_text"], "turn failed")
 
     def test_resident_off_stops_it_between_turns(self):
         _runner, worker = self._worker()
