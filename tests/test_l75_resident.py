@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import acp, adapters, harnesses, resident
 
@@ -365,18 +366,53 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertFalse(driver._writer.is_alive())
         self.assertTrue(driver.proc.stdin.closed)
 
-    def test_an_input_held_by_an_escaped_child_is_left_open(self):
+    def test_an_input_held_by_an_escaped_child_is_closed_once_the_writer_ends(self):
+        # #387: the writer outlives close() (slow poll here); the input is
+        # closed by whichever of the two ends last, here the writer
         driver = self.driver()
         driver.start()
         self.wait(driver.send("ORPHAN_IN DEAF"))
         self.orphan_pid()
         driver.send("z" * 2_000_000)
         self.until(lambda: not driver._outbox.qsize())
-        self.bounded(lambda: driver.close(0.3))
-        # the writer is still blocked in its write: its descriptor stays ours
+        with mock.patch.object(resident, "WRITE_POLL", 2.0):
+            time.sleep(0.3)  # the writer is in its (slow) poll
+            self.bounded(lambda: driver.close(0.1))
+            self.assertTrue(driver._writer.is_alive())
+            self.assertFalse(driver.proc.stdin.closed)
+            self.until(lambda: not driver._writer.is_alive(), 5)
+        self.assertTrue(driver.proc.stdin.closed)
+
+    def test_the_writer_wakes_up_when_the_harness_dies(self):
+        # #387: the harness dies while its writer waits on a full pipe that a
+        # child left behind still holds: the writer ends and the turn fails
+        driver = self.driver()
+        driver.start()
+        self.wait(driver.send("ORPHAN_IN DEAF"))
+        self.orphan_pid()
+        turn = driver.send("z" * 2_000_000)
+        self.until(lambda: not driver._outbox.qsize())
+        time.sleep(0.3)
         self.assertTrue(driver._writer.is_alive())
-        self.assertFalse(driver.proc.stdin.closed)
-        os.fstat(driver.proc.stdin.fileno())
+        os.kill(driver.pid, signal.SIGKILL)
+        self.until(lambda: not driver._writer.is_alive())
+        result = self.wait(turn, 5)
+        self.assertEqual(result.status, resident.FAILED)
+        self.assertIn("exited", result.error)
+
+    def test_the_outbox_is_bounded(self):
+        # #387: past MAX_OUTBOX_BYTES not yet written, an input is refused;
+        # a line counts until the harness has taken it whole
+        driver = self.driver()
+        driver.start()
+        with mock.patch.object(resident, "MAX_OUTBOX_BYTES", 3_000_000):
+            self.wait(driver.send("a" * 2_000_000))
+            self.wait(driver.send("DEAF " + "b" * 2_000_000))
+            turn = driver.send("z" * 2_000_000)  # written in part: still counted
+            with self.assertRaises(resident.ResidentError):
+                driver.steer("y" * 2_000_000, input_id="refused")
+        self.assertNotIn("refused", turn.inputs)
+        self.assertTrue(driver.alive)
 
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was

@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import select
 import signal
 import subprocess
 import sys
@@ -71,6 +72,11 @@ PROBE_TIMEOUT = 5.0
 CLOSE_GRACE = 2.0
 #: largest line read from the harness (memory guard)
 MAX_LINE_CHARS = acp.MAX_MESSAGE_CHARS
+#: bytes queued for the harness's input and not yet written: past it, an
+#: input is refused (a harness that stops reading never fills our memory)
+MAX_OUTBOX_BYTES = 16 * 1024 * 1024
+#: how often a writer waiting on a full pipe checks that the harness lives
+WRITE_POLL = 0.2
 #: final text kept per turn
 FINAL_MAX_CHARS = 100_000
 
@@ -500,6 +506,12 @@ class ClaudeStreamJson(ResidentDriver):
         #: input and a harness that fills its output first would block both
         #: pipes, codex r1, #325); None stops it
         self._outbox: queue.Queue = queue.Queue()
+        #: bytes in the outbox or being written (bounded, MAX_OUTBOX_BYTES)
+        self._outbox_bytes = 0
+        #: the input is closed by whichever ends last: the writer or close()
+        self._input_lock = threading.Lock()
+        self._writer_gone = False
+        self._input_released = False
         self._writer: threading.Thread | None = None
         #: ends the reader after close (EOF may never come)
         self._stop_read = threading.Event()
@@ -557,15 +569,24 @@ class ClaudeStreamJson(ResidentDriver):
         return True
 
     def _close_input_late(self, grace: float) -> None:
-        # the group is killed: a write blocked on it fails (EPIPE) and the
-        # writer ends; only then is the descriptor closed, never under it
-        writer, proc = self._writer, self._proc
-        if writer is not None:
-            writer.join(grace)
-        if writer is not None and writer.is_alive():
-            log("writer still blocked (a child that left the group holds the input): "
-                "the input is left open")
-            return
+        # the group is killed and the writer sees it at its next poll; the
+        # descriptor is closed by whichever ends last, never under the writer
+        if self._writer is not None:
+            self._writer.join(grace)
+        self._release_input(writer=False)
+
+    def _release_input(self, *, writer: bool) -> None:
+        """The writer has ended (`writer`) or close() gives the input up: the
+        second of the two closes it (a writer still running after close()
+        closes it when it ends, #387)."""
+        with self._input_lock:
+            if writer:
+                self._writer_gone = True
+            else:
+                self._input_released = True
+            if not (self._writer_gone and self._input_released):
+                return
+        proc = self._proc
         try:
             if proc is not None and proc.stdin is not None:
                 proc.stdin.close()
@@ -584,31 +605,58 @@ class ClaudeStreamJson(ResidentDriver):
     # -- writing -----------------------------------------------------------
     def _write(self, message: dict) -> None:
         """Queue a line for the writer thread (never blocks): lines reach the
-        harness in the order they were queued."""
+        harness in the order they were queued. Refused past MAX_OUTBOX_BYTES
+        not yet written (a harness that no longer reads its input, #387)."""
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None \
                 or self._dead is not None or self._closed:
             raise ResidentError("resident harness is not running")
-        self._outbox.put((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+        data = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._input_lock:
+            if self._outbox_bytes + len(data) > MAX_OUTBOX_BYTES:
+                raise ResidentError("input refused: %d bytes not yet read by the harness "
+                                    "(at most %d)" % (self._outbox_bytes, MAX_OUTBOX_BYTES))
+            self._outbox_bytes += len(data)
+        self._outbox.put(data)
 
     def _write_loop(self) -> None:
         """Writes the queued lines on the harness's input, by its descriptor:
         no Python buffer lock, so that closing the input never waits for a
-        blocked write."""
+        blocked write. The descriptor is non-blocking: a full pipe is waited
+        on by `poll`, and the writer wakes up when the harness dies, even if
+        a child that left the group still holds the input (#387)."""
         proc = self._proc
         assert proc is not None and proc.stdin is not None
-        fd = proc.stdin.fileno()
-        while True:
-            data = self._outbox.get()
-            if data is None or self._closed:
-                return
-            try:
-                view = memoryview(data)
-                while view and not self._closed:
-                    view = view[os.write(fd, view):]
-            except (OSError, ValueError) as exc:
-                self._died("cannot write to the harness: %s" % exc)
-                return
+        try:
+            fd = proc.stdin.fileno()
+            os.set_blocking(fd, False)
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            while True:
+                data = self._outbox.get()
+                if data is None or self._closed:
+                    return
+                try:
+                    view = memoryview(data)
+                    while view and not self._closed:
+                        if proc.poll() is not None:
+                            self._died("resident harness exited (code %s) before reading "
+                                       "its input" % proc.returncode)
+                            return
+                        if not poller.poll(WRITE_POLL * 1000):
+                            continue
+                        try:
+                            view = view[os.write(fd, view):]
+                        except BlockingIOError:
+                            continue
+                except (OSError, ValueError) as exc:
+                    self._died("cannot write to the harness: %s" % exc)
+                    return
+                finally:
+                    with self._input_lock:
+                        self._outbox_bytes -= len(data)
+        finally:
+            self._release_input(writer=True)
 
     def _control(self, request: dict, timeout: float, *,
                  turn: Turn | None = None) -> dict | None:
