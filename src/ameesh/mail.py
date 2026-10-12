@@ -113,8 +113,17 @@ def unread(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
 
 
 def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
-    """L125 : les non-lus qui ouvriront un tour (hors courrier passif)."""
-    return storage.of(db).mailbox.unread_active(recipient, limit)
+    """L125 : les non-lus qui ouvriront un tour (hors courrier passif).
+
+    Path B: `mailbox.unread_active` is not in contract 1.1, so a mediated
+    executor reads `mailbox.unread` (admitted) and drops passive mail here,
+    with the same rule as the SQL (`passive_reason`). Only the first
+    `UNREAD_LIMIT` unread messages are looked at there."""
+    st = storage.of(db)
+    if getattr(st, "driver", None) == "mediated":
+        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
+        return [row for row in rows if not passive_reason(row)][:int(limit)]
+    return st.mailbox.unread_active(recipient, limit)
 
 
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:

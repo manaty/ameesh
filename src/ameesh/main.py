@@ -113,7 +113,13 @@
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
         same output and exit code, local fallback;
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
-  ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
+  ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
+  ameesh host enroll|revoke|list|show   enroll lending devices (L110,
+        authorized human only);
+  ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
+  ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
+        mediated executor API (/api/exec/v1, L108): an executor on a
+        device without database access (docs/EXECUTEUR-MEDIEE.md).
 
 The human approval service (spec §9) is a separate command,
 `ameesh-approve` (python -m ameesh.approve), run under its own
@@ -287,6 +293,14 @@ def _dispatch(argv: list[str] | None) -> int:
     if command in ACTION_COMMANDS:
         from . import actions_cli
         return actions_cli.main(argv)
+    if command == "serve":
+        # L108 : l'API d'exécuteur médiée ; L84 y ajoutera l'interface
+        from .mediated_executor import server
+        return server.main(rest)
+    if command in ("host", "device"):
+        # L110 : enrôlement et identité des exécuteurs médiés
+        from . import host_cli
+        return host_cli.main(argv)
     if command == "guard":
         # L159e : garde de capacité d'une VM prêteuse (service système, sans base)
         from . import guard

@@ -46,6 +46,12 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       authenticators.public_key, .credential_id
+--   * exécuteurs médiés (voie B, 0062 et 0063) — empreintes de jetons et de
+--     codes, identifiants d'assertions, clé et attestation d'appareil,
+--     réponses rejouables du cache d'idempotence :
+--       executor_tokens.token_sha256, executor_invitations.code_sha256,
+--       executor_assertion_jti.jti, executors.public_key, .device_attestation,
+--       exec_idempotency.response
 --   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
 --     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
 --     reconnaîtrait un jeton fuité ; inutile à la supervision :
@@ -185,6 +191,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'turn_max_seconds', 'turn_mail_max',
         -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
         'turn_grace_seconds',
+        -- L165b (0384) : réveil sur lot actionnable, on/off (un réglage) ;
+        -- harnais, dossier et id de la session dont ils notent l'ouverture
+        -- (même nature que harness, cwd, session_id)
+        'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
@@ -240,6 +250,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'grant_id', 'action_id', 'amount', 'connector', 'operation',
         'action_class', 'currency', 'reserved_by', 'reserved_at',
         'released_at', 'released_reason'
+    ]),
+    -- L165b (0384): sessions put aside per (agent, lot) and the runner's
+    -- wake bookkeeping; a session id, like agent_registry.session_id
+    ('agent_lot_sessions', ARRAY[
+        'agent', 'work_item_id', 'session_id', 'harness', 'account', 'cwd',
+        'parked_at', 'wakes', 'last_wake_at', 'wake_activity_at', 'created_at'
     ]),
     -- L385 (0373): explicit prerequisites and their audit attribution.
     ('work_item_dependencies', ARRAY[
@@ -334,6 +350,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'spend_key',
         -- L95 (0043) : raison d'une ligne écartée des sommes
         'void_reason',
+        -- L111 (0064) : provenance (harness, relay, device) et bail
+        'source', 'executor', 'lease_owner', 'lease_epoch',
         -- L225 (0059) : raison d'un tour facturé au repli prudent
         'price_fallback',
         -- L225 (0059) : écritures de cache Claude du tour
@@ -344,6 +362,37 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('turn_cost_corrections', ARRAY[
         'id', 'run_id', 'turn_cost_id', 'kind', 'reason', 'old_row', 'new_values',
         'actor', 'at'
+    ]),
+    -- exécuteurs médiés (voie B : 0062, 0063) : de l'ÉTAT, jamais une
+    -- empreinte de jeton ou de code, ni une réponse rejouable
+    ('exec_idempotency', ARRAY[
+        'executor_id', 'key', 'op', 'request_sha256', 'status', 'at'
+    ]),
+    ('exec_host_availability', ARRAY[
+        'host', 'executor_id', 'available', 'state', 'seq', 'until_at', 'caps',
+        'reason', 'updated_at'
+    ]),
+    ('exec_audit', ARRAY[
+        'id', 'at', 'executor_id', 'host', 'principal', 'agent', 'op', 'route',
+        'status', 'error', 'fenced', 'replayed', 'idempotency_key'
+    ]),
+    ('executor_invitations', ARRAY[
+        'mesh', 'host', 'agents_allowlist', 'created_by', 'created_at',
+        'expires_at', 'consumed_at', 'executor_id', 'cancelled_at'
+    ]),
+    ('executors', ARRAY[
+        'id', 'mesh', 'host', 'thumbprint', 'agents_allowlist', 'label',
+        'device_key_sha256', 'enrolled_by', 'enrolled_at', 'last_seen_at',
+        'revoked_at', 'revoked_by', 'revoked_why'
+    ]),
+    ('executor_tokens', ARRAY[
+        'kind', 'executor_id', 'agent', 'epoch', 'created_at', 'expires_at'
+    ]),
+    ('executor_assertion_jti', ARRAY[
+        'executor_id', 'expires_at'
+    ]),
+    ('executor_events', ARRAY[
+        'id', 'at', 'kind', 'host', 'executor_id', 'actor', 'detail'
     ]),
     -- comptes multiples (L30, 0028) : des NOMS de comptes et l'état de bascule,
     -- jamais un profil (dossier, clé) : ceux-là restent sur l'hôte
@@ -442,8 +491,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- prévues
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
-        -- L122 (0053) : numéro de migration réservé par le lot
-        'migration',
+        -- L122 (0053) : numéro de migration réservé par le lot, et son
+        -- dépôt (#443, 0390)
+        'migration', 'migration_repo',
         -- L157b (0054) : taille déclarée du changement
         'change_size'
     ]),
