@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import conversation as C, db as db_mod, fil, progress, storage
+from ameesh import adapters, conversation as C, db as db_mod, fil, progress, storage
 from tests.support import PgTestCase
 
 
@@ -42,7 +42,7 @@ class UnitTest(unittest.TestCase):
             self.assertTrue(entered.wait(1))
             start = time.monotonic()
             for _ in range(100):
-                recorder.on_event({"type": "text"}, {"display": ["delta"]})
+                recorder.on_event({"type": "text", "text": "delta"}, {"display": ["delta"]})
             self.assertLess(time.monotonic() - start, 0.2)
             self.assertEqual(recorder.dropped, 98)
             gate.set()
@@ -65,7 +65,8 @@ class UnitTest(unittest.TestCase):
             recorder = C.Recorder(mock.Mock(), agent="worker", turn="t2", connect=mock.Mock(),
                                   warn=mock.Mock())
             recorder.on_event({"parent_tool_use_id": "child"}, {"display": ["hidden"]})
-            recorder.on_event({}, {"display": ["a", "b"]})
+            recorder.on_event({"type": "text", "text": "a"}, {"display": ["a"]})
+            recorder.on_event({"type": "text", "text": "b"}, {"display": ["b"]})
             self.assertFalse(text_written.wait(0.1))
             self.assertTrue(text_written.wait(1))
             recorder.close()
@@ -76,6 +77,71 @@ class UnitTest(unittest.TestCase):
         for args in ((-1, 10), (0, 0), (0, 501), (True, 10)):
             with self.assertRaises(ValueError):
                 C.history(None, "worker", after=args[0], limit=args[1])
+
+    def test_acp_tool_title_cannot_be_persisted_in_text_or_metadata(self):
+        log = mock.Mock()
+        raw = {"type": "tool", "kind": "execute", "status": "completed",
+               "title": "curl -H Authorization:Bearer SECRET"}
+        with mock.patch.object(C, "Log", return_value=log):
+            recorder = C.Recorder(mock.Mock(), agent="worker", turn="title", connect=mock.Mock())
+            recorder.on_event(raw, adapters.AcpStream().parse_event(raw))
+            recorder.close()
+        calls = log.append.call_args_list
+        self.assertNotIn("SECRET", repr(calls))
+        tools = [call for call in calls if call.args[0] == "tool"]
+        self.assertEqual([(c.args[1], c.kwargs["meta"]["tool"]) for c in tools], [("execute", "execute")])
+
+    def test_textstream_envelopes_and_unidentified_display_are_not_agent_text(self):
+        secret = "SECRET_FROM_TOOL_OUTPUT"
+        raw = {"type": "item.completed", "item": {"type": "command_execution",
+                "command": "curl -H Authorization:Bearer " + secret,
+                "aggregated_output": secret}}
+        line = json.dumps(raw)
+        log = mock.Mock()
+        with mock.patch.object(C, "Log", return_value=log):
+            recorder = C.Recorder(mock.Mock(), agent="worker", turn="display", connect=mock.Mock())
+            recorder.on_event(line, adapters.TextStream().parse(line))
+            recorder.on_event("plain output " + secret, {"display": [secret]})
+            recorder.on_event({"type": "thought", "text": secret}, {"display": [secret]})
+            recorder.on_event({"type": "text", "text": "explicit answer"}, {"display": ["wrong " + secret]})
+            recorder.close()
+        self.assertNotIn(secret, repr(log.append.call_args_list))
+        self.assertEqual([c.args[1] for c in log.append.call_args_list if c.args[0] == "text"],
+                         ["explicit answer"])
+
+    def test_history_detects_internal_and_trailing_holes_in_retained_detail(self):
+        st = mock.Mock()
+        cases = [(1, [3], 3, False, True), (0, [1, 3], 3, False, True),
+                 (0, [1], 3, False, True), (1, [], 3, False, True),
+                 (0, [1], 3, True, False), (1, [2, 3], 3, False, False),
+                 (3, [], 3, False, False)]
+        with mock.patch.object(C.storage, "of", return_value=st):
+            for after, seqs, last, more, gap in cases:
+                with self.subTest(after=after, seqs=seqs, more=more):
+                    st.conversations.read.return_value = {
+                        "entries": [{"seq": seq} for seq in seqs], "oldest_seq": 1,
+                        "last_seq": last, "more": more}
+                    self.assertEqual(C.history(None, "worker", after=after)["gap"], gap)
+
+    def test_identified_text_sources_keep_agent_text_across_protocols(self):
+        cases = [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "answer"}, {"type": "thinking", "thinking": "secret"}]}},
+            {"type": "result", "result": "answer", "is_error": False},
+            {"type": "text", "text": "answer"}, {"type": "final", "text": "answer"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "answer"}},
+            {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "answer"}}},
+            {"method": "item/agentMessage/delta", "params": {"delta": "answer"}},
+            {"type": "stream_event", "event": {"type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "answer"}}}]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(C.agent_text(raw, {"display": ["raw envelope secret"]}), ["answer"])
+                self.assertEqual(C.agent_text(raw, {}), [])
+        self.assertEqual(C.agent_text({"type": "result", "result": "secret", "is_error": True},
+                                      {"final": "secret"}), [])
+        self.assertEqual(C.tool_events({"type": "tool", "name": "curl -H secret",
+                                        "kind": {}, "status": ["secret"]}), [("tool", "updated")])
 
 
 class StoreTest(PgTestCase):
@@ -180,17 +246,39 @@ class StoreTest(PgTestCase):
         self.assertEqual(agents[0]["conversation"]["last_seq"], 1)
         self.assertEqual(agents[1]["conversation"]["entries"], [])
 
+    def test_retention_hole_behind_pending_r12_and_after_retained_tail(self):
+        self.log.append("human_message", "pending question", author="human:alice")
+        self.log.append("text", "old detail")
+        self.log.append("text", "recent detail")
+        self.db.execute("UPDATE conversation_log SET created_at = now() - interval '91 days' WHERE seq <= 2")
+        self.assertEqual(self.log.prune(), 1)
+        page = C.history(self.db, "worker", after=1)
+        self.assertEqual([r["seq"] for r in page["entries"]], [3])
+        self.assertTrue(page["gap"])
+        self.assertTrue(C.history(self.db, "worker")["gap"])
+        # Retention can also remove the last entries while the outbox survives.
+        self.assertEqual(self.log.prune(now=time.time() + 92 * 86400), 1)
+        self.assertEqual([r["seq"] for r in C.history(self.db, "worker")["entries"]], [1])
+        self.assertTrue(C.history(self.db, "worker")["gap"])
+        self.assertTrue(C.history(self.db, "worker", after=1)["gap"])
+        self.assertFalse(C.history(self.db, "worker", after=3)["gap"])
+
     def test_real_recorder_uses_dedicated_connection_and_writes_final_to_thread(self):
         recorder = C.Recorder(self.cfg, agent="worker", turn="turn-1", project="acme", lot="78")
         recorder.on_event({"type": "session"}, {"session": "session-1"})
-        recorder.on_event({"type": "text"}, {"display": ["Hello ", "world"]})
-        recorder.on_event({"type": "tool", "name": "read", "status": "completed",
-                           "output": "secret"}, {"display": ["[tool] read"]})
+        recorder.on_event({"type": "text", "text": "Hello "}, {"display": ["Hello "]})
+        recorder.on_event({"type": "text", "text": "world"}, {"display": ["world"]})
+        recorder.on_event({"type": "tool", "kind": "read", "status": "completed",
+                           "title": "read Authorization:Bearer secret", "output": "secret"},
+                          {"display": ["[tool] read Authorization:Bearer secret"]})
+        raw = {"type": "item.completed", "item": {"type": "command_execution",
+               "command": "curl -H Authorization:Bearer secret", "aggregated_output": "secret"}}
+        recorder.on_event(json.dumps(raw), adapters.TextStream().parse(json.dumps(raw)))
         recorder.finish(final="Done", cost=0.1, usage={"input_tokens": 10}, status="completed")
         self.assertTrue(recorder.close())
         self.assertIsNone(recorder.error)
         rows = C.history(self.db, "worker")["entries"]
-        self.assertEqual([r["kind"] for r in rows], ["text", "tool", "turn_end"])
+        self.assertEqual([r["kind"] for r in rows], ["text", "tool", "tool", "turn_end"])
         self.assertEqual(rows[0]["text"], "Hello world")
         self.assertEqual(rows[-1]["meta"]["cost_usd"], 0.1)
         self.assertTrue(all(r["session"] == "session-1" for r in rows))

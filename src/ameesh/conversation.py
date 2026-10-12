@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import queue
+import re
 import threading
 import time
 from collections.abc import Mapping
@@ -24,6 +25,9 @@ THREAD_LIMIT = 100_000
 DETAIL_DAYS = 90
 SLICE_SECONDS = 0.5
 KINDS = frozenset(("human_message", "input", "text", "tool", "turn_end", "state"))
+_TOOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.:/-]{0,79}")
+_ACP_KINDS = frozenset(("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other"))
+_TOOL_STATES = frozenset(("pending", "in_progress", "started", "updated", "completed", "failed"))
 
 
 def identifier(value, *, optional=False):
@@ -123,11 +127,20 @@ def history(db, agent, *, after=0, limit=100):
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
         raise ValueError("conversation page limit must be between 1 and 500")
     page = storage.of(db).conversations.read(agent, after=after, limit=limit)
-    oldest, last = page["oldest_seq"], int(page["last_seq"])
+    last = int(page["last_seq"])
     entries = page["entries"]
+    cursor, gap = after, False
+    for entry in entries:
+        seq = int(entry["seq"])
+        gap = gap or seq != cursor + 1
+        cursor = seq
+    # A pending R12 entry may survive pruning ahead of removed detail. The
+    # oldest retained row cannot tell us about internal or trailing holes.
+    if not page["more"] and cursor < last:
+        gap = True
     return dict(page, schema=SCHEMA, agent=agent,
                 next_seq=int(entries[-1]["seq"]) if entries else max(after, last),
-                gap=bool(after < last and (oldest is None or after < int(oldest) - 1)))
+                gap=gap)
 
 
 def attach_progress(db, agents, *, limit=20):
@@ -141,6 +154,56 @@ def attach_progress(db, agents, *, limit=20):
                                  "limit": limit}
 
 
+def safe_tool_name(name, fallback="tool"):
+    """A bounded tool identifier, never a title or a shortened command line."""
+    if isinstance(name, str) and _TOOL_NAME.fullmatch(name):
+        return name
+    return fallback if isinstance(fallback, str) and _TOOL_NAME.fullmatch(fallback) else "tool"
+
+
+def agent_text(raw, parsed):
+    """Extract only typed assistant text, never arbitrary adapter display.
+
+    The parsed event must identify displayed/final content too: L75 emits an
+    empty parsed event for another thread. Raw fields give the provenance;
+    display strings can be complete JSON envelopes with tool output.
+    """
+    if not isinstance(raw, Mapping) or not isinstance(parsed, Mapping) or raw.get("parent_tool_use_id"):
+        return []
+    if not parsed.get("display") and "final" not in parsed:
+        return []
+    kind = raw.get("type")
+    text = None
+    if kind == "assistant":
+        message = raw.get("message")
+        if isinstance(message, Mapping) and message.get("role", "assistant") == "assistant":
+            return [c["text"] for c in message.get("content") or []
+                    if isinstance(c, Mapping) and c.get("type") == "text"
+                    and isinstance(c.get("text"), str)]
+    elif kind == "result" and not raw.get("is_error"):
+        text = raw.get("result")
+    elif kind in ("text", "final"):
+        # ACP bridge and dsh explicitly distinguish text from thought/tool.
+        text = raw.get("text")
+    elif kind == "stream_event":
+        event = raw.get("event")
+        if isinstance(event, Mapping) and event.get("type") == "content_block_delta":
+            delta = event.get("delta")
+            if isinstance(delta, Mapping) and delta.get("type") == "text_delta":
+                text = delta.get("text")
+    else:
+        method = raw.get("method") or kind
+        params = raw.get("params") or raw
+        if isinstance(params, Mapping):
+            if method == "item/agentMessage/delta":
+                text = params.get("delta")
+            elif method in ("item.completed", "item/completed"):
+                item = params.get("item")
+                if isinstance(item, Mapping) and item.get("type") in ("agent_message", "agentMessage"):
+                    text = item.get("text", "")
+    return [text] if isinstance(text, str) else []
+
+
 def tool_events(raw):
     """Select names/states only, across Claude, Codex and the ACP bridge."""
     if not isinstance(raw, Mapping):
@@ -149,7 +212,7 @@ def tool_events(raw):
         message = raw.get("message") or {}
         if not isinstance(message, Mapping):
             return []
-        return [(str(c.get("name") or "tool")[:256], "started")
+        return [(safe_tool_name(c.get("name")), "started")
                 for c in message.get("content") or [] if isinstance(c, Mapping)
                 and c.get("type") == "tool_use"]
     if raw.get("type") == "user":
@@ -159,8 +222,11 @@ def tool_events(raw):
         return [("tool", "completed") for c in message.get("content") or []
                 if isinstance(c, Mapping) and c.get("type") == "tool_result"]
     if raw.get("type") == "tool":
-        return [(str(raw.get("name") or raw.get("title") or "tool")[:256],
-                 str(raw.get("status") or "updated")[:256])]
+        kind = raw.get("kind")
+        fallback = kind if isinstance(kind, str) and kind in _ACP_KINDS else "tool"
+        status = raw.get("status")
+        return [(safe_tool_name(raw.get("name"), fallback),
+                 status if isinstance(status, str) and status in _TOOL_STATES else "updated")]
     method = raw.get("method") or raw.get("type") or ""
     if method in ("item.started", "item.completed", "item/started", "item/completed"):
         container = raw.get("params") or raw
@@ -172,7 +238,7 @@ def tool_events(raw):
         kind = item.get("type") or ""
         if kind and kind not in ("agentMessage", "agent_message", "userMessage",
                                  "reasoning", "plan", "contextCompaction"):
-            return [(str(item.get("name") or kind)[:256],
+            return [(safe_tool_name(item.get("name"), kind),
                      "completed" if method.endswith("completed") else "started")]
     return []
 
@@ -198,6 +264,7 @@ class Recorder:
         self.dropped = 0
         self.closed = False
         self.error = None
+        self.final_text = None
         self.thread = threading.Thread(target=self._run, name="conversation-" + agent,
                                        daemon=True)
         self.thread.start()
@@ -234,9 +301,11 @@ class Recorder:
             self._put(("tool", name, {"tool": name, "status": status}))
         # Codex reports `final` on each completed agent message (including
         # commentary). Keep it live; only finish publishes the final to R12.
-        texts = ([parsed["final"]] if "final" in parsed else parsed.get("display") or [])
+        texts = agent_text(raw, parsed)
+        if "final" in parsed:
+            self.final_text = "".join(texts) if texts else ""
         for text in texts:
-            if not str(text).startswith(("[tool]", "[permission", "thinking:")):
+            if text:
                 self._put(("text", *bounded(text)))
 
     def append(self, kind, text, **kwargs):

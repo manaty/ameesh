@@ -3326,7 +3326,7 @@ class AgentWorker(threading.Thread):
                 interrupted = (self.lease_lost.is_set() or self.preempting.is_set()
                                or self.restarting.is_set() or clos)
                 conversation_recorder.finish(
-                    final=self.last_final or "",
+                    final=conversation_recorder.final_text or "",
                     status="interrupted" if interrupted else (
                         "failed" if result_code or error or sys.exc_info()[0] else "completed"),
                     cost=cost, usage=conversation_usage,

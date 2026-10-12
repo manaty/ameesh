@@ -12,7 +12,11 @@ event or instruction), `text` (texte), `tool` (outil), `turn_end`
 Text is capped at 20,000 characters per entry, with `truncated` set when
 clipped. Metadata allows only tool name, status, cost, duration, token
 counts and dropped-event count. Tool arguments, results, raw protocol
-objects and reasoning are excluded.
+objects and reasoning are excluded. ACP tool titles are excluded too; only
+a bounded identifier or a known ACP tool kind is retained. An adapter's
+arbitrary `display` is never stored: text is extracted from explicitly typed
+assistant-message/chunk/final fields. Plain `TextStream` output stays in the
+ordinary disk trace, without being copied into shared conversation detail.
 
 `conversation_heads` serializes writers for an agent through commit.
 Sequences therefore follow commit order; a subscriber cannot skip a
@@ -24,7 +28,10 @@ published at commit, never with message text. Consumers re-read using
 `conversation.history(db, agent, after=last_seq, limit=100)`. The
 `ameesh-conversation/1` result gives ascending `entries`, `last_seq`,
 `oldest_seq`, `next_seq`, `more` and `gap`. `gap` explicitly reports a
-cursor older than the retained history. Limits are 1–500 entries.
+missing sequences before or within the returned page, and a missing tail
+when `more` is false. This includes holes behind a pending R12 entry that
+survives detail retention. Continue pagination with `next_seq` while `more`
+is true. Limits are 1–500 entries.
 LISTEN consumers use `storage.of(db).wakeups.subscribe(['ameesh_chat'])`;
 clients without LISTEN poll the same history API. Notifications are hints,
 so every reconnect must read from its last cursor even without a signal.
