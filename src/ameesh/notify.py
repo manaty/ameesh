@@ -87,6 +87,10 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
                  "ci_main_red",
+                 # #246 : btrfs presque plein côté allocation (df ne le voit pas)
+                 "host_disk_low",
+                 # L225 : des tours sans tarif au barème échappent à la dépense
+                 "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
@@ -145,6 +149,8 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "biais d'estimation",
     "ci_main_red": "CI rouge sur main",
+    "host_disk_low": "disque btrfs presque plein",
+    "turn_unpriced": "tour sans tarif au barème",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
@@ -967,9 +973,19 @@ class Notifier:
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
+                if alert.get("type") in exploitation.ESCALATING:
+                    entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
+            elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
+                  and not entry.get("escalated")):
+                # #246 : même épisode, niveau critique atteint — poussée une
+                # seconde fois, sur place (une seule fois par épisode ; le
+                # retour au seuil puis au critique ne la relève pas)
+                entry.update(alert={k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                             escalated=True, status="nouvelle", channels={})
+                self._raise(entry, router, now)
             else:
                 if alert.get("type") == "orphan_lot" and alert.get("grouped"):
                     entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
