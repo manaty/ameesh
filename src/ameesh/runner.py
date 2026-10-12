@@ -3541,6 +3541,10 @@ class AgentWorker(threading.Thread):
             self.maybe_rotate()
             spec = self.rotate_for_lot(self.pick())
             if spec:
+                # #283 r2 : la même garde que `run()` — une rotation a pu
+                # déplacer l'agent ; la consigne reste alors en attente
+                if self._moved_before_turn(spec):
+                    return False
                 self.run_turn(spec)
                 return True
             if self.stopping.is_set() or time.monotonic() >= deadline:

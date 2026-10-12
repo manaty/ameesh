@@ -978,6 +978,23 @@ class CoupureTest(PgTestCase):
         self.assertEqual(ligne["pending_prompt"], "travail")
         self.assertIsNone(ligne.get("lease_owner"))
 
+    def test_place_ailleurs_pendant_une_rotation_en_mode_once(self):
+        # #283 r2 : process_once (--once) passe par la même garde que run()
+        worker = self._worker("unefois")
+        registry.set_pending_prompt(self.db, "unefois", "travail")
+
+        def rotation():
+            self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
+                            " WHERE name = 'unefois'")
+            return True
+
+        with mock.patch.object(worker, "maybe_rotate", side_effect=rotation), \
+                mock.patch.object(worker, "run_turn") as tour, \
+                mock.patch.object(runner_mod, "log"):
+            self.assertFalse(worker.process_once(0))
+        tour.assert_not_called()
+        self.assertEqual(registry.get(self.db, "unefois")["pending_prompt"], "travail")
+
     def test_base_perdue_au_controle_de_placement_la_consigne_survit(self):
         # #283 r1 : pick() a pris A, le contrôle de placement lève Unavailable ;
         # B arrive avant la reprise — A n'est pas perdue, les deux partent
