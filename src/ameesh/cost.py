@@ -134,6 +134,9 @@ def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
 PACE_MARGIN = 0.10
 PACE_CEILING = 0.90
+#: L242b : plancher du rapport réel/estimé qui corrige l'estimation entre deux
+#: relevés de solde (`CostBook.paid_hour`) — jamais une dépense comptée nulle
+PAID_RATIO_FLOOR = 0.10
 
 #: Bornes de lecture des journaux : on ne charge jamais un fichier entier, les
 #: sessions des harnais grossissent sans fin.
@@ -233,8 +236,9 @@ class Gauge:
         """
         return 0.0 if self.reset_passed(now) else self.used
 
-    def exceeded(self, now: float) -> bool:
-        return self.used_at(now) >= self.pace_cap(now)
+    def exceeded(self, now: float, reserve: float = 0.0) -> bool:
+        """Au seuil de rythme ; `reserve` (L242b) l'abaisse d'autant."""
+        return self.used_at(now) >= max(0.0, self.pace_cap(now) - reserve)
 
     def reset_passed(self, now: float) -> bool:
         """La fenêtre publiée est-elle déjà remise à zéro (`resets_at` passé) ?
@@ -753,19 +757,23 @@ class CostBook:
         except Exception:  # historique facultatif : jamais fatal
             return 0
 
-    def pace_exceeded(self, harness: str) -> str:
+    def pace_exceeded(self, harness: str, reserve: float = 0.0) -> str:
         """Le forfait d'un harnais avance-t-il trop vite ? La raison, ou ''.
 
         Le seuil est celui de la décision 0019 §2 :
-        `utilisation >= min(90 %, part écoulée de la fenêtre + 10 points)`.
+        `utilisation >= min(90 %, part écoulée de la fenêtre + 10 points)`,
+        moins `reserve` pour un agent non critique (L242b (2)).
         """
         now = self.clock()
         for gauge in self.gauges(harness):
-            if gauge.exceeded(now):
+            if gauge.exceeded(now, reserve):
                 return ("plan %s %s: %.0f%% used with %.0f%% of the window "
-                        "elapsed (pace cap %.0f%%)" % (
+                        "elapsed (pace cap %.0f%%%s)" % (
                             harness, gauge.key, gauge.used * 100,
-                            gauge.elapsed(now) * 100, gauge.pace_cap(now) * 100))
+                            gauge.elapsed(now) * 100,
+                            max(0.0, gauge.pace_cap(now) - reserve) * 100,
+                            ", %.0f points kept for critical agents" % (reserve * 100)
+                            if reserve else ""))
         return ""
 
     # -- comptabilité par tour ---------------------------------------------
@@ -1228,14 +1236,63 @@ class CostBook:
         return storage.of(self.db).turn_costs.spent(seconds, agent=agent,
                                                      harnesses=harnesses)
 
+    def paid_hour(self, paid: Sequence[str]) -> float:
+        """L242b (décision de mesh-design du 2026-10-12) : la dépense payée au
+        token du mesh sur les 60 dernières minutes, comptée sur la **baisse
+        réelle des soldes** (`balance.compare`) des fournisseurs relevés.
+        Hors de l'intervalle couvert par les relevés (avant le premier, après
+        le dernier), l'estimation du grand livre, corrigée par le rapport
+        réel/estimé de l'intervalle couvert (s'il porte sur au moins
+        `balance.GAP_MIN_USD` estimés ; jamais sous `PAID_RATIO_FLOOR`). Un
+        harnais sans relevé, ou des soldes illisibles : l'estimation seule."""
+        ledger_hour = self.spent("all", 3600, harnesses=paid)
+        if self.db is None or not paid:
+            return ledger_hour
+        from . import balance
+        now = self.clock()
+        start = now - 3600.0
+        try:
+            real = [entry for entry in balance.compare(self.db, paid, start, now)
+                    if entry["provider"] in paid and entry["currency"] == "USD"]
+            if not real:
+                return ledger_hour
+            ledger = storage.of(self.db).turn_costs
+            total = 0.0
+            for entry in real:
+                estimated = entry.get("estimated_usd") or 0.0
+                ratio = 1.0
+                if estimated >= balance.GAP_MIN_USD:
+                    ratio = max(PAID_RATIO_FLOOR, entry["real_spent"] / estimated)
+                outside = 0.0
+                covered_from = float(entry.get("start_ts") or start)
+                covered_to = float(entry.get("end_ts") or now)
+                if covered_from > start:
+                    outside += ledger.spent_between(start, covered_from,
+                                                    harnesses=[entry["provider"]])
+                if covered_to < now:
+                    outside += ledger.spent_between(covered_to, now,
+                                                    harnesses=[entry["provider"]])
+                total += max(0.0, float(entry["real_spent"])) + outside * ratio
+            rest = [h for h in paid if h not in {entry["provider"] for entry in real}]
+            if rest:
+                total += self.spent("all", 3600, harnesses=rest)
+            return total
+        except Exception:  # noqa: BLE001 - soldes illisibles : l'estimation
+            return ledger_hour
+
     def over(self, agent: str = "all", *,
-             paid_harnesses: Sequence[str] | None = None, pace: bool = True) -> str:
+             paid_harnesses: Sequence[str] | None = None, pace: bool = True,
+             reserve: float = 0.0, hourly_share: float = 1.0) -> str:
         """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
 
         Le plafond horaire ne somme que l'usage payé au token
         (`paid_harnesses`, défaut `paid_harnesses_of()`, lu dans les descripteurs) ;
         les forfaits sont couverts par `pace_exceeded`, pas par cette somme
         (0019 §2), et un agent au forfait n'y est pas soumis (L49).
+
+        `reserve` (L242b (2)) : un agent non critique s'arrête autant sous
+        le plafond de rythme. `hourly_share` (L242b) : il s'arrête à cette
+        part du plafond horaire du mesh (`noncritical_hourly_share`).
 
         `pace=False` (L30) : le rythme est jugé compte par compte par
         `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
@@ -1247,7 +1304,7 @@ class CostBook:
         absent ne s'applique pas.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
-        reason = self.pace_exceeded(harness) if (harness and pace) else ""
+        reason = self.pace_exceeded(harness, reserve) if (harness and pace) else ""
         if reason:
             return reason
         paid = paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
@@ -1259,11 +1316,15 @@ class CostBook:
         # L70 : plafonds du mesh (heure, jour glissant), puis ceux de l'agent
         for window, cap in ((3600, self.hourly_usd), (86400, self.daily_usd)):
             if cap and cap > 0:
-                total = self.spent("all", window, harnesses=paid)
-                if total >= cap:
+                total = (self.paid_hour(paid) if window == 3600
+                         else self.spent("all", window, harnesses=paid))
+                held = cap * hourly_share if window == 3600 else cap
+                if total >= held:
                     return ("%s budget (pay-per-token): %.2f $ over %s "
-                            "(cap %.2f $)" % (WINDOW_LABELS[window][0], total,
-                                                  WINDOW_LABELS[window][1], cap))
+                            "(cap %.2f $%s)" % (
+                                WINDOW_LABELS[window][0], total, WINDOW_LABELS[window][1],
+                                cap, ", %.2f $ for a non-critical agent" % held
+                                if held < cap else ""))
         if agent != "all":
             for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
                 if cap and cap > 0 and window in WINDOW_LABELS:

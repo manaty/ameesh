@@ -2060,9 +2060,16 @@ class AgentWorker(threading.Thread):
         # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
         # compte et la garde bascule au lieu de mettre en pause.
         raison = account_turn.choose(self, book)
+        # L242b : un non-critique s'arrête plus tôt — sous le rythme (réserve,
+        # sans comptes déclarés ; avec, `accounts.choose` la prend) et à une
+        # part du plafond horaire payé au token du mesh
+        from . import accounts as accounts_mod
+        critique = account_turn.is_critical(self)
+        part = 1.0 if critique else getattr(self.cfg, "noncritical_hourly_share", 0.75)
         if raison is None:
-            return book.over(self.name)
-        return raison or book.over(self.name, pace=False)
+            return book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
+                             hourly_share=part)
+        return raison or book.over(self.name, pace=False, hourly_share=part)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
