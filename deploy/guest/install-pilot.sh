@@ -126,6 +126,7 @@ case "$ROOT" in /|/home|/tmp|/srv|/root|/opt|/usr|/etc|/var|/run|/mnt) die "--ro
 [ "$PURGE" = 0 ] || [ "$MODE" = uninstall ] || die "--purge goes with --uninstall"
 # the tests' dry runs read a state of their own; a real run reads only $STATE
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_STATE:-}" ] && STATE=$PILOT_TEST_STATE
+[ "$DRY" = 1 ] && [ -n "${PILOT_TEST_VENV:-}" ] && VENV=$PILOT_TEST_VENV
 # the mounts, binds included: read in mountinfo, never guessed (a dry run of
 # the tests may read a mountinfo of its own)
 MOUNTINFO=/proc/self/mountinfo
@@ -194,6 +195,37 @@ is_mount() {
   awk -v p="$1" '$5 == p { found = 1 } END { exit !found }' "$MOUNTINFO"
 }
 
+# remove_tree [--runtime] PATH: the script's ONLY recursive removal. PATH
+# must be a resolved path of its own (--runtime: one of the fixed runtime
+# directories under /run that systemd and this script manage), with no
+# mount point on it or beneath (mountinfo, binds included); then
+# rm -rf --one-file-system as a last defence. Returns 1, saying why, when
+# it refuses: the caller keeps the path (and its record).
+remove_tree() {
+  local runtime=0
+  if [ "$1" = --runtime ]; then runtime=1; shift; fi
+  local path=$1
+  # (a dry run shows it all the same)
+  if absent "$path" && [ "$DRY" = 0 ]; then return 0; fi
+  if [ "$runtime" = 1 ]; then
+    case "$path" in
+      /run/ameesh-gate|"$CONTROL"/ameesh-guest.slice.d|"$CONTROL"/ameesh-guest-runner@*.service.d) ;;
+      *) echo "not removed: $path (not a runtime directory of this script)"; return 1 ;;
+    esac
+  elif ! purgeable "$path"; then
+    echo "not removed: $path (not a path of its own)"; return 1
+  fi
+  if ! resolved "$path"; then
+    echo "kept $path: it goes through a symbolic link now (resolve it, then run again)"
+    return 1
+  fi
+  if mounts_under "$path"; then
+    echo "kept $path: a mount point is there or beneath (unmount it, then run again)"
+    return 1
+  fi
+  run rm -rf --one-file-system "$path"
+}
+
 # purgeable PATH: a directory of its own, two levels deep at least, never
 # a top directory (/home, /tmp, /work…), a user's home nor a system tree
 purgeable() {
@@ -215,8 +247,8 @@ CONTROL=/run/systemd/system.control
 reset_caps() {
   local props u
   say "the guard's caps taken off: the guest's units keep their own"
-  run rm -rf "$CONTROL/ameesh-guest.slice.d"
-  for u in $(runner_units); do run rm -rf "$CONTROL/$u.d"; done
+  remove_tree --runtime "$CONTROL/ameesh-guest.slice.d" || true
+  for u in $(runner_units); do remove_tree --runtime "$CONTROL/$u.d" || true; done
   run systemctl daemon-reload
   props=$(grep -E '^(CPUWeight|IOWeight|CPUQuota|MemoryHigh|MemoryMax)=' \
             "$UNITS/ameesh-guest.slice" 2>/dev/null | tr '\n' ' ' || true)
@@ -230,8 +262,8 @@ reset_caps() {
     run systemctl set-property --runtime "$u" "MemoryMax=$props" || true
   done
   # the values written again are the units' own: their drop-ins go too
-  run rm -rf "$CONTROL/ameesh-guest.slice.d"
-  for u in $(runner_units); do run rm -rf "$CONTROL/$u.d"; done
+  remove_tree --runtime "$CONTROL/ameesh-guest.slice.d" || true
+  for u in $(runner_units); do remove_tree --runtime "$CONTROL/$u.d" || true; done
   run systemctl daemon-reload
 }
 
@@ -371,9 +403,13 @@ if [ "$MODE" = uninstall ]; then
             "$UNITS/ameesh-guest.slice" "$UNITS/ameesh.slice.d/guest-weight.conf" "$PATH_DROPIN"
   run rmdir --ignore-fail-on-non-empty "$UNITS/ameesh.slice.d" "$(dirname "$PATH_DROPIN")" || true
   run rm -f "$TMPFILES"
-  run rm -rf /run/ameesh-gate
+  remove_tree --runtime /run/ameesh-gate || true
   # the guard's runtime caps (systemd keeps them until the reboot)
-  run rm -rf "$CONTROL/ameesh-guest.slice.d" "$CONTROL"/ameesh-guest-runner@*.service.d
+  remove_tree --runtime "$CONTROL/ameesh-guest.slice.d" || true
+  for d in "$CONTROL"/ameesh-guest-runner@*.service.d; do
+    [ -e "$d" ] || continue
+    remove_tree --runtime "$d" || true
+  done
   run systemctl daemon-reload
   run rm -f "$ETC/guard.env"
   say "4. (yours) drop the host's Postgres login role (L56)"
@@ -408,14 +444,11 @@ if [ "$MODE" = uninstall ]; then
           kept+=("$kind $path")
         elif ! purgeable "$path"; then
           echo "not removed: $path (recorded, but not a path of its own)"
-        elif ! resolved "$path"; then
-          echo "kept $path: it goes through a symbolic link now (resolve it, then --purge again)"
-          kept+=("$kind $path")
-        elif mounts_under "$path"; then
-          echo "kept $path: a mount point is there or beneath (unmount it, then --purge again)"
-          kept+=("$kind $path")
         elif [ "${kind#*-}" = tree ]; then
-          run rm -rf --one-file-system "$path"
+          remove_tree "$path" || kept+=("$kind $path")
+        elif ! resolved "$path" || mounts_under "$path"; then
+          echo "kept $path: a symbolic link or a mount point there (then --purge again)"
+          kept+=("$kind $path")
         else
           run rmdir --ignore-fail-on-non-empty "$path"
           # a directory left non-empty keeps its record
@@ -557,17 +590,21 @@ done
 if [ -x "$VENV/bin/ameesh" ] && ! created "venv-tree $VENV"; then
   echo "$VENV exists and was not made by this script: upgraded in place"
 else
-  if [ -d "$VENV" ] && [ ! -x "$VENV/bin/pip" ]; then
+  make_venv=0
+  if absent "$VENV"; then
+    make_venv=1
+  elif [ ! -x "$VENV/bin/pip" ]; then
     # a venv this script began and did not finish: made again
     created "venv-tree $VENV" || die "$VENV exists without bin/pip and is not this script's"
-    run rm -rf "$VENV"
+    remove_tree "$VENV" || die "$VENV not made again: see above"
+    make_venv=1
   fi
-  if absent "$VENV"; then
+  if [ "$make_venv" = 1 ]; then
     absent "$(dirname "$VENV")" && remember "venv-dir $(dirname "$VENV")"
     remember "venv-tree $VENV"
     run python3 -m venv "$VENV" || {
-      run rm -rf "$VENV"
-      die "python3 -m venv failed (python3-venv, ensurepip?): nothing left in $VENV"
+      remove_tree "$VENV" || true
+      die "python3 -m venv failed (python3-venv, ensurepip?): $VENV removed unless said above"
     }
   fi
 fi

@@ -324,6 +324,40 @@ class InstallPilotTest(unittest.TestCase):
             self.assertIn("kept in %s: guest-tree %s guest-tree %s" % (state, linked, work), out)
             self.assertNotIn("+ rm -f %s" % state, out)
 
+    def test_a_broken_venv_is_never_removed_across_a_mount(self):
+        # codex #383 r4 P1: the venv's recovery goes through the purge's own
+        # protected removal (a bind of a user's home under share)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            venv = os.path.join(tmp, "opt", "venv")
+            os.makedirs(os.path.join(venv, "share"))       # no bin/pip: broken
+            state = os.path.join(tmp, "state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("venv-tree %s\n" % venv)
+            env = dict(os.environ, PILOT_TEST_STATE=state, PILOT_TEST_VENV=venv,
+                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, venv + "/share"))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test",
+                                  "--allow-rootfs", "--root", os.path.join(tmp, "guest")],
+                                 capture_output=True, text=True, env=env)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("kept %s: a mount point is there or beneath" % venv, res.stdout)
+            self.assertIn("%s not made again" % venv, res.stderr)
+            self.assertNotIn("rm -rf", res.stdout)
+            # without the bind: removed, then made again
+            env["PILOT_TEST_MOUNTINFO"] = self.mountinfo(tmp)
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test",
+                                  "--allow-rootfs", "--root", os.path.join(tmp, "guest")],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertLess(res.stdout.index("+ rm -rf --one-file-system %s\n" % venv),
+                            res.stdout.index("+ python3 -m venv %s" % venv))
+
+    def test_every_recursive_removal_is_the_protected_one(self):
+        # codex #383 r4: one removal path for the whole script
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            lines = [l for l in fh if "rm -r" in l and not l.lstrip().startswith("#")]
+        self.assertEqual([l.strip() for l in lines], ['run rm -rf --one-file-system "$path"'])
+
     def test_a_failed_userdel_keeps_its_record(self):
         # codex #383 r3 P3: the guest still has processes; a later purge retries
         with tempfile.TemporaryDirectory() as tmp:
@@ -373,7 +407,7 @@ class InstallPilotTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout
         stop = out.index("+ systemctl stop ameesh-guard.service")
-        reset = out.index("+ rm -rf /run/systemd/system.control/ameesh-guest.slice.d")
+        reset = out.index("+ rm -rf --one-file-system /run/systemd/system.control/ameesh-guest.slice.d")
         start = out.index("+ systemctl start ameesh-guard.service")
         self.assertLess(stop, reset)
         self.assertLess(reset, start)
