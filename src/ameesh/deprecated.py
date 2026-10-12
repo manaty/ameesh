@@ -23,15 +23,25 @@ class DeprecatedAlias(argparse.Action):  # type: ignore[type-arg]
         p.add_argument("--deploiement", dest="livraison", action=DeprecatedAlias,
                        canonical="--delivery", default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)
+
+    ``append=True`` reproduces ``action="append"`` for a repeatable alias
+    (``--depend-de``): the values collect in the canonical option's list,
+    whatever the order, and the canonical argument keeps the ``default=[]``.
     """
 
-    def __init__(self, option_strings, dest, canonical="", **kwargs):
+    def __init__(self, option_strings, dest, canonical="", append=False, **kwargs):
         super().__init__(option_strings, dest, **kwargs)
         self.canonical = canonical
+        self.append = append
 
     def __call__(self, parser, namespace, values, option_string=None):
         sys.stderr.write("%s is deprecated, use %s\n" % (option_string, self.canonical))
         if self.nargs == 0:
             setattr(namespace, self.dest, self.const if self.const is not None else True)
+        elif self.append:
+            items = getattr(namespace, self.dest, None)
+            items = [] if items is None else list(items)
+            items.append(values)
+            setattr(namespace, self.dest, items)
         else:
             setattr(namespace, self.dest, values)

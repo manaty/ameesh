@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Roadmap: planned dates, dated commitments, Gantt (lot L96).
 
-  ameesh work plan <task|package> [--debut D] [--fin D] [--livraison D] [--source S]
-  ameesh plan add "what" --pour D [--projet P] [--porteur X] [--lot N] [--fiche F]
+  ameesh work plan <task|package> [--start D] [--end D] [--delivery D] [--source S]
+  ameesh plan add "what" --due D [--project P] [--owner X] [--lot N] [--card F]
                   [--source-type conversation|decision|thread|task|other] [--source S]
-                  [--depend-de REF ...] [--decision]
+                  [--depends-on REF ...] [--decision]
   ameesh plan list [--all] [--json]
-  ameesh plan accept <id> [--pour D] | done <id> | cancel <id> [--note ...]
+  ameesh plan accept <id> [--due D] | done <id> | cancel <id> [--note ...]
   ameesh plan propose [--from DIR] [--no-canon] [--no-tasks] [--record] [--json]
   ameesh plan show [--json] [--project P] [--width N]
 
@@ -173,7 +173,7 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
         if value is not _UNSET:
             dates[key] = parse_day(value, now=now, allow_clear=True)
     if not dates and source is None:
-        raise RoadmapError("nothing to plan: --debut, --fin or --livraison (or --source; "
+        raise RoadmapError("nothing to plan: --start, --end or --delivery (or --source; "
                            "--estimate for a task's duration)")
     text = str(target).strip().lstrip("#")
     st = storage.of(db)
@@ -225,7 +225,7 @@ def add_commitment(db, what: str, *, due=None, decision: bool = False, owner: st
                                                                  ", ".join(SOURCE_KINDS)))
     day = parse_day(due, now=now) if due not in (None, "") else None
     if day is None and not decision:
-        raise RoadmapError("a commitment needs a date: --pour YYYY-MM-DD (or monday, tomorrow…)")
+        raise RoadmapError("a commitment needs a date: --due YYYY-MM-DD (or monday, tomorrow…)")
     st = storage.of(db)
     item_id = None
     if lot not in (None, ""):
@@ -256,7 +256,7 @@ def _commitment(db, ident) -> dict:
 
 def accept(db, ident, *, due=None, actor: str = "", now: float | None = None) -> dict:
     """Valide une proposition : elle devient un engagement ouvert. Sans date
-    (proposition tirée d'une décision sans échéance), `--pour` la fixe."""
+    (proposition tirée d'une décision sans échéance), `--due` la fixe."""
     row = _commitment(db, ident)
     if row["status"] != "proposed":
         raise RoadmapError("commitment %s: %s, not a proposal" % (ident, row["status"]))
@@ -264,7 +264,7 @@ def accept(db, ident, *, due=None, actor: str = "", now: float | None = None) ->
     if due not in (None, ""):
         values["due_on"] = parse_day(due, now=now)
     if not values.get("due_on") and not row.get("due_on") and row["kind"] != "decision":
-        raise RoadmapError("proposal %s is undated: --pour YYYY-MM-DD" % ident)
+        raise RoadmapError("proposal %s is undated: --due YYYY-MM-DD" % ident)
     if actor:
         values["note"] = (row.get("note") + "; " if row.get("note") else "") + \
             "accepted by %s" % actor
@@ -904,22 +904,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_add = sub.add_parser("add", help="record a dated commitment (or --decision)")
     p_add.add_argument("what", help="what (one sentence)")
-    p_add.add_argument("--pour", dest="due", default=None, metavar="DAY",
+    p_add.add_argument("--due", dest="due", default=None, metavar="DAY",
                        help="by when: YYYY-MM-DD, today, tomorrow, monday…")
-    p_add.add_argument("--projet", "--project", dest="project", default=None)
-    p_add.add_argument("--porteur", "--owner", dest="owner", default=None,
+    p_add.add_argument("--pour", dest="due", action=DeprecatedAlias, canonical="--due",
+                       default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_add.add_argument("--project", dest="project", default=None)
+    p_add.add_argument("--projet", dest="project", action=DeprecatedAlias,
+                       canonical="--project", default=argparse.SUPPRESS,
+                       help=argparse.SUPPRESS)
+    p_add.add_argument("--owner", dest="owner", default=None,
                        help="who owns it (agent or human:<id>)")
+    p_add.add_argument("--porteur", dest="owner", action=DeprecatedAlias, canonical="--owner",
+                       default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p_add.add_argument("--lot", dest="lot", default=None,
                        help="existing task it is attached to")
     p_add.add_argument("--tache", dest="lot", action=DeprecatedAlias, canonical="--lot",
                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    p_add.add_argument("--fiche", dest="package", default=None, help="WorkPackage")
+    p_add.add_argument("--card", dest="package", default=None, help="WorkPackage")
+    p_add.add_argument("--fiche", dest="package", action=DeprecatedAlias, canonical="--card",
+                       default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p_add.add_argument("--source-type", dest="source_kind", default="conversation",
                        choices=SOURCE_KINDS)
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
-    p_add.add_argument("--depend-de", dest="depends_on", action="append", default=[],
+    p_add.add_argument("--depends-on", dest="depends_on", action="append", default=[],
                        help="dependency (task #N, commitment eN, lot Lxx); repeatable")
+    p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
+                       canonical="--depends-on", append=True, default=argparse.SUPPRESS,
+                       help=argparse.SUPPRESS)
     p_add.add_argument("--decision", action="store_true",
                        help="decision milestone: an open question waiting for a human")
     p_add.add_argument("--note", default="")
@@ -932,7 +944,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_acc = sub.add_parser("accept", help="accept a proposal")
     p_acc.add_argument("id", type=int)
-    p_acc.add_argument("--pour", dest="due", default=None, metavar="DAY")
+    p_acc.add_argument("--due", dest="due", default=None, metavar="DAY")
+    p_acc.add_argument("--pour", dest="due", action=DeprecatedAlias, canonical="--due",
+                       default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p_acc.add_argument("--actor", default="")
     for name, help_ in (("done", "commitment kept"),
                         ("cancel", "commitment dropped, or proposal rejected")):

@@ -90,7 +90,7 @@ class ProposeTest(unittest.TestCase):
             self.assertEqual(p["source_ref"], "canon:decisions/0099.md@abc")
             self.assertTrue(p["command"].startswith("ameesh plan add "), p["command"])
         monday = next(p for p in props if p["due"] == "2026-10-12")
-        self.assertIn("--pour 2026-10-12", monday["command"])
+        self.assertIn("--due 2026-10-12", monday["command"])
         # clés stables : une relecture rend les mêmes
         again = roadmap_propose.from_decision(
             {"title": "Comptes séparés par organisation", "status": "proposed",
@@ -113,7 +113,7 @@ class ProposeTest(unittest.TestCase):
         p = props[0]
         self.assertEqual((p["due"], p["lot"], p["source_kind"], p["source_ref"]),
                          ("2026-10-12", 65, "task", "#65"))
-        self.assertIn("ameesh work plan 65 --livraison 2026-10-12", p["command"])
+        self.assertIn("ameesh work plan 65 --delivery 2026-10-12", p["command"])
         # déjà porté par un engagement : rien à proposer
         self.assertEqual(roadmap_propose.from_task(
             item, base=_dt.date(2026, 10, 10), has_due={(65, "2026-10-12")}), [])

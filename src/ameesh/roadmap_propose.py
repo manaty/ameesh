@@ -21,7 +21,7 @@ pour établir la roadmap » (propriétaire, 2026-10-10). Ce module LIT :
 
 Ce ne sont que des PROPOSITIONS, rendues avec la commande qui les validerait.
 `--record` les enregistre (statut `proposed`, dédoublonnées par une clé
-stable) ; `ameesh plan accept <id> [--pour J]` les valide, `ameesh plan
+stable) ; `ameesh plan accept <id> [--due J]` les valide, `ameesh plan
 cancel <id>` les rejette. Rien n'est créé ni daté sans ce contrôle.
 """
 from __future__ import annotations
@@ -99,20 +99,20 @@ def _ref_date(data: dict, default: _dt.date) -> _dt.date:
 
 def _command(p: dict) -> str:
     if p.get("plan_task") and p.get("due"):
-        return "ameesh work plan %d --livraison %s --source %s" % (
+        return "ameesh work plan %d --delivery %s --source %s" % (
             p["lot"], p["due"], shlex.quote(p["source_label"]))
     parts = ["ameesh", "plan", "add", shlex.quote(p["what"])]
     if p.get("due"):
-        parts += ["--pour", p["due"]]
+        parts += ["--due", p["due"]]
     if p["kind"] == "decision":
         parts.append("--decision")
     if p.get("lot"):
         parts += ["--lot", str(p["lot"])]
     if p.get("project"):
-        parts += ["--projet", shlex.quote(p["project"])]
+        parts += ["--project", shlex.quote(p["project"])]
     parts += ["--source-type", p["source_kind"], "--source", shlex.quote(p["source_ref"] or "")]
     for dep in p.get("depends_on") or ():
-        parts += ["--depend-de", dep]
+        parts += ["--depends-on", dep]
     return " ".join(parts)
 
 
@@ -346,7 +346,7 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
         print("    source: %s" % (p["source_ref"] or p["source_label"]))
         print("    to accept: %s" % (
             "ameesh plan accept %d%s" % (p["recorded"]["id"], "" if p["due"] else
-                                         " --pour YYYY-MM-DD")
+                                         " --due YYYY-MM-DD")
             if p.get("recorded") else p["command"]))
     if not args.record and view["proposals"]:
         print("(nothing recorded: use --record to keep these proposals for review)")
