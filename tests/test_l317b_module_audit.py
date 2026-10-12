@@ -158,4 +158,3 @@ class AuditEvidenceTest(PgTestCase):
         self.assertEqual(len(sender.sent), 2)
         self.assertIn("resolved", sender.sent[-1][1].body)
         self.assertEqual(notifier.state["briefs"], {})
-
