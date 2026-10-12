@@ -2252,6 +2252,11 @@ class HostLifecycle(Domain):
     def complete_return(self, host: str, generation: int) -> bool:
         """Finish a return only when all remaining origins are home and unfenced."""
 
+    @abc.abstractmethod
+    def detect_losses(self, *, actor: str, older_than: int,
+                      critical: Sequence[str] = ()) -> list[dict]:
+        """Close stale known hosts atomically; loss is not a quiescence proof."""
+
 
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).

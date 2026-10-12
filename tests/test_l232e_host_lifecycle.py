@@ -127,3 +127,96 @@ class HostLifecycleTest(PgTestCase):
         self.assertEqual(errors, [])
         self.assertEqual(result[0]["mode"], "draining")
         self.assertEqual(self.api.hosts.latest("source")["gate_state"], "draining")
+
+    def age_source(self):
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()-interval '10 minutes' "
+                        "WHERE host='source'")
+
+    def detect_loss(self):
+        return self.api.host_lifecycle.detect_losses(actor="remote", older_than=180, critical=("dev",))
+
+    def test_loss_requires_stale_heartbeat_and_no_live_lease(self):
+        self.age_source()
+        self.assertEqual(self.detect_loss(), [])
+        registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
+        found = self.detect_loss()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["mode"], "lost")
+        self.assertIsNone(registry.claim(self.db, "dev", "new", ttl_seconds=300))
+        self.assertEqual(self.detect_loss(), [])
+        self.assertEqual(self.api.host_lifecycle.agents("source", found[0]["generation"])[0]["critical"], True)
+
+    def test_fresh_or_unobserved_host_is_not_lost(self):
+        registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
+        self.assertEqual(self.detect_loss(), [])
+        self.db.execute("DELETE FROM host_resources WHERE host='source'")
+        self.assertEqual(self.detect_loss(), [])
+        self.assertIsNone(self.api.host_lifecycle.get("source"))
+
+    def test_loss_does_not_claim_quiescence_or_change_an_expired_running_turn(self):
+        self.assertTrue(registry.begin_turn(self.db, "dev", "runner", self.lease["lease_epoch"], "active"))
+        self.age_source()
+        self.db.execute("UPDATE agent_registry SET lease_expires_at=clock_timestamp()-interval '1 second' "
+                        "WHERE name='dev'")
+        before = registry.get(self.db, "dev")
+        self.assertEqual(self.detect_loss()[0]["mode"], "lost")
+        after = registry.get(self.db, "dev")
+        for key in ("status", "lease_owner", "lease_epoch", "lease_expires_ts", "handoff_fenced", "host"):
+            self.assertEqual(after[key], before[key])
+        self.assertIsNone(self.api.handoffs.active("dev"))
+        self.assertIsNone(registry.claim(self.db, "dev", "remote", ttl_seconds=300))
+
+    def test_returning_heartbeat_does_not_reopen_lost_host(self):
+        self.age_source()
+        registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
+        found = self.detect_loss()[0]
+        self.api.hosts.record({"host": "source", "gate_state": "available"})
+        self.assertEqual(self.api.hosts.latest("source")["gate_state"], "draining")
+        self.assertEqual(self.api.host_lifecycle.get("source"), found)
+        self.assertIsNone(registry.claim(self.db, "dev", "old", ttl_seconds=300))
+        with self.assertRaisesRegex(ValueError, "verified recovery"):
+            self.api.host_lifecycle.undrain("source", actor="orch")
+        self.assertEqual(self.api.host_lifecycle.get("source"), found)
+
+    def test_loss_preserves_drain_origins_and_cancels_automatic_return(self):
+        first = self.drain()
+        self.age_source()
+        registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
+        found = self.detect_loss()[0]
+        self.assertEqual(found["generation"], first["generation"])
+        self.assertIsNone(found["return_ts"])
+        self.assertEqual(len(self.api.host_lifecycle.agents("source", first["generation"])), 1)
+        self.assertEqual(self.api.host_lifecycle.expire_returns(), [])
+
+    def test_loss_rechecks_heartbeat_after_waiting_for_gate_lock(self):
+        self.age_source()
+        registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
+        started = threading.Event()
+        result, errors = [], []
+
+        def detect():
+            other = db_mod.connect(self.cfg)
+            try:
+                started.set()
+                result.extend(storage.of(other).host_lifecycle.detect_losses(actor="remote", older_than=180))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=detect, daemon=True)
+        try:
+            with self.db.transaction() as tx:
+                tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("host-gate:source",))
+                thread.start()
+                self.assertTrue(started.wait(5))
+                thread.join(0.1)
+                self.assertTrue(thread.is_alive())
+                storage.of(tx).hosts.record({"host": "source", "gate_state": "available"})
+        finally:
+            if thread.ident is not None:
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [])
+        self.assertIsNone(self.api.host_lifecycle.get("source"))

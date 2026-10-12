@@ -4818,6 +4818,9 @@ class Runner:
         from . import handoffs, host_lifecycle
         try:
             api = storage.of(db).host_lifecycle
+            api.detect_losses(actor=self.runner_id,
+                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+                              critical=host_lifecycle.critical_names(self.cfg, db))
             api.expire_returns()
             for control in api.listing():
                 if control["mode"] in ("draining", "returning"):

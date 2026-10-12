@@ -116,3 +116,30 @@ L232a is tested with simulated adapters and local Git repositories. It does
 not install a real host adapter, enable production agents, copy secrets,
 perform root operations or authorise spending. L232b/c and provider login
 readiness supply those separate integrations.
+
+## L232e lifecycle checkpoint
+
+`ameesh host drain HOST [--for 8h]` closes new claims, turns and prompt
+consumption while preserving the current turn and lease. The persistent
+request takes precedence over later resource readings that say `available`.
+The controller considers critical agents first, checks receiving-host
+readiness and uses a handoff at a turn boundary. `ameesh host undrain HOST`
+requests their return; an elapsed `--for` duration makes the same request.
+Missing helper, secret requirements and host-scoped logins remain named
+refusals. These paths currently use simulated adapters.
+
+The runner detects a known host as `lost` after its latest resource sample
+is older than the larger of 180 seconds and three resource intervals, and
+none of its executing agents has a live lease. It rechecks both facts after
+locking the host gate and agent rows. An unobserved host is not classified
+as lost. An existing drain retains its generation and agent origins, but
+its automatic return timer is removed. A new heartbeat does not reopen
+claims on a lost host.
+`undrain` also refuses a lost host until verified recovery is implemented;
+the planned-return path cannot bypass the recovery proof.
+
+Detection preserves agent placement, expired leases and running-turn state;
+it is not proof that an executor has stopped. Automatic loss recovery is
+still pending: before enabling another executor it requires independent
+source fencing/quiescence and a verified published checkpoint. Heartbeat
+absence alone must never enable a second executor.

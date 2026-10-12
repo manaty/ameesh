@@ -12,6 +12,54 @@ _ROW = ("host, mode, generation, actor, "
 
 
 class HostLifecycle(interface.HostLifecycle):
+    def detect_losses(self, *, actor, older_than, critical=()):
+        if isinstance(older_than, bool) or not isinstance(older_than, int) or older_than < 60:
+            raise ValueError("loss threshold must be at least 60 seconds")
+        # Only hosts with an observed heartbeat qualify. Missing inventory
+        # and a fresh runner lease are not evidence of a lost machine.
+        candidates = self.db.query(
+            "SELECT host FROM host_resources GROUP BY host "
+            "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s) "
+            "ORDER BY host", (older_than,))
+        changed = []
+        for candidate in candidates:
+            host = candidate["host"]
+            with self.db.transaction() as tx:
+                Hosts._lock_gate(tx, host)
+                agents = tx.query("SELECT name FROM agent_registry WHERE host=%s "
+                                  "AND mode='execute' ORDER BY name FOR UPDATE", (host,))
+                old = HostLifecycle(tx).get(host)
+                if not agents or (old and old["mode"] == "lost"):
+                    continue
+                # Re-read after the gate/agent locks: a heartbeat or renewal
+                # may have committed while this detector was waiting.
+                stale = tx.query(
+                    "SELECT host FROM host_resources WHERE host=%s GROUP BY host "
+                    "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s) "
+                    "AND NOT EXISTS (SELECT 1 FROM agent_registry r WHERE r.host=%s "
+                    "AND r.mode='execute' AND r.lease_expires_at>clock_timestamp())",
+                    (host, older_than, host))
+                if not stale:
+                    continue
+                if old and old["mode"] == "draining":
+                    row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,return_at=NULL, "
+                                   "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
+                                   (actor, host))[0]
+                else:
+                    row = tx.query(
+                        "INSERT INTO host_lifecycle(host,mode,actor) VALUES (%s,'lost',%s) "
+                        "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
+                        "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
+                        "return_at=NULL,updated_at=clock_timestamp() RETURNING " + _ROW,
+                        (host, actor))[0]
+                for agent in agents:
+                    tx.execute("INSERT INTO host_lifecycle_agents(host,generation,agent,critical) "
+                               "VALUES (%s,%s,%s,%s) ON CONFLICT(host,generation,agent) "
+                               "DO UPDATE SET critical=host_lifecycle_agents.critical OR excluded.critical",
+                               (host, row["generation"], agent["name"], agent["name"] in critical))
+                changed.append(row)
+        return changed
+
     def get(self, host):
         rows = self.db.query("SELECT " + _ROW + " FROM host_lifecycle WHERE host=%s", (host,))
         return rows[0] if rows else None
@@ -48,9 +96,12 @@ class HostLifecycle(interface.HostLifecycle):
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             tx.query("SELECT name FROM agent_registry WHERE host=%s ORDER BY name FOR UPDATE", (host,))
+            old = HostLifecycle(tx).get(host)
+            if old and old["mode"] == "lost":
+                raise ValueError("lost host requires verified recovery before return")
             rows = tx.query("UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
                             "updated_at=clock_timestamp() WHERE host=%s "
-                            "AND mode IN ('draining','lost') RETURNING " + _ROW, (actor, host))
+                            "AND mode='draining' RETURNING " + _ROW, (actor, host))
             return rows[0] if rows else HostLifecycle(tx).get(host)
 
     def agents(self, host, generation):
