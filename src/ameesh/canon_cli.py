@@ -407,7 +407,6 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
         print("%s  %-16s %-14s %s" % (tag, action.agent,
                                       ACTION_LABELS.get(action.action, action.action),
                                       action.detail))
-
         for reason in action.blocked:
             print("%s  %-16s   blocked by %s" % (tag, "", reason))
     refused = [a.agent for a in report.actions

@@ -413,6 +413,10 @@ class WorkItems(interface.WorkItems):
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
 
+    def lock_deep_analysis(self, item_id) -> None:
+        self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
+                      ("ameesh_deep_analysis:%d:" % int(item_id),))
+
     def waiting_episodes(self, item_ids) -> dict:
         ids = [int(i) for i in item_ids]
         if not ids:
@@ -447,6 +451,19 @@ class WorkItems(interface.WorkItems):
              ORDER BY id DESC LIMIT %s
             """,
             (int(item_id), int(limit)),
+        )
+
+    def events_noted(self, prefix, since_ts) -> list[dict]:
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return self.db.query(
+            """
+            SELECT id, work_item_id, state, note, actor,
+                   extract(epoch from created_at)::float8 as created_ts
+              FROM work_item_events
+             WHERE note LIKE %s AND created_at >= to_timestamp(%s)
+             ORDER BY id
+            """,
+            (pattern, float(since_ts)),
         )
 
     def milestones(self, item_id, limit) -> list[dict]:

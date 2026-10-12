@@ -56,6 +56,7 @@ def send(
     allow_structured: bool = False,
     thread: bool = True,
     thread_meta: dict | None = None,
+    after_commit: list | None = None,
 ) -> int:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
@@ -65,7 +66,10 @@ def send(
 
     `allow_structured` lève le refus des corps illisibles (tests et outils
     seulement). `thread=False` laisse l'écriture du fil à l'appelant (envoi à
-    « all » regroupé en une entrée, import déjà écrit). Projet du fil : celui
+    « all » regroupé en une entrée, import déjà écrit). `after_commit` (une
+    liste) : l'écriture du fil y est ajoutée, à appeler par l'appelant après
+    le commit de sa transaction — un envoi annulé n'en laisse aucune trace
+    dans le fil externe. Projet du fil : celui
     de l'expéditeur, sinon du destinataire — son équipe (`team`) s'il est
     gouverné par le canon, sinon son chantier —, sinon AMEESH_PROJECT, sinon
     `default` ; lot : `work_item_id`.
@@ -84,12 +88,18 @@ def send(
         if kind != "notify":
             meta["kind"] = kind
         meta.update(thread_meta or {})
-        fil.record(
-            db.cfg, db, sender=sender, recipients=[recipient], text=body,
-            ts=row.get("created_ts"),
-            project=fil.project_for(db.cfg, row.get("sender_project"),
-                                    row.get("recipient_project")),
-            lot=work_item_id, mailbox_ids=[message_id], meta=meta)
+
+        def record(cfg=db.cfg, target=db) -> None:
+            fil.record(
+                cfg, target, sender=sender, recipients=[recipient], text=body,
+                ts=row.get("created_ts"),
+                project=fil.project_for(cfg, row.get("sender_project"),
+                                        row.get("recipient_project")),
+                lot=work_item_id, mailbox_ids=[message_id], meta=meta)
+        if after_commit is not None:
+            after_commit.append(record)
+        else:
+            record()
     return message_id
 
 
