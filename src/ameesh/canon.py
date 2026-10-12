@@ -1607,14 +1607,32 @@ class Naming:
         return {"org": self.org, "projects": dict(self.projects),
                 "roles": dict(self.roles)}
 
-    def project_segment(self, project: str, known: Iterable[str] = ()) -> str:
+    def segment(self, project: str) -> str | None:
+        """Segment que CE nommage donne à `project`, sans refus.
+
+        Le nom court déclaré, sinon la troncature à 6 caractères si c'est un
+        segment, sinon None. Sert à décrire les dépôts d'un AUTRE canon avec
+        SES segments (codex r2, #452) : comparer les noms de dépôts ferait
+        rater `otherrepo: catalo` face à `catalogue`, ou refuser à tort
+        `catalogapi: capi`."""
+        declared = self.projects.get(project)
+        if declared:
+            return declared
+        short = str(project)[:6]
+        return short if NAMING_SEGMENT_RE.match(short) else None
+
+    def project_segment(self, project: str,
+                        known: Mapping[str, str] | None = None) -> str:
         """Segment d'un projet : le nom court déclaré, sinon le nom tronqué à 6.
 
         Une troncature qui rejoindrait le segment d'un AUTRE dépôt connu est
         refusée (deux dépôts ne partagent jamais un segment), avec la clé
-        `naming.projects.<dépôt>` à déclarer. `known` : les noms de dépôts
-        connus du mesh mais absents de `naming.projects` (fiches, demande) —
-        sans eux, deux dépôts non déclarés tronqués pareil passeraient."""
+        `naming.projects.<dépôt>` à déclarer. `known` : les dépôts connus du
+        mesh (fiches, demande, `naming.projects` des autres canons) et le
+        segment que LEUR nommage leur donne — un mapping dépôt → segment. On
+        compare les segments engendrés, jamais les noms de dépôts (codex r2,
+        #452) : le canon B peut déclarer `otherrepo: catalo` (même segment que
+        `catalogue`, refusé) ou `catalogapi: capi` (aucun rapport)."""
         declared = self.projects.get(project)
         if declared:
             return declared
@@ -1623,13 +1641,14 @@ class Naming:
             raise NamingError(
                 "project %r has no usable short name (%r): declare "
                 "naming.projects.%s in the federation" % (project, short, project))
-        others = {str(key) for key in known} | set(self.projects)
-        others.discard(project)
-        clash = sorted(key for key in others
-                       if (self.projects.get(key) or str(key)[:6]) == short)
+        others = dict(known or {})
+        for key, segment in self.projects.items():
+            others.setdefault(str(key), segment)
+        others.pop(project, None)
+        clash = sorted(key for key, segment in others.items() if segment == short)
         if clash:
             raise NamingError(
-                "project %r: the 6-character name %r is already the short name of %s: "
+                "project %r: the 6-character name %r is already the segment of %s: "
                 "declare naming.projects.%s in the federation"
                 % (project, short, ", ".join(clash), project))
         return short
@@ -1643,7 +1662,7 @@ class Naming:
         return declared
 
     def prefix(self, role: str, projects: Iterable[str],
-               known: Iterable[str] = ()) -> str:
+               known: Mapping[str, str] | None = None) -> str:
         """Préfixe du nom : `<org>-<repo>-<role>-` (un projet) ou
         `<org>-<role>-` (plusieurs : le segment de dépôt disparaît)."""
         projects = list(projects)
@@ -1659,13 +1678,14 @@ class Naming:
         return "-".join(parts) + "-"
 
     def next_name(self, role: str, projects: Iterable[str], taken: Iterable[str],
-                  known: Iterable[str] = ()) -> str:
+                  known: Mapping[str, str] | None = None) -> str:
         """Premier numéro libre pour ce préfixe, sur deux chiffres (`01`).
 
         `taken` : tous les noms déjà pris (fiches, registre — agents arrêtés
         compris — et alias de #423) : un numéro déjà attribué n'est jamais
         réutilisé tant que le nom reste réservé. `known` : les dépôts connus
-        hors `naming.projects`, pour refuser une troncature ambiguë."""
+        hors `naming.projects` et le segment que leur nommage leur donne
+        (mapping dépôt → segment), pour refuser une troncature ambiguë."""
         prefix = self.prefix(role, projects, known)
         used = set()
         for name in taken:
@@ -1738,22 +1758,45 @@ def parse_naming(value: Any) -> tuple[Naming | None, str | None]:
     return Naming(org=org, projects=out["projects"], roles=out["roles"]), None
 
 
-def known_projects(canons: Iterable, requested: Iterable[str] = ()) -> set:
-    """Noms de dépôts connus (L243, #468), hors `naming.projects` déclaré.
+def _segment_of(naming: "Naming | None", project: str) -> str | None:
+    """Segment d'un dépôt sous un nommage (sans nommage : la troncature à 6)."""
+    if naming is not None:
+        return naming.segment(project)
+    short = str(project)[:6]
+    return short if NAMING_SEGMENT_RE.match(short) else None
 
-    Ceux de la demande, puis ceux des fiches de chaque canon (`projects:`,
-    L243/#435 ; `team` sinon). `Naming.project_segment` s'en sert pour refuser
-    une troncature à 6 caractères que deux dépôts non déclarés partageraient :
-    sans cette liste, `catalogue` et `catalogapi` donneraient le même segment
-    `catalo` sans que rien ne le dise."""
-    known = {str(project) for project in requested if isinstance(project, str)}
+
+def known_projects(canons: Iterable, requested: Iterable[str] = (),
+                   naming: "Naming | None" = None) -> dict:
+    """Dépôts connus du mesh et le segment qu'ils portent (L243, #468).
+
+    Un mapping dépôt → segment, chacun calculé par le nommage qui le
+    GOUVERNE : `naming` (celui qui engendre le nom) pour la demande, le
+    nommage de chaque canon pour ses `naming.projects` et les `projects:` de
+    ses fiches (`team` sinon). `Naming.project_segment` compare ces segments —
+    jamais les noms de dépôts, qui peuvent se ressembler sans collision
+    (`catalogue` / `catalogapi`) ou se distinguer avec le même segment
+    (`catalogue` / `otherrepo: catalo`) : codex r2, #452."""
+    known: dict[str, str] = {}
+    for project in requested:
+        if not isinstance(project, str) or project in known:
+            continue
+        segment = _segment_of(naming, project)
+        if segment:
+            known[project] = segment
     for canon in canons:
-        naming = getattr(canon, "naming", None)
-        if naming is not None:
-            known.update(str(key) for key in naming.projects)
+        canon_naming = getattr(canon, "naming", None)
+        if canon_naming is not None:
+            for key, segment in canon_naming.projects.items():
+                if isinstance(key, str):
+                    known.setdefault(key, segment)
         for agent in getattr(canon, "agents", ()) or ():
-            known.update(project for project in agent.effective_projects
-                         if isinstance(project, str))
+            for project in agent.effective_projects:
+                if not isinstance(project, str) or project in known:
+                    continue
+                segment = _segment_of(canon_naming, project)
+                if segment:
+                    known[project] = segment
     return known
 
 

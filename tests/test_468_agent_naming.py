@@ -12,11 +12,13 @@ one. `canon agent spawn` uses the same generator when no name is given.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 
 from ameesh import canon, registry
 
-from .test_canon import _CanonDbCase, _TmpMixin, codes, fiche, write
+from .test_canon import (_CanonDbCase, _TmpMixin, codes, commit_all, fiche, git,
+                         publish, write)
 
 NAMING = ("extensions:\n"
           "  ameesh:\n"
@@ -220,10 +222,12 @@ class NamingGeneratorTest(unittest.TestCase):
         # sans la liste des dépôts connus, la troncature reste permise
         self.assertEqual(naming.next_name("implementer", ["catalogue"], []),
                          "mty-catalo-impl-01")
-        # connus (fiches, demande), deux dépôts qui tronquent pareil : refus
+        # connus (fiches, demande), deux dépôts qui tronquent pareil : refus ;
+        # `known` porte le segment de chaque dépôt (codex r2, #452)
         with self.assertRaises(canon.NamingError) as caught:
             naming.next_name("implementer", ["catalogue"], [],
-                             known=["catalogue", "catalogapi"])
+                             known={"catalogapi": "catalo"})
+        self.assertIn("catalogapi", str(caught.exception))
         self.assertIn("naming.projects.catalogue", str(caught.exception))
         # le nom court déclaré de l'autre dépôt lève l'ambiguïté
         declared = canon.Naming(org="mty", projects={"catalogapi": "capi"},
@@ -393,6 +397,61 @@ class NamingCliTest(_CanonDbCase):
                          "implementer", "--project", "acme-web", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.strip(), "mty-amh-impl-02")
+
+    def test_canon_dir_reads_the_configured_revision(self):
+        """Codex r2 (#452, P2) : `--canon DOSSIER` perdait la révision configurée.
+
+        B est configuré sur `origin/stable`, qui réserve `mty-amh-impl-01` ;
+        `origin/main`, la révision que lit un dossier nu, ne le connaît pas.
+        Dédupliquer les canons par dossier seul perdait cette réservation."""
+        workspace = self.make_tmp()
+        _bare_a, clone_a = publish(workspace, "a", None)
+        _bare_b, clone_b = publish(workspace, "b", None)
+        write(clone_b, "federation.yaml",
+              "id: acme-other\nroot: acme\nmembers: []\n" + NAMING)
+        commit_all(clone_b)                     # origin/main : le nommage, sans la fiche
+        git(clone_b, "checkout", "-q", "-b", "stable")
+        write(clone_b, "agents/mty-amh-impl-01.md", card("mty-amh-impl-01"))
+        commit_all(clone_b)                     # origin/stable : + la réservation
+        git(clone_b, "checkout", "-q", "main")
+        config = os.path.join(workspace, "config.json")
+        with open(config, "w", encoding="utf-8") as fh:
+            json.dump({"canons": [
+                {"path": clone_a, "untrusted": True},
+                {"path": clone_b, "ref": "origin/stable", "untrusted": True}]}, fh)
+        proc = self.mesh("agent", "name", "--canon", clone_b, "--role", "implementer",
+                         "--project", "acme-web", env=self.env(AMEESH_CONFIG=config))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "mty-amh-impl-02")
+
+    def test_another_canons_declared_segment_counts(self):
+        """Codex r2 (#452, P2) : comparer les SEGMENTS des autres canons, pas
+        leurs noms de dépôts."""
+        self.naming()
+        other = self.example_copy()
+        write(other, "federation.yaml",
+              "id: acme-other\nroot: acme\nmembers: []\n"
+              "extensions:\n  ameesh:\n    naming:\n      org: oth\n"
+              "      projects:\n        otherrepo: catalo\n")
+        env = self.cli_env(AMEESH_CANONS="%s:%s" % (self.root, other))
+        # B donne `catalo` à `otherrepo` : le `catalogue` non déclaré de A
+        # porterait le segment d'un AUTRE dépôt -> refus, même si les noms
+        # ne se ressemblent pas
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "catalogue", env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("otherrepo", proc.stderr)
+        self.assertIn("naming.projects.catalogue", proc.stderr)
+        # B donne `capi` à `catalogapi` : aucun segment commun avec le
+        # `catalo` de `catalogue`, malgré des noms qui se ressemblent
+        write(other, "federation.yaml",
+              "id: acme-other\nroot: acme\nmembers: []\n"
+              "extensions:\n  ameesh:\n    naming:\n      org: oth\n"
+              "      projects:\n        catalogapi: capi\n")
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "catalogue", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "mty-catalo-impl-01")
 
     def test_truncation_clash_with_a_card_project_is_refused(self):
         """Codex r1 (#452, P2) : deux dépôts non déclarés, même troncature."""

@@ -619,6 +619,18 @@ def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
     return 1
 
 
+def _canon_read_key(canon: canon_mod.Canon) -> tuple:
+    """(dossier réel, révision lue) : la clé de déduplication d'un canon (L243, #468).
+
+    Deux lectures du MÊME dossier à deux révisions ne sont pas le même canon :
+    `--canon DOSSIER` lit la révision par défaut, mais un canon configuré sur
+    `origin/stable` réserve des noms que `origin/main` ignore. Dédupliquer sur
+    le seul dossier perdait ces réservations (codex r2, #452)."""
+    source = canon.sources[0] if canon.sources else None
+    return (os.path.realpath(canon.root),
+            (source.commit or source.rev) if source is not None else "")
+
+
 def _configured_canons(cfg: Config, args: argparse.Namespace) -> list[canon_mod.Canon]:
     """Tous les canons configurés, le canon par défaut d'abord.
 
@@ -626,7 +638,9 @@ def _configured_canons(cfg: Config, args: argparse.Namespace) -> list[canon_mod.
     noms déjà pris se lisent partout ; `--canon` ne choisit que le nommage
     qui s'applique (voir `_naming_canon`). Un `--canon DOSSIER` n'est donc pas
     le SEUL canon lu : les canons configurés restent lus pour leurs
-    réservations (sinon le générateur rendrait un nom déjà déclaré ailleurs)."""
+    réservations (sinon le générateur rendrait un nom déjà déclaré ailleurs).
+    La déduplication se fait sur (dossier, révision) : un dossier configuré à
+    deux révisions est lu deux fois, chacune pour ses réservations."""
     if getattr(args, "ref", None):
         cfg = dataclasses.replace(cfg, canon_ref=args.ref)
     fetch = bool(getattr(args, "fetch", False))
@@ -637,12 +651,12 @@ def _configured_canons(cfg: Config, args: argparse.Namespace) -> list[canon_mod.
         if not entries:
             return [chosen]
         merged = [chosen]
-        seen = {os.path.realpath(chosen.root)}
+        seen = {_canon_read_key(chosen)}
         for canon in canon_mod.from_config_all(cfg, fetch=fetch):
-            root = os.path.realpath(canon.root)
-            if root in seen:                # `--canon` désigne un canon configuré
+            key = _canon_read_key(canon)
+            if key in seen:                 # même dossier, même révision que `--canon`
                 continue
-            seen.add(root)
+            seen.add(key)
             merged.append(canon)
         return merged
     if len(entries) <= 1:
@@ -680,7 +694,7 @@ def _generated_name(naming, role: str | None, projects, canons: list, db) -> str
             "roles in its federation.yaml")
     if not role:
         raise canon_mod.NamingError("--role is required to generate a name")
-    known = canon_mod.known_projects(canons, projects or [])
+    known = canon_mod.known_projects(canons, projects or [], naming)
     return naming.next_name(role, projects or [], _taken_agent_names(canons, db), known)
 
 
