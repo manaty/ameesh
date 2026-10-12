@@ -65,7 +65,9 @@ def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
     """The time each reading stands for, cut by day: (day, row, held,
     window) seconds — `held`, its state up to the next reading; `window`,
     its averages (`guest_cpu`) over the window before it, at most the gap
-    to the previous reading (the earlier time is that reading's)."""
+    to the previous reading (the earlier time is that reading's). A window
+    longer than `MAX_GAP_S` — as measured, before that cap, or else the gap
+    itself — spans a hole in the measure: it counts for nothing."""
     out = []
     for i, row in enumerate(readings):
         ts = float(row["sampled_ts"])
@@ -76,10 +78,12 @@ def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
         window = row.get("cpu_window_s")
         before = ts - float(readings[i - 1]["sampled_ts"]) if i else None
         if window is None:
-            window = before if before is not None and before <= MAX_GAP_S else 0.0
-        elif before is not None:
-            window = min(float(window), before)
-        window = min(max(float(window), 0.0), MAX_GAP_S)
+            window = before if before is not None else 0.0
+        window = float(window)
+        if window > MAX_GAP_S:
+            continue
+        if before is not None:
+            window = min(window, before)
         if window > 0:
             out += [(day, row, 0.0, secs) for day, secs in _by_day(ts - window, ts)]
     return out
@@ -102,13 +106,18 @@ def _episode_starts(readings: list[dict], limits: dict) -> list[dict]:
     return out
 
 
+def _pressure_s(intervals, limits: dict) -> float:
+    """The seconds held by readings that block new turns, unrounded."""
+    return sum(held for _day_, row, held, _window in intervals
+               if held and resources.pressure(row, limits=limits)["blocked"])
+
+
 def _summary(readings: list[dict], intervals, episodes: int, limits: dict) -> dict:
-    pressure_s = turns_s = guest_cpu_s = measured_s = 0.0
+    turns_s = guest_cpu_s = measured_s = 0.0
+    pressure_s = _pressure_s(intervals, limits)
     for _day_, row, held, window in intervals:
         if held:
             measured_s += held
-            if resources.pressure(row, limits=limits)["blocked"]:
-                pressure_s += held
             turns_s += (row.get("turns_in_progress") or 0) * held
         guest_cpu_s += (row.get("guest_cpu") or 0.0) * window
     cpus = [r.get("cpu_count") for r in readings if r.get("cpu_count")]
@@ -121,6 +130,7 @@ def _summary(readings: list[dict], intervals, episodes: int, limits: dict) -> di
         "samples": len(readings),
         "measured_s": round(measured_s, 1),
         "pressure_min": round(pressure_s / 60.0, 1),
+        "pressure_s": round(pressure_s, 3),
         "critical_episodes": episodes,
         "cpu_count": max(cpus) if cpus else None,
         "load_p95": _round(percentile(values("load1"), 0.95)),
@@ -175,10 +185,14 @@ def report(host: str, readings: list[dict], limits: dict, *, days: float) -> dic
         checks.append({"key": key, "value": value, "target": target,
                        "ok": None if value is None else ok})
 
-    # the target holds for each day, not on average: the worst measured day
-    worst = max((d["pressure_min"] for d in by_day if d["measured_s"] > 0), default=None)
-    check("pressure_min_per_day", worst, TARGET_PRESSURE_MIN_PER_DAY,
-          worst is not None and worst < TARGET_PRESSURE_MIN_PER_DAY)
+    # the target holds for each day, not on average: the worst measured day,
+    # judged on its unrounded seconds (599.9 s shows 10.0 min yet meets the
+    # target)
+    worst = max((_pressure_s(daily[d["day"]]["intervals"], limits)
+                 for d in by_day if d["measured_s"] > 0), default=None)
+    check("pressure_min_per_day", None if worst is None else round(worst / 60.0, 1),
+          TARGET_PRESSURE_MIN_PER_DAY,
+          worst is not None and worst < TARGET_PRESSURE_MIN_PER_DAY * 60.0)
     load_target = TARGET_LOAD_P95_PER_CPU * cpus if cpus else None
     check("load_p95", total["load_p95"], load_target,
           load_target is not None and total["load_p95"] is not None
@@ -225,7 +239,7 @@ def format_report(rep: dict) -> list[str]:
             "—" if day["tmpfs_max"] is None else "%d %%" % round(day["tmpfs_max"] * 100),
             num(day["psi_cpu_p95"]), num(day["psi_mem_p95"]),
             num(day["turn_hours"], "%.2f"), num(day["guest_cpu_hours"], "%.2f")))
-    out.append("  lendable   CPU min %s ; memory min %s, median %s" % (
+    out.append("  lendable   CPU min %s; memory min %s, median %s" % (
         num(total["lendable_cpu_min"], "%.2f"), _fmt_bytes(total["lendable_memory_min"]),
         _fmt_bytes(total["lendable_memory_median"])))
     for c in rep["checks"]:

@@ -207,17 +207,17 @@ class RoutageTest(unittest.TestCase):
         f = {"test": "tests.test_a.T.test_ko", "part": "psql 1/1", "status": "echec",
              "excerpt": "\n".join("l%d" % i for i in range(60)), "replay": "python -m unittest x"}
         texte = ci.failure_text(run, lot, [f], first=True)
-        self.assertIn("premier échec", texte)
-        self.assertIn("rejouer : python -m unittest x", texte)
-        self.assertIn("(20 ligne(s) de plus)", texte)
+        self.assertIn("first failure", texte)
+        self.assertIn("replay: python -m unittest x", texte)
+        self.assertIn("(20 more line(s))", texte)
         self.assertIn("gh pr checks --watch", texte)
         self.assertNotIn("l45", texte)
         self.assertIsNone(__import__("ameesh.fil", fromlist=["x"]).unreadable_reason(texte))
-        self.assertIn("verte.", ci.verdict_text(run, lot, "success", []))
+        self.assertIn("green.", ci.verdict_text(run, lot, "success", []))
         herite = ci.verdict_text(run, lot, "failure", [dict(f, inherited=True)])
-        self.assertIn("rien ne t'est imputé", herite)
+        self.assertIn("nothing is charged to you", herite)
         rouge = ci.verdict_text(run, lot, "failure", [f, dict(f, test="t2", inherited=True)])
-        self.assertIn("rouge, 1 échec(s), et 1 hérité(s)", rouge)
+        self.assertIn("red, 1 failure(s), and 1 inherited from the base", rouge)
 
 
 # --------------------------------------------------------------------------
@@ -314,7 +314,7 @@ class WatcherTest(PgTestCase):
         mails = self.mails("dev-a")
         self.assertEqual(len(mails), 3)
         verdict = mails[-1]
-        self.assertIn("rouge, 2 échec(s)", verdict["body"])
+        self.assertIn("red, 2 failure(s)", verdict["body"])
         self.assertFalse(mail.is_urgent(verdict))
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 201)["status"], "failure")
         # ameesh ci status
@@ -322,7 +322,7 @@ class WatcherTest(PgTestCase):
         self.assertEqual(report["runs"][0]["status"], "failure")
         self.assertEqual(len(report["runs"][0]["failures"]), 2)
         texte = "\n".join(ci.render_status(report))
-        self.assertIn("rouge  2 échec(s)", texte)
+        self.assertIn("red  2 failure(s)", texte)
 
     def test_vert_sans_echec(self):
         self.api.live = [run_view(202, "d" * 40, "lot/1-un")]
@@ -330,7 +330,7 @@ class WatcherTest(PgTestCase):
         self.api.live, self.api.done[202] = [], {"status": "completed", "conclusion": "success"}
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["status"], o["to"]) for o in out], [("success", "dev-a")])
-        self.assertIn(": verte.", self.mails("dev-a")[0]["body"])
+        self.assertIn(": green.", self.mails("dev-a")[0]["body"])
 
     def test_annulee_sans_message(self):
         self.api.live = [run_view(203, "e" * 40, "lot/1-un")]
@@ -368,7 +368,7 @@ class WatcherTest(PgTestCase):
         self.api.live, self.api.done[301] = [], {"status": "completed", "conclusion": "failure"}
         self.watcher.tick(self.db)
         (verdict,) = self.mails("dev-a")
-        self.assertIn("rien ne t'est imputé", verdict["body"])
+        self.assertIn("nothing is charged to you", verdict["body"])
         # main repasse au vert : plus d'alerte
         self.api.live = [run_view(302, "2" * 40, "main")]
         self.watcher.tick(self.db)
@@ -465,15 +465,15 @@ class WatcherTest(PgTestCase):
         (m,) = self.mails("dev-a")
         self.assertFalse(mail.is_urgent(m))
         self.assertEqual(mail.passive_reason(m), "ci_passif")
-        self.assertIn("peut-être hérités", m["body"])
-        self.assertIn("premier échec", m["body"])
+        self.assertIn("may be inherited", m["body"])
+        self.assertIn("first failure", m["body"])
         self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 431)["urgent_message_id"])
         # le suivant n'est plus « premier », et toujours sans urgent
         self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=431),
                                            ev_test("tests.test_b.T.test_2", execution=431)])]
         out = self.watcher.tick(self.db)
         self.assertEqual([o["urgent"] for o in out], [False])
-        self.assertIn("échec suivant", self.mails("dev-a")[-1]["body"])
+        self.assertIn("next failure", self.mails("dev-a")[-1]["body"])
 
     def test_retrait_reserve_au_courrier_de_ci(self):
         # relecture (5) : withdraw ne touche qu'un message de CI d'ameesh

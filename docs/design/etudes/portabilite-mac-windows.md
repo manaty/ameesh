@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "Study — ameesh on Linux, macOS and Windows"
-description: "What fails, or works without protecting, outside Linux; why stay in Python rather than rewrite in Rust; an ameesh.plateforme layer that refuses when a guarantee is missing; lots L63–L69."
+description: "What fails, or works without protecting, outside Linux; why stay in Python rather than rewrite in Rust; an ameesh.plateforme layer that refuses when a guarantee is missing; the owner's answers of 2026-10-12 (WSL2 first, psutil required, no bypass for secret files and open sessions, remote database, uv tool install, no Rust); lots L63–L69."
 status: draft
 tags: [portabilite, macos, windows, plateforme, psutil, securite, rust]
 generated: { by: "claude3/claude-opus-5-5", at: "2026-10-10T18:00:00+02:00" }
@@ -11,6 +11,7 @@ sources:
   - { resource: "decisions/0028-ressources-des-hotes-et-repartition.md", title: "Decision 0028 (host resources)" }
   - { resource: "../../src/ameesh/migrations/0036_corrections_de_relecture.sql", title: "Migration 0036 (pid_start)" }
   - { resource: "../../.github/workflows/tests.yml", title: "CI" }
+  - { resource: "ameesh decisions #9411-#9417", title: "Owner answers to questions 1-6, 2026-10-12 (#9416 signed)" }
 ---
 
 # Need
@@ -224,22 +225,45 @@ supported and that Windows goes through WSL2.
 
 # Questions for the owner
 
+Questions 1 to 6 were put to the owner through `ameesh decide ask` on
+2026-10-12 (decisions #9411 to #9417) and answered the same day; the answer
+to question 5 is signed. Questions 7 to 11 were not asked: 7 lapsed when L63
+merged (`6fafe37`), and 8 to 11 belong with the Nexlink Compute work and stay
+in the [open questions](../questions-ouvertes.md).
+
 1. **Windows scope**: native Windows (L67, the biggest lot) or WSL2 only at
    first?
+   **Answer (#9411, a)**: WSL2 only at first; native Windows (L67) later.
 2. **psutil required**: accept a first required dependency, or keep it
    optional (`ameesh[plateforme]`) with the `/proc` fallback on Linux and a
    refusal elsewhere?
+   **Answer (#9412, a)**: required, so that one implementation runs on the
+   three OSes. L63 already made it a dependency (`pyproject.toml`); the
+   `/proc` fallback stays a degraded path on Linux, and no second
+   implementation is written for macOS or Windows.
 3. **`--force` outside Linux**: is a logged `--force` enough when a guarantee
    is missing, or must some (secret files, open session) have no bypass?
+   **Answer (#9413, b)**: no bypass for secret files nor for the open session;
+   a logged `--force` for the rest. L63 as merged still lets `adopt --force`
+   through when the OS cannot check that the session is closed
+   (`reprise.py`, `platform.NotAvailable`): L63b removes that bypass. The
+   `--force` that predates L63, on a session that Linux *does* see open, is
+   outside this question and stays logged as before.
 4. **Database on the workstation**: on macOS and Windows, local PostgreSQL
    (Homebrew, Docker, installer) or remote database only (the team's server)?
+   **Answer (#9414, a)**: remote database only. L65 documents no local
+   PostgreSQL on macOS; CI still installs one to run the suite.
 5. **Distribution**: is `uv tool install` enough, or is a signed executable
    needed (Apple developer account, Windows signing certificate: cost and
    holder)?
+   **Answer (#9416, a, signed)**: `uv tool install` is enough for now. L69
+   shrinks to documentation; no signing account is opened.
 6. **Rust**: confirm "not now". The Nexlink Compute study gives no reason to
    switch: Compute is in TypeScript, with no native agent. The native hook
    remains the first candidate, later.
+   **Answer (#9417, a)**: confirmed, no Rust now.
 7. **Order**: L63 before the L50–L62 lots still in flight, or after them?
+   *Lapsed: L63 is merged.*
 8. **Intended use**: the human on their own workstation, a workstation lent as
    a host through Nexlink Compute, or both? The second depends on the mediated
    runner API (ameesh v2): should it be prioritized?
@@ -251,3 +275,28 @@ supported and that Windows goes through WSL2.
 11. **Sharing with Compute**: a single lease model, the Nexlink device key as
     host identity, a single measure of resources? And who arbitrates the load
     of a workstation that is both an ameesh host and a Compute provider?
+
+# Lot plan after the answers (2026-10-12)
+
+The [proposed plan](#proposed-lot-plan) above is kept as written on
+2026-10-10. Measured since then: L63 merged (`6fafe37`); L159d and L159e
+already route host memory, swap, load and pressure through
+`ameesh.platform` (psutil, `None` for load without `os.getloadavg`); CI has a
+`platform-macos` part, limited to the platform tests without a database.
+WSL2 is a Linux: what runs on Linux runs there, except reaching the Windows
+desktop.
+
+| Lot | Content after the answers | Depends on | Estimate |
+|---|---|---|---|
+| **L63b** — no bypass for an unverifiable session (Q3) | `adopt` and `resume` refuse, even with `--force`, when `platform.NotAvailable` prevents checking that the session is closed; the message names the OS and the missing check; test on a platform without `/proc` nor psutil; check that no secret-file check (`signing`, `notify`, `harnesses`, `approve/config`) accepts a `--force` | L63 | 1 h |
+| **L64** — unmeasured resources said | the measures already go through the layer; left: `ameesh doctor` (and `ameesh show` for the host) lists the measures this OS cannot give (load, PSI, cgroup, btrfs) instead of publishing nothing silently | L63 | 1 h |
+| **L65** — macOS: services and installation | launchd units (runner, `ameesh notify`) generated by `ameesh service install`; macOS installation doc with a **remote database only** (Q4); credentials check in the Keychain (`security find-generic-password`) instead of the skip in `accounts.py` | L63 | 4 h |
+| **L66** — desktop notifications | `osascript` on macOS; under WSL2, a Windows toast through `powershell.exe` (interop), since `notify-send` reaches no Windows desktop there; `doctor --notify-test`; the native Windows toast goes with L67 | L63 | 2 h |
+| **L67** — native Windows (**deferred**, Q1) | content unchanged (locks, Job Objects, ACLs, opening without links, psql driver, services); when it starts, the secret-file ACL check has no bypass (Q3). Opened without planned dates | L63, L64 | 2 d |
+| **L68** — CI on macOS | the macOS part runs the whole suite against a PostgreSQL installed in a step (the workstation's remote-only rule does not apply to CI); `/proc` tests rewritten through the layer (`test_runner.py`, `test_l16_harnais.py`); a test that fails if a guarantee function returns empty instead of raising. No Windows part before L67 | L63 | 3 h |
+| **L69** — distribution | `uv tool install ameesh` documented for Linux, macOS and Windows through WSL2 (harness inside WSL too, see above); no packaged or signed executable for now (Q5) | L65 | 1 h 30 |
+
+No Rust lot (Q6). Order: L63b first (security), then L64, L65, L66 and L68 in
+parallel, L69 after L65; L67 waits for an owner decision to start it. Until
+L65 and L68 land, the doc says that macOS is not yet supported and that
+Windows goes through WSL2.

@@ -69,7 +69,7 @@ class Outcome:
 
     def __post_init__(self):
         if self.state not in OUTCOMES:
-            raise ConnectorError("issue inconnue du protocole : %r (%s)"
+            raise ConnectorError("outcome unknown to the protocol: %r (%s)"
                                  % (self.state, ", ".join(OUTCOMES)))
 
     @classmethod
@@ -109,10 +109,10 @@ def timeout_of(connector) -> float:
 def check(connector) -> None:
     """Refuse un objet qui ne respecte pas le protocole (avant toute écriture)."""
     if not isinstance(connector, Connector):
-        raise ConnectorError("objet %r : pas un connecteur (name, dedupe, classify, execute, "
+        raise ConnectorError("object %r: not a connector (name, dedupe, classify, execute, "
                              "reconcile)" % (connector,))
     if getattr(connector, "dedupe", None) not in DEDUPE:
-        raise ConnectorError("connecteur %s : dedupe %r (guaranteed ou none)"
+        raise ConnectorError("connector %s: dedupe %r (guaranteed or none)"
                              % (getattr(connector, "name", "?"), getattr(connector, "dedupe", None)))
 
 
@@ -127,4 +127,4 @@ def get(name: str, **options) -> Connector:
     if name == "git-merge":
         from .git_merge import GitMergeConnector
         return GitMergeConnector(**options)
-    raise ConnectorError("connecteur inconnu : %r (connus : %s)" % (name, ", ".join(NAMES)))
+    raise ConnectorError("unknown connector: %r (known: %s)" % (name, ", ".join(NAMES)))

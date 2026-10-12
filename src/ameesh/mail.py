@@ -56,6 +56,7 @@ def send(
     allow_structured: bool = False,
     thread: bool = True,
     thread_meta: dict | None = None,
+    after_commit: list | None = None,
 ) -> int:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
@@ -65,7 +66,10 @@ def send(
 
     `allow_structured` lève le refus des corps illisibles (tests et outils
     seulement). `thread=False` laisse l'écriture du fil à l'appelant (envoi à
-    « all » regroupé en une entrée, import déjà écrit). Projet du fil : celui
+    « all » regroupé en une entrée, import déjà écrit). `after_commit` (une
+    liste) : l'écriture du fil y est ajoutée, à appeler par l'appelant après
+    le commit de sa transaction — un envoi annulé n'en laisse aucune trace
+    dans le fil externe. Projet du fil : celui
     de l'expéditeur, sinon du destinataire — son équipe (`team`) s'il est
     gouverné par le canon, sinon son chantier —, sinon AMEESH_PROJECT, sinon
     `default` ; lot : `work_item_id`.
@@ -84,12 +88,18 @@ def send(
         if kind != "notify":
             meta["kind"] = kind
         meta.update(thread_meta or {})
-        fil.record(
-            db.cfg, db, sender=sender, recipients=[recipient], text=body,
-            ts=row.get("created_ts"),
-            project=fil.project_for(db.cfg, row.get("sender_project"),
-                                    row.get("recipient_project")),
-            lot=work_item_id, mailbox_ids=[message_id], meta=meta)
+
+        def record(cfg=db.cfg, target=db) -> None:
+            fil.record(
+                cfg, target, sender=sender, recipients=[recipient], text=body,
+                ts=row.get("created_ts"),
+                project=fil.project_for(cfg, row.get("sender_project"),
+                                        row.get("recipient_project")),
+                lot=work_item_id, mailbox_ids=[message_id], meta=meta)
+        if after_commit is not None:
+            after_commit.append(record)
+        else:
+            record()
     return message_id
 
 
@@ -199,13 +209,13 @@ def _readable_body(row: dict, limite: int | None = None) -> str:
     """Le corps lisible, comme dans le fil : jamais le payload structuré."""
     body = row.get("body") or ""
     if fil.unreadable_reason(body):
-        return "[corps non lisible, non reproduit : voir le fil, message n°%s]" % row.get("id")
+        return "[unreadable body, not reproduced: see the thread, message #%s]" % row.get("id")
     text = fil.clean_text(body).strip("\n")
     if limite is not None:
         text, retire = _tronque(text, limite)
         if retire:
-            text += ("\n[… tronqué : %d octet(s) de plus, texte complet dans le fil, "
-                     "message n°%s]" % (retire, row.get("id")))
+            text += ("\n[... truncated: %d more byte(s), full text in the thread, "
+                     "message #%s]" % (retire, row.get("id")))
     return text
 
 
@@ -217,12 +227,12 @@ def _verdict_note(db: Db | None, row: dict) -> str:
     try:
         verdict = authority.verify_message(db, normalize(row))
     except Exception as exc:  # une vérification impossible n'accorde rien
-        return "  [⚠ signature non vérifiable : %s]" % exc
+        return "  [⚠ signature cannot be verified: %s]" % exc
     if verdict.authority:
-        return "  [autorité du propriétaire PROUVÉE (signature Ed25519)]"
+        return "  [owner's authority PROVEN (Ed25519 signature)]"
     if verdict.ok:
-        return "  [signé par un agent : authentique, sans autorité du propriétaire]"
-    return "  [⚠ signature NON valide : %s]" % verdict.reason
+        return "  [signed by an agent: authentic, without the owner's authority]"
+    return "  [⚠ signature NOT valid: %s]" % verdict.reason
 
 
 def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None = None
@@ -230,11 +240,11 @@ def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None
     """Le rendu d'un message : en-tête (n°, expéditeur, heure, nature,
     autorité, re-livré) puis corps lisible cité ligne à ligne."""
     nature = _nature(row)
-    relivre = ("  [re-livré : déjà réservé pour une remise avant une panne, "
-               "tu l'as peut-être déjà traité]" if maybe_redelivered(row) else "")
+    relivre = ("  [re-delivered: already reserved for delivery before an outage, "
+               "you may have handled it already]" if maybe_redelivered(row) else "")
     moment = fil.iso_local(row.get("created_ts") or 0.0)
     corps = _readable_body(row, limite)
-    return "— message n°%s de %s, %s%s%s%s%s :\n%s" % (
+    return "— message #%s from %s, %s%s%s%s%s:\n%s" % (
         row.get("id"), row.get("sender") or "?", moment, nature,
         _verdict_note(db, row) if note is None else note, relivre, forwarded_note(row),
         "\n".join("> " + line for line in corps.split("\n")))
@@ -246,7 +256,7 @@ def forwarded_note(row: Any) -> str:
     origin = row.get("forwarded_from")
     if not origin:
         return ""
-    return "  [renvoyé : d'abord adressé à %s, dont la boîte n'était plus lue]" % origin
+    return "  [forwarded: first addressed to %s, whose mailbox was no longer read]" % origin
 
 
 def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
@@ -260,7 +270,9 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
         parts.append(adapters.MAIL_REMAINING % remaining)
     parts.append(footer)
     parts.append(adapters.TMP_NOTE)  # L162 : $TMPDIR, jamais /tmp en dur
-    parts.append(adapters.HEAVY_NOTE)  # L131 : suites lourdes plafonnées par hôte
+    # L159b: with a lending VM, heavy suites go there; otherwise L131, heavy
+    # suites capped per host by `ameesh heavy`
+    parts.append(adapters.offload_note() or adapters.HEAVY_NOTE)
     return "\n\n".join(parts)
 
 
@@ -414,9 +426,9 @@ def passive_label(row: Any) -> str:
     reason = passive_reason(row)
     if reason == "cc":
         cible = str(_payload(row).get("cc") or "")
-        return "copie d'un message à %s" % (cible if NAME_RE.match(cible) else "?")
-    return {"ack": "accusé de réception", "broadcast": "diffusion à tous",
-            "radar": "radar de conflits", "ci_passif": "CI sans référence de la base"}.get(reason, "")
+        return "copy of a message to %s" % (cible if NAME_RE.match(cible) else "?")
+    return {"ack": "acknowledgement", "broadcast": "broadcast to all",
+            "radar": "conflict radar", "ci_passif": "CI without base reference"}.get(reason, "")
 
 
 def _nature(row: Any) -> str:
@@ -426,7 +438,7 @@ def _nature(row: Any) -> str:
     if passif:
         return " (%s)" % passif
     if is_event(row):
-        return " (événement%s)" % (", urgent" if is_urgent(row) else "")
+        return " (event%s)" % (", urgent" if is_urgent(row) else "")
     return " (urgent)" if is_urgent(row) else ""
 
 

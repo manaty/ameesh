@@ -20,6 +20,8 @@ from .catalog import Catalog
 from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
+from .conversations import Conversations
+from .credentials import Credentials
 from .grants import Grants
 from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
@@ -34,6 +36,7 @@ from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
 from .threads import Threads
 from .wakeups import Wakeups
+from .watches import Watches
 from .work import WorkItems
 
 
@@ -49,7 +52,9 @@ class PostgresStorage(interface.Storage):
         self.pending_spend = PendingSpend(db)
         self.turn_costs = TurnCosts(db)
         self.accounts = Accounts(db)
+        self.credentials = Credentials(db)
         self.budgets = Budgets(db)
+        self.watches = Watches(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)
@@ -77,3 +82,4 @@ class PostgresStorage(interface.Storage):
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
         self.ci = CiResults(db)
+        self.conversations = Conversations(db)

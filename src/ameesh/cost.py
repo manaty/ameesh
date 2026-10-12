@@ -107,8 +107,8 @@ KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 DEFAULT_HOURLY_USD = 10.0
 
 #: L70 : fenêtres glissantes des plafonds (secondes → libellés de la raison)
-WINDOW_LABELS = {3600: ("horaire", "les 60 dernières minutes"),
-                 86400: ("journalier", "les 24 dernières heures")}
+WINDOW_LABELS = {3600: ("hourly", "the last 60 minutes"),
+                 86400: ("daily", "the last 24 hours")}
 
 
 def gauges_source(harness: str) -> str:
@@ -127,8 +127,8 @@ def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
     """
     descriptors = harnesses.scan(host=host)[0]
     if not descriptors:
-        raise CostError("aucun descripteur de harnais lisible : le plafond horaire "
-                        "payé au token ne peut pas être appliqué")
+        raise CostError("no readable harness descriptor: the pay-per-token hourly cap "
+                        "cannot be applied")
     return tuple(sorted(ident for ident, d in descriptors.items() if d.paid_per_token))
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
@@ -154,6 +154,49 @@ ACCOUNT_MARKER = "ameesh.account"
 #: compté au cumul de toute la session (Claude `total_cost_usd`, Codex
 #: `turn.completed`), pas à la différence.
 TURN_MARKER = "ameesh.turn"
+
+
+@dataclass(frozen=True)
+class Overage:
+    """Paid usage beyond the plan for one account (L226b), as its harness
+    last reported it. Never a secret: two flags.
+
+    * `capable`: the account may go beyond its plan and be billed (Claude
+      `overageStatus` allowed, Codex `credits.has_credits`); None if the
+      harness did not say;
+    * `in_use`: the account is consuming paid usage now (Claude
+      `isUsingOverage`, Codex a window at 100 % with credits).
+    """
+
+    capable: bool | None = None
+    in_use: bool = False
+
+
+class Gauges(list):
+    """The gauges of one reading, with the overage flags of the same reading
+    (`overage`, None if unknown): a list, so every reader of gauges is
+    unchanged."""
+
+    overage: Overage | None = None
+
+    def __init__(self, items=(), overage: Overage | None = None):
+        super().__init__(items)
+        self.overage = overage
+
+    def in_overage(self, now: float) -> bool:
+        """Is the account billed beyond its plan at `now`? A reading in
+        overage goes stale once the windows that ran out have reset (L71):
+        the next window is fresh, and an unused account would otherwise never
+        publish the reading that clears the flag. A saturated window with no
+        reset date keeps the flag (never overage when in doubt)."""
+        if self.overage is None or not self.overage.in_use:
+            return False
+        spent = self.spent()
+        return not spent or any(not g.reset_passed(now) for g in spent)
+
+    def spent(self) -> list:
+        """The windows that ran out (all of them if the reading names none)."""
+        return [g for g in self if g.used >= 1.0] or list(self)
 
 
 class CostError(Exception):
@@ -577,7 +620,7 @@ class CostBook:
                 gauges = _claude_windows(line)
                 if gauges is None:
                     break
-                newest = (mtime, gauges)
+                newest = (mtime, Gauges(gauges, _claude_overage(line)))
                 break
         return newest[1] if newest else []
 
@@ -659,7 +702,7 @@ class CostBook:
                     minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
                 ))
             if gauges:
-                return gauges
+                return Gauges(gauges, _codex_overage(limits, gauges))
         return []
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> list:
@@ -719,8 +762,8 @@ class CostBook:
         now = self.clock()
         for gauge in self.gauges(harness):
             if gauge.exceeded(now):
-                return ("forfait %s %s : %.0f%% utilisé pour %.0f%% de la fenêtre "
-                        "écoulée (plafond de rythme %.0f%%)" % (
+                return ("plan %s %s: %.0f%% used with %.0f%% of the window "
+                        "elapsed (pace cap %.0f%%)" % (
                             harness, gauge.key, gauge.used * 100,
                             gauge.elapsed(now) * 100, gauge.pace_cap(now) * 100))
         return ""
@@ -1099,7 +1142,7 @@ class CostBook:
         deux) ne réécrit pas la ligne : avant L60, il la doublait.
         """
         if self.db is None:
-            raise CostError("record sans base : le repère de cumul vit dans turn_costs")
+            raise CostError("record without a database: the cumulative baseline lives in turn_costs")
         events = self.events(agent, start)
         # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
         # l'insertion : la ligne et le repère doivent porter la même session.
@@ -1218,16 +1261,16 @@ class CostBook:
             if cap and cap > 0:
                 total = self.spent("all", window, harnesses=paid)
                 if total >= cap:
-                    return ("budget %s (payé au token) : %.2f $ sur %s "
-                            "(plafond %.2f $)" % (WINDOW_LABELS[window][0], total,
+                    return ("%s budget (pay-per-token): %.2f $ over %s "
+                            "(cap %.2f $)" % (WINDOW_LABELS[window][0], total,
                                                   WINDOW_LABELS[window][1], cap))
         if agent != "all":
             for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
                 if cap and cap > 0 and window in WINDOW_LABELS:
                     total = self.spent(agent, window, harnesses=paid)
                     if total >= cap:
-                        return ("budget %s de l'agent %s (payé au token) : %.2f $ sur %s "
-                                "(plafond %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
+                        return ("%s budget of agent %s (pay-per-token): %.2f $ over %s "
+                                "(cap %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
                                                       WINDOW_LABELS[window][1], cap))
         return ""
 
@@ -1270,7 +1313,7 @@ class CostBook:
             rows[-1].update({
                 "agent": agent,
                 "harness": harness,
-                "model": self.model_of(agent) or "défaut",
+                "model": self.model_of(agent) or "default",
                 # L95 : payé au token (vrais dollars) ou forfait (équivalent
                 # théorique au barème) ; None si les descripteurs sont illisibles
                 "paid": (harness in paid) if paid is not None else None,
@@ -1300,12 +1343,12 @@ def format_report(rows: Iterable[dict]) -> str:
     """Le tableau de `ameesh cost report`, puis ses deux totaux (L95)."""
     rows = list(rows)
     lines = ["%-16s %-9s %-16s %-8s %10s %10s  %s" % (
-        "agent", "harnais", "modèle", "paiement", "1 h (USD)", "24 h (USD)", "jauges")]
+        "agent", "harness", "model", "payment", "1 h (USD)", "24 h (USD)", "gauges")]
     for row in rows:
         gauges = ", ".join(
-            "%s %.0f%% (rythme %.0f%%%s)" % (
+            "%s %.0f%% (pace %.0f%%%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
-                ", remise à zéro passée, dernier relevé %.0f%%" % (g["last_used"] * 100)
+                ", reset passed, last reading %.0f%%" % (g["last_used"] * 100)
                 if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-16s %-9s %-16s %-8s %10.4f %10.4f  %s" % (
@@ -1319,7 +1362,7 @@ def format_report(rows: Iterable[dict]) -> str:
 
 
 #: libellé du mode de paiement d'une ligne de rapport (L95)
-PAYMENT_LABELS = {True: "token", False: "forfait", None: "?"}
+PAYMENT_LABELS = {True: "token", False: "plan", None: "?"}
 
 
 def totals(rows: Iterable[dict]) -> dict:
@@ -1337,13 +1380,13 @@ def totals(rows: Iterable[dict]) -> dict:
 
 
 def format_totals(sums: dict) -> list:
-    lines = ["dépensé (payé au token, estimé)  : 1 h %.4f $ · 24 h %.4f $" % (
+    lines = ["spent (pay-per-token, estimated): 1 h %.4f $ · 24 h %.4f $" % (
                  sums["paid"]["1h"], sums["paid"]["24h"]),
-             "valeur consommée sur les forfaits : 1 h %.4f $ · 24 h %.4f $ "
-             "(équivalent au barème, non payé au tour)" % (
+             "value consumed on plans:          1 h %.4f $ · 24 h %.4f $ "
+             "(price-list equivalent, not paid per turn)" % (
                  sums["plan_value"]["1h"], sums["plan_value"]["24h"])]
     if sums["unknown"]["1h"] or sums["unknown"]["24h"]:
-        lines.append("mode de paiement inconnu          : 1 h %.4f $ · 24 h %.4f $" % (
+        lines.append("unknown payment mode:             1 h %.4f $ · 24 h %.4f $" % (
             sums["unknown"]["1h"], sums["unknown"]["24h"]))
     return lines
 
@@ -1466,6 +1509,27 @@ def _claude_windows(event: dict) -> list | None:
               float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
         for key, value in windows.items() if isinstance(value, dict)
     ]
+
+
+def _claude_overage(event: dict) -> Overage:
+    """The overage flags of a Claude `rate_limit_event` (L226b)."""
+    info = event.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return Overage()
+    status = info.get("overageStatus")
+    capable = None if not isinstance(status, str) or not status \
+        else status.startswith("allowed")
+    return Overage(capable, info.get("isUsingOverage") is True)
+
+
+def _codex_overage(limits: dict, gauges: list) -> Overage:
+    """The overage flags of a Codex `rate_limits` object (L226b): credits
+    let the account go on, billed, once a window is at 100 %."""
+    credits = limits.get("credits")
+    if not isinstance(credits, dict):
+        return Overage()
+    capable = credits.get("has_credits") is True or credits.get("unlimited") is True
+    return Overage(capable, capable and any(g.used >= 1.0 for g in gauges))
 
 
 def _find_rate_limits(node, depth: int = 0):
@@ -1629,7 +1693,7 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
             gauges = _claude_windows(event)
             if gauges is not None:
-                readings[current] = (stamp, gauges)
+                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
     return readings
 
 

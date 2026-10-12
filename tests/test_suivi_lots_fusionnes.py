@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 import unittest
 from unittest import mock
 
@@ -90,7 +91,7 @@ class MergedCommandTest(_Base):
             self.assertEqual((jalon["sha"], jalon["actor"]), (SHA, "claude1"))
             note = work.events(self.db, lot["id"])[0]
             self.assertEqual(note["actor"], "claude1")
-            self.assertEqual(note["note"], "fusion déclarée par claude1 (commit %s) — fusion "
+            self.assertEqual(note["note"], "merge declared by claude1 (commit %s) — fusion "
                                            "locale sur develop" % SHA[:12])
 
     def test_idempotent_et_jamais_de_reouverture(self):
@@ -103,7 +104,7 @@ class MergedCommandTest(_Base):
         work.close(self.db, ferme["id"], abandoned=True)
         with self.assertRaises(work.WorkError) as ctx:
             work.merged(self.db, ferme["id"], sha=SHA, actor="claude1")
-        self.assertIn("aucune réouverture", str(ctx.exception))
+        self.assertIn("not reopened", str(ctx.exception))
         for bad in ("", "xyz1234", "abc12", "g" * 40):
             with self.assertRaises(work.WorkError):
                 work.merged(self.db, lot["id"], sha=bad, actor="claude1")
@@ -113,13 +114,13 @@ class MergedCommandTest(_Base):
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA, "--note", "à la main",
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d → merged (commit %s, déclaré par claude1)"
+        self.assertIn("lot #%d → merged (commit %s, declared by claude1)"
                       % (lot["id"], SHA[:12]), proc.stdout)
         self.assertEqual(self.merged_milestone(lot["id"])["actor"], "claude1")
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA,
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("déjà merged", proc.stdout)
+        self.assertIn("already merged", proc.stdout)
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
 
@@ -146,13 +147,13 @@ class CorrectionTest(_Base):
     def test_orchestrateur(self):
         proc = self.correct(AGENT_MAIL_NAME="orch", AMEESH_ALERT_ORCHESTRATORS="orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("correction tracée au journal, par orch", proc.stdout)
+        self.assertIn("correction recorded in the log, by orch", proc.stdout)
         item = work.get(self.db, self.lot["id"])
         self.assertEqual(item["state"], "merged")
         self.assertIsNone(item["closed_ts"])
         event = work.events(self.db, self.lot["id"])[0]
         self.assertEqual((event["state"], event["actor"]), ("merged", "orch"))
-        self.assertEqual(event["note"], "correction : promoted → merged — promu par erreur : "
+        self.assertEqual(event["note"], "correction: promoted → merged — promu par erreur : "
                                         "pas encore en production")
         # un seul jalon de fusion : la correction n'en invente pas un second
         self.assertEqual(sum(1 for m in work.milestones(self.db, self.lot["id"])
@@ -167,11 +168,11 @@ class CorrectionTest(_Base):
 
     def test_refus(self):
         cas = [
-            ((), {}, "dites qui corrige"),                                 # humain anonyme
-            ((), {"AGENT_MAIL_NAME": "dev1"}, "correction refusée : dev1"),  # agent ordinaire
+            ((), {}, "say who corrects"),                                  # humain anonyme
+            ((), {"AGENT_MAIL_NAME": "dev1"}, "correction refused: dev1"),   # agent ordinaire
             (("--actor", "human:proprio"), {"AGENT_MAIL_NAME": "dev1"},
-             "cette session est celle de dev1"),                         # au nom d'un autre
-            (("--actor", "dev1"), {}, "correction refusée : dev1"),
+             "this session belongs to dev1"),                            # au nom d'un autre
+            (("--actor", "dev1"), {}, "correction refused: dev1"),
         ]
         for extra, env, attendu in cas:
             proc = self.correct(*extra, **env)
@@ -182,7 +183,7 @@ class CorrectionTest(_Base):
         autre = work.add(self.db, title="autre")
         with self.assertRaises(work.WorkError) as ctx:
             work.move(self.db, autre["id"], "merged", actor="orch", correct="raison")
-        self.assertIn("correction refusée : intake → merged", str(ctx.exception))
+        self.assertIn("correction refused: intake → merged", str(ctx.exception))
         with self.assertRaises(work.WorkError):
             work.move(self.db, self.lot["id"], "merged", actor="orch", correct="  ")
 
@@ -225,7 +226,7 @@ class ActorTest(_Base):
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
         proc = self.mesh("work", "note", str(lot["id"]), "une note sans identité")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("acteur inconnu", proc.stderr)
+        self.assertIn("unknown actor", proc.stderr)
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], work.UNKNOWN_ACTOR)
         proc = self.mesh("work", "move", str(lot["id"]), "build", "--actor", "human:proprio",
                          env=self.env(AGENT_MAIL_NAME="orch"))
@@ -238,7 +239,7 @@ class ActorTest(_Base):
         proc = self.mesh("work", "close", str(lot["id"]), "--abandoned",
                          env=self.env(AGENT_MAIL_NAME="orch"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("avertissement", proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
         self.assertFalse([e for e in work.events(self.db, lot["id"]) if not e["actor"]])
 
@@ -264,6 +265,9 @@ class MergeSweepTest(_Base):
         _git(self.repo, "checkout", "-q", "-b", "develop")
         _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "develop")
         self.agent("claude1", cwd=self.repo)
+        for state in (plan_git._pr_body_backoff, plan_git._pr_body_cache):
+            state.clear()                           # état du processus
+            self.addCleanup(state.clear)
 
     def commit(self, name):
         with open(os.path.join(self.repo, name), "w") as fh:
@@ -300,8 +304,8 @@ class MergeSweepTest(_Base):
         self.assertEqual(item["state"], "merged")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual(jalon["sha"], sha)
-        self.assertIn("relevé des fusions, commit de fusion de develop qui porte "
-                      "« ameesh-work: %d »" % lot["id"], jalon["note"])
+        self.assertIn("merge sweep, merge commit of develop that carries "
+                      "\"ameesh-work: %d\"" % lot["id"], jalon["note"])
         self.assertEqual(work.get(self.db, autre["id"])["state"], "intake")
         self.assertEqual([r["work_item"] for r in self.sync()["results"]], [autre["id"]])
 
@@ -314,7 +318,7 @@ class MergeSweepTest(_Base):
         report = self.sync()
         self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "#id"))
         self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
-        self.assertIn("cite #%d dans son titre (ameesh.lotRef hash)" % lot["id"],
+        self.assertIn("cites #%d in its title (ameesh.lotRef hash)" % lot["id"],
                       self.merged_milestone(lot["id"])["note"])
 
     def test_formes_voisines_et_corps_ignores(self):
@@ -326,6 +330,303 @@ class MergeSweepTest(_Base):
         self.merge("feature/c", "Merge feature/c\n\n* suite de #%d" % n)
         self.sync()
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
+
+    def test_fusion_github_d_une_branche_lot_ferme_le_lot(self):
+        lot = self.lot()
+        n = lot["id"]
+        sha = self.merge("lot/%d-garde" % n,
+                         "Merge pull request #7 from manaty/lot/%d-garde\n\nL1: garde" % n)
+        _git(self.repo, "branch", "-q", "-D", "lot/%d-garde" % n)   # supprimée après la PR
+        lus = []
+        report = self.sync(pr_body=lambda repo, num: lus.append(num) or "Lot #%d." % n)
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "lot-branch"))
+        self.assertEqual(lus, [7])
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+        self.assertIn("merges the branch lot/%d-…" % n, self.merged_milestone(n)["note"])
+
+    def test_pr_partielle_le_lot_reste_ouvert_jusqu_a_la_derniere(self):
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        corps = {7: "Part one.\n\nameesh-work-partial: %d" % n, 8: "The rest."}
+        self.merge("lot/%d-un" % n, "Merge pull request #7 from manaty/lot/%d-un" % n)
+        report = self.sync(pr_body=lambda repo, num: corps[num])
+        self.assertEqual(report["results"][0]["how"], "partial")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        sha = self.merge("lot/%d-deux" % n, "Merge pull request #8 from manaty/lot/%d-deux" % n)
+        report = self.sync(pr_body=lambda repo, num: corps[num])
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+
+    def test_corps_illisible_aucune_fermeture(self):
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-x" % n, "Merge pull request #9 from manaty/lot/%d-x" % n)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        report = self.sync(pr_body=illisible)
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertIn("unreadable", report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_fusion_locale_d_une_branche_lot(self):
+        lot = self.lot()
+        n = lot["id"]
+
+        def jamais(repo, num):
+            raise AssertionError("no PR to read")
+
+        self.merge("lot/%d-local" % n, "Merge branch 'lot/%d-local' into develop" % n)
+        self.assertEqual(self.sync(pr_body=jamais)["merged"], 1)
+
+    def test_branche_implicite_en_avance_rapide(self):
+        lot = self.lot()
+        n = lot["id"]
+        _git(self.repo, "checkout", "-q", "-b", "lot/%d-ff" % n, "develop")
+        self.commit("ff")
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()                       # la pointe en avance est retenue
+        self.assertEqual(report["results"][0]["branch"], "lot/%d-ff" % n)
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        _git(self.repo, "merge", "-q", "--ff-only", "lot/%d-ff" % n)
+        self.assertEqual(work.get(self.db, n)["branch"], "lot/%d-ff" % n)
+        self.assertEqual(self.sync()["merged"], 1)
+
+    def test_formes_lot_branch(self):
+        cite = plan_git.cited_lots
+        self.assertEqual(cite("Merge pull request #3 from o/lot/42-x"), {42: "lot-branch"})
+        self.assertEqual(cite("Merge pull request #3 from o/lot/42"), {42: "lot-branch"})
+        self.assertEqual(cite("Merge branch 'lot/42-x'"), {42: "lot-branch"})
+        self.assertEqual(cite("Merge remote-tracking branch 'origin/main' into lot/42-x"), {})
+        self.assertEqual(cite("Merge pull request #3 from o/lot/42x"), {})
+        self.assertEqual(cite("Merge pull request #3 from o/agent/lot/42-x"), {})
+        self.assertEqual(cite("Merge branch 'lot/42-x'\n\nameesh-work-partial: 42"), {})
+        self.assertEqual(plan_git.merge_pr_number("Merge pull request #3 from o/lot/42-x"), 3)
+        self.assertIsNone(plan_git.merge_pr_number("Merge branch 'lot/42-x'"))
+
+    # --- #312 r1 --------------------------------------------------------
+
+    def test_r1_branche_enregistree_seule_compte(self):
+        # P1 : le lot porte agent/courante, non fusionnée ; la fusion d'une
+        # autre lot/<id>-old ne le ferme pas
+        lot = self.lot()
+        n = lot["id"]
+        work.set_branch(self.db, n, "agent/courante", actor="orch", source="test")
+        _git(self.repo, "checkout", "-q", "-b", "agent/courante", "develop")
+        self.commit("courante")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.merge("lot/%d-old" % n, "Merge branch 'lot/%d-old'" % n)
+        report = self.sync(pr_body=lambda repo, num: "")
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        # la branche enregistrée elle-même, fusionnée par son titre : fermé
+        lot2 = self.lot("deux")
+        work.set_branch(self.db, lot2["id"], "origin/lot/%d-bon" % lot2["id"], actor="orch",
+                        source="test")
+        self.merge("lot/%d-bon" % lot2["id"],
+                   "Merge pull request #4 from manaty/lot/%d-bon" % lot2["id"])
+        self.sync(pr_body=lambda repo, num: "")
+        self.assertEqual(work.get(self.db, lot2["id"])["state"], "merged")
+
+    def test_r1_fusion_locale_partielle_retient_la_branche_implicite(self):
+        # P2 : `ameesh-work-partial` dans le message d'une fusion locale
+        # retient aussi la preuve par la branche implicite
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        self.merge("lot/%d-un" % n, "Merge branch 'lot/%d-un'\n\nameesh-work-partial: %d"
+                   % (n, n))
+        report = self.sync()
+        self.assertEqual(report["results"][0]["how"], "partial")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_r1_corps_illisible_puis_pr_complete_lisible(self):
+        # P2 : le corps toujours illisible de #7 ne cache pas #8, complète
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-a" % n, "Merge pull request #7 from manaty/lot/%d-a" % n)
+        sha = self.merge("lot/%d-b" % n, "Merge pull request #8 from manaty/lot/%d-b" % n)
+        lus = []
+
+        def lire(repo, num):
+            lus.append(num)
+            if num == 7:
+                raise plan_git.GitError("gh: HTTP 404")
+            return "The rest."
+
+        report = self.sync(pr_body=lire)          # un échec de gh par relevé
+        self.assertIn("unreadable", report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(self.sync(pr_body=lire)["merged"], 1)   # #7 recule : #8 lu
+        self.assertEqual(lus, [7, 8])
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+
+    def test_r1_recul_et_plafond_des_lectures_de_gh(self):
+        # P2 : au plus un échec de gh par dépôt et par relevé ; une PR en échec
+        # recule (délai doublé à chaque échec) ; au plus MAX_PR_BODY_READS
+        # lectures par relevé
+        lots = [self.lot("l%d" % i) for i in range(3)]
+        for i, lot in enumerate(lots):
+            self.merge("lot/%d-x" % lot["id"],
+                       "Merge pull request #%d from manaty/lot/%d-x" % (10 + i, lot["id"]))
+        appels = []
+
+        def en_panne(repo, num):
+            appels.append(num)
+            raise plan_git.GitError("gh: timeout")
+
+        for _ in range(4):
+            self.sync(pr_body=en_panne)
+        self.assertEqual(appels, [10, 11, 12])     # rien pendant les reculs
+        key = (self.repo, 10)
+        self.assertEqual(plan_git._pr_body_backoff[key][1], plan_git.PR_BODY_BACKOFF_S)
+        plan_git._pr_body_backoff[key] = (0.0, plan_git._pr_body_backoff[key][1])
+        self.sync(pr_body=en_panne)
+        self.assertEqual(appels, [10, 11, 12, 10])
+        self.assertEqual(plan_git._pr_body_backoff[key][1], 2 * plan_git.PR_BODY_BACKOFF_S)
+        # plafond : une lecture par relevé ; une lecture réussie oublie le recul
+        plan_git._pr_body_backoff.clear()
+        lus = []
+        with mock.patch.object(plan_git, "MAX_PR_BODY_READS", 1):
+            report = self.sync(pr_body=lambda repo, num: lus.append(num) or "")
+        self.assertEqual((len(lus), report["merged"]), (1, 1))
+        self.assertTrue(any("bodies read in this sweep" in r["detail"]
+                            for r in report["results"]))
+
+    def test_r2_corps_lus_gardes_pas_de_famine(self):
+        # P2 : un corps déjà lu ne reprend pas de lecture : le lot suivant
+        # est lu au relevé suivant, même avec un plafond d'une lecture
+        a, b = self.lot("parapluie"), self.lot("complet")
+        self.merge("lot/%d-x" % a["id"], "Merge pull request #30 from manaty/lot/%d-x" % a["id"])
+        self.merge("lot/%d-y" % b["id"], "Merge pull request #31 from manaty/lot/%d-y" % b["id"])
+        corps = {30: "ameesh-work-partial: %d" % a["id"], 31: "Done."}
+        lus = []
+
+        def lire(repo, num):
+            lus.append(num)
+            return corps[num]
+
+        with mock.patch.object(plan_git, "MAX_PR_BODY_READS", 1):
+            self.sync(pr_body=lire)
+            self.sync(pr_body=lire)
+            self.sync(pr_body=lire)
+        self.assertEqual(lus, [30, 31])
+        self.assertEqual(work.get(self.db, b["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
+
+    def test_r2_seule_la_derniere_fusion_partielle_compte(self):
+        # P2 : fusion locale partielle, puis la suite de la même branche
+        # entre dans la cible en avance rapide : le lot est fermé
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        branch = "lot/%d-un" % n
+        self.merge(branch, "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n))
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")
+        self.commit("la-suite")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")   # vue en avance
+        _git(self.repo, "merge", "-q", "--ff-only", branch)
+        self.assertEqual(self.sync()["merged"], 1)
+
+    def pointe_puis_fusion_partielle(self, *, antidate=None):
+        """S vu en avance, la branche ramenée à P (poussée forcée) et fusionnée
+        partiellement (M, sa date de committer `antidate`), puis S fusionné
+        dans la cible par une autre branche, et la branche du lot avancée
+        jusqu'à la cible. Le numéro du lot."""
+        n = self.lot("parapluie")["id"]
+        self.db.execute("UPDATE work_items SET created_at = now() - interval '1 hour'"
+                        " WHERE id = %s", (n,))
+        branch = "lot/%d-un" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("p")
+        p = _git(self.repo, "rev-parse", "HEAD")
+        self.commit("s")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.sync()                                               # S vu en avance
+        s = work.get(self.db, n)["branch_head"]
+        _git(self.repo, "branch", "-q", "-f", "autre", s)
+        _git(self.repo, "branch", "-q", "-f", branch, p)          # poussée forcée à P
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n), branch,
+             env={"GIT_COMMITTER_DATE": antidate} if antidate else None)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", "autre")
+        _git(self.repo, "branch", "-q", "-f", branch, "develop")  # avance rapide
+        return n
+
+    def test_l118d_r1_pointe_vue_avant_la_fusion_partielle(self):
+        # #346 r1 P1 : la pointe S, vue avant la fusion partielle, ne la lève pas
+        n = self.pointe_puis_fusion_partielle()
+        for _ in range(2):
+            report = self.sync()
+            self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_l118d_r2_fusion_partielle_antidatee(self):
+        # #346 r2 P1 : la date de committer de M, antidatée de 10 minutes
+        # (au-delà de CLOCK_SLACK_S), ne compte pas : seul l'instant où le
+        # relevé a vu M, horloge de la base, compte
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        n = self.pointe_puis_fusion_partielle(antidate=stamp)
+        for _ in range(2):                   # M vue, puis relevé suivant
+            report = self.sync()
+            self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        row = work.get(self.db, n)
+        self.assertLess(row["branch_head_ts"], row["partial_seen_ts"])
+
+    def test_l118d_r2_pointe_inchangee_relevee_apres_la_fusion(self):
+        # #346 r2 (suite) : S vu en avance, P seul fusionné partiellement, la
+        # branche toujours à S : S est relevée de nouveau après M, puis entre
+        # dans la cible en avance rapide : le lot est fermé
+        n = self.lot("parapluie")["id"]
+        branch = "lot/%d-un" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("p")
+        p = _git(self.repo, "rev-parse", "HEAD")
+        self.commit("s")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.sync()                                               # S vu en avance
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n), p)
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")   # S relevée après M
+        row = work.get(self.db, n)
+        self.assertGreater(row["branch_head_ts"], row["partial_seen_ts"])
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", branch)
+        self.assertEqual(self.sync()["merged"], 1)
+
+    def test_l118d_r1_erreur_git_garde_le_lot_ouvert(self):
+        # #346 r1 P2 : une ascendance illisible (code 128) n'est pas une preuve
+        merge = {"sha": "m" * 40, "ts": 0.0, "parents": ["a" * 40, "b" * 40]}
+        codes = iter([128, 128, 0])
+        with mock.patch.object(plan_git, "_git", side_effect=lambda *a: subprocess.
+                               CompletedProcess(a, next(codes))):
+            self.assertFalse(plan_git._moved_past(self.repo, "s" * 40, 10_000.0, "s" * 40,
+                                                  merge, 0.0))
+
+    def test_l118d_avance_jusqu_a_la_cible_sans_travail_nouveau(self):
+        # #312 r3 : après une fusion partielle, la branche est avancée jusqu'à
+        # develop sans travail nouveau (et develop a avancé entre-temps) : le
+        # lot reste ouvert
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        branch = "lot/%d-un" % n
+        self.merge(branch, "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n))
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")      # la fusion elle-même
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.commit("travail-d-un-autre")                         # develop avance
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
 
     def test_cited_lots(self):
         cas = {
@@ -355,7 +656,7 @@ class MergeSweepTest(_Base):
         _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "origin/develop")
         entry = self.sync()["results"][0]
         self.assertEqual((entry["work_item"], entry["result"]), (lot["id"], "error"))
-        self.assertIn("ameesh.target = origin/develop introuvable", entry["detail"])
+        self.assertIn("ameesh.target = origin/develop not found", entry["detail"])
 
     def test_stale_lot_dit_l_action_puis_se_tait_apres_le_releve(self):
         lot = self.lot()
@@ -366,8 +667,8 @@ class MergeSweepTest(_Base):
             self.db.execute(sql)
         stale = [a for a in exploitation.alerts(self.cfg, self.db) if a["type"] == "stale_lot"]
         self.assertEqual([a["lot"] for a in stale], [lot["id"]])
-        self.assertIn("fusionné ? fermez-le : ameesh work merged %d --sha <commit de fusion> ; "
-                      "sinon relancez claude1" % lot["id"], stale[0]["detail"])
+        self.assertIn("merged? close it: ameesh work merged %d --sha <merge commit>; "
+                      "otherwise nudge claude1" % lot["id"], stale[0]["detail"])
         self.assertEqual(stale[0]["action"], exploitation.stale_action(stale[0] | {
             "id": lot["id"], "assignee": "claude1"}))
         self.merge("feature/z", "Merge #%d\n\nameesh-work: %d" % (lot["id"], lot["id"]))
@@ -380,8 +681,8 @@ class MergeSweepTest(_Base):
         self.merge("feature/cli", "Merge\n\nameesh-work: %d" % lot["id"])
         proc = self.mesh("work", "sync-branches")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("(sans branche)", proc.stdout)
-        self.assertIn("FERMÉ", proc.stdout)
+        self.assertIn("(no branch)", proc.stdout)
+        self.assertIn("CLOSED", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
 

@@ -2,8 +2,8 @@
 """Ressources des hôtes (lot L31, décision 0028).
 
 Chaque exécuteur relève périodiquement l'état de son hôte — mémoire
-disponible, swap utilisé, charge CPU (1 minute), disque libre du dossier de
-travail, allocation btrfs de ce disque (#246), tours en cours — et le publie
+disponible, swap utilisé, charge CPU (1 minute), disque libre et allocation
+btrfs (#246) de chaque volume où l'hôte écrit (#253), tours en cours — et le publie
 en base (`host_resources`). `ameesh hosts` montre le dernier relevé de
 chaque hôte et l'historique court.
 
@@ -20,10 +20,12 @@ minute. `min_mem_available`, `min_disk_free`, `min_btrfs_unallocated` et
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 import shutil
+import subprocess
 import time
 
 from . import platform, storage
@@ -254,6 +256,21 @@ def _mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
     return platform.mount_of(path, mounts)
 
 
+def _fs_mount(path: str) -> tuple[str, str] | None:
+    """(point, type) of the mount `path` actually resolves to (#289 r2): the
+    one whose id the kernel gives (`mount_id`), else the deepest visible one
+    over the resolved path (`covering_mount`: a mount over a parent hides a
+    deeper one), else `mount_of` (no mountinfo: not Linux)."""
+    mounts = platform.mountinfo() if platform.is_linux() else []
+    if mounts:
+        wanted = platform.mount_id(path)
+        found = next((m for m in mounts if wanted is not None and m.get("id") == wanted),
+                     None) or platform.covering_mount(os.path.realpath(path), mounts)
+        if found is not None:
+            return found["point"], found["fstype"]
+    return _mount_of(path)
+
+
 def fs_usage(path: str | None, *, mounts: str | None = None) -> dict:
     """Occupation du système de fichiers de `path` (L73) : chemin, type
     (`tmpfs`, `ext4`…), taille et octets utilisés ; valeurs None si
@@ -262,7 +279,7 @@ def fs_usage(path: str | None, *, mounts: str | None = None) -> dict:
            "tmp_used_bytes": None}
     if not path or not os.path.isdir(path):
         return out
-    mount = _mount_of(path, mounts)
+    mount = _mount_of(path, mounts) if mounts is not None else _fs_mount(path)
     if mount is not None:
         out["tmp_fstype"] = mount[1]
     try:  # mêmes valeurs que statvfs (f_blocks, f_bfree), sur tous les OS
@@ -272,6 +289,218 @@ def fs_usage(path: str | None, *, mounts: str | None = None) -> dict:
     out["tmp_size_bytes"] = int(usage.total)
     out["tmp_used_bytes"] = int(usage.used)
     return out
+
+
+# --------------------------------------------------------------------------
+# #253: every filesystem the host writes to
+# --------------------------------------------------------------------------
+
+#: the floors read on every volume: (floor, reading field)
+VOLUME_FLOORS = (("min_disk_free", "disk_free_bytes"),
+                 ("min_btrfs_unallocated", "btrfs_unallocated_bytes"),
+                 ("min_btrfs_metadata_headroom", "btrfs_metadata_headroom_bytes"))
+#: `docker info` is best effort: bounded, and a failure is retried later
+DOCKER_INFO_TIMEOUT_S = 5.0
+DOCKER_RETRY_S = 600.0
+_docker_root: dict = {}
+
+
+def docker_root(now: float | None = None) -> str | None:
+    """Docker's root dir (`docker info`), best effort: None without docker or
+    a daemon that answers. A found root is kept for the process; a failure is
+    retried after `DOCKER_RETRY_S`."""
+    now = time.monotonic() if now is None else now
+    if "root" in _docker_root and (_docker_root["root"] is not None
+                                   or now - _docker_root["at"] < DOCKER_RETRY_S):
+        return _docker_root["root"]
+    root = None
+    if shutil.which("docker"):
+        try:
+            done = subprocess.run(["docker", "info", "--format", "{{.DockerRootDir}}"],
+                                  capture_output=True, text=True,
+                                  timeout=DOCKER_INFO_TIMEOUT_S)
+            if done.returncode == 0 and done.stdout.strip().startswith("/"):
+                root = done.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            root = None
+    _docker_root.update(root=root, at=now)
+    return root
+
+
+def tmp_paths(cfg, policy=None) -> list[str]:
+    """The turns' tmp root (with a state dir) and the system tmp (#306)."""
+    from . import menage as menage_mod
+    tmps = []
+    if getattr(cfg, "state_dir", None):
+        try:  # a reading never fails on a managed root
+            tmps.append(menage_mod.tmp_root(cfg, policy or menage_mod.Policy()))
+        except Exception:
+            pass
+    return tmps + [system_tmp()]
+
+
+def disk_paths(cfg, policy=None) -> list[str]:
+    """The paths whose filesystems the guard watches (#253): every work root
+    that exists (the current directory without any), the state dir, the deps
+    cache root, the turns' tmp root and the system tmp (both unless in memory:
+    a tmpfs has its own measure, `tmpfs_fraction`), docker's root dir (best
+    effort) and `/`."""
+    from . import menage as menage_mod
+    paths = [os.path.expanduser(root) for root in getattr(cfg, "worktree_roots", ()) or ()]
+    paths = [p for p in paths if os.path.isdir(p)] or [os.getcwd()]
+    state_dir = getattr(cfg, "state_dir", None)
+    if state_dir:
+        paths.append(state_dir)
+        try:  # a reading never fails on a managed root
+            paths.append(menage_mod.cache_root(cfg, policy or menage_mod.Policy()))
+        except Exception:
+            pass
+    paths += [p for p in tmp_paths(cfg, policy) if not menage_mod.in_memory(p)]
+    docker = docker_root()
+    if docker:
+        paths.append(docker)
+    paths.append(os.sep)
+    return paths
+
+
+def _within(path: str, point: str) -> bool:
+    return path == point or path.startswith(point.rstrip(os.sep) + os.sep)
+
+
+def _anchor(path: str) -> str | None:
+    """`path`, or its nearest ancestor that can be stat'ed: a missing dir (a
+    cache not created yet) or one behind a dir that denies traversal
+    (/data/private/docker) is read on the filesystem of that ancestor.
+
+    #306: never above the path's own mount point (`covering_mount`, read in
+    the mount table without stat): when that point is out of reach (a btrfs
+    mounted AT /data/private/docker), its filesystem is read through another
+    reachable mount of it; None when there is none (the volume is unreadable,
+    never credited to the parent filesystem). The mount is looked up on the
+    path with its symlinks resolved, and another mount is used only if the
+    kernel resolves its point to that very mount (`mount_id`: not hidden by
+    a mount over one of its parents) (#289 r1)."""
+    path = os.path.realpath(path)
+    current = path
+    while True:
+        try:
+            os.stat(current)
+            break
+        except OSError:
+            parent = os.path.dirname(current.rstrip(os.sep)) or os.sep
+            if parent == current:
+                return path
+            current = parent
+    mounts = platform.mountinfo() if platform.is_linux() else []
+    own = platform.covering_mount(path, mounts)
+    if own is None or _within(current, own["point"]):
+        return current
+    for other in mounts:
+        if other["dev"] != own["dev"] or other["point"] == own["point"] \
+                or platform.covering_mount(other["point"], mounts) is not other:
+            continue  # another filesystem, or this mount is overmounted
+        if other.get("id") is None or platform.mount_id(other["point"]) != other["id"]:
+            continue  # out of reach, or another filesystem shows there
+        if not _readable(other["point"]):
+            continue  # #289 r2: the btrfs ioctls need it open read-only
+        return other["point"]
+    return None
+
+
+def _readable(path: str) -> bool:
+    """Can `path` be opened read-only (what the btrfs ioctls and a listing
+    need; O_PATH alone succeeds on a mode-000 directory)?"""
+    try:
+        os.close(os.open(path, os.O_RDONLY))
+        return True
+    except OSError:
+        return False
+
+
+def _probe(path: str) -> str:
+    """`path` (or its `_anchor`), or its nearest parent ON THE SAME FILESYSTEM
+    that can be opened: the btrfs ioctls open the path (docker's root is not
+    readable by the executor); never a parent across a mount point."""
+    path = _anchor(path) or path
+    try:
+        dev = os.stat(path).st_dev
+    except OSError:
+        return path
+    current = path
+    while not os.access(current, os.R_OK):
+        parent = os.path.dirname(current.rstrip(os.sep)) or os.sep
+        if parent == current:
+            break
+        try:
+            if os.stat(parent).st_dev != dev:
+                break
+        except OSError:
+            break
+        current = parent
+    return current
+
+
+def volume_key(path: str) -> str:
+    """The identity of the filesystem holding `path`: its btrfs fsid (two
+    subvolumes of one btrfs are one volume, their st_dev differ), else its
+    st_dev, else the path itself (unreadable: sampled on its own); read on
+    the path's `_anchor`."""
+    anchor = _anchor(path)
+    if anchor is None:  # #306: an unreachable mount is a volume of its own
+        own = platform.covering_mount(os.path.realpath(path), platform.mountinfo())
+        return "mount:%d" % own["dev"]
+    found = platform.btrfs_fs_info(_probe(path)) if platform.is_linux() else None
+    if found is not None and found[0]:
+        return "btrfs:%s" % found[0]
+    try:
+        return "dev:%d" % os.stat(anchor).st_dev
+    except OSError:
+        return "path:%s" % path
+
+
+def volumes(paths) -> list[dict]:
+    """One entry per distinct filesystem among `paths` (#253), in the order
+    of `paths`: `path` (the first that names it), `paths`, `disk_free_bytes`,
+    `btrfs_unallocated_bytes`, `btrfs_metadata_headroom_bytes` (None when
+    unreadable or not btrfs); `unreadable` when the filesystem cannot be
+    reached at all (#306)."""
+    out: list[dict] = []
+    seen: dict[str, dict] = {}
+    for path in paths or ():
+        if not path:
+            continue
+        path = os.path.abspath(os.path.expanduser(path))
+        key = volume_key(path)
+        if key in seen:
+            if path not in seen[key]["paths"]:
+                seen[key]["paths"].append(path)
+            continue
+        volume = {"path": path, "paths": [path]}
+        if _anchor(path) is None:  # #306: out of reach, read as unknown
+            volume.update(dict.fromkeys(f for _floor, f in VOLUME_FLOORS), unreadable=True)
+        else:
+            probe = _probe(path)
+            volume["disk_free_bytes"] = disk_free(probe)
+            volume.update(btrfs_usage(probe))
+        seen[key] = volume
+        out.append(volume)
+    return out
+
+
+def worst(vols: list[dict], field: str) -> dict | None:
+    """The volume with the lowest reading of `field`, None when none reads it."""
+    known = [v for v in vols or () if v.get(field) is not None]
+    return min(known, key=lambda v: v[field]) if known else None
+
+
+def tmp_usage(tmps) -> dict:
+    """`fs_usage` of the fullest tmpfs among `tmps` (#306: the turns' tmp root
+    can be a tmpfs of its own), else of the last one (the system tmp). A tmp
+    root not created yet is read on its `_anchor`, the filesystem it will be
+    created on (#289 r1)."""
+    usages = [dict(fs_usage(_anchor(p) or p), tmp_path=p) for p in tmps]
+    known = [u for u in usages if tmpfs_fraction(u) is not None]
+    return max(known, key=tmpfs_fraction) if known else usages[-1]
 
 
 def system_tmp() -> str:
@@ -598,12 +827,18 @@ def measure(reading: dict | None, offer: dict | None = None) -> dict:
 
 
 def sample(host: str, *, path: str | None = None, now: float | None = None,
-           turns_in_progress: int | None = None, tmp: str | None = None) -> dict:
+           turns_in_progress: int | None = None, tmp: str | list | None = None,
+           paths: list[str] | None = None) -> dict:
     """Un relevé de l'hôte : les mesures lisibles, les autres à None.
 
-    `path` est le dossier dont on mesure le disque (le dossier de travail de
-    l'hôte) ; `now` permet aux tests de fixer l'instant.
+    `paths` (#253, `disk_paths`) : les dossiers dont on mesure les systèmes de
+    fichiers, un relevé par système distinct (`volumes`) ; les colonnes à plat
+    gardent le PIRE relevé de chaque plancher, `disk_path` le chemin du disque
+    le moins libre. `path` seul : ce seul dossier. `tmp` : le /tmp mesuré, ou
+    une liste (#306, `tmp_paths`) dont le tmpfs le plus plein est gardé. `now`
+    permet aux tests de fixer l'instant.
     """
+    vols = volumes(paths if paths is not None else [path] if path else [])
     out: dict = {
         "host": host,
         "sampled_ts": time.time() if now is None else float(now),
@@ -611,13 +846,17 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
         "swap_used_bytes": None,
         "load1": load1(),
         "cpu_count": cpu_count(),
-        "disk_free_bytes": disk_free(path),
-        "disk_path": path,
         "turns_in_progress": turns_in_progress,
+        "volumes": vols,
     }
-    out.update(btrfs_usage(path))
+    for _floor, field in VOLUME_FLOORS:
+        low = worst(vols, field)
+        out[field] = low[field] if low is not None else None
+    low = worst(vols, "disk_free_bytes")
+    out["disk_path"] = low["path"] if low is not None else (vols[0]["path"] if vols else path)
     out.update(_meminfo())
-    out.update(fs_usage(system_tmp() if tmp is None else tmp))
+    out.update(tmp_usage([system_tmp()] if tmp is None
+                         else [tmp] if isinstance(tmp, str) else tmp))
     out.update(power())
     # L159d: PSI, application and guest shares
     out.update(psi())
@@ -627,19 +866,57 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
-def collect(cfg, db: Db, *, now: float | None = None) -> dict:
+def restart_record(record) -> dict | None:
+    """L159e6: a `guard.restart` record ({ts, started, skipped}) checked and
+    copied; None when ill-typed."""
+    if not isinstance(record, dict) or isinstance(record.get("ts"), bool) \
+            or not isinstance(record.get("ts"), (int, float)) \
+            or finite_float(record["ts"]) is None:
+        return None
+    started, skipped = record.get("started"), record.get("skipped")
+    if not isinstance(started, list) or not all(isinstance(u, str) for u in started) \
+            or not isinstance(skipped, dict) \
+            or not all(isinstance(r, str) for r in skipped.values()):
+        return None
+    return {"ts": float(record["ts"]), "started": list(started), "skipped": dict(skipped)}
+
+
+def guard_restart(path: str | None = None, *, now: float | None = None) -> dict | None:
+    """L159e6: the last restart the capacity guard of this host published
+    (`guard.restart` of its state, `path`: `guard.DEFAULT_STATE_PATH`), as
+    {ts, started, skipped, age_s}; None without a guard, an unreadable state
+    or an ill-typed record. `age_s`: its age on this host's clock at `now`,
+    so the reader never compares two clocks (codex #288 r1)."""
+    from . import guard
+    try:
+        with open(path or guard.DEFAULT_STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    block = state.get("guard") if isinstance(state, dict) else None
+    record = restart_record(block.get("restart") if isinstance(block, dict) else None)
+    if record is None:
+        return None
+    now = time.time() if now is None else float(now)
+    record["age_s"] = max(0.0, now - record["ts"])
+    return record
+
+
+def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
     Le nombre de tours en cours vient de la base (agents de l'hôte au bail
-    vivant et en tour) : c'est un état, pas une mesure locale.
+    vivant et en tour) : c'est un état, pas une mesure locale. `policy` : la
+    politique de ménage de l'hôte, pour la racine du cache des dépendances
+    (#253).
     """
     host = cfg.host or ""
     try:
         turns = storage.of(db).hosts.turns_in_progress(host)
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         turns = None
-    path = _work_path(cfg)
-    reading = sample(host, path=path, now=now, turns_in_progress=turns)
+    reading = sample(host, paths=disk_paths(cfg, policy), now=now, turns_in_progress=turns,
+                     tmp=tmp_paths(cfg, policy))
     # L159d: lendable capacity, on the 7 days of readings of the host
     try:
         basis = storage.of(db).hosts.lend_basis(host, LEND_WINDOW_S, LEND_SLOT_S,
@@ -647,18 +924,9 @@ def collect(cfg, db: Db, *, now: float | None = None) -> dict:
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         basis = None
     reading.update(lendable(reading, basis))
+    reading["guard_restart"] = guard_restart(now=now)
     storage.of(db).hosts.record(reading)
     return reading
-
-
-def _work_path(cfg) -> str | None:
-    """Dossier dont on mesure le disque : la première racine de travail de
-    l'hôte qui existe, sinon le répertoire courant."""
-    for root in getattr(cfg, "worktree_roots", ()) or ():
-        expanded = os.path.expanduser(root)
-        if os.path.isdir(expanded):
-            return expanded
-    return os.getcwd()
 
 
 # --------------------------------------------------------------------------
@@ -824,6 +1092,23 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
                         "critical": value <= limit * critical_factor})
 
+    # #253: the disk floors hold on every volume the host writes to; the worst
+    # reading of each floor decides, and the breach names its path
+    vols = reading.get("volumes") or []
+
+    def volume_floor(key, label, field, limit, critical_factor):
+        low = worst(vols, field)
+        if low is None:
+            path = reading.get("disk_path")  # a reading from before 0359
+            value = reading.get(field)
+        else:
+            path, value = low["path"], low[field]
+        before = len(out)
+        floor(key, "%s %s" % (label, path) if path else label, value, limit,
+              critical_factor)
+        if len(out) > before:
+            out[-1]["path"] = path
+
     def ceiling(key, label, value, limit, critical_factor):
         if value is None:
             return
@@ -831,28 +1116,27 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
                         "critical": value >= limit * critical_factor})
 
-    floor("min_mem_available", "mémoire disponible", reading.get("mem_available_bytes"),
+    floor("min_mem_available", "available memory", reading.get("mem_available_bytes"),
           limits["min_mem_available"], CRITICAL_MEM_FACTOR)
-    ceiling("max_swap_used", "swap utilisé", reading.get("swap_used_bytes"),
+    ceiling("max_swap_used", "swap used", reading.get("swap_used_bytes"),
             limits["max_swap_used"], CRITICAL_SWAP_FACTOR)
-    ceiling("max_load", "charge 1 min", reading.get("load1"),
+    ceiling("max_load", "1-min load", reading.get("load1"),
             limits["max_load"], CRITICAL_LOAD_FACTOR)
-    floor("min_disk_free", "disque libre", reading.get("disk_free_bytes"),
-          limits["min_disk_free"], CRITICAL_DISK_FACTOR)
+    volume_floor("min_disk_free", "free disk", "disk_free_bytes",
+                 limits["min_disk_free"], CRITICAL_DISK_FACTOR)
     # #246: btrfs allocation, which `disk_free` (statvfs) does not see; like
     # the other floors, a breach closes new turns well before the critical level
-    floor("min_btrfs_unallocated", "btrfs non alloué",
-          reading.get("btrfs_unallocated_bytes"), limits.get("min_btrfs_unallocated"),
-          CRITICAL_BTRFS_FACTOR)
-    floor("min_btrfs_metadata_headroom", "marge des métadonnées btrfs",
-          reading.get("btrfs_metadata_headroom_bytes"),
-          limits.get("min_btrfs_metadata_headroom"), CRITICAL_BTRFS_FACTOR)
+    volume_floor("min_btrfs_unallocated", "btrfs unallocated", "btrfs_unallocated_bytes",
+                 limits.get("min_btrfs_unallocated"), CRITICAL_BTRFS_FACTOR)
+    volume_floor("min_btrfs_metadata_headroom", "btrfs metadata headroom",
+                 "btrfs_metadata_headroom_bytes",
+                 limits.get("min_btrfs_metadata_headroom"), CRITICAL_BTRFS_FACTOR)
     # L73 : un /tmp en tmpfs vit en mémoire et en swap ; critique à mi-chemin
     # entre le seuil et le plein.
     part = tmpfs_fraction(reading)
     limit = limits.get("max_tmpfs_used")
     if part is not None and limit is not None and part > limit:
-        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s occupé"
+        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s used"
                     % (reading.get("tmp_path") or "/tmp"), "value": part, "limit": limit,
                     "critical": part >= limit + (1.0 - limit) / 2.0})
     # L159d: CPU pressure of the host; critical halfway between the ceiling
@@ -866,7 +1150,7 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     if etat["state"] in ("low", "stop"):
         # L106 : jamais `critical` — la pause des agents peu prioritaires ne
         # sert à rien ici ; l'arrêt propre (`stop`) est l'affaire de l'exécuteur
-        out.append({"key": "min_battery_percent", "label": "batterie (sur batterie)",
+        out.append({"key": "min_battery_percent", "label": "battery (on battery power)",
                     "value": etat["battery_percent"], "limit": etat["min"],
                     "critical": False, "power": etat["state"]})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
@@ -934,7 +1218,7 @@ def fmt_value(key: str, value) -> str:
 
 def describe(found: list[dict]) -> str:
     """Les franchissements en clair : « swap utilisé 17.5 GiB (seuil 16.0 GiB) »."""
-    return " ; ".join("%s %s (seuil %s)" % (b["label"], fmt_value(b["key"], b["value"]),
+    return "; ".join("%s %s (threshold %s)" % (b["label"], fmt_value(b["key"], b["value"]),
                                             fmt_value(b["key"], b["limit"]))
                       for b in found or [])
 

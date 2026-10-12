@@ -41,12 +41,13 @@ the [decisions](decisions/)). Open as of 2026-10-05:
   licence and single-application questions are closed; the others stay open.
 
 - macOS and Windows portability ([study](etudes/portabilite-mac-windows.md),
-  2026-10-10): native Windows or WSL2 first; psutil as a required or optional
-  dependency; logged `--force` or no bypass when a guarantee is missing; local
-  or remote database on macOS and Windows; signed executable (accounts and
-  certificates) or `uv tool install`; Rust "not now" to confirm after the
-  Nexlink Compute study; place of L63 (security fix for `adopt`) relative to
-  the lots in flight.
+  2026-10-10): the owner answered questions 1 to 6 on 2026-10-12 (WSL2 first,
+  psutil required, no bypass for secret files and open sessions, remote
+  database only, `uv tool install`, no Rust now). Still open, with the
+  Nexlink Compute work: intended use (own workstation, workstation lent
+  through Compute, or both); aligning WSL2 with the Compute VM; ameesh
+  installed by the Nexlink application or independent; sharing the lease
+  model, the device identity and the resource measure with Compute.
 
 # Awaiting a study or a prototype
 

@@ -1,28 +1,28 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Demandes de décision au propriétaire, reçues et répondues au même endroit (lot L124).
+"""Decision requests to the owner, received and answered in one place (work item L124).
 
-  ameesh decide ask (--lot <id|réf> | --new-lot "titre") --question "…"
+  ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
                     --option a="…" [--option b="…" …] [--recommend a [--why "…"]]
                     [--urgent] [--by 2h|18:00|"2026-10-12 09:00"] [--needs-signature] [--json]
-        un agent dépose une demande : rattachée au projet et au lot, le lot
-        passe en `waiting_human` (il revient à son état précédent à la
-        réponse), le propriétaire visé est notifié ;
+        an agent files a request: attached to the project and the work item, the
+        work item moves to `waiting_human` (it returns to its previous state on
+        the answer), the target owner is notified;
         `--from-mail <id>` (L233): the mail in which the agent wrote this
         decision in prose (the lot of the mail by default);
-  ameesh decide <id> <option | "texte libre"> [--key FICHIER [--as NOM] | --signed] [--json]
-        le propriétaire répond (une identité HUMAINE seulement) ; la réponse
-        part au demandeur par courrier (elle le réveille), au fil et au lot ;
-  ameesh decide withdraw <id> [--why "…"] [--json]     le demandeur retire sa demande ;
-  ameesh decide show <id> [--json]                     une demande, sa réponse, sa preuve ;
-  ameesh decisions [--all] [--for human:ID] [--json]   la file, tous projets confondus
-        (servie par `actions_cli`, avec les actions sous porte).
+  ameesh decide <id> <option | "free text"> [--key FILE [--as NAME] | --signed] [--json]
+        the owner answers (a HUMAN identity only); the answer goes to the
+        requester by mail (it wakes them up), to the thread and to the work item;
+  ameesh decide withdraw <id> [--why "…"] [--json]     the requester withdraws their request;
+  ameesh decide show <id> [--json]                     a request, its answer, its proof;
+  ameesh decisions [--all] [--for human:ID] [--json]   the queue, across all projects
+        (served by `actions_cli`, together with gated actions).
 
-Constat du 2026-10-10 : les orchestrateurs attendaient des décisions du
-propriétaire pendant 2 h 43 à 4 h 08 ; aucune demande ne lui était adressée,
-elles partaient dans le courrier d'autres agents (parfois une boîte morte),
-et il n'était joignable qu'en s'attachant à la session d'un orchestrateur.
-Désormais une demande a un destinataire humain, une file, une notification,
-une relance à l'échéance, et une réponse tracée.
+Finding of 2026-10-10: orchestrators were waiting for decisions from the
+owner for 2h43 to 4h08; no request was addressed to them, they went into
+other agents' mail (sometimes a dead mailbox), and the owner could only be
+reached by attaching to an orchestrator's session. Now a request has a human
+recipient, a queue, a notification, a reminder at its deadline, and a
+traced answer.
 
 **Only the queue counts** (L233, owner feedback of 2026-10-12): a lot
 enters `waiting_human` only while a request is open for it (`work.move`
@@ -32,29 +32,28 @@ decision written in prose in mail to bureau or to a human is not a request:
 `PROSE_CUES`, last 24 h) with the command that converts it,
 `ameesh decide ask --from-mail <id>`, run by its author.
 
-**Destinataire** (premier trouvé) : le responsable de la fiche du plan du lot
-(en remontant les parents), le responsable de l'agent demandeur, celui de
-l'assigné du lot, `notify.default_human`, le seul humain déclaré
-(`humans`) ; sinon tout humain du mesh (`human:*`).
+**Recipient** (first found): the responsible of the work item's plan entry
+(walking up the parents), the responsible of the requesting agent, that of
+the work item's assignee, `notify.default_human`, the only declared human
+(`humans`); otherwise any human of the mesh (`human:*`).
 
-**Données**, sans migration : une demande est une ligne de `agent_mailbox`
-(`kind = 'request'`, destinataire `human:<id>`, objet `payload.decision`),
-« non remise » tant qu'elle attend ; la réponse la clôt en une écriture
-conditionnelle (un seul gagnant). Les transitions du lot sont dans
-`work_item_events`. La réponse enregistre l'identité, le canal (`cli`,
-`chat`, `signed`) et le texte exact.
+**Data**, no migration: a request is an `agent_mailbox` row
+(`kind = 'request'`, recipient `human:<id>`, object `payload.decision`),
+"undelivered" while it waits; the answer closes it with one conditional
+write (a single winner). The work item's transitions are in
+`work_item_events`. The answer records the identity, the channel (`cli`,
+`chat`, `signed`) and the exact text.
 
-**Identité de qui répond** : un humain, `human:<utilisateur Unix>`. Refusé :
-une session d'agent (`AGENT_MAIL_NAME`, bail d'exécuteur, session liée par
-`ameesh mail bind`), et une commande dont un processus ANCÊTRE porte une
-identité d'agent (une variable retirée par l'agent reste visible dans
-l'environnement initial de ses ancêtres). Exception : la session
-`ameesh chat` du propriétaire (L123), vérifiée par son processus ancêtre
-enregistré — canal `chat`. C'est une garde contre la confusion, pas une
-frontière de sécurité (agents et humain partagent l'utilisateur Unix) : la
-frontière, pour les gestes en production ou irréversibles, est la réponse
-SIGNÉE (`--needs-signature`) par la clé du propriétaire, avec le mécanisme
-d'`ameesh approve` (`mesh_approvals`, consommation unique).
+**Identity of who answers**: a human, `human:<Unix user>`. Refused: an
+agent session (`AGENT_MAIL_NAME`, runner lease, session bound with
+`ameesh mail bind`), and a command whose ANCESTOR process carries an agent
+identity (a variable removed by the agent stays visible in the initial
+environment of its ancestors). Exception: the owner's `ameesh chat` session
+(L123), verified through its recorded ancestor process — channel `chat`.
+This is a guard against confusion, not a security boundary (agents and the
+human share the Unix user): the boundary, for production or irreversible
+actions, is the answer SIGNED (`--needs-signature`) with the owner's key,
+using the `ameesh approve` mechanism (`mesh_approvals`, single use).
 """
 from __future__ import annotations
 
@@ -82,7 +81,7 @@ REPLY_KIND = "reply"
 STATES = ("pending", "answered", "withdrawn")
 #: canaux d'une réponse (`signed` : signée par la clé du propriétaire)
 CHANNELS = ("cli", "chat", "signed")
-CHANNEL_LABELS = {"cli": "cli", "chat": "chat", "signed": "signé"}
+CHANNEL_LABELS = {"cli": "cli", "chat": "chat", "signed": "signed"}
 #: destinataire d'une demande sans responsable connu : tout humain du mesh
 OWNER_ANY = "human:*"
 #: échéance par défaut d'une demande (relance du propriétaire passé ce délai)
@@ -178,9 +177,9 @@ def agent_in_ancestry(*, allow: str | None = None, chain=None, environ_of=None) 
         name = (env.get("AGENT_MAIL_NAME") or "").strip()
         runner = next((env[key] for key in RUNNER_ENV if env.get(key)), "")
         if runner:
-            return "processus %s : agent %s mené par %s" % (pid, name or "?", runner)
+            return "process %s: agent %s run by %s" % (pid, name or "?", runner)
         if name and name != allow:
-            return "processus %s : agent %s" % (pid, name)
+            return "process %s: agent %s" % (pid, name)
     return None
 
 
@@ -192,16 +191,16 @@ def agent_session_reason(cfg: Config, db, *, chain=None, environ_of=None) -> str
     (`ameesh mail bind`), ancêtre qui porte une identité d'agent."""
     name = (os.environ.get("AGENT_MAIL_NAME") or "").strip()
     if name:
-        return "cette session est celle de l'agent %s (AGENT_MAIL_NAME)" % name
+        return "this session belongs to agent %s (AGENT_MAIL_NAME)" % name
     runner = next((os.environ[key] for key in RUNNER_ENV if os.environ.get(key)), "")
     if runner:
-        return "cette session est menée par l'exécuteur %s" % runner
+        return "this session is run by runner %s" % runner
     binding = identity.resolve_binding(cfg, db)
     if binding.name:
-        return "cette session est liée à l'agent %s (ameesh mail bind)" % binding.name
+        return "this session is bound to agent %s (ameesh mail bind)" % binding.name
     found = agent_in_ancestry(chain=chain, environ_of=environ_of)
     if found:
-        return "cette commande est lancée depuis la session d'un agent (%s)" % found
+        return "this command was launched from an agent's session (%s)" % found
     return None
 
 
@@ -210,8 +209,8 @@ def human_session(cfg: Config, db, *, chain=None, environ_of=None) -> str:
     c'est celle d'un agent (`agent_session_reason`)."""
     reason = agent_session_reason(cfg, db, chain=chain, environ_of=environ_of)
     if reason:
-        raise DecisionError("refus : %s ; seul un humain répond à une demande de décision — "
-                            "réponds depuis ton propre terminal, ou dans `ameesh chat`" % reason)
+        raise DecisionError("refused: %s; only a human answers a decision request — "
+                            "answer from your own terminal, or in `ameesh chat`" % reason)
     return current_human()
 
 
@@ -223,17 +222,17 @@ def chat_session(cfg: Config, *, chain=None, environ_of=None) -> Answerer | None
         return None
     if (os.environ.get("AGENT_MAIL_NAME") or "").strip() != name \
             or any(os.environ.get(key) for key in RUNNER_ENV + LEASE_ENV):
-        raise DecisionError("refus : session de chat incohérente (identité ou bail d'exécuteur) "
-                            "— relance `ameesh chat` depuis ton terminal")
+        raise DecisionError("refused: inconsistent chat session (identity or runner lease) "
+                            "— restart `ameesh chat` from your terminal")
     from . import chat as chat_mod
     record = chat_mod.verify_session(cfg, name, os.environ.get(CHAT_PID_ENV), chain=chain)
     found = agent_in_ancestry(allow=name, chain=chain, environ_of=environ_of)
     if found:
-        raise DecisionError("refus : cette commande descend de la session d'un agent (%s), "
-                            "pas seulement du chat %s" % (found, name))
+        raise DecisionError("refused: this command descends from an agent's session (%s), "
+                            "not only from chat %s" % (found, name))
     human = str(record.get("human") or "")
     if human != current_human():
-        raise DecisionError("refus : le chat %s est celui de %s, pas de %s"
+        raise DecisionError("refused: chat %s belongs to %s, not to %s"
                             % (name, human or "?", current_human()))
     return Answerer(human, "chat", name)
 
@@ -398,19 +397,19 @@ def parse_options(values) -> list[dict]:
         key, sep, label = str(value).partition("=")
         key, label = key.strip(), " ".join(label.split())
         if not sep or not OPTION_KEY_RE.match(key) or not label:
-            raise DecisionError("option illisible : %r (attendu --option a=\"libellé\", clé de "
-                                "lettres ou de chiffres, 16 caractères au plus)" % (value,))
+            raise DecisionError("unreadable option: %r (expected --option a=\"label\", a key of "
+                                "letters or digits, 16 characters at most)" % (value,))
         if any(o["key"].lower() == key.lower() for o in out):
-            raise DecisionError("option %s en double" % key)
+            raise DecisionError("duplicate option %s" % key)
         if len(label) > MAX_LABEL:
-            raise DecisionError("option %s : libellé trop long (%d caractères au plus)"
+            raise DecisionError("option %s: label too long (%d characters at most)"
                                 % (key, MAX_LABEL))
         reason = fil.unreadable_reason(label)
         if reason:
-            raise DecisionError("option %s illisible — %s" % (key, reason))
+            raise DecisionError("unreadable option %s — %s" % (key, reason))
         out.append({"key": key, "label": label})
     if len(out) > MAX_OPTIONS:
-        raise DecisionError("%d options au plus" % MAX_OPTIONS)
+        raise DecisionError("%d options at most" % MAX_OPTIONS)
     return out
 
 
@@ -425,7 +424,7 @@ def parse_due(text: str, now: float | None = None) -> float:
     if match:
         hour, minute = int(match.group(1)), int(match.group(2))
         if hour > 23 or minute > 59:
-            raise DecisionError("échéance illisible : %r" % value)
+            raise DecisionError("unreadable deadline: %r" % value)
         local = time.localtime(now)
         moment = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0,
                               0, 0, -1))
@@ -438,7 +437,7 @@ def parse_due(text: str, now: float | None = None) -> float:
     try:
         return now + stagnation.parse_duration(value)
     except stagnation.StaleError as exc:
-        raise DecisionError("--by : %s (ou une heure 18:00, une date 2026-10-12 09:00)"
+        raise DecisionError("--by: %s (or a time 18:00, a date 2026-10-12 09:00)"
                             % exc) from exc
 
 
@@ -447,34 +446,34 @@ def _local(ts) -> str:
 
 
 def _owner_label(owner: str | None) -> str:
-    return owner or "tout humain du mesh"
+    return owner or "any human of the mesh"
 
 
 def request_text(decision: dict, *, requester: str, owner: str | None,
                  decision_id: int | None = None) -> str:
     """Le texte lisible d'une demande (fil, courrier, R12)."""
     lot = decision.get("lot")
-    head = "Décision%s demandée à %s par %s — lot #%s « %s »%s :" % (
+    head = "Decision%s requested from %s by %s — work item #%s \"%s\"%s:" % (
         " #%d" % decision_id if decision_id is not None else "", _owner_label(owner), requester,
         lot, decision.get("lot_title") or "",
-        " (projet %s)" % decision["project"] if decision.get("project") else "")
+        " (project %s)" % decision["project"] if decision.get("project") else "")
     lines = [head, decision.get("question") or ""]
     for option in decision.get("options") or ():
         lines.append("  %s) %s%s" % (option["key"], option["label"],
-                                     "   ← recommandé" if option["key"] == decision.get("recommend")
+                                     "   ← recommended" if option["key"] == decision.get("recommend")
                                      else ""))
     if decision.get("recommend"):
-        lines.append("Recommandation : %s%s" % (
+        lines.append("Recommendation: %s%s" % (
             decision["recommend"], " — %s" % decision["why"] if decision.get("why") else ""))
-    tail = ["Échéance : %s." % _local(decision["due_ts"])] if decision.get("due_ts") else []
+    tail = ["Deadline: %s." % _local(decision["due_ts"])] if decision.get("due_ts") else []
     if decision.get("urgent"):
         tail.append("URGENT.")
     if decision.get("needs_signature"):
-        tail.append("Réponse SIGNÉE exigée (geste en production ou irréversible).")
+        tail.append("SIGNED answer required (production or irreversible action).")
     if tail:
         lines.append(" ".join(tail))
-    lines.append("Répondre : ameesh decide %s <option | \"texte\"> (ou dans ameesh chat)"
-                 % (decision_id if decision_id is not None else "<numéro>"))
+    lines.append("Answer: ameesh decide %s <option | \"text\"> (or in ameesh chat)"
+                 % (decision_id if decision_id is not None else "<number>"))
     return "\n".join(lines)
 
 
@@ -493,7 +492,8 @@ def _hold_lot(db, item: dict, *, note: str, actor: str) -> str:
 def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str | None = None,
         new_lot: str | None = None, recommend: str | None = None, why: str | None = None,
         urgent: bool = False, due_ts: float | None = None, needs_signature: bool = False,
-        source_mail: int | None = None, now: float | None = None) -> dict:
+        source_mail: int | None = None, parent_lot: str | None = None,
+        now: float | None = None) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
     (rien n'est déposé).
@@ -502,6 +502,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     prose; it must be theirs. Its lot is the default `lot`, and once the
     request names it, the mail is no longer shown as a prose decision."""
     now = time.time() if now is None else float(now)
+    mail_lot = None
     if source_mail is not None:
         mail_row = storage.of(db).decisions.source_mail(int(source_mail))
         if mail_row is None:
@@ -515,43 +516,61 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
             lot = mail_lot
     question = str(question or "").strip()
     if not question:
-        raise DecisionError("question vide (--question \"…\")")
+        raise DecisionError("empty question (--question \"…\")")
     if len(question) > MAX_QUESTION:
-        raise DecisionError("question trop longue (%d caractères au plus) : résumez, et "
-                            "renvoyez au fil ou au lot pour le détail" % MAX_QUESTION)
+        raise DecisionError("question too long (%d characters at most): summarize, and "
+                            "refer to the thread or the work item for details" % MAX_QUESTION)
     reason = fil.unreadable_reason(question)
     if reason:
-        raise DecisionError("question illisible — %s" % reason)
+        raise DecisionError("unreadable question — %s" % reason)
     opts = parse_options(options)
     recommend = (recommend or "").strip() or None
     why = " ".join(str(why or "").split()) or None
     if recommend is not None:
         if not opts:
-            raise DecisionError("--recommend sans option : proposez des options (--option a=…)")
+            raise DecisionError("--recommend without options: offer options (--option a=…)")
         match = [o["key"] for o in opts if o["key"].lower() == recommend.lower()]
         if not match:
-            raise DecisionError("--recommend %s : pas une des options (%s)"
+            raise DecisionError("--recommend %s: not one of the options (%s)"
                                 % (recommend, ", ".join(o["key"] for o in opts)))
         recommend = match[0]
     if why and recommend is None:
-        raise DecisionError("--why accompagne --recommend")
+        raise DecisionError("--why goes with --recommend")
     if (lot is None) == (new_lot is None):
-        raise DecisionError("--lot <id|réf> OU --new-lot \"titre\" (exactement un) : une "
-                            "demande est rattachée à un lot")
+        raise DecisionError("--lot <id|ref> OR --new-lot \"title\" (exactly one): a "
+                            "request is attached to a work item")
     if due_ts is None:
         due_ts = now + DEFAULT_DUE_S
     elif float(due_ts) <= now:
-        raise DecisionError("échéance déjà passée (%s)" % _local(due_ts))
+        raise DecisionError("deadline already passed (%s)" % _local(due_ts))
     requester_row = registry.get(db, requester)
+    if parent_lot is not None and new_lot is None:
+        raise DecisionError("--parent-lot goes with --new-lot")
     if new_lot is not None:
         title = " ".join(new_lot.split())
         if not title:
-            raise DecisionError("--new-lot : titre vide")
+            raise DecisionError("--new-lot: empty title")
         try:
+            from . import assignments, work_projects
+            project = work_projects.creation_project(cfg, db, requester)
+            if not project:
+                parent_ref = parent_lot or mail_lot
+                parent = None
+                if parent_ref:
+                    number = str(parent_ref).strip().lstrip("#")
+                    # A follow-up may inherit from a completed lot. It reads
+                    # its project; it does not assign or reopen that lot.
+                    parent = (work.get(db, int(number)) if number.isdigit()
+                              else assignments.resolve_lot(db, parent_ref))
+                    if parent is None:
+                        raise DecisionError("parent work item %s not found" % parent_ref)
+                project = work_projects.creation_project(cfg, db, requester, parent=parent)
             item = work.add(db, title=title, assignee=requester, actor=requester,
-                            source="decision", cfg=cfg)
+                            source="decision", app=project, cfg=cfg)
         except work.WorkError as exc:
-            raise DecisionError("lot non créé — %s" % exc) from exc
+            raise DecisionError("work item not created — %s" % exc) from exc
+        except assignments.AssignmentError as exc:
+            raise DecisionError(str(exc)) from exc
     else:
         from . import assignments
         try:
@@ -559,8 +578,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         except assignments.AssignmentError as exc:
             raise DecisionError(str(exc)) from exc
         if item is None:
-            raise DecisionError("lot %s introuvable : un numéro de lot ouvert, une référence "
-                                "unique, ou --new-lot \"titre\"" % lot)
+            raise DecisionError("work item %s not found: an open work item number, a unique "
+                                "reference, or --new-lot \"title\"" % lot)
     owner, source = resolve_owner(cfg, db, requester_row, item)
     lot_id = int(item["id"])
     previous = item["state"]
@@ -590,7 +609,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                lot=lot_id, mailbox_ids=[decision_id],
                meta={"kind": KIND, "decision": decision_id, "urgent": True if urgent else None,
                      "signature": "exigée" if needs_signature else None})
-    lot_state = _hold_lot(db, item, actor=requester, note="décision #%d demandée à %s : %s" % (
+    lot_state = _hold_lot(db, item, actor=requester, note="decision #%d requested from %s: %s" % (
         decision_id, _owner_label(owner), fil.excerpt(question, 160)))
     out = get(db, decision_id, now) or {"id": decision_id}
     out["lot_state"] = lot_state
@@ -689,18 +708,18 @@ def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
 def _approver_of(human: str, approver: str | None) -> str:
     name = (approver or human.split(":", 1)[-1]).strip()
     if not NAME_RE.match(name):
-        raise DecisionError("clé du propriétaire : précisez son nom au registre (--as NOM)")
+        raise DecisionError("owner key: give its name in the registry (--as NAME)")
     return name
 
 
 def signature_hint(view: dict, text: str, option: str | None, human: str) -> str:
     digest = answer_digest(view, text, option, human)
     answer = text if " " not in text else '"%s"' % text.replace('"', '\\"')
-    return ("décision #%d : réponse SIGNÉE exigée (geste en production ou irréversible). "
-            "Signe-la toi-même, dans ton terminal :\n"
-            "  ameesh decide %d %s --key <clé privée du propriétaire> [--as <nom de la clé>]\n"
-            "ou signe d'abord son empreinte, puis réponds avec --signed :\n"
-            "  ameesh approve --key <clé> --as <nom de la clé> --action %s --kind %s --hash %s\n"
+    return ("decision #%d: SIGNED answer required (production or irreversible action). "
+            "Sign it yourself, in your terminal:\n"
+            "  ameesh decide %d %s --key <owner private key> [--as <key name>]\n"
+            "or first sign its digest, then answer with --signed:\n"
+            "  ameesh approve --key <key> --as <key name> --action %s --kind %s --hash %s\n"
             "  ameesh decide %d %s --signed"
             % (view["id"], view["id"], answer, APPROVAL_ACTION, APPROVAL_KIND, digest,
                view["id"], answer))
@@ -716,18 +735,18 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
         try:
             seed = signing.read_private(os.path.expanduser(key_path))
         except (OSError, ValueError) as exc:
-            raise DecisionError("clé privée illisible : %s" % exc) from exc
+            raise DecisionError("unreadable private key: %s" % exc) from exc
         try:
             authority.create_approval(
                 db, seed, approver=_approver_of(human, approver), action=APPROVAL_ACTION,
                 artifact_kind=APPROVAL_KIND, artifact_hash=digest, ttl=SIGN_TTL_S,
                 meta={"decision": int(view["id"]), "by": human})
         except authority.AuthorityError as exc:
-            raise DecisionError("signature refusée : %s" % exc) from exc
+            raise DecisionError("signature rejected: %s" % exc) from exc
     row, verdict = authority.find_approval(db, APPROVAL_ACTION, digest,
                                            consume_by="decision:%d" % int(view["id"]))
     if row is None or not verdict.ok:
-        raise DecisionError("réponse signée refusée : %s\n%s" % (
+        raise DecisionError("signed answer rejected: %s\n%s" % (
             verdict.reason, signature_hint(view, text, option, human)))
     return {"approval_id": int(row["id"]), "approver": row.get("approver"),
             "signature_key": row.get("signature_key"), "digest": digest}
@@ -741,25 +760,25 @@ def verify_proof(db, view: dict) -> tuple[bool, str]:
     answer = view.get("answer") or {}
     proof = answer.get("proof") or {}
     if not proof:
-        return False, "réponse non signée"
+        return False, "unsigned answer"
     digest = answer_digest(view, answer.get("text") or "", answer.get("option"),
                            answer.get("by") or "")
     if digest != proof.get("digest"):
-        return False, "l'empreinte ne correspond plus à la réponse enregistrée"
+        return False, "the digest no longer matches the recorded answer"
     rows = storage.of(db).approvals.recent(action=APPROVAL_ACTION, artifact_hash=digest, limit=20)
     row = next((r for r in rows if int(r["id"]) == int(proof.get("approval_id") or 0)), None)
     if row is None:
-        return False, "approbation #%s introuvable" % proof.get("approval_id")
+        return False, "approval #%s not found" % proof.get("approval_id")
     if row.get("consumed_by") != "decision:%d" % int(view["id"]):
-        return False, "approbation #%s non consommée par cette décision" % row["id"]
+        return False, "approval #%s not consumed by this decision" % row["id"]
     info = authority.key_info(db, row.get("approver") or "") or {}
     if (info.get("key_role") or "") != "owner" or not info.get("public_key"):
-        return False, "la clé de %s n'est pas (ou plus) une clé du propriétaire" % row.get(
+        return False, "the key of %s is not (or no longer) an owner key" % row.get(
             "approver")
     if info.get("key_revoked_ts"):
-        return False, "clé de %s révoquée depuis" % row.get("approver")
+        return False, "key of %s revoked since" % row.get("approver")
     if info.get("public_key_fingerprint") != row.get("signature_key"):
-        return False, "clé de %s changée depuis la signature" % row.get("approver")
+        return False, "key of %s changed since the signature" % row.get("approver")
     try:
         parts = str(row.get("signed_payload") or "").split("|", 2)
         signed = json.loads(parts[2]) if len(parts) == 3 else {}
@@ -770,17 +789,17 @@ def verify_proof(db, view: dict) -> tuple[bool, str]:
     except (ValueError, authority.AuthorityError):
         ok = False
     if not ok:
-        return False, "signature Ed25519 invalide"
-    return True, "signée par la clé du propriétaire %s (%s…), approbation #%s" % (
+        return False, "invalid Ed25519 signature"
+    return True, "signed with the owner key %s (%s…), approval #%s" % (
         row.get("approver"), str(row.get("signature_key") or "")[:12], row["id"])
 
 
 def _closed_reason(view: dict) -> str:
     if view["state"] == "withdrawn":
         who = (view.get("withdrawn") or {}).get("by") or view.get("requester")
-        return "décision #%d retirée par %s" % (view["id"], who)
+        return "decision #%d withdrawn by %s" % (view["id"], who)
     answer = view.get("answer") or {}
-    return "décision #%d déjà répondue par %s (%s) : « %s »" % (
+    return "decision #%d already answered by %s (%s): \"%s\"" % (
         view["id"], answer.get("by") or "?", CHANNEL_LABELS.get(answer.get("channel"), "?"),
         fil.excerpt(answer.get("text") or "", 120))
 
@@ -801,15 +820,15 @@ def _release_lot(db, view: dict, *, actor: str, note: str) -> dict:
     if item["state"] == "waiting_human" and not others and target \
             and target in work.TRANSITIONS["waiting_human"]:
         try:
-            work.move(db, int(lot), target, note="%s — le lot revient en %s" % (note, target),
+            work.move(db, int(lot), target, note="%s — the work item returns to %s" % (note, target),
                       actor=actor)
             return {"lot": int(lot), "state": target, "moved": True, "others": 0}
         except work.WorkError:
             item = work.get(db, int(lot)) or item
     suffix = ""
     if item["state"] == "waiting_human":
-        suffix = (" — le lot reste en attente : %d autre(s) décision(s) en attente" % len(others)
-                  if others else " — le lot reste en waiting_human (il l'était avant la demande)")
+        suffix = (" — the work item stays waiting: %d other decision(s) pending" % len(others)
+                  if others else " — the work item stays in waiting_human (it was before the request)")
     work.note(db, int(lot), note + suffix, actor=actor)
     return {"lot": int(lot), "state": item["state"], "moved": False, "others": len(others)}
 
@@ -819,22 +838,22 @@ def answer_text(view: dict) -> str:
     answer = view.get("answer") or {}
     channel = answer.get("channel")
     if answer.get("option"):
-        what = "option %s « %s »" % (answer["option"], answer.get("option_label") or "")
+        what = "option %s \"%s\"" % (answer["option"], answer.get("option_label") or "")
     else:
-        what = "réponse libre"
-    lines = ["Décision #%d — réponse du propriétaire %s (%s) sur le lot #%s « %s » : %s." % (
+        what = "free answer"
+    lines = ["Decision #%d — answer from owner %s (%s) on work item #%s \"%s\": %s." % (
         view["id"], answer.get("by"), CHANNEL_LABELS.get(channel, channel), view.get("lot"),
         view.get("lot_title") or "", what),
-        "Texte exact : « %s »" % (answer.get("text") or ""),
-        "Ta question : « %s »" % fil.excerpt(view.get("question") or "", 300)]
+        "Exact text: \"%s\"" % (answer.get("text") or ""),
+        "Your question: \"%s\"" % fil.excerpt(view.get("question") or "", 300)]
     if channel == "signed":
         proof = answer.get("proof") or {}
-        lines.append("Réponse SIGNÉE par la clé du propriétaire (approbation #%s, clé %s…), "
-                     "vérifiée et consommée : `ameesh decide show %d`."
+        lines.append("Answer SIGNED with the owner key (approval #%s, key %s…), "
+                     "verified and consumed: `ameesh decide show %d`."
                      % (proof.get("approval_id"), str(proof.get("signature_key") or "")[:12],
                         view["id"]))
-    lines.append("Cette réponse, enregistrée dans la file des décisions, vaut décision du "
-                 "propriétaire : reprends le lot en conséquence (vérifiable : ameesh decide "
+    lines.append("This answer, recorded in the decision queue, is the owner's "
+                 "decision: resume the work item accordingly (verifiable: ameesh decide "
                  "show %d)." % view["id"])
     return "\n".join(lines)
 
@@ -849,30 +868,30 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     absente ou refusée."""
     now = time.time() if now is None else float(now)
     if channel not in CHANNELS:
-        raise DecisionError("canal inconnu : %r" % channel)
+        raise DecisionError("unknown channel: %r" % channel)
     view = get(db, decision_id, now)
     if view is None:
-        raise DecisionError("décision #%s introuvable (ameesh decisions)" % decision_id)
+        raise DecisionError("decision #%s not found (ameesh decisions)" % decision_id)
     if view["state"] != "pending":
         raise DecisionError(_closed_reason(view))
     if view["owner"] and view["owner"] != human:
-        raise DecisionError("décision #%d adressée à %s : %s n'y répond pas"
+        raise DecisionError("decision #%d is addressed to %s: %s does not answer it"
                             % (view["id"], view["owner"], human))
     text = str(text or "").strip()
     if not text:
-        raise DecisionError("réponse vide : une option (%s) ou un texte"
-                            % (", ".join(o["key"] for o in view["options"]) or "aucune"))
+        raise DecisionError("empty answer: an option (%s) or a text"
+                            % (", ".join(o["key"] for o in view["options"]) or "none"))
     if len(text) > MAX_ANSWER:
-        raise DecisionError("réponse trop longue (%d caractères au plus)" % MAX_ANSWER)
+        raise DecisionError("answer too long (%d characters at most)" % MAX_ANSWER)
     reason = fil.unreadable_reason(text)
     if reason:
-        raise DecisionError("réponse illisible — %s" % reason)
+        raise DecisionError("unreadable answer — %s" % reason)
     option = match_option(view, text)
     proof = None
     if key_path or signed:
         if channel == "chat":
-            raise DecisionError("une réponse signée se donne dans ton terminal, pas dans le "
-                                "chat :\n" + signature_hint(view, text, option, human))
+            raise DecisionError("a signed answer is given in your terminal, not in the "
+                                "chat:\n" + signature_hint(view, text, option, human))
         proof = _sign(db, view, text, option, human, key_path=key_path, approver=approver)
         channel = "signed"
     elif view["needs_signature"]:
@@ -885,13 +904,13 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     if closed is None:
         latest = get(db, decision_id, now)
         raise DecisionError(_closed_reason(latest) if latest else
-                            "décision #%s introuvable" % decision_id)
+                            "decision #%s not found" % decision_id)
     view = view_of(closed, now)
     if option:
-        said = "option %s « %s »" % (option, _option_label(view, option) or "")
+        said = "option %s \"%s\"" % (option, _option_label(view, option) or "")
     else:
-        said = "« %s »" % fil.excerpt(text, 160)
-    lot = _release_lot(db, view, actor=human, note="décision #%d répondue par %s (%s) : %s" % (
+        said = "\"%s\"" % fil.excerpt(text, 160)
+    lot = _release_lot(db, view, actor=human, note="decision #%d answered by %s (%s): %s" % (
         view["id"], human, CHANNEL_LABELS[channel], said))
     out = {"decision": view, "lot": lot, "message_id": None, "warning": None}
     from . import mail
@@ -907,8 +926,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                                          "text": text}},
             thread_meta={"decision": view["id"], "channel": channel})
     except Exception as exc:  # noqa: BLE001 - la réponse est enregistrée : le dire
-        out["warning"] = ("réponse enregistrée, mais le courrier à %s n'a pas été déposé (%s) : "
-                          "prévenez-le" % (view["requester"], exc))
+        out["warning"] = ("answer recorded, but the mail to %s was not delivered (%s): "
+                          "let them know" % (view["requester"], exc))
     return out
 
 
@@ -918,11 +937,11 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
     now = time.time() if now is None else float(now)
     view = get(db, decision_id, now)
     if view is None:
-        raise DecisionError("décision #%s introuvable" % decision_id)
+        raise DecisionError("decision #%s not found" % decision_id)
     if view["state"] != "pending":
         raise DecisionError(_closed_reason(view))
     if view["requester"] != requester:
-        raise DecisionError("décision #%d : seul son demandeur (%s) la retire"
+        raise DecisionError("decision #%d: only its requester (%s) can withdraw it"
                             % (view["id"], view["requester"]))
     why = " ".join(str(why or "").split()) or None
     record = {"state": "withdrawn", "withdrawn": {"by": requester, "why": why,
@@ -931,12 +950,12 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
     if closed is None:
         latest = get(db, decision_id, now)
         raise DecisionError(_closed_reason(latest) if latest else
-                            "décision #%s introuvable" % decision_id)
+                            "decision #%s not found" % decision_id)
     view = view_of(closed, now)
-    text = "décision #%d retirée par %s%s" % (view["id"], requester, " : %s" % why if why else "")
+    text = "decision #%d withdrawn by %s%s" % (view["id"], requester, ": %s" % why if why else "")
     lot = _release_lot(db, view, actor=requester, note=text)
     fil.record(cfg, db, sender=requester, recipients=[view["owner"] or OWNER_ANY],
-               text="Décision #%d retirée par %s%s — question : « %s »" % (
+               text="Decision #%d withdrawn by %s%s — question: \"%s\"" % (
                    view["id"], requester, " (%s)" % why if why else "",
                    fil.excerpt(view["question"], 300)),
                project=fil.project_for(cfg, closed.get("sender_project")), lot=view.get("lot"),
@@ -952,12 +971,12 @@ def describe(view: dict, limit: int = 220) -> str:
     """Une ligne : numéro, demandeur, question, options, recommandation."""
     options = " ; ".join("%s) %s" % (o["key"], fil.excerpt(o["label"], 40))
                          for o in view.get("options") or ())
-    return "décision #%d de %s pour %s : « %s »%s%s — répondre : ameesh decide %d <option> " \
-           "(ou ameesh chat)" % (
+    return "decision #%d from %s for %s: \"%s\"%s%s — answer: ameesh decide %d <option> " \
+           "(or ameesh chat)" % (
                view["id"], view.get("requester"), _owner_label(view.get("owner")),
                fil.excerpt(view.get("question") or "", limit),
                " — %s" % options if options else "",
-               " ; recommandé : %s" % view["recommend"] if view.get("recommend") else "",
+               "; recommended: %s" % view["recommend"] if view.get("recommend") else "",
                view["id"])
 
 
@@ -982,7 +1001,7 @@ def board_summary(rows, *, viewer: str | None = None, now: float | None = None) 
 
 
 def short_span(seconds) -> str:
-    """Une durée courte : 42s, 12m, 2h05, 1j03h."""
+    """Une durée courte : 42s, 12m, 2h05, 1d03h."""
     seconds = int(max(0, seconds or 0))
     if seconds < 60:
         return "%ds" % seconds
@@ -990,7 +1009,7 @@ def short_span(seconds) -> str:
         return "%dm" % (seconds // 60)
     if seconds < 86400:
         return "%dh%02d" % (seconds // 3600, (seconds % 3600) // 60)
-    return "%dj%02dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    return "%dd%02dh" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
 def headline(summary: dict | None, now: float) -> str | None:
@@ -1002,20 +1021,19 @@ def headline(summary: dict | None, now: float) -> str | None:
         return None
     extra = []
     if summary.get("urgent"):
-        extra.append("%d urgente%s" % (summary["urgent"], "s" if summary["urgent"] > 1 else ""))
+        extra.append("%d urgent" % summary["urgent"])
     if summary.get("overdue"):
-        extra.append("%d échue%s" % (summary["overdue"], "s" if summary["overdue"] > 1 else ""))
+        extra.append("%d overdue" % summary["overdue"])
     plural = count > 1
     if summary.get("viewer"):
-        head = "%d décision%s t'attend%s" % (count, "s" if plural else "", "ent" if plural else "")
-        hint = "ameesh decisions, ou ameesh chat"
+        head = "%d decision%s waiting for you" % (count, "s" if plural else "")
+        hint = "ameesh decisions, or ameesh chat"
     else:
-        head = "%d décision%s attend%s un humain" % (count, "s" if plural else "",
-                                                   "ent" if plural else "")
+        head = "%d decision%s waiting for a human" % (count, "s" if plural else "")
         hint = "ameesh decisions"
-    return "%s, la plus ancienne depuis %s%s — %s" % (
+    return "%s, the oldest for %s%s — %s" % (
         head, short_span(now - float(summary["oldest_ts"])),
-        " (dont %s)" % ", ".join(extra) if extra else "", hint)
+        " (of which %s)" % ", ".join(extra) if extra else "", hint)
 
 
 def format_view(view: dict, now: float | None = None) -> list[str]:
@@ -1025,12 +1043,12 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
     if view.get("urgent"):
         flags.append("URGENT")
     if view.get("overdue"):
-        flags.append("ÉCHUE")
+        flags.append("OVERDUE")
     if view.get("needs_signature"):
-        flags.append("signature exigée")
-    head = "#%d  il y a %s · %s · lot #%s « %s » · de %s → %s%s" % (
+        flags.append("signature required")
+    head = "#%d  %s ago · %s · work item #%s \"%s\" · from %s → %s%s" % (
         view["id"], short_span(now - float(view["created_ts"])),
-        view.get("project") or "(sans projet)",
+        view.get("project") or "(no project)",
         view.get("lot"), fil.excerpt(view.get("lot_title") or "", 60), view.get("requester"),
         _owner_label(view.get("owner")), "  [%s]" % "] [".join(flags) if flags else "")
     lines = [head]
@@ -1038,30 +1056,30 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
         lines.append("      %s" % line)
     for option in view.get("options") or ():
         lines.append("        %s) %s%s" % (option["key"], option["label"],
-                                           "   ← recommandé"
+                                           "   ← recommended"
                                            if option["key"] == view.get("recommend") else ""))
     if view.get("recommend"):
-        lines.append("      recommandation : %s%s" % (
+        lines.append("      recommendation: %s%s" % (
             view["recommend"], " — %s" % view["why"] if view.get("why") else ""))
     if view["state"] == "pending":
         due = view.get("due_ts")
-        lines.append("      échéance %s%s · répondre : ameesh decide %d <option | \"texte\">%s" % (
+        lines.append("      deadline %s%s · answer: ameesh decide %d <option | \"text\">%s" % (
             _local(due) if due else "—",
-            (" (dépassée de %s)" % short_span(now - due) if now >= due else
-             " (dans %s)" % short_span(due - now)) if due else "",
-            view["id"], " --key <clé>" if view.get("needs_signature") else ""))
+            (" (overdue by %s)" % short_span(now - due) if now >= due else
+             " (in %s)" % short_span(due - now)) if due else "",
+            view["id"], " --key <key>" if view.get("needs_signature") else ""))
     elif view["state"] == "answered":
         answer = view.get("answer") or {}
-        lines.append("      répondue par %s (%s) le %s : « %s »" % (
+        lines.append("      answered by %s (%s) on %s: \"%s\"" % (
             answer.get("by"), CHANNEL_LABELS.get(answer.get("channel"), "?"),
             _local(answer.get("ts") or view.get("closed_ts") or now),
             fil.excerpt(answer.get("text") or "", 200)))
     else:
         withdrawn = view.get("withdrawn") or {}
-        lines.append("      retirée par %s le %s%s" % (
+        lines.append("      withdrawn by %s on %s%s" % (
             withdrawn.get("by") or view.get("requester"),
             _local(withdrawn.get("ts") or view.get("closed_ts") or now),
-            " : %s" % withdrawn["why"] if withdrawn.get("why") else ""))
+            ": %s" % withdrawn["why"] if withdrawn.get("why") else ""))
     return lines
 
 
@@ -1078,11 +1096,11 @@ def queue(db, *, human: str | None = None, include_closed: bool = False,
 # entrée : ameesh decide
 # --------------------------------------------------------------------------
 
-USAGE = ("usage : ameesh decide ask (--lot <id|réf> | --new-lot \"titre\") --question \"…\" "
+USAGE = ("usage: ameesh decide ask (--lot <id|ref> | --new-lot \"title\") --question \"…\" "
          "--option a=\"…\" [--option b=\"…\"] [--recommend a [--why \"…\"]] [--urgent] "
          "[--by 2h] [--needs-signature] [--from-mail <id>] [--json]\n"
-         "        ameesh decide <id> <option | \"texte libre\"> "
-         "[--key FICHIER [--as NOM] | --signed] [--json]\n"
+         "        ameesh decide <id> <option | \"free text\"> "
+         "[--key FILE [--as NAME] | --signed] [--json]\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
          "        ameesh decide show <id> [--json]")
 
@@ -1109,57 +1127,60 @@ def _parser(prog: str) -> argparse.ArgumentParser:
 def cmd_ask(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide ask")
     target = parser.add_mutually_exclusive_group()
-    target.add_argument("--lot", default=None, help="lot ouvert : numéro ou référence unique")
-    target.add_argument("--new-lot", default=None, help="crée le lot (assigné au demandeur)")
+    target.add_argument("--lot", default=None, help="open work item: number or unique reference")
+    target.add_argument("--new-lot", default=None, help="create the work item (assigned to the requester)")
+    parser.add_argument("--parent-lot", default=None,
+                        help="project fallback for --new-lot; default: the source mail's lot")
     parser.add_argument("--from-mail", type=int, default=None, metavar="ID",
                         help="L233: the mail in which you wrote this decision in prose "
                              "(its lot is the default --lot)")
     parser.add_argument("--question", required=True)
-    parser.add_argument("--option", action="append", default=[], metavar="CLÉ=LIBELLÉ")
-    parser.add_argument("--recommend", default=None, metavar="CLÉ")
-    parser.add_argument("--why", default=None, help="pourquoi cette recommandation")
+    parser.add_argument("--option", action="append", default=[], metavar="KEY=LABEL")
+    parser.add_argument("--recommend", default=None, metavar="KEY")
+    parser.add_argument("--why", default=None, help="why this recommendation")
     parser.add_argument("--urgent", action="store_true")
     parser.add_argument("--by", default=None,
-                        help="échéance : 30m, 2h, 1d, 18:00 ou « 2026-10-12 09:00 » "
-                             "(défaut : dans %d h)" % (DEFAULT_DUE_S // 3600))
+                        help="deadline: 30m, 2h, 1d, 18:00 or \"2026-10-12 09:00\" "
+                             "(default: in %d h)" % (DEFAULT_DUE_S // 3600))
     parser.add_argument("--needs-signature", action="store_true",
-                        help="geste en production ou irréversible : réponse signée exigée")
+                        help="production or irreversible action: signed answer required")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if os.environ.get(CHAT_ENV):
-        raise DecisionError("le chat transmet les demandes du propriétaire aux orchestrateurs ; "
-                            "il ne dépose pas de demande de décision")
+        raise DecisionError("the chat relays the owner's requests to orchestrators; "
+                            "it does not file decision requests")
     due = parse_due(args.by) if args.by else None
     db = _open(cfg)
     try:
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok:
             raise DecisionError(
-                "demandeur non lié (%s) : une demande de décision est déposée par un agent, "
-                "dont l'identité est posée par l'exécuteur (AGENT_MAIL_NAME)"
-                % (binding.reason or "aucune identité"))
+                "unbound requester (%s): a decision request is filed by an agent, "
+                "whose identity is set by the runner (AGENT_MAIL_NAME)"
+                % (binding.reason or "no identity"))
         view = ask(cfg, db, requester=binding.name, question=args.question,
                    options=args.option, lot=args.lot, new_lot=args.new_lot,
                    recommend=args.recommend, why=args.why, urgent=args.urgent, due_ts=due,
-                   needs_signature=args.needs_signature, source_mail=args.from_mail)
+                   needs_signature=args.needs_signature, source_mail=args.from_mail,
+                   parent_lot=args.parent_lot)
     finally:
         db.close()
     if args.json:
         _dump(view)
         return 0
-    print("décision #%d demandée à %s%s — lot #%s « %s » : %s" % (
+    print("decision #%d requested from %s%s — work item #%s \"%s\": %s" % (
         view["id"], _owner_label(view["owner"]),
-        " (%s)" % {"lot": "responsable de la fiche du lot", "agent": "ton responsable",
-                   "assigne": "responsable de l'assigné du lot",
-                   "defaut": "humain par défaut des alertes",
-                   "humain_unique": "seul humain déclaré"}.get(view["owner_source"], "")
+        " (%s)" % {"lot": "responsible of the work item's plan entry", "agent": "your responsible",
+                   "assigne": "responsible of the work item's assignee",
+                   "defaut": "default human for alerts",
+                   "humain_unique": "only declared human"}.get(view["owner_source"], "")
         if view["owner_source"] else "",
         view["lot"], view.get("lot_title") or "", view.get("lot_state")))
-    print("échéance %s%s%s ; le propriétaire est notifié, et relancé à l'échéance." % (
-        _local(view["due_ts"]), " · URGENTE" if view["urgent"] else "",
-        " · réponse SIGNÉE exigée" if view["needs_signature"] else ""))
-    print("La réponse te sera remise par courrier (elle te réveille) : n'attends pas en "
-          "bouclant, termine ton tour. Retirer la demande : ameesh decide withdraw %d"
+    print("deadline %s%s%s; the owner is notified, and reminded at the deadline." % (
+        _local(view["due_ts"]), " · URGENT" if view["urgent"] else "",
+        " · SIGNED answer required" if view["needs_signature"] else ""))
+    print("The answer will be delivered to you by mail (it wakes you up): do not wait in "
+          "a loop, end your turn. Withdraw the request: ameesh decide withdraw %d"
           % view["id"])
     return 0
 
@@ -1167,15 +1188,15 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
 def cmd_answer(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide")
     parser.add_argument("id")
-    parser.add_argument("answer", nargs="+", help="une option, ou un texte libre")
+    parser.add_argument("answer", nargs="+", help="an option, or free text")
     proof = parser.add_mutually_exclusive_group()
     proof.add_argument("--key", default=None,
-                       help="clé privée du propriétaire : signe la réponse (ameesh approve)")
+                       help="owner private key: signs the answer (ameesh approve)")
     proof.add_argument("--signed", action="store_true",
-                       help="la réponse est déjà signée (ameesh approve --action decision "
-                            "--hash …) : la trouver et la consommer")
+                       help="the answer is already signed (ameesh approve --action decision "
+                            "--hash …): find and consume it")
     parser.add_argument("--as", dest="as_name", default=None,
-                        help="nom de la clé du propriétaire au registre (défaut : ton nom)")
+                        help="name of the owner key in the registry (default: your name)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     decision_id = _decision_id(args.id)
@@ -1183,7 +1204,7 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     if args.as_name and not args.key:
-        print("--as n'a de sens qu'avec --key", file=sys.stderr)
+        print("--as only makes sense with --key", file=sys.stderr)
         return 2
     db = _open(cfg)
     try:
@@ -1197,21 +1218,21 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         _dump(result)
         return 0
     view, answer_ = result["decision"], result["decision"]["answer"]
-    print("décision #%d : réponse de %s (%s) enregistrée : %s« %s »" % (
+    print("decision #%d: answer from %s (%s) recorded: %s\"%s\"" % (
         view["id"], answer_["by"], CHANNEL_LABELS[answer_["channel"]],
         "option %s — " % answer_["option"] if answer_.get("option") else "", answer_["text"]))
     lot = result["lot"]
     if lot.get("moved"):
-        print("lot #%s : revient en %s" % (lot["lot"], lot["state"]))
+        print("work item #%s: returns to %s" % (lot["lot"], lot["state"]))
     elif lot.get("lot") is not None and lot.get("state"):
-        print("lot #%s : reste en %s%s" % (lot["lot"], lot["state"],
-                                           " (%d autre(s) décision(s) en attente)"
+        print("work item #%s: stays in %s%s" % (lot["lot"], lot["state"],
+                                           " (%d other decision(s) pending)"
                                            % lot["others"] if lot.get("others") else ""))
     if result.get("message_id"):
-        print("réponse déposée pour %s (message #%d) : elle le réveille"
+        print("answer delivered to %s (message #%d): it wakes them up"
               % (view["requester"], result["message_id"]))
     if result.get("warning"):
-        print("attention : %s" % result["warning"], file=sys.stderr)
+        print("warning: %s" % result["warning"], file=sys.stderr)
     return 0
 
 
@@ -1229,8 +1250,8 @@ def cmd_withdraw(cfg: Config, argv: list[str]) -> int:
     try:
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok or os.environ.get(CHAT_ENV):
-            raise DecisionError("seul l'agent qui a demandé la décision la retire (identité "
-                                "d'agent requise)")
+            raise DecisionError("only the agent that requested the decision can withdraw it (agent "
+                                "identity required)")
         result = withdraw(cfg, db, decision_id, requester=binding.name, why=args.why)
     finally:
         db.close()
@@ -1238,9 +1259,9 @@ def cmd_withdraw(cfg: Config, argv: list[str]) -> int:
         _dump(result)
         return 0
     lot = result["lot"]
-    print("décision #%d retirée%s" % (
+    print("decision #%d withdrawn%s" % (
         result["decision"]["id"],
-        " ; lot #%s %s %s" % (lot["lot"], "revient en" if lot.get("moved") else "reste en",
+        "; work item #%s %s %s" % (lot["lot"], "returns to" if lot.get("moved") else "stays in",
                               lot["state"]) if lot.get("state") else ""))
     return 0
 
@@ -1258,7 +1279,7 @@ def cmd_show(cfg: Config, argv: list[str]) -> int:
     try:
         view = get(db, decision_id)
         if view is None:
-            raise DecisionError("décision #%s introuvable" % args.id)
+            raise DecisionError("decision #%s not found" % args.id)
         proof = verify_proof(db, view) if (view.get("answer") or {}).get("proof") else None
     finally:
         db.close()
@@ -1272,9 +1293,9 @@ def cmd_show(cfg: Config, argv: list[str]) -> int:
         print(line)
     if view["state"] == "answered":
         answer_ = view.get("answer") or {}
-        print("      texte exact : « %s »" % (answer_.get("text") or ""))
+        print("      exact text: \"%s\"" % (answer_.get("text") or ""))
     if proof is not None:
-        print("      preuve : %s — %s" % ("VALIDE" if proof[0] else "INVALIDE", proof[1]))
+        print("      proof: %s — %s" % ("VALID" if proof[0] else "INVALID", proof[1]))
     return 0
 
 
@@ -1297,17 +1318,17 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE, file=sys.stderr)
         return 2
     except DecisionError as exc:
-        print(str(exc) if str(exc).startswith("refus") else "refus : %s" % exc,
+        print(str(exc) if str(exc).startswith("refus") else "refused: %s" % exc,
               file=sys.stderr)
         return 1
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

@@ -62,17 +62,17 @@ def decode_point(data: bytes) -> tuple[int, int]:
     elif len(data) == 33 and data[0] in (0x02, 0x03):
         x = int.from_bytes(data[1:], "big")
         if x >= P:
-            raise P256Error("abscisse hors du corps")
+            raise P256Error("x coordinate outside the field")
         rhs = (x * x * x + A * x + B) % P
         y = pow(rhs, (P + 1) // 4, P)  # p ≡ 3 (mod 4)
         if y * y % P != rhs:
-            raise P256Error("abscisse sans point sur la courbe")
+            raise P256Error("x coordinate with no point on the curve")
         if (y & 1) != (data[0] & 1):
             y = P - y
     else:
-        raise P256Error("point SEC1 attendu (65 octets 04… ou 33 octets 02/03…)")
+        raise P256Error("SEC1 point expected (65 bytes 04… or 33 bytes 02/03…)")
     if not is_on_curve(x, y):
-        raise P256Error("point hors de la courbe P-256")
+        raise P256Error("point not on the P-256 curve")
     return x, y
 
 
@@ -169,17 +169,17 @@ def _shamir(u1: int, u2: int, q: tuple[int, int]) -> tuple[int, int] | None:
 
 def _der_integer(data: bytes, index: int) -> tuple[int, int]:
     if index + 2 > len(data) or data[index] != 0x02:
-        raise P256Error("DER : INTEGER attendu")
+        raise P256Error("DER: INTEGER expected")
     length = data[index + 1]
     if length == 0 or length & 0x80 or length > 33:
-        raise P256Error("DER : longueur d'entier invalide")
+        raise P256Error("DER: invalid integer length")
     body = data[index + 2:index + 2 + length]
     if len(body) != length:
-        raise P256Error("DER : entier tronqué")
+        raise P256Error("DER: truncated integer")
     if body[0] & 0x80:
-        raise P256Error("DER : entier négatif")
+        raise P256Error("DER: negative integer")
     if length > 1 and body[0] == 0 and not body[1] & 0x80:
-        raise P256Error("DER : entier non minimal")
+        raise P256Error("DER: non-minimal integer")
     return int.from_bytes(body, "big"), index + 2 + length
 
 
@@ -187,13 +187,13 @@ def decode_der_signature(data: bytes) -> tuple[int, int]:
     """(r, s) d'une signature ECDSA DER, décodée strictement (DER, pas BER)."""
     data = bytes(data)
     if len(data) < 8 or len(data) > 72 or data[0] != 0x30:
-        raise P256Error("DER : SEQUENCE attendue")
+        raise P256Error("DER: SEQUENCE expected")
     if data[1] & 0x80 or data[1] != len(data) - 2:
-        raise P256Error("DER : longueur de SEQUENCE invalide")
+        raise P256Error("DER: invalid SEQUENCE length")
     r, index = _der_integer(data, 2)
     s, index = _der_integer(data, index)
     if index != len(data):
-        raise P256Error("DER : octets en trop")
+        raise P256Error("DER: trailing bytes")
     return r, s
 
 
@@ -284,9 +284,9 @@ def backend(name: str | None = None):
         try:
             instance = _BACKENDS[wanted]()
         except KeyError:
-            raise ValueError("backend ECDSA inconnu : %r (pure, cryptography)" % wanted)
+            raise ValueError("unknown ECDSA backend: %r (pure, cryptography)" % wanted)
         except ImportError as exc:
-            raise ValueError("backend ECDSA %s indisponible : %s" % (wanted, exc))
+            raise ValueError("ECDSA backend %s unavailable: %s" % (wanted, exc))
     _CACHE[wanted] = instance
     return instance
 

@@ -77,23 +77,23 @@ class NoteTest(unittest.TestCase):
     def test_en_cours_fini_arrete_puis_dit_une_fois(self):
         tracker, now = self._tracker(), 10_000.0
         en_cours = self._entry("aaaa", "running", now - 360,
-                               background.Job(5, "pid 5 « pytest -q »"))
+                               background.Job(5, 'pid 5 "pytest -q"'))
         fini = self._entry("bbbb", "done", now - 900,
-                           background.Job(6, "pid 6 « make test »", code=0, ended=now - 600),
+                           background.Job(6, 'pid 6 "make test"', code=0, ended=now - 600),
                            closed=now - 600)
         tue = self._entry("cccc", "expired", now - 1500,
-                          background.Job(7, "pid 7 « sleep 9999 »", code=-15, ended=now - 300),
+                          background.Job(7, 'pid 7 "sleep 9999"', code=-15, ended=now - 300),
                           closed=now - 300)
         autre = self._entry("dddd", "done", now - 60, background.Job(8, "x", code=1),
                             agent="b", closed=now - 30)
         tracker.entries = [en_cours, fini, tue, autre]
         texte, dits = tracker.note_for("a", now=now)
-        self.assertTrue(texte.startswith("[ameesh] Travail de fond de tes tours précédents"))
-        self.assertIn("pytest -q » : en cours ; arrêté dans 14 min", texte)
-        self.assertIn("terminé 5 min après la fin du tour", texte)
-        self.assertIn("make test » : code de sortie 0", texte)
-        self.assertIn("arrêté à l'échéance du délai de grâce (20 min)", texte)
-        self.assertIn("tué par le signal 15", texte)
+        self.assertTrue(texte.startswith("[ameesh] Background work from your previous turns"))
+        self.assertIn('pytest -q": running; stopped in 14 min', texte)
+        self.assertIn("finished 5 min after the turn ended", texte)
+        self.assertIn('make test": exit code 0', texte)
+        self.assertIn("stopped when the grace period (20 min) ran out", texte)
+        self.assertIn("killed by signal 15", texte)
         self.assertNotIn("dddd", texte)  # un autre agent
         self.assertEqual(dits, [tue.turn_id, fini.turn_id])
         tracker.mark_reported(dits)
@@ -107,7 +107,7 @@ class NoteTest(unittest.TestCase):
     def test_note_bornee(self):
         tracker, now = self._tracker(), 10_000.0
         tracker.entries = [self._entry("%04d" % i, "done", now - 100,
-                                       background.Job(i, "pid %d « %s »" % (i, "x" * 70),
+                                       background.Job(i, 'pid %d "%s"' % (i, "x" * 70),
                                                       code=0), closed=now)
                            for i in range(40)]
         texte, dits = tracker.note_for("a", now=now)
@@ -209,9 +209,9 @@ class GraceTest(_Base):
         self.assertIsNotNone(lignes[0]["ended_ts"])
         # le tour suivant l'apprend en tête de consigne
         consigne = self._tour(worker, "suite")
-        self.assertIn("Travail de fond de tes tours précédents", consigne)
-        self.assertIn("» : en cours", consigne)
-        self.assertIn("arrêté dans 20 min s'il tourne encore", consigne)
+        self.assertIn("Background work from your previous turns", consigne)
+        self.assertIn('": running', consigne)
+        self.assertIn("stopped in 20 min if still running", consigne)
         self.assertTrue(consigne.endswith("suite"))
         # le travail finit : l'exécuteur le constate, ferme la ressource
         open(stop, "w").close()
@@ -220,11 +220,11 @@ class GraceTest(_Base):
         self.assertFalse(runner.background.has_jobs("fond-ok"))
         self.assertEqual(self._ressources("fond-ok")[0]["status"], "done")
         consigne = self._tour(worker, "et après")
-        self.assertIn("terminé", consigne)
+        self.assertIn("finished", consigne)
         # code lu en sous-moissonneur ; ce processus de test ne l'est pas
-        self.assertRegex(consigne, r"code de sortie (4|inconnu)")
+        self.assertRegex(consigne, r"exit code (4|unknown)")
         # dit une fois
-        self.assertNotIn("Travail de fond", self._tour(worker, "encore"))
+        self.assertNotIn("Background work", self._tour(worker, "encore"))
 
     def test_echeance_de_la_grace_reglee_par_agent(self):
         runner, worker = self._worker("fond-long", turn_grace_seconds=1)
@@ -239,7 +239,7 @@ class GraceTest(_Base):
         self.wait_for(lambda: not platform.alive(pid), timeout=10)
         self.assertFalse(runner.background.has_jobs("fond-long"))
         self.assertIn(self._ressources("fond-long")[0]["status"], ("done", "orphan"))
-        self.assertIn("arrêté à l'échéance du délai de grâce", self._tour(worker))
+        self.assertIn("stopped when the grace period", self._tour(worker))
 
     def test_sans_grace_nettoyage_immediat(self):
         runner, worker = self._worker("fond-zero", turn_grace_seconds=0)
@@ -261,7 +261,7 @@ class GraceTest(_Base):
         self._tour(worker, AMEESH_TEST_CLAUDE_CALLS=json.dumps(appels),
                    AMEESH_TEST_BACKGROUND="sleep 60", AMEESH_TEST_BACKGROUND_PID=pidfile)
         self.assertLess(time.monotonic() - debut, 20)
-        self.assertTrue(worker.last_turn_closed.startswith("durée maximale du tour"))
+        self.assertTrue(worker.last_turn_closed.startswith("maximum turn duration"))
         pid = self._pid(pidfile)
         self.assertTrue(platform.alive(pid), "la clôture au point sûr a tué le travail")
         self.assertTrue(runner.background.has_jobs("fond-clos"))
@@ -273,14 +273,14 @@ class GraceTest(_Base):
     def test_arret_d_urgence_sans_grace(self):
         _runner, worker = self._worker("fond-urgence")
         self.assertEqual(worker._urgent_end(), "")
-        for drapeau, raison in ((worker.preempting, "préemption"),
-                                (worker.restarting, "redémarrage demandé"),
-                                (worker.lease_lost, "bail perdu")):
+        for drapeau, raison in ((worker.preempting, "preemption"),
+                                (worker.restarting, "restart requested"),
+                                (worker.lease_lost, "lease lost")):
             drapeau.set()
             self.assertEqual(worker._urgent_end(), raison)
             drapeau.clear()
         worker.runner.stop.set()
-        self.assertEqual(worker._urgent_end(), "arrêt de l'exécuteur")
+        self.assertEqual(worker._urgent_end(), "runner shutdown")
 
     def test_ressource_en_grace_jugee_sur_la_fin_du_tour(self):
         tours = storage.of(self.db).turn_resources
@@ -331,22 +331,22 @@ class CourrierEtTravailTest(_Base):
             mail.send(self.db, "pair", "orch-fond", "message n°%d" % i)
         sortie = self._hook(worker, "tour-fond", borne=2)
         self.assertIn("message n°1", sortie)
-        self.assertIn("2 message(s) en attente", sortie)
-        self.assertIn("ne conclus pas avant sa fin", sortie)
+        self.assertIn("2 pending message(s)", sortie)
+        self.assertIn("do not wrap up before it ends", sortie)
         self.assertIn("sleep 60", sortie)
-        self.assertNotIn("Conclus ce tour", sortie)
+        self.assertNotIn("Wrap up this turn", sortie)
         # le travail fini, l'invitation à conclure vient
         os.kill(pid, signal.SIGKILL)
         self.wait_for(lambda: not platform.alive(pid), timeout=5)
         self._releve_perime("orch-fond")
-        self.assertIn("Conclus ce tour", self._hook(worker, "tour-fond", borne=2))
+        self.assertIn("Wrap up this turn", self._hook(worker, "tour-fond", borne=2))
 
     def test_sans_travail_la_borne_conclut_comme_avant(self):
         _runner, worker = self._worker("orch-sans")
         for i in range(3):
             mail.send(self.db, "pair", "orch-sans", "message n°%d" % i)
         sortie = self._hook(worker, "tour-inconnu", borne=2)
-        self.assertIn("Conclus ce tour", sortie)
+        self.assertIn("Wrap up this turn", sortie)
 
 
 class ReglagesTest(_Base):
@@ -364,12 +364,12 @@ class ReglagesTest(_Base):
         self._worker("grace-set")
         proc = self.mesh("set", "grace-set", "turn_grace_seconds=45m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("grace_fond_s=2700", proc.stdout)
+        self.assertIn("background_grace_s=2700", proc.stdout)
         self.assertEqual(registry.get(self.db, "grace-set")["turn_grace_seconds"], 2700)
         self.assertEqual(self.mesh("set", "grace-set", "turn_grace_seconds=bientot")
                          .returncode, 2)
         proc = self.mesh("set", "grace-set", "turn_grace_seconds=")
-        self.assertIn("grace_fond_s=1200 (défaut)", proc.stdout)
+        self.assertIn("background_grace_s=1200 (default)", proc.stdout)
 
 
 @unittest.skipUnless(platform.is_linux(), "sous-moissonneur : Linux")
@@ -392,7 +392,7 @@ class SousMoissonneurTest(_Base):
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=60)
-        self.assertIn("code de sortie 3", self.turns()[1]["argv"][-1], sortie)
+        self.assertIn("exit code 3", self.turns()[1]["argv"][-1], sortie)
 
 
 if __name__ == "__main__":

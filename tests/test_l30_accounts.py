@@ -97,8 +97,8 @@ class ProfilsTest(unittest.TestCase):
         sans = _dossier(os.path.join(self.tmp, "sans"))
         bon = _dossier(os.path.join(self.tmp, "bon"), creds=".credentials.json")
         p = lambda chemin: accounts.Profile("claude", "x", path=chemin)  # noqa: E731
-        self.assertTrue(any("non privé" in m for m in accounts.check(p(ouvert))))
-        self.assertTrue(any("identifiants absents" in m for m in accounts.check(p(sans))))
+        self.assertTrue(any("not private" in m for m in accounts.check(p(ouvert))))
+        self.assertTrue(any("credentials missing" in m for m in accounts.check(p(sans))))
         self.assertEqual(accounts.check(p(bon)), [])
         self.assertTrue(accounts.check(p(os.path.join(self.tmp, "absent"))))
         codex = accounts.Profile("codex", "c", path=_dossier(
@@ -112,7 +112,7 @@ class ProfilsTest(unittest.TestCase):
         os.chmod(cle, 0o644)
         prof = accounts.Profile("deepseek", "a", kind="api_key_env",
                                 env="DEEPSEEK_API_KEY", key_file=cle)
-        self.assertTrue(any("trop ouvert" in m for m in accounts.check(prof)))
+        self.assertTrue(any("too permissive" in m for m in accounts.check(prof)))
         with self.assertRaises(accounts.AccountError) as ctx:
             accounts.apply_env({}, prof)
         self.assertNotIn("cle-factice-a", str(ctx.exception))
@@ -276,7 +276,7 @@ class ChoixTest(_Base):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertEqual(choix.switched["kind"], "bascule")
-        self.assertIn("primaire au seuil", choix.switched["reason"])
+        self.assertIn("primaire at threshold", choix.switched["reason"])
         self.assertEqual(storage.of(self.db).accounts.holds(self.cfg.host, "codex"), {})
         # avant la remise à zéro : le primaire est toujours au seuil
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now + 60)
@@ -328,7 +328,7 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
-        self.assertIn("tous les comptes codex au seuil", choix.reason)
+        self.assertIn("all codex accounts at threshold", choix.reason)
         self.assertIn("primaire", choix.reason)
         self.assertIn("secondaire", choix.reason)
 
@@ -352,15 +352,48 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
                                        by="human:test"))
-        choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
-        self.assertIsNone(choix.profile)  # forcé ET au seuil : pause, pas de bascule
-        self.assertIn("forcé", choix.reason)
-        self.assertTrue(accounts.automatic(self.db, self.cfg.host, "codex", by="human:test"))
+        # L226b (bureau, 2026-10-12) : forcé ET au seuil, un autre compte libre —
+        # le forçage est levé (journalisé `auto`) et le choix automatique bascule
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertEqual(choix.profile.name, "primaire")
+        self.assertFalse(choix.forced)
+        self.assertFalse(accounts.automatic(self.db, self.cfg.host, "codex", by="human:test"))
+        # aucun autre compte libre : le forçage tient, pause
+        _codex_rollout(items[0].path, 96, now + 3600)
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                                       by="human:test"))
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
+        self.assertIsNone(choix.profile)
+        self.assertIn("forced", choix.reason)
         with self.assertRaises(accounts.AccountError):
             accounts.force(self.db, self.cfg.host, "codex", items, "inconnu", by="human:test")
-        self.assertEqual([b["kind"] for b in self._bascules()], ["manuel", "auto", "bascule"])
+        self.assertEqual([b["kind"] for b in self._bascules()],
+                         ["manuel", "auto", "bascule", "manuel"])
+
+    def test_levee_du_forcage_garde_un_forcage_humain_concurrent(self):
+        """#295 : un humain force primaire entre la lecture de la ligne et la
+        levée du forçage de secondaire (au seuil) : son forçage tient."""
+        items = self._items()
+        now = time.time()
+        _codex_rollout(items[0].path, 5, now + 3600)
+        _codex_rollout(items[1].path, 95, now + 3600)
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                                       by="human:test"))
+        store = type(storage.of(self.db).accounts)
+        lever = store.set_auto
+
+        def humain_dabord(self_, host, harness, **kw):
+            accounts.force(self.db, host, harness, items, "primaire", by="human:concurrent")
+            return lever(self_, host, harness, **kw)
+
+        with mock.patch.object(store, "set_auto", humain_dabord):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
+        self.assertEqual(choix.profile.name, "primaire")
+        self.assertTrue(choix.forced)
+        ligne = storage.of(self.db).accounts.active(self.cfg.host, "codex")
+        self.assertEqual((ligne["account"], ligne["forced"]), ("primaire", True))
+        self.assertEqual([b["kind"] for b in self._bascules()], ["manuel", "manuel"])
 
     def test_profil_invalide_jamais_choisi(self):
         comptes = self._codex_comptes()
@@ -371,7 +404,7 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
-        self.assertIn("non privé", choix.reason)
+        self.assertIn("not private", choix.reason)
 
 
 class ExecuteurTest(_Base):
@@ -397,8 +430,8 @@ class ExecuteurTest(_Base):
                               for b in self._bascules()],
                              [("primaire", "secondaire", "bascule", "cl")])
             fil = self._fil()
-            self.assertIn("Bascule de compte claude : primaire → secondaire", fil)
-            self.assertIn("reprise telle quelle", fil)
+            self.assertIn("Account switch claude: primaire → secondaire", fil)
+            self.assertIn("resumed as is", fil)
             # le grand livre attribue chaque tour à son compte
             lignes = self.db.query("SELECT account FROM turn_costs WHERE agent = 'cl'"
                                    " ORDER BY id")
@@ -422,13 +455,13 @@ class ExecuteurTest(_Base):
             # … puis le tour sous le nouveau, session neuve ouverte par le résumé
             self.assertEqual(tours[1]["compte"]["CLAUDE_CONFIG_DIR"], comptes[1]["path"])
             self.assertNotIn("--resume", tours[1]["argv"])
-            self.assertIn("Reprise de session après rotation", tours[1]["argv"][-1])
+            self.assertIn("Session resumed after rotation", tours[1]["argv"][-1])
             # le résumé de l'agent, encadré : sa propre note, sans autorité
             self.assertEqual(tours[0]["argv"][-1], adapters.SUMMARY_PROMPT)
-            self.assertIn("le résumé que tu as écrit toi-même", tours[1]["argv"][-1])
-            self.assertIn('auteur="toi-même, session précédente" autorite="aucune"',
+            self.assertIn("the summary you wrote yourself", tours[1]["argv"][-1])
+            self.assertIn('author="yourself, previous session" authority="none"',
                           tours[1]["argv"][-1])
-            self.assertIn("rotation avec résumé", self._fil().lower())
+            self.assertIn("rotation with resume summary", self._fil().lower())
         finally:
             worker.watchdog_stop.set()
 
@@ -448,7 +481,7 @@ class ExecuteurTest(_Base):
             self.assertEqual(tours[1]["compte"]["CODEX_HOME"], comptes[1]["path"])
             self.assertNotIn("resume", tours[1]["argv"])       # fil neuf, sous le secondaire
             fil = self._fil()
-            self.assertIn("ne peut pas être reprise sous le compte secondaire", fil)
+            self.assertIn("cannot be resumed under account secondaire", fil)
         finally:
             worker.watchdog_stop.set()
 
@@ -457,7 +490,9 @@ class ExecuteurTest(_Base):
         l'exécuteur (mécanisme de cost.CostBook) ; compte déclaré : le sien."""
         herite = _dossier(os.path.join(self.tmp, "codex-herite"), creds="auth.json")
         secondaire = self._codex_comptes()[1]
-        comptes = {"codex": [{"name": "primaire"}, secondaire]}
+        # L226b: the primary comes last by default; here it is put first to
+        # test the gauges mechanism
+        comptes = {"codex": [{"name": "primaire", "priority": 0}, secondaire]}
         runner, worker = self._worker("cxd", "codex", comptes)
         try:
             with mock.patch.dict(os.environ, {"CODEX_HOME": herite}):
@@ -483,7 +518,7 @@ class ExecuteurTest(_Base):
             self.assertIsNone(self._tour(worker))
             ligne = registry.get(self.db, "cx2")
             self.assertEqual(ligne["status"], "blocked")
-            self.assertIn("tous les comptes codex au seuil", ligne["status_text"])
+            self.assertIn("all codex accounts at threshold", ligne["status_text"])
             self.assertEqual(self.turns(), [])
         finally:
             worker.watchdog_stop.set()
@@ -632,7 +667,7 @@ class IsolementTest(_Base):
             self.assertEqual(len(self.turns()), 0, "un dossier invalide a lancé un harnais")
             ligne = registry.get(self.db, "invalid-dir")
             self.assertEqual(ligne["status"], "blocked")
-            self.assertIn("dossier absent", ligne["last_error"] or "")
+            self.assertIn("missing directory", ligne["last_error"] or "")
             self.assertEqual(ligne["pending_prompt"], "travail")
         finally:
             worker.watchdog_stop.set()
@@ -649,7 +684,7 @@ class IsolementTest(_Base):
                 os.chmod(comptes[0]["path"], 0o755)  # entre le choix et le lancement
                 self.assertFalse(worker.run_turn(spec))
             self.assertEqual(self.turns(), [])
-            self.assertIn("non privé", registry.get(self.db, "apres-choix")["last_error"])
+            self.assertIn("not private", registry.get(self.db, "apres-choix")["last_error"])
         finally:
             worker.watchdog_stop.set()
 
@@ -713,7 +748,7 @@ class SoldesEtCliTest(_Base):
         with mock.patch.dict(os.environ, {"AMEESH_TEST_CLE_B": "cle-factice-b"}):
             choix = accounts.choose(self.db, self.cfg.host, "deepseek", items, book)
         self.assertEqual(choix.profile.name, "cle-b")
-        self.assertIn("solde du compte", choix.switched["reason"])
+        self.assertIn("account balance", choix.switched["reason"])
         # deux séries distinctes : pas de « dépense » entre deux clés
         self.assertEqual(balance.spend(rows)["hourly"], [])
 
@@ -759,7 +794,7 @@ class SoldesEtCliTest(_Base):
                                    env=env).returncode, 1)
         proc = self.mesh("accounts", "auto", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("automatique", proc.stdout)
+        self.assertIn("automatic", proc.stdout)
         # `ameesh cost` : compte actif et jauges par compte
         os.makedirs(os.path.join(self.cfg.state_dir, "cxa"), exist_ok=True)
         with open(os.path.join(self.cfg.state_dir, "cxa", "tool"), "w",
@@ -768,7 +803,7 @@ class SoldesEtCliTest(_Base):
         proc = self.mesh("cost", "report", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("codex/secondaire", proc.stdout)
-        self.assertIn("comptes (hôte", proc.stdout)
+        self.assertIn("accounts (host", proc.stdout)
         proc = self.mesh("cost", "report", "--json", env=env)
         ligne = json.loads(proc.stdout)[0]
         self.assertEqual(ligne["account"], "secondaire")
@@ -780,7 +815,7 @@ class SoldesEtCliTest(_Base):
         env = self.env(AMEESH_CONFIG=self._config({"claude": [{"name": "a"}, {"name": "a"}]}))
         proc = self.mesh("accounts", "list", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("en double", proc.stderr)
+        self.assertIn("duplicate account", proc.stderr)
 
 
 if __name__ == "__main__":

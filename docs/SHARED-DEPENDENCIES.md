@@ -83,8 +83,9 @@ point worktrees to it.
 ### Commands
 
 ```
-ameesh deps link [PATH…] [--no-fill] [--replace]   link (fill once if needed); default .
+ameesh deps link [PATH…] [--no-fill] [--replace] [--force]  link; default .
 ameesh deps local [PATH…]                          swap the link for a local npm ci
+ameesh deps unlink [PATH…]                         same local install, before packaging
 ameesh deps status [PATH…]                         per package: key, link, cache state
 ameesh deps entries                                the cache entries, files, size, links
 ```
@@ -92,6 +93,55 @@ ameesh deps entries                                the cache entries, files, siz
 A PATH is a worktree (its packages are found down to depth 3, never through
 `node_modules`, hidden directories or symlinks) or a package directory.
 `link` leaves a real local `node_modules` alone unless `--replace` is given.
+
+### Packaging projects (L248b)
+
+`deps link` refuses packages declaring `electron-builder`, `electron-packager`,
+`@electron/packager`, `pkg`, `@yao-pkg/pkg`, `nexe` or `@vercel/ncc`, including npm
+dependency aliases. It also detects their command names in `package.json`
+scripts (`ncc` for `@vercel/ncc`), at command positions: the start of a command,
+after shell separators or through `npx` / `npm exec`. Arguments such as
+`tsc --outDir pkg` or `echo electron-builder` do not trigger detection.
+Electron-builder's `build` manifest key and
+`electron-builder.{yml,yaml,json,json5,js,cjs,ts}` files also trigger the guard,
+even when the tool is invoked externally through `npx`. Manifest configuration
+keys `pkg` and `nexe` are detected too. Within a git worktree, root and sibling
+manifests are inspected even without lockfiles: tooling anywhere in the same
+repository conservatively guards every package, since it may target another
+app with `--projectDir`. Nested repositories, hidden and generated directories,
+and directory symlinks are excluded. The refusal happens before any install or
+replacement of a local tree. `--force` allows a development link explicitly;
+it does not make the link suitable for a release. Turn-start linking applies
+the same guard and removes existing shared-cache links in detected projects,
+without installing dependencies. Run `deps unlink` to install a local tree
+before building. Real local trees and links outside the shared cache are kept.
+The turn-start scan includes child packages even when the root has a lockfile.
+Scripts hidden in external JS or shell files without declarations or recognized
+configuration cannot be inferred.
+
+Before packaging, run in the package directory:
+
+```sh
+ameesh deps unlink .
+npm run dist
+```
+
+`unlink` is an alias of `local`: it removes the symlink and runs the real
+`npm ci` locally, using `package-lock.json`, with development, optional and
+peer dependencies and lifecycle scripts enabled. It reports the local
+installation, leaves the shared cache and other worktrees' links intact, and
+returns a failure if npm fails or a requested package has no lockfile, including
+mixed requests where other packages succeed. Missing lockfiles are reported
+before removing their links. `unlink` and `local` discover the root and its
+child packages down to depth 3, even when the root has a manifest or lockfile.
+A local tree already
+present is kept; use `AMEESH_DEPS=off npm ci` to refresh it before a release.
+
+In a detected packaging project, the npm wrapper passes install commands to
+the real npm after removing any shared link. Thus a subsequent `npm ci` does
+not recreate the link. `deps status` warns about an existing link in such a
+project; its JSON includes `packagers` and `warning`. An invalid manifest is
+reported and cannot silently permit a new link.
 
 ### `npm` in a turn
 
@@ -169,7 +219,7 @@ the cache, node 26.8.1:
 | electron-builder 26 (desktop) | **packages a broken app without an error**: its module walk checks `lstat(node_modules).isDirectory()`, false for a link, so only the direct dependencies reach `app.asar` (10 modules, 3.7 MB, against 54 modules, 12 MB from a real directory); only a "cannot find path for dependency" warning shows. Run `ameesh deps local` before `npm run dist` |
 | postinstall scripts that patch `node_modules` (mobile, assist) | run once, during the fill, before the tree is sealed; covered by the key (`patches/**`, script files) |
 
-The fallback is always available: `ameesh deps local` in the package, then
+The fallback is always available: `ameesh deps unlink` (or `local`) in the package, then
 the tool as before. Use it for anything that ships: an electron-builder
 package, a release or OTA bundle, a portable Next standalone tree.
 

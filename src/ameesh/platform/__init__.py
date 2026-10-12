@@ -12,7 +12,11 @@ le reste du code. Un sous-module par sujet :
   moisson d'un enfant, environnement initial d'un processus (L124) ;
 * `terminal` : le terminal de l'humain ;
 * `host` : mémoire, swap, charge, alimentation, système de fichiers,
-  allocation btrfs (#246).
+  allocation btrfs (#246) ;
+* `offload_shell` : le côté VM du déport (L159b), Linux seulement par
+  construction ; script autonome (bibliothèque standard seule, aucun import
+  d'ameesh), installé seul et lancé en `python3 -I` : il lit `/proc`
+  lui-même.
 
 Appuyé sur psutil (roues binaires Linux, macOS, Windows) ; sous Linux, un
 repli par `/proc` reste en place si psutil est absent.
@@ -54,7 +58,7 @@ class NotAvailable(RuntimeError):
         self.subject = subject
         self.system = system or SYSTEM
         self.reason = reason
-        super().__init__("%s indisponible sur %s : %s" % (subject, self.system, reason))
+        super().__init__("%s unavailable on %s: %s" % (subject, self.system, reason))
 
 
 def is_linux() -> bool:
@@ -80,20 +84,20 @@ def machine() -> str:
     return stdlib_platform.machine() or ""
 
 
-from .process import (alive, ancestry, become_subreaper, boot_time,  # noqa: E402
+from .process import (alive, ancestry, become_subreaper, boot_time, children,  # noqa: E402
                       command_line, environ, fd_path, holders, open_fd_count, process_table,
                       reap, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402
-from .host import (CGROUP_ROOT, btrfs_allocation, cgroup_cpu_seconds,  # noqa: E402
+from .host import (CGROUP_ROOT, btrfs_allocation, btrfs_fs_info, cgroup_cpu_seconds,  # noqa: E402
                    cgroup_memory_bytes, cpu_busy_seconds, load_average, memory, mount_of, parse_pressure,
-                   power, pressure)
+                   power, pressure, mountinfo, covering_mount, mount_id)
 
 __all__ = [
     "NotAvailable", "SYSTEM", "is_linux", "is_macos", "is_windows", "has_psutil",
     "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ", "fd_path",
-    "holders", "open_fd_count", "process_table", "reap", "start_time", "same_start",
+    "children", "holders", "open_fd_count", "process_table", "reap", "start_time", "same_start",
     "ticks_to_epoch", "human_tty", "load_average", "memory", "mount_of", "power",
     "CGROUP_ROOT", "cgroup_cpu_seconds", "cgroup_memory_bytes", "cpu_busy_seconds",
     "parse_pressure", "pressure", "user_paths", "UserPaths",
-    "btrfs_allocation",
+    "btrfs_allocation", "btrfs_fs_info", "mountinfo", "covering_mount", "mount_id",
 ]

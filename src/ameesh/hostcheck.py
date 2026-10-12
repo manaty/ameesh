@@ -177,14 +177,14 @@ def missing_runner_lines(cfg, db, run=_systemctl) -> list[str]:
         return []
     coverage = runner_coverage([row["name"] for row in agents], run=run)
     if coverage is None:
-        return ["exécuteurs : systemd indisponible — unités non vérifiées"]
+        return ["runners    : systemd unavailable — units not checked"]
     manquants = sorted(name for name, unit in coverage.items() if unit is None)
     if not manquants:
-        return ["exécuteurs : %d agent(s) mené(s), tous avec une unité activée"
+        return ["runners    : %d agent(s) run here, all with an enabled unit"
                 % len(coverage)]
-    lines = ["attention  : %d agent(s) mené(s) sans unité d'exécuteur activée sur %s "
-             "(ne repart pas au redémarrage ; une session attach morte n'est reprise "
-             "par personne) : %s" % (len(manquants), cfg.host, ", ".join(manquants))]
+    lines = ["warning    : %d agent(s) run without an enabled runner unit on %s "
+             "(not restarted after a reboot; nobody resumes a dead attach "
+             "session): %s" % (len(manquants), cfg.host, ", ".join(manquants))]
     # serveur du mesh (modèle système installé) : la commande système
     serveur = (SYSTEM_RUNNER_TEMPLATE % "") in (
         run(SYSTEM, "list-unit-files", "--type=service", "--no-legend", "--plain") or "")
@@ -233,29 +233,29 @@ def memory_cap_lines(cfg, db, canons=None, run=_systemctl,
         unit = RUNNER_TEMPLATE % name
         shown = run("show", unit, "-p", "LoadState", "-p", "MemoryMax", "-p", "Slice")
         if shown is None:
-            return ["plafonds   : systemd utilisateur indisponible — non vérifiés"]
+            return ["memory caps: user systemd unavailable — not checked"]
         props = dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
         if props.get("LoadState") != "loaded":
             continue  # pas d'unité du modèle : signalé par missing_runner_lines
         cap = resources_mod.agent_memory_cap(canons, cfg.host or "", name)
         problems = []
         if props.get("Slice") != AGENTS_SLICE:
-            problems.append("slice %s (attendue : %s)" % (props.get("Slice") or "?", AGENTS_SLICE))
+            problems.append("slice %s (expected: %s)" % (props.get("Slice") or "?", AGENTS_SLICE))
         try:
             current = int(props.get("MemoryMax") or "")
         except ValueError:
             current = None  # « infinity » : aucun plafond
         if current is None:
-            problems.append("aucun plafond mémoire")
+            problems.append("no memory cap")
         elif abs(current - cap["max"]) > cap["max"] * CAP_TOLERANCE:
-            problems.append("MemoryMax %s, le canon dit %s (%s)"
+            problems.append("MemoryMax %s, the canon says %s (%s)"
                             % (_size(current), _size(cap["max"]), cap["origin"]))
         if not problems:
             ok += 1
             continue
-        lines.append("attention  : %s : %s" % (unit, " ; ".join(problems)))
+        lines.append("warning    : %s: %s" % (unit, "; ".join(problems)))
         if props.get("Slice") != AGENTS_SLICE:
-            lines.append("             réinstallez deploy/systemd (unité et %s), puis "
+            lines.append("             reinstall deploy/systemd (unit and %s), then "
                          "systemctl --user daemon-reload" % AGENTS_SLICE)
         if current is None or abs(current - cap["max"]) > cap["max"] * CAP_TOLERANCE:
             lines.append("             systemctl --user set-property %s MemoryMax=%s MemoryHigh=%s"
@@ -263,10 +263,10 @@ def memory_cap_lines(cfg, db, canons=None, run=_systemctl,
     delegated = controllers()
     if delegated is not None and "memory" not in delegated:
         # sans délégation, systemd accepte MemoryMax mais ne l'applique pas
-        lines.append("attention  : contrôleur mémoire non délégué au systemd utilisateur : "
-                     "les plafonds ne s'appliquent pas (docs/EXPLOITATION.md, L159c)")
+        lines.append("warning    : memory controller not delegated to user systemd: "
+                     "caps are not enforced (docs/EXPLOITATION.md, L159c)")
     if ok and not lines:
-        lines.append("plafonds   : %d unité(s) d'agent dans %s, MemoryMax conforme au canon"
+        lines.append("memory caps: %d agent unit(s) in %s, MemoryMax matches the canon"
                      % (ok, AGENTS_SLICE))
     return lines
 
@@ -279,10 +279,10 @@ def cmd_harness(cfg, db=None) -> int:
         try:
             agents = served_agents(cfg, db)
         except Exception as exc:  # diagnostic : on continue sans la base
-            print("agents     : illisibles (%s) — tous les descripteurs vérifiés"
+            print("agents     : unreadable (%s) — checking all descriptors"
                   % type(exc).__name__)
-    print("hôte       : %s" % cfg.host)
-    print("PATH       : %s" % (os.environ.get("PATH") or "(vide)"))
+    print("host       : %s" % cfg.host)
+    print("PATH       : %s" % (os.environ.get("PATH") or "(empty)"))
     systemd_path = adapters.systemd_manager_path()
     if systemd_path and systemd_path != os.environ.get("PATH"):
         print("PATH systemd : %s" % systemd_path)
@@ -290,17 +290,17 @@ def cmd_harness(cfg, db=None) -> int:
     for item in harness_report(agents):
         qui = " [%s]" % ", ".join(item["agents"]) if item["agents"] else ""
         if item["ok"]:
-            print("harnais    : %s%s → %s" % (item["harness"], qui, item["detail"]))
+            print("harness    : %s%s → %s" % (item["harness"], qui, item["detail"]))
             # L120: the version, read now (doctor records nothing)
             version = harness_versions.probe(item["harness"])
             print("             version %s" % (version["version"] or "unknown (%s)"
                                                % (version["error"] or "?")))
-            if item.get("source") in ("PATH du gestionnaire systemd", "emplacement connu"):
-                print("             conseil : trouvé hors du PATH — posez PATH dans l'unité "
-                      "(deploy/systemd) ou `harness_bins` dans la configuration")
+            if item.get("source") in ("systemd manager PATH", "known location"):
+                print("             hint: found outside PATH — set PATH in the unit "
+                      "(deploy/systemd) or `harness_bins` in the config")
         else:
             verdict = 1
-            print("harnais    : %s%s KO — %s" % (item["harness"], qui, item["detail"]))
+            print("harness    : %s%s KO — %s" % (item["harness"], qui, item["detail"]))
     if db is not None and agents is not None:
         for line in missing_runner_lines(cfg, db) + memory_cap_lines(cfg, db):
             print(line)
