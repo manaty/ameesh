@@ -349,7 +349,18 @@ class BudgetGateTest(PgTestCase):
         self.assertTrue(worker._compta_marque(0, "tour", ""))
         sans = {k: v for k, v in os.environ.items()
                 if not k.endswith("_BIN") and not k.endswith("_BIN_DIR")}
+        # Le binaire est « désinstallé » pour de bon, quel que soit l'hôte :
+        # PATH vide, replis coupés, aucun chemin de configuration. Neutraliser
+        # `shutil.which` ne suffit pas — `_scan` lit le PATH et les emplacements
+        # connus directement, donc sur un hôte où le harnais est installé
+        # (dsh dans /opt/node/bin) le contrôle échouait sans que la
+        # comptabilité soit en cause.
+        vide = os.path.join(self.tmp, "sans-binaire")
+        os.makedirs(vide, exist_ok=True)
+        sans["PATH"] = vide
+        sans[adapters.SEARCH_ENV] = ""
         with mock.patch.dict(os.environ, sans, clear=True), \
+                mock.patch.dict(adapters._HARNESS_BINS, {}, clear=True), \
                 mock.patch("ameesh.adapters.shutil.which", return_value=None):
             with self.assertRaises(adapters.HarnessMissing):
                 adapter_for("deepseek")  # le binaire est bien introuvable
