@@ -187,6 +187,144 @@ class EvictionTest(unittest.TestCase):
         self.assertEqual(result["worktrees"], [])
         self.assertFalse(os.path.exists(os.path.join(dead, "f")))
 
+    def test_unlink_failure_reclassifies_and_stops_the_eviction(self):
+        # r2 (codex P1): a candidate whose unlink fails stays, its bytes become
+        # unremovable, and NO more recent file is deleted to make up for it
+        ours = [os.path.join(self.mine, "o%d" % i) for i in range(4)]
+        for i, path in enumerate(ours):
+            _write(path, age_s=(10 - i) * HOUR)          # o0 is the oldest
+
+        def refuse(path, root):
+            raise OSError(1, "operation not permitted", path)
+
+        with mock.patch.object(menage, "_unlink_in_root", refuse):
+            result = menage.evict_lru([self.mine], self.root, 2 * B)
+        self.assertEqual(result["files"], 0)
+        self.assertTrue(all(os.path.exists(path) for path in ours))
+        self.assertEqual(result["unremovable"], B)
+        self.assertEqual(result["failed"], [ours[0]])
+        self.assertFalse(result["blocked"])              # one block, quota two
+        entries = menage.eviction_entries(result, kind="tmp", path=self.mine,
+                                          quota=2 * B)
+        self.assertEqual([e["action"] for e in entries], ["unremovable"])
+        self.assertIn("deletion refused", entries[0]["detail"])
+
+    def test_git_root_recognised_before_the_file_limit(self):
+        # r2 (codex P1): the work tree is found at the directory level, before
+        # its files are listed, so WALK_LIMIT can no longer hide it
+        repo = os.path.join(self.base, "repo-limit")
+        os.makedirs(repo)
+        _git("init", "-q", "-b", "main", cwd=repo)
+        _git("commit", "-q", "--allow-empty", "-m", "racine", cwd=repo)
+        clone = os.path.join(self.mine, "clone")
+        _git("clone", "-q", repo, clone, cwd=self.base)
+        for i in range(12):
+            _write(os.path.join(clone, "src", "f%d" % i))
+        loose = os.path.join(self.mine, "loose")
+        _write(loose, size=2 * B)
+        with mock.patch.object(menage, "WALK_LIMIT", 5):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["worktrees"], [clone])
+        self.assertEqual(result["files"], 1)
+        self.assertFalse(os.path.exists(loose))
+        self.assertTrue(os.path.exists(os.path.join(clone, "src", "f11")))
+
+    def test_truncated_listing_evicts_nothing_and_is_signaled(self):
+        # r2 (codex P1): a walk stopped by WALK_LIMIT proves nothing about what
+        # is removable: nothing is evicted, and the journal says so
+        many = [os.path.join(self.mine, "many", "f%d" % i) for i in range(6)]
+        for path in many:
+            _write(path)
+        with mock.patch.object(menage, "WALK_LIMIT", 3):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["truncated_paths"], [self.mine])
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["evicted"], 0)
+        self.assertTrue(all(os.path.exists(path) for path in many))
+        entries = menage.eviction_entries(result, kind="tmp", path=self.mine, quota=B)
+        self.assertEqual([e["action"] for e in entries], ["truncated"])
+        self.assertIn("truncated", entries[0]["detail"])
+
+    def test_parent_replaced_by_symlink_never_deletes_outside(self):
+        # r2 (codex P1): the unlink is directory-relative (O_DIRECTORY|
+        # O_NOFOLLOW at every level), so a parent swapped for a symbolic link
+        # after the `_located_in` check cannot reach outside the root
+        outside = os.path.join(self.base, "outside")
+        victim = os.path.join(outside, "f")
+        _write(victim)
+        inside = os.path.join(self.mine, "dir")
+        _write(os.path.join(inside, "f"))
+        real = menage._unlink_in_root
+
+        def swapping(path, root):
+            os.unlink(os.path.join(inside, "f"))
+            os.rmdir(inside)
+            os.symlink(outside, inside)
+            return real(path, root)
+
+        with mock.patch.object(menage, "_unlink_in_root", swapping):
+            result = menage.evict_lru([self.mine], self.root, 0)
+        self.assertTrue(os.path.exists(victim))
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["unremovable"], B)
+        self.assertEqual(result["failed"], [os.path.join(inside, "f")])
+
+    def test_git_marker_symlink_protects_the_subtree_and_is_signaled(self):
+        # r2 (codex P2): a `.git` that is a symbolic link is not followed; the
+        # subtree is protected by prudence and reported
+        target = os.path.join(self.base, "gitdir-target")
+        os.makedirs(target)
+        _write(os.path.join(target, "HEAD"), size=10)
+        fake = os.path.join(self.mine, "fake")
+        os.makedirs(fake)
+        os.symlink(target, os.path.join(fake, ".git"))
+        _write(os.path.join(fake, "data"), size=2 * B)
+        result = menage.evict_lru([self.mine], self.root, B)
+        self.assertEqual(result["worktrees"], [])
+        self.assertEqual(result["worktree_symlinks"], [fake])
+        self.assertTrue(os.path.exists(os.path.join(fake, "data")))
+        self.assertTrue(os.path.exists(os.path.join(target, "HEAD")))
+        entries = menage.eviction_entries(result, kind="tmp", path=self.mine, quota=B)
+        signaled = [e for e in entries if e["action"] == "signaled"]
+        self.assertEqual([e["path"] for e in signaled], [fake])
+        self.assertIn("symbolic link", signaled[0]["detail"])
+
+    def test_unremovable_bytes_reported_even_without_eviction(self):
+        # r2 (codex P2): the bytes are in the journal and in `data` as soon as
+        # they exist, even when the quota still holds (nothing evicted)
+        foreign = {os.path.join(self.mine, "wine", "f%d" % i) for i in range(3)}
+        for path in foreign:
+            _write(path)
+        ours = [os.path.join(self.mine, "o%d" % i) for i in range(3)]
+        for path in ours:
+            _write(path)
+        with self._foreign(foreign):
+            result = menage.evict_lru([self.mine], self.root, 5 * B)
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["unremovable"], 3 * B)
+        self.assertFalse(result["blocked"])
+        entries = menage.eviction_entries(result, kind="tmp", path=self.mine, quota=5 * B)
+        self.assertEqual([e["action"] for e in entries], ["unremovable"])
+        self.assertFalse(entries[0]["data"]["blocked"])
+        self.assertEqual(entries[0]["data"]["unremovable_bytes"], 3 * B)
+
+    def test_hard_links_and_blocks_count_once(self):
+        # r2 (codex P2): sizes are st_blocks*512 and a hard link is not a
+        # second file
+        first = os.path.join(self.mine, "a")
+        _write(first, size=5)                    # 5 bytes: one 4096 block
+        os.link(first, os.path.join(self.mine, "b"))
+        self.assertEqual(menage.size_of(self.mine), B)
+        found = list(menage._files(self.mine))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][1], B)
+        result = menage.evict_lru([self.mine], self.root, 0)
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(sum(os.path.exists(os.path.join(self.mine, name))
+                             for name in ("a", "b")), 1)
+
     def test_turn_end_logs_unremovable_instead_of_wiping(self):
         cfg = _Cfg(os.path.join(self.base, "state"))
         pol = menage.Policy(tmp_quota=4 * B)
@@ -233,16 +371,56 @@ class PassAndAlertTest(PgTestCase):
         self.assertEqual(alerts[0]["path"], tmp)
         self.assertEqual(alerts[0]["value"], 5 * B)
         self.assertIn("tmp_unremovable", notify.TYPE_LABELS)
-        # the owner removes the leftovers: the next pass under quota writes
-        # nothing, an eviction line clears the alert
+        # the owner removes the leftovers: with no new file and no eviction,
+        # the next pass writes the lifting line (`resolved`) and the alert goes
         restore()
         for i in range(5):
             os.unlink(os.path.join(tmp, "rootdir", "f%d" % i))
-        for i in range(6):
-            _write(os.path.join(tmp, "new%d" % i))
-        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        report = menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        self.assertIn(("tmp", "resolved"),
+                      [(e["kind"], e["action"]) for e in report["entries"]])
         self.assertEqual([a for a in exploitation._housekeeping_alerts([], self.db)
                           if a["type"] == "tmp_unremovable"], [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root unlinks in a read-only directory")
+    def test_episode_since_is_stable_across_passes(self):
+        # r2 (codex P2): `since` is the first observation of the episode, so
+        # `--follow` does not announce the same alert again at every pass
+        tmp = menage.turn_env(self.mine, self.pol, "codex3", {})["TMPDIR"]
+        for i in range(5):
+            _write(os.path.join(tmp, "rootdir", "f%d" % i))
+        self.addCleanup(_read_only(os.path.join(tmp, "rootdir")))
+        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        first = [a for a in exploitation._housekeeping_alerts([], self.db)
+                 if a["type"] == "tmp_unremovable"]
+        self.assertEqual(len(first), 1)
+        time.sleep(1.1)                       # a different at_ts, same episode
+        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        second = [a for a in exploitation._housekeeping_alerts([], self.db)
+                  if a["type"] == "tmp_unremovable"]
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["since"], first[0]["since"])
+        self.assertEqual(exploitation.alert_key(second[0]),
+                         exploitation.alert_key(first[0]))
+
+    def test_truncated_listing_alerts_and_evicts_nothing(self):
+        # r2 (codex P1): nothing is evicted on a truncated listing, and the
+        # tmp_unscanned alert says it
+        tmp = menage.turn_env(self.mine, self.pol, "codex3", {})["TMPDIR"]
+        many = [os.path.join(tmp, "many", "f%d" % i) for i in range(6)]
+        for path in many:
+            _write(path)
+        with mock.patch.object(menage, "WALK_LIMIT", 3):
+            report = menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        self.assertTrue(all(os.path.exists(path) for path in many))
+        self.assertIn(("tmp", "truncated"),
+                      [(e["kind"], e["action"]) for e in report["entries"]])
+        self.assertTrue(any("truncated" in note for note in report["skipped"]))
+        alerts = [a for a in exploitation._housekeeping_alerts([], self.db)
+                  if a["type"] == "tmp_unscanned"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["path"], tmp)
+        self.assertIn("tmp_unscanned", notify.TYPE_LABELS)
 
 
 if __name__ == "__main__":

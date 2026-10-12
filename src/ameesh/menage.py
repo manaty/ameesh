@@ -757,17 +757,35 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
 # tailles, éviction et suppression sûre
 # --------------------------------------------------------------------------
 
-def _files(top: str, limit: int = WALK_LIMIT):
+def _files(top: str, limit: int | None = None, *, state: dict | None = None,
+           protect_git: bool = False):
     """(chemin, taille, mtime) des fichiers sous `top`, sans suivre les liens
-    ni changer de système de fichiers ; s'arrête à `limit` fichiers."""
+    ni changer de système de fichiers ; s'arrête à `limit` fichiers (défaut
+    `WALK_LIMIT`) et le dit alors dans `state["truncated"]` si `state` est
+    fourni.
+
+    #500 : les octets d'un même inode (liens durs) ne comptent qu'une fois.
+    Avec `protect_git`, un dossier qui porte un marqueur git est reconnu AVANT
+    d'en lister les fichiers et n'est pas parcouru : sa racine est ajoutée à
+    `state["protected"]`, donc le sous-arbre n'est jamais évincé, même quand
+    la marche s'arrête à `limit` avant de l'avoir atteint."""
+    limit = WALK_LIMIT if limit is None else limit
     try:
         device = os.lstat(top).st_dev
     except OSError:
         return
     count = 0
+    seen: set = set()
     stack = [top]
     while stack:
         current = stack.pop()
+        if protect_git:
+            marker = _git_marker(current)
+            if marker is not None:
+                if state is not None:
+                    state.setdefault("protected", []).append(
+                        {"path": marker[1], "marker": marker[0]})
+                continue
         try:
             with os.scandir(current) as it:
                 for entry in it:
@@ -779,10 +797,17 @@ def _files(top: str, limit: int = WALK_LIMIT):
                         if st.st_dev == device:
                             stack.append(entry.path)
                         continue
+                    inode = (st.st_dev, st.st_ino)
+                    if inode in seen:            # #500: hard link, counted once
+                        continue
+                    seen.add(inode)
                     count += 1
                     yield entry.path, st.st_blocks * 512 if st.st_blocks else st.st_size, \
                         st.st_mtime
                     if count >= limit:
+                        if state is not None:
+                            state["truncated"] = True
+                            state.setdefault("truncated_paths", []).append(top)
                         return
         except OSError:
             continue
@@ -855,26 +880,56 @@ def _prune_empty_dirs(top: str) -> None:
                 pass
 
 
-def _git_root(path: str) -> str | None:
-    """#500: the work tree that `path` (a file found by the walk) proves:
-    a `.git` file whose `gitdir:` exists (a linked worktree, live or
-    registered), or the `HEAD` of a `.git` directory (a clone). None
-    otherwise, or when the gitdir is gone (a worktree already prunable)."""
-    name = os.path.basename(path)
-    parent = os.path.dirname(path)
-    if name == "HEAD" and os.path.basename(parent) == ".git":
-        return os.path.dirname(parent)
-    if name != ".git":
+def _git_marker(directory: str) -> tuple[str, str] | None:
+    """#500 : le marqueur git d'un dossier, lu AVANT d'en lister les fichiers :
+    `("root", dossier)` pour un clone (`.git` est un dossier) ou un worktree
+    lié (`.git` est un fichier dont le `gitdir:` existe) ; `("symlink",
+    dossier)` pour un `.git` qui est un lien symbolique — jamais suivi, le
+    sous-arbre est protégé par prudence et signalé ; None sinon, dont un
+    worktree dont le gitdir a disparu (il est évincable, comme avant)."""
+    marker = os.path.join(directory, ".git")
+    try:
+        st = os.lstat(marker)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return ("symlink", directory)
+    if stat.S_ISDIR(st.st_mode):
+        return ("root", directory)
+    if not stat.S_ISREG(st.st_mode):
         return None
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with open(marker, encoding="utf-8", errors="replace") as fh:
             line = fh.readline(4096).strip()
     except OSError:
         return None
     if not line.startswith("gitdir:"):
         return None
-    gitdir = os.path.join(parent, line[len("gitdir:"):].strip())
-    return parent if os.path.isdir(gitdir) else None
+    gitdir = os.path.join(directory, line[len("gitdir:"):].strip())
+    return ("root", directory) if os.path.isdir(gitdir) else None
+
+
+def _unlink_in_root(path: str, root: str) -> None:
+    """#500 : retire `path` relativement à `root` : chaque composant est ouvert
+    avec `O_DIRECTORY|O_NOFOLLOW`, puis `os.unlink(nom, dir_fd=fd)`. Un dossier
+    parent remplacé par un lien symbolique entre la vérification `_located_in`
+    et la suppression ne peut donc plus faire sortir la suppression de la
+    racine gérée (ELOOP/ENOTDIR, l'appelant reclasse le fichier). Lève OSError
+    aussi si `path` n'est pas sous `root`."""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    parts = [part for part in rel.split(os.sep) if part]
+    if not parts or any(part == os.pardir for part in parts):
+        raise OSError("path outside the managed root: %s" % path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(root, flags)
+    try:
+        for part in parts[:-1]:
+            following = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = following
+        os.unlink(parts[-1], dir_fd=fd)
+    finally:
+        os.close(fd)
 
 
 def _removable(path: str, uid: int | None, writable: dict) -> bool:
@@ -902,53 +957,74 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
 
     #500: only what this pass can remove counts toward the quota (owned by
     us, directory writable, outside a git work tree); the rest is reported
-    (`unremovable`, `worktree_bytes` and `worktrees`). When the unremovable
-    part alone exceeds the quota, nothing is evicted (`blocked`): before,
-    root-owned leftovers kept the total over the quota and every turn end
-    emptied the agent's directory. Rend `{before, after, evicted, files,
-    over_quota, unremovable, worktree_bytes, worktrees, blocked}`."""
+    (`unremovable`, `worktrees`). When the unremovable part alone exceeds the
+    quota, nothing is evicted (`blocked`): before, root-owned leftovers kept
+    the total over the quota and every turn end emptied the agent's directory.
+    A git subtree is recognised before its files are listed (so WALK_LIMIT can
+    no longer hide it) and is never evicted. When the listing is truncated by
+    `WALK_LIMIT`, nothing is evicted at all (`truncated`, alerted): the pass
+    cannot prove what is removable. Rend `{before, after, evicted, files,
+    over_quota, unremovable, worktrees, worktree_symlinks, truncated,
+    truncated_paths, failed, blocked}`."""
     now = time.time() if now is None else float(now)
+    scan: dict = {}
     found = []
     for directory in directories:
+        if scan.get("truncated"):
+            break                      # the listing is partial: no eviction (below)
         if os.path.isdir(directory) and not os.path.islink(directory):
-            found.extend(_files(directory))
+            found.extend(_files(directory, state=scan, protect_git=True))
     before = sum(size for _p, size, _m in found)
     total, evicted, files = before, 0, 0
-    unremovable = worktree_bytes = 0
-    worktrees: list[str] = []
+    unremovable = 0
     blocked = False
+    truncated = bool(scan.get("truncated"))
+    failed: list[str] = []
+    # a protected subtree is left out of the scan itself: one git root per
+    # subtree, the nested ones would never be reached (kept for safety)
+    roots = sorted({m["path"] for m in scan.get("protected", ()) if m["marker"] == "root"})
+    worktrees = [r for r in roots
+                 if not any(r.startswith(o + "/") for o in roots if o != r)]
+    symlinks = sorted({m["path"] for m in scan.get("protected", ())
+                       if m["marker"] == "symlink"})
     counted = before
-    if before > quota:
+    if not truncated and before > quota:
         if not dry_run and not _managed(root):
             raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
-        roots = sorted({r for r in (_git_root(p) for p, _s, _m in found) if r})
-        worktrees = [r for r in roots
-                     if not any(r.startswith(o + "/") for o in roots if o != r)]
         uid = os.geteuid() if hasattr(os, "geteuid") else None
         writable: dict = {}
         candidates = []
         for item in found:
-            path = item[0]
-            if any(path.startswith(w + "/") for w in worktrees):
-                worktree_bytes += item[1]
-            elif not _removable(path, uid, writable):
+            if not _removable(item[0], uid, writable):
                 unremovable += item[1]
             else:
                 candidates.append(item)
-        counted = before - unremovable - worktree_bytes
+        counted = before - unremovable
         blocked = unremovable > quota
         for path, size, mtime in sorted(candidates, key=lambda item: item[2]):
             if blocked or counted <= quota:
                 break
             if now - mtime < min_age:
                 continue
+            # #500: a candidate whose deletion is refused (path no longer in
+            # the root, or unlink failed) is reclassified as unremovable and
+            # STOPS the eviction: never a more recent file deleted to make up
+            # for a failure.
             if not _located_in(path, root):
-                continue
+                unremovable += size
+                counted -= size
+                blocked = unremovable > quota
+                failed.append(path)
+                break
             if not dry_run:
                 try:
-                    os.unlink(path)
+                    _unlink_in_root(path, root)
                 except OSError:
-                    continue
+                    unremovable += size
+                    counted -= size
+                    blocked = unremovable > quota
+                    failed.append(path)
+                    break
             total -= size
             counted -= size
             evicted += size
@@ -958,18 +1034,62 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 _prune_empty_dirs(directory)
     return {"before": before, "after": total, "evicted": evicted, "files": files,
             "over_quota": counted > quota, "unremovable": unremovable,
-            "worktree_bytes": worktree_bytes, "worktrees": worktrees, "blocked": blocked}
+            "worktrees": worktrees, "worktree_symlinks": symlinks,
+            "truncated": truncated, "truncated_paths": scan.get("truncated_paths") or [],
+            "failed": failed, "blocked": blocked}
+
+
+def unremovable_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
+    """#500: what the previous journal line for `path` says about the
+    `unremovable` episode, so that `--follow` announces one alert per episode
+    and not one per pass:
+
+    * `since` — first observation of the current episode (carried from line to
+      line), `now` when the episode starts or the journal is unreadable;
+    * `resolved` — the previous line was blocking and this pass has nothing
+      unremovable any more (nor a truncated listing): the alert must be lifted,
+      so an entry says it even though nothing was evicted.
+
+    A journal that cannot be read never raises: the alert then just gets a new
+    `since`, as before."""
+    out = {"since": float(now), "resolved": False}
+    if db is None:
+        return out
+    try:
+        rows = storage.of(db).housekeeping.latest_by_path(host or None, "tmp")
+    except Exception:
+        return out
+    for row in rows:
+        if row.get("path") != path:
+            continue
+        data = row.get("data") or {}
+        was_blocking = row.get("action") == "unremovable" and data.get("blocked", True) is not False
+        if was_blocking:
+            out["since"] = float(data.get("episode_since") or row.get("at_ts") or now)
+            out["resolved"] = (not result.get("unremovable") and not result.get("truncated")
+                               and not result.get("files"))
+        break
+    return out
 
 
 def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
-                     agent: str | None = None, lot: str | None = None) -> list[dict]:
-    """#500: the log lines of one `evict_lru` result: the eviction, the
-    quota held by files this pass cannot remove (`unremovable`, read by the
-    `tmp_unremovable` alert), and each git work tree left out (`signaled`)."""
+                     agent: str | None = None, lot: str | None = None,
+                     since: float | None = None, resolved: bool = False) -> list[dict]:
+    """#500: the log lines of one `evict_lru` result: the eviction, the files
+    this pass cannot remove (`unremovable`, reported as soon as they exist —
+    read by the `tmp_unremovable` alert when they block the quota), a
+    truncated listing (`truncated`, read by `tmp_unscanned`), the lifting of a
+    previous alert (`resolved`), and each git work tree left out (`signaled`).
+
+    `since` is the first observation of the episode (`unremovable_episode`):
+    it is stored in the data so the next line carries it, and `--follow` does
+    not announce the same alert again at every pass."""
     q = resources_mod.fmt_value("q", quota)
     out = []
-    data = {"unremovable_bytes": result["unremovable"],
-            "worktree_bytes": result["worktree_bytes"], "quota": quota}
+    data = {"unremovable_bytes": result["unremovable"], "quota": quota,
+            "blocked": bool(result["blocked"]), "over_quota": bool(result["over_quota"])}
+    if since is not None:
+        data["episode_since"] = float(since)
     if result["files"]:
         out.append({"kind": kind, "action": "evicted", "path": path,
                     "bytes": result["evicted"], "agent": agent, "lot": lot, "data": data,
@@ -978,15 +1098,47 @@ def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
                         "; %s not removable by this pass" % resources_mod.fmt_value(
                             "q", result["unremovable"]) if result["unremovable"] else "")})
     if result["blocked"]:
+        detail = ("quota %s exceeded by %s of files this pass cannot remove "
+                  "(other owner or read-only directory): nothing evicted"
+                  % (q, resources_mod.fmt_value("q", result["unremovable"])))
+        if result.get("failed"):
+            detail += "; deletion refused for %s" % result["failed"][0]
         out.append({"kind": kind, "action": "unremovable", "path": path,
                     "bytes": result["unremovable"], "agent": agent, "lot": lot, "data": data,
-                    "detail": "quota %s exceeded by %s of files this pass cannot remove "
-                              "(other owner or read-only directory): nothing evicted"
-                              % (q, resources_mod.fmt_value("q", result["unremovable"]))})
+                    "detail": detail})
+    elif result["unremovable"]:
+        # the quota still holds (the unremovable part alone is under it), but
+        # the bytes exist: reported, without raising the alert (`blocked`
+        # false in the data)
+        detail = ("%s of files this pass cannot remove (other owner or "
+                  "read-only directory); the quota %s still holds"
+                  % (resources_mod.fmt_value("q", result["unremovable"]), q))
+        if result.get("failed"):
+            detail += "; deletion refused for %s" % result["failed"][0]
+        out.append({"kind": kind, "action": "unremovable", "path": path,
+                    "bytes": result["unremovable"], "agent": agent, "lot": lot, "data": data,
+                    "detail": detail})
+    if result["truncated"]:
+        out.append({"kind": kind, "action": "truncated", "path": path,
+                    "bytes": result["before"], "agent": agent, "lot": lot, "data": data,
+                    "detail": "listing of %s truncated at %d file(s) (WALK_LIMIT): nothing "
+                              "evicted, what is removable is unknown"
+                              % (", ".join(result["truncated_paths"]) or path,
+                                 WALK_LIMIT)})
+    if resolved:
+        out.append({"kind": kind, "action": "resolved", "path": path, "bytes": 0,
+                    "agent": agent, "lot": lot, "data": data,
+                    "detail": "quota %s: no file this pass cannot remove any more; the "
+                              "previous `unremovable` episode is over" % q})
     for tree in result["worktrees"]:
         out.append({"kind": kind, "action": "signaled", "path": tree, "agent": agent,
                     "lot": lot, "data": {"worktree": tree, "quota": quota},
                     "detail": "git work tree inside %s left out of the quota eviction" % path})
+    for link in result.get("worktree_symlinks", ()):
+        out.append({"kind": kind, "action": "signaled", "path": link, "agent": agent,
+                    "lot": lot, "data": {"worktree": link, "symlink": True, "quota": quota},
+                    "detail": "git marker `.git` of %s is a symbolic link: not followed, "
+                              "the subtree is left out of the eviction" % link})
     return out
 
 
@@ -1733,9 +1885,12 @@ class Turn:
                 root = tmp_root(self.cfg, policy)
                 result = evict_lru([self.tmp], root, policy.tmp_quota,
                                    min_age=EVICT_MIN_AGE_S)
+                episode = unremovable_episode(db, host, self.tmp, result,
+                                              now=time.time())
                 self.entries.extend(eviction_entries(
                     result, kind="tmp", path=self.tmp, quota=policy.tmp_quota,
-                    agent=self.agent, lot=lot))
+                    agent=self.agent, lot=lot, since=episode["since"],
+                    resolved=episode["resolved"]))
         finally:
             if self.lock is not None:      # L219: the turn is over
                 self.lock.release()
@@ -2358,22 +2513,30 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
                                    dry_run=dry_run)
+                episode = unremovable_episode(db, host, full, result, now=now)
                 if result["files"]:
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "éviction", "bytes": result["evicted"],
                                  "detail": "%d file(s), quota %s" % (
                                      result["files"],
                                      resources_mod.fmt_value("q", policy.tmp_quota))})
-                if result["blocked"]:
+                if result["truncated"]:
+                    skipped.append("tmp %s: listing truncated (%s file limit), nothing "
+                                   "evicted" % (full, WALK_LIMIT))
+                elif result["blocked"]:
                     skipped.append("tmp %s: quota held by %s this pass cannot remove, "
                                    "nothing evicted" % (full, resources_mod.fmt_value(
                                        "q", result["unremovable"])))
                 for tree in result["worktrees"]:
                     skipped.append("tmp %s: git work tree %s left out of the eviction"
                                    % (full, tree))
+                for link in result["worktree_symlinks"]:
+                    skipped.append("tmp %s: git marker `.git` of %s is a symbolic link, "
+                                   "left out of the eviction" % (full, link))
                 if not dry_run:
                     entries.extend(eviction_entries(
-                        result, kind="tmp", path=full, quota=policy.tmp_quota, agent=agent))
+                        result, kind="tmp", path=full, quota=policy.tmp_quota, agent=agent,
+                        since=episode["since"], resolved=episode["resolved"]))
             finally:
                 if lock is not None:
                     lock.close()
@@ -2394,7 +2557,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                 "detail": "quota %s: %d oldest file(s) evicted"
                                           % (resources_mod.fmt_value("q", policy.cache_quota),
                                              result["files"])})
-        if result["blocked"]:
+        if result["truncated"]:
+            skipped.append("caches: listing truncated (%s file limit), nothing evicted"
+                           % WALK_LIMIT)
+        elif result["blocked"]:
             skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
                            % resources_mod.fmt_value("q", result["unremovable"]))
         elif result["over_quota"]:
