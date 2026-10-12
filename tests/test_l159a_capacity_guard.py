@@ -194,6 +194,37 @@ class OfferTest(unittest.TestCase):
             with self.subTest(text):
                 self.assertIsNone(capacity_guard.parse_window(text))
 
+    def test_every_number_too_large_for_a_float(self):
+        # codex #212 r4: every number of the offer, reclaim included, goes
+        # through one guarded conversion: 1 followed by 400 zeros, inf or nan
+        # drop the offer with a problem on its key, never an OverflowError
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB",
+                "reclaim": {"busy_units": ["actions.runner.*"]}}
+        keys = [(k,) for k in ("cpu_max", "memory_max", "agent_memory_max", "disk_max",
+                                 "cpu_weight", "drain_seconds", "calm_seconds")]
+        keys += [("reclaim", k) for k in ("memory_available_min", "cpu_pressure_max",
+                                          "memory_pressure_max", "busy_max")]
+        for path in keys:
+            for value in (10 ** 400, float("inf"), float("nan")):
+                with self.subTest(path=path, value=str(value)[:6]):
+                    lend = json.loads(json.dumps(base))
+                    (lend if len(path) == 1 else lend["reclaim"])[path[-1]] = value
+                    offer, problems, _ = capacity_guard.parse_lend(lend)
+                    self.assertIsNone(offer)
+                    self.assertTrue(any(path[-1] in p for p in problems), problems)
+
+    def test_parse_helpers_never_overflow(self):
+        # codex #212 r4: the resources helpers the contract uses
+        for value in (10 ** 400, "1" + "0" * 400, float("inf"), float("nan"), "inf", "nan"):
+            with self.subTest(value=str(value)[:6]):
+                self.assertIsNone(resources.finite_float(value))
+                self.assertIsNone(resources.parse_percent(value))
+                self.assertIsNone(resources.parse_fraction(value))
+                if not isinstance(value, str) or value[0].isdigit():
+                    self.assertIsNone(resources.parse_bytes(value))
+        self.assertEqual(resources.finite_float("2.5"), 2.5)
+        self.assertEqual(resources.parse_bytes(10 ** 18), 10 ** 18)
+
     def test_unknown_keys_are_reported(self):
         lend = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB", "gpu_max": 1,
                 "reclaim": {"swap_max": "1GiB"}}
@@ -244,6 +275,35 @@ class CanonTest(_Canons, unittest.TestCase):
                 found = canon.validate(loaded)
                 self.assertIsNone(loaded.host(HOST).policy.lend)
                 self.assertIn("host-policy-invalid", codes(found, canon.ERROR))
+
+    def test_numbers_too_large_for_a_float_in_the_fiche(self):
+        # codex #212 r4: reclaim.cpu_pressure_max of 1 and 400 zeros crashed
+        # the host builder; every number of policy.lend and policy.resources
+        huge = "1" + "0" * 400
+        lend = {"cpu_max": "3", "memory_max": "14GiB", "disk_max": "80GiB"}
+        cases = [("lend", k, None) for k in ("agent_memory_max", "cpu_weight",
+                                             "drain_seconds", "calm_seconds")]
+        cases += [("lend", "reclaim", k) for k in ("memory_available_min", "cpu_pressure_max",
+                                                   "memory_pressure_max", "busy_max")]
+        cases += [("resources", k, None) for k in resources.THRESHOLD_KEYS
+                  + ("agent_memory_max",)]
+        for n, (section, key, sub) in enumerate(cases):
+            with self.subTest(section=section, key=key, sub=sub):
+                if section == "lend":
+                    lines = dict(lend)
+                    if sub is None:
+                        lines[key] = huge
+                    else:
+                        lines["reclaim"] = "{busy_units: [x.service], %s: %s}" % (sub, huge)
+                    yaml = "  lend:\n" + "".join("    %s: %s\n" % kv for kv in lines.items())
+                else:
+                    yaml = "  resources:\n    %s: %s\n" % (key, huge)
+                text = host("bob", harnesses=("codex",), resources_yaml=yaml)
+                loaded = canon.load(self.acme(host_text=text, name="h%d" % n), default=False)
+                found = canon.validate(loaded)
+                self.assertIn("host-policy-invalid", codes(found, canon.ERROR))
+                if section == "lend":
+                    self.assertIsNone(loaded.host(HOST).policy.lend)
 
     def test_no_offer(self):
         loaded = canon.load(self.acme(host_text=host("bob", harnesses=("codex",))),

@@ -22,7 +22,6 @@ The guard itself (`ameesh guard`, L159e) and the common measure
 """
 from __future__ import annotations
 
-import math
 import re
 
 from . import resources as resources_mod
@@ -73,11 +72,7 @@ def _finite(value) -> float | None:
     an integer too large for a float (YAML or JSON digits: no OverflowError)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)
-    except OverflowError:
-        return None
-    return number if math.isfinite(number) else None
+    return resources_mod.finite_float(value)
 
 
 def gate_state(doc, now: float, *, lending: bool) -> str:
@@ -146,7 +141,10 @@ def _minutes(text: str) -> int | None:
 
 
 def _positive_int(value, minimum: int = 0) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    # an integer too large for a float is refused: seconds and counts meet
+    # floats downstream (`now + drain_seconds`)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum \
+            or _finite(value) is None:
         return None
     return value
 

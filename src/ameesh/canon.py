@@ -2227,13 +2227,11 @@ class _Loader:
             if value is None:
                 continue
             if key == "max_load":
-                try:
-                    number = float(value)
-                    if number < 0:
-                        raise ValueError
-                except (TypeError, ValueError):
+                # codex #212 r4: inf, nan, 1 followed by 400 zeros refused
+                number = resources_mod.finite_float(value)
+                if number is None or number < 0:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.max_load` : nombre positif attendu",
+                             "`policy.resources.max_load` : nombre positif fini attendu",
                              **where, **subject)
                     continue
                 parsed[key] = number

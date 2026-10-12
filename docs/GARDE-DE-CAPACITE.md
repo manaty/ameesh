@@ -87,7 +87,8 @@ policy:
   an IANA zone (`Europe/Paris`).
 - **Fail closed.** Any unreadable key, or one of the three caps
   missing, is a `host-policy-invalid` error, and the whole offer is
-  dropped: the host lends nothing until its fiche is fixed. An unknown key
+  dropped. A number counts as unreadable if it is `.inf`, `.nan` or has
+  more digits than a float holds, `reclaim` included: the host lends nothing until its fiche is fixed. An unknown key
   is a `host-lend-unknown` warning, and the key is ignored.
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.

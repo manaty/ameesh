@@ -118,7 +118,8 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value >= 0 else None
+        # 1 followed by 400 zeros: no float, so no size (codex #212 r4)
+        return value if value >= 0 and finite_float(value) is not None else None
     if isinstance(value, float):
         # .inf, .nan (YAML): no size, never an unbounded one
         if not decimal_ok or not math.isfinite(value) or value < 0:
@@ -150,26 +151,31 @@ def parse_fraction(value) -> float | None:
         except ValueError:
             return None
     elif isinstance(value, (int, float)):
-        number = float(value)
+        number = finite_float(value)
     else:
         return None
-    return number if 0.0 < number <= 1.0 else None
+    return number if number is not None and 0.0 < number <= 1.0 else None
 
 
-def _as_float(value) -> float | None:
+def finite_float(value) -> float | None:
+    """`value` (number or text) as a finite float; None for None, a bool,
+    unreadable text, inf, nan, or an integer too large for a float (YAML or
+    JSON digits: never an OverflowError). Every number of a host policy or
+    of a guest state goes through it (codex #212 r4)."""
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def parse_percent(value) -> float | None:
     """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None."""
     if isinstance(value, str):
         value = value.strip().rstrip("%").strip()
-    number = _as_float(value)
+    number = finite_float(value)
     if number is None or not 0.0 <= number <= 100.0:
         return None
     return number
@@ -489,7 +495,7 @@ def lend_offer(policy) -> dict | None:
         return None
     if not isinstance(raw, dict):
         raw = {key: getattr(raw, key, None) for key in LEND_OFFER_KEYS}
-    cpu = _as_float(raw.get("cpu_max"))
+    cpu = finite_float(raw.get("cpu_max"))
     return {"cpu_max": cpu if cpu is not None and cpu >= 0 else None,
             "memory_max": parse_bytes(raw.get("memory_max")),
             "disk_max": parse_bytes(raw.get("disk_max"))}
@@ -658,7 +664,7 @@ def thresholds(policy=None) -> dict:
     mem = parse_bytes(raw.get("min_mem_available"))
     swap = parse_bytes(raw.get("max_swap_used"))
     disk = parse_bytes(raw.get("min_disk_free"))
-    load = _as_float(raw.get("max_load"))
+    load = finite_float(raw.get("max_load"))
     tmpfs = parse_fraction(raw.get("max_tmpfs_used"))
     low = parse_percent(raw.get("min_battery_percent"))
     stop = parse_percent(raw.get("stop_battery_percent"))
@@ -696,7 +702,7 @@ def declared(policy) -> dict:
         return {}
     out: dict = {}
     for key in THRESHOLD_KEYS:
-        value = (_as_float(raw.get(key)) if key == "max_load"
+        value = (finite_float(raw.get(key)) if key == "max_load"
                  else parse_fraction(raw.get(key)) if key in FRACTION_KEYS
                  else parse_percent(raw.get(key)) if key in POWER_KEYS + PRESSURE_KEYS
                  else parse_bytes(raw.get(key)))
