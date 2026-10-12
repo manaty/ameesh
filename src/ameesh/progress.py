@@ -936,13 +936,16 @@ def _gauge_text(g: dict) -> str:
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_page.html")
 _DATA_MARK = "/*__AMEESH_PROGRESS_DATA__*/null"
 _MODE_MARK = '/*__AMEESH_PROGRESS_MODE__*/"static"'
+_CSP_MARK = "default-src 'none';"
 
 
-def render_html(snap: dict, *, served: bool = False) -> str:
+def render_html(snap: dict | None, *, served: bool = False) -> str:
     """La page de référence avec l'instantané embarqué (aucune ressource externe).
 
-    `served` (L304) : page rendue par `ameesh progress --serve` ; son bouton
-    Refresh recharge la page. Statique, il est désactivé.
+    `served` (L304) : page de `ameesh progress --serve`, rendue sans données
+    (`snap` None) : elle lit `/api/progress.json` avec le jeton, la politique
+    de sécurité ajoute donc `connect-src 'self'` (rien d'autre). Statique, le
+    bouton Refresh est désactivé et la page ne peut rien demander au réseau.
 
     Le JSON est inséré dans un `<script type="application/json">` : `<`, `>`
     et `&` y sont échappés en `\\u003c`… pour qu'aucun texte (titre de lot,
@@ -953,9 +956,11 @@ def render_html(snap: dict, *, served: bool = False) -> str:
     data = (json.dumps(snap, ensure_ascii=False, sort_keys=True)
             .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
-    if _DATA_MARK not in page or _MODE_MARK not in page:
+    if _DATA_MARK not in page or _MODE_MARK not in page or _CSP_MARK not in page:
         raise ProgressError("page template has no data placeholder")
     page = page.replace(_MODE_MARK, '"served"' if served else '"static"', 1)
+    if served:
+        page = page.replace(_CSP_MARK, _CSP_MARK + " connect-src 'self';", 1)
     return page.replace(_DATA_MARK, data, 1)
 
 

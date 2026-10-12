@@ -237,30 +237,72 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 <script>
 "use strict";
 (function () {
-  var D = JSON.parse(document.getElementById("data").textContent || "null");
-  // L304 : "served" sous `ameesh progress --serve` (la page se recharge),
-  // "static" pour un fichier --html (rien à rafraîchir)
+  // L304 : "served" sous `ameesh progress --serve` : la page arrive sans
+  // données et lit /api/progress.json avec le jeton (en-tête Authorization) ;
+  // "static" pour un fichier --html : données embarquées, rien à relire
   var MODE = /*__AMEESH_PROGRESS_MODE__*/"static";
-  (function () {
-    var btn = document.getElementById("refresh"), auto = document.getElementById("auto-refresh");
-    if (D && D.generated_ts) {
-      var g = new Date(D.generated_ts * 1000);
-      document.getElementById("asof").textContent = "data as of " +
-        (g.getHours() < 10 ? "0" : "") + g.getHours() + ":" + (g.getMinutes() < 10 ? "0" : "") + g.getMinutes();
-    }
-    if (MODE !== "served") {
-      btn.disabled = true; auto.disabled = true;
-      btn.title = "open with ameesh progress --serve to refresh";
-      document.getElementById("asof").textContent += " · open with --serve to refresh";
-      return;
-    }
-    auto.checked = location.hash === "#auto";
-    btn.addEventListener("click", function () { location.reload(); });
-    auto.addEventListener("change", function () {
-      history.replaceState(null, "", auto.checked ? "#auto" : location.pathname);
+  var API = "/api/progress.json", TOKEN_KEY = "ameesh-progress-token";
+  var btn = document.getElementById("refresh"), auto = document.getElementById("auto-refresh");
+  var asof = document.getElementById("asof");
+  // le fragment porte le jeton (#t=…) et le rafraîchissement auto (#auto)
+  function hashParams() {
+    var out = {};
+    location.hash.replace(/^#/, "").split("&").forEach(function (kv) {
+      if (!kv) return;
+      var i = kv.indexOf("=");
+      out[i < 0 ? kv : kv.slice(0, i)] = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1));
     });
-    setInterval(function () { if (auto.checked && !document.hidden) location.reload(); }, 60000);
-  })();
+    return out;
+  }
+  function setHash(h) {
+    var parts = Object.keys(h).map(function (k) { return h[k] === "" ? k : k + "=" + encodeURIComponent(h[k]); });
+    // ?project= reste : seul le fragment change
+    history.replaceState(null, "", location.pathname + location.search + (parts.length ? "#" + parts.join("&") : ""));
+  }
+  function store(v) {
+    try {
+      if (v === undefined) return window.sessionStorage.getItem(TOKEN_KEY) || "";
+      window.sessionStorage.setItem(TOKEN_KEY, v);
+    } catch (e) { /* sans stockage : le jeton reste le temps de la page */ }
+    return "";
+  }
+  if (MODE !== "served") {
+    btn.disabled = true; auto.disabled = true;
+    btn.title = "open with ameesh progress --serve to refresh";
+    render(JSON.parse(document.getElementById("data").textContent || "null"), " · open with --serve to refresh");
+    return;
+  }
+  // le jeton quitte l'URL (historique, copie de lien) pour le sessionStorage,
+  // propre à l'origine, donc au port : un autre serveur local ne le lit pas
+  var h = hashParams(), token = h.t || store();
+  if (h.t) { store(h.t); delete h.t; setHash(h); }
+  auto.checked = "auto" in h;
+  btn.addEventListener("click", function () { location.reload(); });
+  auto.addEventListener("change", function () {
+    var x = hashParams();
+    if (auto.checked) x.auto = ""; else delete x.auto;
+    setHash(x);
+  });
+  setInterval(function () { if (auto.checked && !document.hidden) location.reload(); }, 60000);
+  if (!token) { asof.textContent = "token missing: open the URL printed by ameesh progress --serve"; return; }
+  var project = new URLSearchParams(location.search).get("project");
+  asof.textContent = "loading…";
+  fetch(API + (project !== null ? "?project=" + encodeURIComponent(project) : ""),
+        {credentials: "omit", cache: "no-store",
+         headers: {"Accept": "application/json", "Authorization": "Bearer " + token}})
+    .then(function (r) {
+      if (r.status === 401) throw new Error("token refused: open the URL printed at start (a restart draws a new one)");
+      if (!r.ok) return r.text().then(function (t) { throw new Error("HTTP " + r.status + ": " + t.trim()); });
+      return r.json();
+    })
+    .then(function (d) { render(d, ""); }, function (e) { asof.textContent = e.message; });
+
+  function render(D, note) {
+  if (D && D.generated_ts) {
+    var g = new Date(D.generated_ts * 1000);
+    asof.textContent = "data as of " +
+      (g.getHours() < 10 ? "0" : "") + g.getHours() + ":" + (g.getMinutes() < 10 ? "0" : "") + g.getMinutes() + note;
+  }
   if (!D || D.schema !== "ameesh-progress/1") {
     document.getElementById("when").textContent = "missing data or unknown schema";
     return;
@@ -770,6 +812,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 
   var miss = document.getElementById("missing");
   (D.missing || []).forEach(function (t) { miss.appendChild(el("li", null, t)); });
+  }
 })();
 </script>
 </body>

@@ -8,18 +8,23 @@ option), **read-only**: GET and HEAD, nothing else (405), and a Postgres
 session with `default_transaction_read_only` — a write would fail in the
 database itself.
 
-  /                      the page, with the current snapshot embedded;
-                         its Refresh button reloads it
-  /api/progress.json     the `ameesh-progress/1` snapshot (`?project=P`:
+  /                      the page, **without data** (no token needed): it
+                         reads /api/progress.json; Refresh reloads it
+  /api/progress.json     the `ameesh-progress/1` snapshot, with
+                         `Authorization: Bearer <token>` only (`?project=P`:
                          a known project, 400 otherwise)
 
 The host is shared (several agents, several Unix accounts): 127.0.0.1 does
-not keep them out. A random **token**, drawn at each start, is required: the
-URL printed at start carries it (`/?t=…`); the first visit stores it in an
-HttpOnly SameSite=Strict cookie named after the port (browsers share
-localhost cookies across ports), then redirects to the URL without it. The
-token is compared in constant time and only written on the command's
-output, never in a log: logged request lines lose their query string.
+not keep them out. A random **token**, drawn at each start, is required by
+the API. The URL printed at start carries it in the **fragment** (`/#t=…`),
+which the browser never sends: the page moves it to `sessionStorage`
+(isolated per origin, hence per port) and sends it in an `Authorization`
+header. No cookie: browsers share localhost cookies across ports, so any
+local server on another port would receive them. A custom header also makes
+any cross-origin fetch a preflight, which gets 405. The token is compared in
+constant time and only written on the command's output, never in a log nor
+in an error page: request lines are logged without their query string, and
+error pages never echo the request.
 
 The Host header must name 127.0.0.1 or localhost on the right port (against
 DNS rebinding). A snapshot is kept `CACHE_S` seconds per project: an open
@@ -47,6 +52,7 @@ DEFAULT_PORT = 8765
 CACHE_S = 5.0
 API = "/api/progress.json"
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/-]{0,200})")
 _HEADERS = (("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
             ("Referrer-Policy", "no-referrer"), ("X-Frame-Options", "DENY"),
             ("Cross-Origin-Resource-Policy", "same-origin"))
@@ -118,21 +124,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- garde --------------------------------------------------------------
 
-    @property
-    def _cookie_name(self) -> str:
-        return "ameesh_progress_%d" % self.server.server_address[1]
-
     def _host_ok(self) -> bool:
         port = self.server.server_address[1]
         host = (self.headers.get("Host") or "").strip().lower()
         return host in ("127.0.0.1:%d" % port, "localhost:%d" % port)
 
-    def _cookie_token(self) -> str:
-        for part in (self.headers.get("Cookie") or "").split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == self._cookie_name:
-                return value
-        return ""
+    def _bearer(self) -> str:
+        scheme, _, value = (self.headers.get("Authorization") or "").strip().partition(" ")
+        return value.strip() if scheme.lower() == "bearer" else ""
 
     def _token_ok(self, value: str) -> bool:
         return bool(value) and hmac.compare_digest(value.encode(), self.token.encode())
@@ -167,37 +166,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         % self.server.server_address[1])
             return
         url = urllib.parse.urlsplit(self.path)
+        if url.path == "/":
+            # la page seule, sans données : rien à protéger
+            html = progress.render_html(None, served=True)
+            self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if url.path != API:
+            self._error(404, "not found: / or %s" % API)
+            return
+        if not self._token_ok(self._bearer()):
+            self._error(401, "token missing or refused: open the URL printed at start "
+                             "by ameesh progress --serve", (("WWW-Authenticate", "Bearer"),))
+            return
         query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
-        given = (query.get("t") or [""])[0]
-        if given:
-            if not self._token_ok(given):
-                self._error(401, "token refused: open the URL printed at start")
-                return
-            # le jeton quitte l'URL (historique, en-tête Referer) pour un cookie
-            rest = urllib.parse.urlencode([(k, v) for k, vs in query.items() if k != "t"
-                                           for v in vs])
-            # vers un chemin servi seulement (`//ailleurs` serait une redirection ouverte)
-            where = url.path if url.path in ("/", API) else "/"
-            self._send(303, b"", "text/plain; charset=utf-8", (
-                ("Location", where + ("?" + rest if rest else "")),
-                ("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Strict"
-                 % (self._cookie_name, self.token))))
-            return
-        if not self._token_ok(self._cookie_token()):
-            self._error(401, "token missing: open the URL printed at start "
-                             "by ameesh progress --serve")
-            return
         try:
             project = self._project(query)
-            if url.path == "/":
-                html = progress.render_html(self.snapshots.get(project), served=True)
-                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
-            elif url.path == API:
-                data = json.dumps(self.snapshots.get(project), ensure_ascii=False,
-                                  sort_keys=True)
-                self._send(200, data.encode("utf-8"), "application/json; charset=utf-8")
-            else:
-                self._error(404, "not found: / or %s" % API)
+            data = json.dumps(self.snapshots.get(project), ensure_ascii=False, sort_keys=True)
+            self._send(200, data.encode("utf-8"), "application/json; charset=utf-8")
         except ServeError as exc:
             self._error(exc.status, str(exc))
         except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
@@ -215,14 +200,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ServeError(400, "unknown project: %s" % name[:64])
         return name
 
+    def send_error(self, code, message=None, explain=None) -> None:
+        # jamais la requête dans la page d'erreur ni dans le journal : le
+        # module standard y recopie la ligne reçue (« Bad request syntax
+        # ('GET /?t=… ') »), qui pourrait porter un jeton
+        try:
+            phrase = http.HTTPStatus(code).phrase
+        except ValueError:
+            phrase = "error"
+        self.close_connection = True
+        self.log_message("code %d, %s", code, phrase)
+        self._error(code, "%d %s" % (code, phrase))
+
     def log_message(self, fmt: str, *args) -> None:
         # jamais la chaîne de requête (elle peut porter le jeton) : la
         # méthode, le chemin et le statut seulement
         if fmt.startswith('"%s"') and args:
-            line = str(args[0])
-            method, _, rest = line.partition(" ")
-            path = urllib.parse.urlsplit(rest.split(" ")[0]).path
-            args = ("%s %s" % (method, path),) + tuple(args[1:])
+            # une ligne mal formée ne passe pas : rien que « MÉTHODE /chemin »
+            m = _LINE_RE.match(str(args[0]))
+            args = ((m.group(1) + " " + m.group(2)) if m else "(malformed request)",) + tuple(args[1:])
         sys.stderr.write("progress --serve: %s\n" % (fmt % args))
 
 
@@ -244,7 +240,8 @@ def make_server(snapshots: Snapshots, *, port: int = DEFAULT_PORT, token: str | 
 
 
 def url_of(server) -> str:
-    return "http://%s:%d/?t=%s" % (BIND, server.server_address[1], server.token)
+    """L'URL à ouvrir : le jeton dans le fragment, que le navigateur n'envoie pas."""
+    return "http://%s:%d/#t=%s" % (BIND, server.server_address[1], server.token)
 
 
 def serve(cfg, *, port: int, since: str, stale_after: float, gantt: bool,

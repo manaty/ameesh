@@ -47,8 +47,8 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 
 | Path | Response |
 |---|---|
-| `/` | the page with the current snapshot embedded; its **Refresh** button reloads it, optionally every 60 s (`#auto` in the URL); "data as of HH:MM" is `generated_ts` |
-| `/api/progress.json` | this schema; `?project=P` takes a project known to the unfiltered snapshot (400 otherwise), empty = all projects |
+| `/` | the page **without data** (no token needed, nothing to protect): it reads `/api/progress.json` with the token; its **Refresh** button reloads it, optionally every 60 s (`#auto` in the URL); "data as of HH:MM" is `generated_ts` |
+| `/api/progress.json` | this schema, with `Authorization: Bearer <token>` only (401 otherwise); `?project=P` takes a project known to the unfiltered snapshot (400 otherwise), empty = all projects |
 
 * **Bound to `127.0.0.1` only**; no option changes the address. The `Host`
   header must be `127.0.0.1:<port>` or `localhost:<port>` (403 otherwise:
@@ -58,11 +58,17 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
   with `default_transaction_read_only=on`.
 * **Token**: the host is shared by several agents and Unix accounts, which
   `127.0.0.1` does not keep out. Each start draws a random token, printed
-  **only on the command's output**: `http://127.0.0.1:<port>/?t=<token>`.
-  The first visit stores it in an `HttpOnly; SameSite=Strict` cookie named
-  `ameesh_progress_<port>` and redirects to the URL without it; it is compared
-  in constant time; a restart draws a new one (old links and cookies stop
-  working). Request lines are logged on stderr without their query string.
+  **only on the command's output**: `http://127.0.0.1:<port>/#t=<token>`.
+  It sits in the URL **fragment**, which the browser never sends; the page
+  moves it to `sessionStorage` (isolated per origin, so per port), removes
+  it from the URL and sends it in an `Authorization: Bearer` header. **No
+  cookie**: browsers share `127.0.0.1` cookies across ports, so any local
+  server another account runs on another port would receive them. The
+  custom header also turns any cross-origin fetch into a preflight, which
+  gets 405. The token is compared in constant time; a restart draws a new
+  one (old links stop working). Request lines are logged on stderr as
+  method and path only, and error pages (malformed request included) never
+  echo the request.
 * A snapshot is kept 5 s per project: an open tab does not hammer the
   database. Responses carry `Cache-Control: no-store`.
 

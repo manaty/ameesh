@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """`ameesh progress --serve` (L304) : serveur local en lecture seule.
 
-Sans base : liaison 127.0.0.1, jeton (URL → cookie lié au port, temps
-constant, jamais journalisé), en-tête Host, 405 hors GET/HEAD, forme du
+Sans base : liaison 127.0.0.1, jeton (fragment de l'URL → en-tête
+Authorization, aucun cookie, temps constant, jamais journalisé ni renvoyé
+dans une page d'erreur), en-tête Host, 405 hors GET/HEAD, forme du
 JSON, cache, `?project=`. Sur Postgres réel : l'instantané lu par une session
 en lecture seule, les cartes `overview` et la CLI.
 """
@@ -55,11 +56,11 @@ class ServerCase(unittest.TestCase):
         self.server.server_close()
         self.thread.join(5)
 
-    def request(self, method, path, *, host=None, cookie=None, body=None):
+    def request(self, method, path, *, host=None, auth=None, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        headers = {"Host": host or "127.0.0.1:%d" % self.port}
-        if cookie:
-            headers["Cookie"] = cookie
+        headers = dict(headers or {}, Host=host or "127.0.0.1:%d" % self.port)
+        if auth:
+            headers["Authorization"] = auth
         try:
             conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -67,8 +68,20 @@ class ServerCase(unittest.TestCase):
         finally:
             conn.close()
 
-    def cookie(self):
-        return "ameesh_progress_%d=%s" % (self.port, self.server.token)
+    def auth(self):
+        return "Bearer %s" % self.server.token
+
+    def raw(self, line: bytes) -> bytes:
+        """Une requête brute (mal formée au besoin) ; la réponse entière."""
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(line)
+            out = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return out
+                out += chunk
 
 
 class ServeTest(ServerCase):
@@ -77,32 +90,47 @@ class ServeTest(ServerCase):
         self.assertEqual(progress_serve.BIND, "127.0.0.1")
         self.assertNotIn("host", progress_serve.make_server.__code__.co_varnames)
 
-    def test_jeton_de_l_url_vers_le_cookie(self):
-        resp, _ = self.request("GET", "/")
+    def test_jeton_en_en_tete_jamais_en_cookie(self):
+        # la page vient sans jeton, mais sans données
+        resp, body = self.request("GET", "/")
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.getheader("Set-Cookie"))
+        self.assertIn('<script type="application/json" id="data">null</script>', body.decode())
+        self.assertEqual(self.calls, [])
+        # l'API exige le jeton, en en-tête Authorization seulement
+        for auth in (None, "Bearer faux", "Bearer " + self.server.token + "x",
+                     "Basic " + self.server.token, self.server.token):
+            resp, _ = self.request("GET", progress_serve.API, auth=auth)
+            self.assertEqual(resp.status, 401, auth)
+            self.assertEqual(resp.getheader("WWW-Authenticate"), "Bearer")
+        # ni l'URL ni un cookie ne le remplacent (un autre serveur local, sur un
+        # autre port, recevrait les cookies de 127.0.0.1)
+        self.assertEqual(self.request("GET", progress_serve.API + "?t=" + self.server.token)[0].status, 401)
+        resp, _ = self.request("GET", progress_serve.API, headers={
+            "Cookie": "ameesh_progress_%d=%s" % (self.port, self.server.token)})
         self.assertEqual(resp.status, 401)
-        resp, _ = self.request("GET", "/?t=faux")
-        self.assertEqual(resp.status, 401)
-        resp, _ = self.request("GET", "/?t=%s&project=demo" % self.server.token)
-        self.assertEqual(resp.status, 303)
-        self.assertEqual(resp.getheader("Location"), "/?project=demo")
-        cookie = resp.getheader("Set-Cookie")
-        self.assertTrue(cookie.startswith(self.cookie() + ";"), cookie)
-        for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
-            self.assertIn(flag, cookie)
-        # le cookie d'un autre port (un autre serveur) ne vaut rien ici
-        other = "ameesh_progress_%d=%s" % (self.port + 1, self.server.token)
-        self.assertEqual(self.request("GET", "/", cookie=other)[0].status, 401)
-        self.assertEqual(self.request("GET", "/", cookie=self.cookie() + "x")[0].status, 401)
-        self.assertEqual(self.request("GET", "/", cookie=self.cookie())[0].status, 200)
+        resp, _ = self.request("GET", progress_serve.API, auth=self.auth())
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.getheader("Set-Cookie"))
+        self.assertEqual(self.calls, [None])
 
-    def test_redirection_vers_un_chemin_servi_seulement(self):
-        resp, _ = self.request("GET", "//ailleurs.example/?t=%s" % self.server.token)
-        self.assertEqual(resp.status, 303)
-        self.assertEqual(resp.getheader("Location"), "/")
+    def test_url_au_jeton_dans_le_fragment(self):
+        url = progress_serve.url_of(self.server)
+        self.assertEqual(url, "http://127.0.0.1:%d/#t=%s" % (self.port, self.server.token))
+
+    def test_requete_mal_formee_sans_echo(self):
+        # le module standard recopie la ligne reçue dans la page 400 et le journal
+        for line in (b"GET /api/progress.json?t=" + self.server.token.encode() + b" HTTP/1.1 x\r\n\r\n",
+                     b"GET /?t=" + self.server.token.encode() + b" HTTP/9.9\r\n\r\n",
+                     b"G\tET /" + self.server.token.encode() + b"\r\n\r\n"):
+            out = self.raw(line)
+            self.assertRegex(out, rb"\b(400|505)\b")
+            self.assertNotIn(self.server.token.encode(), out)
+        self.assertNotIn(self.server.token, self.stderr.getvalue())
 
     def test_jeton_compare_en_temps_constant(self):
         with mock.patch("hmac.compare_digest", wraps=__import__("hmac").compare_digest) as cd:
-            self.request("GET", "/", cookie=self.cookie())
+            self.request("GET", progress_serve.API, auth=self.auth())
         self.assertTrue(cd.called)
 
     def test_jeton_neuf_a_chaque_serveur(self):
@@ -114,42 +142,43 @@ class ServeTest(ServerCase):
             other.server_close()
 
     def test_jeton_jamais_journalise(self):
-        self.request("GET", "/?t=%s" % self.server.token)
-        self.request("GET", "/?t=%s" % self.server.token[:-1])
-        self.request("GET", "/", cookie=self.cookie())
+        self.request("GET", progress_serve.API + "?t=%s" % self.server.token)
+        self.request("GET", progress_serve.API, auth="Bearer " + self.server.token[:-1])
+        self.request("GET", progress_serve.API, auth=self.auth())
         log = self.stderr.getvalue()
-        self.assertIn("GET /", log)
+        self.assertIn("GET /api/progress.json", log)
         self.assertNotIn(self.server.token, log)
         self.assertNotIn(self.server.token[:-1], log)
 
     def test_hote_refuse(self):
         for host in ("ailleurs.example:%d" % self.port, "127.0.0.1:1", "127.0.0.1"):
-            resp, _ = self.request("GET", "/", host=host, cookie=self.cookie())
+            resp, _ = self.request("GET", "/", host=host, auth=self.auth())
             self.assertEqual(resp.status, 403, host)
         resp, _ = self.request("GET", progress_serve.API, host="localhost:%d" % self.port,
-                               cookie=self.cookie())
+                               auth=self.auth())
         self.assertEqual(resp.status, 200)
 
     def test_lecture_seule(self):
         for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
-            resp, _ = self.request(method, progress_serve.API, cookie=self.cookie(), body=b"{}")
+            resp, _ = self.request(method, progress_serve.API, auth=self.auth(), body=b"{}")
             self.assertEqual(resp.status, 405, method)
             self.assertEqual(resp.getheader("Allow"), "GET, HEAD")
         self.assertEqual(self.calls, [])
 
     def test_page_servie(self):
-        resp, body = self.request("GET", "/", cookie=self.cookie())
+        resp, body = self.request("GET", "/", auth=self.auth())
         self.assertEqual(resp.getheader("Content-Type"), "text/html; charset=utf-8")
         self.assertEqual(resp.getheader("Cache-Control"), "no-store")
         self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
         html = body.decode("utf-8")
         self.assertIn('var MODE = "served";', html)
+        self.assertIn("connect-src 'self'", html)
         self.assertNotIn("</script><b>", html)
-        head, _ = self.request("HEAD", "/", cookie=self.cookie())
+        head, _ = self.request("HEAD", "/", auth=self.auth())
         self.assertEqual(head.status, 200)
 
     def test_json_et_projet(self):
-        resp, body = self.request("GET", progress_serve.API, cookie=self.cookie())
+        resp, body = self.request("GET", progress_serve.API, auth=self.auth())
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.getheader("Content-Type"), "application/json; charset=utf-8")
         data = json.loads(body)
@@ -157,20 +186,20 @@ class ServeTest(ServerCase):
         for key in ("overview", "decisions", "lots", "agents", "generated_ts"):
             self.assertIn(key, data)
         resp, body = self.request("GET", progress_serve.API + "?project=demo",
-                                  cookie=self.cookie())
+                                  auth=self.auth())
         self.assertEqual(json.loads(body)["project"], "demo")
         for bad in ("inconnu", "../x", "a" * 80):
             resp, _ = self.request("GET", progress_serve.API + "?project=" + bad,
-                                   cookie=self.cookie())
+                                   auth=self.auth())
             self.assertEqual(resp.status, 400, bad)
-        self.assertEqual(self.request("GET", "/ailleurs", cookie=self.cookie())[0].status, 404)
+        self.assertEqual(self.request("GET", "/ailleurs", auth=self.auth())[0].status, 404)
 
     def test_cache(self):
-        self.request("GET", progress_serve.API, cookie=self.cookie())
-        self.request("GET", "/", cookie=self.cookie())
+        self.request("GET", progress_serve.API, auth=self.auth())
+        self.request("GET", progress_serve.API, auth=self.auth())
         self.assertEqual(self.calls, [None])
         self.clock[0] += progress_serve.CACHE_S
-        self.request("GET", progress_serve.API, cookie=self.cookie())
+        self.request("GET", progress_serve.API, auth=self.auth())
         self.assertEqual(self.calls, [None, None])
 
 
@@ -180,7 +209,15 @@ class PageModeTest(unittest.TestCase):
         self.assertIn('var MODE = "static";', html)
         self.assertIn("open with --serve to refresh", html)
         self.assertIn("default-src 'none'", html)
-        self.assertIn('var MODE = "served";', progress.render_html(_snap(), served=True))
+        self.assertNotIn("connect-src", html)
+        served = progress.render_html(None, served=True)
+        self.assertIn('var MODE = "served";', served)
+        self.assertIn("default-src 'none'; connect-src 'self';", served)
+        # le jeton part en en-tête, jamais en cookie ; couper l'auto garde ?project=
+        self.assertIn('"Authorization": "Bearer " + token', served)
+        self.assertIn('credentials: "omit"', served)
+        self.assertIn("location.pathname + location.search", served)
+        self.assertIn("sessionStorage", served)
 
 
 class OverviewTest(unittest.TestCase):
