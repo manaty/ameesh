@@ -246,44 +246,20 @@ class Offer:
     published: dict = dataclasses.field(default_factory=dict, compare=False)
 
 
-def _percent(value: Any, key: str) -> float | None:
-    if value is None:
-        return None
-    number = resources.parse_percent(value)
-    if number is None:
-        raise GuardError("lend.reclaim.%s: percentage expected, got %r" % (key, value))
-    return number
-
-
-def _bytes(value: Any, key: str) -> int | None:
-    if value is None:
-        return None
-    number = resources.parse_bytes(value)
-    if number is None:
-        raise GuardError("lend.%s: size expected (e.g. 6GiB), got %r" % (key, value))
-    return number
-
-
-#: reclaim keys only the guard reads; the contract's reader reports them as
-#: unknown and ignores them
-GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
+#: the guard's own reclaim keys: the contract's reader knows and validates
+#: them too (capacity_guard.GUARD_RECLAIM_KEYS)
+GUARD_RECLAIM_KEYS = capacity_guard.GUARD_RECLAIM_KEYS
 
 
 def parse_offer(lend: Any) -> Offer:
     """`Offer` from the `lend` object, read by the contract's own reader
     (`capacity_guard.parse_lend`): the guard accepts exactly the offers the
-    canon accepts (codex #211 r6), plus the reclaim keys of
-    `GUARD_RECLAIM_KEYS`. `GuardError` on any problem."""
+    canon accepts (codex #211 r6), the reclaim keys of `GUARD_RECLAIM_KEYS`
+    included. `GuardError` on any problem."""
     parsed, problems, _unknown = capacity_guard.parse_lend(lend)
     if problems or parsed is None:
         raise GuardError("lend: %s" % "; ".join(problems or ["unreadable"]))
     reclaim = parsed.get("reclaim") or {}
-    extra = lend.get("reclaim") or {}
-    paths = extra.get("disk_paths") or ["/"]
-    if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
-        raise GuardError("lend.reclaim.disk_paths: list of paths expected")
-    io = _percent(extra.get("io_pressure_max"), "io_pressure_max")
-    disk_min = _bytes(extra.get("disk_free_min"), "reclaim.disk_free_min")
     published = dict(parsed)
     restart = lend.get("restart_after_seconds")
     if restart is not None:
@@ -292,11 +268,7 @@ def parse_offer(lend: Any) -> Offer:
         if restart is None:
             raise GuardError("lend.restart_after_seconds: whole number of seconds expected")
         published["restart_after_seconds"] = restart
-    guard_keys = {"io_pressure_max": io, "disk_free_min": disk_min,
-                  "disk_paths": paths if "disk_paths" in extra else None}
-    guard_keys = {k: v for k, v in guard_keys.items() if v is not None}
-    if guard_keys:
-        published["reclaim"] = dict(reclaim, **guard_keys)
+    disk_min = reclaim.get("disk_free_min")
     return Offer(
         cpu_max=parsed["cpu_max"], cpu_weight=parsed.get("cpu_weight", 10),
         memory_max=parsed["memory_max"], agent_memory_max=parsed.get("agent_memory_max"),
@@ -305,10 +277,10 @@ def parse_offer(lend: Any) -> Offer:
         memory_available_min=reclaim.get("memory_available_min"),
         cpu_pressure_max=reclaim.get("cpu_pressure_max"),
         memory_pressure_max=reclaim.get("memory_pressure_max"),
-        io_pressure_max=io,
+        io_pressure_max=reclaim.get("io_pressure_max"),
         busy_units=tuple(reclaim.get("busy_units", ())), busy_max=reclaim.get("busy_max"),
         disk_free_min=DEFAULT_DISK_FREE_MIN if disk_min is None else disk_min,
-        disk_paths=tuple(paths),
+        disk_paths=tuple(reclaim.get("disk_paths") or ("/",)),
         drain_seconds=float(parsed["drain_seconds"]),
         calm_seconds=float(parsed["calm_seconds"]),
         restart_after_seconds=DEFAULT_RESTART_AFTER_S if restart is None else float(restart),

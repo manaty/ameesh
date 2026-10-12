@@ -52,8 +52,12 @@ LEND_CAPS = ("cpu_max", "memory_max", "disk_max")
 LEND_SIZES = ("memory_max", "agent_memory_max", "disk_max")
 LEND_KEYS = LEND_CAPS + ("cpu_weight", "agent_memory_max", "windows", "reclaim",
                          "drain_seconds", "calm_seconds")
+#: the three reclaim keys the guard reads itself (L159a): the contract's
+#: reader knows them too, so a valid host fiche using them is not reported
+#: as a `host-lend-unknown` warning
+GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
 RECLAIM_KEYS = ("memory_available_min", "cpu_pressure_max", "memory_pressure_max",
-                "busy_units", "busy_max")
+                "busy_units", "busy_max") + GUARD_RECLAIM_KEYS
 DEFAULT_DRAIN_SECONDS = 90
 DEFAULT_CALM_SECONDS = 600
 #: systemd `CPUWeight=` bounds
@@ -244,13 +248,16 @@ def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
         return {}, ["mapping expected"], []
     out: dict = {}
     problems: list[str] = []
-    if raw.get("memory_available_min") is not None:
-        octets = resources_mod.parse_bytes(raw["memory_available_min"])
+    for key in ("memory_available_min", "disk_free_min"):
+        if raw.get(key) is None:
+            continue
+        octets = resources_mod.parse_bytes(raw[key])
         if octets is None:
-            problems.append("`memory_available_min`: size in bytes expected (e.g. 6GiB)")
+            problems.append("`%s`: size in bytes expected (e.g. %s)"
+                            % (key, "6GiB" if key == "memory_available_min" else "10GiB"))
         else:
-            out["memory_available_min"] = octets
-    for key in ("cpu_pressure_max", "memory_pressure_max"):
+            out[key] = octets
+    for key in ("cpu_pressure_max", "memory_pressure_max", "io_pressure_max"):
         if raw.get(key) is None:
             continue
         percent = resources_mod.parse_percent(raw[key])
@@ -258,6 +265,13 @@ def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`%s`: percentage from 0 to 100 expected (PSI some, avg60)" % key)
         else:
             out[key] = percent
+    if raw.get("disk_paths") is not None:
+        paths = raw["disk_paths"]
+        if not isinstance(paths, list) or not paths or not all(
+                isinstance(p, str) and p.strip() for p in paths):
+            problems.append("`disk_paths`: non-empty list of paths expected")
+        else:
+            out["disk_paths"] = [p.strip() for p in paths]
     if raw.get("busy_units") is not None:
         units = raw["busy_units"]
         if isinstance(units, str):

@@ -75,6 +75,9 @@ policy:
       memory_pressure_max: 2%     # PSI memory "some", avg60
       busy_units: ["actions.runner.*"]   # systemd unit patterns (CI jobs)
       busy_max: 4                 # requires busy_units
+      io_pressure_max: 20%        # PSI io "some", avg60 (ameesh guard, L159e)
+      disk_free_min: 10GiB        # watched free space under this (ameesh guard, L159e)
+      disk_paths: ["/", "/srv/ameesh-guest"]   # filesystems watched (ameesh guard, L159e)
     drain_seconds: 90         # deadline of the withdrawal (default 90, > 0)
     calm_seconds: 600         # hysteresis before lending again (default 600)
     restart_after_seconds: 600   # ameesh guard only: units it stopped start again (L159e4)
@@ -91,6 +94,11 @@ policy:
   dropped. A number counts as unreadable if it is `.inf`, `.nan` or has
   more digits than a float holds, `reclaim` included: the host lends nothing until its fiche is fixed. An unknown key
   is a `host-lend-unknown` warning, and the key is ignored.
+- Three `reclaim` keys drive the ameesh guard (L159e): `io_pressure_max`
+  (a percentage), `disk_free_min` (a size) and `disk_paths` (a non-empty
+  list of paths whose free space is watched). The reader knows and
+  validates them (L479), so they are no warning; a reader that does not
+  use them ignores them.
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 

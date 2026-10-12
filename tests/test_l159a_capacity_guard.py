@@ -203,7 +203,8 @@ class OfferTest(unittest.TestCase):
         keys = [(k,) for k in ("cpu_max", "memory_max", "agent_memory_max", "disk_max",
                                  "cpu_weight", "drain_seconds", "calm_seconds")]
         keys += [("reclaim", k) for k in ("memory_available_min", "cpu_pressure_max",
-                                          "memory_pressure_max", "busy_max")]
+                                          "memory_pressure_max", "io_pressure_max",
+                                          "disk_free_min", "busy_max")]
         for path in keys:
             for value in (10 ** 400, float("inf"), float("nan")):
                 with self.subTest(path=path, value=str(value)[:6]):
@@ -212,6 +213,31 @@ class OfferTest(unittest.TestCase):
                     offer, problems, _ = capacity_guard.parse_lend(lend)
                     self.assertIsNone(offer)
                     self.assertTrue(any(path[-1] in p for p in problems), problems)
+
+    def test_guard_reclaim_keys_are_known(self):
+        # L479/#450: the guard's three reclaim keys are read by the contract
+        # too: a fiche using them is valid (no unknown key), and they are
+        # validated the way the guard does
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        lend = dict(base, reclaim={"io_pressure_max": "20%", "disk_free_min": "10GiB",
+                                   "disk_paths": ["/", "/srv/ameesh-guest"]})
+        offer, problems, unknown = capacity_guard.parse_lend(lend)
+        self.assertEqual(problems, [])
+        self.assertEqual(unknown, [])
+        self.assertEqual(offer["reclaim"], {"io_pressure_max": 20.0, "disk_free_min": 10 * GIB,
+                                            "disk_paths": ["/", "/srv/ameesh-guest"]})
+        self.assertTrue(set(capacity_guard.GUARD_RECLAIM_KEYS)
+                        <= set(capacity_guard.RECLAIM_KEYS))
+        for key, value in (("io_pressure_max", "120%"), ("io_pressure_max", -1),
+                           ("disk_free_min", "lots"), ("disk_free_min", -1),
+                           ("disk_paths", "/"), ("disk_paths", []),
+                           ("disk_paths", [""]), ("disk_paths", ["/", 3])):
+            with self.subTest(key=key, value=value):
+                offer, problems, unknown = capacity_guard.parse_lend(
+                    dict(base, reclaim={key: value}))
+                self.assertIsNone(offer)
+                self.assertTrue(any(key in p for p in problems), problems)
+                self.assertEqual(unknown, [])
 
     def test_parse_helpers_never_overflow(self):
         # codex #212 r4: the resources helpers the contract uses
@@ -249,6 +275,21 @@ class CanonTest(_Canons, unittest.TestCase):
         self.assertNotIn("host-policy-invalid", codes(found, canon.ERROR))
         self.assertIn("host-lend-unknown", codes(found, canon.WARNING))
 
+    def test_canon_check_accepts_the_guard_reclaim_keys(self):
+        # L479/#450: the guard's three reclaim keys are part of the offer the
+        # canon reads: a valid fiche using them is no host-lend-unknown
+        text = host("bob", harnesses=("codex",), resources_yaml=(
+            "  lend:\n    cpu_max: 3\n    memory_max: 14GiB\n    disk_max: 80GiB\n"
+            "    reclaim:\n      io_pressure_max: 20%\n      disk_free_min: 10GiB\n"
+            "      disk_paths: [\"/\", \"/srv/ameesh-guest\"]\n"))
+        loaded = canon.load(self.acme(host_text=text, name="l479"), default=False)
+        found = canon.validate(loaded)
+        self.assertNotIn("host-lend-unknown", codes(found, canon.WARNING))
+        self.assertNotIn("host-policy-invalid", codes(found, canon.ERROR))
+        self.assertEqual(loaded.host(HOST).policy.lend["reclaim"],
+                         {"io_pressure_max": 20.0, "disk_free_min": 10 * GIB,
+                          "disk_paths": ["/", "/srv/ameesh-guest"]})
+
     def test_unreadable_offer_lends_nothing(self):
         text = host("bob", harnesses=("codex",), resources_yaml=(
             "  lend:\n    cpu_max: 3\n    memory_max: 14GiB\n"))
@@ -284,7 +325,8 @@ class CanonTest(_Canons, unittest.TestCase):
         cases = [("lend", k, None) for k in ("agent_memory_max", "cpu_weight",
                                              "drain_seconds", "calm_seconds")]
         cases += [("lend", "reclaim", k) for k in ("memory_available_min", "cpu_pressure_max",
-                                                   "memory_pressure_max", "busy_max")]
+                                                   "memory_pressure_max", "io_pressure_max",
+                                                   "disk_free_min", "busy_max")]
         cases += [("resources", k, None) for k in resources.THRESHOLD_KEYS
                   + ("agent_memory_max",)]
         for n, (section, key, sub) in enumerate(cases):
