@@ -264,8 +264,9 @@ class MergeSweepTest(_Base):
         _git(self.repo, "checkout", "-q", "-b", "develop")
         _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "develop")
         self.agent("claude1", cwd=self.repo)
-        plan_git._pr_body_backoff.clear()           # état du processus
-        self.addCleanup(plan_git._pr_body_backoff.clear)
+        for state in (plan_git._pr_body_backoff, plan_git._pr_body_cache):
+            state.clear()                           # état du processus
+            self.addCleanup(state.clear)
 
     def commit(self, name):
         with open(os.path.join(self.repo, name), "w") as fh:
@@ -492,6 +493,42 @@ class MergeSweepTest(_Base):
         self.assertEqual((len(lus), report["merged"]), (1, 1))
         self.assertTrue(any("bodies read in this sweep" in r["detail"]
                             for r in report["results"]))
+
+    def test_r2_corps_lus_gardes_pas_de_famine(self):
+        # P2 : un corps déjà lu ne reprend pas de lecture : le lot suivant
+        # est lu au relevé suivant, même avec un plafond d'une lecture
+        a, b = self.lot("parapluie"), self.lot("complet")
+        self.merge("lot/%d-x" % a["id"], "Merge pull request #30 from manaty/lot/%d-x" % a["id"])
+        self.merge("lot/%d-y" % b["id"], "Merge pull request #31 from manaty/lot/%d-y" % b["id"])
+        corps = {30: "ameesh-work-partial: %d" % a["id"], 31: "Done."}
+        lus = []
+
+        def lire(repo, num):
+            lus.append(num)
+            return corps[num]
+
+        with mock.patch.object(plan_git, "MAX_PR_BODY_READS", 1):
+            self.sync(pr_body=lire)
+            self.sync(pr_body=lire)
+            self.sync(pr_body=lire)
+        self.assertEqual(lus, [30, 31])
+        self.assertEqual(work.get(self.db, b["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
+
+    def test_r2_seule_la_derniere_fusion_partielle_compte(self):
+        # P2 : fusion locale partielle, puis la suite de la même branche
+        # entre dans la cible en avance rapide : le lot est fermé
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        branch = "lot/%d-un" % n
+        self.merge(branch, "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n))
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")
+        self.commit("la-suite")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--ff-only", branch)
+        self.assertEqual(self.sync()["merged"], 1)
 
     def test_cited_lots(self):
         cas = {

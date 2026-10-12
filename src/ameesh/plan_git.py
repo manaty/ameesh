@@ -266,6 +266,11 @@ PR_BODY_BACKOFF_S = 60.0
 PR_BODY_BACKOFF_MAX_S = 3600.0
 #: (dépôt, PR) → (pas avant, délai courant) ; état du processus (relevés successifs)
 _pr_body_backoff: dict = {}
+#: #312 r2 : (dépôt, PR) → corps déjà lu d'une PR fusionnée (il ne change
+#: plus) : relu sans appel ni lecture comptée, les relevés suivants lisent
+#: les PR suivantes ; état du processus, borné
+_pr_body_cache: dict = {}
+PR_BODY_CACHE_MAX = 5000
 #: clé de configuration git du dépôt qui nomme la cible par défaut
 TARGET_GIT_KEY = "ameesh.target"
 DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
@@ -441,8 +446,8 @@ def lot_ref_hash(repo: str) -> bool:
 def merge_commits(repo: str, target: str, since_ts: float | None = None,
                   limit: int = MAX_MERGE_SCAN) -> list[dict]:
     """Les commits de FUSION de `target` (au plus `limit`, du plus récent au
-    plus ancien, postérieurs à `since_ts`) : `{sha, ts, message}`."""
-    args = ["log", "--merges", "--format=%H%x00%ct%x00%B%x1e", "--max-count=%d" % int(limit)]
+    plus ancien, postérieurs à `since_ts`) : `{sha, ts, message, parents}`."""
+    args = ["log", "--merges", "--format=%H%x00%ct%x00%P%x00%B%x1e", "--max-count=%d" % int(limit)]
     if since_ts:
         args.append("--since=@%d" % int(since_ts))
     proc = _git(repo, *args, target)
@@ -452,13 +457,15 @@ def merge_commits(repo: str, target: str, since_ts: float | None = None,
     rows = []
     for record in proc.stdout.decode("utf-8", "replace").split("\x1e"):
         sha, _sep, rest = record.strip().partition("\x00")
-        stamp, _sep, message = rest.partition("\x00")
+        stamp, _sep, rest = rest.partition("\x00")
+        parents, _sep, message = rest.partition("\x00")
         if sha:
             try:
                 ts = float(stamp)
             except ValueError:
                 ts = 0.0
-            rows.append({"sha": sha, "ts": ts, "message": message.strip()})
+            rows.append({"sha": sha, "ts": ts, "message": message.strip(),
+                         "parents": parents.split()})
     return rows
 
 
@@ -607,12 +614,23 @@ def gh_pr_body(repo: str, number: int) -> str:
     return (data or {}).get("body") or ""
 
 
+def _moved_past(repo: str, tip: str, merge: dict) -> bool:
+    """#312 r2 : la pointe fusionnée `tip` va-t-elle au-delà de la branche
+    qu'avait fusionnée `merge` (son second parent) ?"""
+    parents = merge.get("parents") or []
+    if len(parents) < 2:
+        return False
+    return _git(repo, "merge-base", "--is-ancestor", tip, parents[1]).returncode != 0
+
+
 def _read_pr_body(pr_body, repo: str, number: int, sweep: dict):
     """#312 r1 : le corps de la PR, ou la GitError qui le rend illisible —
     sans appel pendant le recul de cette PR, après un échec de `gh` sur ce
     dépôt dans ce relevé, ni au-delà de `MAX_PR_BODY_READS` lectures : une
     PR toujours illisible ne cache pas longtemps les suivantes."""
     import time
+    if (repo, number) in _pr_body_cache:
+        return _pr_body_cache[(repo, number)]
     now = time.time()
     until, delay = _pr_body_backoff.get((repo, number), (0.0, 0.0))
     if now < until:
@@ -631,6 +649,9 @@ def _read_pr_body(pr_body, repo: str, number: int, sweep: dict):
         sweep["failed"].add(repo)
         return exc
     _pr_body_backoff.pop((repo, number), None)
+    if len(_pr_body_cache) >= PR_BODY_CACHE_MAX:
+        _pr_body_cache.pop(next(iter(_pr_body_cache)))     # le plus ancien lu
+    _pr_body_cache[(repo, number)] = body
     return body
 
 
@@ -739,17 +760,16 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                           or merge_branch(m["message"]) == mine]
             # L118b : une fusion GitHub de `lot/<id>-…` ne ferme le lot que si
             # sa PR ne se déclare pas partielle ; la première qui livre tout
-            held = None
-            unreadable = False
-            partial = False
+            unreadable = None                # pourquoi une PR reste illisible
+            partial = None                   # la dernière fusion partielle, et pourquoi
             cited = None
             # #312 r1 : une fusion locale qui se déclare partielle retient
             # aussi la preuve par la branche
             for merge in merges_partial(merges[(repo, target)], lot,
                                         since_ts=row.get("created_ts")):
-                partial = True
-                held = ("merge commit %s declares itself partial (\"ameesh-work-partial: "
-                        "%d\"): lot kept open" % (merge["sha"][:12], lot))
+                partial = (merge, "merge commit %s declares itself partial "
+                           "(\"ameesh-work-partial: %d\"): lot kept open"
+                           % (merge["sha"][:12], lot))
             for merge in citing:
                 number = merge_pr_number(merge["message"])
                 if not number:
@@ -761,15 +781,15 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 if isinstance(body, GitError):
                     # #312 r1 : une PR plus récente lisible et complète peut
                     # encore fermer le lot
-                    unreadable = True
-                    held = held or ("PR #%d merged, but its body is unreadable (%s): not "
-                                    "closed until it says whether it is partial"
-                                    % (number, body))
+                    unreadable = unreadable or (
+                        "PR #%d merged, but its body is unreadable (%s): not closed until "
+                        "it says whether it is partial" % (number, body))
                     continue
                 if lot in partial_lots(body):
-                    partial = True
-                    held = ("PR #%d declares itself partial (\"ameesh-work-partial: %d\"): "
-                            "lot kept open" % (number, lot))
+                    if partial is None or merge["ts"] >= partial[0]["ts"]:
+                        partial = (merge, "PR #%d declares itself partial "
+                                   "(\"ameesh-work-partial: %d\"): lot kept open"
+                                   % (number, lot))
                     continue
                 cited = merge
                 break
@@ -777,7 +797,13 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # quand le corps est illisible (hôte sans gh) : seule la preuve
             # implicite attend de savoir ; une fusion partielle retient toujours
             proven = bool(found and found["merged"] and row.get("branch"))
-            if held and cited is None and (partial or not (unreadable and proven)):
+            if partial and found and found["merged"] and found["tip"] \
+                    and _moved_past(repo, found["tip"], partial[0]):
+                # #312 r2 : seule la dernière fusion de la branche compte ; la
+                # branche fusionnée depuis au-delà (avance rapide) a livré la suite
+                partial = None
+            held = partial[1] if partial else unreadable
+            if held and cited is None and (partial or not proven):
                 found = dict(found or {"tip": None, "ahead": False, "ref": None},
                              merged=False, how="partial", detail=held)
             elif found is None or not found["merged"]:
