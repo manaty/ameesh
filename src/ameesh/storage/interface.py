@@ -1765,6 +1765,21 @@ class Decisions(Domain):
         inconnue) — rien n'est écrit."""
 
     @abc.abstractmethod
+    def source_mail(self, message_id: int) -> dict | None:
+        """L233: mail `message_id` (id, sender, recipient, body, kind,
+        work_item_id, created_ts), or None — the source of a request filed
+        with `ameesh decide ask --from-mail`."""
+
+    @abc.abstractmethod
+    def prose_candidates(self, *, recipients: Sequence[str], since_ts: float,
+                         limit: int) -> list[dict]:
+        """L233: mail sent since `since_ts` by an agent (not `ameesh`, not a
+        human, not a chat) to one of `recipients` or to any `human:*`, that is
+        neither a request, a reply, an alert (`event`) nor a receipt, and that
+        no request names as its source (`payload.decision.source_mail`): the
+        `limit` most recent, oldest first, same columns as `source_mail`."""
+
+    @abc.abstractmethod
     def register_chat(self, name: str, *, human: str, host: str, harness: str,
                       cwd: str | None, status_text: str) -> dict | None:
         """Inscrit (ou rafraîchit) l'agent de conversation `name` : mode

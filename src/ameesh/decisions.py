@@ -7,6 +7,8 @@
         un agent dépose une demande : rattachée au projet et au lot, le lot
         passe en `waiting_human` (il revient à son état précédent à la
         réponse), le propriétaire visé est notifié ;
+        `--from-mail <id>` (L233): the mail in which the agent wrote this
+        decision in prose (the lot of the mail by default);
   ameesh decide <id> <option | "texte libre"> [--key FICHIER [--as NOM] | --signed] [--json]
         le propriétaire répond (une identité HUMAINE seulement) ; la réponse
         part au demandeur par courrier (elle le réveille), au fil et au lot ;
@@ -21,6 +23,14 @@ elles partaient dans le courrier d'autres agents (parfois une boîte morte),
 et il n'était joignable qu'en s'attachant à la session d'un orchestrateur.
 Désormais une demande a un destinataire humain, une file, une notification,
 une relance à l'échéance, et une réponse tracée.
+
+**Only the queue counts** (L233, owner feedback of 2026-10-12): a lot
+enters `waiting_human` only while a request is open for it (`work.move`
+refuses otherwise; alert `waiting_without_question` for older rows), and a
+decision written in prose in mail to bureau or to a human is not a request:
+`ameesh decisions` lists such mail (`prose_decisions`, cue words
+`PROSE_CUES`, last 24 h) with the command that converts it,
+`ameesh decide ask --from-mail <id>`, run by its author.
 
 **Destinataire** (premier trouvé) : le responsable de la fiche du plan du lot
 (en remontant les parents), le responsable de l'agent demandeur, celui de
@@ -100,6 +110,21 @@ RUNNER_ENV = ("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID")
 LEASE_ENV = ("AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH")
 
 _TIME_RE = re.compile(r"^\s*(\d{1,2})[:h](\d{2})\s*$")
+
+#: L233: a decision written in prose in mail to the owner's desk or to a
+#: human never counts; `ameesh decisions` (and so `ameesh chat`) shows such
+#: mail and offers to convert it (`ameesh decide ask --from-mail <id>`).
+#: Recipients watched besides any `human:*`:
+PROSE_RECIPIENTS = ("bureau",)
+#: how far back mail is read (seconds)
+PROSE_WINDOW_S = 24 * 3600.0
+#: at most this many candidate mails, the most recent
+PROSE_LIMIT = 500
+#: cue words of a decision expected from the owner (French and English)
+PROSE_CUES = re.compile(
+    r"\bd[ée]cisions?\b|\bgo\s*\?|\bgo\s*/\s*no[\s-]*go\b|[àa]\s+valider\b"
+    r"|[àa]\s+trancher\b|\barbitrages?\b|\bto\s+(?:validate|approve|decide)\b"
+    r"|\bneeds?\s+(?:your\s+)?(?:approval|sign-?off)\b", re.IGNORECASE)
 
 
 class DecisionError(RuntimeError):
@@ -468,11 +493,26 @@ def _hold_lot(db, item: dict, *, note: str, actor: str) -> str:
 def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str | None = None,
         new_lot: str | None = None, recommend: str | None = None, why: str | None = None,
         urgent: bool = False, due_ts: float | None = None, needs_signature: bool = False,
-        now: float | None = None) -> dict:
+        source_mail: int | None = None, now: float | None = None) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
-    (rien n'est déposé)."""
+    (rien n'est déposé).
+
+    `source_mail` (L233): the mail in which `requester` wrote this decision in
+    prose; it must be theirs. Its lot is the default `lot`, and once the
+    request names it, the mail is no longer shown as a prose decision."""
     now = time.time() if now is None else float(now)
+    if source_mail is not None:
+        mail_row = storage.of(db).decisions.source_mail(int(source_mail))
+        if mail_row is None:
+            raise DecisionError("--from-mail %s: no such mail" % source_mail)
+        if mail_row.get("sender") != requester:
+            raise DecisionError("--from-mail %s: written by %s, not by you (%s) — only its "
+                                "author turns it into a request"
+                                % (source_mail, mail_row.get("sender"), requester))
+        mail_lot = str(mail_row.get("work_item_id") or "").strip()
+        if lot is None and new_lot is None and mail_lot:
+            lot = mail_lot
     question = str(question or "").strip()
     if not question:
         raise DecisionError("question vide (--question \"…\")")
@@ -536,6 +576,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         "owner_source": source, "project": _project(db, item, requester_row),
         "lot": lot_id, "lot_title": item.get("title") or "", "previous_state": previous,
     }
+    if source_mail is not None:
+        decision["source_mail"] = int(source_mail)
     row = storage.of(db).decisions.create(
         sender=requester, recipient=owner or OWNER_ANY,
         body=request_text(decision, requester=requester, owner=owner),
@@ -553,6 +595,60 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     out = get(db, decision_id, now) or {"id": decision_id}
     out["lot_state"] = lot_state
     return out
+
+
+# --------------------------------------------------------------------------
+# decisions written in prose (L233)
+# --------------------------------------------------------------------------
+
+def prose_cues(text: str) -> list[str]:
+    """The cue words of an owner decision found in `text` (lower case, once
+    each, in order of appearance)."""
+    out: list[str] = []
+    for match in PROSE_CUES.finditer(text or ""):
+        cue = " ".join(match.group(0).lower().split())
+        if cue not in out:
+            out.append(cue)
+    return out
+
+
+def prose_decisions(db, now: float | None = None, *, since_s: float = PROSE_WINDOW_S,
+                    recipients=PROSE_RECIPIENTS, limit: int = PROSE_LIMIT) -> list[dict]:
+    """Mail of the last `since_s` seconds in which an agent wrote to bureau
+    (`recipients`) or to a human something that reads as a decision expected
+    from the owner, and that no request names as its source. Oldest first:
+    `{id, sender, recipient, lot, created_ts, age_s, cues, excerpt, convert}`
+    — `convert`, the command its author runs to file it as a request."""
+    now = time.time() if now is None else float(now)
+    rows = storage.of(db).decisions.prose_candidates(
+        recipients=list(recipients), since_ts=now - float(since_s), limit=int(limit))
+    out = []
+    for row in rows:
+        cues = prose_cues(row.get("body") or "")
+        if not cues:
+            continue
+        lot = str(row.get("work_item_id") or "").strip()
+        lot = int(lot) if lot.isdigit() else (lot or None)
+        out.append({
+            "id": int(row["id"]), "sender": row["sender"], "recipient": row["recipient"],
+            "lot": lot, "created_ts": round(float(row["created_ts"]), 3),
+            "age_s": int(max(0.0, now - float(row["created_ts"]))), "cues": cues,
+            "excerpt": fil.excerpt(row.get("body") or "", 220),
+            "convert": "ameesh decide ask --from-mail %d%s --question \"…\" --option a=\"…\""
+                       % (int(row["id"]), "" if lot else " --lot <id>"),
+        })
+    return out
+
+
+def format_prose(row: dict, now: float | None = None) -> list[str]:
+    """Lines of a prose decision for `ameesh decisions`."""
+    return [
+        "mail #%d %s → %s, %s ago%s — cues: %s" % (
+            row["id"], row["sender"], row["recipient"], short_span(row["age_s"]),
+            ", lot #%s" % row["lot"] if row.get("lot") else "", ", ".join(row["cues"])),
+        "    « %s »" % row["excerpt"],
+        "    not a request: %s should file it — %s" % (row["sender"], row["convert"]),
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -984,7 +1080,7 @@ def queue(db, *, human: str | None = None, include_closed: bool = False,
 
 USAGE = ("usage : ameesh decide ask (--lot <id|réf> | --new-lot \"titre\") --question \"…\" "
          "--option a=\"…\" [--option b=\"…\"] [--recommend a [--why \"…\"]] [--urgent] "
-         "[--by 2h] [--needs-signature] [--json]\n"
+         "[--by 2h] [--needs-signature] [--from-mail <id>] [--json]\n"
          "        ameesh decide <id> <option | \"texte libre\"> "
          "[--key FICHIER [--as NOM] | --signed] [--json]\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
@@ -1012,9 +1108,12 @@ def _parser(prog: str) -> argparse.ArgumentParser:
 
 def cmd_ask(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide ask")
-    target = parser.add_mutually_exclusive_group(required=True)
+    target = parser.add_mutually_exclusive_group()
     target.add_argument("--lot", default=None, help="lot ouvert : numéro ou référence unique")
     target.add_argument("--new-lot", default=None, help="crée le lot (assigné au demandeur)")
+    parser.add_argument("--from-mail", type=int, default=None, metavar="ID",
+                        help="L233: the mail in which you wrote this decision in prose "
+                             "(its lot is the default --lot)")
     parser.add_argument("--question", required=True)
     parser.add_argument("--option", action="append", default=[], metavar="CLÉ=LIBELLÉ")
     parser.add_argument("--recommend", default=None, metavar="CLÉ")
@@ -1042,7 +1141,7 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
         view = ask(cfg, db, requester=binding.name, question=args.question,
                    options=args.option, lot=args.lot, new_lot=args.new_lot,
                    recommend=args.recommend, why=args.why, urgent=args.urgent, due_ts=due,
-                   needs_signature=args.needs_signature)
+                   needs_signature=args.needs_signature, source_mail=args.from_mail)
     finally:
         db.close()
     if args.json:

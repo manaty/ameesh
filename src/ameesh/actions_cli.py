@@ -481,9 +481,15 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         # L124 : les demandes de décision des agents, tous projets confondus
         requests = decisions_mod.queue(db, human=args.for_human, include_closed=args.all,
                                        now=now)
+        # L233: decisions written in prose in mail, not filed as requests
+        prose = decisions_mod.prose_decisions(db, now)
     finally:
         db.close()
+    if args.for_human:
+        prose = [p for p in prose
+                 if p["recipient"] in decisions_mod.PROSE_RECIPIENTS + (args.for_human,)]
     queue["requests"] = requests["pending"]
+    queue["prose"] = prose
     if args.all:
         queue["requests_closed"] = requests["closed"]
     if args.json:
@@ -491,8 +497,10 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     # un lot tenu par une demande est montré avec elle, pas deux fois
     held = {r["lot"] for r in queue["requests"]}
+    # L233: a lot in waiting_human with no open request has no question for
+    # the owner — it is shown apart, and is not counted as a decision
     waiting = [item for item in queue["waiting_human"] if item["id"] not in held]
-    total = len(queue["requests"]) + len(waiting) + sum(
+    total = len(queue["requests"]) + sum(
         len(queue[key]) for key in ("approvals", "unknown", "interrupted"))
     who = " pour %s" % args.for_human if args.for_human else ""
     if not total:
@@ -505,6 +513,7 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
             for line in decisions_mod.format_view(view, now):
                 print("  " + line)
     if not total:
+        _prose_and_unasked(prose, waiting, now)
         _closed_requests(queue.get("requests_closed") or [], now)
         return 0
     if queue["approvals"]:
@@ -517,13 +526,27 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         for row in queue["unknown"] + queue["interrupted"]:
             print("  " + _line(row))
             print("      %s" % row["hint"])
+    _prose_and_unasked(prose, waiting, now)
+    _closed_requests(queue.get("requests_closed") or [], now)
+    return 0
+
+
+def _prose_and_unasked(prose: list[dict], waiting: list[dict], now: float) -> None:
+    """L233: what is NOT a decision request, and why — decisions written in
+    prose in mail, and lots in waiting_human with no question asked."""
+    from . import decisions as decisions_mod
+    if prose:
+        print("\ndecisions written in prose in mail — not requests, nothing to answer here "
+              "(offer to have them filed):")
+        for row in prose:
+            for line in decisions_mod.format_prose(row, now):
+                print("  " + line)
     if waiting:
-        print("\nlots en attente d'un humain :")
+        print("\nlots in waiting_human with no question asked (no open request; their "
+              "assignee must ask: ameesh decide ask --lot <id>):")
         for item in waiting:
             print("  #%-5d %-12s %s" % (item["id"], (item.get("assignee") or "—")[:12],
                                         item["title"][:70]))
-    _closed_requests(queue.get("requests_closed") or [], now)
-    return 0
 
 
 def _closed_requests(rows: list[dict], now: float) -> None:

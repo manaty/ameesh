@@ -148,6 +148,9 @@ TYPE_LABELS = {
     "ci_main_red": "CI rouge sur main",
     "host_disk_low": "disque btrfs presque plein",
     "turn_unpriced": "tour sans tarif au barème",
+    # L233: briefed to the assignee and the orchestrators (alert_briefs); not
+    # pushed to humans by default (add it to `notify.types` to receive it)
+    "waiting_without_question": "lot waiting for the owner with no question asked",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
