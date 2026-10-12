@@ -229,17 +229,13 @@ def _awaited(row: dict, *, waiting_free: bool = False) -> bool:
     (L165b, lots de l'équipe) : un lot, de session ou assigné, qui attend un
     autre que lui (relecture, humain, autre lot) ou commence après aujourd'hui
     ne l'occupe pas."""
-    from . import sous_utilisation, stagnation
+    from . import sous_utilisation
     if not sous_utilisation.free_of_lots(row, waiting_free=waiting_free) \
             or int(row.get("unread") or 0):
         return True
     if row.get("has_pending_prompt"):
         return True
-    state = row.get("session_lot_state")
-    if waiting_free and (state in sous_utilisation.LOTS_WAITING_ON_OTHERS
-                         or row.get("session_lot_later")):
-        return False
-    return bool(state) and state not in stagnation.DONE_STATES
+    return sous_utilisation.session_lot_busy(row, waiting_free=waiting_free)
 
 
 def _default_budget_check(cfg, db):

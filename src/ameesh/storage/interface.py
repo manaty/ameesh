@@ -1951,7 +1951,7 @@ class Operations(Domain):
         epoch, échéance recontrôlée). Faux si le bail n'est plus le nôtre."""
 
     @abc.abstractmethod
-    def listing(self) -> list[dict]:
+    def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
@@ -1962,7 +1962,9 @@ class Operations(Domain):
         début prévu est après aujourd'hui), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
         lots qui l'occupent (`active_lots`, L165b : assignés, ouverts, ni en
-        `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui),
+        `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui ;
+        « aujourd'hui » : `today`, jour ISO, par défaut le jour local de
+        l'hôte, jamais celui du fuseau de la base),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +
         entrée en cache, `last_turn_session`, `last_turn_recorded_ts`) et
         demande de redémarrage (`restart_requested_ts`)."""

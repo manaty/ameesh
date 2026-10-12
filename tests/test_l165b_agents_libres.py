@@ -70,6 +70,23 @@ class PriseTest(_Libres):
         lot = self.lot("à prendre")
         self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
 
+    def test_jour_local_et_non_celui_de_la_base(self):
+        # #318 r2 : « aujourd'hui » est le jour local passé à la requête
+        import datetime
+        self.agent("dev7", team="nexlink")
+        lot = self.tenu("dev7", "build")
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        ((datetime.date.today() + datetime.timedelta(days=1)).isoformat(),
+                         lot["id"]))
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s"
+                        " WHERE name = 'dev7'", (str(lot["id"]),))
+        ops = storage.of(self.db).operations
+        row = {r["name"]: r for r in ops.listing()}["dev7"]
+        self.assertEqual((row["active_lots"], row["session_lot_later"]), (0, True))
+        demain = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        row = {r["name"]: r for r in ops.listing(today=demain)}["dev7"]
+        self.assertEqual((row["active_lots"], row["session_lot_later"]), (1, False))
+
     def test_lot_de_session_prevu_aujourd_hui_occupe(self):
         self.agent("dev7", team="nexlink")
         self.agent("claude2", team="autre")
@@ -143,6 +160,27 @@ class IdleCapacityTest(_Libres):
         alerts = sous_utilisation.idle_capacity(
             self.db, self.listing(), time.time(), ["orchestrateur"])
         self.assertEqual([a["agents"] for a in alerts], [["dev7"]])
+
+    def test_un_lot_de_session_d_un_autre_en_cours_occupe(self):
+        # #318 r2 : la même garde que la prise (`_awaited`)
+        self.agent("orchestrateur", team="nexlink", status="running")
+        self.agent("dev7", team="nexlink")
+        self.agent("dev4", team="nexlink")
+        self.agent("claude2", team="autre")
+        self.tenu("dev7", "qa")
+        self.tenu("dev4", "qa")
+        session = self.tenu("claude2", "build", title="lot de session d'un autre")
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s"
+                        " WHERE name = 'dev4'", (str(session["id"]),))
+        self.lot("sans agent")
+        alerts = sous_utilisation.idle_capacity(
+            self.db, self.listing(), time.time(), ["orchestrateur"])
+        self.assertEqual([a["agents"] for a in alerts], [["dev7"]])
+        work.move(self.db, session["id"], "qa")
+        alerts = sous_utilisation.idle_capacity(
+            self.db, self.listing(), time.time(), ["orchestrateur"])
+        # (claude2, dont le lot passe en qa, est libre lui aussi)
+        self.assertEqual([a["agents"] for a in alerts], [["claude2", "dev4", "dev7"]])
 
     def test_sans_lot_en_attente_l_auditeur_n_a_pas_de_geste(self):
         text = alert_briefs._for_auditor({"detail": "x", "lots": []})

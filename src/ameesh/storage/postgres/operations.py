@@ -76,7 +76,9 @@ class Operations(interface.Operations):
         return bool(rows)
 
     # -- lectures d'exploitation --------------------------------------------
-    def listing(self) -> list[dict]:
+    def listing(self, *, today: str | None = None) -> list[dict]:
+        import datetime as _dt
+        today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
@@ -101,7 +103,7 @@ class Operations(interface.Operations):
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
                    coalesce(m.n_passive, 0)::bigint AS passive_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
-                   coalesce(sw.planned_start > current_date, false) AS session_lot_later,
+                   coalesce(sw.planned_start > j.today, false) AS session_lot_later,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
                    coalesce(al.n, 0)::bigint AS active_lots,
@@ -113,6 +115,8 @@ class Operations(interface.Operations):
                    t.session AS last_turn_session,
                    extract(epoch from t.recorded_at)::float8 AS last_turn_recorded_ts
               FROM agent_registry r
+              -- #318 r2 : le jour local de l'hôte, pas celui du fuseau de la base
+              CROSS JOIN (SELECT %s::date AS today) j
               LEFT JOIN spend_pending p ON p.agent = r.name
               LEFT JOIN LATERAL (
                   -- L125 : `unread` = le courrier qui ouvrira un tour ; le
@@ -136,14 +140,14 @@ class Operations(interface.Operations):
                   SELECT count(*) AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
-                     AND (w.planned_start IS NULL OR w.planned_start <= current_date)) al ON true
+                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)) al ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
                    WHERE c.agent = r.name
                    ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1) t ON true
              ORDER BY r.name
-            """)
+            """, (today,))
 
     # -- redémarrage ---------------------------------------------------------
     def request_restart(self, name, brief) -> dict | None:

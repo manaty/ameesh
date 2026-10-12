@@ -384,14 +384,29 @@ def free_of_lots(row: dict, *, waiting_free: bool = False) -> bool:
     return not int(row.get("active_lots") or 0)
 
 
+def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
+    """Le lot de session de l'agent (assigné à lui ou à un autre) est-il
+    encore ouvert et l'occupe-t-il ? `waiting_free` (L165b) : pas s'il attend
+    un autre (`LOTS_WAITING_ON_OTHERS`) ou commence après aujourd'hui
+    (`session_lot_later`). Partagé par la prise (`backlog._awaited`) et
+    `idle_agents` (#318 r2)."""
+    from . import stagnation
+    state = row.get("session_lot_state")
+    if not state or state in stagnation.DONE_STATES:
+        return False
+    return not (waiting_free and (state in LOTS_WAITING_ON_OTHERS
+                                  or row.get("session_lot_later")))
+
+
 def idle_agents(listing: list, now: float, idle_s: float, *,
                 waiting_free: bool = False) -> list:
     """Les agents réveillables au repos sans lot ni courrier depuis au moins
     `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
     au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
     `idle_capacity`, `backlog_empty` et la prise automatique (L119) ;
-    `waiting_free` : voir `free_of_lots` (L165b), et une consigne en attente
-    occupe l'agent, comme pour la prise (`backlog._awaited`)."""
+    `waiting_free` : voir `free_of_lots` (L165b) ; une consigne en attente
+    et un lot de session qui l'occupe (`session_lot_busy`) occupent l'agent,
+    comme pour la prise (`backlog._awaited`)."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -402,7 +417,8 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
             continue
         if not free_of_lots(row, waiting_free=waiting_free):
             continue
-        if waiting_free and row.get("has_pending_prompt"):
+        if waiting_free and (row.get("has_pending_prompt")
+                             or session_lot_busy(row, waiting_free=True)):
             continue
         since = idle_since(row)
         if not since or now - since < idle_s:
