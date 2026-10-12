@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import os
 import time
+from unittest import mock
 
-from ameesh import registry, storage, work
-from ameesh.runner import Runner
+from ameesh import mail, registry, storage, work
+from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase
+from .support import FAKEBIN, PgTestCase
 
 
 class _Base(PgTestCase):
@@ -49,13 +50,13 @@ class StockageTest(_Base):
         registry.set_session(self.db, "a1", "sess-a", "compte")
         cle = dict(harness="claude", account="compte", cwd="/w")
         out = self.st.switch("a1", runner.runner_id, epoch, to_lot=str(b),
-                             current="sess-a", **cle)
+                             current="sess-a", current_account="compte", **cle)
         self.assertEqual(out, {"resumed": None, "parked": "sess-a", "discarded": None})
         agent = registry.get(self.db, "a1")
         self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, str(b)))
         registry.set_session(self.db, "a1", "sess-b", "compte")
         out = self.st.switch("a1", runner.runner_id, epoch, to_lot=str(a),
-                             current="sess-b", **cle)
+                             current="sess-b", current_account="compte", **cle)
         self.assertEqual(out, {"resumed": "sess-a", "parked": "sess-b", "discarded": None})
         agent = registry.get(self.db, "a1")
         self.assertEqual((agent["session_id"], agent["session_work_item"],
@@ -75,7 +76,8 @@ class StockageTest(_Base):
                 storage.of(self.db).operations.set_session_work_item(
                     "a2", runner.runner_id, epoch, str(a))
                 self.st.switch("a2", runner.runner_id, epoch, to_lot=str(b),
-                               current="sess-%d" % i, **cle)
+                               current="sess-%d" % i, current_account="compte",
+                               **cle)
                 cle.update(autre)
                 out = self.st.switch("a2", runner.runner_id, epoch, to_lot=str(a),
                                      current=None, **cle)
@@ -149,3 +151,60 @@ class StockageTest(_Base):
         self.assertEqual(set(ids), {haut, bas, build, repris})
         self.assertNotIn(demain, ids)
         self.assertTrue(all(r["activity_ts"] for r in self.st.actionable("a6")))
+
+
+class RoutageTest(_Base):
+    def _worker(self, name):
+        runner, lease = self.bail(name)
+        return AgentWorker(runner, registry.get(self.db, name), lease)
+
+    def _env(self, session):
+        return mock.patch.dict(os.environ, {
+            "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+            "AMEESH_SESSION_STORE_CHECK": "0", "AMEESH_TEST_NEW_SESSION": session})
+
+    def tour(self, worker, lot, texte, session="claude-sess-x"):
+        mail.send(self.db, "orch", worker.name, texte, work_item_id=str(lot))
+        with self._env(session):
+            spec = worker.rotate_for_lot(worker.pick())
+            self.assertEqual(spec["lot"], str(lot))
+            self.assertTrue(worker.run_turn(spec))
+        return self.turns()[-1]["argv"]
+
+    def test_relecture_puis_retour_reprend_la_session_du_lot(self):
+        worker = self._worker("w1")
+        try:
+            a = work.add(self.db, title="A", assignee="w1")["id"]
+            work.move(self.db, a, "build")
+            argv = self.tour(worker, a, "commence A", session="sess-A")
+            self.assertNotIn("--resume", argv)
+            self.assertEqual(registry.get(self.db, "w1")["session_id"], "sess-A")
+            work.move(self.db, a, "qa")                    # A part en relecture
+            b = work.add(self.db, title="B", assignee="w1")["id"]
+            argv = self.tour(worker, b, "prends B", session="sess-B")
+            self.assertNotIn("--resume", argv)             # session distincte
+            self.assertIn("dedicated to lot #%d" % b, " ".join(argv))
+            agent = registry.get(self.db, "w1")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-B", str(b)))
+            argv = self.tour(worker, a, "retour de relecture sur A")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-A")
+            self.assertNotIn("dedicated to lot", " ".join(argv))
+            argv = self.tour(worker, b, "suite de B")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
+            lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("w1")}
+            self.assertEqual(lignes, {a: "sess-A", b: None})
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_le_lot_du_tour_est_l_unique_lot_actionnable(self):
+        worker = self._worker("w2")
+        try:
+            a = work.add(self.db, title="A", assignee="w2")["id"]
+            work.move(self.db, a, "build")
+            work.move(self.db, a, "qa")
+            b = work.add(self.db, title="B", assignee="w2")["id"]
+            registry.set_pending_prompt(self.db, "w2", "continue")
+            self.assertEqual(worker.pick()["lot"], str(b))
+        finally:
+            worker.watchdog_stop.set()

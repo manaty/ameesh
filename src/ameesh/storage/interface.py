@@ -2471,12 +2471,14 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def switch(self, name: str, owner: str, epoch: int, *, to_lot: str,
                harness: str | None, account: str | None, cwd: str | None,
-               current: str | None = None) -> dict | None:
+               current: str | None = None,
+               current_account: str | None = None) -> dict | None:
         """Change le lot de la session active, **fencé par le bail**, en une
-        transaction : la session active `current` est mise de côté pour le
-        lot de session noté au registre (s'il est un lot), puis celle mise de
-        côté pour `to_lot` devient active si elle a été ouverte sous les mêmes
-        harnais, compte et dossier (sinon elle est écartée et la session
+        transaction : la session active `current` (ouverte sous le compte
+        `current_account`) est mise de côté pour le lot de session noté au
+        registre (s'il est un lot), puis celle mise de côté pour `to_lot`
+        devient active si elle a été ouverte sous les harnais `harness`, compte
+        `account` (celui du prochain tour) et dossier `cwd` (sinon elle est écartée et la session
         active est vide : une session neuve s'ouvrira). Rend `{resumed,
         parked, discarded}` (identifiants ou None), ou None si le bail n'est
         plus le nôtre (rien n'est écrit)."""

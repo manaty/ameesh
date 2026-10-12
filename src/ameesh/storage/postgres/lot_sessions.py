@@ -20,7 +20,8 @@ _COLUMNS = """
 
 class LotSessions(interface.LotSessions):
 
-    def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None):
+    def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None,
+               current_account=None):
         with self.db.transaction() as tx:
             reg = tx.query(
                 "SELECT session_work_item,"
@@ -44,7 +45,7 @@ class LotSessions(interface.LotSessions):
                     "        account = excluded.account, cwd = excluded.cwd,"
                     "        parked_at = excluded.parked_at"
                     " RETURNING l.session_id",
-                    (name, current, harness, account, cwd, int(courant)))
+                    (name, current, harness, current_account, cwd, int(courant)))
                 parked = rows[0]["session_id"] if rows else None
             resumed = discarded = None
             if str(to_lot).isdigit():
