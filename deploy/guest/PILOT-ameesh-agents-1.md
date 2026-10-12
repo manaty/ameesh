@@ -6,16 +6,20 @@ general steps and the report are in
 the design in the [L159 study](../../docs/design/etudes/l159-capacite-des-hotes.md),
 sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
 
-* guests: `deepseek5` and `deepseek6` (today on manaty-mesh-1), DeepSeek
-  through `dsh`, no subscription account; installed in observation only;
+* guests: `deepseek6` and `deepseek1` (today the last two personas on
+  manaty-mesh-1; `deepseek5` became a native agent of the host with
+  manaty/home#27), DeepSeek through `dsh`, no subscription account; installed
+  in observation only;
 * the script's default offer: `cpu_max 2`, `cpu_weight 10`, `memory_max
   9GiB`, `agent_memory_max 4.5GiB`, `disk_max 40GiB`; reclaim at 6 GiB
   available, CPU pressure 20 %, memory 2 %, I/O 20 %, 10 GiB free on `/`;
   drain 120 s, calm 600 s;
-* the host's own agents stay six, to be reviewed with the report of 20/10;
-  the canon's `max_agents` goes from 6 to 8 because it counts every
-  placement of the host, the guests' included (6 would make the fiche
-  invalid).
+* the host's own agents stay thirteen (manaty/home#22, #23, #26, #27), to be
+  reviewed with the report of 20/10; the canon's `max_agents` goes from 13
+  to 15 because it counts every placement of the host, the guests' included
+  (13 would make the fiche invalid); manaty-mesh-1 goes to `max_agents: 0`
+  and carries only the mesh database (validated by the owner, relayed by
+  bureau on 2026-10-12 at 19:40).
 
 ## Before
 
@@ -39,12 +43,29 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   40GiB` (no filesystem quota; the guard's reclaim watches `/`). Cost:
   €0.000130/GB/hour excluding VAT (scaleway.com/en/pricing/storage, read on
   2026-10-12), about **€3.80 per month** (730 h), snapshots not included.
-  From a workstation with the `scw` CLI configured for the ameesh project:
+  `deploy/guest/volume-pilot.sh` does the steps below, idempotent, with
+  its rollback (`unmount`, then `detach [--delete]`); read its `--dry-run`
+  first:
 
   ```sh
-  scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB zone=fr-par-1
+  deploy/guest/volume-pilot.sh create --project-id <project-id>   # workstation, scw
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>   # host
+  sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
+  ```
+
+  `--project-id` is the ameesh project (`scw account project list`): every
+  list is filtered by it, the server and the volume checked against it,
+  never the CLI's default project. It finds the disk by the volume's id,
+  formats it only when both probes (`blkid`, `wipefs`) succeed and find
+  nothing, and writes the fstab line with the filesystem's UUID last, once
+  the mount point is checked free and empty. By hand, from a
+  workstation with the `scw` CLI configured for the ameesh project:
+
+  ```sh
+  scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB \
+    project-id=<project-id> zone=fr-par-1
   scw block volume wait <volume-id> zone=fr-par-1          # until "available"
-  scw instance server list name=ameesh-agents-1 zone=fr-par-1
+  scw instance server list name=ameesh-agents-1 project-id=<project-id> zone=fr-par-1
   scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
     volume-type=sbs_volume zone=fr-par-1
   ```
@@ -56,7 +77,7 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
   sudo mkfs.ext4 -L ameesh-guest /dev/<new disk>
   sudo mkdir -p /srv/ameesh-guest
-  echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
+  echo "UUID=$(sudo blkid -p -s UUID -o value /dev/<new disk>) /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2" \
     | sudo tee -a /etc/fstab
   sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
   findmnt /srv/ameesh-guest                                # the volume, 40 GB
@@ -69,6 +90,40 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   `--allow-rootfs` (the guest on `/`, `disk_max` indicative only) is not
   used on this host.
 
+* **An existing volume.** On 2026-10-12 at about 17:40Z,
+  `/srv/ameesh-guest` was found already mounted from an SBS volume
+  (`/dev/disk/by-id/scsi-0SCW_sbs_volume-24f1ba5b-…`), an ext4 labelled
+  `ameesh-guest`, with a by-hand line in `/etc/fstab`:
+
+  ```
+  LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2
+  ```
+
+  The script adopts such a volume as it is, never formatting it and
+  keeping that line: give its id to `mount` (nothing to `create`), then
+  `check`:
+
+  ```sh
+  scw block volume get <volume-id> zone=fr-par-1     # workstation: ameesh-guest, 40 GB, the project
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id> --dry-run
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>
+  sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
+  ```
+
+  It is adopted only when it is shown to be the pilot's: the disk of
+  `<volume-id>` is an ext4 labelled `ameesh-guest`; the label names that
+  disk and no other (udev's `/dev/disk/by-label/ameesh-guest`, and every
+  disk probed again with `blkid`), or the line would mount another disk at
+  the next boot; the filesystem mounted on `/srv/ameesh-guest`, if any, is
+  that disk's, its UUID too. Anything else is refused, nothing changed.
+  `check` says `ok` for the `LABEL=` line on the same conditions (the label
+  and the mounted UUID are the volume's, by udev's links); without
+  `--volume-id` it cannot tell, and says `NOT ok`. `unmount` removes that
+  line like its own, on the same conditions. `create` and `detach` take it
+  only if Scaleway says it is the pilot's (named `ameesh-guest`, 40 GB, in
+  the project: the `scw block volume get` above); otherwise they refuse it,
+  and it is renamed or replaced by hand first.
+
 ## Install (guard in observation, no guest runner started)
 
 `dsh` is in `/opt/node/bin`, which `sudo`'s `secure_path` does not contain:
@@ -77,9 +132,9 @@ give it with `--path`.
 ```sh
 cd /root/ameesh
 sudo deploy/guest/install-pilot.sh --dry-run --host ameesh-agents-1 \
-  --agent deepseek5 --agent deepseek6 --path /opt/node/bin    # read it all
+  --agent deepseek6 --agent deepseek1 --path /opt/node/bin    # read it all
 sudo deploy/guest/install-pilot.sh --host ameesh-agents-1 \
-  --agent deepseek5 --agent deepseek6 --path /opt/node/bin
+  --agent deepseek6 --agent deepseek1 --path /opt/node/bin
 ```
 
 Then the secrets (files created empty, `0640 root:ameesh-guest`, never
@@ -87,7 +142,7 @@ overwritten by the script):
 
 ```sh
 sudoedit /etc/ameesh/guest.env             # AMEESH_DSN=… the host's login role (L56)
-sudoedit /etc/ameesh/guest-deepseek5.env   # DEEPSEEK_API_KEY=…, GH_TOKEN=…
+sudoedit /etc/ameesh/guest-deepseek1.env   # DEEPSEEK_API_KEY=…, GH_TOKEN=…
 sudoedit /etc/ameesh/guest-deepseek6.env
 sudo deploy/guest/install-pilot.sh --check # every line "ok"
 ```
@@ -95,14 +150,15 @@ sudo deploy/guest/install-pilot.sh --check # every line "ok"
 ## Enable the two guests
 
 Only once the canon PR (manaty/home#24, a draft until that day) is merged: the Host fiche gets `policy.lend` (the
-offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 8` (6
+offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 15` (13
 own agents + 2 guests), without `volatile`; `policy.work_dirs` puts the guests'
-work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek5 and
-deepseek6 move from manaty-mesh-1 to ameesh-agents-1. Their runners on manaty-mesh-1 are
+work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek6 and
+deepseek1 move from manaty-mesh-1 to ameesh-agents-1, which keeps
+`max_agents: 0` there. Their runners on manaty-mesh-1 are
 stopped first: an agent runs on one host at a time.
 
 ```sh
-sudo deploy/guest/install-pilot.sh --enable deepseek5 deepseek6
+sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1
 sudo deploy/guest/install-pilot.sh --check
 systemctl status 'ameesh-guest-runner@*'
 ```
@@ -121,7 +177,7 @@ From the lightest to the full one; each step is enough on its own.
 | When | Command |
 |---|---|
 | The guard's caps get in the way of the host | `sudo deploy/guest/install-pilot.sh --set-guard-mode observe` (stops the guard, takes its caps off the slice and the runners, starts it again observing) |
-| A guest misbehaves | `sudo deploy/guest/install-pilot.sh --disable deepseek5` (its turn drains first, 180 s at most) |
+| A guest misbehaves | `sudo deploy/guest/install-pilot.sh --disable deepseek1` (its turn drains first, 180 s at most) |
 | The pilot stops (§4.4 target missed, natives delayed) | `sudo deploy/guest/install-pilot.sh --uninstall` |
 | Nothing of the pilot must stay | `sudo deploy/guest/install-pilot.sh --uninstall --purge` |
 
@@ -141,6 +197,11 @@ What stays keeps its record, so a later `--purge` can still remove it,
 the user too when `userdel` fails (its processes still running). A `--root`
 through a symbolic link is refused: give the resolved path. The install refuses a volume bigger than `disk_max` (nothing else
 holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
-deepseek5 and deepseek6 back on manaty-mesh-1 and removes `policy.lend`, and
-the host's login role (L56) is dropped. A mounted volume is unmounted and
-detached by hand.
+deepseek6 and deepseek1 back on manaty-mesh-1 (its `max_agents` back to 2) and removes `policy.lend`, and
+the host's login role (L56) is dropped. The volume: `sudo
+deploy/guest/volume-pilot.sh unmount --volume-id <volume-id>` on the host
+(only that volume's filesystem, by its source and UUID; its fstab line, or
+an older by-hand `LABEL=ameesh-guest` one), then
+`deploy/guest/volume-pilot.sh detach --project-id <project-id> [--delete]`
+from the workstation (`--delete`: its data lost, its billing stopped; only
+the pilot's volume, its name, project and size checked).

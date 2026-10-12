@@ -354,7 +354,7 @@ def _edited(issue: dict, recorded: str | None) -> list[str]:
     return [k for k, d in zip(_FIELD_NAMES, parts) if _digest(now[k]) != d]
 
 
-def fiche_link(canon_ref: str | None, base: str | None) -> str:
+def card_link(canon_ref: str | None, base: str | None) -> str:
     """Lien vers la fiche : `base/<chemin>` (`{commit}` remplacé), sinon la réf."""
     ref = canon_ref or ""
     member_path, _, commit = ref.rpartition("@")
@@ -363,6 +363,10 @@ def fiche_link(canon_ref: str | None, base: str | None) -> str:
         url = base.replace("{commit}", commit).rstrip("/") + "/" + path
         return "[%s](%s) (`%s`)" % (path, url, ref)
     return "`%s`" % ref if ref else "—"
+
+
+#: L148 (stage 2c): old spelling kept for the callers not yet renamed.
+fiche_link = card_link
 
 
 def lot_state(items: list[dict]) -> tuple[str | None, str]:
@@ -417,7 +421,7 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
         epic = plan_mod.epic_of(pid, by_id)
         body = "\n".join([
             _HEADER, "",
-            "- Package: %s" % fiche_link(p.get("canon_ref"), canon_url),
+            "- Package: %s" % card_link(p.get("canon_ref"), canon_url),
             "- Epic: %s" % ("`%s`" % epic if epic else "—"),
             "- Owner: %s" % (p.get("responsible") or "—"),
             "- ameesh state: %s%s" % (
@@ -438,7 +442,7 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
         done = e["lots_total"] and e["lots_merged"] == e["lots_total"] - e["lots_abandoned"]
         body = "\n".join([
             _HEADER, "",
-            "- Package: %s" % fiche_link(p.get("canon_ref"), canon_url),
+            "- Package: %s" % card_link(p.get("canon_ref"), canon_url),
             "- Milestone: %s" % ("`%s`" % e["milestone"] if e["milestone"] else "—"),
             "- Owner: %s" % (p.get("responsible") or "—"),
             "- Progress: %d/%d work items merged%s" % (

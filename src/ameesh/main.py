@@ -87,7 +87,7 @@
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
         mail; withdrawal by the requester; detail and proof (L124);
-  ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
+  ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
@@ -102,9 +102,11 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
+        durable withdrawal, return and lost-host recovery (L232e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
-  ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
+  ameesh housekeeping [--apply] [--json]  cleanup of what agents create (L73);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
@@ -140,7 +142,9 @@ MESH_COMMANDS = (
     "review-class", "handoff",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
-    # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
+    # L73 : ménage de ce que les agents créent (`ameesh housekeeping [--apply]`)
+    "housekeeping",
+    # L148 : `ameesh menage` reste accepté (alias déprécié, retiré au stage 7)
     "menage",
     # L160b : radar de conflits entre lots (`ameesh conflicts [--json]`)
     "conflicts",
@@ -245,6 +249,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L84: read API, local mode
         from . import serve
         return serve.main(rest)
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
+        from . import host_lifecycle
+        return host_lifecycle.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap

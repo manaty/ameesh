@@ -248,10 +248,12 @@ def reap(db: Db, host: str | None = None) -> list[dict]:
     return storage.of(db).leases.reap(host)
 
 
-def set_session(db: Db, name: str, session_id: str, account: str | None = None) -> None:
+def set_session(db: Db, name: str, session_id: str, account: str | None = None, *,
+                harness: str | None = None, cwd: str | None = None) -> None:
     """Enregistre la session et, L39 (0030), le compte sous lequel elle tourne
-    (`session_account` ; None : aucun compte déclaré pour le harnais)."""
-    storage.of(db).agents.set_session(name, session_id, account)
+    (`session_account` ; None : aucun compte déclaré pour le harnais) ; #408,
+    le harnais et le dossier de son ouverture s'ils sont donnés."""
+    storage.of(db).agents.set_session(name, session_id, account, harness=harness, cwd=cwd)
 
 
 def set_session_account(db: Db, name: str, account: str | None) -> bool:

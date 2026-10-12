@@ -118,7 +118,125 @@ class NoteTest(unittest.TestCase):
         self.assertTrue(all(t[:8] in texte for t in dits))
 
 
+@unittest.skipUnless(hasattr(os, "fork") and sys.platform.startswith("linux"), "Linux")
+class ZombieTest(unittest.TestCase):
+    """#458 : un zombie du groupe dont le parent n'est pas l'exécuteur (un
+    sous-moissonneur au-dessus de lui, ex. l'exécuteur qui fait tourner
+    l'agent qui lance ces tests) ne garde pas la ressource « orpheline »."""
+
+    ENFANT = ("import os, sys, time\n"
+              "pid = os.fork()\n"
+              "if pid == 0:\n"
+              "    os.setpgid(0, 0)\n"
+              "    os._exit(4)\n"
+              "print(pid, flush=True)\n"
+              "time.sleep(30)\n")
+
+    def test_zombie_d_un_autre_parent_ferme_done(self):
+        # parent qui ne moissonne pas : son fils, seul de son groupe, reste zombie
+        parent = subprocess.Popen([sys.executable, "-c", self.ENFANT],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(parent.wait)
+        self.addCleanup(parent.kill)
+        pid = int(parent.stdout.readline())
+        fin = time.monotonic() + 10
+        while not any(p["pid"] == pid and p["zombie"] for p in platform.process_table()):
+            self.assertLess(time.monotonic(), fin, "pas de zombie")
+            time.sleep(0.02)
+        self.assertTrue(background._group_alive(pid))  # signal 0 : le zombie répond
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *_a: None)
+        now = time.time()
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=pid, ended=now,
+                                 deadline=now + 1200, grace_s=1200, lineage={pid})
+        entry.jobs[pid] = background.Job(pid, 'pid %d "sh"' % pid)
+        tracker.entries = [entry]
+        with mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=now)
+        self.assertEqual(entry.state, "done")
+        of.return_value.turn_resources.close_turn.assert_called_once_with(
+            entry.turn_id, orphan=False, containers=None)
+
+
 @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX")
+class PgidRecycleTest(unittest.TestCase):
+    """#458 r2 (test de mty-amh-qa-01) : le passage de suivi voit le groupe du
+    tour vide, puis son numéro est recyclé avant la fermeture de la
+    ressource. Le verdict du passage fait foi : la ressource se ferme `done`
+    (orphan=False), rien n'est signalé au groupe étranger. Sans Postgres."""
+
+    PGID = 4242       # pid du harnais du tour == pgid de son groupe
+    JOB = 4243        # tâche de fond du tour, vue dans la lignée
+
+    @staticmethod
+    def _p(pid, ppid, pgid, name="x", zombie=False) -> dict:
+        return {"pid": pid, "ppid": ppid, "pgid": pgid, "name": name,
+                "start": 0.0, "zombie": zombie}
+
+    def _tick_with_recycled_group(self, now: float, recycled: list):
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *a: None)
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=self.PGID,
+                                 ended=now - 30.0, deadline=now + 1200.0,
+                                 grace_s=1200, lineage={self.PGID, self.JOB})
+        entry.jobs[self.JOB] = background.Job(self.JOB, 'pid %d "pytest"' % self.JOB)
+        tracker.entries = [entry]
+        # 1re lecture (le passage) : groupe vide ; ensuite : un groupe étranger
+        reads = [[]]
+        signaux: list = []
+        with mock.patch.object(background.platform, "process_table",
+                               side_effect=lambda: reads.pop(0) if reads else list(recycled)), \
+                mock.patch.object(background, "_group_alive", side_effect=bool), \
+                mock.patch.object(background.os, "killpg",
+                                  side_effect=lambda p, s: signaux.append((p, s))), \
+                mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=now)
+        self.assertEqual(entry.state, "done")
+        of.return_value.turn_resources.close_turn.assert_called_once_with(
+            entry.turn_id, orphan=False, containers=None)
+        self.assertEqual(signaux, [], "nothing may be signalled")
+
+    def test_numero_recycle_ferme_done(self):
+        """Un membre étranger du groupe recyclé (pid != pgid, hors lignée)."""
+        self._tick_with_recycled_group(10000.0, [self._p(99999, 1, self.PGID, "unrelated")])
+
+    def test_numero_recycle_chef_du_nouveau_groupe(self):
+        """Le chef du nouveau groupe a pour pid l'ancien pgid, donc un pid de
+        la lignée apprise : seul le verdict du passage tranche."""
+        self._tick_with_recycled_group(10000.0, [self._p(self.PGID, 1, self.PGID, "unrelated")])
+
+
+class KillVerdictTest(unittest.TestCase):
+    """#458 r3 (codex) : un signal refusé (EPERM) n'est pas un groupe
+    disparu ; le survivant garde la ressource orpheline. Sans Postgres."""
+
+    def _expire(self, error):
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *a: None)
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=4242, ended=0.0,
+                                 deadline=1.0, grace_s=1, lineage={4242})
+        tracker.entries = [entry]
+        vivant = [{"pid": 4242, "ppid": 1, "pgid": 4242, "name": "x", "start": 0.0,
+                   "zombie": False}]
+        with mock.patch.object(background.platform, "process_table", return_value=vivant), \
+                mock.patch.object(background.os, "killpg", side_effect=error), \
+                mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=10.0)
+        self.assertEqual(entry.state, "expired")
+        return of.return_value.turn_resources.close_turn
+
+    def test_signal_refuse_le_groupe_vivant_reste_orphelin(self):
+        self._expire(PermissionError(1, "EPERM")).assert_called_once_with(
+            "t" * 32, orphan=True, containers=None)
+
+    def test_groupe_disparu_ferme_non_orphelin(self):
+        self._expire(ProcessLookupError(3, "ESRCH")).assert_called_once_with(
+            "t" * 32, orphan=False, containers=None)
+
+
 class PlatformTest(unittest.TestCase):
     def test_moisson_d_un_enfant_et_table_des_processus(self):
         proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])

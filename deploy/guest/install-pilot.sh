@@ -18,7 +18,7 @@
 #   --dry-run            print every command and file, change nothing
 #   --host NAME          host name in the canon (default: hostname -s)
 #   --agent NAME         a guest agent: its secrets file is prepared
-#                        (repeatable; default deepseek5, deepseek6)
+#                        (repeatable; default deepseek6, deepseek1)
 #   --max-agents N       guest agents at once, for the guard (default 2)
 #   --lend FILE          the offer, JSON: the `policy.lend` of the canon's
 #                        Host fiche (default: the one printed by --dry-run)
@@ -112,7 +112,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
-[ ${#AGENTS[@]} -gt 0 ] || AGENTS=(deepseek5 deepseek6)
+[ ${#AGENTS[@]} -gt 0 ] || AGENTS=(deepseek6 deepseek1)
 
 valid_name() { case "$1" in ''|*[!a-z0-9_-]*|-*) return 1 ;; esac; }
 valid_name "$HOST" || die "invalid --host $HOST"
@@ -127,15 +127,39 @@ case "$ROOT" in /|/home|/tmp|/srv|/root|/opt|/usr|/etc|/var|/run|/mnt) die "--ro
 # the tests' dry runs read a state of their own; a real run reads only $STATE
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_STATE:-}" ] && STATE=$PILOT_TEST_STATE
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_VENV:-}" ] && VENV=$PILOT_TEST_VENV
+# the tests' dry runs see a host of their own, PILOT_TEST_HOST=DIR: its
+# /etc, /opt, /srv and /run are read under DIR, its users in DIR/etc/passwd,
+# its mounts in DIR/proc/self/mountinfo, and systemd is asked nothing; a
+# real run reads only the host
+HOSTDIR=
+if [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_HOST:-}" ]; then
+  HOSTDIR=$PILOT_TEST_HOST
+  case "$HOSTDIR" in /?*) ;; *) die "PILOT_TEST_HOST must be absolute" ;; esac
+  [ -d "$HOSTDIR" ] || die "PILOT_TEST_HOST $HOSTDIR: no such directory"
+fi
+# at PATH: where PATH of the host is read (itself, but in a test's host)
+at() {
+  case "$1" in
+    /etc|/etc/*|/opt|/opt/*|/srv|/srv/*|/run|/run/*|/proc/*) printf '%s%s' "$HOSTDIR" "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+# host_says CMD…: asks the live host (systemd, the user database); a test's
+# host has nothing to ask: CMD fails there
+host_says() { [ -z "$HOSTDIR" ] && "$@"; }
+user_exists() {
+  if [ -n "$HOSTDIR" ]; then grep -q "^$GUEST:" "$HOSTDIR/etc/passwd" 2>/dev/null
+  else id -u "$GUEST" >/dev/null 2>&1; fi
+}
 # the mounts, binds included: read in mountinfo, never guessed (a dry run of
 # the tests may read a mountinfo of its own)
-MOUNTINFO=/proc/self/mountinfo
+MOUNTINFO=$(at /proc/self/mountinfo)
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_MOUNTINFO:-}" ] && MOUNTINFO=$PILOT_TEST_MOUNTINFO
 # a path through a symbolic link is refused: mounts and records are compared
 # as resolved paths, so the paths themselves must be resolved
-resolved() { [ "$(realpath -m -- "$1")" = "$1" ]; }
+resolved() { local p; p=$(at "$1"); [ "$(realpath -m -- "$p")" = "$p" ]; }
 if [ "$MODE" = install ]; then
-  resolved "$ROOT" || die "--root $ROOT goes through a symbolic link: give $(realpath -m -- "$ROOT")"
+  resolved "$ROOT" || die "--root $ROOT goes through a symbolic link: give $(r=$(realpath -m -- "$(at "$ROOT")"); echo "${r#"$HOSTDIR"}")"
   resolved "$VENV" || die "$VENV goes through a symbolic link"
 fi
 
@@ -179,9 +203,11 @@ remember() {
   install -d -m 0755 "$ETC"
   grep -qxF "$1" "$STATE" 2>/dev/null || echo "$1" >> "$STATE"
 }
-created() { grep -qxF "$1" "$STATE" 2>/dev/null; }
+created() { grep -qxF "$1" "$(at "$STATE")" 2>/dev/null; }
 # absent PATH: nothing there, not even a dangling link
-absent() { [ ! -e "$1" ] && [ ! -L "$1" ]; }
+absent() { local p; p=$(at "$1"); [ ! -e "$p" ] && [ ! -L "$p" ]; }
+# not_a_dir PATH: something there that is not a plain directory
+not_a_dir() { local p; p=$(at "$1"); [ -L "$p" ] || { [ -e "$p" ] && [ ! -d "$p" ]; }; }
 
 # mounts_under PATH: a mount point at PATH or beneath it (a bind mount of
 # the same filesystem included, which rm --one-file-system would cross);
@@ -251,13 +277,13 @@ reset_caps() {
   for u in $(runner_units); do remove_tree --runtime "$CONTROL/$u.d" || true; done
   run systemctl daemon-reload
   props=$(grep -E '^(CPUWeight|IOWeight|CPUQuota|MemoryHigh|MemoryMax)=' \
-            "$UNITS/ameesh-guest.slice" 2>/dev/null | tr '\n' ' ' || true)
+            "$(at "$UNITS")/ameesh-guest.slice" 2>/dev/null | tr '\n' ' ' || true)
   if [ -n "$props" ]; then
     # shellcheck disable=SC2086
     run systemctl set-property --runtime ameesh-guest.slice $props || true
   fi
   for u in $(runner_units); do
-    props=$(systemctl show --value --property=MemoryMax "$u" 2>/dev/null || true)
+    props=$(host_says systemctl show --value --property=MemoryMax "$u" 2>/dev/null || true)
     [ -n "$props" ] || props="<its unit's>"
     run systemctl set-property --runtime "$u" "MemoryMax=$props" || true
   done
@@ -269,7 +295,8 @@ reset_caps() {
 
 # the installed guard's mode (the unit's default: observe)
 installed_mode() {
-  if [ -f "$ETC/guard.env" ] && ! grep -q '^AMEESH_GUARD_ARGS=--observe' "$ETC/guard.env"; then
+  local env; env=$(at "$ETC/guard.env")
+  if [ -f "$env" ] && ! grep -q '^AMEESH_GUARD_ARGS=--observe' "$env"; then
     echo enforce
   else
     echo observe
@@ -278,9 +305,9 @@ installed_mode() {
 
 # guest runners known to systemd (loaded or enabled)
 runner_units() {
-  { systemctl list-units --all --plain --no-legend 'ameesh-guest-runner@*.service' 2>/dev/null \
-      | awk '{print $1}'
-    ls "$UNITS"/multi-user.target.wants/ 2>/dev/null | grep '^ameesh-guest-runner@.*\.service$' || true
+  { host_says systemctl list-units --all --plain --no-legend 'ameesh-guest-runner@*.service' \
+      2>/dev/null | awk '{print $1}'
+    ls "$(at "$UNITS")"/multi-user.target.wants/ 2>/dev/null | grep '^ameesh-guest-runner@.*\.service$' || true
   } | sort -u
 }
 
@@ -300,23 +327,26 @@ if [ "$MODE" = check ]; then
   status=0
   ok() { echo "ok   $*"; }
   ko() { echo "FAIL $*"; status=1; }
-  if id -u "$GUEST" >/dev/null 2>&1; then
-    ok "user $GUEST ($(id -nG "$GUEST"))"
+  # (read only: a dry run reads the same, in a test's host if one is given)
+  if user_exists; then
+    groups=$(host_says id -nG "$GUEST" || true)
+    ok "user $GUEST ($groups)"
     for g in sudo wheel admin docker adm lxd libvirt; do
-      if id -nG "$GUEST" | tr ' ' '\n' | grep -qx "$g"; then ko "$GUEST is in group $g"; fi
+      if printf '%s\n' $groups | grep -qx "$g"; then ko "$GUEST is in group $g"; fi
     done
   else ko "no user $GUEST"; fi
   for f in ameesh-guest.slice ameesh.slice.d/guest-weight.conf ameesh-guest-runner@.service \
            ameesh-guard.service; do
-    [ -f "$UNITS/$f" ] && ok "$UNITS/$f" || ko "missing $UNITS/$f"
+    [ -f "$(at "$UNITS/$f")" ] && ok "$UNITS/$f" || ko "missing $UNITS/$f"
   done
-  [ -x "$VENV/bin/ameesh" ] && ok "$VENV ($("$VENV/bin/ameesh" --version 2>/dev/null || echo '?'))" \
+  [ -x "$(at "$VENV")/bin/ameesh" ] \
+    && ok "$VENV ($("$(at "$VENV")/bin/ameesh" --version 2>/dev/null || echo '?'))" \
     || ko "missing $VENV/bin/ameesh"
-  [ -d /run/ameesh-gate/ack ] && ok "/run/ameesh-gate/ack" || ko "missing /run/ameesh-gate/ack"
-  if systemctl is-active --quiet ameesh-guard; then
+  [ -d "$(at /run/ameesh-gate/ack)" ] && ok "/run/ameesh-gate/ack" || ko "missing /run/ameesh-gate/ack"
+  if host_says systemctl is-active --quiet ameesh-guard; then
     ok "ameesh-guard active ($(grep -h '^AMEESH_GUARD_ARGS=' "$ETC/guard.env" 2>/dev/null || echo 'mode ?'))"
   else ko "ameesh-guard not active"; fi
-  python3 - /run/ameesh-gate/state/state.json <<'EOF' || status=1
+  python3 - "$(at /run/ameesh-gate/state/state.json)" <<'EOF' || status=1
 import json, sys, time
 try:
     s = json.load(open(sys.argv[1]))
@@ -327,17 +357,18 @@ print("%s gate state %s, level %s, seq %s%s" % ("ok  " if fresh else "FAIL", s.g
       s.get("level"), s.get("seq"), "" if fresh else " (stale)"))
 sys.exit(0 if fresh else 1)
 EOF
-  for f in "$ETC/guest.env" "$ETC"/guest-*.env; do
+  for f in "$(at "$ETC")/guest.env" "$(at "$ETC")"/guest-*.env; do
     [ -e "$f" ] || continue
     perm=$(stat -c '%a %U:%G' "$f")
+    f=${f#"$HOSTDIR"}
     [ "$perm" = "640 root:$GUEST" ] && ok "$f ($perm)" || ko "$f is $perm, expected 640 root:$GUEST"
   done
-  grep -q '^AMEESH_DSN=.' "$ETC/guest.env" 2>/dev/null && ok "AMEESH_DSN set in guest.env" \
+  grep -q '^AMEESH_DSN=.' "$(at "$ETC")/guest.env" 2>/dev/null && ok "AMEESH_DSN set in guest.env" \
     || ko "AMEESH_DSN not set in $ETC/guest.env"
   for u in $(runner_units); do
     echo "     $u: $(systemctl is-enabled "$u" 2>/dev/null || true), $(systemctl is-active "$u" 2>/dev/null || true)"
   done
-  systemd-analyze verify "$UNITS/ameesh-guard.service" "$UNITS/ameesh-guest.slice" \
+  host_says systemd-analyze verify "$UNITS/ameesh-guard.service" "$UNITS/ameesh-guest.slice" \
     >/dev/null 2>&1 && ok "systemd-analyze verify" || ko "systemd-analyze verify (run it for details)"
   exit $status
 fi
@@ -389,7 +420,8 @@ fi
 if [ "$MODE" = uninstall ]; then
   need_root
   say "1. drain: the guest agents return their leases"
-  if systemctl is-active --quiet ameesh-guard 2>/dev/null && [ -x "$VENV/bin/ameesh" ]; then
+  if host_says systemctl is-active --quiet ameesh-guard 2>/dev/null \
+     && [ -x "$(at "$VENV")/bin/ameesh" ]; then
     run env AMEESH_GUARD_CONFIG="$ETC/guard.json" "$VENV/bin/ameesh" guard drain || true
   fi
   say "2. (yours) a canon PR removes the guest agents' placements on $HOST"
@@ -406,9 +438,9 @@ if [ "$MODE" = uninstall ]; then
   remove_tree --runtime /run/ameesh-gate || true
   # the guard's runtime caps (systemd keeps them until the reboot)
   remove_tree --runtime "$CONTROL/ameesh-guest.slice.d" || true
-  for d in "$CONTROL"/ameesh-guest-runner@*.service.d; do
+  for d in "$(at "$CONTROL")"/ameesh-guest-runner@*.service.d; do
     [ -e "$d" ] || continue
-    remove_tree --runtime "$d" || true
+    remove_tree --runtime "${d#"$HOSTDIR"}" || true
   done
   run systemctl daemon-reload
   run rm -f "$ETC/guard.env"
@@ -417,7 +449,7 @@ if [ "$MODE" = uninstall ]; then
     say "5. purge: secrets, offer, and what this script created"
     run rm -f "$ETC/guard.json"
     offload=0
-    if [ -f /etc/ameesh-guest/offload.json ]; then
+    if [ -f "$(at /etc/ameesh-guest/offload.json)" ]; then
       offload=1
       echo "kept user $GUEST and the guest's directories: the offload (install.sh, L159b) uses them"
     fi
@@ -426,7 +458,7 @@ if [ "$MODE" = uninstall ]; then
     # offload, a non-empty directory) keeps its record: a later purge can
     # still remove it.
     kept=()
-    if [ -f "$STATE" ]; then
+    if [ -f "$(at "$STATE")" ]; then
       while read -r kind path; do
         case "$kind" in
           secret)
@@ -454,7 +486,7 @@ if [ "$MODE" = uninstall ]; then
           # a directory left non-empty keeps its record
           [ "$DRY" = 1 ] || absent "$path" || kept+=("$kind $path")
         fi
-      done < <(tac "$STATE")
+      done < <(tac "$(at "$STATE")")
     fi
     if created user; then
       if [ "$offload" = 1 ]; then
@@ -520,11 +552,12 @@ if problems:
     sys.exit("invalid offer: " + "; ".join(problems))
 # disk_max: only the size of the guest volume holds it (no quota); a bigger
 # volume is refused, unless accepted (argv[6]); a dry run says so (argv[7]);
-# a mount point, binds included, read in mountinfo by the shell (argv[8])
+# a mount point, binds included, read in mountinfo by the shell (argv[8]);
+# the filesystem is read at argv[9] (the root, under PILOT_TEST_HOST in a test)
 root, disk_max = sys.argv[5], offer["disk_max"]
 if sys.argv[8] == "1":
     # the filesystem under it (a dry run may name a root not made yet)
-    probe = root
+    probe = sys.argv[9]
     while not os.path.exists(probe):
         probe = os.path.dirname(probe)
     st = os.statvfs(probe)
@@ -544,7 +577,8 @@ else:
           file=sys.stderr)
 print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
                   "work_path": sys.argv[5], "lend": lend}, indent=2))
-' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY" "$ROOT_MOUNTED") \
+' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY" "$ROOT_MOUNTED" \
+  "$(at "$ROOT")") \
   || die "offer or volume refused"
 
 # PATH of the runners: the directory of the DeepSeek harness (`dsh`)
@@ -558,7 +592,7 @@ PREVIOUS_MODE=$(installed_mode)
 GUARD_MODE=${GUARD_MODE:-$PREVIOUS_MODE}
 
 say "1. user $GUEST and its volume $ROOT"
-if id -u "$GUEST" >/dev/null 2>&1; then
+if user_exists; then
   echo "user $GUEST exists: kept as is"
 else
   remember user
@@ -570,7 +604,7 @@ fi
 # (anything already there that is not a plain directory: refused, before
 # any record, never taken for absent)
 for d in "$ROOT" "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; do
-  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+  if not_a_dir "$d"; then
     die "$d exists and is not a directory: move it away first"
   fi
 done
@@ -583,17 +617,17 @@ done
 
 say "2. ameesh in $VENV (root-owned; the guest can run it, not change it)"
 for d in "$(dirname "$VENV")" "$VENV"; do
-  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+  if not_a_dir "$d"; then
     die "$d exists and is not a directory: move it away first"
   fi
 done
-if [ -x "$VENV/bin/ameesh" ] && ! created "venv-tree $VENV"; then
+if [ -x "$(at "$VENV")/bin/ameesh" ] && ! created "venv-tree $VENV"; then
   echo "$VENV exists and was not made by this script: upgraded in place"
 else
   make_venv=0
   if absent "$VENV"; then
     make_venv=1
-  elif [ ! -x "$VENV/bin/pip" ]; then
+  elif [ ! -x "$(at "$VENV")/bin/pip" ]; then
     # a venv this script began and did not finish: made again
     created "venv-tree $VENV" || die "$VENV exists without bin/pip and is not this script's"
     remove_tree "$VENV" || die "$VENV not made again: see above"
