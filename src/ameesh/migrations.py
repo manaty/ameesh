@@ -51,7 +51,7 @@ def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
             continue
         version = int(match.group(1))
         if version in found:
-            raise DbError("version de migration en double : %04d" % version)
+            raise DbError("duplicate migration version: %04d" % version)
         path = os.path.join(directory, filename)
         with open(path, encoding="utf-8") as fh:
             sql = fh.read()
@@ -63,7 +63,7 @@ def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
             checksum=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
         )
     if not found:
-        raise DbError("aucune migration dans %s" % directory)
+        raise DbError("no migration in %s" % directory)
     return [found[v] for v in sorted(found)]
 
 
@@ -127,8 +127,8 @@ def pending(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR) -> 
             out.append(migration)
         elif done[migration.version] != migration.checksum:
             raise DbError(
-                "migration %s modifiée après application (empreinte %s != %s) : "
-                "une migration appliquée est immuable, ajoutez-en une nouvelle"
+                "migration %s modified after being applied (checksum %s != %s): "
+                "an applied migration is immutable, add a new one"
                 % (migration.label, done[migration.version][:12], migration.checksum[:12])
             )
     return out
@@ -160,7 +160,7 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR, log
         )
         db.script(script)
         if log:
-            log("%s appliquée" % migration.label)
+            log("%s applied" % migration.label)
     return todo
 
 
@@ -192,15 +192,15 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
 #: AVANT d'installer le code qui l'apporte. Remplacer une contrainte (drop puis
 #: add) reste additif : les migrations du dépôt ne le font que pour l'élargir.
 _NON_ADDITIVE = (
-    (re.compile(r"\bdrop\s+(table|column|schema|type)\b"), "suppression (drop %s)"),
-    (re.compile(r"\brename\b"), "renommage"),
+    (re.compile(r"\bdrop\s+(table|column|schema|type)\b"), "removal (drop %s)"),
+    (re.compile(r"\brename\b"), "rename"),
     (re.compile(r"\balter\s+column\s+\S+\s+(set\s+data\s+)?type\b"),
-     "changement de type d'une colonne"),
-    (re.compile(r"\bset\s+not\s+null\b"), "colonne rendue obligatoire (set not null)"),
-    (re.compile(r"\btruncate\b"), "vidage (truncate)"),
-    (re.compile(r"\bdelete\s+from\b"), "suppression de lignes (delete)"),
+     "column type change"),
+    (re.compile(r"\bset\s+not\s+null\b"), "column made mandatory (set not null)"),
+    (re.compile(r"\btruncate\b"), "table emptied (truncate)"),
+    (re.compile(r"\bdelete\s+from\b"), "row deletion (delete)"),
     (re.compile(r"\badd\s+column\s+(if\s+not\s+exists\s+)?[^,;]*?\bnot\s+null\b(?![^,;]*\bdefault\b)"),
-     "colonne obligatoire sans défaut (add column … not null)"),
+     "mandatory column without default (add column ... not null)"),
 )
 #: une vue ou une fonction supprimée puis recréée dans la même migration
 #: (`r.*` figé à la création d'une vue) reste additive
@@ -217,7 +217,7 @@ def non_additive(migration: Migration) -> list[str]:
     contraintes remplacées)."""
     reasons = []
     if _MARKER.search(migration.sql):
-        reasons.append("marquée non additive")
+        reasons.append("marked non-additive")
     # commentaires retirés : une explication qui cite « drop » ne compte pas
     text = re.sub(r"--[^\n]*", " ", migration.sql)
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
@@ -231,7 +231,7 @@ def non_additive(migration: Migration) -> list[str]:
         recreated = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?%s\s+%s\b"
                                % (r"\s+".join(kind.split()), re.escape(name)))
         if not recreated.search(text, match.end()):
-            reasons.append("suppression (drop %s %s)" % (kind, name))
+            reasons.append("removal (drop %s %s)" % (kind, name))
     return reasons
 
 def _applied_readonly(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:

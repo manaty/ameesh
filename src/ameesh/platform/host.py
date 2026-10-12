@@ -10,6 +10,9 @@ l'appelant sache que rien n'a été lu.
 from __future__ import annotations
 
 import os
+import re
+import time
+from fractions import Fraction
 
 from . import NotAvailable, is_linux
 from .process import PROC, _proc_ok, _psutil
@@ -32,7 +35,9 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
     if meminfo is None and ps is not None:
         out: dict[str, int] = {}
         try:
-            out["mem_available_bytes"] = int(ps.virtual_memory().available)
+            vm = ps.virtual_memory()
+            out["mem_available_bytes"] = int(vm.available)
+            out["mem_total_bytes"] = int(vm.total)
         except Exception:
             pass
         try:
@@ -40,11 +45,11 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
         except Exception:
             pass
         if not out:
-            raise NotAvailable("mémoire de l'hôte", "psutil ne la donne pas")
+            raise NotAvailable("host memory", "psutil does not report it")
         return out
     if meminfo is None:
         if not _proc_ok():
-            raise NotAvailable("mémoire de l'hôte", "ni psutil ni /proc")
+            raise NotAvailable("host memory", "neither psutil nor /proc")
         meminfo = os.path.join(PROC, "meminfo")
     values: dict[str, int] = {}
     try:
@@ -55,10 +60,13 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
                     continue
                 values[key.strip()] = int(rest.strip().split()[0]) * 1024
     except (OSError, ValueError, IndexError) as exc:
-        raise NotAvailable("mémoire de l'hôte", "%s illisible : %s" % (meminfo, exc)) from None
+        raise NotAvailable("host memory", "%s unreadable: %s" % (meminfo, exc)) from None
     out = {}
     if "MemAvailable" in values:
         out["mem_available_bytes"] = values["MemAvailable"]
+        # L159d: total memory, for the prudent lendable share
+        if "MemTotal" in values:
+            out["mem_total_bytes"] = values["MemTotal"]
     total, free = values.get("SwapTotal"), values.get("SwapFree")
     if total is not None and free is not None:
         out["swap_used_bytes"] = max(0, total - free)
@@ -219,3 +227,449 @@ def mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
             if best is None or len(point) > len(best[0]):
                 best = (point, fstype)
     return best
+
+
+def _unescape(field: str) -> str:
+    """A path field of /proc/self/mountinfo (octal escapes: `\\040` etc.)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def mountinfo(path: str | None = None) -> list[dict]:
+    """The mounts of this process (#306), in mount order: `id` (the mount
+    id), `point`, `dev` (an st_dev value), `fstype`, `source`, from
+    /proc/self/mountinfo (`path`: a file in that format, tests). Read without touching the mount points: a mount behind a
+    directory that denies traversal is listed too. Not Linux, unreadable: []."""
+    if path is None:
+        if not _proc_ok():
+            return []
+        path = os.path.join(PROC, "self", "mountinfo")
+    out: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                head, sep, tail = line.partition(" - ")
+                fields, rest = head.split(), tail.split()
+                if not sep or len(fields) < 5 or len(rest) < 2:
+                    continue
+                major, _, minor = fields[2].partition(":")
+                try:
+                    dev = os.makedev(int(major), int(minor))
+                except ValueError:
+                    continue
+                out.append({"id": int(fields[0]) if fields[0].isdigit() else None,
+                            "point": _unescape(fields[4]), "dev": dev,
+                            "fstype": rest[0], "source": _unescape(rest[1])})
+    except OSError:
+        return []
+    return out
+
+
+def _under(path: str, point: str) -> bool:
+    return path == point or path.startswith(point.rstrip(os.sep) + os.sep)
+
+
+def covering_mount(path: str, mounts: list[dict] | None = None) -> dict | None:
+    """The deepest visible mount whose point is `path` or one of its
+    parents, by the path's text alone (no stat: works behind an
+    untraversable directory). A mount is hidden by any later one on its
+    point or on a parent of it (#289 r1: /rescue mounted over /rescue/fs).
+    None without mount table."""
+    path = os.path.abspath(path)
+    best = None
+    for entry in mountinfo() if mounts is None else mounts:
+        point = entry["point"]
+        if best is not None and _under(best["point"], point):
+            best = None     # mounted over
+        if _under(path, point) and (best is None or len(point) > len(best["point"])):
+            best = entry
+    return best
+
+
+def mount_id(path: str) -> int | None:
+    """The id of the mount `path` resolves to (#289 r1), the `mnt_id` the
+    kernel gives an O_PATH descriptor in /proc/self/fdinfo: no read
+    permission needed. None when unreadable or not Linux."""
+    try:
+        fd = os.open(path, getattr(os, "O_PATH", 0) or os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        text = _read(os.path.join(PROC, "self", "fdinfo", str(fd))) or ""
+    finally:
+        os.close(fd)
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key == "mnt_id" and value.strip().isdigit():
+            return int(value)
+    return None
+
+
+# --------------------------------------------------------------------------
+# pressure, CPU time and cgroups (L159d)
+# --------------------------------------------------------------------------
+
+#: pressure stall information of the host (Linux 4.20 and later)
+PSI_DIR = os.path.join(PROC, "pressure")
+#: busy CPU time of the host
+PROC_STAT = os.path.join(PROC, "stat")
+#: root of the cgroup v2 hierarchy
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def parse_pressure(text: str) -> dict:
+    """A PSI file (`some avg10=0.00 avg60=0.00 avg300=0.00 total=0`):
+    {line: {key: value}}; unreadable lines are skipped."""
+    out: dict = {}
+    for line in (text or "").splitlines():
+        kind, _, rest = line.strip().partition(" ")
+        if kind not in ("some", "full"):
+            continue
+        values = {}
+        for item in rest.split():
+            key, _, value = item.partition("=")
+            number = _float(value)
+            if number is not None:
+                values[key] = number
+        out[kind] = values
+    return out
+
+
+def pressure(resource: str, base: str | None = None) -> dict:
+    """PSI of `resource` (`cpu`, `memory`, `io`), parsed; {} when unknown
+    (outside Linux, before Linux 4.20, `psi=0`). `base`: a folder in the
+    format of /proc/pressure, for the tests."""
+    if base is None and not is_linux():
+        return {}
+    return parse_pressure(_read(os.path.join(base or PSI_DIR, resource)) or "")
+
+
+def cpu_busy_seconds(stat: str | None = None) -> float | None:
+    """Busy CPU time of the host since boot (line `cpu` of /proc/stat), in
+    seconds: everything but `idle` and `iowait`; `guest` and `guest_nice`
+    are already counted in `user` and `nice`. None when unknown. `stat`: a
+    file in the format of /proc/stat, for the tests."""
+    if stat is None and not is_linux():
+        return None
+    for line in (_read(stat or PROC_STAT) or "").splitlines():
+        fields = line.split()
+        if not fields or fields[0] != "cpu":
+            continue
+        try:
+            ticks = [float(x) for x in fields[1:9]]
+        except ValueError:
+            return None
+        while len(ticks) < 8:
+            ticks.append(0.0)
+        user, nice, system, _idle, _iowait, irq, softirq, steal = ticks
+        try:
+            hz = float(os.sysconf("SC_CLK_TCK"))
+        except (AttributeError, OSError, ValueError):
+            hz = 100.0
+        return (user + nice + system + irq + softirq + steal) / (hz or 100.0)
+    return None
+
+
+def cgroup_cpu_seconds(path: str) -> float | None:
+    """CPU time used by a cgroup (`cpu.stat`, `usage_usec`), in seconds."""
+    for line in (_read(os.path.join(path, "cpu.stat")) or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "usage_usec":
+            number = _float(value)
+            return None if number is None else number / 1e6
+    return None
+
+
+def cgroup_memory_bytes(path: str) -> int | None:
+    """Memory charged to a cgroup (`memory.current`), in bytes."""
+    number = _float(_read(os.path.join(path, "memory.current")))
+    return None if number is None else int(number)
+
+
+# --------------------------------------------------------------------------
+# btrfs allocation (#246)
+# --------------------------------------------------------------------------
+
+#: sysfs root (tests pass a fake tree)
+SYSFS = "/sys"
+#: unprivileged btrfs ioctls (linux/btrfs.h): _IOR(0x94, 31, 1024 bytes) and
+#: _IOWR(0x94, 30, 4096 bytes)
+BTRFS_IOC_FS_INFO = (2 << 30) | (1024 << 16) | (0x94 << 8) | 31
+BTRFS_IOC_DEV_INFO = (3 << 30) | (4096 << 16) | (0x94 << 8) | 30
+#: offset of `path` in btrfs_ioctl_dev_info_args (devid, uuid, bytes_used,
+#: total_bytes, fsid, unused[377]): empty for a missing device
+BTRFS_DEV_PATH = 8 + 16 + 8 + 8 + 16 + 377 * 8
+#: total_bytes, then every space-info counter the kernel deducts from it
+#: (btrfs_space_info_used, fs/btrfs/space-info.h); bytes_zone_unusable too,
+#: when the kernel has it
+BTRFS_UNAVAILABLE = ("total_bytes", "bytes_used", "bytes_may_use", "bytes_reserved",
+                     "bytes_pinned", "bytes_readonly")
+
+
+def _int_file(path: str) -> int | None:
+    value = _read(path)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
+    """(fsid as hex, (size, allocated bytes) of each device as the
+    filesystem uses it) of the filesystem visible at `path`, through the
+    unprivileged BTRFS_IOC_FS_INFO and BTRFS_IOC_DEV_INFO ioctls on `path`
+    itself: the kernel resolves the path, overmounts and propagated mounts
+    included. None when not btrfs or the ioctls are unavailable; the devices
+    alone are None when one does not answer. The size is the device's
+    `total_bytes` in the chunk tree, which can be smaller than the block
+    device (filesystem shrunk, device grown without `btrfs filesystem
+    resize`); the allocated bytes its `bytes_used`, the chunks carved on it
+    (#252) — all of its size for a missing device (DEV_INFO still answers,
+    with an empty path): nothing can be allocated on it."""
+    try:
+        import fcntl
+        import struct
+        fd = os.open(path, os.O_RDONLY)
+    except (ImportError, OSError):
+        return None
+    try:
+        info = bytearray(1024)
+        try:
+            fcntl.ioctl(fd, BTRFS_IOC_FS_INFO, info)
+        except OSError:         # ENOTTY: not btrfs
+            return None
+        max_id, count = struct.unpack_from("=QQ", info)
+        fsid = bytes(info[16:32]).hex()
+        devices: list[tuple[int, int]] = []
+        for devid in range(1, max_id + 1):
+            dev = bytearray(4096)
+            struct.pack_into("=Q", dev, 0, devid)
+            try:
+                fcntl.ioctl(fd, BTRFS_IOC_DEV_INFO, dev)
+            except OSError:     # ENODEV: a device id freed by `device remove`
+                continue
+            used, size = struct.unpack_from("=QQ", dev, 24)
+            if not dev[BTRFS_DEV_PATH:BTRFS_DEV_PATH + 1].strip(b"\0"):
+                used = size     # #311 r1: a missing device (empty path) takes nothing
+            devices.append((size, used))
+        return fsid, (devices if devices and len(devices) == count else None)
+    except struct.error:
+        return None
+    finally:
+        os.close(fd)
+
+
+#: copies of a metadata chunk on distinct devices, per mirrored profile (the
+#: sysfs name of its directory under allocation/<kind>/)
+BTRFS_MIRRORS = {"raid1": 2, "raid1c3": 3, "raid1c4": 4}
+#: the kernel's stripe unit (volumes.h): a device with less room holds no
+#: chunk, and every stripe is a multiple of it
+BTRFS_STRIPE_LEN = 64 * 1024
+#: parity stripes and minimum devices of a parity profile
+BTRFS_PARITY = {"raid5": (1, 2), "raid6": (2, 3)}
+
+
+def _mirrored(free: list[int], copies: int) -> int:
+    """What chunks of `copies` copies, each copy on a distinct device, can
+    still take of the per-device `free` space: the smallest, for j from 0 to
+    copies - 1, of (free outside the j largest devices) / (copies - j) — for
+    RAID1 min(sum / 2, sum - largest). The kernel caps a chunk (1 GiB of
+    metadata at most) and gives each one the devices with the most room,
+    which spreads it that evenly."""
+    largest = sorted(free, reverse=True)
+    return min((sum(free) - sum(largest[:j])) // (copies - j) for j in range(copies))
+
+
+def _striped_parity(free: list[int], parity: int, devs_min: int) -> int:
+    """What RAID5/6 chunks can still take of the per-device `free` space:
+    each chunk spans every device with room, its stripe the smallest room
+    among them, `parity` of its stripes parity; none below `devs_min`."""
+    left = [f for f in free if f > 0]
+    growth = 0
+    while len(left) >= devs_min:
+        stripe = min(left)
+        growth += stripe * (len(left) - parity)
+        left = [f - stripe for f in left if f > stripe]
+    return growth
+
+
+def _raid10(free: list[int]) -> int:
+    """What RAID10 chunks can still take of the per-device `free` space
+    (#311 r1, r2), in whole stripes (`BTRFS_STRIPE_LEN`). The kernel
+    (fs/btrfs/volumes.c, `btrfs_raid_array`: devs_min 2, devs_increment 2
+    since 5.15) gives each chunk the devices with the most room, as many as
+    there are rounded down to an even number, its stripes equal — the
+    smallest room among them, 1 GiB at most — half of them copies. Unlike
+    RAID1 a small device fills with the others: [100 GiB, 400 MiB x 3] holds
+    800 MiB, not 1200; and two devices still hold chunks once the others are
+    full.
+
+    Simulated by events, not by chunks (O(n log n), however large the
+    devices): with an even number of devices all of them shrink together
+    until the smallest is full; with an odd number the one left out is one
+    of the smallest, those tied at the minimum taking turns: together they
+    shrink at (t - 1) / t of the others' pace, until a larger device comes
+    down to them or they are full. That turn-taking is continuous, the
+    kernel's is chunk by chunk: the result is an approximation, the limit of
+    small chunks (L229e). Against an allocator of one-stripe chunks it is
+    never above and at most one stripe below ([1, 1, 1, 1, 2] stripes: 2,
+    the allocator 3); against chunks of k stripes, within -k/2 and +k, on
+    every case of up to 6 devices checked (tests/test_246_btrfs_guard.py)."""
+    above = sorted(f // BTRFS_STRIPE_LEN for f in free if f >= BTRFS_STRIPE_LEN)
+    shift = low = Fraction(0)   # all above shrink alike; the tied smallest: `low`
+    tied = growth = at = 0      # above[at:] are still above
+    while True:
+        if not low:             # the smallest are full: the next ones are
+            tied = 0
+            if at < len(above):
+                low = above[at] - shift
+        while at < len(above) and above[at] - shift == low:
+            at += 1
+            tied += 1
+        n = tied + len(above) - at
+        if n < 2:
+            return int(growth) * BTRFS_STRIPE_LEN
+        if n % 2 == 0:          # every device, until the smallest is full
+            span, pace = low, 1
+        else:                   # the smallest take turns being left out
+            pace = Fraction(tied - 1, tied)
+            span = min(([(above[at] - shift - low) * tied] if at < len(above) else [])
+                       + ([low / pace] if pace else []))
+        growth += span * (n - n % 2) / 2
+        shift += span
+        low -= span * pace
+
+
+def btrfs_growth(profile: str | None, free: list[int], copies: int) -> int:
+    """What metadata of `profile` (the sysfs name, None when the kernel
+    names none) can still grow into, given each device's unallocated
+    `free` bytes (#252): single and RAID0 all of it, DUP half of each
+    device, a mirror (RAID1, RAID1C3, RAID1C4) only what its copies
+    find on distinct devices, RAID10 what equal stripes on an even number of
+    devices leave (`_raid10`) — two devices, the smaller full, leave RAID1
+    nothing — RAID5/6 the stripes left. An unknown profile reads as
+    `copies` copies (disk_total / total_bytes, rounded up): on one device
+    DUP, on several a mirror, the smaller of what it could be."""
+    free = [f - f % BTRFS_STRIPE_LEN for f in free]     # whole stripes only (L229e)
+    if profile in ("single", "raid0"):
+        return sum(free)
+    if profile == "dup":
+        return sum(f // 2 for f in free)
+    if profile in BTRFS_MIRRORS:
+        return _mirrored(free, BTRFS_MIRRORS[profile])
+    if profile == "raid10":
+        return _raid10(free)
+    if profile in BTRFS_PARITY:
+        return _striped_parity(free, *BTRFS_PARITY[profile])
+    if copies <= 1:
+        return sum(free)
+    if len(free) == 1:
+        return free[0] // copies
+    return _mirrored(free, copies)
+
+
+def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None) -> dict:
+    """`btrfs_unallocated_bytes` and `btrfs_metadata_headroom_bytes` of the
+    btrfs filesystem visible at `path`, read without root.
+
+    The 2026-10-11 outage: btrfs had 1 MiB unallocated and no metadata left
+    while `df` still showed 4.7 then 16 GB free — `statvfs` does not see
+    chunk allocation. The filesystem is the one `fs_info` (`btrfs_fs_info`
+    by default) finds at `path`, read under /sys/fs/btrfs/<its fsid>.
+
+    unallocated = sum of the device sizes the filesystem uses - sum of the
+    `disk_total` of every space-info directory under `allocation/` (data,
+    metadata, system, and mixed, data-reloc, metadata-treelog where the
+    kernel has them); without those sizes it is unknown — the block device
+    can be larger than the filesystem, its size would invent free space.
+
+    Metadata headroom = what metadata can still take: `total_bytes` minus
+    every counter the kernel holds unavailable (`bytes_used`,
+    `bytes_may_use`, `bytes_reserved`, `bytes_pinned`, `bytes_readonly`,
+    `bytes_zone_unusable`), 0 when they exceed it, PLUS the unallocated
+    space metadata can still grow into (`btrfs_growth`: per device and per
+    profile, #252) — btrfs grows metadata into unallocated space, a small
+    metadata group on a filesystem with room to spare is no shortage. The
+    profile is the directory under the metadata kind (`dup`, `raid1`...);
+    during a conversion there are two, the smaller growth is read. Read
+    from `metadata` (from `mixed` on a mixed-group filesystem); unknown when
+    unallocated is. Not btrfs, not Linux, or unreadable: None (no guard
+    fires on an unknown)."""
+    out: dict = {"btrfs_unallocated_bytes": None, "btrfs_metadata_headroom_bytes": None}
+    if not path or (fs_info is None and not is_linux()):
+        return out
+    found = (fs_info or btrfs_fs_info)(path)
+    if found is None:
+        return out
+    fsid, devices = found
+    if len(fsid) != 32:
+        return out
+    uuid = "-".join((fsid[:8], fsid[8:12], fsid[12:16], fsid[16:20], fsid[20:]))
+    allocation = os.path.join(sysfs or SYSFS, "fs", "btrfs", uuid, "allocation")
+    try:
+        kinds = sorted(name for name in os.listdir(allocation)
+                       if os.path.isdir(os.path.join(allocation, name)))
+    except OSError:
+        return out
+    carved = [_int_file(os.path.join(allocation, kind, "disk_total")) for kind in kinds]
+    if not kinds or None in carved or not devices:
+        return out
+    unallocated = max(0, sum(size for size, _ in devices) - sum(carved))
+    out["btrfs_unallocated_bytes"] = unallocated
+    meta_kind = os.path.join(allocation, "metadata" if "metadata" in kinds else "mixed")
+    meta = [_int_file(os.path.join(meta_kind, name)) for name in BTRFS_UNAVAILABLE]
+    disk_total = _int_file(os.path.join(meta_kind, "disk_total"))
+    if None in meta or not meta[0] or not disk_total:
+        return out
+    # bytes_zone_unusable only exists from Linux 5.12 (zoned devices)
+    zone = _int_file(os.path.join(meta_kind, "bytes_zone_unusable")) or 0
+    free = [max(0, size - used) for size, used in devices]
+    copies = -(-disk_total // meta[0])
+    try:
+        profiles = [name for name in os.listdir(meta_kind)
+                    if os.path.isdir(os.path.join(meta_kind, name))] or [None]
+    except OSError:
+        profiles = [None]
+    growth = min(btrfs_growth(profile, free, copies) for profile in profiles)
+    out["btrfs_metadata_headroom_bytes"] = max(0, meta[0] - sum(meta[1:]) - zone) + growth
+    return out
+
+
+# --------------------------------------------------------------------------
+# the process's own cgroup and the boot (L159e: the capacity guard's freeze)
+# --------------------------------------------------------------------------
+
+#: identifier of the current boot, new at every boot
+BOOT_ID = os.path.join(PROC, "sys", "kernel", "random", "boot_id")
+#: the boot clock as a shell reads it: seconds since the boot, suspend
+#: included (CLOCK_BOOTTIME), first field
+UPTIME = os.path.join(PROC, "uptime")
+
+
+def own_cgroup(path: str | None = None) -> str | None:
+    """The cgroup v2 path of this process (`/system.slice/x.service`), None
+    when unknown. `path`: a file in the format of /proc/self/cgroup."""
+    if path is None and not is_linux():
+        return None
+    for line in (_read(path or os.path.join(PROC, "self", "cgroup")) or "").splitlines():
+        if line.startswith("0::"):
+            return line[3:] or "/"
+    return None
+
+
+def boot_id(path: str | None = None) -> str | None:
+    """The identifier of the current boot, None when unknown."""
+    if path is None and not is_linux():
+        return None
+    return _read(path or BOOT_ID) or None
+
+
+def boottime() -> float | None:
+    """Seconds since the boot, on a clock the wall clock never moves
+    (CLOCK_BOOTTIME); None where it does not exist."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    if clock is None:
+        return None
+    try:
+        return time.clock_gettime(clock)
+    except OSError:
+        return None

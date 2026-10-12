@@ -100,13 +100,13 @@ def _same_process(row: dict) -> bool:
 
 def check_harness(harness: str) -> str:
     if harness not in HARNESSES:
-        raise BindError("harnais invalide : %r (%s)" % (harness, "|".join(HARNESSES)))
+        raise BindError("invalid harness: %r (%s)" % (harness, "|".join(HARNESSES)))
     return harness
 
 
 def check_session(session_id: str) -> str:
     if not isinstance(session_id, str) or not SESSION_RE.match(session_id):
-        raise BindError("identifiant de session invalide : %r" % (session_id,))
+        raise BindError("invalid session id: %r" % (session_id,))
     return session_id
 
 
@@ -116,9 +116,9 @@ def check_pid(pid) -> int | None:
     try:
         value = int(pid)
     except (TypeError, ValueError):
-        raise BindError("pid invalide : %r" % (pid,)) from None
+        raise BindError("invalid pid: %r" % (pid,)) from None
     if value <= 1:
-        raise BindError("pid invalide : %r" % (pid,))
+        raise BindError("invalid pid: %r" % (pid,))
     return value
 
 
@@ -145,8 +145,8 @@ class BindResult:
 
 
 #: L46 : refus d'une liaison à un agent `execute` (sauf --force)
-EXECUTE_REFUSAL = ("agent mené par l'exécuteur ; une session externe lui volerait "
-                   "son courrier")
+EXECUTE_REFUSAL = ("agent driven by the runner; an external session would steal "
+                   "its mail")
 
 
 def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
@@ -162,19 +162,19 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
     prendrait le courrier destiné à son prochain tour. `force` ne lève jamais
     le refus du bail vivant."""
     if not NAME_RE.match(agent or ""):
-        raise BindError("nom d'agent invalide : %r" % (agent,))
+        raise BindError("invalid agent name: %r" % (agent,))
     check_harness(harness)
     check_session(session_id)
     pid = check_pid(pid)
     holder = lease_holder(db, agent)
     if holder:
         raise BindError(
-            "%s détient un bail vivant (exécuteur %s) : il est mené par l'exécuteur, "
-            "qui lui remet son courrier ; une session externe ne se lie pas à lui"
+            "%s holds a live lease (runner %s): it is driven by the runner, "
+            "which delivers its mail; an external session cannot bind to it"
             % (agent, holder))
     existing = registry.get(db, agent)
     if existing is not None and existing.get("mode") == "execute" and not force:
-        raise BindError("%s : %s (ameesh set %s mode=externe, ou --force)"
+        raise BindError("%s: %s (ameesh set %s mode=externe, or --force)"
                         % (agent, EXECUTE_REFUSAL, agent))
     store = storage.of(db).session_bindings
     host = cfg.host
@@ -184,7 +184,7 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
     try:
         start = pid_started_at(pid) if pid is not None else None
     except platform.NotAvailable as exc:
-        raise BindError("--pid %d invérifiable sur cet hôte (%s) : liaison refusée"
+        raise BindError("--pid %d cannot be verified on this host (%s): binding refused"
                         % (pid, exc)) from None
     row = store.bind(host=host, harness=harness, session_id=session_id, agent=agent,
                      pid=pid, created_by=by, pid_started_at=start)
@@ -195,11 +195,11 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
             row = store.bind(host=host, harness=harness, session_id=session_id,
                              agent=agent, pid=pid, created_by=by, pid_started_at=start)
             if row is None:
-                raise BindError("liaison concurrente de la session %s : réessayez"
+                raise BindError("concurrent binding of session %s: retry"
                                 % session_id)
         elif current.get("agent") != agent:
-            raise BindError("la session %s %s est déjà liée à %s (ameesh mail unbind "
-                            "--session %s --harness %s d'abord)"
+            raise BindError("session %s %s is already bound to %s (ameesh mail unbind "
+                            "--session %s --harness %s first)"
                             % (harness, session_id, current.get("agent"),
                                session_id, harness))
         elif pid is not None and (current.get("pid") != pid
@@ -211,32 +211,32 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
             row, status = current, "unchanged"
     result = BindResult(status=status, row=row)
     if pid is not None and start is None:
-        result.warnings.append("pid %d introuvable sur cet hôte : son heure de démarrage "
-                               "n'est pas enregistrée (seul le PID sera contrôlé)" % pid)
+        result.warnings.append("pid %d not found on this host: its start time "
+                               "is not recorded (only the PID will be checked)" % pid)
     if existing is not None and existing.get("mode") == "execute":
-        result.warnings.append("%s est un agent `execute` lié de force : %s"
+        result.warnings.append("%s is an `execute` agent bound by force: %s"
                                % (agent, EXECUTE_REFUSAL))
     if existing is None:
         # L46 : lier une session, c'est déclarer l'agent EXTERNE. Inscrit ici
         # (et non au premier hook), il ne naît pas `execute` par un courrier
         # qui le précéderait (`send` inscrit un destinataire inconnu).
         registry.upsert_unleased(db, agent, harness=harness, host=host)
-        result.warnings.append("%s n'était pas dans le registre : inscrit comme agent "
-                               "externe (session humaine)" % agent)
+        result.warnings.append("%s was not in the registry: registered as an external "
+                               "agent (human session)" % agent)
     others = [b for b in store.listing(agent=agent)
               if not (b.get("host") == host and b.get("harness") == harness
                       and b.get("session_id") == session_id)]
     if others:
         result.warnings.append(
-            "%s est aussi liée à %d autre(s) session(s) : %s" % (
+            "%s is also bound to %d other session(s): %s" % (
                 agent, len(others), ", ".join("%s:%s" % (b.get("harness"), b.get("session_id"))
                                              for b in others[:5])))
     if status != "unchanged":
         _audit(cfg, db, by=by, agent=agent,
-               text="Session %s %s %s à %s sur %s par %s%s." % (
-                   harness, session_id, "liée" if status == "created" else "re-liée",
-                   agent, host, by, (" (pid ancêtre exigé : %d)" % pid) if pid else
-                   " (sans contrôle de pid)"),
+               text="Session %s %s %s to %s on %s by %s%s." % (
+                   harness, session_id, "bound" if status == "created" else "re-bound",
+                   agent, host, by, (" (ancestor pid required: %d)" % pid) if pid else
+                   " (no pid check)"),
                meta={"action": "bind", "harness": harness, "session": session_id,
                      "host": host, "pid": pid})
     return result
@@ -249,7 +249,7 @@ def unbind(cfg: Config, db, *, session_id: str, harness: str, by: str) -> dict |
     row = storage.of(db).session_bindings.revoke(cfg.host, harness, session_id)
     if row is not None:
         _audit(cfg, db, by=by, agent=row["agent"],
-               text="Liaison de la session %s %s à %s révoquée sur %s par %s." % (
+               text="Binding of session %s %s to %s revoked on %s by %s." % (
                    harness, session_id, row["agent"], cfg.host, by),
                meta={"action": "unbind", "harness": harness, "session": session_id,
                      "host": cfg.host})
@@ -269,7 +269,7 @@ def revoke_agent(cfg: Config, db, agent: str, *, by: str, why: str) -> list[dict
             done.append(revoked)
     if done:
         _audit(cfg, db, by=by, agent=agent,
-               text="Liaison(s) de session de %s révoquée(s) par %s (%s) : %s." % (
+               text="Session binding(s) of %s revoked by %s (%s): %s." % (
                    agent, by, why, ", ".join("%s:%s@%s" % (r["harness"], r["session_id"],
                                                           r["host"]) for r in done)),
                meta={"action": "unbind", "reason": why,
@@ -299,11 +299,11 @@ def import_file(cfg: Config, db, path: str, *, by: str) -> ImportReport:
     with open(os.path.expanduser(path), encoding="utf-8") as fh:
         data = json.load(fh)
     if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict):
-        raise ValueError("format inattendu : objet {\"version\", \"sessions\": {…}} attendu")
+        raise ValueError("unexpected format: object {\"version\", \"sessions\": {...}} expected")
     report = ImportReport()
     for session_id, entry in data["sessions"].items():
         if not isinstance(entry, dict):
-            report.skipped.append((str(session_id), "entrée illisible"))
+            report.skipped.append((str(session_id), "unreadable entry"))
             continue
         agent = entry.get("name") or ""
         harness = entry.get("harness") or ""
@@ -314,11 +314,11 @@ def import_file(cfg: Config, db, path: str, *, by: str) -> ImportReport:
             report.skipped.append((str(session_id), str(exc)))
             continue
         if result.status == "unchanged":
-            report.skipped.append((str(session_id), "déjà liée à %s (identique)" % agent))
+            report.skipped.append((str(session_id), "already bound to %s (identical)" % agent))
             continue
-        detail = "%s, pid %s" % (harness, result.row.get("pid") or "non contrôlé")
+        detail = "%s, pid %s" % (harness, result.row.get("pid") or "not checked")
         if result.status == "updated":
-            detail += ", pid mis à jour"
+            detail += ", pid updated"
         report.imported.append((str(session_id), agent, detail))
     return report
 
@@ -335,23 +335,23 @@ def for_hook(cfg: Config, db, harness: str, session_id: str,
     renseigné) est dans l'ascendance du hook ; (ligne, raison) si elle existe
     mais ne vaut pas ici ; (None, raison) sans liaison."""
     if harness not in HARNESSES or not SESSION_RE.match(session_id or ""):
-        return None, "pas d'identifiant de session exploitable"
+        return None, "no usable session id"
     row = storage.of(db).session_bindings.active(cfg.host, harness, session_id)
     if row is None:
-        return None, "session %s %s non liée (ameesh mail bind)" % (harness, session_id)
+        return None, "session %s %s not bound (ameesh mail bind)" % (harness, session_id)
     pid = row.get("pid")
     if pid:
         try:
             chain = list(ancestors() if chain is None else chain)
         except platform.NotAvailable as exc:
-            return row, ("ascendance du hook invérifiable sur cet hôte (%s) : liaison "
-                         "--pid sans effet" % exc)
+            return row, ("hook ancestry cannot be verified on this host (%s): "
+                         "--pid binding has no effect" % exc)
         if int(pid) not in chain:
-            return row, ("pid %s de la liaison absent de l'ascendance du hook "
-                         "(session reprise ailleurs ? re-liez avec --pid)" % pid)
+            return row, ("binding pid %s not in the hook ancestry "
+                         "(session resumed elsewhere? re-bind with --pid)" % pid)
         if not _same_process(row):
-            return row, ("pid %s de la liaison réutilisé par un autre processus (heure de "
-                         "démarrage différente) : re-liez avec --pid" % pid)
+            return row, ("binding pid %s reused by another process (different "
+                         "start time): re-bind with --pid" % pid)
     return row, ""
 
 

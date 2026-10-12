@@ -10,6 +10,10 @@ jalon, action liée, message lié (`agent_mailbox.work_item_id`). Un lot
 (`closed`, L29) sans activité depuis un seuil (défaut 6 h ; `--stale-after`,
 `AMEESH_STALE_AFTER`).
 
+L368: a future planned start or an explicit open commitment/plan dependency
+on another open lot defers stagnation; `planned_waits` resolves those sources
+for all three views, without interpreting notes or changing activity.
+
 **Attente** (`waiting`) : `{what, who, label}`, déduite de l'état, des jalons
 (L10, lus par `progress._jalons_de_lot`) et des actions, jamais inventée
 (`who` est None quand ameesh ne sait pas qui). Ordre :
@@ -63,7 +67,7 @@ def parse_duration(text: str) -> float:
     """« 90m », « 6h », « 2d »/« 2j », « 3600 » → secondes (strictement positif)."""
     match = _DURATION_RE.match(text or "")
     if not match or float(match.group(1)) <= 0:
-        raise StaleError("durée illisible : %r (90m, 6h, 2d…)" % text)
+        raise StaleError("unreadable duration: %r (90m, 6h, 2d...)" % text)
     return float(match.group(1)) * _UNITS[match.group(2).lower()]
 
 
@@ -106,17 +110,19 @@ def stale(state: str, last_ts: float | None, now: float, threshold: float) -> di
 # --------------------------------------------------------------------------
 
 _LABELS = {
-    "start": ("démarrage par %s", "attribution (lot non assigné)"),
-    "build": ("travail de %s", "travail (lot non assigné)"),
-    "verdict": ("verdict de %s", "verdict d'un relecteur (non désigné)"),
-    "fix": ("correction de %s", "correction (auteur non désigné)"),
-    "merge-approval": ("approbation de la fusion par %s", "approbation de la fusion"),
-    "merge": ("fusion par %s", "fusion (exécutant non désigné)"),
-    "merge-outcome": ("issue de la fusion inconnue : réconciliation par %s",
-                      "issue de la fusion inconnue : réconciliation"),
-    "decision": ("décision humaine de %s", "décision humaine"),
-    "unblock": ("déblocage par %s", "déblocage"),
+    "start": ("start by %s", "assignment (lot unassigned)"),
+    "build": ("work by %s", "work (lot unassigned)"),
+    "verdict": ("verdict by %s", "verdict from a reviewer (none designated)"),
+    "fix": ("fix by %s", "fix (author not designated)"),
+    "merge-approval": ("merge approval by %s", "merge approval"),
+    "merge": ("merge by %s", "merge (executor not designated)"),
+    "merge-outcome": ("merge outcome unknown: reconciliation by %s",
+                      "merge outcome unknown: reconciliation"),
+    "decision": ("human decision by %s", "human decision"),
+    "unblock": ("unblocking by %s", "unblocking"),
 }
+#: display labels of the `who_state` values (the values stay as stored/emitted)
+_STATE_LABELS = {"inconnu": "unknown", "arrêté": "stopped", "externe": "external session"}
 
 
 def _waiting(what: str, who) -> dict:
@@ -230,13 +236,12 @@ def with_availability(detail: dict | None, states: dict[str, str] | None,
         return detail
     single = len(notes) == 1 and "," not in str(detail["who"])
     if single and next(iter(notes.values())) == "externe":
-        suffix = " (session externe, %s)" % (responsible or "sans responsable")
+        suffix = " (external session, %s)" % (responsible or "no responsible")
     elif single:
-        suffix = " (agent %s)" % next(iter(notes.values()))
+        suffix = " (agent %s)" % _STATE_LABELS[next(iter(notes.values()))]
     else:
         suffix = " (%s)" % ", ".join(
-            "%s %s" % (n, "session externe" if st == "externe" else st)
-            for n, st in notes.items())
+            "%s %s" % (n, _STATE_LABELS[st]) for n, st in notes.items())
     out = dict(detail, label=detail["label"] + suffix,
                who_state=notes if len(notes) > 1 else next(iter(notes.values())))
     if "externe" in notes.values():
@@ -281,7 +286,8 @@ def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict]:
 
 
 def describe(db, rows: list[dict], *, now: float | None = None,
-             threshold: float = DEFAULT_THRESHOLD_S) -> dict[int, dict]:
+             threshold: float = DEFAULT_THRESHOLD_S,
+             open_items: list[dict] | None = None) -> dict[int, dict]:
     """Pour chaque lot (lignes de `work_items`) : `{waiting, waiting_for,
     last_activity_ts, stale}`. Une lecture groupée, aucune requête par lot."""
     from . import progress  # import tardif : progress importe ce module
@@ -292,6 +298,11 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     packages = {p["id"]: p for p in st.packages.all(include_absent=True)}
     states, externals = agent_availability(db)
     events, milestones, actions, messages = _grouped(st, ids)
+    from . import planned_waits
+    from . import work_dependencies
+    dependencies = work_dependencies.grouped(db, ids)
+    holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items,
+                              dependencies=[e for edges in dependencies.values() for e in edges])
     out: dict[int, dict] = {}
     for row in rows:
         rid = int(row["id"])
@@ -306,7 +317,10 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                              messages.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
-                    "stale": stale(row.get("state") or "", last, now, threshold)}
+                    "planned_wait": holds.get(rid),
+                    "dependencies": dependencies.get(rid, []),
+                    "stale": None if rid in holds else
+                             stale(row.get("state") or "", last, now, threshold)}
     return out
 
 
@@ -322,15 +336,20 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     st = storage.of(db)
     # L119 (0037) : un élément de la file d'amélioration qui attend son
     # preneur n'est pas stagnant, il est en file
-    rows = [r for r in st.operations.open_lots_activity(limit)
+    # Read all open lots before filtering: deferred lots must not occupy the
+    # render limit and hide an actionable stale lot or a dependency beyond it.
+    open_items = st.operations.open_lots_activity(None)
+    rows = [r for r in open_items
             if r.get("last_activity_ts") is not None
             and now - float(r["last_activity_ts"]) >= float(threshold_s)
             and not sous_utilisation.is_backlog_item(r)]
-    described = describe(db, rows, now=now, threshold=threshold_s)
+    described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items)
     out = []
     for row in rows:
         lot = int(row["id"])
         info = described[lot]
+        if info["stale"] is None:
+            continue
         out.append({
             "id": lot,
             "title": row.get("title"),
@@ -341,4 +360,4 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "waiting_for": info["waiting_for"],
             "waiting": info["waiting"],
         })
-    return out
+    return out[:max(0, int(limit))]

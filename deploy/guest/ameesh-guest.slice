@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh — slice of the GUEST on a lending host (study L159 §1.6, §2.1, lot
+# L159g). The guest runners (`ameesh-guest-runner@<agent>`) live here, under a
+# low weight: the application of the host always wins. systemd nests this
+# slice under `ameesh.slice`, so the weights below only rank the guest among
+# ameesh's own slices; the weight against the application is the parent's
+# (`ameesh.slice.d/guest-weight.conf`, installed with this file). The ceilings of the
+# whole guest (`CPUQuota`, `MemoryHigh`, `MemoryMax`) follow the offer of the
+# Host fiche (`policy.lend`); the guard (`ameesh guard`, L159e) sets them at
+# run time with `systemctl set-property --runtime`. The values below are
+# the safe floor until the guard runs. Installed by the owner, as root:
+#
+#   install -m 0644 ameesh-guest.slice /etc/systemd/system/
+#   install -D -m 0644 ameesh.slice.d/guest-weight.conf \
+#       /etc/systemd/system/ameesh.slice.d/guest-weight.conf
+#   systemctl daemon-reload
+
+[Unit]
+Description=ameesh — guest of a lending host
+Before=slices.target
+
+[Slice]
+CPUWeight=10
+IOWeight=10
+CPUQuota=200%
+MemoryHigh=8G
+MemoryMax=9G

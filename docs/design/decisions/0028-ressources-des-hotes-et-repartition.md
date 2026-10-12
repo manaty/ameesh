@@ -1,49 +1,49 @@
 ---
 type: Decision
-title: "ameesh surveille les ressources de chaque hôte et répartit les agents en conséquence"
-description: "Chaque exécuteur mesure mémoire, swap, CPU et disque de son hôte ; sous pression il retient les nouveaux tours, signale les ressources orphelines et, quand le canon autorise plusieurs hôtes pour un agent, déplace l'agent vers un hôte moins chargé entre deux tours."
+title: "ameesh monitors each host's resources and distributes agents accordingly"
+description: "Each runner measures its host's memory, swap, CPU and disk; under pressure it holds back new turns, reports orphaned resources and, when the canon allows several hosts for an agent, moves the agent to a less loaded host between two turns."
 status: stable
 tags: [placement, ressources, exploitation, multi-hotes]
 decided_by: human:smichea
 decision_date: 2026-10-05
-attestation: "demande du propriétaire dans sa conversation avec mesh-design, après une saturation mémoire du poste (12 Go de swap) ; non signée"
+attestation: "owner request in his conversation with mesh-design, after a memory saturation of the workstation (12 GB of swap); unsigned"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-05T17:30:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Le placement v1 est déclaratif (un agent → un hôte, `max_agents` par hôte).
-Rien ne mesure la charge réelle : un poste a saturé sa mémoire (navigateur,
-suites de tests des agents, une douzaine de bases de test oubliées depuis 17 h)
-sans qu'aucun outil ne le voie ni n'agisse.
+The v1 placement is declarative (one agent → one host, `max_agents` per host).
+Nothing measures the actual load: a workstation saturated its memory (browser,
+agents' test suites, a dozen test databases forgotten for 17 hours)
+without any tool seeing it or acting on it.
 
-# Décision
+# Decision
 
-1. **Mesure** : chaque exécuteur relève périodiquement les ressources de son
-   hôte (mémoire disponible, swap, charge CPU, disque libre, nombre de tours en
-   cours) et les publie en base ; `ameesh hosts [--json]` les montre, avec
-   l'historique court.
-2. **Seuils au canon** : la politique d'un `Host` porte des seuils (mémoire
-   disponible minimale, swap maximal, charge maximale, disque minimal), avec des
-   valeurs par défaut prudentes.
-3. **Contre-pression locale** : au-dessus d'un seuil, l'exécuteur ne démarre
-   plus de nouveau tour (les tours en cours finissent) et lève une alerte ; en
-   cas critique, il met en pause les agents les moins prioritaires, jamais au
-   milieu d'un tour.
-4. **Ressources orphelines** : l'exécuteur rattache à chaque tour les processus
-   et conteneurs qu'il lance (groupe de processus, étiquettes de conteneur) et
-   signale ceux qui survivent à leur tour ou à leur agent ; il ne supprime rien
-   sans action explicite.
-5. **Répartition** : un `Placement` peut désigner plusieurs hôtes admis pour un
-   agent (ordre de préférence) ; entre deux tours, un agent passe à un hôte
-   admis moins chargé (bail rendu puis repris ; même session si le stockage des
-   sessions le permet, sinon rotation avec résumé, [0025](0025-une-session-par-lot.md)).
-   La politique d'hôte et les identifiants (mode, comptes, [0027](0027-bascule-automatique-entre-comptes.md))
-   restent vérifiés sur l'hôte d'arrivée.
+1. **Measurement**: each runner periodically reads its host's resources
+   (available memory, swap, CPU load, free disk, number of turns in
+   progress) and publishes them to the database; `ameesh hosts [--json]` shows
+   them, with the short history.
+2. **Thresholds in the canon**: a `Host`'s policy carries thresholds (minimum
+   available memory, maximum swap, maximum load, minimum disk), with
+   cautious default values.
+3. **Local back-pressure**: above a threshold, the runner no longer starts
+   a new turn (turns in progress finish) and raises an alert; in a
+   critical case, it pauses the lowest-priority agents, never in the
+   middle of a turn.
+4. **Orphaned resources**: the runner attaches to each turn the processes
+   and containers it launches (process group, container labels) and
+   reports those that outlive their turn or their agent; it deletes nothing
+   without explicit action.
+5. **Distribution**: a `Placement` can designate several admitted hosts for an
+   agent (order of preference); between two turns, an agent moves to a less
+   loaded admitted host (lease released then retaken; same session if session
+   storage allows it, otherwise rotation with summary, [0025](0025-une-session-par-lot.md)).
+   The host policy and the credentials (mode, accounts, [0027](0027-bascule-automatique-entre-comptes.md))
+   are still checked on the destination host.
 
-# Conséquences
+# Consequences
 
-- Lot L31 ; s'appuie sur L3 (placement), L26 (alertes), L30 (comptes) et L25
-  (profil cluster, où chaque pod est un hôte).
-- Les seuils et les hôtes admis sont déclaratifs et revus (canon) ; les mesures
-  sont de l'état d'exécution (base).
+- Lot L31; builds on L3 (placement), L26 (alerts), L30 (accounts) and L25
+  (cluster profile, where each pod is a host).
+- Thresholds and admitted hosts are declarative and reviewed (canon); the
+  measurements are runtime state (database).

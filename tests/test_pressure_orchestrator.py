@@ -99,7 +99,7 @@ class PressionTest(PgTestCase):
         self.assertEqual(spec["kind"], "prompt")
         self.assertEqual(spec["prompt"], "travail")
         texte = registry.get(self.db, "ouvrier")["status_text"]
-        self.assertIn("en attente : pression de l'hôte", texte)
+        self.assertIn("waiting: pressure on host", texte)
         self.assertTrue(registry.get(self.db, "ouvrier")["pending_prompt"])
 
     def test_jamais_sous_pression_critique_ni_sur_batterie(self):
@@ -110,6 +110,22 @@ class PressionTest(PgTestCase):
         self.assertTrue(orch._held_by_pressure(BATTERIE))
         ouvrier = self._worker("ouvrier")
         self.assertTrue(ouvrier._held_by_pressure(NON_CRITIQUE))
+
+    def test_auditeur_passe_et_leve_une_ancienne_pause_de_charge(self):
+        auditeur = self._worker("auditeur")
+        with self._sous(CRITIQUE):
+            # Une pause posée avant L234 ne doit pas rester affichée.
+            auditeur._host_pressure_note(CRITIQUE)
+            self.assertIn("paused: critical pressure", registry.get(self.db, "auditeur")["status_text"])
+            spec = auditeur.pick()
+        self.assertEqual(spec["kind"], "prompt")
+        self.assertEqual(spec["prompt"], "travail")
+        self.assertNotIn("paused: critical pressure", registry.get(self.db, "auditeur")["status_text"])
+
+    def test_auditeur_reste_sous_la_garde_de_budget(self):
+        auditeur = self._worker("auditeur")
+        with self._sous(CRITIQUE), mock.patch.object(auditeur, "budget_ok", return_value=False):
+            self.assertIsNone(auditeur.pick())
 
     def test_la_rotation_attend_la_fin_de_la_pression(self):
         worker = self._worker("tourne", prompt=None)
@@ -146,12 +162,12 @@ class PressionTest(PgTestCase):
             self.assertFalse(self.executeur.host_pressure(
                 now=self.executeur._pressure_at + 11.0)["blocked"])
             self.executeur.host_pressure(now=self.executeur._pressure_at + 11.0)
-        pression = [l for l in lignes if "pression de l'hôte" in l]
+        pression = [l for l in lignes if "pressure on host" in l]
         self.assertEqual(len(pression), 2, lignes)
-        self.assertIn("début — mémoire disponible", pression[0])
-        self.assertIn("sauf ceux d'un orchestrateur", pression[0])
-        self.assertRegex(pression[1], r"fin — de \d\d:\d\d:\d\d à \d\d:\d\d:\d\d \(\d+ s\)")
-        self.assertIn("2 tour(s) retardé(s) (a, b)", pression[1])
+        self.assertIn("available memory", pression[0])
+        self.assertIn("except an orchestrator's", pression[0])
+        self.assertRegex(pression[1], r"end — from \d\d:\d\d:\d\d to \d\d:\d\d:\d\d \(\d+ s\)")
+        self.assertIn("2 turn(s) delayed (a, b)", pression[1])
 
 
 if __name__ == "__main__":

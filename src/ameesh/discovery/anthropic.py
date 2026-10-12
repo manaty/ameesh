@@ -29,7 +29,7 @@ def listing(*, token: str | None = None, base_url: str | None = None, timeout: f
     key = token or os.environ.get(KEY_VAR) or ""
     if not key:
         return SourceResult(
-            source=PROVIDER, complete=False, detail="aucune clé disponible : rien n'est retiré"
+            source=PROVIDER, complete=False, detail="no key available: nothing is removed"
         )
     url = (base_url or os.environ.get(f"{KEY_VAR}_BASE_URL") or DEFAULT_BASE_URL).rstrip("/") + LIST_PATH
     # `http.fetch_json` refuse les redirections, exige HTTPS et vérifie l'origine :
@@ -48,13 +48,13 @@ def listing(*, token: str | None = None, base_url: str | None = None, timeout: f
         return SourceResult(
             source=PROVIDER,
             complete=False,
-            detail=f"{type(refused).__name__} : lecture refusée, rien n'est retiré",
+            detail=f"{type(refused).__name__}: read refused, nothing is removed",
         )
     if failure:
         return SourceResult(
             source=PROVIDER,
             complete=False,
-            detail=f"{failure} : lecture impossible, rien n'est retiré",
+            detail=f"{failure}: read failed, nothing is removed",
         )
     return providers.parse_listing(payload, provider=PROVIDER)
 

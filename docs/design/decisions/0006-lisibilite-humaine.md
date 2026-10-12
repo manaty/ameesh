@@ -1,26 +1,26 @@
 ---
 type: Decision
-title: "Tous les échanges sont lisibles et auditables par les humains"
-description: "Les agents se parlent en langage humain, dans des canaux que l'équipe peut lire ; aucun canal caché."
+title: "All exchanges are readable and auditable by humans"
+description: "Agents talk to each other in human language, in channels the team can read; no hidden channel."
 status: stable
 tags: [audit, messagerie]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-« On a encore la chance que les IA soient des LLM et se parlent entre eux en langage humain, profitons-en. » (le propriétaire)
+"We are still lucky that AIs are LLMs and talk to each other in human language; let's take advantage of it." (the owner)
 
-# Décision
+# Decision
 
-Tous les messages, **y compris d'agent à agent**, sont **auditables par les humains** : en langage naturel, dans un fil que l'équipe peut lire, retrouver et auditer.
+All messages, **including agent to agent**, are **auditable by humans**: in natural language, in a thread the team can read, find and audit.
 
-# Conséquences
+# Consequences
 
-- La boîte aux lettres d'ameesh n'est qu'une file ou un cache ; la référence est le fil lisible.
-- Le corps d'un message se suffit à lui-même ; les métadonnées structurées s'ajoutent, jamais ne remplacent.
-- Un fil par lot.
-- Lisible ne veut pas dire autorisé : l'autorité reste prouvée par signature ([0009](0009-paroles-signees.md)).
+- The ameesh mailbox is only a queue or a cache; the reference is the readable thread.
+- The body of a message is self-sufficient; structured metadata is added, never replaces it.
+- One thread per lot.
+- Readable does not mean authorised: authority is still proven by signature ([0009](0009-paroles-signees.md)).

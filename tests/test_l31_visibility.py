@@ -140,7 +140,7 @@ class ForgeTest(test_canon._TmpMixin, unittest.TestCase):
         # plusieurs humains : refus explicite, jamais de repli sur github.com
         visible, why = forge.visible(repo, self.humans, self.logins)
         self.assertFalse(visible)
-        self.assertIn("non prise en charge", why)
+        self.assertIn("not supported", why)
         # un seul humain : la copie d'essai prévue par 0029 peut prouver l'accès
         forge = visibility.Forge(mode="auto", gh=fake_gh({}), git=fake_git(True))
         visible, why = forge.visible(repo, ["human:bruno"], {"human:bruno": None})
@@ -290,7 +290,7 @@ class VisibilityDbTest(test_canon._CanonDbCase):
         row = self._orchestre()
         self.assertIs(row["placement_ok"], True)
         self.assertIs(row["visibility_ok"], True)
-        self.assertIn("accès", row["visibility_diagnostic"])
+        self.assertIn("access", row["visibility_diagnostic"])
 
     def test_sync_cache_par_contexte(self):
         add_memory(self.root, "orchestre")
