@@ -739,10 +739,17 @@ class GateController:
         return live + ([foreground] if foreground is not None else [])
 
     # -- transitions --------------------------------------------------------
-    def apply(self, state: GateState) -> bool:
-        """Applies a state; True when it changed."""
+    def apply(self, state: GateState, *, newer_only: bool = False) -> bool:
+        """Applies a state; True when it changed. `newer_only` (`refresh`):
+        only a later seq, or the same seq closing (the fallback of an
+        unreadable file): a state read before the loop applied a newer one
+        never reopens the controller (r5)."""
         now = self._clock()
         with self._lock:
+            if newer_only and self._applied is not None and (
+                    state.seq < self._state.seq
+                    or (state.seq == self._state.seq and state.may_claim)):
+                return False
             self._account_freeze(state, now)
             if _key(state) == self._applied:
                 return False
@@ -803,12 +810,12 @@ class GateController:
                       % (before, state.reason, state.seq))
 
     def refresh(self) -> GateState:
-        """Reads the gate now, not at the loop's next pass, applies it and
-        ticks (`--once`, before its turn); gives the state read."""
-        state = self.gate.state()
-        self.apply(state)
+        """Reads the gate now, not at the loop's next pass, applies it if it
+        is newer than the applied state, and ticks (`--once`, before its
+        turn); gives the applied state, the one to decide on."""
+        self.apply(self.gate.state(), newer_only=True)
         self.tick()
-        return state
+        return self.current
 
     def tick(self) -> GateAck:
         """Drain deadline, lateness, ack; gives the ack."""

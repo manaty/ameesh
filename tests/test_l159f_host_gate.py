@@ -562,6 +562,26 @@ class ControllerTest(unittest.TestCase):
         self.assertTrue(self.ctl.holds_turns())
         self.assertEqual(self.gate.acks[-1].state, "draining")
 
+    def test_refresh_never_reopens_with_a_state_read_before_a_newer_one(self):
+        # r5: refresh reads available seq 1; meanwhile the loop applies
+        # stopped seq 2; refresh's late apply must not reopen the controller
+        read = self.gate.state
+
+        def racing_read():
+            st = read()
+            self.state("stopped", 2, reason="host_memory")  # the loop, in between
+            return st
+
+        self.gate.state = racing_read
+        self.assertFalse(self.ctl.refresh().may_claim)
+        self.assertTrue(self.ctl.holds_turns())
+        self.assertEqual(self.ctl.current.seq, 2)
+        # the same seq closing (the fallback of an unreadable file) applies
+        self.gate.state = read
+        self.state("available", 3)
+        self.gate.st = host_gate.fallback_state("stopped", 3)
+        self.assertFalse(self.ctl.refresh().may_claim)
+
     def test_available_reopens_and_wakes_the_runner(self):
         self.state("stopped", 2)
         self.assertTrue(self.ctl.holds_turns())
