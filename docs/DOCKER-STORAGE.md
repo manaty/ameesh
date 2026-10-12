@@ -107,3 +107,8 @@ authorize deletion of newly created resources.
 
 References: [volume prune](https://docs.docker.com/reference/cli/docker/volume/prune/),
 [builder prune](https://docs.docker.com/reference/cli/docker/builder/prune/).
+
+Post-prune read-only refresh: the Docker prune process was no longer present.
+The refresh found 40 volumes, 5 unreferenced, and 20 named volumes;
+all named volumes are retained in the updated preservation manifest.
+No resources were deleted by this agent.

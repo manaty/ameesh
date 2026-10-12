@@ -1,7 +1,7 @@
 {
   "host": "pc-smichea",
-  "snapshot": "2026-10-12T14:54:00+02:00",
-  "prune_in_progress": true,
+  "snapshot": "2026-10-12T15:32:40.998474+02:00",
+  "prune_in_progress": false,
   "named_volumes_to_keep": [
     {
       "name": "agent-mesh-pg-data",
