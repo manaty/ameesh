@@ -238,12 +238,15 @@ none; computed over all lots, regardless of the window.
 
 `ameesh-versions/1`. One **product** per version-tag stream of the
 repository a project cites (`issue_ref`, else the `github.projects`
-setting) — the same model for `--serve` and `--html`. GitHub is read
-**read-only** with the host token (`GH_TOKEN`/`GITHUB_TOKEN`; `gh` only as
-a local fallback, never on the server) and only for tags, releases, one
-file and one commit date: merged lots and their PRs come from the
-database (`sync-github`). The reader is cached 5 min and shared by the
-whole server; `--no-versions` reads nothing.
+setting) — the same model for `--serve` and `--html`. Products and trains
+are indexed by `(stream, version)`, never by version alone: `v1.0.0` and
+`desktop-v1.0.0` are two products. GitHub is read **read-only** with the
+host token (`GH_TOKEN`/`GITHUB_TOKEN`; `gh` only as a local fallback, never
+on the server) and only for tags, releases, one file and one commit date:
+merged lots and their PRs come from the database (`sync-github`). The
+reader is cached 5 min and shared by the whole server; a failed read is
+cached 60 s and the previous data, when there is some, keeps being served
+marked stale; `--no-versions` reads nothing.
 
 | Key | Meaning |
 |---|---|
@@ -260,28 +263,38 @@ whole server; `--no-versions` reads nothing.
 | `project`, `repo`, `product`, `label`, `prefix` | the project, its repository and the product; one stream per tag prefix; the prefix-less stream is `<project> server/prod` when the repository has several |
 | `last` | last **published** version: `{version, tag, published_ts, date, url, prerelease, source, read_ts}` |
 | `last_tag` | the newest tag when it is ahead of `last` (tag without release, draft release): `{version, tag, date, published_ts, draft, url, source, read_ts}`; a `missing` line says the tag has no published release |
-| `next` | the next release, or `null`: `{version, tag, state, date, date_source, date_label, lots[], release, pr, notes, summary, themes[], merged_lots[], merged_since, missing[]}` |
+| `next` | the next release, or `null`: `{version, tag, state, date, date_source, date_label, date_partial, lots[], release, pr, notes, notes_reason, summary, themes[], merged_lots[], merged_since, missing[]}` |
+| `unassigned` | `true` on the single `<project> (product not assigned)` entry: the merged lots whose title names no product surely; never duplicated under two products |
 | `missing` | texts: what this product lacks |
 
-The next version is the smallest one above the stream's last tag announced
-by an open release lot (`Release x.y.z`, `REL-…`, `QA-…`) or a draft
-release. `next.date` is the planned date of its lots (the latest delivery,
-end or start), otherwise the p80 of the L157 reference table
-(`date_source`: `plan` or `p80`); a release without date is said in
-`next.missing`. `next.state` is the most demanding state of the train
+The next version is the smallest one above the stream's last **published**
+version, announced by an open release lot (`Release x.y.z`, `REL-…`,
+`QA-…`) or a draft release — a draft does not raise the base, it shows as
+prepared on the next train (`next.release.draft`, state `draft` when no lot
+drives it). Semver pre-releases (`0.2.11-rc.1`) are kept whole and sort
+before their final version; `next.tag` is the expected tag. `next.date` is
+a **firm** date only when every lot of the train has one (their latest
+delivery, end or start; otherwise the p80 of the L157 reference table,
+`date_source`: `plan` or `p80`); as soon as one lot lacks a date, `date` is
+`null`, `date_partial` keeps the latest known date as a lower bound (shown
+as `not firm, latest …`) and `next.missing` says `N of M lot(s) have no
+planned date`. `next.state` is the most demanding state of the train
 (`blocked`, `waiting_human`, `qa`, `build`, `intake`), otherwise `draft`
 (draft release) or `pull request` (open release PR).
 
-Content: the notes file `docs/versions/<version>.md` read from the release
-branch (`release/vX.Y.Z`, otherwise the tag, otherwise the default
-branch) — `notes.source` is the reference actually read; `notes` and the
-parsed `summary`/`themes` come from GitHub and carry `origin`/`read_ts`.
-Without that file, the lots merged since the last tag are grouped by their
-epic (`themes[]`), and `merged_lots[]` carries each lot with its `pr` read
-from the database. Every datum read from GitHub (`last`, `last_tag`,
-`release`, `notes`) carries `source` and `read_ts`; those read from the
-database (`lots[]`, `merged_lots[]`, `pr`) say `ameesh work items`.
-The text render adds one line: `GitHub (api): read 3 min ago`.
+Content: the notes file `docs/versions/<version>.md` read from the **head
+branch of the release PR** (the lot's branch, from the database) — never
+from `release/vX`, the tag or the default branch; `notes.source` names that
+reference. Without that file, `notes` is `null`, `notes_reason` says why
+and the lots merged since the last tag are grouped by their epic
+(`themes[]`), each lot attributed to a product only when its title names
+one surely (a stream prefix, or `serveur`/`server`/`prod` for the
+prefix-less stream); the others go to the `<project> (product not
+assigned)` entry. `merged_lots[]` carries each lot with its `pr` read from
+the database. Every datum read from GitHub (`last`, `last_tag`, `release`,
+`notes`) carries `source` and `read_ts`; those read from the database
+(`lots[]`, `merged_lots[]`, `pr`) say `ameesh work items`. The text render
+adds one line: `GitHub (api): read 3 min ago`.
 
 ## `actions[]`
 
