@@ -118,6 +118,47 @@ class NoteTest(unittest.TestCase):
         self.assertTrue(all(t[:8] in texte for t in dits))
 
 
+@unittest.skipUnless(hasattr(os, "fork") and sys.platform.startswith("linux"), "Linux")
+class ZombieTest(unittest.TestCase):
+    """#458 : un zombie du groupe dont le parent n'est pas l'exécuteur (un
+    sous-moissonneur au-dessus de lui, ex. l'exécuteur qui fait tourner
+    l'agent qui lance ces tests) ne garde pas la ressource « orpheline »."""
+
+    ENFANT = ("import os, sys, time\n"
+              "pid = os.fork()\n"
+              "if pid == 0:\n"
+              "    os.setpgid(0, 0)\n"
+              "    os._exit(4)\n"
+              "print(pid, flush=True)\n"
+              "time.sleep(30)\n")
+
+    def test_zombie_d_un_autre_parent_ferme_done(self):
+        # parent qui ne moissonne pas : son fils, seul de son groupe, reste zombie
+        parent = subprocess.Popen([sys.executable, "-c", self.ENFANT],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(parent.wait)
+        self.addCleanup(parent.kill)
+        pid = int(parent.stdout.readline())
+        fin = time.monotonic() + 10
+        while not any(p["pid"] == pid and p["zombie"] for p in platform.process_table()):
+            self.assertLess(time.monotonic(), fin, "pas de zombie")
+            time.sleep(0.02)
+        self.assertTrue(background._group_alive(pid))  # signal 0 : le zombie répond
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *_a: None)
+        now = time.time()
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=pid, ended=now,
+                                 deadline=now + 1200, grace_s=1200, lineage={pid})
+        entry.jobs[pid] = background.Job(pid, 'pid %d "sh"' % pid)
+        tracker.entries = [entry]
+        with mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=now)
+        self.assertEqual(entry.state, "done")
+        of.return_value.turn_resources.close_turn.assert_called_once_with(
+            entry.turn_id, orphan=False, containers=None)
+
+
 @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX")
 class PlatformTest(unittest.TestCase):
     def test_moisson_d_un_enfant_et_table_des_processus(self):

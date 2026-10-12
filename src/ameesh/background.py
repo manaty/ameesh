@@ -433,7 +433,7 @@ class Tracker:
                 restants = [c["id"] for c in runtime.turn_containers(entry.turn_id) or ()]
             except Exception:
                 restants = []
-        orphelin = bool(restants) or bool(entry.pgid and _group_alive(entry.pgid))
+        orphelin = bool(restants) or _group_running(entry.pgid)
         try:
             storage.of(db).turn_resources.close_turn(entry.turn_id, orphan=orphelin,
                                                      containers=restants or None)
@@ -599,6 +599,20 @@ class Tracker:
             return "stopped when the grace period (%s) ran out — %s" % (
                 _minutes(entry.grace_s), self._what(entry, state=state))
         return "stopped with the runner — %s" % self._what(entry, state=state)
+
+
+def _group_running(pgid: int | None) -> bool:
+    """Un membre VIVANT du groupe tourne-t-il encore ? Les zombies ne comptent
+    pas, comme dans `_members` : celui d'un autre parent (un sous-moissonneur
+    au-dessus de l'exécuteur, #458) répond au signal 0 sans rien faire tourner.
+    Sans table des processus : le signal 0."""
+    if not pgid:
+        return False
+    try:
+        table = platform.process_table()
+    except platform.NotAvailable:
+        return _group_alive(pgid)
+    return any(p["pgid"] == pgid and not p["zombie"] for p in table)
 
 
 def _group_alive(pgid: int | None) -> bool:
