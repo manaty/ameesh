@@ -34,9 +34,9 @@
 #   écrire, pas même un fetch (le distant est lu par ls-remote, main est
 #   $DISTANT/main local). Ces deux étapes ne lisent pas $BASCULE_ENV.
 #
-# REF (migrer, installer) : commit, branche ou étiquette du dépôt qui contient
-# ce script ; défaut : HEAD de ce dépôt. MIGRER_APRES=1 (installer) : ancien
-# ordre, pour une migration non additive (docs/BASCULE.md, L151).
+# REF : commit, branche ou étiquette du dépôt qui contient ce script.
+# Obligatoire pour migrer ; défaut HEAD pour installer. MIGRER_APRES=1
+# ne désactive jamais la garde additive de migrer (docs/BASCULE.md, L232b).
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57, jamais dans le dépôt) : VM (adresse WireGuard du serveur),
@@ -184,22 +184,16 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
-# Migrations du commit REF, lancées depuis son instantané. Avant installation,
-# seules les migrations additives passent (--additive-only) : le code en
-# place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
-# fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
+# Migrations du commit explicite REF : résolution unique, garde additive même
+# si ce code est déjà installé. L'état d'un lien n'accorde aucune autorité.
 migrer() {
-  local ref=${1:-HEAD} cible garde=(--additive-only)
-  cible=$(instantane "$ref")
-  if installe "$cible"; then
-    garde=()
-    etape "$(basename "$cible") déjà installé : toutes ses migrations passent"
-  else
-    etape "migrations de $(basename "$cible"), avant son installation (additives seulement)"
-  fi
+  local ref=${1:?REF requis pour migrer} sha cible garde=(--additive-only)
+  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
+  cible=$(instantane "$sha")
+  etape "migrations du commit $sha, additives seulement"
   etape "base du mesh (une seule fois pour tout le mesh)"
   echo "base : $(dsn_de "$CONFIG" | sans_secret)"
-  ameesh_de "$cible" migrate --dry-run
+  ameesh_de "$cible" migrate --dry-run --additive-only
   migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
@@ -212,7 +206,7 @@ migrer_base() {
   ameesh_de "$cible" migrate "$@" || code=$?
   if [ "$code" = 3 ]; then
     echo "migration non additive : le code en place casserait sur la base migrée." >&2
-    echo "Procédure à part (docs/BASCULE.md, L151) : MIGRER_APRES=1 $0 installer, puis $0 migrer, puis redemarrer, d'affilée." >&2
+    echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
   fi
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
@@ -537,7 +531,7 @@ case "${1:-}" in
   verifier) verifier ;;
   sauvegarder) sauvegarder ;;
   installer) installer "${2:-HEAD}" ;;
-  migrer) migrer ;;
+  migrer) migrer "${2:?REF requis pour migrer}" ;;
   role) role ;;
   redemarrer) redemarrer ;;
   controler) controler ;;
