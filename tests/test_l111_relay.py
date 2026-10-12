@@ -473,6 +473,16 @@ class RelaisSansBaseTest(unittest.TestCase):
         self.assertEqual(relay.settle(meter.usage, 1000, 100).output_tokens, 120)
         meter.event({"type": "message_delta", "usage": {"output_tokens": 7}})
         self.assertEqual(relay.settle(meter.usage, 1000, 100).output_tokens, 120)
+        for final in ({}, {"output_tokens": None}, {"output_tokens": -1},
+                      {"output_tokens": "invalid"}, {"output_tokens": True}):
+            with self.subTest(final=final):
+                incomplete = relay.UsageMeter("deepseek-flash")
+                incomplete.event({"type": "message_delta", "usage": final})
+                self.assertFalse(incomplete.usage.complete)
+                self.assertEqual(relay.settle(incomplete.usage, 1000, 100).output_tokens, 100)
+                incomplete.body(json.dumps({"usage": final}).encode())
+                self.assertFalse(incomplete.usage.complete)
+                self.assertEqual(relay.settle(incomplete.usage, 1000, 100).output_tokens, 100)
 
 
 if __name__ == "__main__":

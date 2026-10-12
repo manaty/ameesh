@@ -424,8 +424,9 @@ class UsageMeter:
                 self._absorb(message.get("usage") or {})
             self.usage.started = True
         elif kind == "message_delta":
-            self._absorb(data.get("usage") or {})
-            self.usage.complete = True
+            usage = data.get("usage") or {}
+            self._absorb(usage)
+            self.usage.complete = self.usage.complete or self._has_output(usage)
         elif kind == "content_block_delta":
             delta = data.get("delta") or {}
             if isinstance(delta, dict):
@@ -455,8 +456,16 @@ class UsageMeter:
         if isinstance(data, dict):
             if data.get("model"):
                 self.usage.model = str(data["model"])[:200]
-            self._absorb(data.get("usage") or {})
-            self.usage.started = self.usage.complete = True
+            usage = data.get("usage") or {}
+            self._absorb(usage)
+            self.usage.started = True
+            self.usage.complete = self._has_output(usage)
+
+    @staticmethod
+    def _has_output(usage) -> bool:
+        """A final event without a valid output count is not a usage report."""
+        return (isinstance(usage, dict) and type(usage.get("output_tokens")) is int
+                and usage["output_tokens"] >= 0)
 
 
 def price_usage(usage: Usage, harness: str, prices: dict) -> float:
