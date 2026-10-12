@@ -213,9 +213,12 @@ def _bytes(value: Any, key: str) -> int | None:
 def _positive(value: Any, key: str, default: float | None = None) -> float | None:
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise GuardError("lend.%s: positive number expected, got %r" % (key, value))
-    return float(value)
+    # finite: drain_seconds of 1e309 (inf) or nan kept the guard draining
+    # forever (codex #211 r5)
+    number = resources.finite_float(value) if isinstance(value, (int, float)) else None
+    if number is None or number <= 0:
+        raise GuardError("lend.%s: positive finite number expected, got %r" % (key, value))
+    return number
 
 
 def parse_offer(lend: Any) -> Offer:
@@ -644,7 +647,8 @@ def read_ack(path: str) -> dict | None:
 
 
 def _number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # finite: -Infinity or 400 digits in the state file never restore
+    return isinstance(value, (int, float)) and resources.finite_float(value) is not None
 
 
 def restore_decision(previous: dict, now: float) -> tuple[Decision, int | None]:

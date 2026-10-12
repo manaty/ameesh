@@ -67,7 +67,11 @@ class OfferTest(unittest.TestCase):
                      {"cpu_weight": 0}, {"reclaim": {"cpu_pressure_max": "120%"}},
                      {"reclaim": {"busy_units": "x"}}, {"reclaim": {"busy_max": -1}},
                      {"windows": ["someday"]}, {"windows": ["mon 25:00-26:00"]},
-                     {"drain_seconds": 0}):
+                     {"drain_seconds": 0},
+                     # codex #211 r5: non-finite times kept the guard draining forever
+                     {"drain_seconds": 1e309}, {"drain_seconds": float("nan")},
+                     {"calm_seconds": float("inf")}, {"calm_seconds": 10 ** 400},
+                     {"cpu_max": float("nan")}, {"drain_seconds": True}):
             with self.assertRaises(guard.GuardError, msg=lend):
                 guard.parse_offer(lend)
 
@@ -278,7 +282,14 @@ class StateTest(unittest.TestCase):
                       {"seq": 7, "guard": {"decision": {"level": "3", "reason": "x",
                                                         "since_ts": 0}}},
                       {"seq": 7, "guard": {"decision": {"level": 3, "reason": "x",
-                                                        "since_ts": 1e12}}}):
+                                                        "since_ts": 1e12}}},
+                      {"seq": 7, "guard": {"decision": {"level": 3, "reason": "x",
+                                                        "since_ts": -10 ** 400}}},
+                      {"seq": 7, "guard": {"decision": {"level": 3, "reason": "x",
+                                                        "since_ts": float("-inf")}}},
+                      {"seq": 7, "guard": {"decision": {"level": 1, "reason": "x",
+                                                        "since_ts": 0,
+                                                        "calm_since_ts": float("nan")}}}):
             with open(self.cfg.state_path, "w") as fh:
                 json.dump(saved, fh)
             restored = self._guard([100.0], [dict(self.reading)])
