@@ -96,25 +96,36 @@ def _remote_branch(name: str) -> str:
 
 
 _SCP = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
-_URL = re.compile(r"^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$", re.I)
+_URL = re.compile(r"^([a-z][a-z0-9+.-]*)://(?:[^@/]+@)?([^/:]+)(?::(\d+))?/(.+)$", re.I)
+#: the port a scheme names when it names none: `ssh://host:22/x` is `host:x`
+_DEFAULT_PORTS = {"ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418, "http": 80,
+                  "https": 443}
 
 
 def source_of(repo: str) -> str:
     """The repository a lot is queued from, as a radar pass compares it: its
     origin as `host/path` (`git@github.com:o/r.git` and
-    `https://github.com/o/r` are one source; a checkout recreated keeps it),
-    else the real path of the origin or of `repo` itself. Two projects that
-    share commits (a fork) are two sources."""
+    `https://github.com/o/r` are one source; a checkout recreated keeps it;
+    a port other than the scheme's own is kept: two servers on one host are
+    two sources), else the real path of the origin or of `repo` itself. Two
+    projects that share commits (a fork) are two sources."""
     url = (plan_git._out(repo, "remote", "get-url", "origin") or "").strip()
     if not url:
         return os.path.realpath(repo)
-    found = _URL.match(url) or (None if url.startswith(("/", ".")) else _SCP.match(url))
-    if found is None:
+    host, port, path = None, None, ""
+    found = _URL.match(url)
+    if found and found.group(1).lower() != "file":
+        scheme, host, port, path = found.groups()
+        if port is not None and int(port) == _DEFAULT_PORTS.get(scheme.lower()):
+            port = None
+    elif not url.startswith(("/", ".", "file://")) and _SCP.match(url):
+        host, path = _SCP.match(url).groups()
+    if host is None:
         local = url[len("file://"):] if url.startswith("file://") else url
         return os.path.realpath(os.path.join(repo, local))
-    path = found.group(2).strip("/")
+    path = path.strip("/")
     path = path[:-len(".git")] if path.endswith(".git") else path
-    return "%s/%s" % (found.group(1).lower(), path)
+    return "%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path)
 
 
 def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
@@ -338,6 +349,12 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dic
             lot = int(one["work_item"])
             base = resolutions._check(run(path, "rev-parse", "HEAD"), "rev-parse")
             replayer._empty_cache()
+            if run(path, "merge-base", "--is-ancestor", one["tip"], "HEAD").returncode == 0:
+                # r6: already in the target (or a lot stacked): nothing to
+                # merge, and no empty commit to stop the lots after it
+                out[lot] = {"state": "contained", "files": []}
+                stacked.append(lot)
+                continue
             for other in stacked:
                 row = latest.get(frozenset((lot, other)))
                 if row and row["commit_sha"] not in missing \

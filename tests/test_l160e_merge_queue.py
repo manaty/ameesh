@@ -304,6 +304,16 @@ class StackTest(_Base):
         self.assertEqual(_git(self.repo, "status", "--porcelain"), "")
         self.assertFalse(os.path.exists(os.path.join(self.repo, ".git", "rr-cache")))
 
+    def test_a_lot_already_in_the_target_does_not_stop_the_replay(self):
+        # codex #188 r6: the fresh target already holds lot 1; the lots after
+        # it are still tried
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "1 lands", "lot/1-a")
+        main = _git(self.repo, "rev-parse", "main")
+        got = merge_queue.stack(self.replayer(), main, self.lots(1, 4), [])
+        self.assertEqual(got[1], {"state": "contained", "files": []})
+        self.assertEqual(got[4]["state"], "clean")
+
     def test_a_resolution_with_a_lot_behind_does_not_count(self):
         sha = _manual_resolution(self.repo, "lot/2-b", "lot/1-a")
         row = {"work_item_id": 2, "other_item_id": 1, "commit_sha": sha}
@@ -530,6 +540,14 @@ class PassTest(_Base):
                 _git(self.repo, "remote", "add", "origin", url)
                 self.assertEqual(merge_queue.source_of(self.repo), "github.com/Manaty/ameesh")
                 _git(self.repo, "remote", "remove", "origin")
+        # r6: two servers on one host, by their ports, are two sources
+        seen = []
+        for url in ("ssh://git@host:2222/team/repo.git", "ssh://git@host:2223/team/repo.git",
+                    "https://host:443/team/repo"):
+            _git(self.repo, "remote", "add", "origin", url)
+            seen.append(merge_queue.source_of(self.repo))
+            _git(self.repo, "remote", "remove", "origin")
+        self.assertEqual(seen, ["host:2222/team/repo", "host:2223/team/repo", "host/team/repo"])
 
     def test_the_stacked_trial_runs_on_the_fresh_target(self):
         """Codex #188 r4: origin's main moves to a conflicting commit while
