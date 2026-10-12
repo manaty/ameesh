@@ -1210,7 +1210,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     " (last commit seen ahead: %s)" % item["branch_head"][:12]
                     if item.get("branch_head") else ""))
             if item.get("migration"):
-                print("migration: %04d reserved (L122)" % item["migration"])
+                print("migration: %s reserved in %s (L122)" % (
+                    work.migration_layout(item, cfg).label(item["migration"]),
+                    item.get("migration_repo")))
             for mark in item["module_milestones"]:
                 print("module   : %s/%s · %s · by %s" % (
                     mark["module"], mark["kind"], mark["subject"], mark["actor"]))
@@ -1258,15 +1260,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "migration":
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
-                                          repo=args.repo, actor=args.actor)
+                                          repo=args.repo, actor=args.actor, cfg=cfg)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             elif item.get("migration") is None:
                 print("lot #%d: no migration reserved" % item["id"])
             else:
-                print("lot #%d: migration %04d reserved — file "
-                      "src/ameesh/migrations/%04d_<name>.sql" % (
-                          item["id"], item["migration"], item["migration"]))
+                print("lot #%d: migration %s reserved in %s — file %s" % (
+                    item["id"], item["migration_label"], item["migration_repo"],
+                    item.get("migration_file") or "<migrations>/%s_<name>.sql"
+                    % item["migration_label"]))
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
@@ -1993,13 +1996,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "before writing the file; idempotent, visible in work show")
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
-                        help="reserve this exact number (refused if reserved by another "
-                             "work item)")
+                        help="reserve this exact number (refused if it already exists in the "
+                             "lot's repository or is reserved by another work item)")
     pw_mig.add_argument("--release", action="store_true",
                         help="release the reservation (the work item no longer adds a migration)")
     pw_mig.add_argument("--repo", default=None,
-                        help="ameesh repository whose branches count (default: the current "
-                             "git repository)")
+                        help="local clone of the lot's repository (that of its issue), whose "
+                             "worktree and branches count (default: the clone declared in "
+                             "radar.projects, else the current git repository; its origin "
+                             "must be the lot's repository)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")

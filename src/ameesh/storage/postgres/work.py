@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+from ...db import DbError
 from .. import interface
 from . import catalog as _catalog
 
@@ -20,7 +21,7 @@ ITEM_COLUMNS = """
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
-    branch, branch_target, branch_head, migration,
+    branch, branch_target, branch_head, migration, migration_repo,
     extract(epoch from branch_head_at)::float8 as branch_head_ts,
     partial_merge, extract(epoch from partial_seen_at)::float8 as partial_seen_ts,
     estimate_minutes, estimate_source, estimate_by, change_size,
@@ -59,6 +60,8 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: #443 : essais d'une réservation automatique perdue contre une autre simultanée
+_RESERVE_ATTEMPTS = 8
 
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
@@ -584,33 +587,48 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- numéro de migration réservé (L122) ----------------------------------
-    def reserve_migration(self, item_id, number, floor, *, note, actor,
+    def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
-        ouvert, avec une ligne de journal. Sans `number` : le prochain libre,
-        au moins `floor`, calculé sous verrou consultatif (deux réservations
-        simultanées ne lisent pas le même maximum) ; l'index unique
-        `work_items_migration_idx` reste le dernier garde-fou."""
-        with self.db.transaction() as tx:
-            tx.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
-                     ("ameesh_migration_reservation:",))
-            if number is None and not release:
-                top = tx.query("SELECT coalesce(max(migration), 0) AS top FROM work_items")
-                number = max(int(floor), int(top[0]["top"]) + 1)
-            rows = tx.query(
-                "UPDATE work_items SET migration = %%s, updated_at = now()"
-                " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
-                " RETURNING %s" % ITEM_COLUMNS,
-                (None if release else int(number), int(item_id)))
-            if not rows:
-                return None
-            WorkItems(tx)._event(int(item_id), rows[0]["state"],
-                                 note % {"number": int(number or 0)}, actor)
-            return rows[0]
+        ouvert dans le dépôt `repo`, avec une ligne de journal. Sans
+        `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
+        dans l'UPDATE même ; l'index unique `work_items_migration_repo_idx`
+        tranche entre deux réservations simultanées : la perdante échoue et
+        recalcule (nouvelle transaction). Un `number` explicite déjà pris lève
+        la DbError de l'index."""
+        if release:
+            value, params = "NULL", ()
+        elif number is None:
+            value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
+                     "               WHERE migration_repo = %s))")
+            params = (int(floor), repo)
+        else:
+            value, params = "%s", (int(number),)
+        for attempt in range(_RESERVE_ATTEMPTS):
+            try:
+                with self.db.transaction() as tx:
+                    rows = tx.query(
+                        "UPDATE work_items SET migration = %s, migration_repo = %%s,"
+                        "       updated_at = now()"
+                        " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+                        " RETURNING %s" % (value, ITEM_COLUMNS),
+                        params + (None if release else repo, int(item_id)))
+                    if not rows:
+                        return None
+                    WorkItems(tx)._event(int(item_id), rows[0]["state"],
+                                         note % {"number": int(rows[0]["migration"] or 0)},
+                                         actor)
+                    return rows[0]
+            except DbError as exc:
+                if (number is not None or release or attempt == _RESERVE_ATTEMPTS - 1
+                        or "work_items_migration_repo_idx" not in str(exc)):
+                    raise
+        return None
 
-    def migration_holder(self, number) -> dict | None:
+    def migration_holder(self, number, repo) -> dict | None:
         rows = self.db.query(
-            "SELECT id, title, state FROM work_items WHERE migration = %s", (int(number),))
+            "SELECT id, title, state FROM work_items WHERE migration = %s"
+            " AND migration_repo = %s", (int(number), repo))
         return rows[0] if rows else None
 
     # -- prepared conflict resolutions (L160d, 0057) ---------------------------

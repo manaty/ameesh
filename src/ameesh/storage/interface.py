@@ -1009,17 +1009,20 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
-    def reserve_migration(self, item_id: int, number: int | None, floor: int, *,
-                          note: str, actor: str, release: bool = False) -> dict | None:
-        """L122 : réserve un numéro de migration au lot ouvert (journalisé) :
-        `number` s'il est donné, sinon le prochain libre, au moins `floor`
-        et au-delà des numéros déjà réservés, sous verrou. `note` peut citer `%(number)04d`. None si le
-        lot n'est plus ouvert ; DbError si le numéro est pris par un autre.
+    def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
+                          floor: int, *, note: str, actor: str,
+                          release: bool = False) -> dict | None:
+        """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
+        ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
+        de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
+        l'index unique : deux réservations simultanées ne prennent jamais le
+        même numéro. `note` peut citer `%(number)04d`. None si le lot n'est
+        plus ouvert ; DbError si `number` est pris par un autre lot.
         `release` libère la réservation."""
 
     @abc.abstractmethod
-    def migration_holder(self, number: int) -> dict | None:
-        """L122 : le lot (id, titre, état) qui a réservé ce numéro."""
+    def migration_holder(self, number: int, repo: str) -> dict | None:
+        """L122 : le lot (id, titre, état) qui a réservé ce numéro du dépôt."""
 
     @abc.abstractmethod
     def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,

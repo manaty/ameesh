@@ -297,14 +297,43 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
 # numéro de migration réservé (L122)
 # --------------------------------------------------------------------------
 
+#: le dépôt d'un lot, lu dans son issue : `owner/repo#N`
+_ISSUE_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[0-9]+$")
+
+
+def lot_repository(item: dict, cfg=None) -> str:
+    """#443 : le dépôt `owner/repo` d'un lot, celui de son issue, sinon celui
+    que la configuration de l'hôte donne à son projet (`github.projects`)."""
+    match = _ISSUE_REPO_RE.match((item.get("issue_ref") or "").strip())
+    if match:
+        return match.group(1)
+    if cfg is not None and (item.get("app") or "").strip():
+        from . import plan_github
+
+        try:
+            repo = plan_github.settings_of(cfg).repo_for(item["app"])
+        except plan_github.SettingsError:
+            repo = None
+        if repo:
+            return repo
+    raise WorkError("lot #%s has no repository: link its issue first "
+                    "(`ameesh work link %s owner/repo#N`)" % (item["id"], item["id"]))
+
+
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
-                      actor: str = "") -> dict:
-    """L122 : réserve au lot le numéro de sa migration, avant d'écrire le
-    fichier. Sans `number` : le prochain libre, au-delà des migrations connues
-    (paquet, dépôt courant et ses branches, voir `migrations.highest_known`)
-    et des numéros déjà réservés par d'autres lots. Un lot qui a déjà sa
-    réservation la garde (idempotent). `release` la libère. Rend le lot."""
+                      actor: str = "", cfg=None) -> dict:
+    """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
+    le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
+    numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
+    `repo` : un clone local de ce dépôt (défaut : celui que l'hôte déclare,
+    sinon le dépôt git courant) ; son `origin` doit être le dépôt du lot.
+    Sans `number` : le prochain libre, au-delà des numéros du dépôt (arbre,
+    toutes ses branches) et de ceux déjà réservés pour ce dépôt. `number` est
+    refusé s'il existe déjà dans le dépôt ou s'il est réservé par un autre lot
+    (index unique (dépôt, numéro) : la base tranche, même entre deux
+    réservations simultanées). Un lot qui a déjà sa réservation la garde
+    (idempotent). `release` la libère. Rend le lot, avec `migration_file`."""
     from . import migrations
 
     item = get(db, item_id)
@@ -316,28 +345,82 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     if release:
         if current is None:
             return item
-        note, number = "migration %04d released" % current, None
-    elif number is None:
-        if current is not None:
-            return item
-        note = "migration %(number)04d reserved"
+        layout = migration_layout(item, cfg)
+        row = storage.of(db).work.reserve_migration(
+            item_id, item.get("migration_repo"), None, 0, actor=actor, release=True,
+            note="migration %s released (%s)" % (layout.label(current), layout.repo))
+        if row is None:
+            raise WorkError("lot %s is no longer open: no reservation" % item_id)
+        return row
+    if number is not None and not 1 <= int(number) <= 9999:
+        raise WorkError("migration number outside 0001-9999: %s" % number)
+    if current is not None and (number is None or current == int(number)):
+        return _with_file(item, cfg)
+    slug = lot_repository(item, cfg)
+    layout = migrations.layout_for(slug, cfg)
+    if layout is None:
+        raise WorkError("repository %s: migrations directory unknown (declare it in the host "
+                        "configuration: radar.projects.<project> with github %s and "
+                        "migrations <dir>)" % (slug, slug))
+    checkout = _checkout(slug, repo, cfg)
+    present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"))
+    if number is None:
+        floor = max(present or [0]) + 1
+        note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
     else:
-        if not 1 <= int(number) <= 9999:
-            raise WorkError("migration number outside 0001-9999: %s" % number)
-        if current == int(number):
-            return item
-        holder = storage.of(db).work.migration_holder(int(number))
-        if holder is not None:
-            raise WorkError("migration %04d already reserved by lot #%s (%s)" % (
-                int(number), holder["id"], holder["title"]))
-        note = "migration %%(number)04d reserved (before: %s)" % (
-            "%04d" % current if current is not None else "none")
-    floor = migrations.highest_known(repo) + 1 if number is None and not release else 0
-    row = storage.of(db).work.reserve_migration(item_id, number, floor, note=note,
-                                                actor=actor, release=release)
+        number = int(number)
+        if number in present:
+            raise WorkError("migration %s already in %s (%s): choose another number" % (
+                layout.label(number), slug, ", ".join(sorted(present[number])[:3])))
+        floor = 0
+        note = "migration %s reserved (%s; before: %s)" % (
+            layout.label(number), slug,
+            layout.label(current) if current is not None else "none")
+    try:
+        row = storage.of(db).work.reserve_migration(item_id, slug, number, floor, note=note,
+                                                    actor=actor)
+    except DbError as exc:
+        if number is None or "work_items_migration_repo_idx" not in str(exc):
+            raise
+        holder = storage.of(db).work.migration_holder(number, slug)
+        raise WorkError("migration %s of %s already reserved by lot #%s (%s)" % (
+            layout.label(number), slug, holder["id"] if holder else "?",
+            holder["title"] if holder else "concurrent reservation")) from exc
     if row is None:
         raise WorkError("lot %s is no longer open: no reservation" % item_id)
-    return row
+    return _with_file(row, cfg)
+
+
+def migration_layout(item: dict, cfg=None):
+    """La disposition des migrations du dépôt réservé (défaut : 4 chiffres)."""
+    from . import migrations
+
+    slug = item.get("migration_repo") or ""
+    return migrations.layout_for(slug, cfg) or migrations.Layout(slug, "", 4)
+
+
+def _with_file(item: dict, cfg=None) -> dict:
+    if item.get("migration") is None:
+        return item
+    layout = migration_layout(item, cfg)
+    return dict(item, migration_label=layout.label(item["migration"]),
+                migration_file=layout.file(item["migration"]) if layout.directory else None)
+
+
+def _checkout(slug: str, path: str | None, cfg=None) -> str:
+    """Le clone local du dépôt `slug` à lire, vérifié par son `origin`."""
+    from . import migrations
+
+    where = path or migrations.checkout_for(slug, cfg) or os.getcwd()
+    top = migrations.toplevel(where)
+    if not top:
+        raise WorkError("%s is not a git repository: pass --repo <clone of %s>" % (where, slug))
+    origin = migrations.origin_repo(top)
+    if (origin or "").casefold() != slug.casefold():
+        raise WorkError("%s is a clone of %s, not of %s (the lot's repository): "
+                        "pass --repo <clone of %s>" % (top, origin or "no GitHub origin",
+                                                       slug, slug))
+    return top
 
 
 def open_lots(db: Db, assignee: str) -> list[dict]:
