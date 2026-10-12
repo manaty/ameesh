@@ -607,6 +607,12 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
 DOUBT_RETRIES = 5
 DOUBT_RETRY_S = 0.1
 
+#: L63b: `(sd-pam)` is forked by the user's service manager during PAM
+#: setup, before any unit: 30 ms after it on the reference host, the first
+#: user service 440 ms. Exempt only within this delay of the manager's own
+#: start (start times from /proc/<pid>/stat, which no process can change)
+SD_PAM_DELAY_S = 0.25
+
 #: L63b, off Linux: system executables no user can write (SIP), e.g. macOS's
 #: ContextStoreAgent, which runs as the user and denies its open files. Not
 #: /usr/bin: a harness can run under Apple's python.
@@ -636,9 +642,10 @@ def service_managers(uid: int | None = None) -> frozenset:
     whose open files are never readable. Told by PID, never by name or
     command line, which any process can borrow (review #377 r2): the
     MainPID of user@<uid>.service, asked of PID 1 (`systemctl`), and its
-    earliest-started child named `(sd-pam)`, forked during PAM setup before
-    any unit (no user process can start before it). Empty without systemd
-    or /proc."""
+    earliest-started direct child if it is named `(sd-pam)` AND started
+    within `SD_PAM_DELAY_S` of the manager (r3: if the real helper is gone,
+    a later child taking its name is not exempt). Empty without systemd or
+    /proc."""
     import subprocess
     uid = os.getuid() if uid is None else uid
     if not _proc_ok():
@@ -653,6 +660,11 @@ def service_managers(uid: int | None = None) -> frozenset:
     if done.returncode != 0 or not main.isdigit() or int(main) <= 1:
         return frozenset()
     main = int(main)
+    try:
+        fields = _stat_fields(main)
+        main_start = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return frozenset({main})
     first = None
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
@@ -668,7 +680,11 @@ def service_managers(uid: int | None = None) -> frozenset:
             if first is None or start < first[0]:
                 first = (start, int(pid))
     out = {main}
-    if first is not None and \
+    try:
+        tick = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError, AttributeError):
+        tick = 100
+    if first is not None and first[0] - main_start <= SD_PAM_DELAY_S * tick and \
             _read_text(os.path.join(PROC, str(first[1]), "comm")).strip() == "(sd-pam)":
         out.add(first[1])
     return frozenset(out)
