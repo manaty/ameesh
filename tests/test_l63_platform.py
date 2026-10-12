@@ -8,6 +8,7 @@ installé) et par le repli /proc (psutil retiré).
 from __future__ import annotations
 
 import ast
+import io
 import os
 import subprocess
 import sys
@@ -233,12 +234,13 @@ class PlatformTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 class AdoptFailClosedTest(PgTestCase):
-    """Sans moyen de vérifier qu'une session est fermée, `adopt` refuse ;
-    `--force` passe, mais l'avertissement va au fil (journalisé)."""
+    """Sans moyen de vérifier qu'une session est fermée, `adopt` refuse, même
+    avec `--force` (L63b, décision du propriétaire #9413 b). `--force` sur une
+    session que l'hôte voit ouverte reste possible, journalisé."""
 
-    def test_adopt_refuse_puis_force_journalise(self):
+    def _session(self):
         import dataclasses
-        from ameesh import registry, reprise
+        from ameesh import registry
         from .test_l39_adoption_reprise import SID, _rollout
         comptes_dir = os.path.join(self.tmp, "comptes", "codex-1")
         os.makedirs(comptes_dir, mode=0o700)
@@ -250,25 +252,62 @@ class AdoptFailClosedTest(PgTestCase):
         cfg = dataclasses.replace(
             self.cfg, accounts={"codex": [{"name": "primaire", "path": comptes_dir}]})
         registry.upsert(self.db, "coord", harness="codex", host=cfg.host, mode="externe")
-        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
-        with mock.patch.object(platform, "holders", side_effect=muet):
-            with self.assertRaises(reprise.RepriseError) as ctx:
-                reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex")
-            self.assertIn("cannot check", str(ctx.exception))
-            self.assertEqual(registry.get(self.db, "coord")["mode"], "externe")
-            avert: list[str] = []
-            out = reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex",
-                                force=True, warn=avert.append)
-        self.assertTrue(out["forced"])
-        self.assertTrue(any("without checking" in a for a in avert))
-        self.assertTrue(any("without checking" in n for n in out["notes"]))
+        return cfg, SID
+
+    def _fil(self) -> str:
         texte = []
         for racine, _d, fichiers in os.walk(self.cfg.threads_root):
             for nom in fichiers:
                 with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as fh:
                     texte.append(fh.read())
-        self.assertIn("without checking that it is closed", "\n".join(texte))
+        return "\n".join(texte)
+
+    def test_adopt_refuse_meme_avec_force(self):
+        from ameesh import registry, reprise
+        cfg, sid = self._session()
+        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
+        for force in (False, True):
+            with self.subTest(force=force):
+                avert: list[str] = []
+                with mock.patch.object(platform, "holders", side_effect=muet):
+                    with self.assertRaises(reprise.RepriseError) as ctx:
+                        reprise.adopt(cfg, self.db, "coord", session_id=sid,
+                                      harness="codex", force=force, warn=avert.append)
+                self.assertIn("cannot check", str(ctx.exception))
+                self.assertIn("with or without --force", str(ctx.exception))
+                self.assertEqual(avert, [])
+                row = registry.get(self.db, "coord")
+                self.assertEqual(row["mode"], "externe")
+                self.assertNotEqual(row.get("session_id"), sid)
+        self.assertNotIn("without checking", self._fil())
+
+    def test_force_sur_une_session_vue_ouverte_reste_journalise(self):
+        from ameesh import registry, reprise
+        cfg, sid = self._session()
+        tenant = [{"pid": 4242, "why": "open file", "cmd": "codex"}]
+        with mock.patch.object(platform, "holders", return_value=tenant):
+            with self.assertRaises(reprise.RepriseError) as ctx:
+                reprise.adopt(cfg, self.db, "coord", session_id=sid, harness="codex")
+            self.assertIn("still open", str(ctx.exception))
+            avert: list[str] = []
+            out = reprise.adopt(cfg, self.db, "coord", session_id=sid, harness="codex",
+                                force=True, warn=avert.append)
+        self.assertTrue(out["forced"])
+        self.assertTrue(any("while it is still open" in a for a in avert))
+        self.assertIn("while it is still open", self._fil())
         self.assertEqual(registry.get(self.db, "coord")["mode"], "execute")
+
+    def test_cli_force_ne_contourne_pas(self):
+        from ameesh import reprise
+        cfg, sid = self._session()
+        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
+        sortie = io.StringIO()
+        with mock.patch.object(platform, "holders", side_effect=muet), \
+                mock.patch("sys.stderr", sortie):
+            code = reprise.cmd_adopt(cfg, reprise.build_parser().parse_args(
+                ["adopt", "coord", "--session", sid, "--harness", "codex", "--force"]))
+        self.assertNotEqual(code, 0)
+        self.assertIn("with or without --force", sortie.getvalue())
 
 
 # --------------------------------------------------------------------------

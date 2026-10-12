@@ -625,7 +625,8 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
 
     Refus (`RepriseError`) : nom, harnais ou id invalide ; agent épinglé à un
     autre hôte ; bail vivant ; session introuvable sous les comptes de l'hôte ;
-    session encore ouverte (sauf `force`, journalisé).
+    session encore ouverte (sauf `force`, journalisé) ; session dont cet hôte
+    ne peut pas vérifier qu'elle est fermée (L63b : même avec `force`).
     """
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
@@ -678,22 +679,16 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                    "in the host configuration, or set its CODEX_HOME / "
                    "CLAUDE_CONFIG_DIR / DSH_HOME variable)"))
     # L63 : si l'OS ne permet pas de vérifier que la session est fermée,
-    # refus (fail-closed), sauf --force — journalisé comme un forçage
-    unverified = ""
+    # refus (fail-closed). L63b (owner, decision #9413 b): no bypass, not even
+    # --force — the open session is one of the guarantees without one
     try:
         tenants = holders(path, session_id) if path else []
     except platform.NotAvailable as exc:
-        tenants, unverified = [], str(exc)
-    if unverified and not force:
         raise RepriseError(
-            "cannot check that session %s is closed on this host (%s): "
-            "adoption refused (or --force, at your own risk: if it is still open, "
-            "two harnesses would write the same session)" % (session_id, unverified))
-    if unverified:
-        avert = ("--force: session %s adopted without checking that it is closed (%s)"
-                 % (session_id, unverified))
-        warn(avert)
-        constats.append(avert)
+            "cannot check that session %s is closed on this host (%s): adoption "
+            "refused, with or without --force (if it is still open, two harnesses "
+            "would write the same session); close the session, then adopt it from "
+            "a host that can check it" % (session_id, exc)) from None
     if tenants and not force:
         raise RepriseError(
             "session %s is still open (%s): close the interactive session first "
@@ -771,10 +766,10 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                        "".join("\n- %s" % c for c in constats)),
                project=_project(cfg, after),
                meta={"audit": "adopt", "session": session_id, "account": compte or "",
-                     "harness": harness, "forced": bool(tenants or unverified),
+                     "harness": harness, "forced": bool(tenants),
                      "previous_session": result.get("previous_session") or ""})
     return {"agent": name, "session": session_id, "harness": harness, "account": compte,
-            "path": path, "cwd": effectif, "forced": bool(tenants or unverified),
+            "path": path, "cwd": effectif, "forced": bool(tenants),
             "wakeable": ok,
             "previous_session": result.get("previous_session"),
             "previous_mode": result.get("previous_mode"), "notes": constats}
@@ -1065,8 +1060,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="first instruction under the runner (default: standard resume)")
     p_ad.add_argument("--chantier", default=None, help="workspace (new agent)")
     p_ad.add_argument("--force", action="store_true",
-                      help="adopt even if a process still holds the session, or if "
-                           "this host cannot check it (logged)")
+                      help="adopt even if a process still holds the session (logged); "
+                           "never when this host cannot check it (L63b)")
     p_ad.add_argument("--json", action="store_true")
     p_ad.set_defaults(func=cmd_adopt)
 
