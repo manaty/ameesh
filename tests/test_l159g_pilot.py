@@ -92,12 +92,42 @@ class UnitsTest(unittest.TestCase):
 
 class InstallPilotTest(unittest.TestCase):
     """deploy/guest/install-pilot.sh: what the owner runs on the host (dry
-    runs only: nothing is installed by the tests)."""
+    runs only: nothing is installed by the tests). Every dry run sees a host
+    of its own (PILOT_TEST_HOST): never the real /etc/ameesh, the real
+    ameesh-guest user, mounts or systemd units, whatever this machine has."""
     SCRIPT = os.path.join(GUEST, "install-pilot.sh")
 
-    def dry(self, *args, stdin=None):
-        return subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", *args],
-                              capture_output=True, text=True, input=stdin)
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.host = os.path.realpath(tmp.name)
+        for d in ("etc", "proc/self", "opt", "srv", "run"):
+            os.makedirs(os.path.join(self.host, d))
+        with open(os.path.join(self.host, "etc", "passwd"), "w", encoding="utf-8") as fh:
+            fh.write("root:x:0:0:root:/root:/bin/bash\n")
+        # "/" only: /srv/ameesh-guest is not a mount point
+        self.mountinfo(os.path.join(self.host, "proc", "self"))
+
+    def env(self, **extra):
+        return dict(os.environ, PILOT_TEST_HOST=self.host, **extra)
+
+    def run_script(self, *args, stdin=None, **extra):
+        return subprocess.run(["bash", self.SCRIPT, "--dry-run", *args], capture_output=True,
+                              text=True, input=stdin, env=self.env(**extra))
+
+    def dry(self, *args, stdin=None, **extra):
+        return self.run_script("--host", "vm-test", *args, stdin=stdin, **extra)
+
+    def on_host(self, path, content=None):
+        """PATH made in the test's host: a directory, or a file with CONTENT."""
+        full = self.host + path
+        if content is None:
+            os.makedirs(full, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return full
 
     def test_guard_unit(self):
         u = unit("ameesh-guard.service")
@@ -132,6 +162,33 @@ class InstallPilotTest(unittest.TestCase):
                         out.index("systemctl enable --now ameesh-guard.service"))
         # no guest runner is started by the install
         self.assertNotIn("+ systemctl enable --now ameesh-guest-runner@", out)
+
+    def test_the_dry_run_reads_the_test_host_only(self):
+        # mesh-design #436: the tests never read the machine they run on
+        # (its /etc/ameesh, its ameesh-guest user, its mounts, its units)
+        out = self.dry().stdout
+        self.assertIn("+ useradd --system", out)
+        self.assertIn("warning: /srv/ameesh-guest is not a mount point", out)
+        self.assertIn("+ record 'secret /etc/ameesh/guest.env'", out)
+        self.assertIn("+ record 'guest-dir /srv/ameesh-guest'", out)
+        # the same test host, with the user, a secrets file, the volume
+        # mounted and an enforcing guard installed: seen there, not elsewhere
+        with open(os.path.join(self.host, "etc", "passwd"), "a", encoding="utf-8") as fh:
+            fh.write("ameesh-guest:x:998:998::/srv/ameesh-guest/home:/bin/bash\n")
+        self.on_host("/etc/ameesh/guest.env", "AMEESH_DSN=x\n")
+        self.on_host("/etc/ameesh/guard.env", "AMEESH_GUARD_ARGS=\n")
+        self.on_host("/srv/ameesh-guest/home")
+        self.mountinfo(os.path.join(self.host, "proc", "self"), "/srv/ameesh-guest")
+        res = self.dry()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn("user ameesh-guest exists: kept as is", out)
+        self.assertNotIn("useradd", out)
+        self.assertNotIn("not a mount point", out)
+        self.assertIn("kept /etc/ameesh/guest.env", out)
+        self.assertNotIn("guest-dir /srv/ameesh-guest'", out)
+        self.assertNotIn("guest-tree /srv/ameesh-guest/home'", out)
+        self.assertIn("AMEESH_GUARD_ARGS=\n", out)     # the installed mode kept
 
     def test_an_invalid_offer_is_refused(self):
         res = self.dry("--allow-rootfs", "--lend", "/dev/stdin", stdin='{"cpu_max": 2}')
@@ -224,9 +281,9 @@ class InstallPilotTest(unittest.TestCase):
                 rec = out.index("record 'guest-tree %s/%s'" % (root, d))
                 self.assertLess(rec, out.index("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/%s"
                                                % (root, d)))
-            if not os.path.isdir("/opt/ameesh/venv"):
-                self.assertLess(out.index("record 'venv-tree /opt/ameesh/venv'"),
-                                out.index("python3 -m venv /opt/ameesh/venv"))
+            # the test's host has no /opt/ameesh/venv
+            self.assertLess(out.index("record 'venv-tree /opt/ameesh/venv'"),
+                            out.index("python3 -m venv /opt/ameesh/venv"))
 
     def test_purge_removes_only_the_recorded_paths(self):
         # codex #383 r1 P1: the absolute paths recorded, never /home, /tmp,
@@ -241,10 +298,8 @@ class InstallPilotTest(unittest.TestCase):
                          "guest-tree /tmp\nguest-tree %s/gone\nroot-content\n"
                          "secret /etc/ameesh/guest-deepseek5.env\nsecret /etc/passwd\n"
                          % (made, made, made))
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge",
-                                  "--root", "/srv/elsewhere"],
-                                 capture_output=True, text=True,
-                                 env=dict(os.environ, PILOT_TEST_STATE=state))
+            res = self.run_script("--uninstall", "--purge", "--root", "/srv/elsewhere",
+                                  PILOT_TEST_STATE=state)
             self.assertEqual(res.returncode, 0, res.stderr)
             out = res.stdout
             removed = [l for l in out.splitlines() if l.startswith("+ rm") and made in l]
@@ -292,14 +347,17 @@ class InstallPilotTest(unittest.TestCase):
 
     def test_a_volume_bigger_than_disk_max_is_refused(self):
         # codex #383 r2 P2: nothing but the volume's size holds disk_max
-        if not os.path.ismount("/dev/shm"):
-            self.skipTest("no /dev/shm mount")
+        if not os.path.isdir("/dev/shm"):
+            self.skipTest("no /dev/shm")
         lend = json.dumps({"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB"})
-        res = self.dry("--root", "/dev/shm", "--lend", "/dev/stdin", stdin=lend)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("refused for real", res.stderr)
-        res = self.dry("--root", "/dev/shm", "--accept-larger-volume", "--lend", "/dev/stdin",
-                       stdin=lend)
+        with tempfile.TemporaryDirectory() as tmp:
+            info = self.mountinfo(tmp, "/dev/shm")
+            res = self.dry("--root", "/dev/shm", "--lend", "/dev/stdin", stdin=lend,
+                           PILOT_TEST_MOUNTINFO=info)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("refused for real", res.stderr)
+            res = self.dry("--root", "/dev/shm", "--accept-larger-volume", "--lend",
+                           "/dev/stdin", stdin=lend, PILOT_TEST_MOUNTINFO=info)
         self.assertNotIn("refused", res.stderr)
         self.assertIn("(accepted)", res.stderr)
 
@@ -337,10 +395,8 @@ class InstallPilotTest(unittest.TestCase):
             state = os.path.join(tmp, "state")
             with open(state, "w", encoding="utf-8") as fh:
                 fh.write("guest-tree %s\nguest-tree %s\n" % (work, linked))
-            env = dict(os.environ, PILOT_TEST_STATE=state,
-                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, work + "/shared"))
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
-                                 capture_output=True, text=True, env=env)
+            res = self.run_script("--uninstall", "--purge", PILOT_TEST_STATE=state,
+                                  PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, work + "/shared"))
             self.assertEqual(res.returncode, 0, res.stderr)
             out = res.stdout
             self.assertNotIn("rm -rf --one-file-system %s" % work, out)
@@ -360,20 +416,16 @@ class InstallPilotTest(unittest.TestCase):
             state = os.path.join(tmp, "state")
             with open(state, "w", encoding="utf-8") as fh:
                 fh.write("venv-tree %s\n" % venv)
-            env = dict(os.environ, PILOT_TEST_STATE=state, PILOT_TEST_VENV=venv,
+            env = dict(PILOT_TEST_STATE=state, PILOT_TEST_VENV=venv,
                        PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, venv + "/share"))
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test",
-                                  "--allow-rootfs", "--root", os.path.join(tmp, "guest")],
-                                 capture_output=True, text=True, env=env)
+            res = self.dry("--allow-rootfs", "--root", os.path.join(tmp, "guest"), **env)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("kept %s: a mount point is there or beneath" % venv, res.stdout)
             self.assertIn("%s not made again" % venv, res.stderr)
             self.assertNotIn("rm -rf", res.stdout)
             # without the bind: removed, then made again
             env["PILOT_TEST_MOUNTINFO"] = self.mountinfo(tmp)
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test",
-                                  "--allow-rootfs", "--root", os.path.join(tmp, "guest")],
-                                 capture_output=True, text=True, env=env)
+            res = self.dry("--allow-rootfs", "--root", os.path.join(tmp, "guest"), **env)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertLess(res.stdout.index("+ rm -rf --one-file-system %s\n" % venv),
                             res.stdout.index("+ python3 -m venv %s" % venv))
@@ -390,18 +442,15 @@ class InstallPilotTest(unittest.TestCase):
             state = os.path.join(tmp, "state")
             with open(state, "w", encoding="utf-8") as fh:
                 fh.write("user\n")
-            env = dict(os.environ, PILOT_TEST_STATE=state, PILOT_TEST_FAIL="userdel",
-                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp))
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
-                                 capture_output=True, text=True, env=env)
+            env = dict(PILOT_TEST_STATE=state, PILOT_TEST_FAIL="userdel")
+            res = self.run_script("--uninstall", "--purge", **env)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn("+ userdel ameesh-guest", res.stdout)
             self.assertIn("kept user ameesh-guest: userdel failed", res.stdout)
             self.assertIn("kept in %s: user" % state, res.stdout)
             self.assertNotIn("+ rm -f %s" % state, res.stdout)
             env.pop("PILOT_TEST_FAIL")
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
-                                 capture_output=True, text=True, env=env)
+            res = self.run_script("--uninstall", "--purge", **env)
             self.assertIn("+ rm -f %s" % state, res.stdout)
 
     def test_a_bind_mounted_root_is_held_to_disk_max(self):
@@ -412,10 +461,9 @@ class InstallPilotTest(unittest.TestCase):
             tmp = os.path.realpath(tmp)
             root = os.path.join(tmp, "pilot")
             os.makedirs(root)
-            env = dict(os.environ, PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, root))
-            run = lambda *a: subprocess.run(
-                ["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", "--root", root,
-                 "--lend", "/dev/stdin", *a], capture_output=True, text=True, input=lend, env=env)
+            env = dict(PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, root))
+            run = lambda *a: self.dry("--root", root, "--lend", "/dev/stdin", *a,
+                                      stdin=lend, **env)
             res = run()
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertNotIn("not a mount point", res.stdout)
@@ -464,8 +512,7 @@ class InstallPilotTest(unittest.TestCase):
             args = [a for a in args if a != "--dry-run"]
             if "--host" not in args:
                 args = ["--host", "vm-test", *args]   # --enable takes the rest
-            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", *args],
-                                 capture_output=True, text=True)
+            res = self.run_script(*args)
             if "--check" in args:   # read only: it fails here, nothing being installed
                 self.assertNotIn("install-pilot.sh:", res.stderr, args)
             else:

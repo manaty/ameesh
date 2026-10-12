@@ -33,7 +33,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
-  agent-mesh menage [--dry-run | --apply] [--json]       agent cleanup (L73)
+  agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
@@ -640,10 +640,16 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
     return ci.cmd_ci(cfg, args)
 
 
+def cmd_housekeeping(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh housekeeping` (L73, L148) : voir `ameesh.housekeeping.cmd_housekeeping`."""
+    from . import housekeeping
+    return housekeeping.cmd_housekeeping(cfg, args)
+
+
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
-    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
-    from . import menage
-    return menage.cmd_menage(cfg, args)
+    """`ameesh menage` (L73), déprécié (L148) : alias caché de `housekeeping`."""
+    sys.stderr.write("menage is deprecated, use housekeeping\n")
+    return cmd_housekeeping(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -1592,10 +1598,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
 #: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
-#: interactive sessions (`ameesh attach`), also local
+#: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
+#: (rule 1, the runner's wake on an actionable lot), in the database
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode")
+            "permission_mode", "lot_wake")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1684,13 +1691,16 @@ def cmd_set(cfg: Config, args) -> int:
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
-                      "permission_mode=auto|acceptEdits|…"
+                      "permission_mode=auto|acceptEdits|… lot_wake=on|off"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
             if cle == "mode" and valeur and valeur not in registry.MODES:
                 print("invalid mode: %r (%s)" % (valeur, " | ".join(registry.MODES)),
                       file=sys.stderr)
+                return 2
+            if cle == "lot_wake" and valeur and valeur not in ("on", "off"):
+                print("invalid lot_wake: %r (on | off)" % valeur, file=sys.stderr)
                 return 2
             if cle == "session_policy" and valeur and valeur not in SESSION_POLICIES:
                 print("invalid session_policy: %r (%s)"
@@ -1792,12 +1802,13 @@ def cmd_set(cfg: Config, args) -> int:
             regroupement, secondes = "", int(cfg.mail_batch)
         regroupement_txt = ("immediate" if secondes == 0 else "%ds" % secondes) + (
             "" if regroupement else " (default)")
+        reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
         print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
-              "(takes effect at the next turn)"
+              "lot_wake=%s (takes effect at the next turn)"
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
-                 grace_txt, regroupement_txt))
+                 grace_txt, regroupement_txt, reveil_txt))
         for local in ("mail_batch", "permission_mode"):
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
                 print("warning: %s is read from the local state of the agent's host "
@@ -1918,6 +1929,13 @@ def cmd_models_discover(cfg, args) -> int:
     return 1 if failures and not getattr(args, "dry_run", False) else 0
 
 
+#: L148 : commandes encore acceptées pour la transition mais absentes de
+#: l'aide (`menage` → `housekeeping`), retirées au stage 7. argparse affiche
+#: les choix en clair dans la ligne d'usage : `build_parser` lui donne la
+#: liste visible par `metavar`.
+HIDDEN_COMMANDS = frozenset({"menage"})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-mesh", description=__doc__,
@@ -1945,8 +1963,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="window of --report, in days (default 7)")
     p_hosts.set_defaults(func=cmd_hosts)
 
-    p_menage = sub.add_parser(
-        "menage", help="cleanup of what agents create (L73); dry run by default")
+    p_housekeeping = sub.add_parser(
+        "housekeeping", help="cleanup of what agents create (L73); dry run by default")
+    mode = p_housekeeping.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="show only (default): nothing is removed")
+    mode.add_argument("--apply", action="store_true",
+                      help="apply (human or runner only, never an agent "
+                           "session)")
+    p_housekeeping.add_argument("--by", default="", help="who triggers it (log), e.g. human:alice")
+    p_housekeeping.add_argument("--json", action="store_true", help="`ameesh-menage/1` report")
+    p_housekeeping.set_defaults(func=cmd_housekeeping)
+
+    # L148 : `ameesh menage` reste accepté (une ligne sur stderr) ; sans
+    # `help=`, il ne figure pas dans la liste des commandes.
+    p_menage = sub.add_parser("menage")
     mode = p_menage.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="show only (default): nothing is removed")
@@ -2301,6 +2332,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="key=value",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "lot_wake=on|off "
                             "context_max_tokens=15M|0 "
                             "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
                             "turn_grace_seconds=20m|0 "
@@ -2349,6 +2381,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="files changed since REF (ref..HEAD + working tree)")
     canon_cli._canon_options(p_review)
     p_review.set_defaults(func=cmd_review_class)
+
+    # L148 : la ligne d'usage liste les sous-commandes en clair, y compris
+    # celles cachées ; on lui donne la liste visible (retirée au stage 7).
+    sub.metavar = "{%s}" % ",".join(
+        name for name in sub.choices if name not in HIDDEN_COMMANDS)
     return parser
 
 

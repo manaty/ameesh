@@ -99,6 +99,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    open_lots_activity turns record_gauges gauge_history
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
+   lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
    watches         put delete list deliver
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
@@ -221,9 +222,12 @@ class Agents(Domain):
         """Note l'instant du dernier réveil d'événements."""
 
     @abc.abstractmethod
-    def set_session(self, name: str, session_id: str, account: str | None = None) -> None:
+    def set_session(self, name: str, session_id: str, account: str | None = None, *,
+                    harness: str | None = None, cwd: str | None = None) -> None:
         """Enregistre la session du harnais et le compte sous lequel elle tourne
-        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré)."""
+        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré).
+        #408 : `harness`/`cwd` donnés, ceux de son ouverture (`session_origin`
+        = la session) ; sinon son origine est inconnue."""
 
     @abc.abstractmethod
     def set_session_account(self, name: str, account: str | None) -> bool:
@@ -669,7 +673,7 @@ class Credentials(Domain):
                fingerprint: str | None = None,
                expect_failures: int | None = None) -> dict:
         """Records `state` (healthy | failing | unknown) from `source`
-        (sentinel | turn | manual); `failing_since` is kept while failing and
+        (sentinel | turn | manual | relay); `failing_since` is kept while failing and
         cleared otherwise; `expires_at` (epoch, None = unknown) is the
         credential's forecast expiry, overwritten on each report. A `failing`
         report stamps `last_failure_at`, stores `fingerprint` (of the
@@ -2088,7 +2092,7 @@ class Operations(Domain):
 
     #: colonnes réglables par `set_settings` (liste fermée)
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
-                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds")
+                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "lot_wake")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds")
@@ -2250,6 +2254,53 @@ class Operations(Domain):
 # --------------------------------------------------------------------------
 # ressources des hôtes (lot L31, décision 0028, migration 0029)
 # --------------------------------------------------------------------------
+
+class HostLifecycle(Domain):
+    """Durable withdrawal and return intent for admitted hosts (L232e)."""
+
+    @abc.abstractmethod
+    def get(self, host: str) -> dict | None:
+        """Current host mode/generation and scheduled return."""
+
+    @abc.abstractmethod
+    def listing(self) -> list[dict]:
+        """Persistent host controls, including withdrawn hosts."""
+
+    @abc.abstractmethod
+    def drain(self, host: str, *, actor: str, duration: int | None = None,
+              critical: Sequence[str] = ()) -> dict:
+        """Close claims/enable atomically and retain agents' original host."""
+
+    @abc.abstractmethod
+    def undrain(self, host: str, *, actor: str) -> dict | None:
+        """Request agents' return; retained origin rows survive this request."""
+
+    @abc.abstractmethod
+    def agents(self, host: str, generation: int) -> list[dict]:
+        """Agent origins ordered critical first, with progress/refusals."""
+
+    @abc.abstractmethod
+    def demand(self, agent: str, current_host: str) -> dict | None:
+        """Current withdrawal or return request applicable to this agent."""
+
+    @abc.abstractmethod
+    def progress(self, host: str, generation: int, agent: str, *, operation: str | None,
+                 missing: Sequence[str]) -> bool:
+        """CAS progress against the current host generation."""
+
+    @abc.abstractmethod
+    def expire_returns(self) -> list[dict]:
+        """Convert elapsed planned withdrawals to durable return requests."""
+
+    @abc.abstractmethod
+    def complete_return(self, host: str, generation: int) -> bool:
+        """Finish a return only when all remaining origins are home and unfenced."""
+
+    @abc.abstractmethod
+    def detect_losses(self, *, actor: str, older_than: int,
+                      critical: Sequence[str] = ()) -> list[dict]:
+        """Close stale known hosts atomically; loss is not a quiescence proof."""
+
 
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
@@ -2553,6 +2604,68 @@ class SessionBindings(Domain):
 
 
 # --------------------------------------------------------------------------
+# sessions mises de côté par lot et réveils sur lot actionnable (L165b, #408)
+# --------------------------------------------------------------------------
+
+class LotSessions(Domain):
+    """Une ligne par (agent, lot) : la session mise de côté pour ce lot
+    (`session_id` et le harnais, le compte et le dossier sous lesquels seuls
+    elle se reprend), et les réveils de l'exécuteur sur ce lot (règle 1).
+    La session ACTIVE reste au registre (`session_id`, `session_work_item`)."""
+
+    #: lots que la règle 1 reprend
+    ACTIONABLE_STATES = ("intake", "build")
+    #: note de lot qui retient le réveil (`ameesh work note N "hold: …"`)
+    HOLD_PREFIX = "hold:"
+
+    @abc.abstractmethod
+    def switch(self, name: str, owner: str, epoch: int, *, to_lot: str,
+               harness: str | None, account: str | None, cwd: str | None,
+               current: str | None = None) -> dict | None:
+        """Change le lot de la session active, **fencé par le bail**, en une
+        transaction : la session active `current` est mise de côté pour le lot
+        de session noté au registre (s'il est un lot encore ouvert et assigné
+        à l'agent), avec l'origine notée à son OUVERTURE (`session_harness`,
+        `session_cwd`, `session_account` si `session_origin` est `current` ;
+        inconnue sinon, elle ne sera pas reprise) ; puis celle mise de côté
+        pour `to_lot` devient active si ce lot est encore ouvert et assigné à
+        l'agent et qu'elle a été ouverte sous les harnais `harness`, compte
+        `account` (celui du prochain tour) et dossier `cwd` (sinon elle est
+        écartée et la session active est vide : une session neuve s'ouvrira).
+        Rend `{resumed, parked, discarded, discard_reason}` (identifiants ou
+        None ; raison `origin` ou `lot`), ou None si le bail n'est plus le
+        nôtre (rien n'est écrit)."""
+
+    @abc.abstractmethod
+    def listing(self, name: str | None = None) -> list[dict]:
+        """Les lignes (d'un agent), avec `parked_ts`, `last_wake_ts`,
+        `wake_activity_ts`."""
+
+    @abc.abstractmethod
+    def actionable(self, name: str, *, today: str | None = None) -> list[dict]:
+        """Les lots de l'agent que la règle 1 peut reprendre, par priorité
+        puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
+        `today`, ni en attente d'une décision (demande non lue, jalon de
+        décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
+        (la dernière note du lot). Chaque ligne : `id`, `title`, `state`,
+        `priority`, `activity_ts` (dernier signe de vie du lot : lot, journal,
+        pointe de branche, courrier sur le lot), `wakes`, `last_wake_ts`,
+        `wake_activity_ts`."""
+
+    @abc.abstractmethod
+    def note_wake(self, name: str, lot: int, activity_ts: float | None) -> dict:
+        """Note un réveil de l'agent sur le lot, horloge de la base : le
+        compte repart à 1 si le lot a vécu depuis le réveil précédent
+        (`activity_ts` plus récent que `wake_activity_at`), sinon il croît.
+        Rend la ligne."""
+
+    @abc.abstractmethod
+    def purge(self, name: str | None = None) -> list[dict]:
+        """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
+        sont plus assignés à leur agent ; rend les lignes supprimées."""
+
+
+# --------------------------------------------------------------------------
 # résultats de CI relevés en direct (`ci_runs`, `ci_test_failures`, L161c)
 # --------------------------------------------------------------------------
 
@@ -2678,6 +2791,18 @@ class Handoffs(Domain):
     def drain(self, operation: str) -> dict | None: ...
 
     @abc.abstractmethod
+    def recover_source(self, operation: str, *, proof: dict) -> dict | None:
+        """Fence the expired source epoch after scoped quiescence and publication proof."""
+
+    @abc.abstractmethod
+    def promote_loss(self, operation: str) -> dict | None:
+        """Convert a pre-switch handoff after loss, preserving its capacity reservation."""
+
+    @abc.abstractmethod
+    def cancellation_guard(self, operation: str):
+        """Yield a journal API whose completion/fence writes share the source gate transaction."""
+
+    @abc.abstractmethod
     def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
 
     @abc.abstractmethod
@@ -2713,6 +2838,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
     action_source: ActionSource
@@ -2728,6 +2854,7 @@ class Storage(abc.ABC):
     roadmap: Roadmap
     operations: Operations
     hosts: HostResources
+    host_lifecycle: HostLifecycle
     turn_resources: TurnResources
     visibility: Visibility
     housekeeping: Housekeeping

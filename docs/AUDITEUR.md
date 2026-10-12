@@ -70,7 +70,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot ouvert ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
+| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
 | 4 | Dépense et solde | `ameesh budget --json`, `ameesh cost balance`, `ameesh cost gauges` | dépense réelle au-dessus de l'estimation, plafond proche, `balance_low` |
@@ -615,6 +615,7 @@ FIN
 | agent arrêté, mort ou au repos avec du travail | `ameesh resume <agent>` | `ameesh set` ou arrêt par le responsable |
 | session trop grosse, agent qui tourne en rond, **hors tour** | `ameesh restart <agent> --brief -` (brief de reprise court sur l'entrée standard) | la session précédente reste dans l'historique |
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
+| « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
@@ -913,7 +914,9 @@ Environment=AUDITEUR_RESERVE_DIR=<dossier des scripts de la réserve>
 ```
 
 L'exécuteur ne relance un agent au repos qu'**une fois** : après un tour de
-relance, il attend du courrier. Les passages viennent donc de trois minuteurs.
+relance, il attend du courrier. (#408 : s'il détient un lot actionnable, la règle 1
+le réveille aussi pour ce lot, borné ; `ameesh set auditeur lot_wake=off`
+l'en dispense.) Les passages viennent donc de trois minuteurs.
 Le passage horaire (`ameesh-auditeur-heure.service` et `.timer`) :
 
 ```ini

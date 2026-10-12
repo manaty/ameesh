@@ -119,6 +119,10 @@ MAX_BUFFERED_RESPONSE = 8 * 1024 * 1024
 #: plafond d'une réponse en flux (octets recopiés)
 DEFAULT_MAX_STREAM = 256 * 1024 * 1024
 
+# Separate from CLI accounts: this key belongs to the relay service.
+CREDENTIAL_ACCOUNT = "relay"
+AUTH_BLOCKED = "relay_auth_blocked"
+
 _TURN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
@@ -647,6 +651,7 @@ class Relay:
             if wait:
                 raise Refused(429, "rate_limit_error", "débit du relais dépassé", wait)
             if handler.command == "GET":
+                self._check_credentials(provider)
                 self._models(handler, identity)
                 return
             raw = self._read_body(handler)
@@ -668,6 +673,7 @@ class Relay:
             if not isinstance(asked, int) or asked <= 0 or asked > cap:
                 body["max_tokens"] = cap
             self._check_budget(identity, provider)
+            self._check_credentials(provider)
             if not self.limiter.enter(identity.agent):
                 raise Refused(429, "rate_limit_error", "trop de flux simultanés pour cet agent", 1.0)
             slot = True
@@ -684,6 +690,31 @@ class Relay:
                 self.limiter.leave(identity.agent)
 
     # -- étapes -------------------------------------------------------------
+    def _check_credentials(self, provider: str) -> None:
+        from . import db as db_mod
+        try:
+            with self._db_lock:
+                row = storage.of(self.db).credentials.health(
+                    self.cfg.host, PROVIDERS[provider]["harness"]).get(CREDENTIAL_ACCOUNT)
+        except db_mod.DbError:
+            raise Refused(503, "api_error", "server credential health unavailable") from None
+        if row and row.get("state") == "failing":
+            raise Refused(503, AUTH_BLOCKED,
+                          "Relay server credential failing; waiting for a healthy server probe")
+
+    def _auth_failed(self, provider: str, key: str, status: int) -> None:
+        from . import db as db_mod, sentinel
+        try:
+            with self._db_lock:
+                storage.of(self.db).credentials.report(
+                    self.cfg.host, PROVIDERS[provider]["harness"], CREDENTIAL_ACCOUNT,
+                    "failing", reason="upstream authentication refused (HTTP %d)" % status,
+                    source="relay", fingerprint=sentinel._digest(key))
+        except db_mod.DbError:
+            raise Refused(503, "api_error", "server credential health unavailable") from None
+        raise Refused(503, AUTH_BLOCKED,
+                      "Relay server credential refused; waiting for a healthy server probe")
+
     def _route(self, handler) -> tuple[str, str]:
         path = urllib.parse.urlsplit(handler.path).path
         if not path.startswith(PREFIX):
@@ -831,6 +862,11 @@ class Relay:
             status = response.status
             ctype = response.getheader("content-type") or "application/json"
             streaming = status == 200 and ctype.startswith("text/event-stream")
+            raw = None
+            if not streaming:
+                raw = response.read(MAX_BUFFERED_RESPONSE + 1)
+                if status == 401 or (status == 403 and upstream_auth_error(raw)):
+                    self._auth_failed(provider, key, status)
             handler.send_response(status)
             handler.send_header("Content-Type", ctype)
             request_id = response.getheader("request-id")
@@ -843,7 +879,6 @@ class Relay:
                 handler.end_headers()
                 self._pipe_stream(handler, response, meter)
             else:
-                raw = response.read(MAX_BUFFERED_RESPONSE + 1)
                 if len(raw) > MAX_BUFFERED_RESPONSE:
                     raw = raw[:MAX_BUFFERED_RESPONSE]
                     handler.close_connection = True
@@ -960,6 +995,82 @@ class Relay:
 # ==========================================================================
 # serveur autonome (en attendant le montage dans `ameesh serve`, L108)
 # ==========================================================================
+
+def upstream_auth_error(raw: bytes) -> bool:
+    """A 403 alone may be model permission; classify only a bounded JSON error."""
+    from . import auth_failure
+    try:
+        error = json.loads(raw[:65536]).get("error")
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(error, dict):
+        return False
+    return error.get("type") in ("authentication_error", "invalid_api_key") or bool(
+        auth_failure.classify(str(error.get("message") or "")[:600]))
+
+
+def credential_ready(base_url: str, token: str, harness: str) -> bool:
+    """Read the server's verdict, never provider credentials on the device."""
+    from . import db as db_mod
+    from .storage.remote.http import HttpTransport
+    spec = HARNESS_ENV.get(harness)
+    if spec is None:
+        return True
+    transport = HttpTransport(base_url)
+    path = transport.parts.path.rstrip("/") + "/" + spec["provider"] + "/v1/models"
+    response = transport._once("GET", path, None, {"x-api-key": token})
+    if response.status == 200 and isinstance(response.body, dict) \
+            and isinstance(response.body.get("data"), list):
+        return True
+    error = response.body.get("error") if isinstance(response.body, dict) else None
+    if response.status == 503 and isinstance(error, dict) and error.get("type") == AUTH_BLOCKED:
+        return False
+    raise db_mod.Unavailable("relay credential status unavailable (HTTP %d)" % response.status)
+
+
+def probe_credentials(cfg, db, *, environ=None, transport=None, now=None) -> list[dict]:
+    """Recover relay failures on a positively authenticated server key.
+
+    Called by the credential sentinel. No request without a configured relay
+    key and an existing failure; no model generation. The conditional write
+    preserves a failure recorded during the probe, as in L226. The sentinel
+    timer spaces attempts by PERIOD_S; an unchanged key also waits that long
+    after the last refusal, so a transient 401 can recover without rotation.
+    """
+    from . import balance, sentinel
+    env = os.environ if environ is None else environ
+    spec = PROVIDERS["deepseek"]
+    if not env.get(spec["key_env"]) and not env.get(spec["key_file_env"]):
+        return []
+    credentials = storage.of(db).credentials
+    current = credentials.health(cfg.host, "deepseek").get(CREDENTIAL_ACCOUNT)
+    if not current or current.get("state") != "failing":
+        return []
+    row = {"host": cfg.host, "harness": "deepseek", "account": CREDENTIAL_ACCOUNT,
+           "state": "failing", "previous": "failing", "reason": current.get("reason") or ""}
+    secrets = ServerSecrets(env)
+    try:
+        key = secrets.key("deepseek")
+        fingerprint = sentinel._digest(key)
+        probe_time = time.time() if now is None else now
+        # A rotated key may be checked immediately. Without proof of rotation,
+        # wait one sentinel interval after the most recent authentication error.
+        if (not current.get("failing_fingerprint")
+                or fingerprint == current["failing_fingerprint"]) and \
+                probe_time < float(current.get("last_failure_ts") or 0) + sentinel.PERIOD_S:
+            return [row]
+        source = balance.DeepSeekBalance(env=dict(env, DEEPSEEK_API_KEY=key), transport=transport)
+        if not source.fetch() or secrets.key("deepseek") != key:
+            return [row]
+    except (SecretError, balance.BalanceError):
+        return [row]
+    result = credentials.report(
+        cfg.host, "deepseek", CREDENTIAL_ACCOUNT, "healthy",
+        reason="relay key authenticated by server balance probe", source="sentinel",
+        expect_failures=int(current.get("failures") or 0))
+    if not (result or {}).get("skipped"):
+        row.update(state="healthy", reason="relay key authenticated by server balance probe")
+    return [row]
 
 class RelayHandler(BaseHTTPRequestHandler):
     server_version = "ameesh-relay"
