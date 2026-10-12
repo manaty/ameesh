@@ -168,13 +168,19 @@ def _positive_int(value, minimum: int = 0) -> int | None:
     return value
 
 
-def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
+def parse_lend(raw, warnings: list[str] | None = None) -> tuple[dict | None, list[str], list[str]]:
     """(offer, problems, unknown keys) of `policy.lend`.
 
     The offer keeps sizes in bytes, `cpu_max` in CPUs (float), percentages
     as numbers from 0 to 100, `windows` as written (each one checked) and
     the defaults of `drain_seconds` and `calm_seconds`. With any problem,
-    the offer is None: the host lends nothing until its fiche is fixed."""
+    the offer is None: the host lends nothing until its fiche is fixed.
+
+    `warnings` (optional): legacy spellings of `disk_paths` that main
+    accepted and that are normalized instead of refusing the offer, so the
+    caller can show them (`ameesh canon check`). An upgrade must not stop
+    the guard from starting on an offer that was valid before (codex #459
+    r3)."""
     if not isinstance(raw, dict):
         return None, ["mapping expected"], []
     problems: list[str] = []
@@ -234,7 +240,7 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
             offer[key] = seconds
     unknown = sorted(str(k) for k in raw if k not in LEND_KEYS)
     if raw.get("reclaim") is not None:
-        reclaim, more, extra = _parse_reclaim(raw["reclaim"])
+        reclaim, more, extra = _parse_reclaim(raw["reclaim"], warnings)
         problems += ["`reclaim.%s" % p[1:] if p.startswith("`") else "`reclaim`: " + p
                      for p in more]
         unknown += ["reclaim.%s" % k for k in extra]
@@ -243,29 +249,35 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
     return (None if problems else offer), problems, unknown
 
 
-def _reclaim_path(value) -> str | None:
-    """One path of `disk_paths`: absolute, normalized, without `..` or NUL
-    (codex #459 r1). `resources.disk_free` probes it as written, so a
-    relative or traversing path would watch another filesystem than the one
-    the fiche names, and a NUL raises while measuring. Blanks around it are
-    stripped, as for the other keys. A trailing slash names the same
-    filesystem: it is stripped — except for the root — before the duplicate
-    check, so `/srv/` reads as `/srv` instead of refusing an offer that was
-    valid at r1 (codex #459 r2)."""
+def _reclaim_path(value, warnings: list[str] | None = None) -> str | None:
+    """One path of `disk_paths`: absolute and normalized (codex #459 r1).
+
+    Refused: a relative path (probed from the guard's own directory, it
+    would watch another filesystem than the one the fiche names), a `..`
+    component (`/srv/../etc` is not `/etc` when `/srv` is a symbolic link),
+    a NUL (it raises while measuring) and a blank.
+
+    Accepted and normalized with a warning (codex #459 r3): the spellings
+    that provably name the same directory on Linux — several leading slashes
+    (`//srv`), `//` inside, a `.` component (`/srv/.`), and a trailing slash
+    except for the root. Main accepted them; refusing them would stop the
+    guard from starting after the update. The warning tells the operator to
+    fix the fiche."""
     if not isinstance(value, str):
         return None
     path = value.strip()
-    if not path.startswith("/") or path.startswith("//") or "\x00" in path:
+    if not path or "\x00" in path or not path.startswith("/"):
         return None
-    if path == "/":
-        return path
-    normalized = os.path.normpath(path)
-    if normalized != path.rstrip("/"):
+    if ".." in path.split("/"):
         return None
+    normalized = os.path.normpath("/" + path.lstrip("/"))
+    if normalized != (path.rstrip("/") or "/") and warnings is not None:
+        warnings.append("`reclaim.disk_paths`: %r normalized to %r (same directory; "
+                        "update the fiche)" % (path, normalized))
     return normalized
 
 
-def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
+def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list[str], list[str]]:
     """The thresholds of the application at which the guest gives way."""
     if not isinstance(raw, dict):
         return {}, ["mapping expected"], []
@@ -295,19 +307,28 @@ def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
             out[key] = percent
     if raw.get("disk_paths") is not None:
         paths = raw["disk_paths"]
-        if not isinstance(paths, list) or not paths:
+        if isinstance(paths, list) and not paths:
+            # main read an empty list as its own default (`/`); refusing it
+            # would stop the guard from starting after the update (codex #459 r3)
+            if warnings is not None:
+                warnings.append("`reclaim.disk_paths`: empty list read as [\"/\"] "
+                                "(update the fiche)")
+            out["disk_paths"] = ["/"]
+        elif not isinstance(paths, list):
             problems.append("`disk_paths`: non-empty list of absolute, normalized paths "
                             "expected (e.g. [\"/\", \"/srv/ameesh-guest\"])")
         else:
-            clean = [_reclaim_path(p) for p in paths]
+            clean = [_reclaim_path(p, warnings) for p in paths]
+            unique = list(dict.fromkeys(clean))
             if any(p is None for p in clean):
                 problems.append("`disk_paths`: absolute, normalized paths expected, "
                                 "without `..` or NUL (e.g. [\"/\", \"/srv/ameesh-guest\"])")
-            elif len(set(clean)) != len(clean):
-                problems.append("`disk_paths`: duplicate paths (each filesystem is "
-                                "watched once)")
             else:
-                out["disk_paths"] = clean
+                if len(unique) != len(clean) and warnings is not None:
+                    warnings.append("`reclaim.disk_paths`: duplicate paths collapsed to %s "
+                                    "(each filesystem is watched once; update the fiche)"
+                                    % ", ".join(repr(p) for p in unique))
+                out["disk_paths"] = unique
     if raw.get("busy_units") is not None:
         units = raw["busy_units"]
         if isinstance(units, str):

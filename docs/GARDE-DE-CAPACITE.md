@@ -104,6 +104,19 @@ policy:
   explicit null is refused for every `reclaim` key: it is not an absent
   key, and it used to disable a threshold or fall back to a default,
   silently. A `%` sign is single (`20%%` is not 20).
+- Mise à jour d'une offre existante : les graphies de `disk_paths` que le
+  lecteur précédent acceptait nomment les mêmes dossiers et sont lues
+  normalisées au lieu de faire refuser l'offre — plusieurs slashes de tête
+  (`//srv`), un `//` interne, un composant `.` (`/srv/.`), un slash final,
+  le même chemin deux fois, une liste vide (lue `["/"]`, son ancien
+  défaut). Chacune est signalée en `host-lend-legacy` : l'offre est gardée,
+  la garde démarre, et l'opérateur corrige la fiche. Ce qui reste refusé
+  doit être corrigé **avant** la mise à jour, sinon la garde sort au
+  démarrage : un chemin relatif (il serait sondé depuis le dossier de la
+  garde), un `..` (à travers un lien symbolique, `/srv/../etc` n'est pas
+  `/etc`), un NUL, et une taille qui n'est pas un entier d'octets > 0
+  (`0`, `"0.001KiB"`, un flottant fractionnaire : le lecteur précédent les
+  tronquait, ou lisait `0` comme « pas de reclaim disque »).
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 

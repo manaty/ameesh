@@ -27,7 +27,6 @@ import re
 import shutil
 import subprocess
 import time
-from decimal import Decimal
 
 from . import platform, storage
 from .db import Db
@@ -132,7 +131,8 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     défaut ou du constat). Un texte négatif n'est pas un octet valide.
     `decimal_ok=False` exige un nombre entier d'octets : « 4.5GiB » (exact)
     passe, « 0.001KiB » (1.024 octet) est refusé au lieu d'être tronqué à 1
-    (codex #459 r2)."""
+    (codex #459 r2), et chaque chiffre compte, même au-delà des 28 chiffres
+    du contexte décimal (codex #459 r3)."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -159,12 +159,18 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
         return None
     if decimal_ok:
         return int(size)
-    # arithmétique décimale exacte : le texte doit désigner un nombre entier
-    # d'octets (un « 1.0000000000000001GiB » ne doit pas passer par le float)
-    exact = Decimal(number) * factor
-    if exact != exact.to_integral_value():
+    # arithmétique entière exacte : le texte doit désigner un nombre entier
+    # d'octets, et aucun chiffre ne doit être perdu. Une multiplication
+    # `Decimal` garde le contexte par défaut (28 chiffres significatifs) et
+    # arrondit : « 1.0000000000000000000000000001GiB » passait pour 1 GiB
+    # (codex #459 r3). On multiplie donc le nombre entier de chiffres par le
+    # facteur, puis on exige que l'échelle décimale divise exactement.
+    whole, _, fraction = number.partition(".")
+    exact = int(whole + fraction) * factor
+    scale = 10 ** len(fraction)
+    if exact % scale:
         return None
-    return int(exact)
+    return exact // scale
 
 
 def parse_fraction(value) -> float | None:

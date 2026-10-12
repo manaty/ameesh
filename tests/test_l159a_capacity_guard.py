@@ -230,7 +230,7 @@ class OfferTest(unittest.TestCase):
                         <= set(capacity_guard.RECLAIM_KEYS))
         for key, value in (("io_pressure_max", "120%"), ("io_pressure_max", -1),
                            ("disk_free_min", "lots"), ("disk_free_min", -1),
-                           ("disk_paths", "/"), ("disk_paths", []),
+                           ("disk_paths", "/"),
                            ("disk_paths", [""]), ("disk_paths", ["/", 3])):
             with self.subTest(key=key, value=value):
                 offer, problems, unknown = capacity_guard.parse_lend(
@@ -240,13 +240,13 @@ class OfferTest(unittest.TestCase):
                 self.assertEqual(unknown, [])
 
     def test_disk_paths_are_absolute_normalized_and_unique(self):
-        # codex #459 r1: a relative, traversing, unnormalized or duplicated
-        # path reached the disk probe unchanged; each watched filesystem is
-        # named once, by an absolute normalized path (surrounding blanks are
-        # stripped, as for the other keys)
+        # codex #459 r1: a relative or traversing path reached the disk probe
+        # unchanged; each watched filesystem is named once, by an absolute
+        # normalized path (surrounding blanks are stripped, as for the other
+        # keys)
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
-        for paths in (["../../outside"], ["srv/ameesh"], ["/", "/"],
-                      ["/srv/../etc"], ["//srv"], ["/srv//guest"], ["/."]):
+        for paths in (["../../outside"], ["srv/ameesh"], ["/srv/../etc"],
+                      ["/srv/./../etc"]):
             with self.subTest(paths=paths):
                 offer, problems, unknown = capacity_guard.parse_lend(
                     dict(base, reclaim={"disk_paths": paths}))
@@ -257,6 +257,32 @@ class OfferTest(unittest.TestCase):
             dict(base, reclaim={"disk_paths": [" / ", "/srv/ameesh-guest"]}))
         self.assertEqual(problems, [])
         self.assertEqual(offer["reclaim"]["disk_paths"], ["/", "/srv/ameesh-guest"])
+
+    def test_disk_paths_legacy_spellings_are_normalized_with_a_warning(self):
+        # codex #459 r3: main accepted `//srv`, `/srv/.`, `//` inside, a
+        # duplicate and an empty list; refusing them would stop the guard
+        # from starting after the update. They name the same directories and
+        # are normalized — the warning, not a refusal, asks for a clean fiche
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for paths, expected in ((["//srv"], ["/srv"]),
+                                (["/srv/."], ["/srv"]),
+                                (["/srv//guest"], ["/srv/guest"]),
+                                (["/."], ["/"]),
+                                (["/srv", "/srv/"], ["/srv"]),
+                                ([], ["/"])):
+            with self.subTest(paths=paths):
+                warnings: list[str] = []
+                offer, problems, _ = capacity_guard.parse_lend(
+                    dict(base, reclaim={"disk_paths": paths}), warnings)
+                self.assertEqual(problems, [])
+                self.assertEqual(offer["reclaim"]["disk_paths"], expected)
+                self.assertTrue(warnings, "la forme héritée est signalée")
+                self.assertTrue(all("disk_paths" in w for w in warnings), warnings)
+        warnings = []
+        offer, problems, _ = capacity_guard.parse_lend(
+            dict(base, reclaim={"disk_paths": ["/", "/srv"]}), warnings)
+        self.assertEqual(problems, [])
+        self.assertEqual(warnings, [], "une fiche propre ne dit rien")
 
     def test_disk_paths_refuse_nul(self):
         # codex #459 r1: `disk_paths: ["/\u0000"]` was accepted, then
@@ -297,12 +323,15 @@ class OfferTest(unittest.TestCase):
             dict(base, reclaim={"disk_paths": ["/srv/", "/var/lib//"]}))
         self.assertEqual(problems, [])
         self.assertEqual(offer["reclaim"]["disk_paths"], ["/srv", "/var/lib"])
+        # r3: the same filesystem named twice is collapsed, not refused
         for paths in (["/srv", "/srv/"], ["/srv/", "/srv//"]):
             with self.subTest(paths=paths):
+                warnings: list[str] = []
                 offer, problems, _ = capacity_guard.parse_lend(
-                    dict(base, reclaim={"disk_paths": paths}))
-                self.assertIsNone(offer)
-                self.assertTrue(any("disk_paths" in p for p in problems), problems)
+                    dict(base, reclaim={"disk_paths": paths}), warnings)
+                self.assertEqual(problems, [])
+                self.assertEqual(offer["reclaim"]["disk_paths"], ["/srv"])
+                self.assertTrue(any("duplicate" in w for w in warnings), warnings)
 
     def test_reclaim_sizes_accept_integral_numbers(self):
         # codex #459 r2: `memory_available_min: 6442450944.0` (exactly 6 GiB)
@@ -336,6 +365,32 @@ class OfferTest(unittest.TestCase):
                     self.assertIsNone(offer)
                     self.assertTrue(any(key in p for p in problems), problems)
             for value, expected in (("4.5GiB", int(4.5 * GIB)), ("1.5KiB", 1536)):
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertEqual(problems, [])
+                    self.assertEqual(offer["reclaim"][key], expected)
+
+    def test_reclaim_sizes_keep_every_input_digit(self):
+        # codex #459 r3: the whole-byte check went through `Decimal` under the
+        # default 28-digit context, which rounds: a 29-digit value such as
+        # "1.0000000000000000000000000001GiB" passed as 1 GiB. Every input
+        # digit must count, however long the fraction is.
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        refuse = ("1.0000000000000000000000000001GiB",
+                  "1.0000000000000000000000000001KiB",
+                  "0." + "0" * 27 + "1GiB")
+        for key in ("disk_free_min", "memory_available_min"):
+            for value in refuse:
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertIsNone(offer)
+                    self.assertTrue(any(key in p for p in problems), problems)
+            # the same values padded with zeros after the point are exact and
+            # must keep passing
+            for value, expected in (("1." + "0" * 28 + "GiB", GIB),
+                                    ("4.5" + "0" * 26 + "GiB", int(4.5 * GIB))):
                 with self.subTest(key=key, value=value):
                     offer, problems, _ = capacity_guard.parse_lend(
                         dict(base, reclaim={key: value}))
@@ -417,6 +472,20 @@ class CanonTest(_Canons, unittest.TestCase):
         self.assertEqual(loaded.host(HOST).policy.lend["reclaim"],
                          {"io_pressure_max": 20.0, "disk_free_min": 10 * GIB,
                           "disk_paths": ["/", "/srv/ameesh-guest"]})
+
+    def test_canon_check_normalizes_legacy_disk_paths_with_a_warning(self):
+        # codex #459 r3: an offer main accepted (`//srv`, `/srv/.`, a duplicate)
+        # must not become a startup failure: the canon reads it normalized and
+        # warns (`host-lend-legacy`), it does not refuse it
+        text = host("bob", harnesses=("codex",), resources_yaml=(
+            "  lend:\n    cpu_max: 3\n    memory_max: 14GiB\n    disk_max: 80GiB\n"
+            "    reclaim:\n      disk_paths: [\"//srv\", \"/srv/.\"]\n"))
+        loaded = canon.load(self.acme(host_text=text, name="l479-legacy"), default=False)
+        found = canon.validate(loaded)
+        self.assertNotIn("host-policy-invalid", codes(found, canon.ERROR))
+        self.assertIn("host-lend-legacy", codes(found, canon.WARNING))
+        self.assertEqual(loaded.host(HOST).policy.lend["reclaim"]["disk_paths"],
+                         ["/srv"])
 
     def test_unreadable_offer_lends_nothing(self):
         text = host("bob", harnesses=("codex",), resources_yaml=(

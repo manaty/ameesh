@@ -92,7 +92,6 @@ class OfferTest(unittest.TestCase):
                {"reclaim": {"io_pressure_max": "120%"}},
                {"reclaim": {"disk_paths": "/"}},
                # codex #459 r1: the reader refuses what the guard used to fix up
-               {"reclaim": {"disk_paths": ["/", "/"]}},
                {"reclaim": {"disk_paths": ["../etc"]}},
                {"reclaim": {"disk_paths": ["/\x00"]}},
                {"reclaim": {"disk_free_min": 0}},
@@ -103,6 +102,10 @@ class OfferTest(unittest.TestCase):
         for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
             with self.assertRaises(guard.GuardError, msg=offer):
                 guard.parse_offer(offer)
+        # codex #459 r3: a path named twice (`/` and `/`) is collapsed, not
+        # refused — the guard starts on an offer main accepted
+        offer = guard.parse_offer(lend(reclaim={"disk_paths": ["/", "/"]}))
+        self.assertEqual(offer.disk_paths, ("/",))
 
     def test_config_refuses_duplicate_json_keys(self):
         # codex #459 r1: a duplicate JSON key silently overwrote ('10GiB'
