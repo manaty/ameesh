@@ -352,15 +352,23 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
                                        by="human:test"))
-        choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
-        self.assertIsNone(choix.profile)  # forcé ET au seuil : pause, pas de bascule
-        self.assertIn("forcé", choix.reason)
-        self.assertTrue(accounts.automatic(self.db, self.cfg.host, "codex", by="human:test"))
+        # L226b (bureau, 2026-10-12) : forcé ET au seuil, un autre compte libre —
+        # le forçage est levé (journalisé `auto`) et le choix automatique bascule
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertEqual(choix.profile.name, "primaire")
+        self.assertFalse(choix.forced)
+        self.assertFalse(accounts.automatic(self.db, self.cfg.host, "codex", by="human:test"))
+        # aucun autre compte libre : le forçage tient, pause
+        _codex_rollout(items[0].path, 96, now + 3600)
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                                       by="human:test"))
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
+        self.assertIsNone(choix.profile)
+        self.assertIn("forcé", choix.reason)
         with self.assertRaises(accounts.AccountError):
             accounts.force(self.db, self.cfg.host, "codex", items, "inconnu", by="human:test")
-        self.assertEqual([b["kind"] for b in self._bascules()], ["manuel", "auto", "bascule"])
+        self.assertEqual([b["kind"] for b in self._bascules()],
+                         ["manuel", "auto", "bascule", "manuel"])
 
     def test_profil_invalide_jamais_choisi(self):
         comptes = self._codex_comptes()
@@ -457,7 +465,9 @@ class ExecuteurTest(_Base):
         l'exécuteur (mécanisme de cost.CostBook) ; compte déclaré : le sien."""
         herite = _dossier(os.path.join(self.tmp, "codex-herite"), creds="auth.json")
         secondaire = self._codex_comptes()[1]
-        comptes = {"codex": [{"name": "primaire"}, secondaire]}
+        # L226b: the primary comes last by default; here it is put first to
+        # test the gauges mechanism
+        comptes = {"codex": [{"name": "primaire", "priority": 0}, secondaire]}
         runner, worker = self._worker("cxd", "codex", comptes)
         try:
             with mock.patch.dict(os.environ, {"CODEX_HOME": herite}):
