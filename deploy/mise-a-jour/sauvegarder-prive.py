@@ -69,7 +69,10 @@ def private_connection(parameters, directory):
 
 
 def dump(config, output):
-    parameters = parameters_from(config)
+    return dump_parameters(parameters_from(config), output)
+
+
+def dump_parameters(parameters, output, *, snapshot=None):
     output = Path(output)
     output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     output.parent.chmod(0o700)
@@ -79,7 +82,10 @@ def dump(config, output):
         private = Path(staging)
         archive = private / "archive.dump"
         with private_connection(parameters, private) as (public_dsn, env):
-            run(["pg_dump", "--no-password", "-Fc", "--dbname", public_dsn, "--file", str(archive)], env=env)
+            args = ["pg_dump", "--no-password", "-Fc", "--dbname", public_dsn]
+            if snapshot is not None:
+                args.extend(["--snapshot", snapshot])
+            run(args + ["--file", str(archive)], env=env)
             if not archive.is_file() or archive.stat().st_size == 0:
                 raise BackupError("backup is empty or missing")
             archive.chmod(0o600)
@@ -94,6 +100,58 @@ def dump(config, output):
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+
+
+def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_registry", "agent_mailbox")):
+    """Capture expected rows and the archive from one repeatable-read snapshot.
+
+    The full database is dumped; the private inventory identifies the mesh
+    schema and representative tables that restoration must check.
+    """
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+    output, inventory = Path(output), Path(inventory)
+    if (inventory.parent.resolve() != output.parent.resolve() or inventory == output
+            or os.path.lexists(inventory) or os.path.lexists(output)):
+        raise BackupError("new archive and inventory must share one private directory")
+    if (not isinstance(schema, str) or not schema or "\x00" in schema
+            or not isinstance(tables, (tuple, list)) or not tables
+            or any(not isinstance(table, str) or not table or "\x00" in table for table in tables)):
+        raise BackupError("invalid expected source inventory")
+    parameters = parameters_from(config)
+    with psycopg.connect(make_conninfo(**parameters)) as source:
+        source.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        snapshot = source.execute("SELECT pg_export_snapshot()").fetchone()[0]
+        if not isinstance(snapshot, str) or not re.fullmatch(r"[0-9A-Fa-f-]+", snapshot):
+            raise BackupError("source did not export a valid snapshot")
+        versions = source.execute(sql.SQL("SELECT version,checksum FROM {}.schema_migrations ORDER BY version")
+                                  .format(sql.Identifier(schema))).fetchall()
+        if not versions:
+            raise BackupError("source has no recorded migration inventory")
+        counts = {}
+        for table in sorted(set(tables)):
+            counts[table] = source.execute(sql.SQL("SELECT count(*) FROM {}.{}")
+                                          .format(sql.Identifier(schema), sql.Identifier(table))).fetchone()[0]
+        # The exporting transaction stays open until pg_dump imports and
+        # finishes the snapshot, including writes made concurrently afterwards.
+        dump_parameters(parameters, output, snapshot=snapshot)
+        expected = {"schema": schema, "migrations": [list(row) for row in versions],
+                    "row_counts": counts, "artifact_sha256": digest(output)}
+        with tempfile.TemporaryDirectory(prefix=".inventory-", dir=output.parent) as staging:
+            candidate = Path(staging) / "inventory.json"
+            with candidate.open("x") as stream:
+                candidate.chmod(0o600)
+                json.dump(expected, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(candidate, inventory)
+        directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    return {"artifact_sha256": expected["artifact_sha256"], "inventory": str(inventory)}
 
 
 def digest(path):
@@ -189,6 +247,12 @@ def main():
     backup = commands.add_parser("dump")
     backup.add_argument("--config", required=True)
     backup.add_argument("--output", required=True)
+    snapshot = commands.add_parser("snapshot-dump")
+    snapshot.add_argument("--config", required=True)
+    snapshot.add_argument("--output", required=True)
+    snapshot.add_argument("--inventory", required=True)
+    snapshot.add_argument("--schema", default="public")
+    snapshot.add_argument("--table", action="append", dest="tables")
     transfer = commands.add_parser("upload")
     transfer.add_argument("--file", required=True)
     transfer.add_argument("--host", required=True)
@@ -200,6 +264,10 @@ def main():
     try:
         if args.command == "dump":
             dump(args.config, args.output)
+        elif args.command == "snapshot-dump":
+            proof = snapshot_dump(args.config, args.output, args.inventory, schema=args.schema,
+                                  tables=args.tables or ("agent_registry", "agent_mailbox"))
+            print(json.dumps(proof))
         elif args.command == "upload":
             upload(args.file, args.host)
         else:

@@ -157,3 +157,67 @@ class PrivateBackupTest(unittest.TestCase):
         with mock.patch("psycopg.connect") as connect, self.assertRaises(backup.BackupError):
             backup.verify_restore(self.config, self.output, expected)
         connect.assert_not_called()
+
+    def snapshot_fixture(self, *, versions=((1, "checksum"),)):
+        source, context = mock.MagicMock(), mock.MagicMock()
+        context.__enter__.return_value = source
+        cursors = [mock.MagicMock() for _ in range(5)]
+        cursors[1].fetchone.return_value = ("00000003-000000AE-1",)
+        cursors[2].fetchall.return_value = list(versions)
+        cursors[3].fetchone.return_value = (5,)
+        cursors[4].fetchone.return_value = (2,)
+        source.execute.side_effect = cursors
+        return source, context, cursors
+
+    def test_inventory_and_dump_share_live_exported_snapshot(self):
+        source, context, cursors = self.snapshot_fixture()
+        inventory = self.output.with_suffix(".inventory.json")
+        def child(args, *, env=None):
+            context.__exit__.assert_not_called()
+            self.assertNotIn("CANARY-PASSWORD", str(args))
+            if args[0] == "pg_dump":
+                self.assertEqual(args[args.index("--snapshot") + 1], "00000003-000000AE-1")
+                # Subsequent source changes cannot change the expected snapshot
+                # counts already captured by this transaction.
+                cursors[4].fetchone.return_value = (999,)
+                Path(args[-1]).write_bytes(b"snapshot archive")
+        with mock.patch("psycopg.connect", return_value=context), mock.patch.object(backup, "run", side_effect=child):
+            proof = backup.snapshot_dump(self.config, self.output, inventory)
+        expected = json.loads(inventory.read_text())
+        self.assertEqual(expected["row_counts"], {"agent_mailbox": 5, "agent_registry": 2})
+        self.assertEqual(expected["migrations"], [[1, "checksum"]])
+        self.assertEqual(expected["artifact_sha256"], backup.digest(self.output))
+        self.assertEqual(proof["artifact_sha256"], expected["artifact_sha256"])
+        self.assertEqual(stat.S_IMODE(inventory.stat().st_mode), 0o600)
+        self.assertNotIn("CANARY", inventory.read_text())
+        context.__exit__.assert_called_once()
+
+    def test_failed_snapshot_dump_never_publishes_expected_inventory(self):
+        _, context, _ = self.snapshot_fixture()
+        inventory = self.output.with_suffix(".inventory.json")
+        with mock.patch("psycopg.connect", return_value=context), \
+                mock.patch.object(backup, "run", side_effect=backup.BackupError("dump failed")):
+            with self.assertRaises(backup.BackupError):
+                backup.snapshot_dump(self.config, self.output, inventory)
+        self.assertFalse(inventory.exists())
+        self.assertFalse(self.output.exists())
+        self.assertEqual(list(self.output.parent.iterdir()), [])
+        context.__exit__.assert_called_once()
+
+    def test_empty_source_migrations_block_snapshot_before_dump(self):
+        _, context, _ = self.snapshot_fixture(versions=())
+        inventory = self.output.with_suffix(".inventory.json")
+        with mock.patch("psycopg.connect", return_value=context), mock.patch.object(backup, "run") as child:
+            with self.assertRaises(backup.BackupError):
+                backup.snapshot_dump(self.config, self.output, inventory)
+        child.assert_not_called()
+        self.assertFalse(inventory.exists())
+
+    def test_existing_inventory_is_retained_without_source_connection(self):
+        self.output.parent.mkdir()
+        inventory = self.output.with_suffix(".inventory.json")
+        inventory.write_text("old inventory")
+        with mock.patch("psycopg.connect") as connect, self.assertRaises(backup.BackupError):
+            backup.snapshot_dump(self.config, self.output, inventory)
+        connect.assert_not_called()
+        self.assertEqual(inventory.read_text(), "old inventory")
