@@ -1,49 +1,49 @@
 ---
 type: Decision
-title: "Vitesse : revue proportionnée au risque, interruption, rotation des sessions, délais mesurés"
-description: "ameesh encode les règles de vitesse validées pour Nexlink : politique de revue par classe de risque au canon, interruption de tour de premier ordre, rotation de session avec résumé, sessions robustes au déplacement, métriques de délai par lot."
+title: "Speed: review proportionate to risk, interruption, session rotation, measured lead times"
+description: "ameesh encodes the speed rules validated for Nexlink: review policy per risk class in the canon, first-class turn interruption, session rotation with a summary, sessions robust to relocation, lead-time metrics per lot."
 status: stable
 tags: [vitesse, revue, interruption, sessions, metriques]
 decided_by: human:smichea
 decision_date: 2026-10-04
-attestation: "décision du propriétaire transmise par l'orchestrateur Nexlink (message de 00:09), rapportée par mesh-design ; non signée"
+attestation: "owner decision passed on by the Nexlink orchestrator (message of 00:09), reported by mesh-design; unsigned"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T02:30:00+02:00" }
 sources:
-  - { resource: "nexlink:docs/board/messages/2026-10-04-0215-orchestrateur-velocity-rules.md", title: "Règles de vitesse appliquées à Nexlink" }
+  - { resource: "nexlink:docs/board/messages/2026-10-04-0215-orchestrateur-velocity-rules.md", title: "Speed rules applied to Nexlink" }
 ---
 
-# Contexte
+# Context
 
-Une retouche d'une ligne coûtait 30 à 45 minutes. Causes observées : même
-circuit de revue pour une ligne de style que pour une migration ; messages lus
-seulement entre deux tours (un contre-ordre arrive trop tard) ; revérification
-complète à chaque fois ; orchestrateur relais obligatoire ; sessions qui
-gonflent jusqu'à saturer ; reprise cassée après le renommage d'un dossier.
+A one-line fix cost 30 to 45 minutes. Observed causes: the same
+review circuit for a style line as for a migration; messages read
+only between two turns (a counter-order arrives too late); full
+re-verification every time; mandatory relay orchestrator; sessions that
+swell until saturation; resume broken after a folder rename.
 
-# Décision
+# Decision
 
-À encoder dans ameesh comme exigences :
+To be encoded in ameesh as requirements:
 
-1. **Politique de revue par classe de risque**, déclarative, dans le canon OKF,
-   par portée de fichiers : **léger** (fusion dès que les tests ciblés sont
-   verts, relecture après coup), **normal** (une revue d'un autre éditeur, les
-   détails ne bloquent pas), **sensible** (gel, revue avant fusion, accord
-   explicite : SQL, sécurité, natif, contrats, production). En cas de doute, la
-   classe supérieure.
-2. **Interruption de tour de premier ordre** : un message prioritaire préempte
-   le tour en cours (arrêt du tour, reprise de la même session avec ce message
-   en tête) au lieu d'attendre la fin du tour.
-3. **Rotation de session** pilotée par la taille du contexte et la latence des
-   tours, avec un **résumé de reprise** produit avant la rotation.
-4. **Sessions robustes au déplacement** d'un worktree (renommage de dossier).
-5. **Métriques de délai par lot** (demande → gel → revue → fusion), exposées
-   par `ameesh list` / `ameesh work`.
+1. **Review policy per risk class**, declarative, in the OKF canon,
+   by file scope: **light** (merge as soon as the targeted tests are
+   green, review afterwards), **normal** (one review by another vendor, the
+   details do not block), **sensitive** (freeze, review before merge, explicit
+   agreement: SQL, security, native, contracts, production). When in doubt, the
+   higher class.
+2. **First-class turn interruption**: a priority message preempts
+   the current turn (turn stopped, the same session resumed with that message
+   at the top) instead of waiting for the end of the turn.
+3. **Session rotation** driven by context size and turn
+   latency, with a **resume summary** produced before the rotation.
+4. **Sessions robust to the relocation** of a worktree (folder rename).
+5. **Lead-time metrics per lot** (request → freeze → review → merge), exposed
+   by `ameesh list` / `ameesh work`.
 
-# Conséquences
+# Consequences
 
-- Exigence R19 ; lot L10 (politique de revue au canon et métriques de délai :
-  hors exécuteur) et lot L11 (interruption, rotation, déplacement : dans
-  l'exécuteur, après L8).
-- La classe de risque d'un changement est calculée depuis les fichiers touchés
-  et la politique du canon ; elle alimente aussi la porte (une fusion « légère »
-  peut être une action `reversible`).
+- Requirement R19; lot L10 (review policy in the canon and lead-time metrics:
+  outside the runner) and lot L11 (interruption, rotation, relocation: in
+  the runner, after L8).
+- The risk class of a change is computed from the files touched
+  and the canon policy; it also feeds the gate (a "light" merge
+  can be a `reversible` action).

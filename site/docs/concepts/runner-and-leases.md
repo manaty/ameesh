@@ -142,13 +142,21 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
   alert). When mains power returns, the runner claims its agents again by
   itself. Agents meant to be always available belong on a server.
 
+- **CPU pressure and lendable capacity** (L159d): the reading includes the
+  host's pressure stall information (PSI, 60 s averages), the CPU and memory
+  of the guest (the agents' slice) and of the application (everything else),
+  and the capacity the host could lend, computed on the application's
+  consumption over 7 days. `max_cpu_pressure` (no default) holds new turns
+  above that CPU PSI. `ameesh hosts` shows them; relocation ranks a lending
+  host by its lendable memory.
+
 ## Host not ready
 
 A harness binary or interpreter that cannot be found (a user unit started
 before the session imported its `PATH`, `node` missing for `dsh`), a harness
 that could not execute (exit 126/127 without output), an unreachable database
 (also at startup) or a missing working directory are **host** errors, not
-agent failures: the agent shows `blocked` "hôte non prêt", the prompt and mail
+agent failures: the agent shows `blocked` "hôte non prêt" (host not ready), the prompt and mail
 wait, the fast-failure series does not move, the agent is never stopped. The
 runner retries (15 s, doubling up to `AMEESH_HOST_RETRY_MAX`) and resumes by
 itself; `host_not_ready` alerts the agent's responsible. Binaries are resolved

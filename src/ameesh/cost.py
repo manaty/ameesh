@@ -370,6 +370,8 @@ class CostBook:
         #: L95 : dossiers Codex des comptes déclarés (`CODEX_HOME`), où chercher
         #: le journal d'un fil (modèle, total avant le tour) en plus du défaut
         self.codex_homes = [h for h in (codex_homes or []) if h]
+        # One compact reading map per journal, shared by all account lookups.
+        self._claude_gauge_cache: dict = {}
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -457,14 +459,12 @@ class CostBook:
 
     # -- jauges de forfait --------------------------------------------------
     def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
-        """Le dernier `rate_limit_event` vu par un agent Claude.
+        """Read the latest Claude rate-limit gauges, shared across an account.
 
-        Le forfait est partagé par tout le compte : la jauge la plus récente de
-        n'importe quel agent Claude vaut pour les autres.
-
-        `account` (L30) : seulement les événements de ce compte, reconnus par le
-        marqueur qui précède chaque tour ; un événement sans marqueur avant lui
-        appartient au compte `primary`.
+        With `account` (L30), use the marker preceding each turn, including
+        markers outside the read tail. Only a stream with no account marker
+        belongs to `primary`. Leading readings before any established marker
+        in a marked stream stay unknown, never primary.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary or account)
@@ -490,12 +490,10 @@ class CostBook:
         return newest[1] if newest else []
 
     def _claude_gauges_of(self, account: str, primary: str) -> list:
-        """Les jauges Claude d'UN compte (L30) : le dernier relevé de ce compte.
+        """Read the newest gauges for one Claude account (L30).
 
-        Chaque tour est précédé d'un marqueur daté ; le relevé le plus récent est
-        celui du tour au marqueur le plus récent, tous agents confondus. Dans un
-        flux sans aucun marqueur (agent d'avant L30), les relevés sont du compte
-        primaire et datés par le fichier.
+        Compare turn-marker timestamps across agents. Only a stream without
+        any marker uses the primary account and file modification time.
         """
         best = None
         for agent in self.agents():
@@ -503,29 +501,23 @@ class CostBook:
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
-                mtime = os.stat(path).st_mtime
+                signature = _journal_signature(os.stat(path))
+                cached = self._claude_gauge_cache.get(path)
+                if cached is not None and cached[0] == signature:
+                    readings = cached[1]
+                else:
+                    events, stat, complete = _claude_account_tail(path)
+                    readings = _claude_account_readings(events, stat.st_mtime)
+                    if complete:
+                        self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
+                    else:
+                        self._claude_gauge_cache.pop(path, None)
             except OSError:
+                self._claude_gauge_cache.pop(path, None)
                 continue
-            events = self.events(agent, tail=True)
-            marked = any(e.get("type") == ACCOUNT_MARKER for e in events)
-            current, stamp = primary, (0.0 if marked else mtime)
-            found = None
-            for event in events:
-                kind = event.get("type")
-                if kind == ACCOUNT_MARKER:
-                    if event.get("harness") not in (None, "", "claude"):
-                        continue
-                    current = str(event.get("account") or primary)
-                    try:
-                        stamp = float(event.get("ts") or 0.0)
-                    except (TypeError, ValueError):
-                        stamp = 0.0
-                    continue
-                if kind != "rate_limit_event" or current != account:
-                    continue
-                gauges = _claude_windows(event)
-                if gauges is not None:
-                    found = (stamp, Gauges(gauges, _claude_overage(event)))
+            found = readings.get(account)
+            if found is None and account == primary:
+                found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
         return best[1] if best else []
@@ -1424,6 +1416,122 @@ def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
             return fh.read().decode("utf-8", "ignore")
     except OSError:
         return ""
+
+
+def _is_claude_marker(event: dict) -> bool:
+    return (event.get("type") == ACCOUNT_MARKER
+            and event.get("harness") in (None, "", "claude"))
+
+
+def _last_claude_marker(fh, end: int) -> dict | None:
+    """Find the last complete Claude marker before end by reverse block scan.
+
+    Memory holds one block plus the JSONL line crossing its boundary. Stop at
+    the first matching marker; scan to the beginning to prove a legacy stream.
+    Read failures propagate so callers cannot mistake them for legacy input.
+    """
+    pending: list[bytes] = []
+    while end:
+        start = max(0, end - 64_000)
+        fh.seek(start)
+        block = fh.read(end - start)
+        if len(block) != end - start:
+            raise OSError("Account marker prefix changed during read")
+        lines = block.split(b"\n")
+        if len(lines) > 1:
+            lines[-1] += b"".join(reversed(pending))
+            pending = []
+        if start:
+            pending.append(lines.pop(0))
+        else:
+            lines[0] += b"".join(reversed(pending))
+        for line in reversed(lines):
+            if ACCOUNT_MARKER.encode() not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict) and _is_claude_marker(event):
+                return event
+        end = start
+    return None
+
+
+def _journal_signature(stat) -> tuple:
+    # Inode/device cover replacement; nanosecond ctime covers in-place writes
+    # even when a producer restores mtime. Size detects append/truncation.
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _claude_account_readings(events: list, mtime: float) -> dict:
+    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    marked = any(_is_claude_marker(e) for e in events)
+    current, stamp = None, 0.0 if marked else mtime
+    readings = {}
+    for event in events:
+        if _is_claude_marker(event):
+            current = str(event.get("account") or "") or None
+            try:
+                stamp = float(event.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                stamp = 0.0
+        elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
+            gauges = _claude_windows(event)
+            if gauges is not None:
+                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+    return readings
+
+
+def _claude_account_tail(path: str) -> tuple[list, os.stat_result, bool]:
+    """Read a snapshot tail and recover a preceding marker only if needed.
+
+    A visible marker before every tail reading makes prefix recovery redundant.
+    The final flag allows caching only complete, stable snapshots. Leading
+    readings in a marked stream without a preceding marker stay unknown.
+    """
+    with open(path, "rb") as fh:
+        stat = os.fstat(fh.fileno())
+        start = max(0, stat.st_size - TAIL_BYTES)
+        if start:
+            # Keep complete lines only; the prefix scan includes a marker that
+            # straddles the raw tail boundary.
+            fh.seek(start - 1)
+            if fh.read(1) != b"\n":
+                fh.readline(stat.st_size - start)
+                start = fh.tell()
+        fh.seek(start)
+        raw = fh.read(stat.st_size - start)
+        if len(raw) != stat.st_size - start:
+            raise OSError("Account marker tail changed during read")
+        events = []
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        need_prefix = False
+        for event in events:
+            if _is_claude_marker(event):
+                break
+            if event.get("type") == "rate_limit_event":
+                need_prefix = True
+                break
+        complete = True
+        if start and need_prefix:
+            try:
+                marker = _last_claude_marker(fh, start)
+            except OSError:
+                # Preserve later explicit markers, but ignore the unknown turn.
+                marker = {"type": ACCOUNT_MARKER, "harness": "claude"}
+                complete = False
+            if marker is not None:
+                events.insert(0, marker)
+        if _journal_signature(os.fstat(fh.fileno())) != _journal_signature(stat):
+            raise OSError("Account marker snapshot changed during read")
+        return events, stat, complete
 
 
 def _num(usage: dict, key: str) -> int:

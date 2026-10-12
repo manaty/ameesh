@@ -221,6 +221,15 @@ class Reprise:
         return bilan
 
 
+def _expanduser_in(path: str, env: dict) -> str:
+    """`~` résolu avec le HOME de `env` (l'environnement du tour), pas celui
+    de l'exécuteur (L224, verdict codex #183) ; `~autre` reste à `expanduser`."""
+    home = env.get("HOME")
+    if home and (path == "~" or path.startswith("~/")):
+        return home.rstrip("/") + path[1:] if home != "/" else "/" + path[2:]
+    return os.path.expanduser(path)
+
+
 def worktree_marker(cwd: str | None) -> dict:
     """Identité git d'un dossier de travail (0018 : suivre un renommage).
 
@@ -1471,12 +1480,32 @@ class AgentWorker(threading.Thread):
 
     def _ecarte_session_fille(self, refusee: str) -> None:
         """L166 : le harnais refuse de reprendre `refusee`, session fille
-        (sous-agent, fourche) retenue à tort comme session de l'agent. Le tour
-        suivant repart de la dernière session principale connue (le fichier
-        local, écrit seulement depuis le flux du harnais), sinon d'une session
-        neuve ouverte sur le brief de reprise déterministe. Fencé par le bail."""
+        (sous-agent, fourche) retenue à tort comme session de l'agent."""
+        self._ecarte_session(
+            refusee, motif="session fille %s écartée" % refusee,
+            note="Session %s refusée par le harnais (session fille : sous-agent ou "
+                 "fourche) ; {suite}. Pas compté comme échec rapide." % refusee,
+            action="session-fille")
+
+    def _ecarte_session_inconnue(self, refusee: str, connue) -> None:
+        """L224 : `refusee` n'existe pas dans le stockage de sessions du
+        harnais pour le compte du tour (session d'un autre harnais capturée,
+        session effacée) : jamais de reprise vouée à l'échec en boucle."""
+        self._ecarte_session(
+            refusee, motif="session %s inconnue du harnais" % refusee,
+            note="Session %s introuvable dans le stockage de sessions du harnais "
+                 "pour le compte du tour : non reprise ; {suite}." % refusee,
+            action="session-inconnue", connue=connue)
+
+    def _ecarte_session(self, refusee: str, *, motif: str, note: str, action: str,
+                        connue=None) -> None:
+        """Le tour suivant repart de la dernière session principale connue (le
+        fichier local, écrit seulement depuis le flux du harnais ; si `connue`
+        est donné, encore faut-il qu'elle l'accepte), sinon d'une session neuve
+        ouverte sur le brief de reprise déterministe (L39). Fencé par le bail."""
         principale = self.read_session_file()
-        if principale == refusee:
+        if principale == refusee or (principale and connue is not None
+                                     and not connue(principale)):
             principale = None
         if principale:
             registry.set_session(self.db, self.name, principale, None)
@@ -1496,7 +1525,7 @@ class AgentWorker(threading.Thread):
                 from . import reprise
                 self.resume_summary = reprise.deterministic_brief(
                     self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
-                    session=refusee, reason="session fille %s écartée" % refusee,
+                    session=refusee, reason=motif,
                     consigne="La consigne de ce tour suit ce brief : reprends ton "
                              "travail à partir de là.")
                 self.resume_origin = "ameesh"
@@ -1507,12 +1536,78 @@ class AgentWorker(threading.Thread):
             self.session_turns = 0
             self.session_tokens = 0.0
             suite = "session neuve ouverte sur le brief de reprise"
-        log_async("[%s] session fille %s écartée : %s" % (self.name, refusee, suite))
-        self._fil_note(
-            "Session %s refusée par le harnais (session fille : sous-agent ou "
-            "fourche) ; %s. Pas compté comme échec rapide." % (refusee, suite),
-            meta={"action": "session-fille", "session": refusee,
-                  "reprise": principale or ""})
+        log_async("[%s] %s : %s" % (self.name, motif, suite))
+        self._fil_note(note.replace("{suite}", suite),
+                       meta={"action": action, "session": refusee,
+                             "reprise": principale or ""})
+
+    #: L224 : harnais dont le stockage de sessions est connu (`reprise.find_session`)
+    SESSION_STORES = ("claude", "codex", "deepseek")
+
+    def _session_connue(self, harness: str, compte, adapter):
+        """L224 : prédicat « cette session existe dans le stockage de sessions
+        du harnais, tel que le tour le verra » ; None quand on ne sait pas le
+        vérifier (autre harnais, compte invalide, `AMEESH_SESSION_STORE_CHECK=0`
+        du banc de test, stockage introuvable).
+
+        Le dossier du harnais se résout comme au lancement : environnement de
+        l'exécuteur, puis `adapter.env()` (un descripteur peut poser
+        `CLAUDE_CONFIG_DIR` ou `CODEX_HOME`), puis le compte du tour
+        (`accounts.launch_env`) ; `~` se lit avec le HOME de cet environnement.
+        Le prédicat ne dit « inconnue » que si la session n'est ni là, ni sous
+        un autre compte déclaré du harnais : dans le doute (stockage
+        introuvable, recherche incomplète), la session est gardée (verdict
+        codex #183) — une reprise ratée est rattrapée, un faux négatif efface
+        une vraie session."""
+        if (harness not in self.SESSION_STORES or compte is account_turn.INVALID
+                or os.environ.get("AMEESH_SESSION_STORE_CHECK") == "0"):
+            return None
+        from . import accounts, reprise
+        try:
+            env = os.environ.copy()
+            env.update(adapter.env())  # même ordre que le lancement du tour
+            declared = accounts.parse(getattr(self.cfg, "accounts", None) or {})
+            if declared:
+                accounts.launch_env(env, declared, compte)
+            variable = accounts.config_env_of(harness)
+            home = os.path.abspath(_expanduser_in(
+                (env.get(variable) if variable else "")
+                or accounts.default_home_of(harness), env))
+            autres = [h for _nom, h in reprise.search_homes(self.cfg, harness)
+                      if os.path.abspath(h) != home]
+        except Exception as exc:  # configuration illisible : on ne sait pas
+            self._avertit_session("dossier du harnais %s non résolu (%s)" % (harness, exc))
+            return None
+        if not os.path.isdir(reprise.session_root(harness, home)):
+            self._avertit_session("stockage de sessions %s introuvable"
+                                  % reprise.session_root(harness, home))
+            return None
+
+        def connue(session: str) -> bool:
+            try:
+                if reprise.find_session(harness, home, session, strict=True):
+                    return True
+                for autre in autres:
+                    if reprise.find_session(harness, autre, session, strict=True):
+                        self._avertit_session(
+                            "session %s trouvée sous %s, pas sous %s (dossier du tour) : "
+                            "gardée" % (session, autre, home))
+                        return True
+            except reprise.SessionSearchIncomplete as exc:
+                # stockage momentanément illisible : introuvable n'est pas établi
+                self._avertit_session("recherche de la session %s incomplète (%s) : "
+                                      "gardée" % (session, exc))
+                return True
+            return False
+        return connue
+
+    def _avertit_session(self, texte: str) -> None:
+        """L224 : un doute sur la session est dit une fois par texte (pas à
+        chaque tour), et la session est gardée."""
+        dits = self.__dict__.setdefault("_avertissements_session", set())
+        if texte not in dits:
+            dits.add(texte)
+            log_async("[%s] vérification de session impossible : %s" % (self.name, texte))
 
     # -- hôte non prêt (L106) ------------------------------------------------
     #: statut et préfixe d'erreur d'un blocage « hôte non prêt » (levé seulement
@@ -2734,6 +2829,14 @@ class AgentWorker(threading.Thread):
 
         compte = account_turn.for_turn(self)  # L30 : compte de ce tour (ou None)
         session = self.current_session()
+        connue = (self._session_connue(harness, compte, adapter)
+                  if session and not self.runner.dry_run else None)
+        if connue is not None and not connue(session):
+            # L224 : jamais de --resume sur un id inconnu du harnais et du
+            # compte — le harnais échouerait à chaque tour (échecs rapides,
+            # puis arrêt) ; dernière session principale connue, sinon brief.
+            self._ecarte_session_inconnue(session, connue)
+            session = self.current_session()
         resume = ""
         if self.resume_summary and not session:
             # Session neuve après rotation (0018) : le résumé de reprise, encadré
@@ -2805,6 +2908,9 @@ class AgentWorker(threading.Thread):
             "AGENT_MAIL_STATE": self.cfg.v0_state,
             "AGENT_MAIL_CONFIG": self.cfg.config_dir,
             "AMEESH_TURN_ID": turn_id,
+            # L224 : le hook d'un autre harnais lancé pendant le tour (codex
+            # exec sous claude) est refusé
+            "AMEESH_HARNESS": harness,
             containers_mod.LABELS_ENV: turn_label,
             # Noms courants (ameesh) — et les anciens en alias, pour que
             # l'outillage agent-mesh d'hier continue de fonctionner.
@@ -4082,6 +4188,7 @@ class Runner:
 
     def _housekeeping_pass(self) -> dict | None:
         from . import menage as menage_mod
+        from . import build_artifacts
         from . import resources as resources_mod
         db = None
         try:
@@ -4094,7 +4201,9 @@ class Runner:
             report = menage_mod.run_pass(
                 self.cfg, db, self.housekeeping_policy(), host=self.host,
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
-                runtime=self.container_runtime())
+                runtime=self.container_runtime(),
+                # L230: the worktrees are walked at most every few hours
+                artifact_scan=build_artifacts.due(time.time()))
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("ménage : %s" % " ; ".join(
@@ -4672,7 +4781,8 @@ def attach_owner(host: str) -> str:
     return "attach:%s@%s" % (getpass.getuser(), host)
 
 
-def _attach_env(cfg: Config, name: str, owner: str, epoch: int) -> dict:
+def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
+                harness: str = "") -> dict:
     """L'identité que le harnais interactif transmet à ses hooks."""
     env = os.environ.copy()
     env.update({
@@ -4686,6 +4796,8 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int) -> dict:
         "AMEESH_RUNNER_ID": owner, "AGENT_MESH_RUNNER_ID": owner,
         "AMEESH_LEASE_EPOCH": str(epoch), "AGENT_MESH_LEASE_EPOCH": str(epoch),
     })
+    if harness:
+        env["AMEESH_HARNESS"] = harness  # L224 : comme pour un tour
     return env
 
 
@@ -4747,6 +4859,22 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
         if proc.poll() is None:
             _kill_group(proc)
     log_async("[%s] harnais arrêté (%s)" % (name or "?", reason))
+
+
+def _attach_permission_mode(cfg: Config, name: str) -> str:
+    """L223: the permission mode set for the agent (`ameesh set <agent>
+    permission_mode=…`, local state of its host), '' when unset; an unreadable
+    setting (permissions, invalid bytes) is ignored with a warning."""
+    path = os.path.join(cfg.agent_dir(name), "permission_mode")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError
+        print("ameesh attach: unreadable permission_mode setting (%s: %s), ignored"
+              % (path, exc), file=sys.stderr)
+        return ""
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
@@ -4842,20 +4970,24 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             stop.wait(max(0.05, min(0.5, reste)))
 
     thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
-    thread.start()
     veille = threading.Thread(target=veilleur, daemon=True, name="%s-attach-veilleur" % name)
-    veille.start()
-    argv = adapter.interactive_command(agent.get("session_id"))
-    env = _attach_env(cfg, name, owner, epoch)
-    env.update(adapter.env())
-    holds: list = []
-    env.update(_attach_tmp_env(cfg, name, env, holds))
-    cwd = agent.get("cwd") or None
-    if cwd and not os.path.isdir(cwd):
-        cwd = None
     proc: subprocess.Popen | None = None
     code = 0
+    holds: list = []
     try:
+        # codex verdict #182 (P2): everything after taking the lease is under the
+        # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
+        # slow `claude --help`) still releases the lease
+        thread.start()
+        veille.start()
+        argv = adapter.interactive_command(agent.get("session_id"),
+                                           permission_mode=_attach_permission_mode(cfg, name))
+        env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
+        env.update(adapter.env())
+        env.update(_attach_tmp_env(cfg, name, env, holds))
+        cwd = agent.get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
             return 1  # le `finally` rend le bail
         log_async("[%s] session interactive : %s" % (name, " ".join(argv)))
@@ -4874,12 +5006,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         if proc is not None:
             stop_group_now(proc, "interruption (attach)", name=name)
             code = proc.wait()
+        else:
+            code = 130  # interrupted before the harness was launched
     finally:
         stop.set()
         for hold in holds:          # L219: the session is over
             hold.release()
-        thread.join(timeout=5)
-        veille.join(timeout=5)
+        for worker in (thread, veille):
+            if worker.ident is not None:    # started (L223)
+                worker.join(timeout=5)
         try:
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:

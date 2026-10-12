@@ -1,207 +1,207 @@
-# `ameesh progress` — schéma `ameesh-progress/1`
+# `ameesh progress` — `ameesh-progress/1` schema
 
-Vue temps réel de l'avancement (lot L24, décision
-[0024](design/decisions/0024-vue-temps-reel.md)) : lots sur une frise, agents,
-jalons et budget, **alimentés par ce qu'ameesh enregistre lui-même** —
-transitions des lots (`work_items`, `work_item_events`), actions sous porte
-(`actions`), tours et baux du registre (`agent_registry`, `spend_pending`),
-grand livre des coûts (`turn_costs`). Ni git ni le board ne sont lus.
+Real-time view of progress (lot L24, decision
+[0024](design/decisions/0024-vue-temps-reel.md)): lots on a timeline, agents,
+milestones and budget, **fed by what ameesh records itself** —
+lot transitions (`work_items`, `work_item_events`), gated actions
+(`actions`), turns and leases from the registry (`agent_registry`, `spend_pending`),
+cost ledger (`turn_costs`). Neither git nor the board is read.
 
 ```
-ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # texte, terminal étroit
-ameesh progress --json [--project P] [--since 24h]   # ce schéma
+ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # text, narrow terminal
+ameesh progress --json [--project P] [--since 24h]   # this schema
 ameesh progress --html FICHIER [--project P] [--since 24h]
-ameesh progress … --no-gantt                         # sans la feuille de route (L96)
+ameesh progress … --no-gantt                         # without the roadmap (L96)
 ```
 
-* **Feuille de route** (L96) : la frise des epics, jalons, tâches,
-  engagements et décisions attendues, prévu face au réel, est **affichée par
-  défaut** (texte : section FEUILLE DE ROUTE après PROJETS ; page : section
-  « Feuille de route » avec un bouton « masquer », mémorisé par le
-  navigateur ; JSON : clé `roadmap`). `--no-gantt` la retire (`roadmap:
-  null`). Sa fenêtre est la sienne (jours), pas `--since`.
+* **Roadmap** (L96): the timeline of epics, milestones, tasks,
+  commitments and pending decisions, planned versus actual, is **shown by
+  default** (text: FEUILLE DE ROUTE (ROADMAP) section after PROJETS; page: section
+  "Feuille de route" (Roadmap) with a "masquer" (hide) button, remembered by the
+  browser; JSON: `roadmap` key). `--no-gantt` removes it (`roadmap:
+  null`). Its window is its own (days), not `--since`.
 
-* `--since` : début de la fenêtre, durée (`90m`, `16h`, `2d`/`2j`) ou date
-  ISO 8601 (`2026-10-05`, `2026-10-05T08:00Z` ; sans fuseau = heure locale).
-  Défaut `24h`.
-* `--stale-after D` (L29) : un lot non fusionné sans activité depuis `D` est
-  stagnant (défaut `AMEESH_STALE_AFTER`, sinon `6h`).
-* `--project P` : lots dont `app` ou `workstream` vaut `P` ; actions du projet
-  `P` (et celles liées à ces lots) ; agents dont `chantier` ou `team` vaut
-  `P` ; coûts de ces agents.
-* `--html FICHIER` : page statique **autonome** (CSS et script en ligne,
-  données embarquées, politique `default-src 'none'` : aucune requête
-  réseau, aucune police ni CDN), lisible sur téléphone. Aucun serveur :
-  ouvrez le fichier, ou copiez-le où vous voulez. Écriture atomique (fichier
-  temporaire puis renommage), régénérer = relancer la commande.
+* `--since`: start of the window, a duration (`90m`, `16h`, `2d`/`2j`) or an
+  ISO 8601 date (`2026-10-05`, `2026-10-05T08:00Z`; no time zone = local time).
+  Default `24h`.
+* `--stale-after D` (L29): an unmerged lot with no activity for `D` is
+  stale (default `AMEESH_STALE_AFTER`, otherwise `6h`).
+* `--project P`: lots whose `app` or `workstream` is `P`; actions of project
+  `P` (and those linked to these lots); agents whose `chantier` or `team` is
+  `P`; costs of these agents.
+* `--html FICHIER`: **self-contained** static page (inline CSS and script,
+  embedded data, `default-src 'none'` policy: no network
+  request, no font or CDN), readable on a phone. No server:
+  open the file, or copy it wherever you want. Atomic write (temporary
+  file then rename); to regenerate, rerun the command.
 
-Codes de sortie : 0, 1 (base injoignable, schéma absent, erreur SQL),
-2 (option illisible).
+Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
+2 (unreadable option).
 
 ## Conventions
 
-* Instants : secondes epoch UTC (nombres), clés suffixées `_ts`, ou `null`
-  quand l'instant n'est pas connu. Durées en secondes (`_s`).
-* Montants : dollars US (`_usd`), estimations comprises (voir `budget`).
-* Une donnée qu'ameesh n'a pas est `null` ou une liste vide, jamais devinée ;
-  `missing` dit en clair ce qui manque.
-* Compatibilité : un champ peut être **ajouté** sans changer de version ;
-  retirer ou changer le sens d'un champ fait passer à `ameesh-progress/2`.
+* Instants: UTC epoch seconds (numbers), keys suffixed `_ts`, or `null`
+  when the instant is not known. Durations in seconds (`_s`).
+* Amounts: US dollars (`_usd`), estimates included (see `budget`).
+* Data ameesh does not have is `null` or an empty list, never guessed;
+  `missing` states plainly what is missing.
+* Compatibility: a field may be **added** without changing the version;
+  removing a field or changing its meaning moves to `ameesh-progress/2`.
 
-## Racine
+## Root
 
-| Clé | Type | Sens |
+| Key | Type | Meaning |
 |---|---|---|
-| `schema` | `"ameesh-progress/1"` | version du schéma |
-| `generated_ts`, `generated_at` | nombre, texte ISO (UTC, `Z`) | instant de l'instantané |
-| `host` | texte | hôte qui a produit l'instantané |
-| `project` | texte \| null | filtre `--project` |
-| `window` | `{from_ts, to_ts}` | fenêtre de la frise |
-| `roadmap` | objet \| null | (L96) la feuille de route, schéma `ameesh-roadmap/1` ([EXPLOITATION.md](EXPLOITATION.md), « Feuille de route ») ; `null` avec `--no-gantt` |
-| `projects` | liste | (L62) la vue par projet de `ameesh projects` (schéma des éléments : `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)) ; filtrée par `--project` sur le nom du projet ; en tête du texte et de la page |
-| `lots` | liste | voir ci-dessous, du plus ancien au plus récent |
-| `agents` | liste | voir ci-dessous, par nom |
-| `milestones` | liste | jalons du projet : fiches `WorkPackage` `milestone` du canon (L29) |
-| `epics` | liste | (L29) lots regroupés par epic du plan, avec la progression |
-| `stale_after_s` | entier | (L29) seuil de stagnation appliqué, en secondes |
-| `actions` | liste | actions de la fenêtre |
-| `budget` | objet | dépense et jauges |
-| `truncated` | objet | bornes de rendu atteintes : `{lots?, actions?}`, chacun `{shown, total, limit}` ; `{}` si rien n'est coupé |
-| `missing` | liste de textes | données que la vue ne sait pas (encore) lire |
+| `schema` | `"ameesh-progress/1"` | schema version |
+| `generated_ts`, `generated_at` | number, ISO text (UTC, `Z`) | instant of the snapshot |
+| `host` | text | host that produced the snapshot |
+| `project` | text \| null | `--project` filter |
+| `window` | `{from_ts, to_ts}` | timeline window |
+| `roadmap` | object \| null | (L96) the roadmap, `ameesh-roadmap/1` schema ([EXPLOITATION.md](EXPLOITATION.md), "Feuille de route" (roadmap) section); `null` with `--no-gantt` |
+| `projects` | list | (L62) the per-project view of `ameesh projects` (item schema: `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)); filtered by `--project` on the project name; at the top of the text and the page |
+| `lots` | list | see below, oldest to newest |
+| `agents` | list | see below, by name |
+| `milestones` | list | project milestones: `WorkPackage` `milestone` cards in the canon (L29) |
+| `epics` | list | (L29) lots grouped by plan epic, with progress |
+| `stale_after_s` | integer | (L29) stagnation threshold applied, in seconds |
+| `actions` | list | actions in the window |
+| `budget` | object | spending and gauges |
+| `truncated` | object | rendering limits reached: `{lots?, actions?}`, each `{shown, total, limit}`; `{}` if nothing is cut |
+| `missing` | list of texts | data the view cannot (yet) read |
 
 ## `lots[]`
 
-Un lot figure s'il est ouvert (ni `merged` ni `promoted`) ou modifié dans la
-fenêtre. Borne de rendu : 500 lots, les ouverts d'abord puis les plus
-récemment modifiés (coupure signalée dans `truncated.lots`) ; la liste est
-rendue dans l'ordre de création. Les jalons et l'état d'un lot affiché sont
-lus sans borne (journal complet, toutes ses actions).
+A lot is included if it is open (neither `merged` nor `promoted`) or modified in the
+window. Rendering limit: 500 lots, open ones first then the most
+recently modified (cut reported in `truncated.lots`); the list is
+rendered in creation order. The milestones and state of a displayed lot are
+read without limit (full log, all its actions).
 
-| Clé | Sens |
+| Key | Meaning |
 |---|---|
-| `id`, `title`, `type`, `project` (`app`), `workstream`, `issue_ref` | identité du lot |
-| `state` | `active` \| `review` \| `blocked` \| `approved` \| `merged` \| `closed` (L29 : abandonné ou remplacé) |
-| `work_state` | état brut de `work_items` (`intake`, `build`, `qa`, `merged`, `promoted`, `blocked`, `waiting_human`, `closed`) |
-| `milestones` | `{requested, frozen, verdict, merged}` : instants, `null` si inconnus |
-| `last_frozen_ts` | dernier gel (différent de `milestones.frozen`, le premier, si le lot a été regelé) |
-| `verdict` | verdict retenu (le plus récent) : `ok` \| `blocked` \| null |
-| `milestones_source` | `milestones` (table des jalons de lot, L10) \| `events` (déduction) |
-| `blocked_verdicts` | nombre de verdicts bloquants (entier ; null si la source ne le sait pas) |
-| `blocks` | nombre de mises en attente (`blocked`, `waiting_human`) |
-| `assignee`, `reviewer` | auteur ; auteur du verdict retenu (approbateur pour une action de fusion) |
-| `qa_loops` | allers-retours `qa → build` comptés par `work_items` |
-| `updated_ts`, `budget_usd`, `spent_usd` | dernière modification, budget du lot |
-| `actions` | ids des actions liées au lot |
-| `package`, `epic` | (L29) fiche WorkPackage du lot et son epic, ou null |
-| `pr_ref` | (L29) PR dont la fusion a fermé le lot, ou null |
-| `closed` | (L29) `{reason: abandoned\|superseded, superseded_by, at_ts}` pour un lot fermé, sinon null |
-| `waiting_for` | (L29) ce que le lot attend et de qui : `{what, who, label}` (`what` : start, build, verdict, fix, merge-approval, merge, merge-outcome, decision, unblock ; `who` null quand ameesh ne le sait pas) ; null pour un lot fusionné ou fermé |
-| `last_activity_ts` | (L29) dernière transition, note, jalon ou action |
-| `stale` | (L29) `{since_ts, idle_s, threshold_s}` si le lot non fermé n'a aucune activité depuis le seuil, sinon null ; la page ne le dessine plus actif |
-| `delegation` | (L40, 0030) délégation à échéance (`ameesh work delegate`) : `{delegated_by, delegate, delegated_ts, due_ts, due_in_s, overdue, settled, label}` — `due_in_s` négatif en retard, `due_ts` null et `settled` vrai quand la délégation est soldée (le délégué a travaillé), `label` : « délégué par X, échéance dans 12 min » / « délégué par X, en retard de 5 min » ; null hors délégation et pour un lot fusionné ou fermé (voir [EXPLOITATION.md](EXPLOITATION.md)) |
-| `estimate` | (L157) durée estimée et réel mesuré : `{minutes, source, by, at_ts, started_ts, finished_ts, actual_minutes, elapsed_minutes, ratio, gap_minutes, overrun, label}` — début = premier passage en build (ou qa) ou premier tour de l'assigné, fin = fusion ; `elapsed_minutes` en cours, `actual_minutes` une fois livré ; `label` : « estimé 2 h · réel 2 h 40 (+40 min, ×1,33) » (voir [EXPLOITATION.md](EXPLOITATION.md), « Durée estimée et durée réelle des lots ») |
+| `id`, `title`, `type`, `project` (`app`), `workstream`, `issue_ref` | identity of the lot |
+| `state` | `active` \| `review` \| `blocked` \| `approved` \| `merged` \| `closed` (L29: abandoned or superseded) |
+| `work_state` | raw state from `work_items` (`intake`, `build`, `qa`, `merged`, `promoted`, `blocked`, `waiting_human`, `closed`) |
+| `milestones` | `{requested, frozen, verdict, merged}`: instants, `null` if unknown |
+| `last_frozen_ts` | last freeze (different from `milestones.frozen`, the first one, if the lot was refrozen) |
+| `verdict` | retained verdict (the most recent): `ok` \| `blocked` \| null |
+| `milestones_source` | `milestones` (lot milestones table, L10) \| `events` (deduction) |
+| `blocked_verdicts` | number of blocking verdicts (integer; null if the source does not know) |
+| `blocks` | number of holds (`blocked`, `waiting_human`) |
+| `assignee`, `reviewer` | author; author of the retained verdict (approver for a merge action) |
+| `qa_loops` | `qa → build` round trips counted by `work_items` |
+| `updated_ts`, `budget_usd`, `spent_usd` | last modification, lot budget |
+| `actions` | ids of the actions linked to the lot |
+| `package`, `epic` | (L29) WorkPackage card of the lot and its epic, or null |
+| `pr_ref` | (L29) PR whose merge closed the lot, or null |
+| `closed` | (L29) `{reason: abandoned\|superseded, superseded_by, at_ts}` for a closed lot, otherwise null |
+| `waiting_for` | (L29) what the lot is waiting for and from whom: `{what, who, label}` (`what`: start, build, verdict, fix, merge-approval, merge, merge-outcome, decision, unblock; `who` null when ameesh does not know); null for a merged or closed lot |
+| `last_activity_ts` | (L29) last transition, note, milestone or action |
+| `stale` | (L29) `{since_ts, idle_s, threshold_s}` if the unclosed lot has had no activity since the threshold, otherwise null; the page no longer draws it as active |
+| `delegation` | (L40, 0030) delegation with a deadline (`ameesh work delegate`): `{delegated_by, delegate, delegated_ts, due_ts, due_in_s, overdue, settled, label}` — `due_in_s` negative when overdue, `due_ts` null and `settled` true when the delegation is settled (the delegate has worked), `label`: "délégué par X, échéance dans 12 min" (delegated by X, due in 12 min) / "délégué par X, en retard de 5 min" (delegated by X, 5 min overdue); null outside delegation and for a merged or closed lot (see [EXPLOITATION.md](EXPLOITATION.md)) |
+| `estimate` | (L157) estimated duration and measured actual: `{minutes, source, by, at_ts, started_ts, finished_ts, actual_minutes, elapsed_minutes, ratio, gap_minutes, overrun, label}` — start = first move to build (or qa) or first turn of the assignee, end = merge; `elapsed_minutes` while in progress, `actual_minutes` once delivered; `label`: "estimé 2 h · réel 2 h 40 (+40 min, ×1,33)" (estimated 2 h · actual 2 h 40 (+40 min, ×1.33)) (see [EXPLOITATION.md](EXPLOITATION.md), "Durée estimée et durée réelle des lots" (estimated and actual lot duration)) |
 
-Jalons (fonction unique `progress._jalons_de_lot`). Source : la table des
-jalons de lot (L10, `work_item_milestones`) quand le lot y a un gel ou un verdict
-**déclaré** (tous les instants viennent alors de la table) ; sinon
-déduction depuis le journal des transitions :
+Milestones (single function `progress._jalons_de_lot`). Source: the lot
+milestones table (L10, `work_item_milestones`) when the lot has a **declared** freeze or verdict
+there (all instants then come from the table); otherwise
+deduction from the transition log:
 
-* `requested` : création du lot ;
-* `frozen` (gel) : premier gel déclaré, sinon première entrée en `qa` ;
-* `verdict` : verdict retenu, le plus récent — verdict déclaré, sinon sortie de
-  `qa` vers `merged` (`ok`) ou vers `build` (`blocked`) ; l'approbation de
-  l'action `git-merge` du lot compte comme un verdict `ok` ;
-* `merged` : jalon de fusion, sinon première entrée en `merged`, sinon fin
-  confirmée de l'action `git-merge`.
+* `requested`: creation of the lot;
+* `frozen` (freeze): first declared freeze, otherwise first entry into `qa`;
+* `verdict`: retained verdict, the most recent — declared verdict, otherwise exit from
+  `qa` to `merged` (`ok`) or to `build` (`blocked`); approval of the
+  lot's `git-merge` action counts as an `ok` verdict;
+* `merged`: merge milestone, otherwise first entry into `merged`, otherwise confirmed
+  end of the `git-merge` action.
 
-État : `merged` (`merged`/`promoted`) ; `blocked` (`blocked`/`waiting_human`) ;
-en `qa`, `approved` si le verdict retenu est `ok` et postérieur au **dernier**
-gel, sinon `review` (un lot regelé repasse en revue) ; `active` sinon
+State: `merged` (`merged`/`promoted`); `blocked` (`blocked`/`waiting_human`);
+in `qa`, `approved` if the retained verdict is `ok` and later than the **last**
+freeze, otherwise `review` (a refrozen lot goes back to review); `active` otherwise
 (`intake`, `build`).
 
 ## `agents[]`
 
-| Clé | Sens |
+| Key | Meaning |
 |---|---|
-| `name`, `harness`, `model`, `host`, `project` (`team`, sinon `chantier`) | identité |
-| `effort` | réglage `ameesh set … effort=` ; **null** = défaut du harnais ou inconnu (réglage local d'un autre hôte) |
+| `name`, `harness`, `model`, `host`, `project` (`team`, otherwise `chantier`) | identity |
+| `effort` | `ameesh set … effort=` setting; **null** = harness default or unknown (local setting of another host) |
 | `state` | `working` \| `idle` \| `paused` \| `stopped` |
-| `status`, `status_text` | statut brut du registre et son texte (raison d'une pause) |
-| `since_ts` | début du tour en cours (`working`), fin du dernier tour (`idle`), dernière mise à jour sinon |
-| `turn` | tour en cours ou null : `{started_ts, duration_s, label, task}` (`task` = consigne en cours, tronquée à 140 caractères) |
-| `turns`, `unread`, `pending_prompt`, `lease_live` | tours comptés, non-lus, consigne en attente, bail vivant |
-| `mode`, `stop_reason` | `execute` \| `externe` ; raison d'arrêt structurée quand l'état est `stopped`, sinon `null` (L37, décision 0030) |
+| `status`, `status_text` | raw registry status and its text (reason for a pause) |
+| `since_ts` | start of the current turn (`working`), end of the last turn (`idle`), last update otherwise |
+| `turn` | current turn or null: `{started_ts, duration_s, label, task}` (`task` = current prompt, truncated to 140 characters) |
+| `turns`, `unread`, `pending_prompt`, `lease_live` | turns counted, unread, pending prompt, live lease |
+| `mode`, `stop_reason` | `execute` \| `externe`; structured stop reason when the state is `stopped`, otherwise `null` (L37, decision 0030) |
 
-État : `running` sous bail vivant → `working` ; `running` sans bail vivant,
-`stopped`, `dead` → `stopped` ; `blocked` (pause budget ou comptable de L13)
-→ `paused` ; `idle`, `queued` → `idle`. Le début du tour vient du marqueur
-comptable posé avant chaque tour (`spend_pending`).
+State: `running` under a live lease → `working`; `running` without a live lease,
+`stopped`, `dead` → `stopped`; `blocked` (budget or L13 accounting pause)
+→ `paused`; `idle`, `queued` → `idle`. The turn start comes from the accounting
+marker set before each turn (`spend_pending`).
 
 ## `milestones[]`
 
-Jalons du **projet** déclarés au canon (fiches `WorkPackage` de sorte
-`milestone`, L29, [plan de travail](PLAN-DE-TRAVAIL.md)) : `{id, title,
+**Project** milestones declared in the canon (`WorkPackage` cards of kind
+`milestone`, L29, [work plan](PLAN-DE-TRAVAIL.md)): `{id, title,
 at_ts, date, status, responsible, canon_ref, epics, lots_total, lots_merged,
-lots_abandoned, lots_open, lots_pending, progress}`. L96 : `date` est le jour
-du jalon (ISO) — posé par `ameesh work plan <fiche> --livraison J`, sinon
-déclaré au canon (`date` ou `delivery`) — et `at_ts` son minuit local ; null
-sans date. Vide sans plan synchronisé.
+lots_abandoned, lots_open, lots_pending, progress}`. L96: `date` is the day
+of the milestone (ISO) — set by `ameesh work plan <fiche> --livraison J`, otherwise
+declared in the canon (`date` or `delivery`) — and `at_ts` its local midnight; null
+without a date. Empty without a synchronized plan.
 
 ## `epics[]` (L29)
 
 `{id, title, milestone, responsible, status, canon_ref, planned, lots,
 work_items, lots_total, lots_merged, lots_abandoned, lots_open, lots_pending,
-progress}`. `planned` (L96) : `{start, end, delivery, source}` — dates
-prévues effectives (posées dans ameesh, sinon au canon ; `source` :
-`ameesh`, `canon`, `mixte` ou null). Les unités d'un epic sont ses fiches `lot` (`lots[]` :
-`{id, title, status, work_items}`, statut `pending` sans lot créé, `open`,
-`merged`, `abandoned`) et les lots rattachés directement à l'epic
-(`work_items`). `progress` = fusionnées / (total − abandonnées), null si
-aucune ; calculé sur tous les lots, hors fenêtre.
+progress}`. `planned` (L96): `{start, end, delivery, source}` — effective planned
+dates (set in ameesh, otherwise in the canon; `source`:
+`ameesh`, `canon`, `mixte` or null). The units of an epic are its `lot` cards (`lots[]`:
+`{id, title, status, work_items}`, status `pending` with no lot created, `open`,
+`merged`, `abandoned`) and the lots attached directly to the epic
+(`work_items`). `progress` = merged / (total − abandoned), null if
+none; computed over all lots, regardless of the window.
 
 ## `actions[]`
 
 `{id, project, work_item, connector, operation, class, state, proposed_by,
 attempts, created_ts, approved_ts, launched_ts, finished_ts}` — actions
-modifiées dans la fenêtre ou non terminales (`proposed`, `approved`,
-`launched`, `unknown`). Borne de rendu : 500, les non terminales d'abord
-(coupure signalée dans `truncated.actions`). Les actions d'un lot affiché
-sont toujours dans son champ `actions`, même au-delà de la borne.
+modified in the window or non-terminal (`proposed`, `approved`,
+`launched`, `unknown`). Rendering limit: 500, non-terminal ones first
+(cut reported in `truncated.actions`). The actions of a displayed lot
+are always in its `actions` field, even beyond the limit.
 
 ## `budget`
 
-| Clé | Sens |
+| Key | Meaning |
 |---|---|
 | `currency` | `"USD"` |
-| `paid_harnesses` | harnais payés au token (dépense réelle) ; les autres sont des forfaits dont le coût est une estimation |
-| `hourly_cap_usd` | plafond horaire de l'usage payé au token (décision 0019) |
-| `limits` | L70 : plafonds en vigueur et leur source (`base`, `config`, `défaut`) — même forme que `limits` de `ameesh budget --json` ; null sans configuration |
-| `spend` | `{window, 1h, 24h}`, chacun `{paid_usd, plan_value_usd, total_usd}` : `paid_usd` = **dépensé** (payé au token, estimé tour par tour) ; `plan_value_usd` (L95) = **valeur consommée sur les forfaits**, équivalent théorique au barème qui ne coûte rien de plus par tour ; `total_usd` = leur somme, gardée pour les lecteurs d'avant L95 mais à ne plus afficher |
-| `real` | L95 : dépense **réelle** tirée des relevés de solde (`ameesh cost balance`), face à l'estimation, une entrée par (fournisseur, devise, période) : `{provider, currency, period (24h, ou window si la fenêtre n'est pas de 24 h), real_spent, topups, estimated_usd, gap_usd, alert, start_ts, end_ts, readings, accounts}` — voir ci-dessous |
-| `by_agent` | `{agent, harness, model, paid, usd, turns, failed_turns, input_tokens, fresh_input_tokens, cached_input_tokens, output_tokens}` sur la fenêtre. L95 : `turns` ne compte que les tours qui ont consommé quelque chose ; `failed_turns` les tours sans aucun usage (échec du harnais, tour interrompu : 0 $ et 0 jeton) ; `fresh_input_tokens` l'entrée hors cache (Codex compte le cache dans `input_tokens`) |
-| `plans` | jauges de forfait lues sur l'hôte : `{harness, key, used, pace_cap, elapsed, resets_ts, window_s, exceeded}` (fractions 0..1) |
-| `accounts` | L95 : chaque compte déclaré de l'hôte (`ameesh accounts list`), avec **toutes** ses fenêtres : `{harness, account, active, forced, ok, reason, next, why, expires_in_s, gauges: [{key, used, last_used, pace_cap, elapsed, resets_ts, reset_passed}], losses: [{key, resets_ts, in_s, lost}]}` ; `losses` = capacité perdue à la prochaine remise à zéro si rien ne change, `next` = compte que prendrait une nouvelle session (L74, décision 0034) ; vide sans comptes déclarés |
+| `paid_harnesses` | harnesses paid per token (actual spending); the others are plans whose cost is an estimate |
+| `hourly_cap_usd` | hourly cap on per-token paid usage (decision 0019) |
+| `limits` | L70: caps in force and their source (`base`, `config`, `défaut`) — same shape as `limits` in `ameesh budget --json`; null without configuration |
+| `spend` | `{window, 1h, 24h}`, each `{paid_usd, plan_value_usd, total_usd}`: `paid_usd` = **spent** (paid per token, estimated turn by turn); `plan_value_usd` (L95) = **value consumed on plans**, theoretical list-price equivalent that costs nothing extra per turn; `total_usd` = their sum, kept for pre-L95 readers but no longer to be displayed |
+| `real` | L95: **actual** spending drawn from balance readings (`ameesh cost balance`), versus the estimate, one entry per (provider, currency, period): `{provider, currency, period (24h, or window if the window is not 24 h), real_spent, topups, estimated_usd, gap_usd, alert, start_ts, end_ts, readings, accounts}` — see below |
+| `by_agent` | `{agent, harness, model, paid, usd, turns, failed_turns, input_tokens, fresh_input_tokens, cached_input_tokens, output_tokens}` over the window. L95: `turns` only counts turns that consumed something; `failed_turns` the turns with no usage at all (harness failure, interrupted turn: $0 and 0 tokens); `fresh_input_tokens` the input outside the cache (Codex counts the cache in `input_tokens`) |
+| `plans` | plan gauges read on the host: `{harness, key, used, pace_cap, elapsed, resets_ts, window_s, exceeded}` (fractions 0..1) |
+| `accounts` | L95: each declared account of the host (`ameesh accounts list`), with **all** its windows: `{harness, account, active, forced, ok, reason, next, why, expires_in_s, gauges: [{key, used, last_used, pace_cap, elapsed, resets_ts, reset_passed}], losses: [{key, resets_ts, in_s, lost}]}`; `losses` = capacity lost at the next reset if nothing changes, `next` = account a new session would take (L74, decision 0034); empty without declared accounts |
 
-**Dépense réelle face à l'estimation (L95).** La baisse des soldes entre deux
-relevés est la dépense réelle (une hausse est une recharge, comptée à part
-dans `topups`). L'estimation `estimated_usd` est la somme du grand livre du
-harnais de même nom sur l'intervalle **réellement couvert** par les relevés
-(`start_ts` → `end_ts`), pas sur la fenêtre demandée. `alert` est vrai quand
-l'écart `gap_usd` (estimé − réel) dépasse à la fois 25 % de la dépense réelle
-(`AMEESH_BUDGET_GAP`, fraction) et 0,50 $ ; une devise autre que l'USD n'est
-pas comparée (`gap_usd` null). Les lignes écartées par `ameesh cost correct`
-(migration 0043) ne comptent nulle part.
+**Actual spending versus the estimate (L95).** The drop in balances between two
+readings is the actual spending (a rise is a top-up, counted separately
+in `topups`). The estimate `estimated_usd` is the sum of the ledger of the
+harness of the same name over the interval **actually covered** by the readings
+(`start_ts` → `end_ts`), not over the requested window. `alert` is true when
+the gap `gap_usd` (estimated − actual) exceeds both 25% of the actual spending
+(`AMEESH_BUDGET_GAP`, fraction) and $0.50; a currency other than USD is
+not compared (`gap_usd` null). Rows set aside by `ameesh cost correct`
+(migration 0043) count nowhere.
 
-La page HTML et la sortie texte n'additionnent jamais `paid_usd` et
-`plan_value_usd` : deux totaux distincts, « dépensé (payé au token) » et
-« valeur consommée sur les forfaits ».
+The HTML page and the text output never add up `paid_usd` and
+`plan_value_usd`: two distinct totals, "dépensé (payé au token)" (spent (paid per token)) and
+"valeur consommée sur les forfaits" (value consumed on plans).
 
-Les jauges et les comptes sont ceux de `ameesh cost` et `ameesh accounts
-list` : lus dans les journaux locaux des harnais **de l'hôte qui produit
-l'instantané** ; leur historique est en base depuis L26
-(`ameesh cost gauges --json`, voir `docs/EXPLOITATION.md`).
+The gauges and accounts are those of `ameesh cost` and `ameesh accounts
+list`: read from the local harness logs **of the host producing
+the snapshot**; their history has been in the database since L26
+(`ameesh cost gauges --json`, see `docs/EXPLOITATION.md`).
 
-## Exemple (abrégé)
+## Example (abridged)
 
 ```json
 {
