@@ -444,11 +444,17 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     btn.title = "open with ameesh progress --serve to refresh";
   }
 
-  var busy = false;
+  // Une requête à la fois, étiquetée (projet + compteur) : un changement de
+  // projet pendant un chargement est gardé en file et relancé à la fin, et
+  // une réponse qui ne correspond plus à la sélection courante est jetée.
+  var busy = false, queued = false, seq = 0;
   function refresh() {
-    if (MODE !== "served" || busy) return;
-    busy = true; btn.disabled = true; status.textContent = "loading…"; status.className = "";
-    fetch(API + "?project=" + encodeURIComponent(S.p || ""),
+    if (MODE !== "served") return;
+    if (busy) { queued = true; return; }
+    busy = true; queued = false; btn.disabled = true; status.textContent = "loading…"; status.className = "";
+    var tag = {p: S.p || "", n: ++seq};
+    function current() { return tag.n === seq && tag.p === (S.p || ""); }
+    fetch(API + "?project=" + encodeURIComponent(tag.p),
           {credentials: "omit", cache: "no-store",
            headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
       .then(function (r) {
@@ -457,13 +463,19 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
         return r.json();
       })
       .then(function (d) {
+        if (!current()) return;
         if (!d || d.schema !== "ameesh-progress/1") throw new Error("unknown schema");
         D = d; status.textContent = ""; renderAll();
-      }, function (e) {
+      })
+      .then(null, function (e) {
+        if (!current()) return;
         status.textContent = D ? "refresh failed: " + e.message + " (previous data kept)" : e.message;
         status.className = "warn";
       })
-      .then(function () { busy = false; btn.disabled = false; });
+      .then(function () {
+        busy = false; btn.disabled = false;
+        if (queued || !current()) refresh();
+      });
   }
 
   function renderHeader() {
