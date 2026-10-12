@@ -213,6 +213,14 @@ def brief(op):
                op["plan"].get("checkpoint_lot") or "none", op["plan"].get("project") or "unclassified"))
 
 
+def _adapter_call(adapter, step, op):
+    """Contain host failures without persisting potentially private diagnostics."""
+    try:
+        return getattr(adapter, step)(op)
+    except Exception:
+        raise HandoffError("host adapter failed: " + step) from None
+
+
 def advance(db, operation, adapter):
     """One recoverable step. L232b supplies the enrolled, idempotent host adapter.
 
@@ -231,22 +239,22 @@ def advance(db, operation, adapter):
     try:
         if op["reserved_until_ts"] <= time.time():
             raise HandoffError("reservation expired; explicit replan required")
-        if adapter.revalidate(op) is not True:
+        if _adapter_call(adapter, "revalidate", op) is not True:
             raise HandoffError("host policy, capacity or credentials changed")
         if state == "prepared":
             return api.drain(operation) or op  # active lot/turn keeps running
         if state == "session_ready":
             return api.switch(operation, cwd=op["evidence"]["cwd"], brief=brief(op)) or op
         if state == "drained":
-            if adapter.stop_source(op) is not True:
+            if _adapter_call(adapter, "stop_source", op) is not True:
                 raise HandoffError("source executor not stopped")
         if state == "activated":
             if op["fenced"]:
                 op = api.unfence(operation, state, state) or api.get(operation)
-            if adapter.enable(op) is not True:
+            if _adapter_call(adapter, "enable", op) is not True:
                 raise HandoffError("destination executor not enabled")
         step, next_state = STEPS[state]
-        proof = _proof(step, getattr(adapter, step)(op), op)
+        proof = _proof(step, _adapter_call(adapter, step, op), op)
         if state == "switched":
             return api.unfence(operation, state, next_state) or api.get(operation)
         if state == "activated":
@@ -269,7 +277,7 @@ def cancel(db, operation, adapter):
         return op
     if state in ("switched", "activated", "verified"):
         raise HandoffError("destination may have new work; recovery requires reconciliation")
-    if adapter.restore_source(op) is not True:
+    if _adapter_call(adapter, "restore_source", op) is not True:
         raise HandoffError("source recovery not verified")
     return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
 
@@ -280,7 +288,7 @@ def retry(db, operation, adapter):
     op = api.get(operation)
     if not op or op["state"] != "held":
         raise HandoffError("only a held operation can be retried")
-    if op["reserved_until_ts"] <= time.time() or adapter.revalidate(op) is not True:
+    if op["reserved_until_ts"] <= time.time() or _adapter_call(adapter, "revalidate", op) is not True:
         raise HandoffError("reservation expired or prerequisites changed")
     previous = op["evidence"].get("held_at")
     if previous not in (*STEPS, "prepared", "session_ready"):

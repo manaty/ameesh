@@ -4,6 +4,8 @@ import os
 import subprocess
 import tempfile
 import time
+import threading
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import handoffs, registry, resources, storage, work
@@ -195,3 +197,49 @@ class HandoffTest(PgTestCase):
         second=handoffs.request(self.db,candidate,repository="git@forge:manaty/app.git")
         self.assertEqual(first["id"],second["id"])
         self.assertEqual(len(self.api.handoffs.events(first["id"])),1)
+
+    def test_adapter_exception_is_held_without_private_diagnostics(self):
+        op = self.drain()
+        with mock.patch.object(self.adapter, "publish", side_effect=RuntimeError("private token")):
+            held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("private token", str(held))
+        self.assertNotIn("private token", str(self.api.handoffs.events(op["id"])))
+        self.assertIsNone(registry.claim(self.db, "dev", "other", ttl_seconds=300))
+        handoffs.retry(self.db, op["id"], self.adapter)
+        for _ in range(6): op = self.advance(op)
+        self.assertEqual(op["state"], "verified")
+
+    def test_enable_exception_fences_target_and_retry_preserves_host(self):
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        self.assertEqual(op["state"], "activated")
+        with mock.patch.object(self.adapter, "enable", side_effect=OSError("private path")):
+            held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertEqual(registry.get(self.db, "dev")["host"], "target")
+        self.assertIsNone(registry.claim(self.db, "dev", "other", ttl_seconds=300))
+        with self.assertRaises(handoffs.HandoffError):
+            handoffs.cancel(self.db, op["id"], self.adapter)
+        handoffs.retry(self.db, op["id"], self.adapter)
+        self.assertEqual(self.advance(op)["state"], "verified")
+
+    def test_worker_reserves_then_stops_only_when_source_fenced(self):
+        from ameesh.runner import AgentWorker
+        worker = SimpleNamespace(
+            runner=SimpleNamespace(relocate=True, handoff_limits_for=lambda host: self.limits),
+            db=self.db, name="dev", agent=registry.get(self.db, "dev"),
+            stopping=threading.Event(), wake=threading.Event())
+        worker.agent["pending_prompt"] = "queued work"
+        with mock.patch("ameesh.runner.subprocess.run", return_value=SimpleNamespace(stdout="git@forge:manaty/app.git")):
+            self.assertFalse(AgentWorker.maybe_relocate(worker, {}))
+        op = self.api.handoffs.active("dev")
+        self.assertEqual(op["state"], "planned")
+        self.assertFalse(worker.stopping.is_set())
+        self.assertEqual(registry.get(self.db, "dev")["host"], "source")
+        self.assertFalse(AgentWorker.maybe_relocate(worker, {}))
+        self.advance(op)
+        self.advance(op)
+        self.assertTrue(AgentWorker.maybe_relocate(worker, {}))
+        self.assertTrue(worker.stopping.is_set())
+        self.assertTrue(worker.wake.is_set())
