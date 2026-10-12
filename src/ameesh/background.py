@@ -483,7 +483,7 @@ class Tracker:
                     entry.capped = reason
                     cut.append(entry)
         for entry in cut:
-            self.log("[%s] travail de fond du tour %s : %s — arrêté au plus tard dans %s"
+            self.log("[%s] background work of turn %s: %s — stopped within %s at the latest"
                      % (entry.agent, entry.turn_id[:8], reason,
                         _minutes(max(0.0, deadline - time.time()))))
         return len(cut)
@@ -593,7 +593,7 @@ class Tracker:
             return "finished %s after the turn ended — %s" % (
                 _minutes((entry.closed or now) - entry.ended), self._what(entry, state=state))
         if state == "expired" and entry.capped:
-            return "arrêté avant l'échéance du délai de grâce (%s) — %s" % (
+            return "stopped before the end of the grace period (%s) — %s" % (
                 entry.capped, self._what(entry, state=state))
         if state == "expired":
             return "stopped when the grace period (%s) ran out — %s" % (
