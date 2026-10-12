@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import fil, projects, storage, watch
@@ -138,6 +139,42 @@ class WatchTest(PgTestCase):
         open(os.path.join(self.units, "ameesh-veille-w121.timer"), "w").close()
         warnings, _ = self.enable()
         self.assertIn("hand-written watch of w121", warnings[0])
+
+    def test_who_sets_the_watch_of_another_agent(self):
+        # mesh-design, 2026-10-12: an agent sets its own watch; another's is
+        # for humans and orchestrator or design agents (the rule of
+        # `work move --correct`)
+        from ameesh import assignments, identity
+        def as_(name, orchestrator=False):
+            return mock.patch.multiple(
+                identity, resolve_binding=mock.Mock(return_value=SimpleNamespace(name=name))), \
+                mock.patch.object(assignments, "is_orchestrator", return_value=orchestrator)
+        def enable():
+            with mock.patch.object(watch.fil, "record"):
+                return watch.enable(self.here, self.db, "w121", 1800, run=self.run_,
+                                    env=self.env)
+        who, role = as_("dev9")
+        with who, role, self.assertRaisesRegex(watch.WatchError, "only its own watch"):
+            enable()
+        self.assertEqual((os.listdir(self.units), self.calls), ([], []))   # nothing done
+        who, role = as_("w121")
+        with who, role:
+            enable()
+        self.assertEqual(storage.of(self.db).watches.list("w121")[0]["enabled_by"], "w121")
+        who, role = as_("dev9")
+        with who, role, self.assertRaises(watch.WatchError):
+            watch.disable(self.here, self.db, "w121", run=self.run_, env=self.env)
+        self.assertEqual(len(storage.of(self.db).watches.list("w121")), 1)
+        who, role = as_("mesh-design", orchestrator=True)
+        with who, role:
+            enable()
+        self.assertEqual(storage.of(self.db).watches.list("w121")[0]["enabled_by"],
+                         "mesh-design")
+        who, role = as_("")
+        with who, role, mock.patch("getpass.getuser", return_value="owner"):
+            enable()
+        self.assertEqual(storage.of(self.db).watches.list("w121")[0]["enabled_by"],
+                         "human:owner")
 
     def test_shown_in_projects(self):
         self.enable()

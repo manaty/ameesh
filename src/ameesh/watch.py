@@ -127,12 +127,26 @@ def _systemctl(run: Callable, *args: str) -> None:
             " ".join(args), proc.returncode, (proc.stderr or "").strip()[:200]))
 
 
-def _actor(cfg: Config) -> str:
-    agent = os.environ.get("AGENT_MAIL_NAME") or ""
-    if agent:
-        return "agent:%s" % agent
-    import getpass
-    return "human:%s" % getpass.getuser()
+def authorize(cfg: Config, db, agent: str) -> str:
+    """Who enables or disables the watch of `agent`; WatchError if refused.
+
+    An agent sets its own watch. The watch of ANOTHER agent is reserved to
+    humans and to orchestrator or design agents, the rule of `work move
+    --correct` (`work.CORRECTOR_ROLES`, `assignments.is_orchestrator`): a
+    watch makes its agent take a turn every period (mesh-design, 2026-10-12).
+    A session with no agent identity is a human at their terminal."""
+    from . import assignments, identity, work
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.name:
+        import getpass
+        return "human:%s" % getpass.getuser()
+    if binding.name == agent \
+            or assignments.is_orchestrator(cfg, db, binding.name, roles=work.CORRECTOR_ROLES):
+        return binding.name
+    raise WatchError(
+        "refused: %s sets only its own watch; the watch of %s is set by a human, an "
+        "orchestrator or a design agent (role on its Agent card in the canon, "
+        "AMEESH_ALERT_ORCHESTRATORS)" % (binding.name, agent))
 
 
 def _note(cfg: Config, db, agent: str, actor: str, text: str, **meta) -> None:
@@ -154,7 +168,7 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
     host = cfg.host or ""
     if not host:
         raise WatchError("this host has no name (host of the configuration)")
-    actor = actor or _actor(cfg)
+    actor = actor or authorize(cfg, db, agent)
     warnings = []
     before = storage.of(db).watches.list(agent)
     if before and before[0]["host"] != host:
@@ -189,7 +203,7 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
 def disable(cfg: Config, db, agent: str, *, run: Callable = subprocess.run,
             env: dict | None = None, actor: str | None = None) -> list[str]:
     """Removes the timer of this host (if any) and the watch; notes it."""
-    actor = actor or _actor(cfg)
+    actor = actor or authorize(cfg, db, agent)
     warnings = []
     directory = unit_dir(env)
     timer = os.path.join(directory, unit_name(agent, "timer"))
