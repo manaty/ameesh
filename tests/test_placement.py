@@ -51,10 +51,10 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
             type="Placement", agent="relecteur", host="nulle-part"))
         loaded = self.load()
         cas = {
-            ("orchestre", "atelier"): "admission ambiguë : orchestre admis 2 fois",
-            ("ouvrier", "atelier"): "hôte atelier non admis pour ouvrier (admis : banc)",
-            ("fantome", "atelier"): "fiche Agent fantome introuvable",
-            ("relecteur", "nulle-part"): "hôte nulle-part sans fiche Host",
+            ("orchestre", "atelier"): "ambiguous admission: orchestre admitted 2 times",
+            ("ouvrier", "atelier"): "host atelier not admitted for ouvrier (admitted: banc)",
+            ("fantome", "atelier"): "Agent card fantome not found",
+            ("relecteur", "nulle-part"): "host nulle-part has no Host card",
         }
         for (agent, host), attendu in cas.items():
             with self.subTest(agent=agent, host=host):
@@ -69,9 +69,9 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
         loaded = self.load()
         verdict = placement.evaluate(loaded, "relecteur", "atelier")
         self.assertIs(verdict.ok, False)
-        self.assertIn("harnais codex non admis par l'hôte atelier", verdict.diagnostic)
+        self.assertIn("harness codex not allowed by host atelier", verdict.diagnostic)
         verdict = placement.evaluate(loaded, "orchestre", "atelier")
-        self.assertIn("mode d'identifiants subscription non admis", verdict.diagnostic)
+        self.assertIn("credential mode subscription not allowed", verdict.diagnostic)
 
     def test_propositions(self):
         loaded = self.load()
@@ -82,14 +82,14 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertEqual(choix["atelier"]["credential_mode"], "subscription")
         self.assertFalse(choix["banc"]["admissible"])
         textes = " ".join(choix["banc"]["reasons"])
-        self.assertIn("harnais claude", textes)
-        self.assertIn("fournisseur anthropic", textes)
+        self.assertIn("harness claude", textes)
+        self.assertIn("provider anthropic", textes)
         # le mode n'est pas un motif de refus : le placement peut le fixer
         choix = {c["host"]: c for c in placement.proposals(loaded, "relecteur")}
         # l'admission de relecteur ne nomme que atelier (L31)
         self.assertFalse(choix["banc"]["admissible"])
         self.assertFalse(choix["banc"]["admitted"])
-        self.assertIn("non admis", " ".join(choix["banc"]["reasons"]))
+        self.assertIn("not admitted", " ".join(choix["banc"]["reasons"]))
         self.assertEqual(choix["banc"]["credential_mode"], "api-key")
         # hôte complet (max_agents, sans compter l'agent lui-même)
         write(self.root, "hotes/banc.md", host_card(
@@ -97,7 +97,7 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
             providers=["deepseek", "openai"], credential_modes=["api-key"], max_agents="1"))
         choix = {c["host"]: c for c in placement.proposals(self.load(), "relecteur")}
         self.assertFalse(choix["banc"]["admissible"])
-        self.assertIn("complet", " ".join(choix["banc"]["reasons"]))
+        self.assertIn("host banc full", " ".join(choix["banc"]["reasons"]))
         choix = {c["host"]: c for c in placement.proposals(self.load(), "ouvrier")}
         self.assertTrue(choix["banc"]["admissible"])
 
@@ -144,8 +144,8 @@ class PlacementTest(_PlacementDbCase):
         report = self.sync()
         relecteur = {a.agent: a for a in report.actions}["relecteur"]
         self.assertEqual(relecteur.action, "mis à jour")
-        self.assertIn("placement refusé", relecteur.detail)
-        self.assertIn("harnais codex non admis par l'hôte atelier", relecteur.detail)
+        self.assertIn("placement refused", relecteur.detail)
+        self.assertIn("harness codex not allowed by host atelier", relecteur.detail)
         self.assertIs(relecteur.to_dict()["placement_ok"], False)
         # erreur propre à l'agent : l'hôte reste `ok`, seul relecteur est fermé…
         self.assertEqual(report.status, "ok")
@@ -156,14 +156,14 @@ class PlacementTest(_PlacementDbCase):
         row = self.db.query("SELECT placement_ok, placement_diagnostic FROM agent_registry "
                             "WHERE name = 'relecteur'")[0]
         self.assertIs(row["placement_ok"], False)
-        self.assertIn("harnais codex non admis", row["placement_diagnostic"])
+        self.assertIn("harness codex not allowed", row["placement_diagnostic"])
 
     def test_mode_d_identifiants_non_admis(self):
         self.set_atelier(credential_modes=["api-key"])
         report = self.sync()
         orchestre = {a.agent: a for a in report.actions}["orchestre"]
         self.assertIs(orchestre.placement.ok, False)
-        self.assertIn("mode d'identifiants subscription non admis par l'hôte atelier",
+        self.assertIn("credential mode subscription not allowed by host atelier",
                       orchestre.placement.diagnostic)
         self.assertEqual(self.claimable(), ["relecteur"])
         # le responsable du projet change le mode du placement : de nouveau admis
@@ -187,7 +187,7 @@ class PlacementTest(_PlacementDbCase):
                             "lease_epoch, status FROM agent_registry "
                             "WHERE name = 'orchestre'")[0]
         self.assertIs(row["placement_ok"], False)
-        self.assertIn("aucune admission de orchestre", row["placement_diagnostic"])
+        self.assertIn("no admission for orchestre", row["placement_diagnostic"])
         self.assertEqual((row["lease_owner"], int(row["lease_epoch"]), row["status"]),
                          ("runner-x", epoch, "running"))
         # fin du tour : avant la synchronisation suivante, plus réclamable sur cet hôte
@@ -208,7 +208,7 @@ class PlacementTest(_PlacementDbCase):
                                     "WHERE name = 'ouvrier'")[0]["placement_ok"], True)
         ouvrier = placement.recorded(self.db)["ouvrier"]
         self.assertIs(ouvrier["placement_profile_ok"], False)
-        self.assertIn("profil divergé depuis l'évaluation", ouvrier["placement_diagnostic"])
+        self.assertIn("profile diverged since the placement was evaluated", ouvrier["placement_diagnostic"])
         self.assertIn("host='banc'", ouvrier["placement_profile"])
         self.assertIn("host='atelier'", ouvrier["placement_profile_current"])
         self.assertEqual(self.claimable(), ["orchestre", "relecteur"])     # canon ok sur atelier
@@ -314,7 +314,7 @@ class PlacementTest(_PlacementDbCase):
         row = self.db.query("SELECT placement_ok, placement_diagnostic FROM agent_registry "
                             "WHERE name = 'petit'")[0]
         self.assertIs(row["placement_ok"], False)
-        self.assertIn("harnais claude non admis", row["placement_diagnostic"])
+        self.assertIn("harness claude not allowed", row["placement_diagnostic"])
         # R14 empêche déjà un agent refusé par le canon (responsable vidé) de créer
         with self.assertRaises(canon_sync.SpawnError):
             canon_sync.spawn(self.db, "tardif", "orchestre", 3600)
@@ -334,7 +334,7 @@ class PlacementTest(_PlacementDbCase):
         self.db.execute("UPDATE agent_registry SET created_by = 'disparu' WHERE name = 'petit'")
         self.sync()
         self.assertNotIn("petit", self.claimable())
-        self.assertIn("lignée invérifiable", self.db.query(
+        self.assertIn("unverifiable lineage", self.db.query(
             "SELECT placement_diagnostic FROM agent_registry WHERE name = 'petit'"
         )[0]["placement_diagnostic"])
 
@@ -414,13 +414,13 @@ class ProfilEvalueTest(_PlacementDbCase):
                 self.assertIn("harness='claude'", verdict["placement_profile"])
                 recorded = placement.recorded(self.db, "atelier")[name]
                 self.assertIs(recorded["placement_profile_ok"], False)
-                self.assertIn("profil divergé depuis l'évaluation",
+                self.assertIn("profile diverged since the placement was evaluated",
                               recorded["placement_diagnostic"])
                 self.assertIn("harness='codex'", recorded["placement_diagnostic"])
         # un éphémère créé par le créateur divergé naît refusé, et le dit
         row = canon_sync.spawn(self.db, "tardif", "orchestre", 3600)
         self.assertIs(row["placement_ok"], False)
-        self.assertIn("profil de orchestre divergé depuis l'évaluation",
+        self.assertIn("profile of orchestre diverged since the placement was evaluated",
                       row["placement_diagnostic"])
         self.assert_closed("tardif")
         # le sync suivant réévalue : le canon remet orchestre sur claude (admis) ;
@@ -433,7 +433,7 @@ class ProfilEvalueTest(_PlacementDbCase):
             with self.subTest(agent=name):
                 verdict = self.verdict(name)
                 self.assertIs(verdict["placement_ok"], False)
-                self.assertIn("profil divergé de celui évalué pour le créateur orchestre",
+                self.assertIn("profile diverged from the one evaluated for creator orchestre",
                               verdict["placement_diagnostic"])
                 self.assertIn("harness='codex'", verdict["placement_diagnostic"])
         # revenus au profil évalué du créateur : fermés jusqu'au sync, qui les rouvre
@@ -472,7 +472,7 @@ class ProfilEvalueTest(_PlacementDbCase):
                 self.db.execute(sql)
                 self.assert_closed(name, host)
                 self.assertIs(self.verdict(name)["placement_ok"], True)   # écrit, mais caduc
-                self.assertIn("profil divergé depuis l'évaluation",
+                self.assertIn("profile diverged since the placement was evaluated",
                               placement.recorded(self.db)[name]["placement_diagnostic"])
                 report = self.sync()
                 self.assertEqual(self.actions(report)[name], "mis à jour")
@@ -513,7 +513,7 @@ class ProfilEvalueTest(_PlacementDbCase):
                 self.sync()
                 verdict = self.verdict("petit")
                 self.assertIs(verdict["placement_ok"], False)
-                self.assertIn("profil divergé de celui évalué pour le créateur orchestre",
+                self.assertIn("profile diverged from the one evaluated for creator orchestre",
                               verdict["placement_diagnostic"])
                 self.assert_closed("petit")
                 self.assertEqual(self.strict(), ["aide", "orchestre", "relecteur"])
@@ -562,7 +562,7 @@ class PlacementCliTest(test_canon._CanonDbCase):
         refuses = {c["host"]: c for c in entry["refused"]}
         self.assertIn("banc", refuses)
         self.assertFalse(refuses["banc"]["admitted"])
-        self.assertIn("non admis", " ".join(refuses["banc"]["reasons"]))
+        self.assertIn("not admitted", " ".join(refuses["banc"]["reasons"]))
         self.assertEqual(refuses["banc"]["credential_modes"], ["api-key"])
         # orchestre admis sur le banc : refusé par la politique, expliqué
         write(self.root, "placements/orchestre-atelier.md", fiche(
@@ -573,20 +573,20 @@ class PlacementCliTest(test_canon._CanonDbCase):
         (entry,) = json.loads(proc.stdout)["agents"]
         (actuel,) = entry["placements"]
         self.assertEqual((actuel["host"], actuel["placement_ok"]), ("banc", False))
-        for attendu in ("harnais claude non admis par l'hôte banc",
-                        "fournisseur anthropic non admis",
-                        "mode d'identifiants subscription non admis"):
+        for attendu in ("harness claude not allowed by host banc",
+                        "provider anthropic not allowed",
+                        "credential mode subscription not allowed"):
             self.assertIn(attendu, actuel["placement_diagnostic"])
         # aucun hôte pleinement admissible : atelier n'est pas admis, banc
         # refuse la politique ; les deux sont expliqués
         self.assertEqual([c["host"] for c in entry["admissible"]], [])
         refuses = {c["host"]: c for c in entry["refused"]}
         self.assertEqual(sorted(refuses), ["atelier", "banc"])
-        self.assertIn("non admis", " ".join(refuses["atelier"]["reasons"]))
+        self.assertIn("not admitted", " ".join(refuses["atelier"]["reasons"]))
         proc = self.mesh("placement", "check", "--agent", "orchestre", env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
-        for attendu in ("REFUSÉ", "non réclamable sur banc", "refusés",
-                        "ameesh ne déplace aucun agent", "[NON APPROUVÉ]"):
+        for attendu in ("REFUSED", "not claimable on banc", "  refused:\n",
+                        "ameesh moves no agent", "[NOT APPROVED]"):
             self.assertIn(attendu, proc.stdout)
         # tous les agents ; un agent inconnu est une erreur
         data = json.loads(self.mesh("placement", "check", "--json", env=self.cli_env()).stdout)
@@ -595,7 +595,7 @@ class PlacementCliTest(test_canon._CanonDbCase):
         self.assertEqual(data["refused"], 1)
         proc = self.mesh("placement", "check", "--agent", "fantome", env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("aucune fiche Agent", proc.stdout)
+        self.assertIn("no Agent card", proc.stdout)
         # lecture seule : rien n'a bougé au registre, aucun agent déplacé
         self.assertEqual(self.snapshot(), avant)
         self.assertEqual(self.row("orchestre")["host"], "atelier")
@@ -606,9 +606,9 @@ class PlacementCliTest(test_canon._CanonDbCase):
         registry.upsert(self.db, "manuel", harness="codex", host="atelier")
         proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("placements sur atelier : 1 admis, 1 refusé(s)", proc.stdout)
+        self.assertIn("placements on atelier: 1 admitted, 1 refused", proc.stdout)
         self.assertIn("relecteur", proc.stdout)
-        self.assertIn("REFUSÉ — harnais codex non admis", proc.stdout)
+        self.assertIn("REFUSED — harness codex not allowed", proc.stdout)
         data = json.loads(self.mesh("canon", "check", "--host", "atelier", "--json",
                                     env=self.cli_env()).stdout)
         verdicts = {(p["agent"], p["host"]): p for p in data["placements"]}
@@ -617,18 +617,18 @@ class PlacementCliTest(test_canon._CanonDbCase):
         self.assertIs(verdicts[("ouvrier", "banc")]["placement_ok"], True)
         proc = self.mesh("canon", "sync", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("placement refusé sur atelier : relecteur", proc.stdout)
+        self.assertIn("placement refused on atelier: relecteur", proc.stdout)
         data = json.loads(self.mesh("canon", "sync", "--host", "atelier", "--json",
                                     env=self.cli_env()).stdout)
         actions = {a["agent"]: a for a in data["actions"]}
         self.assertIs(actions["relecteur"]["placement_ok"], False)
-        self.assertIn("harnais codex", actions["relecteur"]["placement_diagnostic"])
+        self.assertIn("harness codex", actions["relecteur"]["placement_diagnostic"])
         self.assertIs(actions["orchestre"]["placement_ok"], True)
         self.assertNotIn("placement_ok", actions["manuel"])
         rows = {r["name"]: r for r in json.loads(self.mesh("list", "--json").stdout)}
         self.assertEqual((rows["relecteur"]["placement_ok"], rows["relecteur"]["canon_claim_ok"]),
                          (False, False))
-        self.assertIn("harnais codex non admis", rows["relecteur"]["placement_diagnostic"])
+        self.assertIn("harness codex not allowed", rows["relecteur"]["placement_diagnostic"])
         self.assertEqual((rows["orchestre"]["placement_ok"], rows["orchestre"]["canon_claim_ok"],
                           rows["orchestre"]["placement_diagnostic"]), (True, True, ""))
         self.assertEqual((rows["manuel"]["placement_ok"], rows["manuel"]["canon_claim_ok"]),
@@ -642,7 +642,7 @@ class PlacementCliTest(test_canon._CanonDbCase):
         orchestre = rows["orchestre"]
         self.assertEqual((orchestre["placement_ok"], orchestre["placement_profile_ok"],
                           orchestre["canon_claim_ok"]), (True, False, False))
-        self.assertIn("profil divergé depuis l'évaluation", orchestre["placement_diagnostic"])
+        self.assertIn("profile diverged since the placement was evaluated", orchestre["placement_diagnostic"])
         self.assertIn("harness='claude'", orchestre["placement_profile"])
         self.assertIn("harness='codex'", orchestre["placement_profile_current"])
         self.assertEqual((rows["relecteur"]["placement_profile_ok"],
@@ -651,11 +651,11 @@ class PlacementCliTest(test_canon._CanonDbCase):
         proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         line = [ligne for ligne in proc.stdout.splitlines()
-                if ligne.startswith("registre  : orchestre")]
+                if ligne.startswith("registry  : orchestre")]
         self.assertEqual(len(line), 1, proc.stdout)
-        self.assertIn("profil divergé depuis l'évaluation", line[0])
-        self.assertIn("« ameesh canon sync »", line[0])
-        self.assertNotIn("registre  : relecteur", proc.stdout)
+        self.assertIn("profile diverged since the placement was evaluated", line[0])
+        self.assertIn('"ameesh canon sync"', line[0])
+        self.assertNotIn("registry  : relecteur", proc.stdout)
         data = json.loads(self.mesh("canon", "check", "--host", "atelier", "--json",
                                     env=self.cli_env()).stdout)
         recorded = {p["agent"]: p for p in data["registry_placements"]}
@@ -664,7 +664,7 @@ class PlacementCliTest(test_canon._CanonDbCase):
         # le sync suivant réévalue : plus de divergence
         self.sync()
         proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
-        self.assertNotIn("profil divergé", proc.stdout)
+        self.assertNotIn("profile diverged", proc.stdout)
 
 
 if __name__ == "__main__":

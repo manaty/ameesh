@@ -63,7 +63,7 @@ def parse_duration(text: str) -> float:
     """« 90m », « 6h », « 2d »/« 2j », « 3600 » → secondes (strictement positif)."""
     match = _DURATION_RE.match(text or "")
     if not match or float(match.group(1)) <= 0:
-        raise StaleError("durée illisible : %r (90m, 6h, 2d…)" % text)
+        raise StaleError("unreadable duration: %r (90m, 6h, 2d...)" % text)
     return float(match.group(1)) * _UNITS[match.group(2).lower()]
 
 
@@ -106,17 +106,19 @@ def stale(state: str, last_ts: float | None, now: float, threshold: float) -> di
 # --------------------------------------------------------------------------
 
 _LABELS = {
-    "start": ("démarrage par %s", "attribution (lot non assigné)"),
-    "build": ("travail de %s", "travail (lot non assigné)"),
-    "verdict": ("verdict de %s", "verdict d'un relecteur (non désigné)"),
-    "fix": ("correction de %s", "correction (auteur non désigné)"),
-    "merge-approval": ("approbation de la fusion par %s", "approbation de la fusion"),
-    "merge": ("fusion par %s", "fusion (exécutant non désigné)"),
-    "merge-outcome": ("issue de la fusion inconnue : réconciliation par %s",
-                      "issue de la fusion inconnue : réconciliation"),
-    "decision": ("décision humaine de %s", "décision humaine"),
-    "unblock": ("déblocage par %s", "déblocage"),
+    "start": ("start by %s", "assignment (lot unassigned)"),
+    "build": ("work by %s", "work (lot unassigned)"),
+    "verdict": ("verdict by %s", "verdict from a reviewer (none designated)"),
+    "fix": ("fix by %s", "fix (author not designated)"),
+    "merge-approval": ("merge approval by %s", "merge approval"),
+    "merge": ("merge by %s", "merge (executor not designated)"),
+    "merge-outcome": ("merge outcome unknown: reconciliation by %s",
+                      "merge outcome unknown: reconciliation"),
+    "decision": ("human decision by %s", "human decision"),
+    "unblock": ("unblocking by %s", "unblocking"),
 }
+#: display labels of the `who_state` values (the values stay as stored/emitted)
+_STATE_LABELS = {"inconnu": "unknown", "arrêté": "stopped", "externe": "external session"}
 
 
 def _waiting(what: str, who) -> dict:
@@ -230,13 +232,12 @@ def with_availability(detail: dict | None, states: dict[str, str] | None,
         return detail
     single = len(notes) == 1 and "," not in str(detail["who"])
     if single and next(iter(notes.values())) == "externe":
-        suffix = " (session externe, %s)" % (responsible or "sans responsable")
+        suffix = " (external session, %s)" % (responsible or "no responsible")
     elif single:
-        suffix = " (agent %s)" % next(iter(notes.values()))
+        suffix = " (agent %s)" % _STATE_LABELS[next(iter(notes.values()))]
     else:
         suffix = " (%s)" % ", ".join(
-            "%s %s" % (n, "session externe" if st == "externe" else st)
-            for n, st in notes.items())
+            "%s %s" % (n, _STATE_LABELS[st]) for n, st in notes.items())
     out = dict(detail, label=detail["label"] + suffix,
                who_state=notes if len(notes) > 1 else next(iter(notes.values())))
     if "externe" in notes.values():

@@ -296,7 +296,7 @@ class ChooseTest(_AuthBase):
                                 session_account="primaire")
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertFalse(choix.auth_blocked)
-        self.assertIn("primaire en échec d'authentification", choix.switched["reason"])
+        self.assertIn("primaire authentication failing", choix.switched["reason"])
         # healthy again: back to the usual rule (declared order breaks the tie)
         self._report("codex", "primaire", "healthy")
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
@@ -310,7 +310,7 @@ class ChooseTest(_AuthBase):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book)
         self.assertTrue(choix.auth_blocked)
         self.assertEqual(choix.profile.name, "primaire")
-        self.assertIn("aucun compte codex sain", choix.why)
+        self.assertIn("no healthy codex account", choix.why)
 
     def test_healthy_ones_at_threshold_is_still_a_budget_pause(self):
         items = self._items()
@@ -323,7 +323,7 @@ class ChooseTest(_AuthBase):
         _codex_rollout(items[0].path, 95, now + 3600)
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
-        self.assertIn("au seuil", choix.reason)
+        self.assertIn("at threshold", choix.reason)
 
 
 class ContinuityCapTest(_AuthBase):
@@ -387,8 +387,8 @@ class RunnerTest(_AuthBase):
                              comptes[1]["path"])
             self.assertEqual(registry.get(self.db, "au")["status"], "idle")
             fil = self._fil()
-            self.assertIn("Tour en échec d'authentification sur claude/primaire", fil)
-            self.assertIn("Blocage auth_blocked: claude/primaire levé", fil)
+            self.assertIn("Turn failed authentication on claude/primaire", fil)
+            self.assertIn("Block auth_blocked: claude/primaire lifted", fil)
         finally:
             worker.watchdog_stop.set()
 
@@ -398,7 +398,7 @@ class RunnerTest(_AuthBase):
             self.assertIsNotNone(self._tour(worker, **self.LOGIN))
             self.assertEqual(len(self.turns()), 1)
             ligne = registry.get(self.db, "nu")
-            self.assertEqual(ligne["status_text"], "auth_blocked: claude/(défaut)")
+            self.assertEqual(ligne["status_text"], "auth_blocked: claude/(default)")
             self.assertTrue(ligne["last_error"].startswith("auth_blocked: invalid api key"))
             # no relaunch: nothing consumed, no turn
             self.assertIsNone(self._suite(worker))
@@ -408,7 +408,7 @@ class RunnerTest(_AuthBase):
             alertes = [a for a in exploitation.alerts(self.cfg, self.db)
                        if a["type"] == "auth_blocked"]
             self.assertEqual([(a["agent"], a["harness"], a["account"]) for a in alertes],
-                             [("nu", "claude", "(défaut)")])
+                             [("nu", "claude", "(default)")])
             # the sentinel sees the credential healthy again: the agent resumes
             self._report("claude", "", "healthy")
             self.assertIsNotNone(self._suite(worker))
@@ -427,7 +427,7 @@ class RunnerTest(_AuthBase):
             self.assertEqual(self.turns(), [])
             ligne = registry.get(self.db, "pre")
             self.assertEqual((ligne["status"], ligne["status_text"]),
-                             ("blocked", "auth_blocked: claude/(défaut)"))
+                             ("blocked", "auth_blocked: claude/(default)"))
             self.assertEqual(ligne["pending_prompt"], "travail")
         finally:
             worker.watchdog_stop.set()
@@ -622,7 +622,7 @@ class ReviewR2Test(_CapsBase):
         ok, why = account_turn.summary_possible(items[1], Broken({}), items,
                                                 now=1_800_000_000.0)
         self.assertFalse(ok)
-        self.assertIn("illisibles", why)
+        self.assertIn("unreadable", why)
 
     def test_overage_reading_without_windows(self):
         now = 1_800_000_000.0
@@ -677,7 +677,7 @@ class RunnerReviewR2Test(_AuthBase):
         try:
             self._report("claude", "", "failing")
             self.assertIsNone(self._tour(worker))
-            texte = "auth_blocked: claude/(défaut)"
+            texte = "auth_blocked: claude/(default)"
             self.assertEqual(registry.get(self.db, "ab")["status_text"], texte)
             # a budget pause replaced the mark, then lifted itself: idle
             registry.set_status(self.db, "ab", "blocked", status_text="budget : test")
@@ -729,7 +729,7 @@ class LegacySessionTest(_CapsBase):
             self.assertEqual(account_turn.session_account(worker, items), "primaire")
         # nothing declared on the default folder: the synthetic profile
         other = items[1:]
-        self.assertEqual(account_turn.legacy_profile("claude", other).name, "(défaut)")
+        self.assertEqual(account_turn.legacy_profile("claude", other).name, "(default)")
 
     def test_no_summary_on_a_failing_primary(self):
         items = self._items()

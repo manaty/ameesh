@@ -65,7 +65,7 @@ def _https_transport(url: str, headers: dict, timeout: float) -> tuple[object | 
         return discovery_http.fetch_json(url, headers=headers, timeout=timeout)
     except (discovery_http.RedirectRefused, discovery_http.InsecureEndpoint,
             discovery_http.OriginChanged) as refused:
-        raise BalanceError("lecture de solde refusée (%s)" % type(refused).__name__) from None
+        raise BalanceError("balance read refused (%s)" % type(refused).__name__) from None
 
 
 def _number(value) -> float | None:
@@ -119,13 +119,13 @@ class DeepSeekBalance(BalanceSource):
     def fetch(self) -> list[BalanceReading]:
         key = self._key()
         if not key:
-            raise BalanceError("clé absente : posez %s dans l'environnement" % self.KEY_ENV[0])
+            raise BalanceError("missing key: set %s in the environment" % self.KEY_ENV[0])
         payload, failure = self.transport(
             self.url(), {"Authorization": "Bearer " + key, "Accept": "application/json"},
             TIMEOUT)
         if failure or payload is None:
-            raise BalanceError("solde illisible ou refusé par le fournisseur (%s)"
-                               % (failure or "réponse vide"))
+            raise BalanceError("balance unreadable or refused by the provider (%s)"
+                               % (failure or "empty response"))
         return self.parse(payload)
 
     @classmethod
@@ -133,10 +133,10 @@ class DeepSeekBalance(BalanceSource):
         """`{"is_available": …, "balance_infos": [{currency, total_balance,
         granted_balance, topped_up_balance}]}` → un relevé par devise."""
         if not isinstance(payload, dict):
-            raise BalanceError("réponse de solde inattendue")
+            raise BalanceError("unexpected balance response")
         infos = payload.get("balance_infos")
         if not isinstance(infos, list):
-            raise BalanceError("réponse de solde sans balance_infos")
+            raise BalanceError("balance response without balance_infos")
         available = payload.get("is_available")
         out = []
         for info in infos:
@@ -152,7 +152,7 @@ class DeepSeekBalance(BalanceSource):
                 topped_up=_number(info.get("topped_up_balance")),
                 available=bool(available) if isinstance(available, bool) else None))
         if not out:
-            raise BalanceError("réponse de solde sans montant lisible")
+            raise BalanceError("balance response without a readable amount")
         return out
 
 
@@ -401,16 +401,16 @@ def compare(db, paid_harnesses: Iterable[str], from_ts: float, to_ts: float, *,
 
 def describe(entry: dict) -> str:
     """Dépense réelle d'un fournisseur face à l'estimation (L95), en une ligne."""
-    period = {"window": "fenêtre", "24h": "24 h"}.get(entry.get("period"), "")
-    text = "dépense réelle %s%s (soldes) : %.2f %s" % (
+    period = {"window": "window", "24h": "24 h"}.get(entry.get("period"), "")
+    text = "actual spend %s%s (balances): %.2f %s" % (
         entry["provider"], " " + period if period else "", entry["real_spent"],
         entry["currency"])
     if entry.get("estimated_usd") is not None:
-        text += " · estimée %.2f $" % entry["estimated_usd"]
+        text += " · estimated %.2f $" % entry["estimated_usd"]
     if entry.get("gap_usd") is not None:
-        text += " · écart %+.2f $" % entry["gap_usd"]
+        text += " · gap %+.2f $" % entry["gap_usd"]
         if entry.get("alert"):
-            text += " — ÉCART AU-DELÀ DU SEUIL"
+            text += " — GAP ABOVE THRESHOLD"
     if entry.get("topups"):
-        text += " · recharge(s) %.2f" % entry["topups"]
+        text += " · top-up(s) %.2f" % entry["topups"]
     return text

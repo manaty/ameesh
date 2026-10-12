@@ -131,7 +131,7 @@ class AcpTest(unittest.TestCase):
         proc = self.run_bridge("noresume", args=["--session", "s-old"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("session/new", [c["method"] for c in self.calls()])
-        self.assertIn("ne sait pas reprendre", proc.stderr)
+        self.assertIn("cannot resume", proc.stderr)
 
     def test_permission_refusee_par_defaut(self):
         proc = self.run_bridge("permission")
@@ -140,7 +140,7 @@ class AcpTest(unittest.TestCase):
         permission = [e for e in events if e["type"] == "permission"]
         self.assertEqual(len(permission), 1)
         self.assertEqual(permission[0]["decision"], "deny")
-        self.assertIn("refus par défaut", permission[0]["reason"])
+        self.assertIn("denied by default", permission[0]["reason"])
         reponse = self.called("permission_answer")[0]["result"]
         self.assertEqual(reponse, {"outcome": {"outcome": "selected",
                                                "optionId": "reject-1"}})
@@ -181,7 +181,7 @@ class AcpTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         events = self.events(proc)
         self.assertEqual(events[-1]["type"], "error")
-        self.assertIn("s'est arrêté", events[-1]["message"])
+        self.assertIn("stopped", events[-1]["message"])
 
     def test_protocole_invalide_finit_en_erreur(self):
         for mode in ("garbage", "unknown", "badresponse"):
@@ -214,7 +214,7 @@ class AcpTest(unittest.TestCase):
     def test_delai_d_initialisation(self):
         proc = self.run_bridge("mute", args=["--init-timeout", "0.5"], timeout=20)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("délai dépassé", self.events(proc)[-1]["message"])
+        self.assertIn("timed out", self.events(proc)[-1]["message"])
 
     def test_descripteur_modifie_depuis_la_commande_refuse(self):
         """Le pont épingle l'empreinte vue par l'exécuteur (chaîne de confiance)."""
@@ -228,7 +228,7 @@ class AcpTest(unittest.TestCase):
         proc = self.run_bridge("normal", descriptor=path,
                                args=["--descriptor-sha256", sha], timeout=20)
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("modifié", self.events(proc)[-1]["message"])
+        self.assertIn("modified", self.events(proc)[-1]["message"])
         self.assertEqual(self.calls(), [])  # l'agent n'a jamais été lancé
 
     def test_fichiers_borne_au_dossier_du_tour(self):
@@ -244,9 +244,9 @@ class AcpTest(unittest.TestCase):
         with open(fichier, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "écrit par l'agent\n")
         final = self.events(proc)[-1]
-        self.assertIn("hors du dossier de travail", final["text"])
+        self.assertIn("outside the session working directory", final["text"])
         self.assertNotIn("CONTENU_SECRET", final["text"])
-        self.assertIn("fs refusé hors du dossier", proc.stderr)
+        self.assertIn("fs denied outside the working directory", proc.stderr)
 
     def test_modele_par_option_de_configuration(self):
         proc = self.run_bridge("normal", args=["--model", "modele-1"])
@@ -270,7 +270,7 @@ class AcpTest(unittest.TestCase):
         try:
             with self.assertRaises(acp.AcpError) as ctx:
                 peer.request("initialize", {}, timeout=5)
-            self.assertIn("trop grand", str(ctx.exception))
+            self.assertIn("too large", str(ctx.exception))
         finally:
             peer.close()
 
@@ -314,7 +314,7 @@ class PermissionTest(unittest.TestCase):
         decision, option, raison = acp.permission_decision(
             {}, {"kind": "execute"}, [{"optionId": "r", "kind": "reject_once"}])
         self.assertEqual((decision, option), ("deny", "r"))
-        self.assertIn("refus par défaut", raison)
+        self.assertIn("denied by default", raison)
 
     def test_allow_et_deny_explicites(self):
         decision, option, _ = acp.permission_decision(
@@ -325,7 +325,7 @@ class PermissionTest(unittest.TestCase):
             {"default": "allow", "deny_kinds": ["execute"]}, {"kind": "execute"},
             [{"optionId": "r", "kind": "reject_once"}])
         self.assertEqual((decision, option), ("deny", "r"))
-        self.assertIn("explicitement refusé", raison)
+        self.assertIn("explicitly denied", raison)
 
     def test_sans_option_utilisable_rend_cancelled(self):
         decision, option, _ = acp.permission_decision(
@@ -499,7 +499,7 @@ class AcpStreamTest(unittest.TestCase):
     def test_correspondance_des_evenements(self):
         self.assertEqual(self.parse({"type": "session", "sessionId": "s"})["session"], "s")
         self.assertEqual(self.parse({"type": "text", "text": "salut"})["display"], ["salut"])
-        self.assertIn("réflexion", self.parse({"type": "thought", "text": "hmm"})["display"][0])
+        self.assertIn("thinking", self.parse({"type": "thought", "text": "hmm"})["display"][0])
         outil = self.parse({"type": "tool", "title": "lire", "status": "completed"})
         self.assertIn("lire", outil["display"][0])
         usage = self.parse({"type": "usage", "usage": {"input_tokens": 10},
@@ -515,7 +515,7 @@ class AcpStreamTest(unittest.TestCase):
         self.assertEqual(final["cost"], 0.1)
         self.assertIn("end_turn", final["display"][0])
         refus = self.parse({"type": "final", "stopReason": "refusal"})
-        self.assertIn("refusé", refus["error"])
+        self.assertIn("refused", refus["error"])
         err = self.parse({"type": "error", "message": "boum"})
         self.assertEqual(err["error"], "boum")
         self.assertEqual(self.parse("pas du json"), {})

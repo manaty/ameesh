@@ -113,7 +113,7 @@ class ClaudeGaugeTest(Sandbox, unittest.TestCase):
         })
         reason = book.pace_exceeded("claude")
         self.assertIn("five_hour", reason)
-        self.assertIn("plafond de rythme 30%", reason)
+        self.assertIn("pace cap 30%", reason)
 
     def test_le_plafond_ne_depasse_jamais_90_et_vaut_90_sans_reset(self):
         # Sans date de réinitialisation, on suppose la fenêtre entièrement écoulée :
@@ -717,7 +717,7 @@ class CostDbTest(Sandbox, PgTestCase):
                                            "outputTokens": 0}})
         self.assertEqual(book.over("a1"), "")
         book.record("a1")
-        self.assertIn("budget horaire", book.over("a1"))
+        self.assertIn("hourly budget", book.over("a1"))
 
     def test_plafond_payé_au_token_ne_pause_pas_un_agent_au_forfait(self):
         """L49 (0019 §2) : la dépense DeepSeek au-delà du plafond met en pause
@@ -733,10 +733,10 @@ class CostDbTest(Sandbox, PgTestCase):
                                            "outputTokens": 0}})
         book.record("a1")
         paid = ("deepseek",)
-        self.assertIn("budget horaire", book.over("a1", paid_harnesses=paid, pace=False))
+        self.assertIn("hourly budget", book.over("a1", paid_harnesses=paid, pace=False))
         self.assertEqual(book.over("orch", paid_harnesses=paid, pace=False), "")
-        self.assertIn("budget horaire", book.over("inconnu", paid_harnesses=paid, pace=False))
-        self.assertIn("budget horaire", book.over("all", paid_harnesses=paid))
+        self.assertIn("hourly budget", book.over("inconnu", paid_harnesses=paid, pace=False))
+        self.assertIn("hourly budget", book.over("all", paid_harnesses=paid))
 
     def test_report_liste_les_agents_et_leurs_jauges(self):
         book = self.book()

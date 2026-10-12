@@ -29,5 +29,5 @@ def listing() -> SourceResult:
         models=(),
         raw=raw,
         kind="local",
-        detail="les harnais exposent des drapeaux, pas des listes de modèles : rien à retirer",
+        detail="harnesses expose flags, not model lists: nothing to remove",
     )

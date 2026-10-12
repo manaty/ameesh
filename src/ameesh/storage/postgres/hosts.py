@@ -39,7 +39,9 @@ READING_COLUMNS = (
     "app_cpu, guest_cpu, cpu_window_s, guest_mem_bytes, "
     "lendable_cpu, lendable_memory_bytes, lendable_disk_bytes, "
     # #246 (0067): btrfs allocation
-    "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes"
+    "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes, "
+    # #253 (0359): every filesystem the host writes to
+    "volumes"
 )
 
 #: L159d (and #246) columns written by `record`, in this order
@@ -49,6 +51,24 @@ MEASURE_COLUMNS = (
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
     "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
 )
+
+def _volumes_param(volumes) -> str | None:
+    """#253: the reading's filesystems as a JSON parameter, None without."""
+    return json.dumps(list(volumes)) if volumes is not None else None
+
+
+def _reading(row: dict) -> dict:
+    """A reading as read back: `volumes` decoded (a driver may hand jsonb as
+    text), [] when the reading predates 0359."""
+    value = row.get("volumes")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = None
+    row["volumes"] = value if isinstance(value, list) else []
+    return row
+
 
 #: colonnes d'une ressource de tour
 TURN_COLUMNS = (
@@ -67,8 +87,8 @@ class Hosts(interface.HostResources):
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
                  tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
-                 on_ac, battery_percent, """ + ", ".join(MEASURE_COLUMNS) + """)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, """
+                 on_ac, battery_percent, volumes, """ + ", ".join(MEASURE_COLUMNS) + """)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, """
             + ", ".join(["%s"] * len(MEASURE_COLUMNS)) + """)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
@@ -78,6 +98,7 @@ class Hosts(interface.HostResources):
              reading.get("tmp_path"), reading.get("tmp_fstype"),
              reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes"),
              reading.get("on_ac"), reading.get("battery_percent"),
+             _volumes_param(reading.get("volumes")),
              *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
@@ -85,19 +106,19 @@ class Hosts(interface.HostResources):
         self.db.execute(
             "DELETE FROM host_resources"
             " WHERE sampled_at < now() - interval '7 days'", ())
-        return rows[0]
+        return _reading(rows[0])
 
     def latest(self, host) -> dict | None:
         rows = self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " ORDER BY sampled_at DESC, id DESC LIMIT 1", (host,))
-        return rows[0] if rows else None
+        return _reading(rows[0]) if rows else None
 
     def history(self, host, limit) -> list[dict]:
         rows = self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " ORDER BY sampled_at DESC, id DESC LIMIT %s", (host, int(limit)))
-        return list(reversed(rows))
+        return [_reading(row) for row in reversed(rows)]
 
     def current(self, host) -> list[dict]:
         params: list[Any] = []
@@ -108,7 +129,7 @@ class Hosts(interface.HostResources):
         rows = self.db.query(
             "SELECT DISTINCT ON (host) " + READING_COLUMNS + " FROM host_resources"
             + where + " ORDER BY host, sampled_at DESC, id DESC", tuple(params))
-        return rows
+        return [_reading(row) for row in rows]
 
     def usage(self, host, since_s) -> dict:
         rows = self.db.query(

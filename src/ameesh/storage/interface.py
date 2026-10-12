@@ -1490,7 +1490,7 @@ class RegistryLock:
 
     def __init__(self, db: Any, proof: object = None):
         if proof is not _LOCK_PROOF:
-            raise RegistryLockError("RegistryLock : rendu par receipts.lock_registry seulement")
+            raise RegistryLockError("RegistryLock: only issued by receipts.lock_registry")
         self.db = db
 
 

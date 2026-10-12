@@ -108,7 +108,7 @@ class BudgetGateTest(PgTestCase):
             self.assertIsNone(worker.pick())
             ligne = registry.get(self.db, "budget")
             self.assertEqual(ligne["status"], "blocked")
-            self.assertIn("budget horaire", ligne["status_text"])
+            self.assertIn("hourly budget", ligne["status_text"])
         finally:
             worker.watchdog_stop.set()
 
@@ -130,7 +130,7 @@ class BudgetGateTest(PgTestCase):
                            resets_at=time.time() + 3600, window_s=5 * 3600)
         with mock.patch("ameesh.cost.CostBook.gauges", return_value=[jauge]):
             raison = worker.budget_reason()
-        self.assertIn("forfait claude", raison)
+        self.assertIn("plan claude", raison)
 
     def test_modele_de_la_ligne_est_applique(self):
         runner, worker = self._worker(plafond=10.0)

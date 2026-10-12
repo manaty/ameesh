@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh receipt | authenticator — reçus d'approbation (spec §8).
+"""ameesh receipt | authenticator — approval receipts (spec §8).
 
-  ameesh receipt verify <fichier.json> [--rp-id R] [--origin O]… [--allow-facade F]…
+  ameesh receipt verify <file.json> [--rp-id R] [--origin O]… [--allow-facade F]…
                         [--level standard|eleve] [--digest sha256:…] [--action-id A]
                         [--kind action|standing|any] [--decision approve|deny|any]
-                        [--canon ID] [--consume --by NOM] [--json]
-        vérifie un reçu ameesh-receipt/1 contre le registre de confiance (celui
-        du canon de l'objet approuvé, --canon ; défaut : le canon par défaut) ; sans
-        --consume, le nonce est seulement contrôlé (non consommé) ; --consume
-        exige --digest et --action-id ;
+                        [--canon ID] [--consume --by NAME] [--json]
+        verify an ameesh-receipt/1 receipt against the trust registry (the one
+        of the approved object's canon, --canon; default: the default canon);
+        without --consume, the nonce is only checked (not consumed); --consume
+        requires --digest and --action-id;
   ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA]
                             [--canon ID] [--json]
-        le registre des authentificateurs (copie de travail du canon).
+        the authenticator registry (working copy of the canon).
 
-`--rp-id` et `--origin` ont pour défaut AMEESH_APPROVE_RP_ID et
-AMEESH_APPROVE_ORIGINS (origines séparées par des virgules). La façade ed25519
-n'est admise que si on la nomme (`--allow-facade ed25519`) : elle ne fait pas
-autorité humaine par défaut.
+`--rp-id` and `--origin` default to AMEESH_APPROVE_RP_ID and
+AMEESH_APPROVE_ORIGINS (comma-separated origins). The ed25519 facade is only
+accepted when named (`--allow-facade ed25519`): by default it does not carry
+human authority.
 """
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ def _moment(epoch) -> str:
 
 def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
     if args.consume and not (args.by and args.digest and args.action_id):
-        print("erreur : --consume exige --by NOM, --digest et --action-id "
-              "(un reçu se consomme pour une action précise)", file=sys.stderr)
+        print("error: --consume requires --by NAME, --digest and --action-id "
+              "(a receipt is consumed for one specific action)", file=sys.stderr)
         return 2
     with open(args.file, "rb") as fh:
         raw = fh.read()
@@ -74,16 +74,16 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(verdict.as_dict(), ensure_ascii=False, indent=2))
     elif verdict.ok:
-        print("reçu VALIDE : %s par %s (%s, niveau %s)" % (
+        print("receipt VALID: %s by %s (%s, level %s)" % (
             verdict.decision, verdict.approver, verdict.facade, verdict.level))
-        print("objet    : %s" % (verdict.action_id or "grant %s" % json.dumps(
+        print("object   : %s" % (verdict.action_id or "grant %s" % json.dumps(
             verdict.standing, ensure_ascii=False)))
         if verdict.digest:
-            print("empreinte: %s" % verdict.digest)
-        print("échéance : %s   nonce : %s" % (
-            _moment(verdict.exp), "consommé" if verdict.consumed else "disponible"))
+            print("digest   : %s" % verdict.digest)
+        print("expires  : %s   nonce: %s" % (
+            _moment(verdict.exp), "consumed" if verdict.consumed else "available"))
     else:
-        print("reçu REFUSÉ [%s] : %s" % (verdict.code, verdict.reason), file=sys.stderr)
+        print("receipt REFUSED [%s]: %s" % (verdict.code, verdict.reason), file=sys.stderr)
     return 0 if verdict.ok else 1
 
 
@@ -105,19 +105,19 @@ def cmd_authenticator_list(cfg: Config, args: argparse.Namespace) -> int:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 1 if off else 0
     if not rows:
-        print("aucun authentificateur")
+        print("no authenticators")
         return 0
     print("%-22s %-13s %-24s %-9s %-17s %-16s %s" % (
-        "APPROBATEUR", "FAÇADE", "CREDENTIAL", "NIVEAU", "CLÉ", "ENRÔLÉ", "ÉTAT"))
+        "APPROVER", "FACADE", "CREDENTIAL", "LEVEL", "KEY", "ENROLLED", "STATE"))
     for row in rows:
-        state = "révoqué %s" % _moment(row.get("revoked_ts")) if row.get("revoked_ts") else "actif"
+        state = "revoked %s" % _moment(row.get("revoked_ts")) if row.get("revoked_ts") else "active"
         if row["off_canon"]:
-            state += " — HORS CANON ATTENDU"
+            state += " — NOT FROM EXPECTED CANON"
         print("%-22s %-13s %-24s %-9s %-17s %-16s %s" % (
             row["approver"][:22], row["facade"], row["credential_id"][:24], row["level"],
             row["key_fingerprint"][:16] + "…", _moment(row.get("enrolled_ts")), state))
-        print("%22s canon : %s%s" % ("", row.get("canon_ref") or "—",
-                                     " (déclaré par le canon %s)" % row["canon"]
+        print("%22s canon: %s%s" % ("", row.get("canon_ref") or "—",
+                                     " (declared by canon %s)" % row["canon"]
                                      if row.get("canon") else ""))
     return 1 if off else 0
 
@@ -128,42 +128,42 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
 
-    p_receipt = sub.add_parser("receipt", help="reçus d'approbation")
+    p_receipt = sub.add_parser("receipt", help="approval receipts")
     receipt_sub = p_receipt.add_subparsers(dest="receipt_command")
-    p_verify = receipt_sub.add_parser("verify", help="vérifier un reçu ameesh-receipt/1")
+    p_verify = receipt_sub.add_parser("verify", help="verify an ameesh-receipt/1 receipt")
     p_verify.add_argument("file")
     p_verify.add_argument("--rp-id", default=None)
     p_verify.add_argument("--origin", action="append", default=[],
-                          help="origine autorisée (répétable)")
+                          help="allowed origin (repeatable)")
     p_verify.add_argument("--allow-facade", action="append", default=[],
                           choices=list(receipts.FACADES),
-                          help="façade admise (répétable ; défaut webauthn, device-es256)")
+                          help="accepted facade (repeatable; default webauthn, device-es256)")
     p_verify.add_argument("--level", choices=list(receipts.LEVELS), default="standard")
-    p_verify.add_argument("--digest", default=None, help="empreinte attendue (sha256:…)")
+    p_verify.add_argument("--digest", default=None, help="expected digest (sha256:…)")
     p_verify.add_argument("--action-id", default=None)
     p_verify.add_argument("--kind", choices=["action", "standing", "any"], default="any")
     p_verify.add_argument("--decision", choices=["approve", "deny", "any"], default="approve")
     p_verify.add_argument("--expect-commit", default=None,
-                          help="l'authentificateur doit venir de ce commit du canon")
+                          help="the authenticator must come from this canon commit")
     p_verify.add_argument("--canon", default="", metavar="ID",
-                          help="canon de l'objet approuvé (L44) : seuls ses authentificateurs "
-                               "sont admis ; défaut : le canon par défaut")
+                          help="canon of the approved object (L44): only its authenticators "
+                               "are accepted; default: the default canon")
     p_verify.add_argument("--consume", action="store_true",
-                          help="consommer le nonce (usage unique)")
-    p_verify.add_argument("--by", default=None)
+                          help="consume the nonce (single use)")
+    p_verify.add_argument("--by", default=None, metavar="NAME")
     p_verify.add_argument("--json", action="store_true")
     p_verify.set_defaults(func=cmd_verify)
 
-    p_auth = sub.add_parser("authenticator", help="registre des authentificateurs")
+    p_auth = sub.add_parser("authenticator", help="authenticator registry")
     auth_sub = p_auth.add_subparsers(dest="authenticator_command")
     p_list = auth_sub.add_parser("list")
     p_list.add_argument("--approver", default=None)
-    p_list.add_argument("--all", action="store_true", help="avec les révoqués")
+    p_list.add_argument("--all", action="store_true", help="include revoked ones")
     p_list.add_argument("--expect-commit", default=None,
-                        help="signaler les lignes qui ne viennent pas de ce commit")
+                        help="flag rows that do not come from this commit")
     p_list.add_argument("--canon", default=None, metavar="ID",
-                        help="seulement les authentificateurs de ce canon (L44 ; \"\" : le "
-                             "canon par défaut)")
+                        help="only the authenticators of this canon (L44; \"\": the "
+                             "default canon)")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_authenticator_list)
     return parser
@@ -183,13 +183,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(cfg, args)
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except (db_mod.DbError, receipts.ReceiptError, ValueError, OSError) as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

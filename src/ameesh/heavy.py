@@ -27,6 +27,14 @@ the group's number, so no unrelated group can take it and be signalled. On a
 terminal, the command's group gets the foreground while it runs (a suite that
 asks a question would otherwise stop on SIGTTIN), and the wrapper takes it
 back afterwards.
+
+L131c (codex review r4 of #224): on Linux the wrapper is a child subreaper,
+so whatever the command leaves — through a fork chain, or after `setsid` —
+is reparented to it; "nothing left" is "no live child but the command",
+read at once from the kernel, and each leftover is signalled by pid. The
+terminal is the controlling one (`/dev/tty`), even with stdin redirected.
+Ctrl-Z stops the command, then the wrapper itself, so the shell's prompt
+comes back; `fg` resumes both.
 """
 from __future__ import annotations
 
@@ -216,24 +224,128 @@ def _drain_group(pgid: int, *, grace: float | None = None, sleep=time.sleep,
     return _group_gone(pgid)
 
 
-def _wait_unreaped(child) -> int:
+def _tree_children(leader: int) -> list[int] | None:
+    """L131c: the wrapper's live children other than the command, once the
+    wrapper is a child subreaper — every orphaned descendant is reparented to
+    it, so a live descendant always means a live child: one read of the
+    kernel's list, no scan to race with a fork chain. Zombies (but the
+    command's) are reaped on the way, and the list is read again after a
+    read that reaped one (#266 r1): a child that forked a replacement and
+    exited after the list was read had it reparented before turning zombie.
+    None if the list is not available."""
+    from . import platform
+    while True:
+        try:
+            rows = platform.children()
+        except platform.NotAvailable:
+            return None
+        live = []
+        reaped = False
+        for row in rows:
+            if row["pid"] == leader:
+                continue
+            if row["zombie"]:
+                reaped = platform.reap(row["pid"]) is not None or reaped
+                continue
+            live.append(row["pid"])
+        if not reaped:
+            return live
+
+
+def _tree_gone(leader: int) -> bool:
+    """No live descendant on two consecutive reads (#266 r1)."""
+    return not _tree_children(leader) and not _tree_children(leader)
+
+
+def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
+                clock=time.monotonic) -> bool:
+    """L131c: stops every descendant the command left (its group or not:
+    nothing escapes a subreaper), each signalled by pid — a child's pid
+    cannot be reused before its parent reaps it. SIGTERM, then SIGKILL after
+    `grace`, then `grace` more; True when none is left. A descendant that
+    may not be signalled (its credentials changed: setuid) is said once and
+    the others are still stopped (#266 r1)."""
+    grace = GROUP_GRACE_S if grace is None else grace
+    refused: set = set()
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        sent: set = set()
+        deadline = clock() + grace
+        while True:
+            live = _tree_children(leader)
+            if not live and _tree_gone(leader):
+                return True
+            if clock() >= deadline:
+                break
+            for pid in live or ():
+                if pid not in sent:   # a grandchild reparented since
+                    try:
+                        os.kill(pid, signum)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        if pid not in refused:
+                            refused.add(pid)
+                            print("ameesh heavy: process %d left by the command may not "
+                                  "be signalled (credentials changed)" % pid,
+                                  file=sys.stderr)
+                    sent.add(pid)
+            sleep(0.1)
+    return _tree_gone(leader)
+
+
+def _wait_unreaped(child, tty: int | None = None) -> int:
     """The command's exit code (negative: killed by that signal), waited for
     WITHOUT reaping it (codex review r3): its zombie holds its pid, which is
-    also the group's number, until `child.wait()`."""
+    also the group's number, until `child.wait()`. With a terminal, a stop of
+    the command (Ctrl-Z) suspends the wrapper too (`_suspend`)."""
     if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
         return child.wait()
-    info = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
-    return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
+    while True:
+        flags = os.WEXITED | os.WNOWAIT | (os.WSTOPPED if tty is not None else 0)
+        info = os.waitid(os.P_PID, child.pid, flags)
+        if info.si_code == os.CLD_STOPPED:
+            os.waitid(os.P_PID, child.pid, os.WSTOPPED | os.WNOHANG)   # consumed
+            _suspend(tty, child.pid)
+            continue
+        return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
+
+
+def _suspend(tty: int, pgid: int) -> None:
+    """L131c: Ctrl-Z stopped the command's group. The wrapper takes the
+    terminal back and stops too, so the shell, which waits for the wrapper,
+    gets its prompt back; on `fg` (SIGCONT, terminal given to the wrapper)
+    the command gets the terminal and continues — on `bg` it just
+    continues. The terminal is taken only from the command's group: a
+    command stopped in the background (SIGTTIN after `bg`) leaves it to
+    whoever holds it, the shell (#266 r1)."""
+    try:
+        if os.tcgetpgrp(tty) == pgid:
+            os.tcsetpgrp(tty, os.getpgrp())
+    except OSError:
+        pass
+    os.kill(os.getpid(), signal.SIGSTOP)
+    try:
+        if os.tcgetpgrp(tty) == os.getpgrp():
+            os.tcsetpgrp(tty, pgid)
+    except OSError:
+        pass
+    _killpg(pgid, signal.SIGCONT)
 
 
 def _foreground_tty() -> int | None:
-    """stdin's descriptor when it is the controlling terminal and the
+    """A descriptor of the controlling terminal (`/dev/tty`, whatever stdin
+    is: L131c, a command reading /dev/tty with stdin redirected) when the
     wrapper's group holds its foreground; None otherwise."""
     try:
-        if os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp():
-            return 0
+        fd = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None                 # no controlling terminal
+    try:
+        if os.tcgetpgrp(fd) == os.getpgrp():
+            return fd
     except OSError:
         pass
+    os.close(fd)
     return None
 
 
@@ -254,6 +366,9 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
             _killpg(child.pid, signum)  # the group, even once the command is gone
 
     previous = {sig: signal.signal(sig, relay) for sig in RELAYED}
+    # L131c: what the command leaves, even through a fork chain or setsid,
+    # is reparented to the wrapper, which then knows it exactly
+    tree = platform_subreaper()
     tty = _foreground_tty()
     if tty is not None:
         # handing the terminal over and taking it back from the background
@@ -267,7 +382,10 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
             # returns after the exec, the group exists when signals are relayed
             os.setpgid(0, 0)
             if tty is not None:
-                os.tcsetpgrp(tty, os.getpgrp())     # SIGTTOU ignored, inherited
+                # the controlling terminal itself (stdin may be redirected)
+                fd = os.open("/dev/tty", os.O_RDWR)
+                os.tcsetpgrp(fd, os.getpgrp())      # SIGTTOU ignored, inherited
+                os.close(fd)
                 signal.signal(signal.SIGTTOU, ttou)
             if nice:
                 os.nice(nice)
@@ -279,10 +397,15 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         _note_child(fh, child.pid)
         for signum in pending:
             relay(signum, None)
-        # without a process table the leader's zombie would look alive for
-        # ever: it is reaped at once, as before codex review r3
-        code = _wait_unreaped(child) if _can_scan() else child.wait()
-        if not _drain_group(child.pid):
+        if tree and _tree_children(child.pid) is not None:
+            code = _wait_unreaped(child, tty)
+            drained = _drain_tree(child.pid)
+        else:
+            # without a process table the leader's zombie would look alive
+            # for ever: it is reaped at once, as before codex review r3
+            code = _wait_unreaped(child, tty) if _can_scan() else child.wait()
+            drained = _drain_group(child.pid)
+        if not drained:
             print("ameesh heavy: processes of the command (group %d) survive SIGKILL; "
                   "slot released" % child.pid, file=sys.stderr)
         return code if code >= 0 else 128 - code
@@ -292,11 +415,19 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
                 os.tcsetpgrp(tty, os.getpgrp())
             except OSError:
                 pass
+            os.close(tty)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         if child is not None:
             child.wait()            # reaped last: the group's number is free now
         release(fh)
+
+
+def platform_subreaper() -> bool:
+    """The wrapper adopts the orphans of what it runs (`PR_SET_CHILD_SUBREAPER`,
+    Linux); False elsewhere, where the group scan stays the rule."""
+    from . import platform
+    return platform.become_subreaper()
 
 
 def cmd_heavy(cfg, args) -> int:

@@ -76,7 +76,7 @@ def reconcile(active: list[ActiveModel], result: SourceResult) -> Decision:
             source=result.source,
             seen=seen,
             refused_reason="local-source",
-            detail="source locale : elle apporte des prix, elle ne retire rien",
+            detail="local source: it provides prices, it never retires anything",
         )
 
     if not result.complete:
@@ -84,7 +84,7 @@ def reconcile(active: list[ActiveModel], result: SourceResult) -> Decision:
             source=result.source,
             seen=seen,
             refused_reason="incomplete",
-            detail=result.detail or "source incomplète : rien n'est retiré",
+            detail=result.detail or "incomplete source: nothing is retired",
         )
 
     if not seen:
@@ -93,7 +93,7 @@ def reconcile(active: list[ActiveModel], result: SourceResult) -> Decision:
         return Decision(
             source=result.source,
             refused_reason="empty",
-            detail=result.detail or "liste complète mais sans modèle : rien n'est retiré",
+            detail=result.detail or "complete list but no models: nothing is retired",
         )
 
     missing = tuple(row for row in own if row.model_id not in set(seen))
@@ -107,8 +107,8 @@ def reconcile(active: list[ActiveModel], result: SourceResult) -> Decision:
             mass_withdrawal_refused=missing,
             refused_reason="mass-withdrawal",
             detail=(
-                f"{len(missing)} modèles sur {len(own)} actifs auraient été retirés "
-                f"({result.source}) : retrait massif refusé, un humain tranche"
+                f"{len(missing)} of {len(own)} active models would have been retired "
+                f"({result.source}): mass withdrawal refused, a human decides"
             ),
         )
 
@@ -140,7 +140,7 @@ def events_for(
     if appeared:
         events.append(
             CatalogEvent(
-                body=f"catalogue {source} : {len(appeared)} nouveau(x) modèle(s) — "
+                body=f"catalog {source}: {len(appeared)} new model(s) — "
                      + ", ".join(appeared[:12])
                      + ("…" if len(appeared) > 12 else ""),
                 payload={"source": source, "new": list(appeared)},
@@ -149,7 +149,7 @@ def events_for(
     if repriced:
         events.append(
             CatalogEvent(
-                body=f"catalogue {source} : {len(repriced)} prix modifié(s) — "
+                body=f"catalog {source}: {len(repriced)} price(s) changed — "
                      + ", ".join(repriced[:12]),
                 payload={"source": source, "repriced": list(repriced)},
             )
@@ -157,26 +157,26 @@ def events_for(
     if decision.to_retire:
         events.append(
             CatalogEvent(
-                body=f"catalogue {source} : {len(decision.to_retire)} modèle(s) retiré(s) — "
+                body=f"catalog {source}: {len(decision.to_retire)} model(s) retired — "
                      + ", ".join(row.model_id for row in decision.to_retire[:12]),
                 payload={
                     "source": source,
                     "retired": [row.model_id for row in decision.to_retire],
-                    "reason": "absence dans une liste complète et réussie",
+                    "reason": "missing from a complete, successful list",
                 },
             )
         )
     if decision.mass_withdrawal_refused:
         events.append(
             CatalogEvent(
-                body=f"catalogue {source} : retrait massif REFUSÉ — "
-                     f"{len(decision.mass_withdrawal_refused)} modèles auraient disparu, "
-                     "rien n'a été retiré ; un humain doit trancher",
+                body=f"catalog {source}: mass withdrawal REFUSED — "
+                     f"{len(decision.mass_withdrawal_refused)} models would have disappeared, "
+                     "nothing was retired; a human must decide",
                 payload={
                     "source": source,
                     "refused": [row.model_id for row in decision.mass_withdrawal_refused],
                     "urgent": True,
-                    "reason": "plus de la moitié des modèles actifs de la source",
+                    "reason": "more than half of the source's active models",
                 },
             )
         )

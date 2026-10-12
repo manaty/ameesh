@@ -81,7 +81,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 #: priorités d'un lot (L130, comme la file d'amélioration L119) : 1 haute,
 #: 2 normale, 3 basse ; sans priorité, le lot n'en a pas (NULL)
 PRIORITIES = (1, 2, 3)
-PRIORITY_LABELS = {1: "haute", 2: "normale", 3: "basse"}
+PRIORITY_LABELS = {1: "high", 2: "normal", 3: "low"}
 #: L157b : taille déclarée du changement d'un lot (petit, moyen, gros)
 SIZES = ("s", "m", "l")
 #: L233: a lot enters `waiting_human` only while an owner decision request
@@ -118,11 +118,11 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
     if binding.name:
         if binding.ok:
             return binding.name, None
-        return binding.name, ("identité %s non liée (%s) : retenue comme acteur"
-                              % (binding.name, binding.reason or "raison inconnue"))
-    return UNKNOWN_ACTOR, ("acteur inconnu : aucune identité liée à cette session "
-                           "(AGENT_MAIL_NAME, ameesh mail bind) — le journal du lot dira "
-                           "« %s » ; précisez --actor <agent|human:id>" % UNKNOWN_ACTOR)
+        return binding.name, ("identity %s not bound (%s): used as actor"
+                              % (binding.name, binding.reason or "unknown reason"))
+    return UNKNOWN_ACTOR, ("unknown actor: no identity bound to this session "
+                           "(AGENT_MAIL_NAME, ameesh mail bind); the lot journal will say "
+                           "\"%s\"; pass --actor <agent|human:id>" % UNKNOWN_ACTOR)
 
 
 def corrector(cfg, db, explicit: str | None = None) -> str:
@@ -141,18 +141,18 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
 
     text = (explicit or "").strip()
     binding = identity.resolve_binding(cfg, db)
-    refus = ("correction refusée : %s n'est ni un humain, ni un orchestrateur, ni un agent "
-             "de conception (rôle orchestrateur ou conception de sa fiche Agent au canon, "
-             "AMEESH_ALERT_ORCHESTRATORS) — demandez-la à l'orchestrateur ou au responsable")
+    refus = ("correction refused: %s is neither a human, an orchestrator nor a design agent "
+             "(orchestrator or design role on its Agent card in the canon, "
+             "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner")
     if binding.name:
         if text and text != binding.name:
-            raise WorkError("correction refusée : cette session est celle de %s, elle ne "
-                            "corrige pas au nom de %s" % (binding.name, text))
+            raise WorkError("correction refused: this session belongs to %s, it does not "
+                            "correct on behalf of %s" % (binding.name, text))
         if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES):
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
-        raise WorkError("correction : dites qui corrige (--actor human:<id>)")
+        raise WorkError("correction: say who corrects (--actor human:<id>)")
     if text.startswith(HUMAN_PREFIX):
         return text
     human = known_human(db, text, cfg)
@@ -204,25 +204,25 @@ def add(
         from . import estimates
         minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
-        raise WorkError("type inconnu : %r (bug ou evolution)" % type)
+        raise WorkError("unknown type: %r (bug or evolution)" % type)
     if size not in (None, "") and size not in SIZES:
-        raise WorkError("taille inconnue : %r (s, m ou l)" % (size,))
+        raise WorkError("unknown size: %r (s, m or l)" % (size,))
     if not (title or "").strip():
-        raise WorkError("titre obligatoire")
+        raise WorkError("title required")
     if priority is not None and priority not in PRIORITIES:
-        raise WorkError("priorité 1 (haute), 2 (normale) ou 3 (basse) : %r" % (priority,))
+        raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
     elif externe:
-        raise WorkError("--externe sans assigné : rien à forcer")
+        raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
     return storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else "")
-        + (" ; estimation : %s" % span(minutes * 60) if minutes else ""),
+        budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
+        + ("; estimate: %s" % span(minutes * 60) if minutes else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
@@ -243,10 +243,10 @@ def _branch_args(branch, target) -> tuple:
     branch = (branch or "").strip() or None
     target = (target or "").strip() or None
     if target and not branch:
-        raise WorkError("une cible sans branche : précisez aussi --branch")
+        raise WorkError("a target without a branch: also pass --branch")
     try:
-        return (plan_git.check_ref(branch, "branche") if branch else None,
-                plan_git.check_ref(target, "cible") if target else None)
+        return (plan_git.check_ref(branch, "branch") if branch else None,
+                plan_git.check_ref(target, "target") if target else None)
     except ValueError as exc:
         raise WorkError(str(exc)) from exc
 
@@ -257,20 +257,20 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     le lot. Une branche identique (et la même cible) ne réécrit rien."""
     branch, target = _branch_args(branch, target)
     if not branch:
-        raise WorkError("branche vide")
+        raise WorkError("empty branch")
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     if item.get("branch") == branch and (target is None or item.get("branch_target") == target):
         return item
     target = target if target is not None else (
         item.get("branch_target") if item.get("branch") == branch else None)
-    note = "branche %s%s%s (avant : %s)" % (
-        branch, " vers %s" % target if target else "",
-        " — %s" % source if source else "", item.get("branch") or "aucune")
+    note = "branch %s%s%s (before: %s)" % (
+        branch, " to %s" % target if target else "",
+        " — %s" % source if source else "", item.get("branch") or "none")
     row = storage.of(db).work.set_branch(item_id, branch, target, note=note, actor=actor)
     if row is None:
-        raise WorkError("lot %s déjà %s : branche non posée" % (item_id, item["state"]))
+        raise WorkError("lot %s already %s: branch not set" % (item_id, item["state"]))
     return row
 
 
@@ -290,34 +290,34 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
 
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     if item["state"] in ("merged", "promoted", "closed"):
-        raise WorkError("lot %s déjà %s : pas de réservation" % (item_id, item["state"]))
+        raise WorkError("lot %s already %s: no reservation" % (item_id, item["state"]))
     current = item.get("migration")
     if release:
         if current is None:
             return item
-        note, number = "migration %04d libérée" % current, None
+        note, number = "migration %04d released" % current, None
     elif number is None:
         if current is not None:
             return item
-        note = "migration %(number)04d réservée"
+        note = "migration %(number)04d reserved"
     else:
         if not 1 <= int(number) <= 9999:
-            raise WorkError("numéro de migration hors de 0001-9999 : %s" % number)
+            raise WorkError("migration number outside 0001-9999: %s" % number)
         if current == int(number):
             return item
         holder = storage.of(db).work.migration_holder(int(number))
         if holder is not None:
-            raise WorkError("migration %04d déjà réservée par le lot #%s (%s)" % (
+            raise WorkError("migration %04d already reserved by lot #%s (%s)" % (
                 int(number), holder["id"], holder["title"]))
-        note = "migration %%(number)04d réservée (avant : %s)" % (
-            "%04d" % current if current is not None else "aucune")
+        note = "migration %%(number)04d reserved (before: %s)" % (
+            "%04d" % current if current is not None else "none")
     floor = migrations.highest_known(repo) + 1 if number is None and not release else 0
     row = storage.of(db).work.reserve_migration(item_id, number, floor, note=note,
                                                 actor=actor, release=release)
     if row is None:
-        raise WorkError("lot %s n'est plus ouvert : pas de réservation" % item_id)
+        raise WorkError("lot %s is no longer open: no reservation" % item_id)
     return row
 
 
@@ -379,9 +379,9 @@ def known_human(db: Db, name: str, cfg=None, *, canons=None) -> str | None:
 
 
 #: L46 : ce qu'il faut faire d'un nom refusé
-_ASSIGNEE_HINT = ("inscrivez l'agent (agent-runner register <nom> <harnais> …) pour "
-                  "qu'ameesh le réveille, attribuez à un humain (human:<id>), ou, pour "
-                  "une session externe qui a un responsable humain, ajoutez --externe")
+_ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> …) so "
+                  "ameesh can wake it, assign to a human (human:<id>), or, for "
+                  "an external session with a human owner, add --externe")
 
 
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
@@ -405,10 +405,10 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
     name = (assignee or "").strip()
     if not name:
-        raise WorkError("assigné vide")
+        raise WorkError("empty assignee")
     if name.startswith(HUMAN_PREFIX):
         if externe:
-            raise WorkError("--externe vise un agent externe, pas un humain (%s)" % name)
+            raise WorkError("--externe targets an external agent, not a human (%s)" % name)
         return {"assignee": name, "externe": False, "responsible": None, "warning": None}
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     row = registry.get(db, name)
@@ -416,40 +416,40 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         human = known_human(db, name, cfg)
         if human and not externe:
             return {"assignee": human, "externe": False, "responsible": None,
-                    "warning": "« %s » n'est pas un agent mais un humain connu : lot "
-                               "attribué à %s" % (name, human)}
-        raise WorkError("attribution refusée : %s n'est pas dans le registre (agent "
-                        "inconnu) : personne ne travaillerait sur ce lot — %s"
+                    "warning": "\"%s\" is not an agent but a known human: lot "
+                               "assigned to %s" % (name, human)}
+        raise WorkError("assignment refused: %s is not in the registry (unknown "
+                        "agent): nobody would work on this lot; %s"
                         % (name, _ASSIGNEE_HINT))
     mode = row.get("mode") or "execute"
     responsible = (row.get("responsible") or "").strip() or None
     if externe:
         if mode != "externe":
-            raise WorkError("--externe refusé : %s est un agent %s (réveillable par "
-                            "ameesh : attribuez-le sans --externe)" % (name, mode))
+            raise WorkError("--externe refused: %s is a %s agent (ameesh can wake "
+                            "it: assign it without --externe)" % (name, mode))
         if not responsible:
-            raise WorkError("--externe refusé : l'agent externe %s n'a pas de responsable "
-                            "humain pour porter le lot (0030) — désignez-le d'abord "
-                            "(canon, ou ameesh set)" % name)
+            raise WorkError("--externe refused: external agent %s has no human owner "
+                            "to carry the lot (0030); set one first "
+                            "(canon, or ameesh set)" % name)
         return {"assignee": name, "externe": True, "responsible": responsible,
                 "warning": None}
     ok, why, note = registry.wake_status(db, cfg, name)
     if not ok:
         if mode == "externe":
-            hint = (" — son responsable peut forcer avec --externe" if responsible
-                    else " — désignez d'abord son responsable humain, puis --externe")
+            hint = (" — its owner can force it with --externe" if responsible
+                    else " — set its human owner first, then --externe")
         else:
-            hint = (" — corrigez son inscription ou son admission (agent-runner register "
-                    "…, canon sync), ou attribuez à un humain (human:<id>)")
-        raise WorkError("attribution refusée : %s%s" % (why, hint))
+            hint = (" — fix its registration or admission (agent-runner register "
+                    "…, canon sync), or assign to a human (human:<id>)")
+        raise WorkError("assignment refused: %s%s" % (why, hint))
     warnings = []
     if row.get("status") == "stopped":
-        warnings.append("%s est arrêté (%s) : le lot attendra sa reprise"
-                        % (name, row.get("stop_reason") or "raison inconnue"))
+        warnings.append("%s is stopped (%s): the lot will wait for it to resume"
+                        % (name, row.get("stop_reason") or "unknown reason"))
     if note:
         warnings.append(note)
     return {"assignee": name, "externe": False, "responsible": responsible,
-            "warning": " ; ".join(warnings) or None}
+            "warning": "; ".join(warnings) or None}
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
@@ -463,9 +463,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     la branche est posée)."""
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
-        raise WorkError("lot %s déjà %s : rien à réassigner" % (item_id, item["state"]))
+        raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
@@ -473,18 +473,18 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         if branch:
             row = set_branch(db, item_id, branch, branch_target, actor=actor)
             return {"item": row, "check": check, "previous": previous}
-        raise WorkError("lot %s déjà assigné à %s" % (item_id, previous))
-    note = "assigné à %s%s (avant : %s)%s" % (
+        raise WorkError("lot %s already assigned to %s" % (item_id, previous))
+    note = "assigned to %s%s (before: %s)%s" % (
         check["assignee"],
-        " — session externe, responsable %s" % check["responsible"] if check["externe"] else "",
-        previous or "personne",
+        " — external session, owner %s" % check["responsible"] if check["externe"] else "",
+        previous or "nobody",
         # L40 (0030) : la réassignation efface la délégation en cours
-        " ; délégation de %s annulée" % item["delegated_by"]
+        "; delegation from %s cancelled" % item["delegated_by"]
         if item.get("delegated_by") and item.get("due_ts") else "")
     row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
                                      actor=actor)
     if row is None:
-        raise WorkError("lot %s modifié entre-temps : réessayez" % item_id)
+        raise WorkError("lot %s changed in the meantime: retry" % item_id)
     if branch:
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
     return {"item": row, "check": check, "previous": previous}
@@ -511,7 +511,7 @@ def span(seconds) -> str:
         minutes = (seconds % 3600) // 60
         return ("%d h %02d" % (seconds // 3600, minutes)) if minutes \
             else "%d h" % (seconds // 3600)
-    return "%d j %d h" % (seconds // 86400, (seconds % 86400) // 3600)
+    return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
 def parse_within(within) -> float:
@@ -521,7 +521,7 @@ def parse_within(within) -> float:
 
     if isinstance(within, (int, float)) and not isinstance(within, bool):
         if float(within) <= 0:
-            raise WorkError("échéance nulle ou négative : %r" % within)
+            raise WorkError("zero or negative deadline: %r" % within)
         return float(within)
     try:
         return stagnation.parse_duration(str(within or ""))
@@ -545,44 +545,44 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
     within_s = parse_within(within)
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
-        raise WorkError("lot %s déjà %s : rien à déléguer" % (item_id, item["state"]))
+        raise WorkError("lot %s already %s: nothing to delegate" % (item_id, item["state"]))
     name = (agent or "").strip()
     if name.startswith(HUMAN_PREFIX):
-        raise WorkError("délégation refusée : %s est un humain ; une délégation à "
-                        "échéance va à un agent réveillable (pour un humain : "
+        raise WorkError("delegation refused: %s is a human; a delegation with a "
+                        "deadline goes to a wakeable agent (for a human: "
                         "ameesh work assign)" % name)
     previous = item.get("assignee")
     delegator = (actor or "").strip() or (previous or "").strip()
     if not delegator:
-        raise WorkError("délégation refusée : le lot %s n'a pas d'assigné ; précisez "
-                        "--actor (le délégant, à qui le lot reviendra)" % item_id)
+        raise WorkError("delegation refused: lot %s has no assignee; pass "
+                        "--actor (the delegator, to whom the lot will return)" % item_id)
     if delegator == name:
-        raise WorkError("délégation refusée : %s se déléguerait le lot à lui-même" % name)
+        raise WorkError("delegation refused: %s would delegate the lot to itself" % name)
     if not delegator.startswith(HUMAN_PREFIX):
         from . import registry
 
         if registry.get(db, delegator) is None:
-            raise WorkError("délégation refusée : le délégant %s n'est pas dans le "
-                            "registre ; le lot ne pourrait revenir à personne" % delegator)
+            raise WorkError("delegation refused: delegator %s is not in the "
+                            "registry; the lot could not return to anyone" % delegator)
     check = check_assignee(db, name, cfg=cfg)
     if check["assignee"].startswith(HUMAN_PREFIX):
         # L46 : un nom nu normalisé en humain n'est pas un délégué possible
-        raise WorkError("délégation refusée : %s désigne un humain (%s) ; une délégation "
-                        "à échéance va à un agent réveillable (pour un humain : ameesh "
+        raise WorkError("delegation refused: %s names a human (%s); a delegation "
+                        "with a deadline goes to a wakeable agent (for a human: ameesh "
                         "work assign)" % (name, check["assignee"]))
-    note = "délégué à %s par %s, échéance dans %s (avant : %s)" % (
-        name, delegator, span(within_s), previous or "personne")
+    note = "delegated to %s by %s, due in %s (before: %s)" % (
+        name, delegator, span(within_s), previous or "nobody")
     out = storage.of(db).work.delegate(
         item_id, name, current=previous, delegated_by=delegator, within_s=within_s,
         note=note, actor=delegator)
     if out is None:
-        raise WorkError("lot %s modifié entre-temps : réessayez" % item_id)
+        raise WorkError("lot %s changed in the meantime: retry" % item_id)
     out.update(check=check, previous=previous, message_id=None, warning=check.get("warning"))
     lot = out["item"]
-    body = ("Lot #%d « %s » : %s te le délègue, à prendre en charge dans %s. Sans tour "
-            "de ta part sur ce lot à l'échéance, il revient à %s."
+    body = ("Lot #%d \"%s\": %s delegates it to you, to pick up within %s. Without a turn "
+            "from you on this lot by the deadline, it returns to %s."
             % (int(lot["id"]), lot.get("title") or "", delegator, span(within_s), delegator))
     from . import mail
 
@@ -592,17 +592,17 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
             payload={"delegation": {"lot": int(lot["id"]), "delegated_by": delegator,
                                     "due_ts": lot.get("due_ts")}})
     except Exception as exc:  # noqa: BLE001 - la délégation est écrite ; le dire
-        out["warning"] = "événement non déposé pour %s (%s) : prévenez-le" % (name, exc)
+        out["warning"] = "event not delivered to %s (%s): notify them" % (name, exc)
     return out
 
 
 def _resolution_note(outcome: str, row: dict) -> str | None:
     """La ligne de journal d'une délégation échue (écrite avec son issue)."""
     if outcome == "rendue":
-        return ("délégation échue : retour à %s (aucun tour de %s sur le lot depuis la "
-                "délégation)" % (row["delegated_by"], row["delegate"]))
+        return ("delegation expired: back to %s (no turn from %s on the lot since the "
+                "delegation)" % (row["delegated_by"], row["delegate"]))
     if outcome == "soldee":
-        return "délégation soldée : %s a travaillé sur le lot avant l'échéance" % row["delegate"]
+        return "delegation settled: %s worked on the lot before the deadline" % row["delegate"]
     return None
 
 
@@ -645,8 +645,8 @@ def expire_delegations(db: Db, now: float | None = None, *, actor: str = SYSTEM_
         if done["outcome"] == "rendue" and not delegator.startswith(HUMAN_PREFIX):
             from . import mail
 
-            body = ("Lot #%d « %s » : délégation échue, il te revient. %s n'a fait aucun "
-                    "tour sur ce lot avant l'échéance."
+            body = ("Lot #%d \"%s\": delegation expired, it is back to you. %s took no "
+                    "turn on this lot before the deadline."
                     % (int(done["work_item_id"]), done.get("title") or "", done["delegate"]))
             try:
                 done["message_id"] = mail.send(
@@ -656,7 +656,7 @@ def expire_delegations(db: Db, now: float | None = None, *, actor: str = SYSTEM_
                         "lot": int(done["work_item_id"]), "delegate": done["delegate"],
                         "due_ts": done.get("due_ts")}})
             except Exception as exc:  # noqa: BLE001 - le retour est fait ; l'alerte suit
-                done["warning"] = "événement non déposé pour %s (%s)" % (delegator, exc)
+                done["warning"] = "event not delivered to %s (%s)" % (delegator, exc)
         out.append(done)
     return out
 
@@ -670,7 +670,7 @@ def mark_delegate_turn(db: Db, agent: str, lots) -> list[int]:
     if not ids:
         return []
     return storage.of(db).work.mark_delegate_turn(
-        agent, ids, "délégation : tour de %s sur le lot" % agent)
+        agent, ids, "delegation: turn of %s on the lot" % agent)
 
 
 def delegation_view(item: dict, now: float | None = None) -> dict | None:
@@ -689,13 +689,13 @@ def delegation_view(item: dict, now: float | None = None) -> dict | None:
     due = item.get("due_ts")
     due_in = int(round(float(due) - now)) if due is not None else None
     overdue = due_in is not None and due_in < 0
-    who = "délégué par %s" % item["delegated_by"]
+    who = "delegated by %s" % item["delegated_by"]
     if due is None:
-        label = "%s, échéance soldée (travail constaté)" % who
+        label = "%s, deadline settled (work seen)" % who
     elif overdue:
-        label = "%s, en retard de %s" % (who, span(-due_in))
+        label = "%s, overdue by %s" % (who, span(-due_in))
     else:
-        label = "%s, échéance dans %s" % (who, span(due_in))
+        label = "%s, due in %s" % (who, span(due_in))
     return {"delegated_by": item["delegated_by"], "delegate": item.get("assignee"),
             "delegated_ts": item.get("delegated_ts"), "due_ts": due,
             "due_in_s": due_in, "overdue": overdue, "settled": due is None,
@@ -710,26 +710,26 @@ def _package(db: Db, ident: str) -> dict:
     """La fiche WorkPackage `ident`, présente au canon synchronisé, sinon WorkError."""
     fiche = storage.of(db).packages.get(ident)
     if fiche is None:
-        raise WorkError("fiche WorkPackage inconnue : %r (déclarez-la au canon puis "
-                        "« ameesh canon sync »)" % ident)
+        raise WorkError("unknown WorkPackage card: %r (declare it in the canon, then "
+                        "run \"ameesh canon sync\")" % ident)
     if not fiche.get("present"):
-        raise WorkError("fiche WorkPackage %s retirée du canon" % ident)
+        raise WorkError("WorkPackage card %s removed from the canon" % ident)
     if fiche.get("kind") not in LINKABLE_KINDS:
-        raise WorkError("fiche %s : un lot se rattache à un %s, pas à un %s"
-                        % (ident, " ou un ".join(LINKABLE_KINDS), fiche.get("kind")))
+        raise WorkError("card %s: a lot links to a %s, not to a %s"
+                        % (ident, " or ".join(LINKABLE_KINDS), fiche.get("kind")))
     return fiche
 
 
 def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
     """Rattache un lot existant à une fiche WorkPackage (None : le détache)."""
     if get(db, item_id) is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     fiche = _package(db, package) if package else None
     row = storage.of(db).work.link_package(
         item_id, fiche["id"] if fiche else None, fiche.get("parent") if fiche else None,
-        note="plan : %s" % package if package else "plan : détaché", actor=actor)
+        note="plan: %s" % package if package else "plan: unlinked", actor=actor)
     if row is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     return row
 
 
@@ -754,18 +754,18 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     for _attempt in range(3):
         item = get(db, item_id)
         if item is None:
-            raise WorkError("lot %s introuvable" % item_id)
+            raise WorkError("lot %s not found" % item_id)
         state = item["state"]
         if state in MERGED_STATES:
             return {"id": int(item_id), "result": "already", "item": item,
-                    "detail": "déjà %s" % state}
+                    "detail": "already %s" % state}
         if state == "closed":
             return {"id": int(item_id), "result": "refused", "item": item,
-                    "detail": "lot fermé (%s) : fusion constatée%s, aucune réouverture"
+                    "detail": "lot closed (%s): merge seen%s, not reopened"
                               % (item.get("close_reason"), " (%s)" % pr_ref if pr_ref else "")}
-        note = "fusion %s%s%s%s%s" % (
-            "déclarée" if declared else "constatée",
-            " par %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
+        note = "merge %s%s%s%s%s" % (
+            "declared" if declared else "seen",
+            " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
             " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
         row = storage.of(db).work.close_merged(
             item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
@@ -777,8 +777,8 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
             if not freezes or int(freezes[0]["id"]) != int(frozen_id):
                 return {"id": int(item_id), "result": "refrozen", "item": get(db, item_id),
-                        "detail": "nouveau gel déclaré entre-temps : non fermé, à réexaminer"}
-    raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
+                        "detail": "new freeze declared in the meantime: not closed, review again"}
+    raise WorkError("lot %s moved in the meantime: retry" % item_id)
 
 
 def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -> dict:
@@ -793,15 +793,15 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -
     `close_merged`."""
     text = (sha or "").strip().lower()
     if not _SHA_RE.match(text):
-        raise WorkError("--sha : le commit de fusion (7 à 64 caractères hexadécimaux), pas %r"
+        raise WorkError("--sha: the merge commit (7 to 64 hex characters), not %r"
                         % (sha,))
     done = close_merged(db, item_id, sha=text, actor=actor, source=actor or UNKNOWN_ACTOR,
                         declared=True, extra=(note or "").strip())
     if done["result"] == "refused":
         item = done["item"]
-        raise WorkError("lot %s fermé (%s) : aucune réouverture — voir ameesh work show %s"
-                        % (item_id, "abandonné" if item.get("close_reason") == "abandoned"
-                           else "remplacé par #%s" % item.get("superseded_by"), item_id))
+        raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
+                        % (item_id, "abandoned" if item.get("close_reason") == "abandoned"
+                           else "superseded by #%s" % item.get("superseded_by"), item_id))
     return done
 
 
@@ -810,27 +810,27 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     """Ferme un lot qui ne sera pas fusionné : abandonné, ou remplacé par un
     autre lot. Jalon `closed` ; rien ne reste ouvert par oubli."""
     if bool(abandoned) == (superseded_by is not None):
-        raise WorkError("préciser --abandoned OU --superseded-by <id>")
+        raise WorkError("pass --abandoned OR --superseded-by <id>")
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     if superseded_by is not None:
         if int(superseded_by) == int(item_id):
-            raise WorkError("un lot ne se remplace pas lui-même")
+            raise WorkError("a lot cannot supersede itself")
         if get(db, superseded_by) is None:
-            raise WorkError("lot remplaçant %s introuvable" % superseded_by)
+            raise WorkError("superseding lot %s not found" % superseded_by)
     state = item["state"]
     if state in MERGED_STATES or state == "closed":
-        raise WorkError("lot %s déjà %s : rien à fermer" % (item_id, state))
+        raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
     reason = "abandoned" if abandoned else "superseded"
-    text = ("abandonné" if abandoned else "remplacé par #%s" % superseded_by) + (
+    text = ("abandoned" if abandoned else "superseded by #%s" % superseded_by) + (
         " — %s" % note.strip() if note and note.strip() else "")
     row = storage.of(db).work.close(
         item_id, current=state, reason=reason,
         superseded_by=int(superseded_by) if superseded_by is not None else None,
         actor=actor, note=text)
     if row is None:
-        raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
+        raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
 
 
@@ -841,7 +841,7 @@ def get(db: Db, item_id: int) -> dict | None:
 def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
     if state and state not in STATES:
-        raise WorkError("état inconnu : %r (%s)" % (state, ", ".join(STATES)))
+        raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
 
@@ -854,46 +854,46 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     `merged`) ; le journal la dit (« correction : promoted → merged — raison »).
     L'appelant a vérifié qui corrige (`corrector`)."""
     if state not in STATES:
-        raise WorkError("état inconnu : %r (%s)" % (state, ", ".join(STATES)))
+        raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
-        raise WorkError("fermer un lot : ameesh work close <id> --abandoned | "
+        raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id>")
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     current = item["state"]
     if current == state:
-        raise WorkError("lot %s déjà en %s" % (item_id, state))
+        raise WorkError("lot %s already in %s" % (item_id, state))
     if correct is not None:
         reason = (correct or "").strip()
         if not reason:
-            raise WorkError("--correct : la raison de la correction est obligatoire")
+            raise WorkError("--correct: the reason for the correction is required")
         if (current, state) not in CORRECTIONS:
             raise WorkError(
-                "correction refusée : %s → %s (corrections possibles : %s ; sinon les "
-                "transitions autorisées depuis %s : %s)"
+                "correction refused: %s → %s (possible corrections: %s; otherwise the "
+                "transitions allowed from %s: %s)"
                 % (current, state, ", ".join("%s → %s" % c for c in sorted(CORRECTIONS)),
-                   current, ", ".join(sorted(TRANSITIONS[current])) or "aucune"))
-        text = "correction : %s → %s — %s%s" % (
+                   current, ", ".join(sorted(TRANSITIONS[current])) or "none"))
+        text = "correction: %s → %s — %s%s" % (
             current, state, reason, " (%s)" % note.strip() if note and note.strip() else "")
         row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
                                        actor=actor)
         if row is None:
-            raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
+            raise WorkError("lot %s moved in the meantime: retry" % item_id)
         return row
     if state not in TRANSITIONS[current]:
         raise WorkError(
-            "transition refusée : %s → %s (autorisées depuis %s : %s)%s"
-            % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "aucune",
-               " — état posé par erreur : ameesh work move %s %s --correct \"raison\""
+            "transition refused: %s → %s (allowed from %s: %s)%s"
+            % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "none",
+               " — state set by mistake: ameesh work move %s %s --correct \"reason\""
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
     if state == "waiting_human" and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
     returning_loop = current == "qa" and state == "build"
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(
-            "boucle qa → build épuisée (%d) : mettre le lot en blocked, ou poser la question "
-            "au propriétaire : ameesh decide ask --lot %s --question \"…\""
+            "qa → build loop exhausted (%d): move the lot to blocked, or ask the "
+            "owner: ameesh decide ask --lot %s --question \"…\""
             % (MAX_QA_LOOPS, item_id))
 
     held = state == "waiting_human"
@@ -904,16 +904,16 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
             raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
-        raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
+        raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
 
 
 def note(db: Db, item_id: int, text: str, *, actor: str = "") -> bool:
     item = get(db, item_id)
     if item is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     if not (text or "").strip():
-        raise WorkError("note vide")
+        raise WorkError("empty note")
     storage.of(db).work.note(item_id, item["state"], text.strip(), actor)
     return True
 
@@ -931,17 +931,17 @@ VERDICTS = ("ok", "blocked")
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
 #: colonne de durée) — l'ordre est celui de la frise lue à l'envers.
 MILESTONES = (
-    ("fusion", "merged_ts", "review_to_merge_s"),
-    ("revue", "reviewed_ts", "freeze_to_review_s"),
-    ("gel", "frozen_ts", "request_to_freeze_s"),
-    ("demande", "requested_ts", None),
+    ("merge", "merged_ts", "review_to_merge_s"),
+    ("review", "reviewed_ts", "freeze_to_review_s"),
+    ("freeze", "frozen_ts", "request_to_freeze_s"),
+    ("request", "requested_ts", None),
 )
 
 #: les durées affichées et leur colonne (la forme de `delays` est stable, L24)
 MILESTONE_DURATIONS = (
-    ("demande → gel", "request_to_freeze_s"),
-    ("gel → revue", "freeze_to_review_s"),
-    ("gel → fusion", "freeze_to_merge_s"),
+    ("request → freeze", "request_to_freeze_s"),
+    ("freeze → review", "freeze_to_review_s"),
+    ("freeze → merge", "freeze_to_merge_s"),
     ("total", "total_s"),
 )
 
@@ -969,19 +969,19 @@ def milestone(
     main serait un mensonge sur la frise.
     """
     if kind not in MILESTONE_KINDS:
-        raise WorkError("jalon inconnu : %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))
+        raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))
     if kind not in MANUAL_KINDS:
         raise WorkError(
-            "le jalon %s est automatique (transition ou fermeture du lot) : %s se "
-            "déclarent seuls" % (kind, ", ".join(MANUAL_KINDS)))
+            "milestone %s is automatic (lot transition or closing): only %s "
+            "are declared by hand" % (kind, ", ".join(MANUAL_KINDS)))
     if kind == "verdict":
         if verdict not in VERDICTS:
-            raise WorkError("verdict manquant ou inconnu : %r (%s)"
+            raise WorkError("missing or unknown verdict: %r (%s)"
                             % (verdict, ", ".join(VERDICTS)))
     elif verdict is not None:
-        raise WorkError("un verdict n'a de sens que pour le jalon `verdict`")
+        raise WorkError("a verdict only makes sense for the `verdict` milestone")
     if get(db, item_id) is None:
-        raise WorkError("lot %s introuvable" % item_id)
+        raise WorkError("lot %s not found" % item_id)
     return storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip())
 
@@ -1011,7 +1011,7 @@ def last_milestone(row: dict) -> tuple[str, float | None]:
     for name, at_key, _duration in MILESTONES:
         if row.get(at_key):
             return name, float(row[at_key])
-    return "demande", float(row["requested_ts"]) if row.get("requested_ts") else None
+    return "request", float(row["requested_ts"]) if row.get("requested_ts") else None
 
 
 def durations(row: dict) -> list[tuple[str, float | None]]:
