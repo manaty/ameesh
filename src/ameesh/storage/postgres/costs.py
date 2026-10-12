@@ -139,6 +139,7 @@ class TurnCosts(interface.TurnCosts):
             "select harness, account, extract(epoch from recorded_at)::float8 as ts,"
             " usd::float8 as usd from turn_costs"
             " where recorded_at > to_timestamp(%s) and void_reason is null"
+            " and source <> 'device'"
             " and harness in (" + ", ".join(["%s"] * len(names)) + ")",
             tuple([float(from_ts)] + names))
 
