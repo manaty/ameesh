@@ -20,6 +20,7 @@ from .catalog import Catalog
 from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
+from .conversations import Conversations
 from .credentials import Credentials
 from .grants import Grants
 from .hosts import Hosts, TurnResources, Visibility
@@ -81,3 +82,4 @@ class PostgresStorage(interface.Storage):
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
         self.ci = CiResults(db)
+        self.conversations = Conversations(db)
