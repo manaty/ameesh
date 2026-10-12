@@ -47,9 +47,13 @@ from . import db as db_mod
 from . import harnesses
 from . import storage
 
-__all__ = ["CorrectionError", "add_parser", "codex_total_before", "default_model",
-           "format_text", "main", "parse_since", "plan", "run", "summarize",
-           "thread_created_ts"]
+#: L148 : `from ameesh.grand_livre import *` doit continuer de donner tous les
+#: noms publics de l'ancien module (les cinq constantes comprises) jusqu'au
+#: stage 7, qui supprimera le shim.
+__all__ = ["CUMUL_FACTOR", "CUMUL_MIN_USD", "CODEX_RESUME_AGE_S", "CorrectionError",
+           "DUP_WINDOW_S", "UNKNOWN_MODELS", "add_parser", "codex_total_before",
+           "default_model", "format_text", "main", "parse_since", "plan", "run",
+           "summarize", "thread_created_ts"]
 
 #: doublon : même tour réécrit à moins de dix minutes d'écart
 DUP_WINDOW_S = 600.0
