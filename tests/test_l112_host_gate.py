@@ -18,6 +18,8 @@ import dataclasses
 import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -458,6 +460,9 @@ class DisponibiliteTest(unittest.TestCase):
 #: faux harnais « claude » : appels d'outils (tool_use, attente, tool_result)
 FAUX_HARNAIS = r'''#!/usr/bin/env python3
 import json, os, sys, time
+if sys.argv[1:] == ["--version"]:
+    print("claude-l112 1.0.0")
+    sys.exit(0)
 journal = os.environ["L112_JOURNAL"]
 def note(m):
     with open(journal, "a") as fh:
@@ -478,6 +483,24 @@ print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
                   "total_cost_usd": 0.0, "session_id": session}), flush=True)
 note({"fin": True})
 '''
+
+
+class HarnessProbeTest(unittest.TestCase):
+    def test_version_probe_does_not_start_a_turn(self):
+        # L120 now probes a served harness at runner startup. A fake that
+        # ignores --version writes turn events even when the gate is stopped,
+        # making every gate assertion observe a spurious turn.
+        with tempfile.TemporaryDirectory(prefix="l112-probe-") as tmp:
+            script = os.path.join(tmp, "claude")
+            journal = os.path.join(tmp, "turns.jsonl")
+            with open(script, "w") as fh:
+                fh.write(FAUX_HARNAIS)
+            proc = subprocess.run([sys.executable, script, "--version"],
+                                  env=dict(os.environ, L112_JOURNAL=journal, L112_DUREE="60"),
+                                  capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "claude-l112 1.0.0")
+            self.assertFalse(os.path.exists(journal))
 
 
 class ExecuteurTest(PgTestCase):
