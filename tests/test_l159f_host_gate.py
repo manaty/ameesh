@@ -324,9 +324,16 @@ class RelocationGateTest(unittest.TestCase):
         offer = {"memory_max": 1}
         self.assertTrue(relocation.gate_open({}, None))
         self.assertFalse(relocation.gate_open({}, offer))  # lending, no gate recorded
-        self.assertTrue(relocation.gate_open({"gate_state": "available"}, offer))
+        fresh = {"gate_state": "available", "sampled_ts": 1000.0}
+        self.assertTrue(relocation.gate_open(fresh, offer, now=1010.0))
         for state in ("draining", "stopped"):
-            self.assertFalse(relocation.gate_open({"gate_state": state}, None))
+            self.assertFalse(relocation.gate_open(dict(fresh, gate_state=state), None,
+                                                  now=1010.0))
+        # a destination that died after publishing `available`: its reading
+        # ages, and its gate no longer counts as open
+        self.assertFalse(relocation.gate_open(fresh, offer, now=1000.0 + 301))
+        self.assertTrue(relocation.gate_open(fresh, offer, now=1000.0 + 301, max_age_s=600))
+        self.assertFalse(relocation.gate_open({"gate_state": "available"}, offer))
 
 
 class RelocationPlanTest(PgTestCase):
@@ -354,6 +361,11 @@ class RelocationPlanTest(PgTestCase):
         self.releve("vm", 8 * 1024 ** 3, gate_state="available", gate_seq=5)
         plan = relocation.plan(["poste", "vm", "autre"], "poste", db=self.db)
         self.assertEqual(plan["target"], "vm")
+        # the vm's executor stops recording: its last `available` ages out
+        self.db.execute("UPDATE host_resources SET sampled_at = now() - interval '10 minutes'"
+                        " WHERE host = 'vm'", ())
+        plan = relocation.plan(["poste", "vm", "autre"], "poste", db=self.db)
+        self.assertEqual(plan["target"], "autre")
 
 
 class RunnerObeysTheGateTest(PgTestCase):

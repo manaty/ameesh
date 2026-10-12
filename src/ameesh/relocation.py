@@ -18,6 +18,8 @@ d'hôte (`gate_open`) : jamais vers un hôte qui se retire.
 """
 from __future__ import annotations
 
+import time
+
 from . import resources, storage
 
 #: message de reprise quand la session native n'est pas portable entre hôtes
@@ -44,14 +46,26 @@ def _score(reading: dict, offer: dict | None = None) -> tuple:
             load if load is not None else float("inf"))
 
 
-def gate_open(reading: dict, offer: dict | None = None) -> bool:
+#: L159f : âge maximal du relevé qui porte la porte d'hôte (5 relevés au pas
+#: par défaut de 60 s) : au-delà, l'exécuteur de l'hôte ne relève plus rien
+#: (arrêté, hôte tombé) et son dernier `available` ne vaut plus
+GATE_MAX_AGE_S = 300.0
+
+
+def gate_open(reading: dict, offer: dict | None = None, *, now: float | None = None,
+              max_age_s: float = GATE_MAX_AGE_S) -> bool:
     """L159f : la porte d'hôte du dernier relevé admet-elle des agents ?
-    `available`, ou pas de porte sur un hôte classique. Un hôte prêteur
-    (`offer`, son `policy.lend`) sans porte relevée est fermé par défaut."""
+    `available` dans un relevé frais, ou pas de porte sur un hôte classique.
+    Un hôte prêteur (`offer`, son `policy.lend`) sans porte relevée est fermé
+    par défaut ; une porte relevée trop ancienne (`max_age_s`) aussi."""
     state = reading.get("gate_state")
     if state is None:
         return offer is None
-    return state == "available"
+    if state != "available":
+        return False
+    sampled = reading.get("sampled_ts")
+    now = time.time() if now is None else now
+    return sampled is not None and now - float(sampled) <= max_age_s
 
 
 def candidates(admitted_hosts, current_host: str, *, db,
@@ -74,7 +88,8 @@ def candidates(admitted_hosts, current_host: str, *, db,
 
 
 def plan(admitted_hosts, current_host: str, *, db, current_limits=None,
-         limits_for=None, shared_sessions: bool = False) -> dict | None:
+         limits_for=None, shared_sessions: bool = False,
+         gate_max_age_s: float = GATE_MAX_AGE_S) -> dict | None:
     """Plan de déplacement, ou None : l'hôte courant doit être sous pression et
     un hôte admis disponible doit exister (et être moins chargé)."""
     current_reading = storage.of(db).hosts.latest(current_host)
@@ -85,7 +100,8 @@ def plan(admitted_hosts, current_host: str, *, db, current_limits=None,
         return None
     dispo = [c for c in candidates(admitted_hosts, current_host, db=db, limits_for=limits_for)
              if not c["pressure"]["blocked"] and gate_open(
-                 c["reading"], (c["pressure"].get("limits") or {}).get("lend"))]
+                 c["reading"], (c["pressure"].get("limits") or {}).get("lend"),
+                 max_age_s=gate_max_age_s)]
     if not dispo:
         return None
     meilleur = min(dispo, key=lambda c: _score(

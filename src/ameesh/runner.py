@@ -2287,7 +2287,9 @@ class AgentWorker(threading.Thread):
                 self.agent.get("admitted_hosts") or [], self.runner.host, db=self.db,
                 current_limits=(pressure or {}).get("limits"),
                 limits_for=self.runner.host_limits_for,
-                shared_sessions=self.runner.shared_sessions)
+                shared_sessions=self.runner.shared_sessions,
+                gate_max_age_s=max(relocation_mod.GATE_MAX_AGE_S,
+                                   5 * float(self.runner.cfg.resource_interval or 0)))
             if plan is None:
                 return False
             result = relocation_mod.move(self.db, self.agent, plan,
