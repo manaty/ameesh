@@ -30,9 +30,13 @@ operations.
 An interrupted model stream without final usage is charged at its requested
 output-token cap, retaining any higher observed count. Git publication is
 revalidated after preparation under executor and agent row locks, held until
-the push and receipt are saved. Per-lease upload receipts survive response
-loss and route restarts; retained commit mappings let subsequent uploads
-reuse a published prefix from an unacknowledged base without duplicating it.
+the push and receipt are saved. Lease expiry uses the database clock in a
+second statement after locking the agent row, so lock contention cannot
+reuse a pre-lock liveness result. The replay window keeps the last 32 receipts
+and at most 64 base/head mappings per lease, even for multi-commit bundles.
+Within that window, receipts survive response loss and route restarts and
+uploads can append from an unacknowledged base without duplicating a prefix.
+An evicted base returns 409; no intermediate per-commit mappings accumulate.
 
 The merge retains main's ordinary database behavior, including assignment
 from mail, undeliverable-mail checks, harness-specific hooks, session
@@ -45,7 +49,10 @@ The 2026-10-12 merge adds main's three optional cost metadata parameters to
 the mediated insert (null defaults) while keeping `source=device` forced.
 Host version polling and boot orphan review stay on classic hosts/server.
 The final main merge retains the optional `held=false` parameter of
-`work.move` and its open-decision-request check. Decision-source/prose reads,
+`work.move` and its open-decision-request check. For a remote transition to
+`waiting_human`, the server forces `held=true` even when the session omits it
+or sends false; the storage UPDATE atomically requires and locks an open
+request. Decision-source/prose reads,
 waiting-episode reads and host-history reads stay refused remotely; the
 313-operation interface is fully classified without increasing the 62
 admitted operations. Credential health operations from L226b also stay

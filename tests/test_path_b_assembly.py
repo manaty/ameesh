@@ -185,6 +185,32 @@ class GateAckTest(unittest.TestCase):
 
 
 class MainIntegrationTest(unittest.TestCase):
+    def test_session_cannot_disable_the_open_decision_check(self):
+        from ameesh.mediated_executor.scope import HostScopeRules
+        from ameesh.mediated_executor.contract import load
+        from ameesh.mediated_executor.interfaces import Principal
+        from ameesh.storage.postgres.work import WorkItems
+        principal = Principal("session", "exec", "mesh", "host", agent="a", epoch=1)
+        db = mock.Mock()
+        # Assignment succeeds; UPDATE simulates a lot without an open request.
+        db.query.side_effect = lambda sql, params: ([{"ok": 1}] if "w.assignee" in sql else [])
+        rules = HostScopeRules(db)
+        for supplied in ({}, {"held": False}, {"held": True}):
+            with self.subTest(supplied=supplied):
+                bound = dict(item_id=1, state="waiting_human", current="build",
+                             loops=0, note="wait", actor="a", **supplied)
+                kw = rules.apply(principal, load().operations["work.move"], bound, None)
+                self.assertIs(kw.get("held", False), True)
+                self.assertIsNone(WorkItems(db).move(**kw))
+                sql, params = db.query.call_args.args
+                self.assertIn("r.delivered_at IS NULL", sql)
+                self.assertIn("FOR UPDATE", sql)
+                self.assertEqual(params[-1], "1")
+        # Notes in an already waiting lot never gain an unsupported argument.
+        kw = rules.apply(principal, load().operations["work.note"],
+                         dict(item_id=1, state="waiting_human", note="note", actor="a"), None)
+        self.assertNotIn("held", kw)
+
     def test_host_maintenance_stays_off_the_device(self):
         from ameesh.runner import Runner
         runner = types.SimpleNamespace(mediated=True, once=False)

@@ -163,12 +163,18 @@ def error_response(code: str, message: str, *, retry_after: Optional[float] = No
 
 def _lease_row(db, name: str) -> Optional[dict]:
     rows = db.query(
-        "SELECT lease_owner, lease_epoch, host,"
-        "       (lease_expires_at IS NOT NULL"
-        "        AND lease_expires_at > clock_timestamp()) AS live"
+        "SELECT lease_owner, lease_epoch, host"
         "  FROM agent_registry WHERE name = %s FOR UPDATE",
         (name,))
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    # SELECT expressions can be evaluated before LockRows waits. Read the
+    # database clock in a separate statement after the row lock is acquired.
+    live = db.query(
+        "SELECT (lease_expires_at IS NOT NULL"
+        "        AND lease_expires_at > clock_timestamp()) AS live"
+        "  FROM agent_registry WHERE name = %s", (name,))
+    return dict(rows[0], live=bool(live and live[0]["live"]))
 
 
 def fence_holds(db, principal: Principal, fence: Fence) -> bool:

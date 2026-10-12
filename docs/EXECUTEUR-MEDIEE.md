@@ -598,10 +598,15 @@ passe par le serveur (`mediated_executor/work_repo.py`, monté par
   `ameesh-exec-bundle/1` : `{branch, commit, device_head, commits}`.
   Après la préparation Git, le serveur recontrôle le bail et la révocation
   sous verrous de lignes (exécuteur, puis agent), conservés pendant la
-  publication et l'enregistrement du reçu. Le cache conserve les mappings
-  des commits et les reçus du bail : une réponse perdue est rejouée, sans
-  nouvelle poussée, et un envoi suivant peut reprendre depuis sa base non
-  acquittée sans dupliquer les commits déjà publiés.
+  publication et l'enregistrement du reçu. La vie du bail est évaluée avec
+  l'horloge de la base dans une seconde instruction, après acquisition du
+  verrou de l'agent (une attente peut dépasser son échéance). Le cache garde
+  les **32 derniers reçus** du bail et leurs correspondances de base et de
+  tête (**64 mappings au plus**), sans conserver les commits intermédiaires.
+  Dans cette fenêtre, une réponse perdue est rejouée sans nouvelle poussée ;
+  un envoi suivant reprend depuis sa base non acquittée sans dupliquer le
+  préfixe publié. Une base purgée rend 409 `idempotency_mismatch`, jamais un
+  rejeu silencieux de l'ancien historique.
 - **Fin du bail.** Le travail non commité est commité, envoyé, puis le
   dossier est effacé. Un bail perdu efface aussi le dossier, sans envoi.
 

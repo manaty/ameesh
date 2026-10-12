@@ -69,6 +69,9 @@ GIT_OPTS = ("-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null",
 DEVICE_BRANCH = "work"
 #: méta-données de l'appareil, dans `.git`
 DEVICE_META = "ameesh-work_repo.json"
+#: Replay window per renewable lease; at most two endpoint mappings per
+#: receipt. Intermediate commits are reconstructed from the incoming history.
+MAX_UPLOAD_RECEIPTS = 32
 
 _AGENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
@@ -341,25 +344,26 @@ class WorkDepot:
             raise DepotError("bad_args", "le paquet ne descend pas de la base %s" % base)
         commits = _out(git(mirror, "rev-list", "--reverse", "--parents",
                            "%s..%s" % (base, head))).splitlines()
-        new = parent
         mapping = dict(state["map"])
-        appending = False
+        remote_head = state.get("remote_head") or parent
+        start = 0
+        # A retained old base can include a published prefix whose intermediate
+        # mappings have been discarded. Locate its published endpoint first.
         for line in commits:
             shas = line.split()
             if len(shas) != 2:
                 raise DepotError("bad_args", "historique linéaire attendu (fusion %s)" % shas[0])
-            if shas[0] in mapping:
-                new = mapping[shas[0]]
-                continue
-            # A response may have been lost before the device learned its new
-            # base. Reuse the published prefix, then append only new commits.
-            if not appending and new != (state.get("remote_head") or parent):
+        if parent != remote_head:
+            for index, line in enumerate(commits):
+                if mapping.get(line.split()[0]) == remote_head:
+                    start = index + 1
+                    break
+            else:
                 raise DepotError("idempotency_mismatch", "historique déjà publié divergent")
-            appending = True
-            new = self._replay(mirror, shas[0], new, principal)
-            mapping[shas[0]] = new
-        if not appending and state.get("remote_head") and new != state["remote_head"]:
-            raise DepotError("idempotency_mismatch", "tête déjà publiée plus récente")
+        new = remote_head
+        for line in commits[start:]:
+            new = self._replay(mirror, line.split()[0], new, principal)
+        mapping[head] = new
         lease = "refs/heads/%s:%s" % (state["branch"], state.get("remote_head") or "")
         reply = {"schema": contract.SCHEMA_BUNDLE, "branch": state["branch"], "commit": new,
                  "device_head": head, "commits": len(commits)}
@@ -372,6 +376,14 @@ class WorkDepot:
             state["map"] = mapping
             state["remote_head"] = new
             state.setdefault("receipts", {})[receipt_key] = reply
+            # Persist a bounded replay window even when one bundle contains
+            # many commits. Bases and heads suffice to recognize old prefixes.
+            receipts = dict(list(state["receipts"].items())[-MAX_UPLOAD_RECEIPTS:])
+            keep = {head}
+            for key, saved in receipts.items():
+                keep.update((key.split(":", 1)[0], saved["device_head"]))
+            state["receipts"] = receipts
+            state["map"] = {sha: mapping[sha] for sha in keep if sha in mapping}
             git(mirror, "update-ref", "refs/ameesh/device/%s" % fence.agent, head)
             self._save(fence.agent, state)
         log.info("dépôt de travail : %s ← %d commit(s), %s", state["branch"], len(commits),

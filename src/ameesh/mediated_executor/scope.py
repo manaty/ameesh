@@ -324,8 +324,13 @@ class HostScopeRules(ScopeRules):
 
     def _apply_work_move(self, principal, kw, fence):
         self._require_assigned(principal, kw.get("item_id"))
+        if kw.get("state") == "waiting_human":
+            # Enforce main's atomic open-decision check in the storage driver;
+            # the session cannot opt out by omitting or falsifying `held`.
+            kw["held"] = True
 
-    _apply_work_note = _apply_work_move
+    def _apply_work_note(self, principal, kw, fence):
+        self._require_assigned(principal, kw.get("item_id"))
 
     def _require_assigned(self, principal, item_id):
         rows = self.db.query(

@@ -24,6 +24,7 @@ import types
 import unittest
 from unittest import mock
 
+from ameesh.db import DbError
 from ameesh.mediated_executor import contract as C
 from ameesh.mediated_executor import work_repo
 from ameesh.mediated_executor.contract import Fence
@@ -203,7 +204,8 @@ class DepotTest(unittest.TestCase):
                 if "FROM executors" in sql:
                     conn.executor_locked = conn.active and "FOR SHARE" in sql
                     return [] if conn.revoked else [{"ok": 1}]
-                conn.agent_locked = conn.active and "FOR UPDATE" in sql
+                if "FOR UPDATE" in sql:
+                    conn.agent_locked = conn.active
                 return [{"lease_owner": OWNER, "lease_epoch": 42,
                          "host": "anna-portable", "live": conn.live}]
 
@@ -243,6 +245,80 @@ class DepotTest(unittest.TestCase):
                 else:
                     work_repo.push(self.transport, self.fence, self.work)
                     self.assertEqual(len(pushes), 1)
+
+    def test_publication_refuses_expiry_while_waiting_for_agent_lock(self):
+        # Simulate PostgreSQL evaluating the old SELECT target before its
+        # LockRows wait, then acquiring the unchanged row after lease expiry.
+        class Connection:
+            expired = False
+
+            @contextlib.contextmanager
+            def transaction(conn):
+                yield conn
+
+            def query(conn, sql, params):
+                if "JOIN executors" in sql or "FROM executors" in sql:
+                    return [{"ok": 1}]
+                if "FOR UPDATE" in sql:
+                    live_before_lock = not conn.expired
+                    conn.expired = True
+                    return [{"lease_owner": OWNER, "lease_epoch": 42,
+                             "host": "anna-portable", "live": live_before_lock}]
+                return [{"live": not conn.expired}]
+
+        conn = Connection()
+        @contextlib.contextmanager
+        def connection():
+            yield conn
+        self.route.lease_check = work_repo.lease_checker(types.SimpleNamespace(connection=connection))
+        work_repo.checkout(self.transport, self.fence, self.work)
+        self._commit("page.html", "test\n", "page")
+        real_git = work_repo.git
+        def no_push(repo, *args, **kw):
+            self.assertNotEqual(args[0], "push", "publication after lease expiry")
+            return real_git(repo, *args, **kw)
+        with mock.patch.object(work_repo, "git", side_effect=no_push):
+            with self.assertRaises(DbError) as ctx:
+                work_repo.push(self.transport, self.fence, self.work)
+        self.assertEqual(ctx.exception.code, "forbidden_scope")
+        self.assertIsNone(self.route._rev(self.forge, "refs/heads/agent/inge-front"))
+
+    def test_receipts_and_endpoint_mappings_remain_bounded(self):
+        work_repo.checkout(self.transport, self.fence, self.work)
+        put = self.transport.put_work
+        sent = []
+        def capture(fence, base, bundle):
+            reply = put(fence, base, bundle)
+            sent.append((base, bundle, reply))
+            return reply
+        with mock.patch.object(work_repo, "MAX_UPLOAD_RECEIPTS", 2), \
+                mock.patch.object(self.transport, "put_work", side_effect=capture):
+            for upload in range(4):
+                # More commits than the receipt window: no per-commit state.
+                for commit in range(3):
+                    self._commit("page.html", "%d-%d\n" % (upload, commit), "page")
+                work_repo.push(self.transport, self.fence, self.work)
+                state = self.route._load(self.fence.agent)
+                self.assertLessEqual(len(state["receipts"]), 2)
+                self.assertLessEqual(len(state["map"]), 4)
+            with mock.patch.object(self.route, "_replay", side_effect=AssertionError("duplicate")):
+                for base, bundle, reply in sent[-2:]:
+                    self.assertEqual(put(self.fence, base, bundle), reply)
+            with self.assertRaises(Exception) as ctx:
+                put(self.fence, sent[0][0], sent[0][1])
+            self.assertEqual(ctx.exception.code, "idempotency_mismatch")
+            # Lost latest reply followed by new work: its old base still has
+            # a receipt, but none of the intermediate prefix commit mappings.
+            work_repo._write_meta(self.work, dict(work_repo._read_meta(self.work),
+                                                  pushed=sent[-1][0]))
+            published = sh(self.forge, "rev-parse", "refs/heads/agent/inge-front")
+            self._commit("page.html", "continuation\n", "continuation")
+            work_repo.push(self.transport, self.fence, self.work)
+            current = sh(self.forge, "rev-parse", "refs/heads/agent/inge-front")
+            self.assertEqual(sh(self.forge, "rev-parse", current + "^"), published)
+            state = self.route._load(self.fence.agent)
+            self.assertEqual(len(state["receipts"]), 2)
+            self.assertLessEqual(len(state["map"]), 4)
 
     def test_lost_upload_reply_is_replayable_and_later_commits_append(self):
         work_repo.checkout(self.transport, self.fence, self.work)

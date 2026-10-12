@@ -292,6 +292,26 @@ class DoreTest(ServeurExecTest):
 
 
 class PorteeTest(ServeurExecTest):
+    def test_waiting_human_requires_an_open_decision_even_without_held(self):
+        for supplied in ({}, {"held": False}, {"held": True}):
+            with self.subTest(supplied=supplied):
+                resp = self.op("work.move", [812, "waiting_human"],
+                               dict(current="build", loops=0, note="wait", actor="x", **supplied),
+                               token=SESSION)
+                self.assertEqual(resp.status, 200, resp.body)
+                self.assertIsNone(resp.body["value"])
+                self.assertEqual(self.db.query("SELECT state FROM work_items WHERE id = 812")[0]["state"],
+                                 "build")
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, work_item_id, payload)"
+            " VALUES ('inge-front', 'coord', 'question', 'request', '812',"
+            " '{\"decision\": {}}'::jsonb)")
+        resp = self.op("work.move", [812, "waiting_human"],
+                       dict(current="build", loops=0, note="wait", actor="x", held=False),
+                       token=SESSION)
+        self.assertEqual(resp.status, 200, resp.body)
+        self.assertEqual(resp.body["value"]["state"], "waiting_human")
+
 
     def _swap(self, value, old, new):
         if isinstance(value, str):
@@ -480,6 +500,46 @@ class PorteeTest(ServeurExecTest):
 class FencingTest(ServeurExecTest):
 
     FENCE = ("inge-front", OWNER, 42)
+
+    def test_expiry_during_row_lock_wait_uses_the_database_clock_after_lock(self):
+        from ameesh.mediated_executor.dispatcher import fence_holds, session_lease_holds
+        self.hold("inge-front", OWNER, 42, seconds=2)
+        result, errors = [], []
+        def contender():
+            try:
+                with self.pool.connection() as conn:
+                    with conn.transaction() as tx:
+                        result.append(fence_holds(tx, self.auth.verify(TOKEN), C.Fence(*self.FENCE)))
+                        result.append(session_lease_holds(tx, self.auth.verify(SESSION)))
+            except Exception as exc:
+                errors.append(exc)
+        thread = threading.Thread(target=contender, daemon=True)
+        try:
+            with self.db.transaction() as tx:
+                tx.query("SELECT name FROM agent_registry WHERE name = 'inge-front' FOR UPDATE")
+                pid = tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
+                thread.start()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    blocked = tx.query(
+                        "SELECT 1 FROM pg_stat_activity WHERE %s = ANY(pg_blocking_pids(pid))", (pid,))
+                    if blocked:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(blocked, "contender never waited for the row lock")
+                self.assertTrue(tx.query(
+                    "SELECT lease_expires_at > clock_timestamp() AS live"
+                    " FROM agent_registry WHERE name = 'inge-front'")[0]["live"])
+                # Wait through expiry without updating the locked row. An
+                # EvalPlanQual row update would hide the stale-target defect.
+                tx.query("SELECT pg_sleep(GREATEST(0, extract(epoch from"
+                         " lease_expires_at - clock_timestamp())) + 0.05)"
+                         " FROM agent_registry WHERE name = 'inge-front'")
+        finally:
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [False, False])
 
     def _writes(self):
         """(opération, args, kwargs) des écritures de portée B, tirées des
