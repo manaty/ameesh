@@ -232,7 +232,10 @@ sur les canons connus.
 references in the same canon. Deputies can act in the responsible human's
 place under their own identities; superiors receive escalations. Unresolved
 or self references are errors (`member-deputies-unresolved`,
-`member-superiors-self`…). These cards declare the relationships; authorisation
+`member-superiors-self`…). Cycles are rejected separately in each relationship
+graph (`member-deputies-cycle`, `member-superiors-cycle`), including indirect
+cycles. `canon show --json` preserves these relationships, and each agent's
+card type, roles and harness preference list. These cards declare the relationships; authorisation
 enforcement belongs to subsequent v2 work.
 
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))

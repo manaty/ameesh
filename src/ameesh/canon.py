@@ -1128,14 +1128,16 @@ class Canon:
             "readable": self.readable,
             "untrusted": self.untrusted,
             "sources": [s.to_dict() for s in self.sources],
-            "members": [dict(title=m.title, roles=m.roles, **fiche(m.fiche))
+            "members": [dict(title=m.title, roles=m.roles, deputies=m.deputies,
+                             superiors=m.superiors, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
-            "agents": [dict(title=a.title, responsible=a.responsible, team=a.team,
+            "agents": [dict(title=a.title, type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
+                            harnesses=a.harnesses, roles=a.roles,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
@@ -2593,6 +2595,31 @@ def from_config_all(cfg, *, fetch: bool = False) -> list[Canon]:
 # Validation (§4.3)
 # ==========================================================================
 
+def _relationship_cycles(graph):
+    """Directed back-edge cycles, without recursion on untrusted member chains."""
+    done = set()
+    for start in graph:
+        if start in done:
+            continue
+        path = [start]
+        positions = {start: 0}
+        stack = [(start, iter(graph[start]))]
+        while stack:
+            node, edges = stack[-1]
+            target = next(edges, None)
+            if target is None:
+                stack.pop()
+                path.pop()
+                positions.pop(node)
+                done.add(node)
+            elif target in positions:
+                yield path[positions[target]:] + [target]
+            elif target not in done:
+                positions[target] = len(path)
+                path.append(target)
+                stack.append((target, iter(graph.get(target, ()))))
+
+
 def validate(canon: Canon) -> list[Finding]:
     """Constats de lecture + constats du profil. Une erreur est bloquante."""
     findings: list[Finding] = list(canon.load_findings)
@@ -2697,6 +2724,24 @@ def validate(canon: Canon) -> list[Finding]:
                         "%s of %s: a human cannot be their own %s"
                         % (key, member.title, "deputy" if key == "deputies" else "superior"),
                         member.fiche)
+
+    members_by_ref = {}
+    for member in canon.members:
+        ref = canon.resolve_human("human:%s" % member.title)
+        if ref is not None:
+            members_by_ref[ref] = member
+    for key in ("deputies", "superiors"):
+        graph = {}
+        for ref, member in members_by_ref.items():
+            graph[ref] = []
+            for target in getattr(member, key) or []:
+                resolved = canon.resolve_human(target)
+                if resolved in members_by_ref and resolved != ref:
+                    graph[ref].append(resolved)
+        for cycle in _relationship_cycles(graph):
+            add("member-%s-cycle" % key, ERROR,
+                "cycle in human %s: %s" % (key, " → ".join(cycle)),
+                members_by_ref[cycle[0]].fiche)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:
