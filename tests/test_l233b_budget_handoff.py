@@ -103,6 +103,33 @@ class LotGitTest(unittest.TestCase):
         out = self.check()
         self.assertIn("branch lot/7 in %s not on origin/lot/7" % self.repo, out["reason"])
 
+    def test_worktree_du_lot_detache(self):
+        # codex r2 (#409) : un worktree du lot détaché sur B, poussé ailleurs,
+        # alors que lot/7 (local et distant) reste sur A
+        other = os.path.join(self.tmp, "wt")
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "worktree", "add", "-q", "--detach", other, "lot/7")
+        with open(os.path.join(other, "b.py"), "w") as fh:
+            fh.write("b = 1\n")
+        _git(other, "add", "-A")
+        _git(other, "commit", "-q", "-m", "B")
+        _git(other, "push", "-q", "origin", "HEAD:refs/heads/backup")
+        _git(self.repo, "fetch", "-q", "origin")
+        item = {"id": 7, "state": "build", "branch": "lot/7"}
+        tracked = [{"agent": "claude1", "lot": "7", "branch": "", "path": other}]
+        out = handoff.lot_git(item, self.source, host="h1", worktrees=tracked)
+        self.assertEqual(out["reason"], "HEAD in %s not on origin/lot/7" % other)
+        _git(other, "push", "-q", "origin", "HEAD:refs/heads/lot/7")
+        _git(self.repo, "fetch", "-q", "origin")
+        self.assertTrue(handoff.lot_git(item, self.source, host="h1", worktrees=tracked)["ok"])
+        # un worktree sur la branche du lot, connu de git seul : son HEAD aussi
+        _git(other, "checkout", "-q", "-B", "lot/7", "origin/lot/7")
+        _git(other, "commit", "-q", "--allow-empty", "-m", "C")
+        _git(other, "push", "-q", "origin", "HEAD:refs/heads/backup2")
+        _git(self.repo, "fetch", "-q", "origin")
+        out = handoff.lot_git(item, self.source, host="h1", worktrees=[])
+        self.assertIn("not on origin/lot/7", out["reason"])
+
     def test_branche_non_poussee_ou_absente(self):
         out = self.check(branch="lot/8")
         self.assertEqual((out["ok"], out["reason"]), (False, "branch lot/8 not pushed"))

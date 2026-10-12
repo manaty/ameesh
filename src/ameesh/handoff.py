@@ -117,16 +117,27 @@ def lot_git(item: dict, source: dict, *, host: str | None, worktrees: list,
         return {"ok": False, "paths": None,
                 "reason": "worktrees on host %s, not readable from %s" % (
                     source.get("host") or "?", host or "?")}
+    # les worktrees du lot : suivis pour lui (détachés compris), ou sur sa
+    # branche d'après git ; leur HEAD doit être sur la branche distante du lot
+    # (codex r2, #409)
+    lot_dirs = [w.get("path") for w in worktrees
+                if w.get("agent") == source["name"]
+                and (str(w.get("lot") or "") == str(item["id"]) or w.get("branch") == branch)]
     dirs = []
-    for path in [source.get("cwd")] + [
-            w.get("path") for w in worktrees
-            if w.get("agent") == source["name"]
-            and (str(w.get("lot") or "") == str(item["id"]) or w.get("branch") == branch)]:
+    for path in [source.get("cwd")] + lot_dirs:
         if path and path not in dirs and os.path.isdir(path):
             dirs.append(path)
     if not dirs:
         return {"ok": False, "paths": None, "reason": "no worktree of %s on this host"
                 % source["name"]}
+    # sur la branche du lot d'après git (d'un autre agent peut-être : seul
+    # son HEAD compte, pas sa propreté)
+    heads = list(dirs)
+    for path in dirs:
+        for other in _branch_worktrees(path, branch, git):
+            lot_dirs.append(other)
+            if other not in heads and os.path.isdir(other):
+                heads.append(other)
     if build:
         for path in dirs:
             seen = state(path)
@@ -147,8 +158,8 @@ def lot_git(item: dict, source: dict, *, host: str | None, worktrees: list,
         # `pushed` dit seulement que HEAD est sur UNE branche distante : le
         # travail de la source doit être sur celle du lot, que le preneur
         # reprend (codex r1, #409)
-        for path in dirs:
-            missing = _not_on_branch(path, branch, remote, git)
+        for path in heads:
+            missing = _not_on_branch(path, branch, remote, git, lot_dir=path in lot_dirs)
             if missing:
                 return {"ok": False, "paths": None,
                         "reason": "%s in %s not on origin/%s" % (missing, path, branch)}
@@ -163,16 +174,34 @@ def lot_git(item: dict, source: dict, *, host: str | None, worktrees: list,
     return {"ok": True, "reason": "", "paths": [p for p in diff.stdout.split("\0") if p]}
 
 
-def _not_on_branch(path: str, branch: str, remote: str, git) -> str:
+def _branch_worktrees(path: str, branch: str, git) -> list:
+    """Les worktrees du dépôt de `path` sur la branche `branch` (`git worktree
+    list --porcelain`)."""
+    listed = git(["worktree", "list", "--porcelain"], path)
+    if listed is None or listed.returncode != 0:
+        return []
+    found, current = [], None
+    for line in listed.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = line[len("worktree "):]
+        elif line == "branch refs/heads/%s" % branch and current:
+            found.append(current)
+    return found
+
+
+def _not_on_branch(path: str, branch: str, remote: str, git, *,
+                   lot_dir: bool = False) -> str:
     """Ce qui, dans le worktree `path`, manque à la branche distante du lot
     (vide sinon) : sa branche locale `branch`, et HEAD quand il est sur
-    `branch`. Un autre dépôt sans cette branche n'a rien à y mettre."""
+    `branch` ou que `path` est un worktree du lot (`lot_dir`, détaché
+    compris). Un autre dépôt sans cette branche n'a rien à y mettre."""
     refs = []
     local = git(["rev-parse", "--verify", "--quiet", "refs/heads/%s^{commit}" % branch], path)
     if local is not None and local.returncode == 0:
         refs.append("refs/heads/%s" % branch)
     current = git(["symbolic-ref", "-q", "--short", "HEAD"], path)
-    if current is not None and current.returncode == 0 and current.stdout.strip() == branch:
+    if lot_dir or (current is not None and current.returncode == 0
+                   and current.stdout.strip() == branch):
         refs.append("HEAD")
     for ref in refs:
         inside = git(["merge-base", "--is-ancestor", ref, remote], path)
