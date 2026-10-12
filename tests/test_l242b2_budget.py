@@ -22,6 +22,17 @@ from .test_l30_accounts import _Base as _L30Base
 HEURE = 3600.0
 
 
+def _heure_de_remise(now: float, delta: float) -> str:
+    """L'heure de remise telle que la pause l'annonce (#373 r2) : « HH:MM »
+    le jour même, « JJ/MM HH:MM » si elle tombe un autre jour. Sans quoi un
+    test lancé après 23 h 30 attend « 00:15 » pour une remise de 30 min que la
+    pause date du lendemain — CI rouge chaque nuit."""
+    fin = time.localtime(now + delta)
+    if time.strftime("%Y-%m-%d", fin) == time.strftime("%Y-%m-%d", time.localtime(now)):
+        return time.strftime("%H:%M", fin)
+    return time.strftime("%d/%m %H:%M", fin)
+
+
 class ReserveForfaitTest(_Comptes):
     def test_un_non_critique_s_arrete_dix_points_plus_tot(self):
         self.jauge("primaire", 96)       # au seuil pour tous
@@ -54,7 +65,7 @@ class ReserveForfaitTest(_Comptes):
         with mock.patch.object(book, "gauges", return_value=[jauge]), \
                 mock.patch.object(book, "clock", return_value=self.now):
             raison = book.pace_exceeded("codex", accounts.RESERVE)
-        heure = time.strftime("%H:%M", time.localtime(self.now + 1800))
+        heure = _heure_de_remise(self.now, 1800)
         self.assertTrue(raison.startswith(
             "pause (account (default), five_hour 96 %%) until %s; plan codex five_hour" % heure),
             raison)
@@ -90,7 +101,7 @@ class AffichageDeLaPauseTest(_Comptes):
         self.jauge("secondaire", 97)
         pause = self.choose()
         self.assertIsNone(pause.profile)
-        heure = time.strftime("%H:%M", time.localtime(self.now + 1800))
+        heure = _heure_de_remise(self.now, 1800)
         self.assertTrue(pause.reason.startswith("pause (account "), pause.reason)
         self.assertIn(") until %s; all codex accounts at threshold" % heure, pause.reason)
         self.assertRegex(pause.reason, r"codex-300min (96|97) %")
