@@ -279,9 +279,9 @@ def load_config(path: str | None = None) -> GuardConfig:
     if isinstance(agents, bool) or not isinstance(agents, int) or agents < 0:
         raise GuardError("max_agents: integer >= 0 expected")
     slice_name = raw.get("slice") or DEFAULT_SLICE
-    if freeze_unit(slice_name) is None:
-        raise GuardError("slice: a systemd slice name expected (letters, digits, "
-                         "':_.-', ending in .slice), got %r" % (slice_name,))
+    refused = refused_slice(slice_name)
+    if refused:
+        raise GuardError("slice %r refused: %s" % (slice_name, refused))
     return GuardConfig(host=str(host), offer=parse_offer(raw.get("lend")), max_agents=agents,
                        state_path=str(raw.get("state_path") or DEFAULT_STATE_PATH),
                        ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
@@ -721,12 +721,50 @@ FREEZE_SCRIPT = ('systemctl freeze "$0" && sleep "$1"; '
                  'until systemctl thaw "$0"; do sleep 2; done')
 
 
+#: the slice the freezing services run in: a freeze never reaches its own
+#: helper (codex #237 r5)
+HELPER_SLICE = "ameesh-guard-helper.slice"
+#: slices never capped nor frozen: the root and those of the system
+SYSTEM_SLICES = ("-.slice", "system.slice", "user.slice")
+#: how long the guard waits for the slice to read `frozen` after starting
+#: its freezing service, and how often it looks
+FREEZE_CONFIRM_S, FREEZE_POLL_S = 2.0, 0.2
+
+
 def freeze_unit(slice_name: str) -> str | None:
     """The freezing unit of a slice (`ameesh-guard-freeze-<slice>.service`),
     None for a slice name the guard refuses."""
     if not isinstance(slice_name, str) or not SLICE_RE.fullmatch(slice_name):
         return None
     return "%s-%s.service" % (FREEZE_UNIT, slice_name[:-len(".slice")])
+
+
+def slice_ancestors(name: str) -> list[str]:
+    """`a-b.slice` and the slices that hold it: `-.slice`, `a.slice`,
+    `a-b.slice` (systemd nests slices along the dashes of their names)."""
+    if name == "-.slice":
+        return [name]
+    parts = name[:-len(".slice")].split("-")
+    return ["-.slice"] + ["-".join(parts[:i + 1]) + ".slice" for i in range(len(parts))]
+
+
+def refused_slice(name: Any, cgroup: str | None = None) -> str | None:
+    """Why the guard refuses to cap or freeze the slice `name`, None if it
+    may: not a plain slice name, a system slice, or a slice that holds the
+    guard's helper or the guard itself (`cgroup`: its own cgroup path;
+    frozen, nothing would ever thaw it)."""
+    if freeze_unit(name) is None:
+        return "not a plain systemd slice name (letters, digits, ':_.-', ending in .slice)"
+    if name in SYSTEM_SLICES:
+        return "a system slice"
+    if name in slice_ancestors(HELPER_SLICE):
+        return "it holds the guard's helper (%s)" % HELPER_SLICE
+    own = host.own_cgroup() if cgroup is None else cgroup
+    for part in (own or "").split("/"):
+        if part.endswith(".slice") and SLICE_RE.fullmatch(part) \
+                and name in slice_ancestors(part):
+            return "it holds the guard itself (%s)" % own
+    return None
 
 
 #: which `caps` key each property enforces
@@ -751,15 +789,23 @@ class Enforcer:
     does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
-                 log: Callable | None = None, clock: Callable = time.time):
+                 log: Callable | None = None, clock: Callable = time.time, *,
+                 cgroup: str | None = None, boottime: Callable = host.boottime,
+                 boot_id: Callable = host.boot_id, sleep: Callable = time.sleep):
         self.cfg = cfg
         self.run = run or subprocess.run
         self.clock = clock
+        self.boottime, self.boot_id, self.sleep = boottime, boot_id, sleep
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
-        self.freeze_done = False         # the freezing service was started
+        self.freeze_done = False         # the slice read `frozen` after a start
         self.freeze_unit = freeze_unit(cfg.slice)
+        #: why this slice is never touched (system slice, holds the guard)
+        self.refused = refused_slice(cfg.slice, cgroup)
+        #: the freeze episode: its since_ts, the boot, and its bound on the
+        #: boot clock, kept across retries and restarts (codex #237 r5)
+        self.episode: dict | None = None
 
     def _command(self, argv: list[str]) -> bool:
         try:
@@ -815,9 +861,54 @@ class Enforcer:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    def freeze(self, on: bool, until: float | None = None) -> bool:
+    def _freezer_state(self) -> str | None:
+        """The slice's FreezerState (`running`, `freezing`, `frozen`,
+        `thawing`), None when unreadable."""
+        try:
+            proc = self.run(["systemctl", "show", "--property=FreezerState", "--value",
+                             self.cfg.slice], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (proc.stdout or "").strip() or None if proc.returncode == 0 else None
+
+    def _confirmed(self) -> bool:
+        """The slice reads `frozen` within `FREEZE_CONFIRM_S`: a service
+        started is no proof (its freeze may fail, the shell still exits 0)."""
+        for _ in range(int(FREEZE_CONFIRM_S / FREEZE_POLL_S) + 1):
+            state = self._freezer_state()
+            if state == "frozen":
+                return True
+            if state not in ("freezing", "running"):
+                return False
+            self.sleep(FREEZE_POLL_S)
+        return False
+
+    def restore_episode(self, record: Any) -> None:
+        """The freeze episode a previous guard published (`guard.freeze`)."""
+        if isinstance(record, dict) and isinstance(record.get("boot_id"), str) \
+                and _number(record.get("since_ts")) and _number(record.get("boot_deadline")):
+            self.episode = {k: record[k] for k in ("since_ts", "boot_id", "boot_deadline")}
+
+    def _seconds_left(self, until: float, since: float | None) -> int | None:
+        """Whole seconds the freeze may still last: on the boot clock, from
+        the episode's bound when this episode already started a freeze (a
+        retry, a restart), else from `until` (at most `FREEZE_MAX_S`)."""
+        boot, now = self.boot_id(), self.boottime()
+        episode = self.episode
+        if boot is None or now is None:
+            left = min(FREEZE_MAX_S, until - self.clock())
+        elif episode and episode["since_ts"] == since and episode["boot_id"] == boot:
+            left = episode["boot_deadline"] - now
+        else:
+            left = min(FREEZE_MAX_S, until - self.clock())
+            self.episode = {"since_ts": since, "boot_id": boot, "boot_deadline": now + left}
+        return int(left) if left >= 1 else None
+
+    def freeze(self, on: bool, until: float | None = None,
+               since: float | None = None) -> bool:
         """Freezes the guest's slice until `until` through its freezing
-        service, or thaws it; True if the slice is as asked."""
+        service (`since`: the episode's start), or thaws it; True if the
+        slice is as asked."""
         if not on:
             if not self.frozen:
                 return True
@@ -828,38 +919,46 @@ class Enforcer:
             self.frozen = self.freeze_done = False
             return True
         if self.freeze_done:
-            return True
-        now = self.clock()
-        if self.freeze_unit is None or until is None or until - now < 1:
-            self.log("freeze refused: %s" % ("slice name %r refused" % self.cfg.slice
-                                             if self.freeze_unit is None else "bound past"))
+            if self._freezer_state() == "frozen":
+                return True
+            self.log("slice %s no longer frozen: freeze started again" % self.cfg.slice)
+            self.freeze_done = False
+        seconds = None if until is None or self.refused else self._seconds_left(until, since)
+        if seconds is None:
+            self.log("freeze refused: %s" % (self.refused or "bound past"))
             self.freeze(False)
             return False
-        # never more than the longest freeze, whatever the wall clock says
-        seconds = min(int(FREEZE_MAX_S), int(math.ceil(until - now)))
         # a service left by a failed attempt or an earlier guard: stopped
-        # (it thaws), forgotten, then started anew
+        # (it thaws), forgotten, then started anew for what is left
         self._quiet("stop", self.freeze_unit)
         self._quiet("reset-failed", self.freeze_unit)
         # started: possibly in force even if systemd-run does not return
         self.frozen = True
-        self.freeze_done = self._command([
-            "systemd-run", "--unit=%s" % self.freeze_unit, "--collect", "--quiet",
+        started = self._command([
+            "systemd-run", "--unit=%s" % self.freeze_unit, "--slice=%s" % HELPER_SLICE,
+            "--collect", "--quiet",
             "--property=RuntimeMaxSec=%d" % (seconds + FREEZE_BACKSTOP_S),
             "--property=ExecStopPost=systemctl thaw %s" % self.cfg.slice,
             "/bin/sh", "-c", FREEZE_SCRIPT, self.cfg.slice, str(seconds)])
+        self.freeze_done = started and self._confirmed()
         return self.freeze_done
 
     def thaw_at_start(self) -> None:
         """A guard that died during a freeze must not leave the guest frozen:
         the slice counts as possibly frozen until a thaw succeeds (retried
-        at every evaluation below level 2)."""
+        at every evaluation below level 2). A refused slice is never touched."""
+        if self.refused:
+            return
         self.frozen = True
         self.freeze(False)
 
     def apply(self, state: dict, cpu_count: int | None) -> list[str]:
         """Enforces `state` (levels 0 to 2; a drain or a stop thaws and keeps
-        the caps); the `caps` keys actually enforced."""
+        the caps); the `caps` keys actually enforced, and `freeze` when the
+        slice reads frozen. A refused slice is never touched."""
+        if self.refused:
+            self.log("slice %s refused: %s; nothing enforced" % (self.cfg.slice, self.refused))
+            return []
         caps = state.get("caps") or {}
         done = self._set(self.cfg.slice, slice_properties(caps, cpu_count))
         enforced = {PROPERTY_CAPS[p] for p in done}
@@ -872,7 +971,7 @@ class Enforcer:
                 enforced.add("agent_memory_mb")
         freeze = state.get("freeze")
         if freeze:
-            if self.freeze(True, freeze.get("until_ts")):
+            if self.freeze(True, freeze.get("until_ts"), freeze.get("since_ts")):
                 enforced.add("freeze")
         else:
             self.freeze(False)
@@ -897,6 +996,9 @@ class Guard:
         self.clock = clock
         self.signals = signals or (lambda now: read_signals(cfg, now))
         previous = read_json(cfg.state_path) or {}
+        if self.enforcer is not None and isinstance(previous.get("guard"), dict):
+            # a freeze retried after a restart gets only what its episode has left
+            self.enforcer.restore_episode(previous["guard"].get("freeze"))
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
         # so do the level, the freeze bound and the drain deadline
@@ -927,7 +1029,13 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"))
+            enforced = self.enforcer.apply(state, reading.get("cpu_count"))
+            # the schema's caps.enforced lists caps only: the freeze says it itself
+            state["caps"]["enforced"] = [k for k in enforced if k != "freeze"]
+            if state.get("freeze") is not None:
+                state["freeze"]["enforced"] = "freeze" in enforced
+            if self.enforcer.episode is not None:
+                state["guard"]["freeze"] = dict(self.enforcer.episode)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
