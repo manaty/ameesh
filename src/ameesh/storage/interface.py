@@ -2228,6 +2228,13 @@ class TurnResources(Domain):
         de `limit` lignes au plus (pagination par `id`)."""
 
     @abc.abstractmethod
+    def running_started_before(self, host: str, before_ts: float, after_id: int = 0,
+                               limit: int = 500) -> list[dict]:
+        """L147b : les lignes `running` de `host` dont le tour a commencé (ou
+        fini, délai de grâce) avant `before_ts`, par id croissant au-delà de
+        `after_id` — la revue d'après démarrage les lit page par page."""
+
+    @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
         secondes (fin du tour, pour une ligne en délai de grâce) : un

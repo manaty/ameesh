@@ -298,6 +298,16 @@ class TurnResources(interface.TurnResources):
             "   AND id > %s ORDER BY id LIMIT %s",
             (host, float(before_ts), int(after_id), int(limit)))
 
+    def running_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
+        # comme `stale_running` : une ligne en délai de grâce se juge sur la
+        # fin de son tour
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND status = 'running'"
+            "   AND coalesce(ended_at, started_at) < to_timestamp(%s)"
+            "   AND id > %s ORDER BY id LIMIT %s",
+            (host, float(before_ts), int(after_id), int(limit)))
+
     def stale_running(self, older_than_s, host=None) -> list[dict]:
         where, params = "", [float(older_than_s)]
         if host:
