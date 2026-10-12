@@ -236,6 +236,7 @@ class SlotPoolTest(unittest.TestCase):
                 "print('held' if slot is not None else 'refused', flush=True)\n"
                 "time.sleep(60)\n" % (os.path.join(REPO, "src"), self.dir))
         proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.stdout.close)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         self.assertEqual(proc.stdout.readline().strip(), "held")
@@ -274,6 +275,44 @@ class SlotPoolTest(unittest.TestCase):
         admitted, slot = Runner._gate_slot(second, {"name": "b"})
         self.assertTrue(admitted)
         host_gate.SlotPool.release(slot)
+
+    def fake_runner(self, cap, workers=None):
+        ack = os.path.join(os.path.dirname(self.dir), "ack.json")
+        gate = types.SimpleNamespace(max_concurrent=lambda: cap["value"],
+                                     gate=types.SimpleNamespace(ack_path=ack))
+        return types.SimpleNamespace(host_gate=gate, lock=threading.Lock(),
+                                     workers=workers or {}, _gate_slots={})
+
+    def test_agents_admitted_without_a_cap_count_when_one_is_set(self):
+        # codex r2 #279: a worker admitted without max_concurrent held no slot,
+        # so a cap set to 1 later did not count it
+        from ameesh.runner import Runner
+        cap = {"value": None}
+        runner = self.fake_runner(cap)
+        admitted, slot = Runner._gate_slot(runner, {"name": "a"})
+        self.assertTrue(admitted)
+        self.assertIsNotNone(slot)  # a slot even without a cap
+        runner._gate_slots["a"] = slot
+        runner.workers["a"] = FakeWorker("a")
+        cap["value"] = 1
+        self.assertEqual(Runner._gate_slot(runner, {"name": "b"}), (False, None))
+        # a worker from before the gate (no slot yet) takes one at the next claim
+        Runner._release_slot(runner, "a")
+        self.assertEqual(Runner._gate_slot(runner, {"name": "b"}), (False, None))
+        self.assertIsNotNone(runner._gate_slots["a"])
+        Runner._release_slot(runner, "a")
+
+    def test_unusable_slots_refuse_under_a_cap(self):
+        # codex r2 #279: the local count admitted one agent per executor
+        from ameesh.runner import Runner
+        os.makedirs(os.path.dirname(self.dir), exist_ok=True)
+        with open(self.dir, "w"):  # `slots` is a file: the folder is unusable
+            pass
+        cap = {"value": 1}
+        runner = self.fake_runner(cap)
+        self.assertEqual(Runner._gate_slot(runner, {"name": "a"}), (False, None))
+        cap["value"] = None  # without a cap, nothing to count: admitted
+        self.assertEqual(Runner._gate_slot(runner, {"name": "a"}), (True, None))
 
     def test_a_lower_cap_counts_every_held_slot(self):
         pool = host_gate.SlotPool(self.dir)
@@ -483,6 +522,29 @@ class RelocationGateTest(unittest.TestCase):
         self.assertFalse(relocation.gate_open(fresh, offer, now=1000.0 + 301))
         self.assertTrue(relocation.gate_open(fresh, offer, now=1000.0 + 301, max_age_s=600))
         self.assertFalse(relocation.gate_open({"gate_state": "available"}, offer))
+
+
+class ClaimErrorTest(PgTestCase):
+    def test_a_claim_error_gives_the_slot_back(self):
+        # codex r2 #279: an exception of registry.claim kept the slot reserved
+        import dataclasses
+        from unittest import mock
+        from ameesh.runner import Runner
+        self.register("solo", "claude", cwd=self.tmp, prompt="consigne")
+        runner = Runner(dataclasses.replace(self.cfg, poll=1.0), self.db, once=False)
+        self.addCleanup(runner.stop.set)
+        slots = os.path.join(self.tmp, "gate", "ack", "slots")
+        runner.host_gate = types.SimpleNamespace(
+            max_concurrent=lambda: 1, holds_turns=lambda: False,
+            gate=types.SimpleNamespace(ack_path=os.path.join(os.path.dirname(slots), "ack.json")))
+        runner._gate_settled.set()
+        with mock.patch.object(registry, "claim", side_effect=RuntimeError("db gone")):
+            with self.assertRaises(RuntimeError):
+                runner.sweep()
+        self.assertEqual(runner._gate_slots, {})
+        slot = host_gate.SlotPool(slots).acquire(1)  # the only slot is free
+        self.assertIsNotNone(slot)
+        host_gate.SlotPool.release(slot)
 
 
 class RelocationPlanTest(PgTestCase):

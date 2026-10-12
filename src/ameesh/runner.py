@@ -3944,25 +3944,35 @@ class Runner:
         """L159f : `caps.max_concurrent` de la porte — agents à la fois sur
         l'HÔTE, tous exécuteurs confondus, éphémères compris (la garde compte
         des processus). Rend (admis, place) : la place (`host_gate.SlotPool`)
-        est tenue tant que le worker vit, rendue par `_release_slot`."""
+        est tenue tant que le worker vit, rendue par `_release_slot`.
+
+        Avec une porte, tout worker tient une place, plafond ou non : un
+        plafond posé plus tard compte aussi les agents déjà là (ceux d'avant
+        la porte en prennent une ici). Dossier des places inutilisable sous
+        un plafond : aucune admission (jamais un comptage local, qui
+        admettrait un agent par exécuteur)."""
         gate = self.host_gate
-        cap = gate.max_concurrent() if gate is not None else None
-        if cap is None:
+        if gate is None:
             return True, None
+        cap = gate.max_concurrent()
         from . import host_gate as host_gate_mod
         directory = os.path.join(os.path.dirname(gate.gate.ack_path) or ".", "slots")
+        pool = host_gate_mod.SlotPool(directory)
         try:
-            slot = host_gate_mod.SlotPool(directory).acquire(cap)
-        except OSError as exc:
-            # dossier partagé inutilisable : au moins le plafond de cet exécuteur
-            if not getattr(self, "_slot_error_logged", False):
-                self._slot_error_logged = True
-                log_async("host gate: slots %s unusable (%s), cap counted "
-                          "for this executor alone" % (directory, exc))
             with self.lock:
-                running = sum(1 for name, worker in self.workers.items()
-                              if name != (agent or {}).get("name") and worker.is_alive())
-            return running < cap, None
+                missing = [name for name, worker in self.workers.items()
+                           if worker.is_alive() and name not in self._gate_slots]
+            for name in missing:
+                self._gate_slots[name] = pool.acquire(None)
+            slot = pool.acquire(cap)
+        except OSError as exc:
+            message = "host gate: slots %s unusable (%s)%s" % (
+                directory, exc, ": no claim while caps.max_concurrent is set"
+                if cap is not None else "")
+            if getattr(self, "_slot_error_logged", None) != message:
+                self._slot_error_logged = message
+                log_async(message)
+            return cap is None, None
         return slot is not None, slot
 
     def _release_slot(self, name: str) -> None:
@@ -4046,33 +4056,42 @@ class Runner:
                                  (getattr(self, "_host_limits_origin", None) or {}).get(
                                      "max_agents", "?"), agent["name"]))
                 continue
-            lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
-            if not lease:
-                self._release_slot(agent["name"])
-                continue  # un autre exécuteur a gagné la course
-            log("lease acquired: %s (epoch %s, host %s)"
-                % (agent["name"], lease["lease_epoch"], self.host))
-            worker = AgentWorker(self, agent, lease)
-            if worker._reprise_attach:
-                # L106 : la session interactive est morte sans rendre son bail
-                log("[%s] attached session dead (lease of %s expired): the runner "
-                    "resumes session %s" % (agent["name"], agent.get("lease_owner"),
-                                            agent.get("session_id") or "new"))
-                worker._fil_note(
-                    "The interactive session (%s) ended without returning its "
-                    "lease; runner %s resumes the same session."
-                    % (agent.get("lease_owner"), self.runner_id),
-                    meta={"action": "reprise-attach",
-                          "session": agent.get("session_id") or None})
-            if self.once:
-                ran = worker.process_once(self.wait)
-                self.did_turn = self.did_turn or ran
-                worker.release_lease()
-                self._release_slot(agent["name"])
-            else:
-                with self.lock:
-                    self.workers[agent["name"]] = worker
-                worker.start()
+            # une exception (base, worker) rend la place de la porte ; un
+            # worker inscrit la rend à sa fin (`sweep`)
+            registered = False
+            try:
+                lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
+                if not lease:
+                    self._release_slot(agent["name"])
+                    continue  # un autre exécuteur a gagné la course
+                log("lease acquired: %s (epoch %s, host %s)"
+                    % (agent["name"], lease["lease_epoch"], self.host))
+                worker = AgentWorker(self, agent, lease)
+                if worker._reprise_attach:
+                    # L106 : la session interactive est morte sans rendre son bail
+                    log("[%s] attached session dead (lease of %s expired): the runner "
+                        "resumes session %s" % (agent["name"], agent.get("lease_owner"),
+                                                agent.get("session_id") or "new"))
+                    worker._fil_note(
+                        "The interactive session (%s) ended without returning its "
+                        "lease; runner %s resumes the same session."
+                        % (agent.get("lease_owner"), self.runner_id),
+                        meta={"action": "reprise-attach",
+                              "session": agent.get("session_id") or None})
+                if self.once:
+                    ran = worker.process_once(self.wait)
+                    self.did_turn = self.did_turn or ran
+                    worker.release_lease()
+                    self._release_slot(agent["name"])
+                else:
+                    with self.lock:
+                        self.workers[agent["name"]] = worker
+                    registered = True
+                    worker.start()
+            except BaseException:
+                if not registered:
+                    self._release_slot(agent["name"])
+                raise
 
     def budget_limits(self, db) -> "budget_mod.Limits":
         """Les plafonds en vigueur (L70) : base (cache court) > config > défaut."""

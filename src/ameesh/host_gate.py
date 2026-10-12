@@ -294,9 +294,10 @@ class SlotPool:
         return os.open(os.path.join(self.directory, name),
                        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
 
-    def acquire(self, cap: int) -> Optional[int]:
+    def acquire(self, cap: Optional[int]) -> Optional[int]:
         """A held slot (an fd, to `release`), or None when `cap` agents already
-        run on the host. Raises OSError when the folder is unusable."""
+        run on the host (`cap` None: never refused, the agent still counts for
+        a cap set later). Raises OSError when the folder is unusable."""
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
         pool = self._open(".lock")
         try:
@@ -315,7 +316,7 @@ class SlotPool:
                     free = fd
                 else:
                     os.close(fd)
-            if held >= cap:
+            if cap is not None and held >= cap:
                 if free is not None:
                     os.close(free)
                 return None
