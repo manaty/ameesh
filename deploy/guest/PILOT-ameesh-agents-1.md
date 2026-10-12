@@ -157,11 +157,72 @@ deepseek1 move from manaty-mesh-1 to ameesh-agents-1, which keeps
 `max_agents: 0` there. Their runners on manaty-mesh-1 are
 stopped first: an agent runs on one host at a time.
 
+`--enable` first prepares what each guest needs to work (lot #483: the
+three steps bureau did by hand on the first activation), then starts the
+runners. Everything is checked before anything is done:
+
+* **its clone**: the agent's project (`team`, here `nexlink`) and its work
+  folder (`policy.work_dirs`, `/srv/ameesh-guest/work/{agent}`) are read in
+  the canon (`--canon`, at `origin/main`, by ameesh's reader, as the
+  checkout's owner); the canon holds no forge for a project, so `--repo`
+  gives it: `https` only, no user or token in the URL. The guest clones it
+  there, detached on `origin/<branch>`. A folder outside
+  `/srv/ameesh-guest/work`, an agent not placed on the host, a folder
+  holding anything but a clone of that repository: refused. A clone already
+  there is kept as it is (never fetched nor reset);
+* **its git credential**: `/opt/ameesh/git-credential-guest` (root, 0755),
+  named in each clone's own `.git/config`, after an empty
+  `credential.helper` that resets the ones read before it (the system's,
+  the guest's `~/.gitconfig`); nothing is written in `~/.gitconfig`. It
+  hands git the runner's `GH_TOKEN`, which systemd reads in
+  `/etc/ameesh/guest-<agent>.env`, for `https://github.com` only. A kept
+  clone with any other credential setting git would read after that reset
+  (any `credential.*` but `credential.helper`, a `credential.<url>.helper`
+  for one, anywhere, the guest's `~/.gitconfig` included; a
+  `credential.helper` in `config.worktree` or in an include) is refused:
+  remove it first, `--enable` says where it is. For the clone itself (and
+  the branch asked first), git, run as the guest, is given an inline
+  helper that reads `GH_TOKEN` in the agent's file itself (the guest's to
+  read, as its runner does), on each request, for `https://github.com`
+  only: root hands git no token (no file, argument, environment or open
+  descriptor), and nothing is printed. A clone without `GH_TOKEN` in the
+  agent's file is refused. **The guests of one host share a UID
+  (`ameesh-guest`), so their tokens**: any guest agent, or a git hook it
+  runs, can read every `guest-<agent>.env`. Use one GitHub token per guest
+  host, with the fewest rights possible (`--check` says it too);
+* **the dsh profile**: `hooks.json` and the plain files of
+  `~/.dsh/profiles/*/` from `--dsh-from` (by default the `sudo` user's
+  `~/.dsh`), never its sessions, keys, logs or modules; refused if a file
+  looks like it holds a key, token or password. Kept if the guest has one;
+  `--check` reads it by the same rules.
+
+What lands in the guest's home or work is written by the guest
+(`runuser -u ameesh-guest`), never by root. `--check` reports each of them
+(with `--canon`, the folders the canon gives; without, `work/<agent>`).
+
+The commands below are this host's (its guests, its project and forge, as
+of the pilot): an example of `--repo`, never a default. ameesh names no
+project; `--repo` is given on each run of `--enable` and is stored nowhere.
+
 ```sh
-sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1
-sudo deploy/guest/install-pilot.sh --check
+sudo deploy/guest/install-pilot.sh --dry-run --enable deepseek6 deepseek1 \
+  --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \
+  --repo nexlink=https://github.com/manaty/nexlink.git#develop   # read it all
+sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1 \
+  --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \
+  --repo nexlink=https://github.com/manaty/nexlink.git#develop
+sudo deploy/guest/install-pilot.sh --check --canon /home/ameesh/canon
 systemctl status 'ameesh-guest-runner@*'
 ```
+
+On ameesh-agents-1, where bureau made the clones, the credential and the
+profile by hand on 2026-10-12: the clones and the profile are kept (said
+`kept`), each clone's `.git/config` names the helper after its reset (the
+same `GH_TOKEN`, from the same file), and `--check` shows them all. A
+helper bureau set for `https://github.com` in the guest's `~/.gitconfig`
+(`credential.https://github.com.helper`) is refused: unset it first
+(`git config --global --unset-all credential.https://github.com.helper`,
+as the guest); a plain `credential.helper` there may stay.
 
 After a day of observation without a missed target
 (`ameesh hosts ameesh-agents-1 --report --days 1`):
