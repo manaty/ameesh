@@ -129,7 +129,7 @@ import sys
 MESH_COMMANDS = (
     "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
-    "review-class",
+    "review-class", "handoff",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)

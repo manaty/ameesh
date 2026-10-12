@@ -2573,6 +2573,44 @@ class CiResults(Domain):
         conclue verte ou rouge."""
 
 
+class Handoffs(Domain):
+    """L232a: destination reservations and durable lot-boundary handoffs."""
+
+    @abc.abstractmethod
+    def get(self, operation: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def active(self, agent: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def cooling(self, agent: str, seconds: int) -> bool: ...
+
+    @abc.abstractmethod
+    def occupancy(self, host: str) -> int: ...
+
+    @abc.abstractmethod
+    def hold(self, operation: str, expected: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def events(self, operation: str) -> list[dict]: ...
+
+    @abc.abstractmethod
+    def reserve(self, operation: str, plan: dict, *, ttl: int) -> dict | None: ...
+
+    @abc.abstractmethod
+    def transition(self, operation: str, expected: str, state: str,
+                   *, evidence: dict | None = None, detail: str = "") -> dict | None: ...
+
+    @abc.abstractmethod
+    def drain(self, operation: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def unfence(self, operation: str, expected: str, state: str) -> dict | None: ...
+
+
 # --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
@@ -2623,3 +2661,4 @@ class Storage(abc.ABC):
     session_bindings: SessionBindings
     ci: CiResults
     conversations: Conversations
+    handoffs: Handoffs

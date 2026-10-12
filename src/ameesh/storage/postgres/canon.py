@@ -364,6 +364,9 @@ class Canon(interface.Canon):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
                AND verrou.status NOT IN ('running', 'stopped')
+               AND NOT ameesh_handoff_fenced(r.name)
+               AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name
+                               AND h.state NOT IN ('verified','cancelled'))
                AND %s = ANY(verrou.admitted_hosts)
              RETURNING r.name, r.host
             """,
