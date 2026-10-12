@@ -15,7 +15,7 @@ l161-tests-par-impact.md, section 1) :
 1. **code Python exécuté, par test, sous-processus compris** : coverage.py,
    un contexte par test dans le processus de la suite, et dans chaque
    sous-processus un contexte statique lu dans `CARTE_CONTEXTE` ;
-   `installer` pose le fichier `.pth` qui démarre la mesure dans les
+   `install` pose le fichier `.pth` qui démarre la mesure dans les
    sous-processus (scripts/map_measure.py) ;
 2. **fichiers de données lus et dossiers listés**, par test : hook d'audit ;
 3. **tables touchées**, par classe : `pg_stat_user_tables` du schéma de la

@@ -49,7 +49,7 @@ carte test → code (`scripts/map.py`) : couverture par test, contexte
 `tests.<module>.<Classe>.<test>` (la classe seule pendant `setUpClass` et
 `tearDownClass`, le module seul pendant son chargement), sous-processus
 compris (`CARTE_CONTEXTE` hérité), fichiers lus et tables touchées.
-Avec `--carte F`, les durées des modules viennent de la carte ;
+Avec `--map F`, les durées des modules viennent de la carte ;
 `tests/parts/durees.json` ne reste qu'en repli.
 
 L161f — **plan**: with `--plan plan.json` (written once per CI run by
@@ -57,7 +57,7 @@ L161f — **plan**: with `--plan plan.json` (written once per CI run by
 their classes from the plan: every part reads the same split, computed once
 from the map. `--parts`, `--list`, `--since` and `--map` are then
 ignored; a plan without a module list for the part (fallback plan) gives
-the L116 split. With `--flux`, the part writes an `impacted` event once its
+the L116 split. With `--flow`, the part writes an `impacted` event once its
 P0 and P1 modules are done (`statut`: `vert` or `rouge`): the provisional
 green, when every part says `vert`.
 """
@@ -252,7 +252,7 @@ def selection(args) -> tuple[list[str], float, list[str], dict[str, float]]:
     if args.list:
         mods = read_list(args.list, mods)
     table = None
-    if getattr(args, "carte", None):
+    if args.map:
         table = map_durations(args.map)
         if not table.get(args.driver):
             table = None
@@ -495,6 +495,15 @@ def _load(part: list[str], measure: _Measure | None) -> unittest.TestSuite:
     return chargeur.suiteClass(suites)
 
 
+def _result_class(flux: Flow | None, classes: dict, measure: _Measure | None,
+                  impactes: tuple | None) -> type:
+    """La classe de résultat de la part : chaque clé porte le nom de
+    l'attribut que lit `_Result` (`measure`, `flux`, `classes`, `impactes`)."""
+    return type("_ResultatPart", (_Result,),
+                {"flux": flux, "classes": classes, "measure": measure,
+                 "impactes": impactes})
+
+
 def run(args) -> int:
     signal.signal(signal.SIGINT, signal.default_int_handler)
     entree = read_plan(args.plan, args.driver, args.part) if args.plan else None
@@ -540,9 +549,7 @@ def run(args) -> int:
     suite = _load(part, measure)
     impactes = None if entree is None else tuple(
         m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1"))
-    resultat_cls = type("_ResultatPart", (_Result,),
-                        {"flux": flux, "classes": classes, "mesure": measure,
-                         "impactes": impactes})
+    resultat_cls = _result_class(flux, classes, measure, impactes)
     runner = unittest.TextTestRunner(verbosity=2, resultclass=resultat_cls)
     debut, resultat = time.monotonic(), None
     try:

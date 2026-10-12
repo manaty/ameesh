@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L161c — chaque échec de test remonté en temps réel au courrier de l'agent du lot.
 
-Côté CI, `scripts/ci-flow.py publier` tient le check run « tests (flux) »
-pendant la part et `fermer` le termine ; côté ameesh, `ci.Watcher` (mené par
+Côté CI, `scripts/ci-flow.py publish` tient le check run « tests (flux) »
+pendant la part et `close` le termine ; côté ameesh, `ci.Watcher` (mené par
 `ameesh notify` sur l'hôte `github.host`) relève les exécutions en cours,
 envoie un urgent au premier échec d'une tête, des événements ordinaires
 ensuite et le verdict à la fin, n'impute jamais un rouge hérité de main, et
@@ -56,7 +56,7 @@ def check_run(events, name="tests (flux) psycopg 1/4"):
 
 
 # --------------------------------------------------------------------------
-# côté CI : scripts/ci-flow.py publier / fermer
+# côté CI : scripts/ci-flow.py publish / close
 # --------------------------------------------------------------------------
 
 class FauxGitHub:

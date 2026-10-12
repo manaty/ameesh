@@ -37,7 +37,7 @@ un résumé qui le dit, jamais une erreur : l'étape tourne `if: always()`.
 L161c — `publish` suit le fichier pendant la part (en arrière-plan) et tient
 le check run « tests (flux) <part> » de la tête poussée : chaque échec y
 entre dès qu'il est écrit, en annotation (lisible dans la PR) et en ligne JSON
-dans la sortie du check run, entre `MARQUEUR` et la fin du bloc. C'est ce que
+dans la sortie du check run, entre `MARKER` et la fin du bloc. C'est ce que
 relève `ameesh notify` (`ameesh.ci`) pour l'envoyer à l'agent du lot. Il
 s'arrête à la ligne `fin`. `close` (étape `if: always()`) le termine dans
 tous les cas, et le crée s'il n'existe pas encore. Sans jeton, ou si GitHub
@@ -269,7 +269,7 @@ class GitHub:
 
 
 class Publication:
-    """L'état d'une publication, partagé entre `publier` et `fermer` par un
+    """L'état d'une publication, partagé entre `publish` et `close` par un
     fichier à côté du flux (`F.jsonl.check`)."""
 
     def __init__(self, flux: str, nom: str, gh: GitHub, log=None):

@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
     -n) N=$2; shift 2 ;;
     -p) case "$2" in les-deux) PILOTES=(psql psycopg) ;; psql|psycopg) PILOTES=("$2") ;;
           *) echo "pilote inconnu : $2" >&2; exit 2 ;; esac; shift 2 ;;
-    --liste) LISTE=(--liste "$2"); shift 2 ;;
+    --liste) LISTE=(--list "$2"); shift 2 ;;
     --maj-durees) MAJ=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "option inconnue : $1" >&2; exit 2 ;;

@@ -15,11 +15,15 @@ at stage 7 with the other shims.
 """
 from __future__ import annotations
 
+import argparse
+import gzip
 import importlib.util
+import io
 import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -35,6 +39,7 @@ def _load(name: str, filename: str):
 
 map_mod = _load("map_l148_stage2b", "map.py")
 flow = _load("ci_flow_l148_stage2b", "ci-flow.py")
+parts = _load("test_parts_l148_stage2b", "test-parts.py")
 
 
 class FileNamesTest(unittest.TestCase):
@@ -103,6 +108,53 @@ class CommandLineTest(unittest.TestCase):
     def test_old_subcommand_is_rejected(self):
         done = self.run_script("ci-flow.py", "publier")
         self.assertEqual(done.returncode, 2)
+
+
+class MapOptionTest(unittest.TestCase):
+    """P2 of the #478 r1 review: `--map FILE` must really drive the split."""
+
+    def test_selection_reads_the_map_durations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "carte.json.gz"
+            with gzip.open(path, "wt", encoding="utf-8") as f:
+                json.dump({"modules": {"test_l148_stage2b_scripts": {
+                    "durees": {"psql": 1234.5}}}}, f)
+            args = argparse.Namespace(part=1, parts=1, list=None, map=str(path),
+                                      driver="psql")
+            _, _, _, weights = parts.selection(args)
+        self.assertEqual(weights["test_l148_stage2b_scripts"], 1234.5)
+
+
+class MeasureOptionTest(unittest.TestCase):
+    """P2 of the #478 r1 review: `--measure DIR` must reach `_Result.measure`."""
+
+    def test_measure_context_is_set_for_every_test(self):
+        class _FakeMeasure:
+            def __init__(self):
+                self.names = []
+
+            def context(self, name):
+                self.names.append(name)
+
+        class _Sample(unittest.TestCase):
+            def test_ok(self):
+                pass
+
+        measure = _FakeMeasure()
+        resultat_cls = parts._result_class(None, {}, measure, None)
+        suite = unittest.TestLoader().loadTestsFromTestCase(_Sample)
+        unittest.TextTestRunner(stream=io.StringIO(), resultclass=resultat_cls,
+                                verbosity=0).run(suite)
+        self.assertEqual(len(measure.names), 1)
+        self.assertTrue(measure.names[0].endswith("_Sample.test_ok"))
+
+
+class ParalleleCallerTest(unittest.TestCase):
+    """P2 of the #478 r1 review: the caller forwards the renamed `--list`."""
+
+    def test_list_is_forwarded_with_its_english_name(self):
+        text = (SCRIPTS / "test-parallele.sh").read_text(encoding="utf-8")
+        self.assertIn('--liste) LISTE=(--list "$2")', text)
 
 
 class CallersTest(unittest.TestCase):
