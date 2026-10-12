@@ -1939,7 +1939,28 @@ class AgentWorker(threading.Thread):
         non habilité est remis comme un message normal (et l'abus est journalisé).
         """
         sender = (row.get("sender") or row.get("from") or "").strip()
-        return bool(sender) and sender in self.cfg.interrupt_senders
+        if bool(sender) and sender in self.cfg.interrupt_senders:
+            return True
+        return self._deep_analysis_interrupt(sender, row)
+
+    def _deep_analysis_interrupt(self, sender: str, row: dict) -> bool:
+        """L317c (#315 r1) : la demande d'analyse profonde (`deep_analysis`)
+        perce le tour en cours d'un auditeur — le premier rapport est dû dans
+        les 30 min —, sans `AMEESH_INTERRUPT_SENDERS`. Seulement si le lot a
+        bien une demande sans rapport : un courrier qui imite l'expéditeur
+        `ameesh` n'interrompt rien."""
+        from . import deep_analysis
+        payload = mail.message_payload(row)
+        if sender != deep_analysis.SENDER or not payload.get("deep_analysis"):
+            return False
+        try:
+            if not self.runner.is_auditor(self.name, self.agent):
+                return False
+            found = deep_analysis.status(self.db, int(payload.get("lot") or 0))
+        except (db_mod.DbError, TypeError, ValueError):
+            return False
+        return bool(found and found["report_ts"] is None
+                    and self.name in found["auditors"])
 
     # -- garde de budget (L13, 0019, R20) ----------------------------------
     def budget_reason(self) -> str:

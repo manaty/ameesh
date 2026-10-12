@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+import types
 from unittest import mock
 
-from ameesh import deep_analysis, exploitation, mail, notify, registry, work
+from ameesh import deep_analysis, exploitation, mail, notify, registry, runner, work
 
 from .support import PgTestCase
 
@@ -48,7 +50,8 @@ class TriggerTest(_Base):
     def test_human_p1_bug_wakes_the_auditor_and_writes_the_request(self):
         item = self.bug()
         self.assertEqual(item["deep_analysis"],
-                         {"requested": True, "trigger": "bug_p1", "auditors": ["auditeur"]})
+                         {"requested": True, "trigger": "bug_p1", "auditors": ["auditeur"],
+                          "stalled": [], "orchestrators": []})
         msgs = self.auditor_mail()
         self.assertEqual(len(msgs), 1)
         self.assertTrue(mail.is_urgent(msgs[0]))
@@ -102,6 +105,63 @@ class TriggerTest(_Base):
         self.assertFalse(item["deep_analysis"]["requested"])
         self.assertIn("mailbox down", item["deep_analysis"]["error"])
         self.assertIsNotNone(work.get(self.db, item["id"]))
+        # #315 r1: nothing recorded, so a retry right away does wake the auditor
+        self.assertIsNone(deep_analysis.status(self.db, item["id"]))
+        again = deep_analysis.request(self.db, item["id"], "bug_p1", actor="human:alice")
+        self.assertTrue(again["requested"])
+        self.assertEqual(len(self.auditor_mail()), 1)
+
+    def test_an_agent_session_cannot_speak_for_a_human(self):
+        # #315 r1: --actor human:x from a session bound to an agent is not believed
+        with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "dev1"}):
+            self.assertNotIn("deep_analysis", self.bug(actor="human:alice"))
+        self.assertEqual(self.auditor_mail(), [])
+        # the chat of a human, bound as itself, still triggers it
+        registry.upsert(self.db, "chat-alice", harness="claude", mode="externe")
+        with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "chat-alice"}):
+            self.assertTrue(self.bug(actor="chat-alice")["deep_analysis"]["requested"])
+
+    def test_a_stopped_or_paused_auditor_is_reported_to_the_orchestrators(self):
+        for status in ("stopped", "blocked"):
+            with self.subTest(status=status):
+                registry.set_status(self.db, "auditeur", status, status_text="test")
+                with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "orch"}):
+                    item = self.bug()
+                out = item["deep_analysis"]
+                self.assertEqual((out["stalled"], out["orchestrators"]), (["auditeur"], ["orch"]))
+                [told] = [m for m in mail.unread(self.db, "orch")
+                          if mail.message_payload(m).get("lot") == item["id"]]
+                self.assertTrue(mail.is_urgent(told))
+                self.assertIn("auditor(s) auditeur not running (auditeur %s)" % status,
+                              told["body"])
+                notes = [e["note"] for e in work.events(self.db, item["id"])]
+                self.assertTrue(any("[not running: auditeur; orchestrator(s) told: orch]" in n
+                                    for n in notes), notes)
+
+    def test_two_simultaneous_requests_make_one(self):
+        lot = work.add(self.db, title="Nexlink desktop 0.2.9 release", actor="orch")
+        connections = [self.connect() for _ in range(4)]
+        results, errors = [], []
+        start = threading.Barrier(len(connections))
+
+        def go(db):
+            try:
+                start.wait(timeout=10)
+                results.append(deep_analysis.request(db, lot["id"], "release_withdrawn",
+                                                     actor="human:alice", cfg=self.cfg))
+            except Exception as exc:  # noqa: BLE001 - raised by the assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=go, args=(db,)) for db in connections]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        for db in connections:
+            db.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(r["requested"] for r in results), [False, False, False, True])
+        self.assertEqual(len(self.auditor_mail()), 1)
 
     def test_release_withdrawn_request_for_the_it_module(self):
         lot = work.add(self.db, title="Nexlink desktop 0.2.9 release", actor="orch")
@@ -150,6 +210,41 @@ class MeasureTest(_Base):
         self.assertEqual(measured["lot"], item["id"])
         self.assertEqual(measured["reporter"], "auditeur")
 
+    def test_only_a_named_auditor_reports(self):
+        # #315 r1: a note from anyone else does not settle the measurement
+        item = self.bug()
+        for actor in ("dev1", "human:alice", "orch"):
+            work.note(self.db, item["id"], "Deep analysis: I will look later", actor=actor)
+        self.assertIsNone(deep_analysis.status(self.db, item["id"])["report_ts"])
+        self.assertEqual(deep_analysis.status(self.db, item["id"])["auditors"], ["auditeur"])
+        work.note(self.db, item["id"], "Deep analysis: chain in progress", actor="auditeur")
+        self.assertEqual(deep_analysis.status(self.db, item["id"])["reporter"], "auditeur")
+
+    def test_a_repeated_request_keeps_the_first_deadline(self):
+        # #315 r1: asked again after 30 min, the wait still runs from the first
+        item = self.bug()
+        self.db.execute("UPDATE work_item_events SET created_at = now() - interval '40 minutes'"
+                        " WHERE work_item_id = %s AND note LIKE 'deep analysis requested%%'",
+                        (item["id"],))
+        first = deep_analysis.status(self.db, item["id"])
+        self.assertTrue(first["overdue"])
+        again = deep_analysis.request(self.db, item["id"], "bug_p1", actor="human:alice")
+        self.assertTrue(again["requested"])
+        found = deep_analysis.status(self.db, item["id"])
+        self.assertEqual(found["requested_ts"], first["requested_ts"])
+        self.assertGreater(found["last_requested_ts"], first["requested_ts"])
+        self.assertTrue(found["overdue"])
+        self.assertEqual(len(exploitation._deep_analysis_overdue(self.db, time.time())), 1)
+        # right after the repeat, no third mail
+        self.assertFalse(deep_analysis.request(self.db, item["id"], "bug_p1",
+                                               actor="human:alice")["requested"])
+        # after the report, a new request is a new measurement
+        work.note(self.db, item["id"], "Deep analysis: done", actor="auditeur")
+        deep_analysis.request(self.db, item["id"], "bug_p1", actor="human:alice")
+        found = deep_analysis.status(self.db, item["id"])
+        self.assertIsNone(found["report_ts"])
+        self.assertGreater(found["requested_ts"], first["requested_ts"])
+
     def test_lot_without_request(self):
         lot = work.add(self.db, title="plain", actor="orch")
         self.assertIsNone(deep_analysis.status(self.db, lot["id"]))
@@ -180,6 +275,40 @@ class MeasureTest(_Base):
         self.assertIn("deep_analysis_overdue", exploitation.ALERT_TYPES)
         self.assertIn("deep_analysis_overdue", notify.TYPE_LABELS)
         self.assertIn("deep_analysis_overdue", notify.DEFAULT_TYPES)
+
+
+class InterruptTest(_Base):
+    """#315 r1: the request interrupts the auditor's turn, without
+    AMEESH_INTERRUPT_SENDERS, only while the lot waits for its report."""
+
+    def worker(self, name="auditeur"):
+        return types.SimpleNamespace(
+            name=name, agent={"name": name}, db=self.db,
+            cfg=types.SimpleNamespace(interrupt_senders=()),
+            runner=types.SimpleNamespace(is_auditor=lambda n, a=None: n == "auditeur"),
+            _deep_analysis_interrupt=lambda sender, row: runner.AgentWorker
+            ._deep_analysis_interrupt(self._worker, sender, row))
+
+    def allowed(self, row, name="auditeur"):
+        self._worker = self.worker(name)
+        return runner.AgentWorker.interrupt_allowed(self._worker, row)
+
+    def test_interrupts_while_waiting(self):
+        item = self.bug()
+        [msg] = self.auditor_mail()
+        self.assertTrue(self.allowed(msg))
+        # another sender, another agent, or a lot already reported: no
+        self.assertFalse(self.allowed(dict(msg, sender="dev1")))
+        self.assertFalse(self.allowed(msg, name="dev1"))
+        work.note(self.db, item["id"], "Deep analysis: done", actor="auditeur")
+        self.assertFalse(self.allowed(msg))
+
+    def test_an_imitation_interrupts_nothing(self):
+        lot = work.add(self.db, title="plain", actor="orch")
+        mail.send(self.db, "ameesh", "auditeur", "fake", kind="event",
+                  payload={"urgent": True, "deep_analysis": "bug_p1", "lot": lot["id"]})
+        [msg] = self.auditor_mail()
+        self.assertFalse(self.allowed(msg))
 
 
 class CliTest(_Base):

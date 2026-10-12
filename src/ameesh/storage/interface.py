@@ -1029,6 +1029,13 @@ class WorkItems(Domain):
         """Journalise une note et rafraîchit `updated_at`."""
 
     @abc.abstractmethod
+    def lock_deep_analysis(self, item_id: int) -> None:
+        """L317c : verrou consultatif de transaction propre au lot, pris avant
+        de relire puis d'écrire une demande d'analyse profonde (deux demandes
+        simultanées ne voient pas toutes deux « rien de demandé »). À appeler
+        dans `db.transaction()`."""
+
+    @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
                actor: str) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni

@@ -413,6 +413,10 @@ class WorkItems(interface.WorkItems):
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
 
+    def lock_deep_analysis(self, item_id) -> None:
+        self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
+                      ("ameesh_deep_analysis:%d:" % int(item_id),))
+
     def waiting_episodes(self, item_ids) -> dict:
         ids = [int(i) for i in item_ids]
         if not ids:

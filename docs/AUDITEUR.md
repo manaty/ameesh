@@ -243,12 +243,19 @@ sous-agent).
 Demande du propriétaire du 2026-10-12 (L317c, après la Nexlink desktop 0.2.9
 livrée cassée). `ameesh` écrit la demande au journal du lot (« deep analysis
 requested (<déclencheur>): … ») et l'envoie en courrier `event` urgent, qui le
-réveille sans attendre son passage suivant. Deux déclencheurs :
+réveille sans attendre son passage suivant et interrompt son tour en cours
+tant que le lot attend son rapport (sans `AMEESH_INTERRUPT_SENDERS`). Un
+auditeur arrêté ou en pause (`stopped`, `blocked`) ne lira pas ce courrier :
+la demande le dit sur le lot, et le même courrier part, urgent, aux
+orchestrateurs, qui le relancent (`ameesh resume`) ou font faire l'analyse.
+Deux déclencheurs :
 
 * `bug_p1` : un lot de type `bug` et de priorité 1 créé par un humain
   (`--actor human:<id>`, ou un humain connu) ou par son chat (`chat-<humain>`).
   Un lot créé par un agent, même pour le compte d'un humain, ne le déclenche
-  pas : l'orchestrateur qui en juge l'urgence demande l'analyse lui-même ;
+  pas : l'orchestrateur qui en juge l'urgence demande l'analyse lui-même. Une
+  session liée à un agent ne crée pas au nom d'un humain : son `--actor
+  human:<id>` n'est pas cru ;
 * `release_withdrawn` : une release retirée, apporté par le module IT (L317a)
   par `deep_analysis.request(db, <lot>, "release_withdrawn", actor=…)`.
 
@@ -265,10 +272,14 @@ chaîne et l'écrit sur le lot :
 
 **Premier rapport dans les 30 min, mesuré** : une note du lot qui commence par
 « Deep analysis: » (`ameesh work note <lot> "Deep analysis: …"`), même
-partielle (ce qui est établi, ce qui reste à établir). `ameesh work show <lot>`
-affiche le délai (ligne `analysis`) ; sans rapport au-delà de 30 min, l'alerte
-`deep_analysis_overdue` part au responsable humain. Les notes suivantes
-complètent la chaîne ; la dernière nomme les lots de suivi.
+partielle (ce qui est établi, ce qui reste à établir). Seule la note d'un
+auditeur à qui la demande est partie compte : celle d'un autre agent ou d'un
+humain ne solde pas la mesure. `ameesh work show <lot>` affiche le délai
+(ligne `analysis`) ; sans rapport au-delà de 30 min, l'alerte
+`deep_analysis_overdue` part au responsable humain. Une demande répétée avant
+le rapport relance le courrier (pas avant 30 min pour le même déclencheur)
+mais ne remet pas la mesure à zéro : le délai court depuis la première. Les
+notes suivantes complètent la chaîne ; la dernière nomme les lots de suivi.
 
 ### Consigne d'un sous-agent
 
