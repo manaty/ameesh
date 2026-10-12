@@ -42,6 +42,7 @@
       "credentials": ".credentials.json",
       "key_env": "ANTHROPIC_API_KEY"
     },
+    "resident": {"protocol": "claude-stream-json", "command": ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages", "--dangerously-skip-permissions"], "new_session": ["--session-id"], "min_version": "2.1.286"},
     "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
   }
 }
