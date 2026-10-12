@@ -33,12 +33,12 @@ token: they say nothing about the mesh's state.
 `GET /api/v1/events` (L85) streams the event log (`events`, migration 0396)
 as Server-Sent Events, read through `fetch` (the client carries the
 `Authorization` header). One `LISTEN ameesh_events` connection per process
-(`Hub`) wakes the streams; each stream rereads the log after its own place,
-keeps what its human may see (`Context.sees`), and sends `id: <position>`,
-`event: <type>`, `data: <json>`. `Last-Event-ID` resumes after a cut (replay
-from the table, at least once: `data.id` tells a repeated event apart);
-`event: reset` says that events were lost (retention, or a rebuilt base):
-the client reloads its views. A comment every 20 s keeps the connection
+(`Hub`) wakes the streams; each stream rereads the log after its own
+position (tx, id) in commit order (`events`), keeps what its human may see
+(`Context.sees`), and sends `id: <tx-id>` (the position of THAT event),
+`event: <type>`, `data: <json>`. `Last-Event-ID` resumes strictly after it
+(replay from the table, exactly once); `event: reset` says that events were
+lost (retention, or a rebuilt base): the client reloads its views. A comment every 20 s keeps the connection
 alive; a stream ends after an hour (the client resumes); at most
 `MAX_STREAMS` streams at once, the others are 503 with `Retry-After`.
 """
@@ -92,7 +92,8 @@ STREAM_MAX_S = 3600.0
 EVENTS_BATCH = 200
 RETRY_MS = 3000
 POLL_S = 5.0
-_EVENT_ID_RE = re.compile(r"^[0-9]{1,18}$")
+#: an event held back by an open transaction is looked for again this often
+WAITING_POLL_S = 1.0
 
 log = logging.getLogger("ameesh.serve")
 
@@ -273,15 +274,15 @@ def _openapi(ctx: Context, db, params, query) -> dict:
     return openapi()
 
 
-def event_message(event: dict, position: int) -> str:
-    """One SSE message: `id` is the place to resume from (the cursor), not
-    the event's id, which is in `data`."""
+def event_message(event: dict) -> str:
+    """One SSE message: `id` is the event's position "tx-id", where a resume
+    starts (strictly after it)."""
     data = {"id": int(event["id"]), "type": event["type"], "object": event["object"],
             "project": event.get("project"), "ts": event.get("ts"),
             "data": event.get("data") or {}}
-    return "id: %d\nevent: %s\ndata: %s\n\n" % (
-        position, event["type"], json.dumps(data, ensure_ascii=False, sort_keys=True,
-                                            default=str))
+    return "id: %s\nevent: %s\ndata: %s\n\n" % (
+        events.format_position((event["tx"], event["id"])), event["type"],
+        json.dumps(data, ensure_ascii=False, sort_keys=True, default=str))
 
 
 _LIMIT = ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_LOTS},
@@ -452,7 +453,8 @@ def openapi() -> dict:
             responses["404"] = _response("not found", "ameesh-error/1")
         if route.stream:
             responses["200"] = {
-                "description": "text/event-stream: `id: <position>`, `event: <type>`, "
+                "description": "text/event-stream: `id: <tx-id>` (the event's position, "
+                               "in commit order), `event: <type>`, "
                                "`data:` an ameesh-event/1 object; `event: reset` (events "
                                "lost: reload), `event: error` (stream ended); a comment "
                                "every %d s" % HEARTBEAT_S,
@@ -461,9 +463,11 @@ def openapi() -> dict:
             responses["503"] = _response("database unavailable, or too many streams "
                                          "(Retry-After)", "ameesh-error/1")
             params.append({"name": "Last-Event-ID", "in": "header", "required": False,
-                           "schema": {"type": "string", "pattern": "^[0-9]{1,18}$"},
-                           "description": "resume after this position (the last `id:` "
-                                          "received); without it, the new events only"})
+                           "schema": {"type": "string",
+                                      "pattern": "^[0-9]{1,20}-[0-9]{1,19}$"},
+                           "description": "resume strictly after this position (the last "
+                                          "`id:` received, \"tx-id\"); without it, the "
+                                          "new events only"})
         operation = {"operationId": re.sub(r"[^A-Za-z0-9]+", "_",
                                            route.path[len(API) + 1:]).strip("_"),
                      "summary": route.summary, "responses": responses}
@@ -555,7 +559,7 @@ class Hub:
             return self.generation
 
     def _poll(self) -> None:
-        last = self.read(lambda db: storage.of(db).events.bounds()["last"])
+        last = self.read(lambda db: storage.of(db).events.bounds()["head"])
         if last != self._last:
             self._last = last
             self.wake()
@@ -709,9 +713,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _stream(self) -> None:
         last = self.headers.get_all("Last-Event-ID") or []
-        if len(last) > 1 or (last and not _EVENT_ID_RE.match(last[0].strip())):
-            raise ApiError(400, "bad_header", "Last-Event-ID: a position (digits) expected")
-        resume = int(last[0].strip()) if last else None
+        resume = events.parse_position(last[0]) if len(last) == 1 else None
+        if len(last) > 1 or (last and resume is None):
+            raise ApiError(400, "bad_header", "Last-Event-ID: a position tx-id expected")
         if self.hub is None:
             raise ApiError(503, "unavailable", "event stream unavailable")
         if not self.server.streams.acquire(blocking=False):
@@ -722,13 +726,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             bounds = self.read(lambda db: storage.of(db).events.bounds())
             reset = None
             if resume is None:
-                position = bounds["last"]
-            elif resume > bounds["last"]:
+                position = bounds["head"]
+            elif resume > bounds["top"]:
                 # a position this base never gave: rebuilt, or another mesh
-                position, reset = bounds["last"], "unknown position"
+                position, reset = bounds["head"], "unknown position"
             else:
                 position = resume
-                if bounds["first"] is not None and resume < bounds["first"] - 1:
+                # every position given is an event's: older than the oldest
+                # kept one, that event (and maybe others) went with the retention
+                if resume != (0, 0) and resume < bounds["oldest"]:
                     reset = "events lost (retention)"
             self.close_connection = True
             self.send_response(200)
@@ -741,11 +747,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             head = "retry: %d\n\n" % RETRY_MS
             if reset:
-                head += "id: %d\nevent: reset\ndata: %s\n\n" % (position, json.dumps(
-                    {"reason": reset, "first": bounds["first"], "last": bounds["last"]}))
+                head += "id: %s\nevent: reset\ndata: %s\n\n" % (
+                    events.format_position(position),
+                    json.dumps({"reason": reset, "first": bounds["first"],
+                                "last": bounds["last"]}))
             try:
                 self._write(head)
-                self._follow(events.Cursor(position))
+                self._follow(position)
             except OSError:
                 pass   # the client left (or stopped reading: socket timeout)
         finally:
@@ -755,30 +763,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(text.encode("utf-8"))
         self.wfile.flush()
 
-    def _drain(self, cursor) -> bool:
-        """Sends the events after the cursor; whether anything was written."""
-        after, wrote = cursor.position, False
+    def _drain(self, position: tuple) -> tuple:
+        """Sends the readable events after `position`: (new position, whether
+        anything was written, whether events wait for an open transaction)."""
+        wrote = False
         while True:
-            rows = self.read(lambda db: storage.of(db).events.after(after, EVENTS_BATCH))
-            fresh = cursor.take(rows)
-            out = "".join(event_message(row, cursor.position) for row in fresh
-                          if self.ctx.sees(row))
+            rows, waiting = self.read(lambda db: (
+                storage.of(db).events.readable(position, EVENTS_BATCH),
+                storage.of(db).events.waiting(position)))
+            for row in rows:
+                row["tx"] = int(row["tx"])
+            out = "".join(event_message(row) for row in rows if self.ctx.sees(row))
             if out:
                 self._write(out)
                 wrote = True
+            if rows:
+                position = (rows[-1]["tx"], int(rows[-1]["id"]))
             if len(rows) < EVENTS_BATCH:
-                return wrote
-            after = int(rows[-1]["id"])
+                return position, wrote, waiting
 
-    def _follow(self, cursor) -> None:
+    def _follow(self, position: tuple) -> None:
         hub = self.hub
         start = written = time.monotonic()
         generation = hub.generation
-        pending = True
+        pending, waiting = True, False
         while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
-            if pending or cursor.stalled:
+            if pending or waiting:
                 try:
-                    wrote = self._drain(cursor)
+                    position, wrote, waiting = self._drain(position)
                 except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
                     log.warning("event stream: database unavailable: %s", type(exc).__name__)
                     self._write("event: error\ndata: %s\n\n" % json.dumps(
@@ -793,8 +805,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 written = time.monotonic()
                 continue
             timeout = HEARTBEAT_S - idle
-            if cursor.stalled:
-                timeout = min(timeout, 1.0)
+            if waiting:
+                # an older open transaction holds events back: its end sends
+                # no notification if it wrote no event
+                timeout = min(timeout, WAITING_POLL_S)
             current = hub.wait(generation, timeout)
             if current != generation:
                 generation, pending = current, True

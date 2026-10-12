@@ -25,11 +25,38 @@ class Events(interface.Events):
             "select " + _COLUMNS + " from ameesh_events where id > %s order by id limit %s",
             (int(after_id), int(limit)))
 
+    def readable(self, position, limit) -> list:
+        tx, last_id = position
+        return self.db.query(
+            "select " + _COLUMNS + ", tx::text as tx from ameesh_events"
+            " where (tx, id) > (%s::text::xid8, %s)"
+            " and tx < pg_snapshot_xmin(pg_current_snapshot())"
+            " order by tx, id limit %s", (str(int(tx)), int(last_id), int(limit)))
+
+    def waiting(self, position) -> bool:
+        tx, last_id = position
+        return bool(self.db.query(
+            "select exists (select 1 from ameesh_events where (tx, id) > (%s::text::xid8, %s)"
+            " and tx >= pg_snapshot_xmin(pg_current_snapshot())) as w",
+            (str(int(tx)), int(last_id)))[0]["w"])
+
     def bounds(self) -> dict:
-        row = self.db.query("select min(id) as first, coalesce(max(id), 0) as last"
-                            " from ameesh_events")[0]
+        row = self.db.query(
+            "select (select min(id) from ameesh_events) as first,"
+            " (select coalesce(max(id), 0) from ameesh_events) as last,"
+            " (select tx::text || ':' || id from ameesh_events"
+            "   where tx < pg_snapshot_xmin(pg_current_snapshot())"
+            "   order by tx desc, id desc limit 1) as head,"
+            " (select tx::text || ':' || id from ameesh_events"
+            "   order by tx desc, id desc limit 1) as top,"
+            " (select tx::text || ':' || id from ameesh_events"
+            "   order by tx, id limit 1) as oldest")[0]
+
+        def position(text):
+            return (0, 0) if not text else tuple(int(part) for part in text.split(":"))
         return {"first": None if row["first"] is None else int(row["first"]),
-                "last": int(row["last"])}
+                "last": int(row["last"]), "head": position(row["head"]),
+                "top": position(row["top"]), "oldest": position(row["oldest"])}
 
     def count_before(self, before_ts) -> int:
         return int(self.db.query("select count(*) as n from ameesh_events"

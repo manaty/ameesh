@@ -28,16 +28,19 @@ object through the API.
 
 **Delivery order.** A `bigserial` is taken at insertion, not at commit: the
 event 10 of a long transaction can become visible after the event 11. A
-reader therefore keeps a `Cursor`: its `position` is the highest id below
-which every event was delivered (or will never exist: a rolled-back
-transaction leaves a hole); the events above it already delivered are
-remembered, and a hole is skipped after `GAP_S` seconds. Delivery is at least
-once: resuming from `position` may give an event again, `id` tells it apart.
+reader therefore follows a **position** (tx, id): it reads only the events
+whose transaction `tx` is below the snapshot's xmin (over for good: committed
+or rolled back, no event can come before them any more), by (tx, id), after
+its position. Each event has its own position (`format_position`, "tx-id"),
+the SSE `id`: resuming after it gives exactly the events that follow, none
+twice, none lost. An open transaction (any one, on the base) holds the
+delivery back until it ends; it never loses an event.
 
 **Retention** (0033 §9): one year by default, `AMEESH_EVENTS_RETENTION_DAYS`
 on the host that prunes (at least 30: the table refuses to delete younger
-events). The runner prunes once an hour; `ameesh events prune` does it by
-hand.
+events). The runner prunes once an hour, `PRUNE_MAX_BATCHES` batches and
+`PRUNE_MAX_S` seconds at most (the rest at the next hour); `ameesh events
+prune` does it by hand, with no bound.
 """
 from __future__ import annotations
 
@@ -59,9 +62,22 @@ RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)
 MIN_RETENTION_DAYS = 30
 PRUNE_BATCH = 10000
-#: a hole in the ids is waited for this long before being skipped
-GAP_S = 30.0
+#: bound of one pass of the runner's retention (the rest at the next pass)
+PRUNE_MAX_BATCHES = 10
+PRUNE_MAX_S = 5.0
 _TYPE_RE = re.compile(r"^[a-z]+\.[a-z_]+$")
+_POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})$")
+
+
+def format_position(position: tuple) -> str:
+    """A reader's position (tx, id) as an SSE id: "tx-id"."""
+    return "%d-%d" % (int(position[0]), int(position[1]))
+
+
+def parse_position(text: str) -> tuple | None:
+    """The position of a `Last-Event-ID`, None if it is not one."""
+    match = _POSITION_RE.match(text.strip())
+    return (int(match.group(1)), int(match.group(2))) if match else None
 
 
 def record(db, type: str, object: str, *, project: str | None = None, **data) -> int:
@@ -88,65 +104,24 @@ def retention_days(env=None) -> int:
 
 
 def prune(db, *, days: int | None = None, now: float | None = None,
-          batch: int = PRUNE_BATCH) -> int:
+          batch: int = PRUNE_BATCH, max_batches: int | None = None,
+          max_s: float | None = None, clock=time.monotonic) -> int:
     """Deletes the events older than `days` (default `retention_days()`), by
-    batches; the number deleted."""
+    batches, `max_batches` batches and `max_s` seconds at most (None: until
+    done); the number deleted."""
     days = retention_days() if days is None else int(days)
     if days < MIN_RETENTION_DAYS:
         raise ValueError("retention: at least %d days" % MIN_RETENTION_DAYS)
     before = (time.time() if now is None else now) - days * 86400.0
     store = storage.of(db).events
-    total = 0
+    total, batches, start = 0, 0, clock()
     while True:
         n = store.prune(before, batch)
         total += n
-        if n < batch:
+        batches += 1
+        if n < batch or (max_batches is not None and batches >= max_batches) \
+                or (max_s is not None and clock() - start >= max_s):
             return total
-
-
-class Cursor:
-    """A reader's place in the log, at least once (see the module's doc).
-
-    `take(rows)` receives rows of id above `position`, by increasing id
-    (already delivered ones included), and returns those not yet delivered."""
-
-    def __init__(self, position: int, *, gap_s: float = GAP_S, clock=time.monotonic):
-        self.position = int(position)
-        self.gap_s = gap_s
-        self.clock = clock
-        self._seen: set[int] = set()
-        self._stalled_at: float | None = None
-
-    @property
-    def stalled(self) -> bool:
-        """A hole is being waited for."""
-        return bool(self._seen)
-
-    def take(self, rows) -> list:
-        fresh = [row for row in rows
-                 if int(row["id"]) > self.position and int(row["id"]) not in self._seen]
-        self._seen.update(int(row["id"]) for row in fresh)
-        self.advance()
-        return fresh
-
-    def advance(self) -> None:
-        """Moves `position` over the delivered ids, and over a hole older than `gap_s`."""
-        while True:
-            while self.position + 1 in self._seen:
-                self.position += 1
-                self._seen.discard(self.position)
-            if not self._seen:
-                self._stalled_at = None
-                return
-            now = self.clock()
-            if self._stalled_at is None:
-                self._stalled_at = now
-                return
-            if now - self._stalled_at < self.gap_s:
-                return
-            # the hole is given up: a rolled-back transaction, or a very long one
-            self.position = min(self._seen) - 1
-            self._stalled_at = None
 
 
 def _main_list(cfg, db, args) -> int:
@@ -215,5 +190,5 @@ def main(argv: list[str] | None = None) -> int:
         db.close()
 
 
-__all__ = ["CHANNEL", "Cursor", "GAP_S", "TYPES", "main", "prune", "record",
+__all__ = ["CHANNEL", "TYPES", "format_position", "main", "parse_position", "prune", "record",
            "retention_days"]

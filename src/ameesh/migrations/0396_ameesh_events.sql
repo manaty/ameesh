@@ -14,6 +14,13 @@
 -- identifier alone (8000-byte limit of NOTIFY, nothing sensitive in the
 -- channel).
 --
+-- Reading order: `id` is taken at insertion, not at commit. `tx` (the
+-- writing transaction) gives the order of a reader: it reads only the
+-- events of `tx < pg_snapshot_xmin(pg_current_snapshot())` (every such
+-- transaction is over: committed or rolled back), by (tx, id), after its
+-- cursor (tx, id). No hole, no timeout; a long open transaction delays the
+-- delivery, it never loses an event.
+--
 -- Neither updated nor deleted, except by the retention (0033 §9: one year by
 -- default, `ameesh events prune`): a row younger than 30 days is never
 -- deleted.
@@ -24,9 +31,11 @@ create table if not exists ameesh_events (
     object      text not null check (length(object) between 1 and 300),
     project     text,
     data        jsonb not null default '{}'::jsonb check (jsonb_typeof(data) = 'object'),
+    tx          xid8 not null default pg_current_xact_id(),
     created_at  timestamptz not null default now()
 );
 create index if not exists ameesh_events_created_idx on ameesh_events (created_at);
+create index if not exists ameesh_events_tx_idx on ameesh_events (tx, id);
 
 create or replace function ameesh_events_notify() returns trigger
 language plpgsql as $$
@@ -61,8 +70,10 @@ create trigger ameesh_events_guard
 create or replace function ameesh_event(p_type text, p_object text, p_project text,
                                         p_data jsonb) returns void
 language sql as $$
+    -- `object` cut to the table's bound: an event never refuses the change
+    -- it describes (a thread of a 301-character project stays writable)
     insert into ameesh_events (type, object, project, data)
-    values (p_type, p_object, nullif(p_project, ''), coalesce(p_data, '{}'::jsonb));
+    values (p_type, left(p_object, 300), nullif(p_project, ''), coalesce(p_data, '{}'::jsonb));
 $$;
 
 -- the project of an agent: its team, otherwise its worksite (projects.agent_project)

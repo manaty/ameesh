@@ -33,42 +33,12 @@ def _types(rows):
     return [(row["type"], row["object"]) for row in rows]
 
 
-class CursorTest(unittest.TestCase):
-    """At least once, in spite of ids that become visible out of order."""
-
-    def setUp(self):
-        self.now = 0.0
-        self.cursor = events.Cursor(10, gap_s=30, clock=lambda: self.now)
-
-    def test_contiguous_ids_move_the_position(self):
-        fresh = self.cursor.take([{"id": 11}, {"id": 12}])
-        self.assertEqual([r["id"] for r in fresh], [11, 12])
-        self.assertEqual(self.cursor.position, 12)
-        self.assertFalse(self.cursor.stalled)
-
-    def test_a_hole_holds_the_position_and_the_late_event_still_comes(self):
-        self.assertEqual([r["id"] for r in self.cursor.take([{"id": 12}])], [12])
-        self.assertEqual(self.cursor.position, 10)
-        self.assertTrue(self.cursor.stalled)
-        # reread from the position: 12 is not given twice, 11 (committed late) comes
-        self.assertEqual([r["id"] for r in self.cursor.take([{"id": 12}])], [])
-        self.now = 10
-        self.assertEqual([r["id"] for r in self.cursor.take([{"id": 11}, {"id": 12}])], [11])
-        self.assertEqual(self.cursor.position, 12)
-        self.assertFalse(self.cursor.stalled)
-
-    def test_a_hole_is_given_up_after_gap_s(self):
-        self.cursor.take([{"id": 13}, {"id": 14}])
-        self.now = 29
-        self.cursor.advance()
-        self.assertEqual(self.cursor.position, 10)
-        self.now = 31
-        self.cursor.advance()
-        self.assertEqual(self.cursor.position, 14)
-        self.assertFalse(self.cursor.stalled)
-
-    def test_ids_at_or_below_the_position_are_ignored(self):
-        self.assertEqual(self.cursor.take([{"id": 9}, {"id": 10}]), [])
+class PositionTest(unittest.TestCase):
+    def test_format_and_parse(self):
+        self.assertEqual(events.format_position((70001, 12)), "70001-12")
+        self.assertEqual(events.parse_position(" 70001-12 "), (70001, 12))
+        for bad in ("12", "a-1", "1-", "-1", "1-2-3", ""):
+            self.assertIsNone(events.parse_position(bad), bad)
 
 
 class RetentionSettingTest(unittest.TestCase):
@@ -102,6 +72,9 @@ class RunnerPruneTest(unittest.TestCase):
         with mock.patch.object(events, "prune", return_value=3) as prune, \
                 mock.patch.object(runner, "log_async"):
             self.assertEqual(runner.Runner.prune_events_once(fake, now=100.0), 3)
+            # bounded: the rest at the next hour
+            self.assertEqual(prune.call_args.kwargs, {
+                "max_batches": events.PRUNE_MAX_BATCHES, "max_s": events.PRUNE_MAX_S})
             self.assertIsNone(runner.Runner.prune_events_once(fake, now=200.0))
             self.assertEqual(runner.Runner.prune_events_once(fake, now=100.0 + 3600), 3)
         self.assertEqual(prune.call_count, 2)
@@ -209,6 +182,52 @@ class EventLogPgTest(PgTestCase):
         self.assertEqual(events.prune(self.db, days=90, batch=1), 1)
         with self.assertRaises(ValueError):
             events.prune(self.db, days=10)
+
+    def test_prune_is_bounded(self):
+        for _ in range(5):
+            self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
+                            " VALUES ('alert.resolved', 'alert:b', now() - interval '400 days')")
+        self.assertEqual(events.prune(self.db, days=365, batch=2, max_batches=2), 4)
+        ticks = iter([0.0, 10.0])
+        self.assertEqual(events.prune(self.db, days=365, batch=1, max_s=5.0,
+                                      clock=lambda: next(ticks)), 1)
+        self.assertEqual(events.prune(self.db, days=365), 0)
+
+    def test_a_long_project_name_never_refuses_the_thread_write(self):
+        project = "p" * 301
+        start = self.last()
+        self.db.execute("INSERT INTO thread_index (project, location) VALUES (%s, 'x')",
+                        (project,))
+        rows = _rows(self.db, start)
+        self.assertEqual(len(rows[0]["object"]), 300)
+        self.assertEqual(rows[0]["project"], project)
+
+    def test_commit_order_an_open_transaction_holds_later_events_back(self):
+        """Codex P1 r1: A takes id 11 and stays open, B takes 12 and commits;
+        the reader must neither give 12 and skip 11, nor lose 11."""
+        store = storage.of(self.db).events
+        position = store.bounds()["head"]
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        with other.transaction() as tx_a:
+            a = storage.of(tx_a).events.record("alert.raised", "alert:a", None, {})
+            b = events.record(self.db, "alert.raised", "alert:b")
+            self.assertGreater(b, a)
+            self.assertEqual(store.readable(position, 100), [])   # held back by A
+            self.assertTrue(store.waiting(position))
+        rows = store.readable(position, 100)
+        self.assertEqual([r["object"] for r in rows], ["alert:a", "alert:b"])
+        self.assertFalse(store.waiting((int(rows[-1]["tx"]), int(rows[-1]["id"]))))
+        # a rolled-back transaction leaves nothing to wait for
+        after = (int(rows[-1]["tx"]), int(rows[-1]["id"]))
+        try:
+            with other.transaction() as tx_c:
+                storage.of(tx_c).events.record("alert.raised", "alert:c", None, {})
+                raise KeyError("rollback")
+        except KeyError:
+            pass
+        events.record(self.db, "alert.raised", "alert:d")
+        self.assertEqual([r["object"] for r in store.readable(after, 100)], ["alert:d"])
 
     def test_notify_carries_the_id_alone(self):
         listener = db_mod.listener(self.db, [events.CHANNEL])
@@ -325,11 +344,27 @@ class StreamPgTest(ServerMixin, PgTestCase):
         data = [json.loads(m["data"]) for m in got]
         self.assertEqual([d["data"]["state"] for d in data], ["intake", "build"])
         self.assertEqual(data[0]["object"], "lot:%d" % lot["id"])
-        self.assertEqual(int(got[-1]["id"]), data[-1]["id"])
-        # resume after the first: the second comes again, nothing before
-        resp2 = self.open_stream({"Last-Event-ID": str(data[0]["id"])})
+        # codex P1 r1: each message carries ITS position, never a later one
+        self.assertNotEqual(got[0]["id"], got[1]["id"])
+        self.assertTrue(got[0]["id"].endswith("-%d" % data[0]["id"]))
+        # resume after the first: exactly the second, then nothing again
+        resp2 = self.open_stream({"Last-Event-ID": got[0]["id"]})
         again = self.read_messages(resp2, 1, kind="lot.updated")
         self.assertEqual(json.loads(again[0]["data"])["id"], data[1]["id"])
+        self.assertEqual(again[0]["id"], got[1]["id"])
+
+    def test_an_event_held_by_an_open_transaction_comes_once_it_ends(self):
+        self.serve()
+        resp = self.open_stream()
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        with other.transaction() as tx_a:
+            storage.of(tx_a).events.record("alert.raised", "alert:first", None, {})
+            events.record(self.db, "alert.raised", "alert:second")
+            time.sleep(0.5)
+        got = self.read_messages(resp, 2, kind="alert.raised")
+        self.assertEqual([json.loads(m["data"])["object"] for m in got],
+                         ["alert:first", "alert:second"])
 
     def test_without_last_event_id_only_new_events(self):
         events.record(self.db, "alert.raised", "alert:before")
@@ -348,11 +383,18 @@ class StreamPgTest(ServerMixin, PgTestCase):
 
     def test_reset_when_events_were_lost(self):
         self.serve()
-        last = storage.of(self.db).events.bounds()["last"]
-        resp = self.open_stream({"Last-Event-ID": str(last + 1000)})
+        events.record(self.db, "alert.raised", "alert:x")
+        bounds = storage.of(self.db).events.bounds()
+        top = bounds["top"]
+        resp = self.open_stream({"Last-Event-ID": "%d-%d" % (top[0] + 1000, top[1])})
         got = self.read_messages(resp, 1, kind="reset")
         self.assertEqual(json.loads(got[0]["data"])["reason"], "unknown position")
-        self.assertEqual(int(got[0]["id"]), last)
+        self.assertEqual(got[0]["id"], events.format_position(bounds["head"]))
+        # a position older than the oldest kept event: lost to the retention
+        oldest = bounds["oldest"]
+        resp = self.open_stream({"Last-Event-ID": "%d-%d" % (oldest[0], oldest[1] - 1)})
+        got = self.read_messages(resp, 1, kind="reset")
+        self.assertEqual(json.loads(got[0]["data"])["reason"], "events lost (retention)")
 
     def test_heartbeat(self):
         with mock.patch.object(serve, "HEARTBEAT_S", 0.3):

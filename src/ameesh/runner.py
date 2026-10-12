@@ -4372,7 +4372,8 @@ class Runner:
 
     def prune_events_once(self, now: float | None = None) -> int | None:
         """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
-        fois par heure et par exécuteur ; rien en dry-run. Une erreur (base,
+        fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
+        `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run. Une erreur (base,
         réglage) est journalisée une fois, jamais fatale à la passe."""
         from . import events as events_mod
 
@@ -4382,7 +4383,8 @@ class Runner:
             return None
         self._events_pruned_at = now
         try:
-            gone = events_mod.prune(self.db)
+            gone = events_mod.prune(self.db, max_batches=events_mod.PRUNE_MAX_BATCHES,
+                                    max_s=events_mod.PRUNE_MAX_S)
         except (db_mod.DbError, ValueError) as exc:
             message = "event log retention not applied (%s)" % exc
             if message != self._events_prune_error:
@@ -4396,9 +4398,9 @@ class Runner:
 
     def sweep(self) -> None:
         self.expire_delegations_once()
-        self.prune_events_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
+        self.prune_events_once()   # L85 : après la moisson des baux, bornée
         finished = []
         with self.lock:
             for name, worker in list(self.workers.items()):

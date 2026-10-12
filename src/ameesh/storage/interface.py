@@ -101,7 +101,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
    watches         put delete list deliver
-   events          record after bounds count_before prune
+   events          record after readable waiting bounds count_before prune
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
@@ -611,12 +611,26 @@ class Events(Domain):
     @abc.abstractmethod
     def after(self, after_id: int, limit: int) -> list[dict]:
         """The events of id greater than `after_id`, by increasing id, at
-        most `limit`."""
+        most `limit` (a listing for humans: ids are not in commit order)."""
+
+    @abc.abstractmethod
+    def readable(self, position: tuple, limit: int) -> list[dict]:
+        """The reader's order: the events after `position` = (tx, id) whose
+        transaction is over for good (`tx` below the snapshot's xmin), by
+        (tx, id), at most `limit`; each row also carries `tx`. Such a
+        transaction can no longer add an event before the last one read."""
+
+    @abc.abstractmethod
+    def waiting(self, position: tuple) -> bool:
+        """Whether events after `position` wait for an older open transaction
+        to end (they are not readable yet)."""
 
     @abc.abstractmethod
     def bounds(self) -> dict:
-        """`{"first": id or None, "last": id or 0}`: the oldest kept event and
-        the last one written (the sequence, not the table: 0 before any)."""
+        """`first`, `last`: the smallest and largest ids kept (None and 0 when
+        empty); `head`: the position (tx, id) of the last readable event,
+        `top`: of the last event written, `oldest`: of the first one kept
+        ((0, 0) when none)."""
 
     @abc.abstractmethod
     def count_before(self, before_ts: float) -> int:

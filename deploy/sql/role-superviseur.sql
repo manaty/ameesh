@@ -380,7 +380,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L85 (0396): the event log, identifiers and states only, never free text
     ('ameesh_events', ARRAY[
-        'id', 'type', 'object', 'project', 'data', 'created_at'
+        'id', 'type', 'object', 'project', 'data', 'tx', 'created_at'
     ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[
