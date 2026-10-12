@@ -2319,6 +2319,13 @@ class TurnResources(Domain):
         de lignes soldées."""
 
     @abc.abstractmethod
+    def settle_unchanged(self, rows: Sequence[dict]) -> list[str]:
+        """#339 r2 : `settle` des lignes lues (`to_review`) qui n'ont pas
+        changé depuis — même statut, fin, groupe et conteneurs ; une ligne
+        qu'un tour a fermée, marquée ou prolongée entre-temps reste. Les
+        `turn_id` soldés."""
+
+    @abc.abstractmethod
     def mark_orphan_many(self, turn_ids: Sequence[str]) -> int:
         """#220 r3 : `mark_orphan` (sans conteneurs) de plusieurs lignes en une
         écriture ; seules celles qui n'étaient pas encore `orphan` changent."""
@@ -2334,6 +2341,14 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def orphans(self, host: str | None = None, limit: int = 50) -> list[dict]:
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def to_review(self, host: str, idle_s: float, after_id: int = 0,
+                  limit: int = 500) -> list[dict]:
+        """#339: the rows of `host` that may have outlived their resources:
+        `orphan` ones, and `running` ones whose turn (or grace period) ended
+        or started more than `idle_s` ago, of `id` above `after_id`, by
+        increasing `id`: a page of `limit` rows at most."""
 
     @abc.abstractmethod
     def orphans_started_before(self, host: str, before_ts: float, after_id: int = 0,
