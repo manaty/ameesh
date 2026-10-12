@@ -121,7 +121,7 @@ INFO = "info"
 #: entrée `members[]` pour un autre membre) qui borne les fiches du profil
 #: ameesh à un ou plusieurs dossiers du bundle : `ameesh: {scope: ameesh}`
 SCOPE_KEY = "ameesh"
-SCOPE_FIELDS = ("scope",)
+SCOPE_FIELDS = ("scope", "projects")
 
 
 class CanonError(ValueError):
@@ -2727,6 +2727,12 @@ def validate(canon: Canon) -> list[Finding]:
     # La déclaration vit dans `federation.yaml`, sous `review_policies.classes` :
     # `canon check` la valide, `ameesh review-class` la relit avec le même code.
     root_member = canon.sources[0].member if canon.sources else ""
+    from . import modules as project_modules
+    try:
+        project_modules.declarations(canon.federation)
+    except ValueError as exc:
+        add("project-modules-invalid", ERROR, str(exc),
+            **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
     _policy, policy_problems = review_mod.policy_from_federation(canon.federation)
     for code, severity, message in policy_problems:
         add(code, severity, message,

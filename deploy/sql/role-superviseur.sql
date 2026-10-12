@@ -67,6 +67,8 @@
 --       commitments.note (L96)
 --       work_item_events.note
 --       work_item_milestones.note
+--       work_module_milestones.payload
+--       project_modules.schemas, .rules
 --       mesh_approvals.meta (et mesh_approvals_status)
 --       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
 --
@@ -379,6 +381,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('work_item_milestones', ARRAY[
         'id', 'work_item_id', 'kind', 'at', 'sha', 'actor', 'verdict'
+    ]),
+    ('project_modules', ARRAY['project', 'module', 'canon', 'types']),
+    ('work_module_milestones', ARRAY[
+        'id', 'work_item_id', 'module', 'kind', 'subject', 'binding_id', 'actor', 'at'
     ]),
     ('work_items', ARRAY[
         'id', 'type', 'source', 'app', 'title', 'issue_ref', 'workstream',

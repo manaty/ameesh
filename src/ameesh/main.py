@@ -92,6 +92,7 @@
   ameesh import-v0 | export-v0          switch from/to the v0 file mailbox;
   ameesh migrate | doctor     schema and diagnostics;
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh module <name> …              installed project module commands;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
@@ -192,6 +193,9 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "module":
+        from . import modules
+        return modules.main(rest)
     if command in ("--version", "version"):
         from . import version
         print("ameesh %s" % version())

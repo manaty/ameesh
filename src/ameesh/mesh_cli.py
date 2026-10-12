@@ -1098,6 +1098,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 return 1
             item["events"] = work.events(db, args.id)
             item["milestones"] = work.milestones(db, args.id)
+            from .modules.storage import ModuleStore
+            item["module_milestones"] = ModuleStore(db).milestones(args.id)
             item["delays"] = work.timeline(db, args.id)
             plan.annotate(db, [item])
             # L96 : dates prévues (feuille de route)
@@ -1176,6 +1178,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     if item.get("branch_head") else ""))
             if item.get("migration"):
                 print("migration: %04d reserved (L122)" % item["migration"])
+            for mark in item["module_milestones"]:
+                print("module   : %s/%s · %s · by %s" % (
+                    mark["module"], mark["kind"], mark["subject"], mark["actor"]))
             for line in resolutions.show_lines(item["resolutions"], args.id):
                 print("resolut. : %s" % line)
             if item.get("resolutions_error"):
@@ -1879,7 +1884,7 @@ def build_parser() -> argparse.ArgumentParser:
     work_sub = p_work.add_subparsers(dest="work_command")
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
-    pw_add.add_argument("--type", default="evolution", choices=["bug", "evolution"],
+    pw_add.add_argument("--type", default="evolution",
                         help="an improvement backlog item goes through "
                              "`ameesh work backlog add` (L119)")
     pw_add.add_argument("--source", default="")
