@@ -42,7 +42,8 @@ DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
 #: (1 MiB unallocated) with its metadata exhausted while `df` still showed
 #: 4.7 then 16 GB free: `min_disk_free` never fired. Unallocated space is what
 #: new metadata chunks are carved from; metadata headroom is what is left in
-#: the chunks already allocated. Only measured on btrfs (None elsewhere).
+#: the chunks already allocated plus what they can still grow into. Only
+#: measured on btrfs (None elsewhere).
 DEFAULT_MIN_BTRFS_UNALLOCATED = 10 * 1024 ** 3
 DEFAULT_MIN_BTRFS_METADATA_HEADROOM = 1024 ** 3
 #: the btrfs floors, in their order in readings and messages

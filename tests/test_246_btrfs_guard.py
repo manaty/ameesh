@@ -24,44 +24,26 @@ UUID = "64c30c91-fd01-4082-802f-9dbd7bf4e8d5"
 
 
 class FakeHost:
-    """A fake /proc/self/mountinfo and /sys tree for one btrfs filesystem."""
+    """A fake /sys tree of btrfs filesystems and what the ioctls answer on
+    the work path."""
 
     def __init__(self, root: str):
         self.root = root
-        #: what the filesystem ioctls answer (None: unavailable); btrfs()
-        #: sets the block sizes
-        self.fs_sizes: tuple[str, list[int]] | None = None
+        #: what the filesystem ioctls answer on the work path: (fsid, device
+        #: sizes or None), None when not btrfs; btrfs() sets its own
+        self.fs_info: tuple[str, list[int] | None] | None = None
         self.sysfs = os.path.join(root, "sys")
-        self.mountinfo = os.path.join(root, "mountinfo")
         self.work = os.path.join(root, "home", "work")
         os.makedirs(self.work)
 
-    def mount(self, source: str, fstype: str = "btrfs", point: str | None = None,
-              over: tuple[str, str] | None = None) -> None:
-        """`over`: (fstype, source) of a second mount on the same point."""
-        point = (point or os.path.join(self.root, "home")).replace(" ", "\\040")
-        with open(self.mountinfo, "w", encoding="utf-8") as fh:
-            fh.write("22 1 0:21 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n")
-            fh.write("35 22 0:31 /@home %s rw,noatime shared:2 - %s %s rw,ssd\n"
-                     % (point, fstype, source))
-            if over:
-                fh.write("41 35 8:17 / %s rw,relatime shared:3 - %s %s rw\n"
-                         % ((point,) + over))
-
     def btrfs(self, devices: dict[str, int], disk_total: dict[str, int],
               metadata: tuple[int, int, int], meta_kind: str = "metadata",
-              unavailable: dict[str, int] | None = None) -> None:
+              unavailable: dict[str, int] | None = None, uuid: str = UUID) -> None:
         """`devices`: name -> size in bytes; `disk_total`: kind -> bytes;
         `metadata`: (total_bytes, bytes_used, bytes_may_use) of `meta_kind`;
         `unavailable`: its other counters (bytes_reserved, bytes_pinned,
         bytes_readonly: 0 by default)."""
-        fs = os.path.join(self.sysfs, "fs", "btrfs", UUID)
-        os.makedirs(os.path.join(fs, "devices"))
-        for name, size in devices.items():
-            block = os.path.join(self.sysfs, "class", "block", name)
-            os.makedirs(block)
-            self.write(os.path.join(block, "size"), size // 512)
-            os.symlink(block, os.path.join(fs, "devices", name))
+        fs = os.path.join(self.sysfs, "fs", "btrfs", uuid)
         for kind, value in disk_total.items():
             os.makedirs(os.path.join(fs, "allocation", kind), exist_ok=True)
             self.write(os.path.join(fs, "allocation", kind, "disk_total"), value)
@@ -71,7 +53,7 @@ class FakeHost:
         os.makedirs(os.path.join(fs, "allocation", meta_kind), exist_ok=True)
         for name, value in counters.items():
             self.write(os.path.join(fs, "allocation", meta_kind, name), value)
-        self.fs_sizes = (UUID.replace("-", ""), list(devices.values()))
+        self.fs_info = (uuid.replace("-", ""), list(devices.values()))
 
     @staticmethod
     def write(path: str, value) -> None:
@@ -79,14 +61,13 @@ class FakeHost:
             fh.write("%s\n" % value)
 
     def read(self) -> dict:
-        return platform.btrfs_allocation(self.work, mountinfo=self.mountinfo,
-                                         sysfs=self.sysfs,
-                                         device_sizes=lambda path: self.fs_sizes)
+        return platform.btrfs_allocation(self.work, sysfs=self.sysfs,
+                                         fs_info=lambda path: self.fs_info)
 
 
 def outage(host: FakeHost) -> None:
-    """2026-10-11 19:20: 1 MiB unallocated; metadata 536 MiB free, all of it in
-    `bytes_may_use`."""
+    """2026-10-11 19:20: 1 MiB unallocated; metadata (DUP) 536 MiB free, all
+    of it in `bytes_may_use`."""
     data, system = 400 * GIB, 32 * MIB
     meta_total, meta_used = 8 * GIB, 8 * GIB - 536 * MIB
     host.btrfs({"dm-0": data + 2 * meta_total + system + MIB},
@@ -103,61 +84,46 @@ class _Tmp(unittest.TestCase):
 
 class ReaderTest(_Tmp):
     def test_outage_golden_values(self):
-        self.host.mount("/dev/dm-0")
+        # metadata exhausted; the 1 MiB left could hold 512 KiB of DUP metadata
         outage(self.host)
         self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": MIB,
-                                            "btrfs_metadata_headroom_bytes": 0})
+                                            "btrfs_metadata_headroom_bytes": MIB // 2})
+        reading = dict(self.host.read(), disk_free_bytes=16 * GIB)
+        self.assertTrue(all(b["critical"] for b in resources.breaches(
+            reading, resources.thresholds(None)) if b["key"] in resources.BTRFS_KEYS))
 
-    def test_device_through_a_symlink_and_several_devices(self):
-        # /dev/mapper/root -> ../dm-0, and a second device added to the volume
-        mapper = os.path.join(self.tmp, "dev", "mapper")
-        os.makedirs(mapper)
-        open(os.path.join(self.tmp, "dev", "dm-0"), "w").close()
-        os.symlink("../dm-0", os.path.join(mapper, "root"))
-        self.host.mount(os.path.join(mapper, "root"))
+    def test_several_devices(self):
         self.host.btrfs({"dm-0": 100 * GIB, "loop0": 4 * GIB},
                         {"data": 90 * GIB, "metadata": 4 * GIB, "system": 16 * MIB},
                         (2 * GIB, GIB, 512 * MIB))
+        unallocated = 104 * GIB - 94 * GIB - 16 * MIB
         self.assertEqual(self.host.read(), {
-            "btrfs_unallocated_bytes": 104 * GIB - 94 * GIB - 16 * MIB,
-            "btrfs_metadata_headroom_bytes": 512 * MIB})
-
-    def test_mount_point_with_a_space(self):
-        point = os.path.join(self.tmp, "my home")
-        self.host.work = os.path.join(point, "work")
-        os.makedirs(self.host.work)
-        self.host.mount("/dev/dm-0", point=point)
-        outage(self.host)
-        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], MIB)
+            "btrfs_unallocated_bytes": unallocated,
+            "btrfs_metadata_headroom_bytes": 512 * MIB + unallocated // 2})
 
     def test_not_btrfs_is_unknown(self):
-        self.host.mount("/dev/dm-0", fstype="ext4")
+        # the ioctl fails on the path (ENOTTY): not btrfs, whatever sysfs holds
         outage(self.host)
+        self.host.fs_info = None
         self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
                                             "btrfs_metadata_headroom_bytes": None})
 
     def test_unreadable_sysfs_is_unknown(self):
-        self.host.mount("/dev/dm-0")
-        # no /sys/fs/btrfs at all, then a filesystem that is not this device
-        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], None)
-        self.host.btrfs({"sdz": 10 * GIB}, {"data": GIB, "metadata": GIB, "system": MIB},
-                        (GIB, 0, 0))
+        self.host.fs_info = (UUID.replace("-", ""), [10 * GIB])
         self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
                                             "btrfs_metadata_headroom_bytes": None})
 
-    def test_missing_disk_total_leaves_unallocated_unknown(self):
-        self.host.mount("/dev/dm-0")
+    def test_missing_disk_total_leaves_both_unknown(self):
         self.host.btrfs({"dm-0": 10 * GIB}, {"data": GIB, "metadata": GIB},
                         (GIB, 0, 0))
         # a group directory without its `disk_total`
         os.makedirs(os.path.join(self.host.sysfs, "fs", "btrfs", UUID, "allocation", "system"))
         self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
-                                            "btrfs_metadata_headroom_bytes": GIB})
+                                            "btrfs_metadata_headroom_bytes": None})
 
     def test_every_allocation_group_is_counted(self):
         # codex r1 (1): recent kernels add data-reloc and metadata-treelog
         # (zoned); a fully allocated 100 GiB volume must read 0, not 21 GiB
-        self.host.mount("/dev/dm-0")
         self.host.btrfs({"dm-0": 100 * GIB},
                         {"data": 70 * GIB, "metadata": 8 * GIB, "system": GIB,
                          "data-reloc": 20 * GIB, "metadata-treelog": GIB},
@@ -168,40 +134,35 @@ class ReaderTest(_Tmp):
     def test_mixed_groups_are_read(self):
         # codex r1 (1): a mixed-group filesystem has `mixed` instead of data
         # and metadata; its headroom is the metadata headroom
-        self.host.mount("/dev/dm-0")
         self.host.btrfs({"dm-0": 16 * GIB}, {"mixed": 15 * GIB, "system": 32 * MIB},
                         (15 * GIB, 14 * GIB, 512 * MIB), meta_kind="mixed")
         fs = os.path.join(self.host.sysfs, "fs", "btrfs", UUID, "allocation")
         self.host.write(os.path.join(fs, "global_rsv_size"), 512 * MIB)  # a file, not a group
         self.assertEqual(self.host.read(), {
             "btrfs_unallocated_bytes": GIB - 32 * MIB,
-            "btrfs_metadata_headroom_bytes": 512 * MIB})
+            "btrfs_metadata_headroom_bytes": 512 * MIB + GIB - 32 * MIB})
 
     def test_the_filesystem_device_size_wins(self):
-        # codex r1 (2): a 200 GiB block device holding a 100 GiB filesystem
-        # (shrunk, or device grown without resize), fully allocated
-        self.host.mount("/dev/dm-0")
-        self.host.btrfs({"dm-0": 200 * GIB},
+        # codex r1 (2), r2 (a): a 200 GiB block device holding a 100 GiB
+        # filesystem, fully allocated: the filesystem's own device sizes;
+        # without them (a device not answering) unknown, never the block size
+        self.host.btrfs({"dm-0": 100 * GIB},
                         {"data": 90 * GIB, "metadata": 9 * GIB, "system": GIB},
                         (4 * GIB, 3 * GIB, 0))
-        self.host.fs_sizes = (UUID.replace("-", ""), [100 * GIB])
-        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], 0)
-        # codex r2 (a): ioctls unavailable, or the sizes of another
-        # filesystem (fsid mismatch): unknown, not the 100 GiB gap between
-        # the block device and the filesystem
-        for sizes in (None, ("0" * 32, [100 * GIB])):
-            self.host.fs_sizes = sizes
-            self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
-                                                "btrfs_metadata_headroom_bytes": GIB})
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": 0,
+                                            "btrfs_metadata_headroom_bytes": GIB})
+        self.host.fs_info = (UUID.replace("-", ""), None)
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
+                                            "btrfs_metadata_headroom_bytes": None})
 
     def test_every_unavailable_counter_is_deducted(self):
         # codex r2 (b): the kernel holds reserved, pinned, read-only and
         # zone-unusable bytes unavailable — total 8, used 6, reserved 2 is
-        # exhausted metadata, even with 33 GiB unallocated
-        self.host.mount("/dev/dm-0")
-        self.host.btrfs({"dm-0": 50 * GIB}, {"data": 8 * GIB, "metadata": 8 * GIB, "system": GIB},
+        # exhausted metadata, here with no unallocated space to grow into
+        self.host.btrfs({"dm-0": 50 * GIB}, {"data": 33 * GIB, "metadata": 16 * GIB,
+                                             "system": GIB},
                         (8 * GIB, 6 * GIB, 0), unavailable={"bytes_reserved": 2 * GIB})
-        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": 33 * GIB,
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": 0,
                                             "btrfs_metadata_headroom_bytes": 0})
         meta = os.path.join(self.host.sysfs, "fs", "btrfs", UUID, "allocation", "metadata")
         for name, value in (("bytes_reserved", 0), ("bytes_pinned", 256 * MIB),
@@ -216,15 +177,37 @@ class ReaderTest(_Tmp):
         os.remove(os.path.join(meta, "bytes_pinned"))
         self.assertIsNone(self.host.read()["btrfs_metadata_headroom_bytes"])
 
-    def test_device_sizes_from_the_ioctls(self):
+    def test_small_metadata_with_room_to_grow_is_no_shortage(self):
+        # codex r3 (1): 30 GiB unallocated, DUP metadata of 256 MiB with 16
+        # MiB left — btrfs allocates a new chunk, no floor is breached
+        self.host.btrfs({"dm-0": 64 * GIB},
+                        {"data": 33 * GIB, "metadata": 512 * MIB, "system": 512 * MIB},
+                        (256 * MIB, 240 * MIB, 0))
+        reading = self.host.read()
+        self.assertEqual(reading, {"btrfs_unallocated_bytes": 30 * GIB,
+                                   "btrfs_metadata_headroom_bytes": 16 * MIB + 15 * GIB})
+        self.assertEqual([b for b in resources.breaches(
+            dict(reading, disk_free_bytes=40 * GIB), resources.thresholds(None))
+            if b["key"] in resources.BTRFS_KEYS], [])
+        # single-profile metadata (copy factor 1) grows by all of it; RAID1C3 by a third
+        meta = os.path.join(self.host.sysfs, "fs", "btrfs", UUID, "allocation", "metadata")
+        for disk_total, copies in ((256 * MIB, 1), (768 * MIB, 3)):
+            self.host.write(os.path.join(meta, "disk_total"), disk_total)
+            unallocated = 64 * GIB - 33 * GIB - 512 * MIB - disk_total
+            self.assertEqual(self.host.read(), {
+                "btrfs_unallocated_bytes": unallocated,
+                "btrfs_metadata_headroom_bytes": 16 * MIB + unallocated // copies})
+
+    def test_device_info_from_the_ioctls(self):
         # the unprivileged ioctls, faked: device 2 was removed (ENODEV)
         fsid = bytes.fromhex(UUID.replace("-", ""))
         sizes = {1: 509943480320, 3: 4089446400}
+        answer = {"count": 2}
 
         def ioctl(fd, request, buf):
             if request == platform.host.BTRFS_IOC_FS_INFO:
                 self.assertEqual(len(buf), 1024)
-                struct.pack_into("=QQ16s", buf, 0, 3, 2, fsid)
+                struct.pack_into("=QQ16s", buf, 0, 3, answer["count"], fsid)
                 return 0
             self.assertEqual((request, len(buf)), (platform.host.BTRFS_IOC_DEV_INFO, 4096))
             devid = struct.unpack_from("=Q", buf)[0]
@@ -234,54 +217,43 @@ class ReaderTest(_Tmp):
             return 0
 
         with mock.patch("fcntl.ioctl", ioctl):
-            self.assertEqual(platform.host.btrfs_device_sizes(self.tmp),
+            self.assertEqual(platform.host.btrfs_fs_info(self.tmp),
                              (fsid.hex(), [509943480320, 4089446400]))
+            # a device that does not answer: the fsid stays, the sizes are unknown
+            answer["count"] = 3
+            self.assertEqual(platform.host.btrfs_fs_info(self.tmp), (fsid.hex(), None))
         self.assertEqual(platform.host.BTRFS_IOC_FS_INFO, 0x8400941F)
         self.assertEqual(platform.host.BTRFS_IOC_DEV_INFO, 0xD000941E)
         with mock.patch("fcntl.ioctl", side_effect=OSError(25, "Not a typewriter")):
-            self.assertIsNone(platform.host.btrfs_device_sizes(self.tmp))
+            self.assertIsNone(platform.host.btrfs_fs_info(self.tmp))
 
-    def test_the_visible_mount_wins(self):
-        # codex r1 (3): ext4 mounted over the btrfs point hides it
+    def test_the_filesystem_visible_at_the_path_is_read(self):
+        # codex r1 (3), r2 (c), r3 (2): overmounts, hidden descendants,
+        # propagated shadow mounts — the kernel resolves the path, the ioctl
+        # on it names the filesystem actually there. Two btrfs in sysfs: the
+        # exhausted one is not read when the path is on the other
+        other = "5c1b80f6-32bd-4e8e-84ca-3f4f078c22ae"
+        self.host.btrfs({"sdb": 100 * GIB}, {"data": 10 * GIB, "metadata": 2 * GIB,
+                                             "system": GIB},
+                        (GIB, 0, 0), uuid=other)
+        healthy = self.host.fs_info
         outage(self.host)
-        self.host.mount("/dev/dm-0", over=("ext4", "/dev/sdb1"))
-        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
-                                            "btrfs_metadata_headroom_bytes": None})
-        self.host.mount("/dev/sdb1", fstype="ext4", over=("btrfs", "/dev/dm-0"))
         self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], MIB)
+        self.host.fs_info = healthy
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": 87 * GIB,
+                                            "btrfs_metadata_headroom_bytes": GIB + 87 * GIB // 2})
 
-    def test_a_mount_hidden_under_a_later_parent_mount_is_not_read(self):
-        # codex r2 (c): btrfs on /work/cache, then ext4 over /work: path
-        # lookup of /work/cache/project goes through ext4, the btrfs child of
-        # the root mount is unreachable
-        outage(self.host)
-        work = os.path.join(self.tmp, "work")
-        cache = os.path.join(work, "cache")
-        self.host.work = os.path.join(cache, "project")
-        os.makedirs(self.host.work)
-
-        def mountinfo(*lines):
-            with open(self.host.mountinfo, "w", encoding="utf-8") as fh:
-                fh.write("22 1 0:21 / / rw - ext4 /dev/sda1 rw\n")
-                for line in lines:
-                    fh.write(line + "\n")
-
-        mountinfo("35 22 0:31 /@cache %s rw - btrfs /dev/dm-0 rw" % cache,
-                  "41 22 8:17 / %s rw - ext4 /dev/sdb1 rw" % work)
-        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
-                                            "btrfs_metadata_headroom_bytes": None})
-        # the same btrfs mounted on the ext4 (child of 41) is visible
-        mountinfo("41 22 8:17 / %s rw - ext4 /dev/sdb1 rw" % work,
-                  "35 41 0:31 /@cache %s rw - btrfs /dev/dm-0 rw" % cache)
-        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], MIB)
-        # a longer, visible prefix below a hidden one: the stack top of the
-        # visible mount, here a btrfs over the ext4 on the same point
-        mountinfo("35 22 0:31 /@cache %s rw - btrfs /dev/dm-0 rw" % cache,
-                  "41 22 8:17 / %s rw - ext4 /dev/sdb1 rw" % work,
-                  "42 41 0:31 /@work %s rw - btrfs /dev/dm-0 rw" % work)
-        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], MIB)
-        self.assertEqual(platform.host._mount_source(self.host.work, self.host.mountinfo),
-                         (work, "btrfs", "/dev/dm-0"))
+    def test_real_path_reads_through_the_ioctl(self):
+        # end to end on this host: a btrfs work path reads both values, any
+        # other filesystem (or none) reads None
+        reading = platform.btrfs_allocation(self.tmp)
+        if platform.host.btrfs_fs_info(self.tmp) is None:
+            self.assertEqual(reading, {"btrfs_unallocated_bytes": None,
+                                       "btrfs_metadata_headroom_bytes": None})
+        else:
+            self.assertIsInstance(reading["btrfs_unallocated_bytes"], int)
+        self.assertEqual(platform.btrfs_allocation("/proc"),
+                         {"btrfs_unallocated_bytes": None, "btrfs_metadata_headroom_bytes": None})
 
     def test_sample_publishes_the_btrfs_reading(self):
         with mock.patch.object(resources.platform, "btrfs_allocation",
