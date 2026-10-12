@@ -161,8 +161,10 @@ BOOT_REVIEW_EVERY_S = 60.0
 BOOT_REVIEW_MAX_ROWS = 2000
 #: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
 BOOT_REVIEW_START = ("running", 0)
-#: L76 : après un démarrage résident raté, un tour par événement pendant ce délai
-RESIDENT_RETRY_S = 600.0
+#: L76 : après un échec du processus résident (démarrage raté, mort), un tour
+#: par événement pendant ce délai, doublé à chaque échec de suite, borné
+RESIDENT_RETRY_MIN_S = 60.0
+RESIDENT_RETRY_MAX_S = 3600.0
 #: L76 : attente de la fin d'un tour résident après son flux (harnais tué)
 RESIDENT_END_WAIT_S = 5.0
 #: #339: this host's rows whose group is gone are settled at start and then
@@ -354,6 +356,8 @@ class AgentWorker(threading.Thread):
         #: L76 : après un démarrage résident raté, un tour par événement
         #: jusqu'à cette échéance (monotone)
         self._resident_refused_until = 0.0
+        #: L76 T2 : échecs du résident de suite (remis à zéro par un tour abouti)
+        self._resident_failures = 0
         self.nudged = False
         #: L48 : le dernier tour a échoué vite (harnais absent, introuvable,
         #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
@@ -3603,7 +3607,7 @@ class AgentWorker(threading.Thread):
         if self.runner.is_auditor(self.name, self.agent):
             return "auditor (its turns keep their own bounds)"
         if time.monotonic() < self._resident_refused_until:
-            return "resident start failed recently"
+            return "resident failed recently (%d in a row)" % self._resident_failures
         return resident_runner.refusal(adapter)
 
     def _spawn_resident(self, argv, **kwargs) -> subprocess.Popen:
@@ -3625,7 +3629,8 @@ class AgentWorker(threading.Thread):
         """Le processus résident qui sert ce tour : celui qui tourne si sa clé
         de lancement et sa session sont celles du tour, sinon un neuf (repris
         sur la session). None si le démarrage échoue : ce tour, et les
-        suivants pendant RESIDENT_RETRY_S, sont servis un par événement."""
+        suivants pendant une attente croissante (`_resident_failed`), sont
+        servis un par événement."""
         from . import containers as containers_mod, resident, resident_runner
         with self.lock:
             rp = self.resident
@@ -3661,9 +3666,7 @@ class AgentWorker(threading.Thread):
                 self.pgid = None
             with self.runner.launch_lock:
                 self.runner.harness_pids.discard(rp.pgid)
-            self._resident_refused_until = time.monotonic() + RESIDENT_RETRY_S
-            log("[%s] resident start failed (%s): one turn per event for %ds"
-                % (self.name, exc, int(RESIDENT_RETRY_S)))
+            self._resident_failed("start failed (%s)" % exc)
             return None
         rp.resource_open = self._attach_resource(life_id, rp.pgid)
         with self.lock:
@@ -3671,6 +3674,30 @@ class AgentWorker(threading.Thread):
         log("[%s] resident process started (pid %s, session %s)"
             % (self.name, rp.pgid, driver.session_id or "new"))
         return rp
+
+    def _resident_failed(self, raison: str) -> None:
+        """T2 : un échec du résident — un tour par événement pendant une
+        attente qui double à chaque échec de suite (RESIDENT_RETRY_MIN_S à
+        RESIDENT_RETRY_MAX_S). Les tours, eux, restent comptés par la série
+        d'échecs rapides de L48, qui arrête l'agent si eux aussi échouent."""
+        self._resident_failures += 1
+        attente = min(RESIDENT_RETRY_MIN_S * 2 ** (self._resident_failures - 1),
+                      RESIDENT_RETRY_MAX_S)
+        self._resident_refused_until = time.monotonic() + attente
+        log("[%s] resident %s (failure %d in a row): one turn per event for %ds"
+            % (self.name, raison, self._resident_failures, int(attente)))
+
+    def _note_dormant(self, raison: str) -> None:
+        """T2 : l'agent est `dormant` — bail gardé, processus arrêté, réveil
+        au prochain tour sur sa session. Dit dans son statut s'il est `idle`
+        (un `blocked` reste lisible tel quel)."""
+        try:
+            agent = registry.get(self.db, self.name)
+            if agent is not None and agent.get("status") == "idle":
+                registry.set_status(self.db, self.name, "idle",
+                                    status_text="dormant: %s; woken by its next turn" % raison)
+        except db_mod.DbError as exc:
+            log_async("[%s] dormant status not written (%s)" % (self.name, db_mod.explain(exc)))
 
     def _close_resident(self, reason: str) -> None:
         """Arrête le processus résident (son groupe entier) et ferme sa ligne
@@ -3721,6 +3748,7 @@ class AgentWorker(threading.Thread):
         if fin is None:
             return 1, "resident turn did not end"
         if fin.status == resident.COMPLETED:
+            self._resident_failures = 0     # T2 : la série d'échecs est close
             return 0, None
         if fin.status == resident.INTERRUPTED:
             return (0, None) if voulu else (1, "resident turn interrupted")
@@ -3740,32 +3768,42 @@ class AgentWorker(threading.Thread):
             pass
         rp.turns += 1
         rp.last_used = time.monotonic()
+        urgence = self._urgent_end() or (
+            "the host is withdrawing" if self.host_yield is not None else
+            "stopping" if self.stopping.is_set() else "")
         raison = ("exited" if not rp.alive else
-                  "its turn did not end" if rp.driver.busy else
-                  self._urgent_end() or (
-                      "the host is withdrawing" if self.host_yield is not None else
-                      "stopping" if self.stopping.is_set() else ""))
+                  "its turn did not end" if rp.driver.busy else urgence)
+        if raison and not urgence:
+            self._resident_failed("process %s during its turn" % raison)
         if raison:
             self._close_resident(raison)
 
     def _resident_between_turns(self) -> None:
-        """Entre deux tours : un résident mort est fermé ; un résident
-        inactif depuis `resident_sleep` est endormi (bail gardé, réveil au
-        prochain tour sur sa session) ; `resident=off` l'arrête."""
+        """Entre deux tours : un résident mort est fermé (un échec, T2) ; un
+        résident inactif depuis `resident_sleep`, ou sous la pression de
+        l'hôte, est endormi — `dormant` (bail gardé, réveil au prochain tour
+        sur sa session) ; `resident=off` l'arrête."""
         from . import resident_runner
         with self.lock:
             rp = self.resident
         if rp is None:
             return
         if not rp.alive:
+            self._resident_failed("process exited between turns")
             self._close_resident("exited")
         elif not resident_runner.enabled(self._state_read(resident_runner.SETTING)):
             self._close_resident("resident=off")
+        elif self.runner.host_pressure().get("blocked"):
+            # T2 : sous la pression de l'hôte (L31), un résident inactif dort
+            # le premier — sa mémoire est rendue, son bail gardé
+            self._close_resident("asleep: host under pressure")
+            self._note_dormant("asleep, host under pressure")
         else:
             sommeil = resident_runner.sleep_seconds(
                 self._state_read(resident_runner.SLEEP_SETTING))
             if sommeil and time.monotonic() - rp.last_used >= sommeil:
                 self._close_resident("asleep after %ds without a turn" % int(sommeil))
+                self._note_dormant("asleep after %ds without a turn" % int(sommeil))
 
     def _menage_apres_tour(self, menage_tour, turn_id: str, spec: dict) -> None:
         """L73 : quota du dossier temporaire, worktrees apparus, /tmp signalé ;
