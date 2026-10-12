@@ -280,6 +280,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
               planned_wait: dict | None = None,
+              dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
               agent_externals: dict[str, str | None] | None = None) -> dict:
     jalons = _jalons_de_lot(item, events, actions, declared)
@@ -328,6 +329,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "stale": None if planned_wait else
                  stagnation.stale(item.get("state") or "", last, now, stale_after),
         "planned_wait": planned_wait,
+        "dependencies": dependencies or [],
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
         # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
@@ -626,12 +628,16 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
     states, externals = stagnation.availability_of(st.agents(None))
     from . import planned_waits
-    holds = planned_waits.read(db, items, now=now, packages=packages)
+    from . import work_dependencies
+    dependencies = work_dependencies.grouped(db, ids)
+    holds = planned_waits.read(db, items, now=now, packages=packages,
+                              dependencies=[e for edges in dependencies.values() for e in edges])
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])), agent_states=states,
                       planned_wait=holds.get(int(item["id"])),
+                      dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
     package_items = st.package_items()
@@ -816,6 +822,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
         if extra:
             line(" · ".join(extra), "    ")
+        if lot.get("planned_wait"):
+            from .work_dependencies import wait_label
+            line(wait_label(lot["planned_wait"]), "    ")
         if lot.get("waiting_for"):
             line("waiting for: %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):
