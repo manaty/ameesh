@@ -16,23 +16,27 @@ a suite launched without it gets the same cap from the runner, checked every
   own cap).
 * Every signal goes through a process handle (`pidfd`), opened while the
   process still has the start time seen in the process table: a reused PID
-  is never signalled. Without pidfd, nothing is signalled (the cap is off on
-  that host, said once in the log). No process group is signalled.
+  is never signalled. Without pidfd (no API, or ENOSYS from the kernel),
+  nothing is signalled (the cap is off on that host, said once in the log). No process group is signalled.
 * The process table is only a list of candidates: every link is checked
   again, live. A suite is stopped only if, parent by parent, re-read while
   each one is held by a handle, it descends from the runner through a child
   outside the runner's own group (its psql clients); its descendants are
   taken the same way, at SIGTERM time and again at SIGKILL time, so a child
   that ignores SIGTERM, even reparented once the suite is gone, is stopped.
-* The trace (thread note, mail) is written off the runner's thread: a lock a
-  suite holds never delays the SIGKILL nor the next checks.
+* The trace (thread note, mail) is written by a single trace thread, from a
+  bounded queue (the oldest trace dropped, and counted, when it is full): a
+  lock a suite holds never delays the SIGKILL nor the next checks, and never
+  piles up threads.
 * No database protection on this path: a stopped suite is ended, not frozen,
   and the server releases its locks when its connections close. The freeze of
   the tools under pressure is a separate lot (#460).
 """
 from __future__ import annotations
 
+import errno
 import os
+import queue
 import re
 import signal
 import threading
@@ -45,6 +49,8 @@ from . import platform
 CAP_EVERY_S = 30.0
 #: SIGTERM, then this delay, then SIGKILL
 TERM_GRACE_S = 5.0
+#: traces waiting for the trace thread at most
+TRACE_QUEUE = 32
 
 #: test runners, by executable or script name (extension dropped)
 RUNNERS = frozenset(("jest", "vitest", "mocha", "pytest", "py.test", "tox", "nox"))
@@ -190,8 +196,13 @@ def is_heavy(argv: list[str]) -> bool:
         _command(args, flags=frozenset())[0] == "heavy"
 
 
+#: set when the kernel refuses pidfd at run time (ENOSYS): the cap is off
+_PIDFD_ENOSYS = False
+
+
 def pidfd_supported() -> bool:
-    return hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+    return (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+            and not _PIDFD_ENOSYS)
 
 
 class Handle:
@@ -223,11 +234,14 @@ class Handle:
     def open_any(cls, pid: int) -> "Handle | None":
         """The handle of whatever process has `pid` now (its identity is
         then established by the caller, e.g. as a live parent)."""
+        global _PIDFD_ENOSYS
         if not pidfd_supported() or not pid or pid <= 0:
             return None
         try:
             return cls(pid, os.pidfd_open(pid))
-        except OSError:
+        except OSError as exc:
+            if exc.errno == errno.ENOSYS:
+                _PIDFD_ENOSYS = True    # the API exists, the kernel has none
             return None
 
     def send(self, signum: int) -> bool:
@@ -341,6 +355,18 @@ class SuiteCap:
         self.capped: dict[int, Capped] = {}
         self._at = float("-inf")
         self._said_off = False
+        #: traces waiting for the single trace thread (bounded: the oldest is
+        #: dropped, and counted, when a lock holds the thread)
+        self._traces: queue.Queue = queue.Queue(maxsize=TRACE_QUEUE)
+        self.traces_dropped = 0
+        self._tracer: threading.Thread | None = None
+        self._trace_lock = threading.Lock()
+
+    def _say_off(self) -> None:
+        if not self._said_off:
+            self._said_off = True
+            self.log("test suite cap off on this host: no pidfd (a PID could be "
+                     "reused between a check and a signal)")
 
     def tick(self, now: float | None = None) -> list[int]:
         now = self.clock() if now is None else float(now)
@@ -386,10 +412,7 @@ class SuiteCap:
         from . import heavy
 
         if not pidfd_supported():
-            if not self._said_off:
-                self._said_off = True
-                self.log("test suite cap off on this host: no pidfd (a PID could be "
-                         "reused between a check and a signal)")
+            self._say_off()
             return []
         if self.capped:
             table = [p for p in platform.process_table() if not p["zombie"]]
@@ -411,7 +434,10 @@ class SuiteCap:
         # group, as the table shows them; every link is checked live below
         children = _children(table)
         todo = [p["pid"] for p in children.get(me, ()) if p["pgid"] != own_group]
-        candidates: dict[int, dict] = {}
+        # the runner's children themselves too: an orphaned suite it adopted
+        # as subreaper is one of them (a harness is never a suite)
+        candidates: dict[int, dict] = {p["pid"]: p for p in children.get(me, ())
+                                       if p["pgid"] != own_group}
         while todo:
             pid = todo.pop()
             for p in children.get(pid, ()):
@@ -431,6 +457,9 @@ class SuiteCap:
                 continue
             h = Handle.open(pid, p["start"])
             if h is None:
+                if not pidfd_supported():
+                    self._say_off()
+                    break
                 continue
             item = None
             try:
@@ -474,13 +503,40 @@ class SuiteCap:
             h.close()
 
     def _trace(self, agent: str | None, text: str) -> None:
-        """Logged at once; the thread note and the mail off this thread (a
-        lock a stopped suite holds never delays the SIGKILL)."""
+        """Logged at once; the thread note and the mail by the single trace
+        thread (a lock a stopped suite holds never delays the SIGKILL, and
+        never piles up threads: a full queue drops its oldest trace)."""
         self.log("[%s] %s" % (agent or "?", text))
         if not agent:
             return
+        with self._trace_lock:
+            while True:
+                try:
+                    self._traces.put_nowait((agent, text))
+                    break
+                except queue.Full:
+                    try:
+                        self._traces.get_nowait()
+                        self.traces_dropped += 1
+                        self.log("test suite cap: oldest trace dropped (%d so far)"
+                                 % self.traces_dropped)
+                    except queue.Empty:
+                        pass
+            if self._tracer is None or not self._tracer.is_alive():
+                self._tracer = threading.Thread(target=self._write_traces, daemon=True,
+                                                name="plafond-trace")
+                self._tracer.start()
 
-        def write() -> None:
+    def _write_traces(self) -> None:
+        while True:
+            try:
+                agent, text = self._traces.get(timeout=60)
+            except queue.Empty:
+                with self._trace_lock:
+                    if self._traces.empty():
+                        self._tracer = None
+                        return
+                continue
             worker = (getattr(self.runner, "workers", {}) or {}).get(agent)
             if worker is not None:
                 try:
@@ -493,8 +549,6 @@ class SuiteCap:
                 mail_mod.send(self.runner.db, "ameesh", agent, text, kind="event")
             except Exception as exc:
                 self.log("[%s] test suite stop not mailed (%s)" % (agent, exc))
-
-        threading.Thread(target=write, daemon=True, name="plafond-trace").start()
 
 
 def _describe(argv: list[str], pid: int) -> str:

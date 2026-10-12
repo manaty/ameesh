@@ -292,6 +292,47 @@ class SuiteCapTest(unittest.TestCase):
         self.assertTrue(_wait(lambda: all(_gone(enfants[j]) for j in
                                           (self.propre, self.dedans))))
 
+    def test_a_suite_adopted_by_the_runner_is_capped_too(self):
+        """r4 #423 : an orphaned suite the runner adopted (subreaper) is one of
+        its own children, outside its group."""
+        jest = subprocess.Popen([os.path.join(self.dir, "jest")], start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(jest.pid, 9) if not _gone(jest.pid) else None,
+                                 jest.wait()))
+        time.sleep(1.2)
+        self.assertIn(jest.pid, self._tick(time.time())[0])
+        self.assertTrue(_wait(lambda: _gone(jest.pid)))
+
+    def test_one_trace_thread_and_a_bounded_queue(self):
+        """r4 #423 : a blocked note never piles up threads."""
+        import threading
+        bloque = threading.Event()
+        self.runner.workers["a1"]._fil_note = lambda text, meta=None: bloque.wait(30)
+        self.addCleanup(bloque.set)
+        avant = set(threading.enumerate())
+        for i in range(self.mod.TRACE_QUEUE + 20):
+            self.cap._trace("a1", "trace %d" % i)
+        time.sleep(0.2)
+        tracers = [t for t in set(threading.enumerate()) - avant if t.name == "plafond-trace"]
+        self.assertEqual(len(tracers), 1)
+        self.assertGreaterEqual(self.cap.traces_dropped, 19)
+        self.assertLessEqual(self.cap._traces.qsize(), self.mod.TRACE_QUEUE)
+
+    def test_enosys_at_run_time_turns_the_cap_off_and_says_so_once(self):
+        import errno
+        logs = []
+        self.cap.log = logs.append
+        self.addCleanup(setattr, self.mod, "_PIDFD_ENOSYS", False)
+
+        def enosys(pid):
+            raise OSError(errno.ENOSYS, "pidfd_open")
+        time.sleep(1.2)
+        with mock.patch("os.pidfd_open", enosys):
+            debut = time.time()
+            self.assertEqual(self._tick(debut)[0], [])
+            self.assertEqual(self._tick(debut + self.mod.CAP_EVERY_S)[0], [])
+        self.assertEqual(sum("cap off" in line for line in logs), 1)
+        self.assertFalse(_gone(self.propre))
+
     def test_nothing_is_signalled_without_pidfd(self):
         time.sleep(1.2)
         with mock.patch.object(self.mod, "pidfd_supported", lambda: False):
