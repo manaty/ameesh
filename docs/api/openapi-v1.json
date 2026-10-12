@@ -916,7 +916,7 @@
                 }
               }
             },
-            "description": "text/event-stream: `id: <tx-id>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended); a comment every 20 s"
+            "description": "text/event-stream: `id: <tx-id>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s"
           },
           "400": {
             "content": {

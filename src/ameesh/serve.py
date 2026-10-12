@@ -38,7 +38,9 @@ position (tx, id) in commit order (`events`), keeps what its human may see
 (`Context.sees`), and sends `id: <tx-id>` (the position of THAT event),
 `event: <type>`, `data: <json>`. `Last-Event-ID` resumes strictly after it
 (replay from the table, exactly once); `event: reset` says that events were
-lost (retention, or a rebuilt base): the client reloads its views. A comment every 20 s keeps the connection
+lost (retention, or a rebuilt base): the client reloads its views;
+`event: delayed`, in place of the heartbeat, that events wait for an open
+transaction of the base (xmin) — nothing is lost, they come once it ends. A comment every 20 s keeps the connection
 alive; a stream ends after an hour (the client resumes); at most
 `MAX_STREAMS` streams at once, the others are 503 with `Retry-After`.
 """
@@ -456,7 +458,8 @@ def openapi() -> dict:
                 "description": "text/event-stream: `id: <tx-id>` (the event's position, "
                                "in commit order), `event: <type>`, "
                                "`data:` an ameesh-event/1 object; `event: reset` (events "
-                               "lost: reload), `event: error` (stream ended); a comment "
+                               "lost: reload), `event: error` (stream ended), `event: "
+                               "delayed` (events wait for an open transaction); a comment "
                                "every %d s" % HEARTBEAT_S,
                 "content": {"text/event-stream": {"schema": {"type": "string"},
                                                   "x-ameesh-data": _ref(route.schema)}}}
@@ -786,7 +789,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         hub = self.hub
         start = written = time.monotonic()
         generation = hub.generation
-        pending, waiting = True, False
+        pending, waiting, waiting_since = True, False, None
         while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
             if pending or waiting:
                 try:
@@ -799,9 +802,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if wrote:
                     written = time.monotonic()
                 pending = False
+                if not waiting:
+                    waiting_since = None
+                elif waiting_since is None:
+                    waiting_since = time.monotonic()
             idle = time.monotonic() - written
             if idle >= HEARTBEAT_S:
-                self._write(": heartbeat\n\n")
+                if waiting_since is not None:
+                    # observable: events wait for an open transaction (xmin);
+                    # no `id`, the client's resume position does not move
+                    self._write("event: delayed\ndata: %s\n\n" % json.dumps(
+                        {"reason": "open transaction (xmin)",
+                         "waiting_s": round(time.monotonic() - waiting_since, 1)}))
+                else:
+                    self._write(": heartbeat\n\n")
                 written = time.monotonic()
                 continue
             timeout = HEARTBEAT_S - idle

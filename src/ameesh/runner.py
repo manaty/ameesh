@@ -4670,13 +4670,15 @@ class Runner:
     def prune_events_once(self, now: float | None = None) -> int | None:
         """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
         fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
-        `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run. Une erreur (base,
-        réglage) est journalisée une fois, jamais fatale à la passe."""
+        `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run
+        ni en exécuteur médié (le journal est au serveur du mesh). Une erreur
+        (base, réglage) est journalisée une fois, jamais fatale à la passe."""
         from . import events as events_mod
 
         now = time.monotonic() if now is None else now
-        if self.dry_run or (self._events_pruned_at is not None
-                            and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
+        if self.dry_run or getattr(self, "mediated", False) or (
+                self._events_pruned_at is not None
+                and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
             return None
         self._events_pruned_at = now
         try:

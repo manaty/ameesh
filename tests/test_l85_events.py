@@ -82,6 +82,8 @@ class RunnerPruneTest(unittest.TestCase):
     def test_dry_run_and_errors(self):
         with mock.patch.object(events, "prune") as prune:
             self.assertIsNone(runner.Runner.prune_events_once(self.fake(dry_run=True)))
+            # a mediated executor has no base: the mesh server prunes
+            self.assertIsNone(runner.Runner.prune_events_once(self.fake(mediated=True)))
         prune.assert_not_called()
         fake = self.fake()
         with mock.patch.object(events, "prune", side_effect=db_mod.DbError("down")), \
@@ -365,6 +367,23 @@ class StreamPgTest(ServerMixin, PgTestCase):
         got = self.read_messages(resp, 2, kind="alert.raised")
         self.assertEqual([json.loads(m["data"])["object"] for m in got],
                          ["alert:first", "alert:second"])
+
+    def test_delayed_is_observable_while_a_transaction_holds_events(self):
+        with mock.patch.object(serve, "HEARTBEAT_S", 0.5):
+            self.serve()
+            resp = self.open_stream()
+            other = db_mod.connect(self.cfg)
+            self.addCleanup(other.close)
+            with other.transaction() as tx_a:
+                storage.of(tx_a).events.record("alert.raised", "alert:held", None, {})
+                events.record(self.db, "alert.raised", "alert:behind")
+                got = self.read_messages(resp, 1, kind="delayed", timeout=5)
+                self.assertNotIn("id", got[0])
+                self.assertEqual(json.loads(got[0]["data"])["reason"],
+                                 "open transaction (xmin)")
+            got = self.read_messages(resp, 2, kind="alert.raised")
+            self.assertEqual([json.loads(m["data"])["object"] for m in got],
+                             ["alert:held", "alert:behind"])
 
     def test_without_last_event_id_only_new_events(self):
         events.record(self.db, "alert.raised", "alert:before")
