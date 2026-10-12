@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import functools
 import hashlib
 import json
 import os
@@ -89,7 +88,7 @@ FILL_OPTIONS = ("--prefer-offline", "--no-audit", "--no-fund")
 #: the only variables a fill sees (plus `LC_*`): no NODE_ENV, no other
 #: npm setting than its download cache, nothing a postinstall could read
 FILL_ENV = ("PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TMP", "TEMP",
-            "npm_config_cache", "NPM_CONFIG_CACHE")
+            "npm_config_cache", "NPM_CONFIG_CACHE", "AMEESH_REAL_NPM")
 #: set in every fill, whatever the environment says: sharp uses its prebuilt
 #: libvips even where the host has one (pc-smichea: libvips 8.18.6), else it
 #: builds from source and the fill fails (#249); not in the key: without a
@@ -163,23 +162,39 @@ def nm_root(cache_root: str) -> str:
     return os.path.join(cache_root, NM_DIR)
 
 
-def _version(command: list[str], cwd: str | None = None) -> str:
+#: how long a toolchain probe is kept (seconds): one command or one turn
+#: start asks several times, the runner lives for days and a package's pin
+#: can change at the same path
+PROBE_TTL_S = 10.0
+_probes: dict = {}
+
+
+def _version(command: list[str], cwd: str | None = None, path: str | None = None) -> str:
+    """The output of a toolchain probe run in `cwd` (where a version manager
+    such as mise or asdf picks the version), "" if it fails; kept PROBE_TTL_S."""
+    memo = (tuple(command), cwd, path)
+    hit = _probes.get(memo)
+    if hit is not None and time.monotonic() - hit[0] < PROBE_TTL_S:
+        return hit[1]
+    env = None
+    if path is not None:
+        env = dict(os.environ, PATH=path)
     try:
-        return subprocess.run(command, capture_output=True, text=True, cwd=cwd,
-                              timeout=20).stdout.strip()
+        out = subprocess.run(command, capture_output=True, text=True, cwd=cwd, env=env,
+                             timeout=20).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return ""
+        out = ""
+    _probes[memo] = (time.monotonic(), out)
+    return out
 
 
-@functools.lru_cache(maxsize=64)
 def node_version(pkg_dir: str | None = None) -> str:
     """Version of the `node` the package runs with (`v26.8.1`), "" without
-    node: asked from the package's directory, where a version manager (mise,
-    asdf) picks it. Native modules are built for it."""
+    node: asked from the package's directory. Native modules are built for
+    it."""
     return _version(["node", "--version"], pkg_dir)
 
 
-@functools.lru_cache(maxsize=64)
 def node_bin(pkg_dir: str) -> str:
     """Directory of the `node` binary the package runs with, "" if unknown.
     The fill puts it first on PATH: run from the cache, a version manager
@@ -190,12 +205,34 @@ def node_bin(pkg_dir: str) -> str:
     return os.path.dirname(path) if os.path.isabs(path) else ""
 
 
-@functools.lru_cache(maxsize=64)
+def _node_path(pkg_dir: str) -> str | None:
+    """PATH with the package's node first, None if its node is unknown."""
+    bindir = node_bin(pkg_dir)
+    return bindir + os.pathsep + os.environ.get("PATH", "") if bindir else None
+
+
+def package_npm(pkg_dir: str | None = None, env: dict | None = None) -> str | None:
+    """The npm binary of the package, the SAME for its key and its fill: the
+    npm beside the package's node (where a version manager's shim leads from
+    the package's directory; the shim itself, run from the cache, would
+    answer the machine default, and the turn's `$AMEESH_REAL_NPM` is that
+    shim), else `$AMEESH_REAL_NPM`, else the real npm of PATH; in `env`
+    (default: this process's environment)."""
+    env = os.environ if env is None else env
+    bindir = node_bin(pkg_dir) if pkg_dir else ""
+    beside = os.path.join(bindir, "npm") if bindir else ""
+    if beside and os.access(beside, os.X_OK):
+        return beside
+    return real_npm(env)
+
+
 def npm_version(pkg_dir: str | None = None) -> str:
-    """Version of the real npm (`11.19.0`) the package runs with, "" without
+    """Version of the package's npm (`11.19.0`, `package_npm`), "" without
     npm: it decides the layout of the tree."""
-    real = real_npm()
-    return _version([real, "--version"], pkg_dir) if real else ""
+    npm = package_npm(pkg_dir)
+    if not npm:
+        return ""
+    return _version([npm, "--version"], pkg_dir, _node_path(pkg_dir) if pkg_dir else None)
 
 
 def _lifecycle(pkg_dir: str) -> dict:
@@ -529,10 +566,14 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
             dest = os.path.join(stage, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy2(os.path.join(pkg_dir, rel), dest)
+        # the package's node first on PATH and the npm its key was made with
+        env = dict(os.environ if env is None else env)
         bindir = node_bin(pkg_dir)
-        if bindir:                          # the package's node, not the cache's
-            env = dict(os.environ if env is None else env)
+        if bindir:
             env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+        npm = package_npm(pkg_dir, env)
+        if npm:
+            env["AMEESH_REAL_NPM"] = npm
         started = time.time()
         try:
             installer(stage, env, lock_fd=lock.fileno())
@@ -597,7 +638,11 @@ def _symlink(target: str, link: str) -> None:
     if os.path.lexists(tmp):
         os.unlink(tmp)
     os.symlink(target, tmp)
-    os.replace(tmp, link)
+    try:
+        os.replace(tmp, link)       # refused over a directory: never deletes one
+    except OSError:
+        os.unlink(tmp)
+        raise
 
 
 def _git(cwd: str, *args: str) -> subprocess.CompletedProcess | None:
@@ -698,12 +743,20 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
             return dict(result, status="not-cached")
         old = None
         if os.path.lexists(link) and not os.path.islink(link):
+            if not replace:
+                # created during the fill (a local npm ci, the user): never touched
+                return dict(result, status="local-kept", filled=filled)
             old = os.path.join(pkg_dir, ".node_modules.ameesh-old-%d" % os.getpid())
             os.rename(link, old)
         # write-ahead: recorded before it exists, so a crash between the two
         # leaves a stale record (pruned), never a live link the GC cannot see
         _record_link(entry_of(root, key), link)
-        _symlink(target, link)
+        try:
+            _symlink(target, link)
+        except OSError:
+            if os.path.isdir(link) and not os.path.islink(link) and old is None:
+                return dict(result, status="local-kept", filled=filled)   # just appeared
+            raise
     finally:
         if lock is not None:
             lock.close()
@@ -736,6 +789,8 @@ def link_ready(top: str, cache_root: str) -> list[dict]:
     out = []
     for pkg in find_packages(root):
         if os.path.lexists(os.path.join(pkg, NODE_MODULES)) or is_review_worktree(pkg):
+            continue
+        if worktree_root(pkg) != root:      # another worktree nested in this one
             continue
         done = link_package(pkg, cache_root, fill_missing=False)
         if done["status"] == "linked":

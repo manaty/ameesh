@@ -30,9 +30,11 @@ point worktrees to it.
   (`node scripts/patch-ios-webrtc.cjs`), `patches/**`, `.npmrc`, the label,
   the install mode, the node and npm versions, the OS and the CPU. Node and
   npm are asked from the package's directory, where a version manager (mise,
-  asdf) picks them, and the fill runs with that node first on `PATH`: a
-  checkout that pins node 22 gets a tree built by node 22, not by the
-  machine default. A source
+  asdf) picks them (probes kept 10 s, so a changed pin counts from the next
+  command). The fill runs with that node first on `PATH` and with the npm
+  beside it, the binary the key asked (a shim run from the cache would pick
+  the machine default): a checkout that pins node 22 gets a tree built by
+  node 22 and its npm, not by the machine default. A source
   change doesn't change the key. A lockfile, patch, node or npm change gives
   a new entry. The link target depends only on the key.
 * **One install mode**: a fill is always a full development install,
@@ -65,6 +67,9 @@ point worktrees to it.
   `node_modules/.cache` (babel-loader, eslint, find-cache-dir) and
   `node_modules/.vite` (vite, vitest) stay writable. They are shared by the
   worktrees of one lockfile; these tools key their content by hash.
+* **Never over a real directory**: without `--replace`, a real
+  `node_modules` that appears while the entry fills (a local `npm ci`) is
+  kept as it is (`local-kept`), even if it appears at the last moment.
 * **Fallback**: if the entry cannot be filled (install error, lock still held
   after the wait), the package gets a local `npm ci`, as before.
 
@@ -117,7 +122,9 @@ wrapper.
 
 At the start of each turn, the runner also links the packages of the agent's
 main worktree that have no `node_modules` yet, when their entry is already in
-the cache. This hook never installs anything.
+the cache. This hook never installs anything. It covers the git worktree
+that holds the turn's directory, nothing outside git and no worktree nested
+in it.
 
 ### Review worktrees get no dependencies
 

@@ -731,42 +731,119 @@ class NexlinkVerificationTests(_Base):
         self.assertEqual(deps.fill_env(env)["SHARP_IGNORE_GLOBAL_LIBVIPS"], "1")
         self.assertEqual(deps.fill_env({})["SHARP_IGNORE_GLOBAL_LIBVIPS"], "1")
 
-    def test_2_key_and_fill_use_the_node_the_package_pins(self):
-        # a version manager stand-in: `node` answers by the directory it runs in
+    def _toolchains(self):
+        """A version manager stand-in: `node` answers by the directory it runs
+        in (`.pin`: node 22 and its npm 10, else node 26 and its npm 11); each
+        npm logs its own path when it installs."""
         fakebin = os.path.join(self.base, "fakebin")
         os.makedirs(fakebin)
-        node = os.path.join(fakebin, "node")
-        with open(node, "w") as fh:
-            fh.write('#!/bin/sh\nif [ -f .pin ]; then v=v22; d=%s/node22/bin; '
-                     'else v=v26; d=%s/node26/bin; fi\n'
-                     'case "$1" in --version) echo $v;; -p) echo $d/node;; esac\n'
-                     % (self.base, self.base))
-        os.chmod(node, 0o755)
+        log = os.path.join(self.base, "npm-ran.log")
+        for major, npm in (("22", "10.9"), ("26", "11.19")):
+            bindir = os.path.join(self.base, "node%s" % major, "bin")
+            os.makedirs(bindir)
+            path = os.path.join(bindir, "npm")
+            with open(path, "w") as fh:
+                fh.write('#!/bin/sh\nif [ "$1" = --version ]; then echo %s; exit 0; fi\n'
+                         'echo "$0" >> %s\nmkdir -p node_modules/x\n' % (npm, log))
+            os.chmod(path, 0o755)
+        with open(os.path.join(fakebin, "node"), "w") as fh:
+            fh.write('#!/bin/sh\nif [ -f .pin ]; then v=22; else v=26; fi\n'
+                     'case "$1" in --version) echo v$v;; -p) echo %s/node$v/bin/node;; esac\n'
+                     % self.base)
+        os.chmod(os.path.join(fakebin, "node"), 0o755)
+        deps._probes.clear()
+        self.addCleanup(deps._probes.clear)
+        return fakebin, log
+
+    def test_2_key_and_fill_use_the_node_and_npm_the_package_pins(self):
+        fakebin, log = self._toolchains()
         pinned = _package(os.path.join(self.base, "main"))
         open(os.path.join(pinned, ".pin"), "w").close()
         loose = _package(os.path.join(self.base, "wt"))
-        for fn in (node_version, deps.node_bin, deps.npm_version):
-            fn.cache_clear()
-        self.addCleanup(lambda: [fn.cache_clear() for fn in
-                                 (node_version, deps.node_bin, deps.npm_version)])
-        seen = []
+        root = deps.nm_root(self.cache)
+        environ = {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}
+        with mock.patch.dict(os.environ, environ), \
+                mock.patch.object(deps, "node_version", node_version), \
+                mock.patch.object(deps, "node_bin", node_bin):
+            os.environ.pop("AMEESH_REAL_NPM", None)
+            self.assertEqual((deps.node_version(pinned), deps.npm_version(pinned)),
+                             ("v22", "10.9"))
+            self.assertEqual((deps.node_version(loose), deps.npm_version(loose)),
+                             ("v26", "11.19"))
+            self.assertNotEqual(deps.cache_key(pinned), deps.cache_key(loose))
+            marker = deps.fill(pinned, root, deps.cache_key(pinned))
+            # the npm binary that ran is the one the key asked
+            with open(log) as fh:
+                self.assertEqual(fh.read().split(), [os.path.join(self.base, "node22/bin/npm")])
+            self.assertEqual((marker["node"], marker["npm"]), ("v22", "10.9"))
+            # the turn's AMEESH_REAL_NPM (a version manager's shim, answering by
+            # its cwd) does not override the npm beside the package's node...
+            shim = os.path.join(self.base, "node26/bin/npm")
+            os.environ["AMEESH_REAL_NPM"] = shim
+            deps._probes.clear()
+            self.assertEqual(deps.npm_version(pinned), "10.9")
+            # ...and is the npm of key AND fill when that node has none beside it
+            os.unlink(os.path.join(self.base, "node22/bin/npm"))
+            deps._probes.clear()
+            self.assertEqual(deps.npm_version(pinned), "11.19")
+            os.unlink(log)
+            deps.fill(pinned, root, deps.cache_key(pinned))
+            with open(log) as fh:
+                self.assertEqual(fh.read().split(), [shim])
 
-        def installer(directory, env=None, *, lock_fd=None):
-            seen.append(env["PATH"].split(os.pathsep)[0])
-            os.makedirs(os.path.join(directory, deps.NODE_MODULES))
-
+    def test_r1_4_probes_are_not_kept_past_their_ttl(self):
+        fakebin, _log = self._toolchains()
+        pkg = _package(os.path.join(self.base, "main"))
+        pin = os.path.join(pkg, ".pin")
+        open(pin, "w").close()
         with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}), \
                 mock.patch.object(deps, "node_version", node_version), \
-                mock.patch.object(deps, "node_bin", node_bin), \
-                mock.patch.object(deps, "npm_version", return_value="11"):
-            self.assertEqual((deps.node_version(pinned), deps.node_version(loose)),
-                             ("v22", "v26"))
-            self.assertNotEqual(deps.cache_key(pinned), deps.cache_key(loose))
-            root = deps.nm_root(self.cache)
-            marker = deps.fill(pinned, root, deps.cache_key(pinned), installer=installer)
-        self.assertEqual(seen, [os.path.join(self.base, "node22", "bin")])
-        self.assertEqual(marker["node"], "v22")
+                mock.patch.object(deps, "node_bin", node_bin):
+            before = deps.cache_key(pkg)
+            os.unlink(pin)                  # the pin changes at the same path
+            self.assertEqual(deps.cache_key(pkg), before)         # within the TTL
+            with mock.patch.object(deps.time, "monotonic",
+                                   return_value=time.monotonic() + deps.PROBE_TTL_S + 1):
+                self.assertNotEqual(deps.cache_key(pkg), before)
+                self.assertEqual(deps.node_version(pkg), "v26")
 
+    def test_r1_1_a_node_modules_made_during_the_fill_is_kept(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        fake = FakeInstaller()
+
+        def installer(directory, env=None, *, lock_fd=None):
+            fake(directory, env, lock_fd=lock_fd)
+            os.makedirs(os.path.join(pkg, "node_modules", "mine"))   # a local npm ci
+
+        done = deps.link_package(pkg, self.cache, installer=installer)
+        self.assertEqual(done["status"], "local-kept")
+        self.assertTrue(os.path.isdir(os.path.join(pkg, "node_modules", "mine")))
+        self.assertFalse(os.path.islink(os.path.join(pkg, "node_modules")))
+        # it appears between the re-check and the symlink: refused, kept
+        other = _package(os.path.join(self.base, "w2"))
+        real_record = deps._record_link
+
+        def record(entry, link):
+            real_record(entry, link)
+            os.makedirs(os.path.join(link, "mine"))
+
+        with mock.patch.object(deps, "_record_link", record):
+            done = deps.link_package(other, self.cache, installer=FakeInstaller())
+        self.assertEqual(done["status"], "local-kept")
+        self.assertTrue(os.path.isdir(os.path.join(other, "node_modules", "mine")))
+        self.assertEqual([n for n in os.listdir(other) if ".ameesh-" in n], [])
+
+    def test_r1_2_link_ready_skips_a_worktree_nested_in_the_turns(self):
+        top = os.path.join(self.base, "root")
+        first = _package(top, "backend")
+        _git(top, "init", "-q", "-b", "main")
+        nested = _package(os.path.join(top, "agent-b"), "backend")
+        _git(os.path.dirname(nested), "init", "-q", "-b", "main")
+        deps.link_package(nested, self.cache, installer=FakeInstaller())
+        os.unlink(os.path.join(nested, "node_modules"))
+        ready = deps.link_ready(top, self.cache)
+        self.assertEqual([r["package"] for r in ready], [first])
+        self.assertFalse(os.path.lexists(os.path.join(nested, "node_modules")))
 
     def test_3_link_ready_stays_in_the_git_worktree_of_the_turn(self):
         # a turn started in the parent of every worktree (an orchestrator's
