@@ -180,6 +180,42 @@ class MeasuredCapsTest(_Paye):
         self.assertIn("daily budget of agent ds (pay-per-token): 7.50 $",
                       self.book.over("ds", paid_harnesses=["deepseek"], pace=False))
 
+    def test_le_plafond_horaire_decide_sur_le_solde_le_grand_livre_reste_brut(self):
+        # 30 $ comptés dans l'heure, 6 $ réels : pas de pause sous 20 $
+        self.solde(100.0, 50 * 60)
+        self.ligne(30.0, 30 * 60)
+        self.solde(94.0, 5 * 60)
+        self.assertEqual(self.book.over("ds", paid_harnesses=["deepseek"], pace=False), "")
+        # le grand livre n'est pas réécrit : la ligne garde son estimation
+        self.assertAlmostEqual(self.book.spent("all", HEURE, harnesses=["deepseek"]), 30.0)
+        rows = self.db.query("SELECT usd::float8 AS usd FROM turn_costs")
+        self.assertEqual([round(r["usd"], 6) for r in rows], [30.0])
+        # au-delà en réel : la pause
+        self.solde(70.0, 60)
+        self.assertIn("hourly budget (pay-per-token): 30.00 $",
+                      self.book.over("ds", paid_harnesses=["deepseek"], pace=False))
+
+    def test_le_relais_avec_depense_non_ecrite_decide_sur_le_solde(self):
+        # relais : plafond journalier du mesh et de l'agent, plus la dépense
+        # gardée en mémoire faute d'écriture (comptée telle quelle)
+        self.solde(100.0, 20 * HEURE)
+        self.ligne(66.0, 12 * HEURE)
+        self.solde(90.0, 2 * HEURE)
+        self.book.hourly_usd = 0.0
+        self.book.daily_usd = 15.0
+        self.book.agent_limits = {"ds": {86400: 15.0}}
+        moi = relay.Identity(executor="e", host="h", agent="ds", lease_owner="e",
+                             lease_epoch=1)
+        stub = mock.Mock(_unrecorded=[{"agent": "ds", "usd": 4.0}])
+        self.assertEqual(relay.Relay._over_with_unrecorded(stub, self.book, moi,
+                                                           ("deepseek",)), "")
+        stub._unrecorded.append({"agent": "ds", "usd": 2.0})
+        self.assertIn("budget du mesh atteint", relay.Relay._over_with_unrecorded(
+            stub, self.book, moi, ("deepseek",)))
+        self.book.daily_usd = 0.0
+        self.assertIn("budget de l'agent ds atteint", relay.Relay._over_with_unrecorded(
+            stub, self.book, moi, ("deepseek",)))
+
     def test_l_heure_ne_change_pas(self):
         # L242b inchangé : `paid_hour` est `paid_spent` sur 3600 s
         self.solde(100.0, 50 * 60)
