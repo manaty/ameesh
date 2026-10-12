@@ -331,6 +331,16 @@ class AgentWorker(threading.Thread):
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
+        #: L159f4 r1 : borne du bail sur l'horloge monotone de cet hôte, prise
+        #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
+        #: avant l'échéance de la base, quel que soit l'écart des horloges
+        self.lease_held_until = self._held_until()
+        #: L159f4 r2 : le fil de renouvellement du tour (son renouvellement en
+        #: cours peut encore prolonger `lease_held_until` après la fin du tour)
+        self.heartbeat_thread: threading.Thread | None = None
+        #: r3 : les appels de renouvellement détachés (sans réponse dans
+        #: `call_budget()`) : l'un d'eux peut encore prolonger le bail en base
+        self.renewals: list[threading.Thread] = []
         self.pgid: int | None = None  # groupe du harnais en cours
         #: dernier descripteur de harnais journalisé (chemin, empreinte) — L16
         self.descriptor_seen: tuple[str, str] = ("", "")
@@ -535,8 +545,15 @@ class AgentWorker(threading.Thread):
                     self.runner.lease_ttl)
             except Exception as exc:  # DbError, mais aussi tout imprévu
                 result["error"] = exc
+            if result.get("expires") is not None or "error" in result:
+                # L159f4 r3/r4 : même arrivée après `call_budget()` (appel
+                # détaché), et même en erreur (la base a pu valider avant
+                # que la réponse se perde), la borne locale du bail va
+                # jusqu'à ce moment + ttl ; seul « bail perdu » ne prolonge rien
+                self.lease_held_until = max(self.lease_held_until, self._held_until())
 
         thread = threading.Thread(target=call, daemon=True)
+        self.renewals = [t for t in self.renewals if t.is_alive()] + [thread]
         thread.start()
         thread.join(timeout=self.call_budget())
         if thread.is_alive():
@@ -608,16 +625,25 @@ class AgentWorker(threading.Thread):
                       "%d failure(s)" % (self.name, self.renew_failures))
         self.renew_failures = 0
         self.lease_deadline = float(expires)
+        self.lease_held_until = self._held_until()
         return True
 
-    def release_lease(self) -> None:
+    def _held_until(self) -> float:
+        return time.monotonic() + float(self.runner.lease_ttl)
+
+    def release_lease(self) -> bool:
+        """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
+        bail reste tenu jusqu'à son échéance (`lease_held_until`, plus
+        renouvelé). Perdu ou déjà repris par un autre : True, il n'est plus
+        à nous. Le retour est tenté même `lease_lost` posé (r1) : des pannes
+        au renouvellement le posent sans que la base ait repris le bail ; le
+        retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
-        if self.lease_lost.is_set():
-            return
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
-            pass
+            return False
+        return True
 
     #: délai laissé au harnais entre SIGTERM et SIGKILL
     TERMINATE_GRACE = 3.0
@@ -3180,7 +3206,9 @@ class AgentWorker(threading.Thread):
             return False
 
         heartbeat_done = threading.Event()
-        threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
@@ -4161,8 +4189,12 @@ class Runner:
                             ran = worker.process_once(self.wait)
                     finally:
                         try:
-                            worker.release_lease()
+                            released = worker.release_lease()
                             self._release_slot(agent["name"])
+                            if not released and gate is not None:
+                                # L159f4 : la part dit le bail tenu tant
+                                # qu'il l'est (nouvel essai, ou échéance)
+                                self._await_release(worker, gate)
                         finally:
                             # r4 : compté jusqu'à la libération faite, sinon
                             # le contrôleur dirait l'hôte vidé, bail tenu
@@ -4179,6 +4211,41 @@ class Runner:
                 if not registered:
                     self._release_slot(agent["name"])
                 raise
+
+    #: `--once` : intervalle des nouveaux essais d'un bail non rendu
+    RELEASE_RETRY_S = 5.0
+
+    def _await_release(self, worker, gate) -> None:
+        """`--once`, la base n'a pas pris le retour du bail : le worker reste
+        compté (`gate_foreground`) et la part le dit tenu, jusqu'à un retour
+        réussi ou l'échéance du bail (il n'est plus renouvelé) ; jamais
+        « vidé » bail tenu (L159f4). Un arrêt de l'exécuteur coupe l'attente :
+        sa part disparaît avec lui."""
+        # r1 : l'échéance lue en base n'est pas comparée à l'horloge murale
+        # de cet hôte (en avance, elle dirait la part libre bail tenu).
+        # r2-r4 : un renouvellement encore en cours (fil du battement, appel
+        # détaché) peut toujours aboutir en base : tant qu'il court, le bail
+        # est tenu, et sa fin (réponse ou erreur) repousse la borne ; elle
+        # est donc relue à chaque tour. Les nouveaux essais du retour ne
+        # l'attendent jamais : un retour réussi met fin à tout.
+        heartbeat = worker.heartbeat_thread
+
+        def renewing() -> bool:
+            pending = [heartbeat] if heartbeat is not None else []
+            return any(t.is_alive() for t in pending + list(worker.renewals))
+
+        log_async("[%s] lease not returned (base): counted as held until it is, "
+                  "or until it expires (%ds)"
+                  % (worker.name, max(0, worker.lease_held_until - time.monotonic())))
+        while renewing() or time.monotonic() < worker.lease_held_until:
+            gate.tick()
+            left = worker.lease_held_until - time.monotonic()
+            wait = self.RELEASE_RETRY_S if renewing() else min(self.RELEASE_RETRY_S,
+                                                                 max(0.0, left))
+            if self.stop.wait(wait):
+                return
+            if worker.release_lease():
+                return
 
     def budget_limits(self, db) -> "budget_mod.Limits":
         """Les plafonds en vigueur (L70) : base (cache court) > config > défaut."""
