@@ -301,6 +301,40 @@ class ReviewR1Test(unittest.TestCase):
                                       environ={"CLOUDSDK_CONFIG": self.tmp})
         self.assertEqual(v.state, "unknown")
 
+    def test_r5_whole_output_is_classified(self):
+        # codex r5: the refusal comes first, then over 4,000 characters of
+        # other account statuses
+        output = ("github.com\n  X Failed to log in to github.com account a (default)\n"
+                  "  - The token in GH_TOKEN is invalid.\n"
+                  + "\n".join("  ✓ Logged in to ghe%d.example account b%d" % (i, i)
+                              for i in range(200)))
+        self.assertGreater(len(output), 4000)
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/gh"):
+            v = sentinel.probe_cli("gh", ["gh"], "fix", mock.Mock(return_value=(1, output)))
+        self.assertEqual(v.state, "failing")
+
+    def test_r5_gh_token_in_effect_is_fingerprinted(self):
+        # codex r5: GH_TOKEN overrides hosts.yml — a refused GH_TOKEN=A then a
+        # healthy B must differ, with or without a store
+        store = os.path.join(self.tmp, "hosts.yml")
+        for exists in (False, True):
+            if exists:
+                with open(store, "w", encoding="utf-8") as fh:
+                    fh.write("github.com: {}\n")
+            a = sentinel.env_fingerprint({"GH_TOKEN": "A"}, sentinel.GH_TOKEN_VARS, store)
+            b = sentinel.env_fingerprint({"GH_TOKEN": "B\n"}, sentinel.GH_TOKEN_VARS, store)
+            self.assertEqual((a, b), (sentinel._digest("A"), sentinel._digest("B")))
+        self.assertEqual(sentinel.env_fingerprint({"GITHUB_TOKEN": "C"},
+                                                  sentinel.GH_TOKEN_VARS, store),
+                         sentinel._digest("C"))
+        self.assertEqual(sentinel.env_fingerprint({}, sentinel.GH_TOKEN_VARS, store),
+                         sentinel.file_fingerprint(store))
+        cfg = SimpleNamespace(host="h1", accounts={}, credential_sentinel={"probes": ["gh"]})
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/gh"):
+            found = sentinel.probe_all(cfg, NOW, mock.Mock(return_value=(0, "ok")),
+                                       environ={"GH_TOKEN": "B", "GH_CONFIG_DIR": self.tmp})
+        self.assertEqual(found[0].fingerprint, sentinel._digest("B"))
+
     def test_r4_turn_failure_gets_the_fix_command(self):
         # codex r4 (6): a turn recorded `invalid api key`; the probe keeps the
         # failure (same token) and adds the account's login command

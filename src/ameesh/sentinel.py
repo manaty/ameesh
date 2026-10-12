@@ -111,7 +111,7 @@ def _run(argv: list, env: dict | None = None, whole: bool = False,
         return proc.returncode, proc.stdout
     lines = [l.strip() for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.strip()]
     if output:
-        return proc.returncode, "\n".join(lines)[-4000:]
+        return proc.returncode, "\n".join(lines)   # whole: a refusal can come first
     return proc.returncode, (lines[-1][:200] if lines else "")
 
 
@@ -391,8 +391,27 @@ def scw_store(environ=None) -> str:
     return environ.get("SCW_CONFIG_PATH") or os.path.expanduser("~/.config/scw/config.yaml")
 
 
+def env_fingerprint(environ, names: tuple, store: str | None) -> str | None:
+    """#210 r5: the credential in effect for a CLI — the first set variable
+    of `names`, which overrides the CLI's store (gh: GH_TOKEN, GITHUB_TOKEN;
+    scw: SCW_SECRET_KEY), else the store file."""
+    environ = os.environ if environ is None else environ
+    for name in names:
+        value = str(environ.get(name) or "").strip()
+        if value:
+            return _digest(value)
+    return file_fingerprint(store)
+
+
+#: the variables that override each CLI's credential store
+GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+SCW_KEY_VARS = ("SCW_SECRET_KEY",)
+
+
 def probe_cli(harness: str, argv: list, fix: str, run=_run,
-              store: str | None = None) -> Verdict | None:
+              store: str | None = None, held: str | None = None) -> Verdict | None:
+    """`held`: the fingerprint of the credential in effect (`env_fingerprint`),
+    else that of `store`."""
     if not shutil.which(argv[0]):
         return None
     code, out = run(argv, output=True)
@@ -404,9 +423,9 @@ def probe_cli(harness: str, argv: list, fix: str, run=_run,
             return Verdict(harness, "", "unknown", "probe failed (exit %s): %s"
                            % (code, _last_line(out) or "no output"))
         return Verdict(harness, "", "failing", "%s: %s" % (why, _last_line(out)), fix=fix,
-                       fingerprint=file_fingerprint(store))
+                       fingerprint=held or file_fingerprint(store))
     return Verdict(harness, "", "healthy", "authenticated", fix=fix,
-                   fingerprint=file_fingerprint(store))
+                   fingerprint=held or file_fingerprint(store))
 
 
 def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Verdict]:
@@ -424,10 +443,12 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
             out.append(probe_gcloud(conf, now, run, environ))
         elif harness == "gh":
             out.append(probe_cli("gh", ["gh", "auth", "status"], "gh auth login -h github.com",
-                                 run, gh_store(environ)))
+                                 run, gh_store(environ),
+                                 env_fingerprint(environ, GH_TOKEN_VARS, gh_store(environ))))
         elif harness == "scw":
             out.append(probe_cli("scw", ["scw", "account", "project", "list", "-o", "json"],
-                                 "scw init", run, scw_store(environ)))
+                                 "scw init", run, scw_store(environ),
+                                 env_fingerprint(environ, SCW_KEY_VARS, scw_store(environ))))
     return [v for v in out if v is not None]
 
 
