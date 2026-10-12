@@ -310,3 +310,30 @@ class PurgeTest(_Base):
         purges = runner.lot_sessions_purge(self.db)
         self.assertEqual([r["work_item_id"] for r in purges], [a])
         self.assertEqual([r["work_item_id"] for r in self.st.listing("p1")], [b])
+
+
+class AlerteTest(_Base):
+    """Règle 3 : l'auditeur relance après au moins un réveil sans effet."""
+
+    def alertes(self):
+        from ameesh import exploitation
+        return [a for a in exploitation.alerts(self.cfg, self.db)
+                if a["type"] == "idle_actionable_lot"]
+
+    def test_seulement_apres_un_reveil_sans_effet(self):
+        from ameesh import alert_briefs
+        self.bail("x1")
+        a = work.add(self.db, title="A", assignee="x1")["id"]
+        self.assertEqual(self.alertes(), [], "sans réveil, la règle 1 agit encore")
+        activite = self.st.actionable("x1")[0]["activity_ts"]
+        self.st.note_wake("x1", a, activite)
+        self.assertEqual(self.alertes(), [], "réveil trop récent")
+        self.db.execute("UPDATE agent_lot_sessions SET last_wake_at = now() - interval '1 hour'")
+        (alerte,) = self.alertes()
+        self.assertEqual((alerte["agent"], alerte["lot"], alerte["wakes"]), ("x1", a, 1))
+        textes = alert_briefs.briefs(alerte, storage.of(self.db).operations.listing(),
+                                     auditor_names=("x1",))
+        self.assertIn("level 1", textes["x1"])
+        self.assertIn("--lot %d" % a, textes["x1"])
+        work.note(self.db, a, "avancé", actor="x1")         # le lot a vécu
+        self.assertEqual(self.alertes(), [])

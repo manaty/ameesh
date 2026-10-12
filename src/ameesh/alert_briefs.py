@@ -20,7 +20,7 @@ from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
-                 "waiting_without_question", "module_deviation")
+                 "waiting_without_question", "module_deviation", "idle_actionable_lot")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -110,6 +110,26 @@ def _waiting_without_question(alert: dict) -> str:
                 lot, " « %s »" % title if title else "", lot, lot))
 
 
+def _idle_actionable_lot(alert: dict) -> str:
+    """#408 (règle 3) : à l'auditeur seul, qui relance (niveau 1)."""
+    lot = int(alert["lot"])
+    who = alert.get("agent") or "?"
+    title = alert.get("title")
+    if alert.get("runner_live"):
+        nudge = ("agent-mail send %s \"…\" --lot %d (what is expected on the lot, or "
+                 "ask it to record why it cannot advance: ameesh work note %d \"hold: "
+                 "<reason>\")" % (who, lot, lot))
+    else:
+        nudge = "ameesh resume %s (its runner is not live), then agent-mail send %s " \
+                "\"…\" --lot %d" % (who, who, lot)
+    return ("Idle with an actionable lot: %s holds #%d%s (%s), and %d wake(s) of its runner "
+            "left the lot unchanged. Expected action, level 1 (reversible), not just naming "
+            "it: nudge it now: %s; if it cannot take the lot, reassign it: ameesh work "
+            "assign %d <agent>. Never twice within an hour for the same agent." % (
+                who, lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
+                int(alert.get("wakes") or 0), nudge, lot))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
     des lots ouverts sans agent, l'écart est le sien (L165b, niveau 1)."""
@@ -150,6 +170,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             if name in by_name and by_name[name].get("chantier") in (None, "", project):
                 out.setdefault(name, text)
         return out
+    elif kind == "idle_actionable_lot":
+        out = {}
+        audit_text = _idle_actionable_lot(alert)
     elif kind == "idle_capacity":
         out = sous_utilisation.orchestrator_briefs(alert, listing, lot_titles)
         audit_text = _for_auditor(alert)
