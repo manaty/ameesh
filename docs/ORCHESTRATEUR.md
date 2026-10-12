@@ -406,6 +406,23 @@ quand elle ne sert plus ; et l'alerte d'un tmpfs plein dit les plus grosses
 entrées et l'action attendue.
 Le texte de chaque tour de courrier rappelle cette règle.
 
+## Review worktrees get no dependencies (#248)
+
+Rule for the orchestrator and every agent it gives a review to. Since the
+2026-10-11 19:20 outage (btrfs metadata full: 144 `node_modules` in nexlink
+worktrees):
+
+* **a review worktree gets no dependencies**: a review reads the diff; tests
+  run in the agent's main worktree, with the branch checked out there. In a
+  worktree whose name has `review`, `relecture` or `revue`, the `npm` of the
+  turn refuses `npm ci` and `npm install`;
+* **elsewhere, `npm ci` links the `node_modules` shared per lockfile**
+  (read-only, one copy per host); `ameesh deps local` before
+  `npm install <pkg>` or a tool that needs a real directory;
+* Rust builds go to `$CARGO_TARGET_DIR` (one per agent), not `target/`.
+
+Details: `docs/SHARED-DEPENDENCIES.md`.
+
 ## Ajouter plutôt que modifier (L160a)
 
 Le 10/10, la moitié des blocs en conflit à la fusion étaient deux ajouts au

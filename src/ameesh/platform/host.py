@@ -32,7 +32,9 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
     if meminfo is None and ps is not None:
         out: dict[str, int] = {}
         try:
-            out["mem_available_bytes"] = int(ps.virtual_memory().available)
+            vm = ps.virtual_memory()
+            out["mem_available_bytes"] = int(vm.available)
+            out["mem_total_bytes"] = int(vm.total)
         except Exception:
             pass
         try:
@@ -59,30 +61,13 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
     out = {}
     if "MemAvailable" in values:
         out["mem_available_bytes"] = values["MemAvailable"]
+        # L159d: total memory, for the prudent lendable share
+        if "MemTotal" in values:
+            out["mem_total_bytes"] = values["MemTotal"]
     total, free = values.get("SwapTotal"), values.get("SwapFree")
     if total is not None and free is not None:
         out["swap_used_bytes"] = max(0, total - free)
     return out
-
-
-def pressure(resource: str, window: str = "avg60", base: str | None = None) -> float | None:
-    """PSI « some » de `resource` (cpu, memory, io) sur `window` (avg10, avg60),
-    en %, ou None : noyau sans PSI, autre OS, fichier illisible.
-
-    `base` : un répertoire au format /proc/pressure (tests)."""
-    if base is None:
-        if not _proc_ok():
-            return None
-        base = os.path.join(PROC, "pressure")
-    try:
-        with open(os.path.join(base, resource), encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("some "):
-                    fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
-                    return float(fields[window])
-    except (OSError, ValueError, KeyError):
-        return None
-    return None
 
 
 def load_average() -> float | None:
@@ -239,3 +224,84 @@ def mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
             if best is None or len(point) > len(best[0]):
                 best = (point, fstype)
     return best
+
+
+# --------------------------------------------------------------------------
+# pressure, CPU time and cgroups (L159d)
+# --------------------------------------------------------------------------
+
+#: pressure stall information of the host (Linux 4.20 and later)
+PSI_DIR = os.path.join(PROC, "pressure")
+#: busy CPU time of the host
+PROC_STAT = os.path.join(PROC, "stat")
+#: root of the cgroup v2 hierarchy
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def parse_pressure(text: str) -> dict:
+    """A PSI file (`some avg10=0.00 avg60=0.00 avg300=0.00 total=0`):
+    {line: {key: value}}; unreadable lines are skipped."""
+    out: dict = {}
+    for line in (text or "").splitlines():
+        kind, _, rest = line.strip().partition(" ")
+        if kind not in ("some", "full"):
+            continue
+        values = {}
+        for item in rest.split():
+            key, _, value = item.partition("=")
+            number = _float(value)
+            if number is not None:
+                values[key] = number
+        out[kind] = values
+    return out
+
+
+def pressure(resource: str, base: str | None = None) -> dict:
+    """PSI of `resource` (`cpu`, `memory`, `io`), parsed; {} when unknown
+    (outside Linux, before Linux 4.20, `psi=0`). `base`: a folder in the
+    format of /proc/pressure, for the tests."""
+    if base is None and not is_linux():
+        return {}
+    return parse_pressure(_read(os.path.join(base or PSI_DIR, resource)) or "")
+
+
+def cpu_busy_seconds(stat: str | None = None) -> float | None:
+    """Busy CPU time of the host since boot (line `cpu` of /proc/stat), in
+    seconds: everything but `idle` and `iowait`; `guest` and `guest_nice`
+    are already counted in `user` and `nice`. None when unknown. `stat`: a
+    file in the format of /proc/stat, for the tests."""
+    if stat is None and not is_linux():
+        return None
+    for line in (_read(stat or PROC_STAT) or "").splitlines():
+        fields = line.split()
+        if not fields or fields[0] != "cpu":
+            continue
+        try:
+            ticks = [float(x) for x in fields[1:9]]
+        except ValueError:
+            return None
+        while len(ticks) < 8:
+            ticks.append(0.0)
+        user, nice, system, _idle, _iowait, irq, softirq, steal = ticks
+        try:
+            hz = float(os.sysconf("SC_CLK_TCK"))
+        except (AttributeError, OSError, ValueError):
+            hz = 100.0
+        return (user + nice + system + irq + softirq + steal) / (hz or 100.0)
+    return None
+
+
+def cgroup_cpu_seconds(path: str) -> float | None:
+    """CPU time used by a cgroup (`cpu.stat`, `usage_usec`), in seconds."""
+    for line in (_read(os.path.join(path, "cpu.stat")) or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "usage_usec":
+            number = _float(value)
+            return None if number is None else number / 1e6
+    return None
+
+
+def cgroup_memory_bytes(path: str) -> int | None:
+    """Memory charged to a cgroup (`memory.current`), in bytes."""
+    number = _float(_read(os.path.join(path, "memory.current")))
+    return None if number is None else int(number)

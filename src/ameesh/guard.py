@@ -294,7 +294,8 @@ def load_config(path: str | None = None) -> GuardConfig:
 def _psi_file(resource: str, window: str) -> float | None:
     """PSI "some" `window` (avg10, avg60) of a resource, in %, or None. Used
     when `resources.psi` (L159d) is not there."""
-    return host.pressure(resource, window, base=os.environ.get("AMEESH_PSI_DIR") or None)
+    found = host.pressure(resource, base=os.environ.get("AMEESH_PSI_DIR") or None)
+    return found.get("some", {}).get(window)
 
 
 def read_psi(window: str) -> dict:
