@@ -405,6 +405,13 @@ class Tracker:
     def _refresh(self, entry: Entry, table: list[dict] | None, now: float) -> None:
         with entry.process_lock:
             self._refresh_owned(entry, table, now)
+            if table is not None:
+                reaped = {(job.pid, job.start) for job in entry.jobs.values()
+                          if job.code is not None}
+                # The stray pass shares this snapshot: consumed wait statuses
+                # must not appear there as unknown/unreaped zombies.
+                table[:] = [p for p in table
+                            if (p["pid"], p.get("start")) not in reaped]
 
     def _refresh_owned(self, entry: Entry, table: list[dict] | None, now: float) -> None:
         vivants: list[dict] = []
@@ -569,7 +576,7 @@ class Tracker:
     def _signal_handles(self, entry: Entry, signum: int) -> None:
         foreign = self._foreign_groups(entry)
         for handle in entry.handles.values():
-            was_stopped, delivered, note = True, False, None
+            was_stopped, stop_attempted, note = True, False, None
             try:
                 with CLEANUP_SIGNAL_LOCK:
                     deadline = time.perf_counter() + self.CLEANUP_SECTION_S
@@ -593,23 +600,17 @@ class Tracker:
                     remaining = self._cleanup_remaining(entry, deadline)
                     if not remaining:
                         continue
+                    stop_attempted = True
                     if not handle.freeze(timeout=min(.5, remaining)):
                         entry.unverified |= bool(handle.live())
                         note = "stop not confirmed; no termination signal"
                         continue
                     if not self._cleanup_remaining(entry, deadline):
                         continue
-                # Registry I/O must not delay suite-cap TERM/CONT. It may
-                # resume this target here; the final local check refuses it.
-                current_foreign = self._foreign_groups(entry)
-                # Later registry ownership changes remain a residual race.
-                with CLEANUP_SIGNAL_LOCK:
-                    deadline = time.perf_counter() + self.CLEANUP_SECTION_S
                     location = handle.location()
                     if not self._cleanup_remaining(entry, deadline):
                         continue
-                    if current_foreign is None or location is None or any(
-                            g in current_foreign for g in location):
+                    if location is None or any(g in foreign for g in location):
                         entry.unverified = True
                         note = "ownership changed while stopping; no termination signal"
                         continue
@@ -619,16 +620,16 @@ class Tracker:
                     if state not in ("T", "t"):
                         entry.unverified |= bool(handle.live())
                         continue
-                    delivered = handle.send(signum)
+                    handle.send(signum)
                     self._cleanup_remaining(entry, deadline)
             finally:
-                with CLEANUP_SIGNAL_LOCK:
-                    deadline = time.perf_counter() + self.CLEANUP_SECTION_S
-                    # Preserve stops seen before cleanup; release our own stop.
-                    if not was_stopped and (signum != signal.SIGKILL or not delivered) and handle.live():
-                        if self._cleanup_remaining(entry, deadline):
-                            handle.send(signal.SIGCONT)
-                    self._cleanup_remaining(entry, deadline)
+                # Always release our stop, even after a scheduler pause or
+                # budget exhaustion. No lock, registry I/O or liveness probe
+                # may stand between this finally and the pidfd CONT.
+                if stop_attempted and not was_stopped:
+                    if not handle.send(signal.SIGCONT):
+                        self.log("[%s] background ERROR pid %s: SIGCONT failed"
+                                 % (entry.agent, handle.pid))
                 # Logging can block on I/O too: keep it outside the shared lock.
                 if note is not None:
                     self.log("[%s] background pid %s: %s" % (entry.agent, handle.pid, note))

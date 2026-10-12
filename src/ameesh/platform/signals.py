@@ -119,11 +119,16 @@ class ProcessHandle:
     def send(self, signum: int) -> bool:
         if self.fd is None:
             return False
-        try:
-            signal.pidfd_send_signal(self.fd, signum)
-            return True
-        except (OSError, ValueError):
-            return False
+        while True:
+            try:
+                signal.pidfd_send_signal(self.fd, signum)
+                return True
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                return False
+            except ValueError:
+                return False
 
     def close(self) -> None:
         if self.fd is not None:

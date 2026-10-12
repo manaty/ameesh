@@ -154,7 +154,7 @@ class OwnershipRaceTest(unittest.TestCase):
             def record(signum):
                 sends.append(signum)
                 return send(signum)
-            with mock.patch.object(tracker, "_foreign_groups", side_effect=[set(), None]), \
+            with mock.patch.object(tracker, "_foreign_groups", return_value=None), \
                     mock.patch.object(handle, "send", side_effect=record):
                 tracker._signal_handles(entry, signal.SIGTERM)
             self.assertEqual(handle.state(), "T")
@@ -230,14 +230,12 @@ class OwnershipRaceTest(unittest.TestCase):
             def registry(_):
                 nonlocal reads, worker
                 reads += 1
-                if reads == 1:
-                    return set()
-                self.assertEqual(handle.state(), "T")
+                self.assertNotEqual(handle.state(), "T")
                 worker = threading.Thread(target=cap_thread)
                 worker.start()
                 self.assertTrue(attempted.wait(2))
                 self.assertTrue(signalled.wait(2))
-                return set()  # final state check must notice suite-cap resumed it
+                return None  # refuse cleanup after proving registry I/O is outside the lock
             with mock.patch.object(suite_cap, "gather"), \
                     mock.patch.object(tracker, "_foreign_groups", side_effect=registry), \
                     mock.patch.object(handle, "send", wraps=handle.send) as sends:
@@ -248,6 +246,7 @@ class OwnershipRaceTest(unittest.TestCase):
             self.assertTrue(handle.live())
             self.assertFalse(worker.is_alive())
             self.assertTrue(signalled.is_set())
+            self.assertEqual(reads, 1)
             self.assertEqual(cap_handle.send.call_args_list,
                              [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT)])
         finally:

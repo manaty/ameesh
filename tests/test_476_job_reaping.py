@@ -55,7 +55,8 @@ class JobReapingTest(unittest.TestCase):
                 start = mock.patch.object(platform, "start_time", return_value=row["start"] + 1) \
                     if mismatch else mock.patch.object(platform, "start_time", wraps=platform.start_time)
                 with start as identity, mock.patch.object(platform, "reap", wraps=platform.reap) as reap:
-                    tracker._refresh(entry, platform.process_table(), now=1)
+                    snapshot = platform.process_table()
+                    tracker._refresh(entry, snapshot, now=1)
                 identity.assert_called_with(pid)
                 self.assertEqual(entry.jobs[pid].code, None if mismatch else -signal.SIGKILL)
                 if mismatch:
@@ -65,6 +66,9 @@ class JobReapingTest(unittest.TestCase):
                     self.assertIsNotNone(os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT))
                 else:
                     reap.assert_called_once_with(pid)
+                    self.assertNotIn(pid, [p["pid"] for p in snapshot])
+                    tracker._reap_strays(snapshot, [])
+                    self.assertEqual(tracker.unknown_zombies, 0)
                     with self.assertRaises(ChildProcessError):
                         os.waitpid(pid, os.WNOHANG)
         finally:

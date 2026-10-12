@@ -108,7 +108,7 @@ class BackgroundSignalTest(unittest.TestCase):
             survives = self.tracker._kill(self.entry)
         self.assertEqual(handle.send.call_args_list,
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT),
-                          mock.call(signal.SIGKILL)])
+                          mock.call(signal.SIGKILL), mock.call(signal.SIGCONT)])
         handle.close.assert_called_once()
         killpg.assert_not_called()
         self.assertTrue(any("process table unavailable" in note for note in self.notes))
@@ -245,7 +245,7 @@ class BackgroundSignalTest(unittest.TestCase):
                 self.tracker.tick(now=11)
         self.assertEqual(child.send.call_args_list,
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT),
-                          mock.call(signal.SIGKILL)])
+                          mock.call(signal.SIGKILL), mock.call(signal.SIGCONT)])
         store.return_value.turn_resources.close_turn.assert_called_once_with(
             "detached", orphan=True, containers=None)
 
@@ -455,7 +455,7 @@ class BackgroundSignalTest(unittest.TestCase):
         killpg.assert_not_called()
         self.assertEqual(old.send.call_args_list,
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT),
-                          mock.call(signal.SIGKILL)])
+                          mock.call(signal.SIGKILL), mock.call(signal.SIGCONT)])
         old.close.assert_called_once()
         self.assertTrue(survives)
 

@@ -3,6 +3,8 @@
 import errno
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -41,6 +43,96 @@ class CleanupLimitsTest(unittest.TestCase):
         self.assertNotIn(mock.call(signal.SIGTERM), target.send.call_args_list)
         self.assertIn(mock.call(signal.SIGCONT), target.send.call_args_list)
         self.assertTrue(entry.unverified)
+
+    def test_cont_ignores_expired_budget_and_shared_lock(self):
+        tracker, target = self.tracker(), self.target()
+        entry = self.entry(target)
+        # A scheduler pause after STOP exhausts the local section. The
+        # release must neither read the clock nor reacquire the lock.
+        clock = [0, .1, .2, .3, 3.1]
+        lock = mock.MagicMock()
+        with mock.patch.object(background.time, "perf_counter", side_effect=clock), \
+                mock.patch.object(background, "CLEANUP_SIGNAL_LOCK", lock):
+            tracker._signal_handles(entry, signal.SIGTERM)
+        self.assertEqual(target.send.call_args_list, [mock.call(signal.SIGCONT)])
+        self.assertEqual(lock.__enter__.call_count, 1)
+        self.assertTrue(entry.unverified)
+
+    def test_cont_retries_eintr_and_reports_failure_with_pid(self):
+        tracker, target = self.tracker(), self.target()
+        entry = self.entry(target)
+        target.location.side_effect = [(7000, 7000), None]
+        notes = []
+        tracker.log = notes.append
+        handle = ProcessHandle(7001, 123)
+        target.send.side_effect = handle.send
+        with mock.patch.object(signal, "pidfd_send_signal", side_effect=[
+                OSError(errno.EINTR, "interrupted"), OSError(errno.EPERM, "refused")]) as send:
+            tracker._signal_handles(entry, signal.SIGTERM)
+        self.assertEqual(send.call_args_list,
+                         [mock.call(123, signal.SIGCONT)] * 2)
+        self.assertTrue(any("ERROR pid 7001: SIGCONT failed" in note for note in notes))
+
+    @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
+    def test_blocked_registry_never_leaves_real_target_stopped(self):
+        tracker = self.tracker()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 start_new_session=True)
+        entered, release, done = threading.Event(), threading.Event(), threading.Event()
+        handle, worker = None, None
+        release_after_stop = threading.Event()
+        reads = 0
+        failures = []
+        try:
+            row = next(p for p in platform.process_table() if p["pid"] == child.pid)
+            handle = ProcessHandle.open(child.pid, row["start"])
+            self.assertIsNotNone(handle)
+            entry = self.entry(handle)
+            entry.pgid = child.pid
+            entry.handles = {child.pid: handle}
+            def registry(_):
+                nonlocal reads
+                reads += 1
+                entered.set()
+                gate = release if reads == 1 else release_after_stop
+                if not gate.wait(5):
+                    raise AssertionError("registry not released")
+                return set()
+            def cleanup():
+                try:
+                    tracker._signal_handles(entry, signal.SIGTERM)
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    done.set()
+            # Reject ownership locally after STOP to leave a live target whose
+            # resumed state can be checked, independently of TERM delivery.
+            with mock.patch.object(tracker, "_foreign_groups", side_effect=registry) as read, \
+                    mock.patch.object(handle, "location", side_effect=[(child.pid, child.pid), None]):
+                worker = threading.Thread(target=cleanup)
+                worker.start()
+                self.assertTrue(entered.wait(2))
+                self.assertNotIn(handle.state(), ("T", "t"))
+                release.set()
+                self.assertTrue(done.wait(2))
+                self.assertEqual(read.call_count, 1)
+                until = time.monotonic() + 2
+                while handle.state() in ("T", "t") and time.monotonic() < until:
+                    time.sleep(.01)
+                self.assertTrue(handle.live())
+                self.assertNotIn(handle.state(), ("T", "t"))
+                self.assertTrue(entry.unverified)
+                self.assertEqual(failures, [])
+        finally:
+            release.set()
+            release_after_stop.set()
+            if worker is not None:
+                worker.join(timeout=2)
+            child.kill()
+            child.wait(timeout=5)
+            if handle is not None:
+                handle.close()
 
     def test_blocked_registry_does_not_delay_suite_cap_term(self):
         tracker, target = self.tracker(), self.target()
