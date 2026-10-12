@@ -1049,13 +1049,29 @@ def drain_requested(path: str, now: float) -> bool:
     if not request or request.get("schema") != SCHEMA_DRAIN_REQUEST:
         return False
     until = request.get("until_ts")
-    return until is None or (isinstance(until, (int, float)) and now < until)
+    return until is None or (_number(until) and now < until)
+
+
+def drain_until(now: float, seconds) -> float:
+    """The end of a drain asked for `seconds`: a finite number > 0 whose end
+    is a date (codex #238 r5: `--for inf` wrote `until_ts: Infinity`, a
+    drain no `--cancel` printed). ValueError otherwise."""
+    if not _number(seconds) or seconds <= 0:
+        raise ValueError("positive number of seconds expected")
+    until = now + seconds
+    try:
+        dt.datetime.fromtimestamp(until, dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("%s seconds: the end is not a date" % seconds) from None
+    return until
 
 
 def request_drain(path: str, now: float, seconds: float | None) -> dict:
-    """Writes the drain request (until `now + seconds`, or until cancelled)."""
-    request = {"schema": SCHEMA_DRAIN_REQUEST, "ts": now,
-               "until_ts": None if seconds is None else now + seconds}
+    """Writes the drain request (until `now + seconds`, or until cancelled);
+    ValueError, before anything is written, for a duration `drain_until`
+    refuses."""
+    until = None if seconds is None else drain_until(now, seconds)
+    request = {"schema": SCHEMA_DRAIN_REQUEST, "ts": now, "until_ts": until}
     write_state(path, request)
     return request
 
@@ -1204,11 +1220,11 @@ def main(argv: list[str] | None = None) -> int:
             found = cancel_drain(cfg.drain_request_path)
             print("drain request %s" % ("withdrawn" if found else "absent: nothing to withdraw"))
             return 0
-        if args.seconds is not None and args.seconds <= 0:
-            print("ameesh guard: --for: positive number of seconds expected", file=sys.stderr)
-            return 2
         try:
             request = request_drain(cfg.drain_request_path, time.time(), args.seconds)
+        except ValueError as exc:
+            print("ameesh guard: --for: %s" % exc, file=sys.stderr)
+            return 2
         except OSError as exc:
             print("ameesh guard: %s: %s" % (cfg.drain_request_path, exc), file=sys.stderr)
             return 1

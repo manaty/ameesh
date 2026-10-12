@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -1181,6 +1182,23 @@ class DrainStopTest(unittest.TestCase):
         with open(path, "w") as fh:
             json.dump({"schema": "other", "until_ts": None}, fh)
         self.assertFalse(guard.drain_requested(path, 0.0))
+        # codex #238 r5: a duration that is not a finite number > 0, or whose
+        # end is not a date, writes nothing; an infinite until_ts is no drain
+        os.unlink(path)
+        for seconds in (0, -1, math.inf, -math.inf, math.nan, 1e300, 10 ** 400,
+                        True, "60"):
+            with self.assertRaises(ValueError, msg=repr(seconds)):
+                guard.request_drain(path, 1000.0, seconds)
+            self.assertFalse(os.path.exists(path), repr(seconds))
+        for until in (math.inf, "2e9"):
+            with open(path, "w") as fh:
+                json.dump({"schema": guard.SCHEMA_DRAIN_REQUEST, "until_ts": until}, fh)
+            self.assertFalse(guard.drain_requested(path, 0.0), repr(until))
+        os.unlink(path)
+        with mock.patch.object(guard, "load_config", lambda path: self.cfg), \
+                mock.patch("sys.stderr"):
+            self.assertEqual(guard.main(["drain", "--for", "inf"]), 2)
+        self.assertFalse(os.path.exists(path))
 
 
 class CliTest(unittest.TestCase):
