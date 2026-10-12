@@ -234,6 +234,14 @@ class PageBuilderTest(unittest.TestCase):
         self.assertIn("sessionStorage", html)
         self.assertNotIn("same-origin", html)
 
+    def test_gantt_groupes_et_zoom(self):
+        # L304 PR 3 : groupes repliables, zoom semaine/jour gardé dans l'URL
+        html = progress.render_html(_snap())
+        self.assertIn('el("details", "rm-gr")', html)
+        self.assertIn('"z=day"', html)
+        self.assertIn('[["week", "week"], ["day", "day"]]', html)
+        self.assertIn("delivered and abandoned (", html)
+
     def test_onglets_et_fenetre(self):
         html = progress.render_html(_snap())
         for tab in ("overview", "gantt", "lots", "agents", "budget", "decisions"):

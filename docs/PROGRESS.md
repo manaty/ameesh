@@ -41,17 +41,24 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
 **Overview** (one card per project, from `overview`: open lots,
 lots merged in the window, pending decisions, 24 h spend, next milestone
 with its progress bar, two warnings at most; then "Watch": overdue or
-urgent decisions, blocked and stale lots), **Gantt** (the roadmap),
+urgent decisions, blocked and stale lots), **Gantt** (the roadmap: tasks
+grouped by epic, or by project when they have none, groups folded by
+default with a summary bar and their open, delivered, blocked and late
+counts; delivered and abandoned tasks hidden unless ticked; week zoom fits
+the window on screen, day zoom gives each day a column and scrolls to
+today, `z=day` in the URL; a milestone can narrow the window; a task opens
+its lot window),
 **Work items**, **Agents** (tables with a text filter and sortable columns;
 merged and closed lots, stopped agents hidden by default), **Budget** and
 **Decisions**. A project selector sits on top (served: the snapshot is read
 again with `?project=`; static: the page filters lots, agents, cards and
-decisions, and says that budget and Gantt cover all projects). Details open
+decisions and Gantt tasks, and says that budget, milestones and epics
+cover all projects). Details open
 in **windows** on click (lot: dated milestones, waiting_for, cost, its
 decisions, thread command; agent; milestone: epics and open lots; decision:
 options, recommendation, answer command). Light, dark or system theme
 (remembered by the browser). Open tab, project and auto-refresh live in
-the URL (`#tab=lots&p=demo&auto=1`).
+the URL (`#tab=lots&p=demo&auto=1`, `#tab=gantt&z=day`).
 
 * `--serve [--port 8765]` (L304): serves the same page and this JSON from
   a local server, **read-only**, until Ctrl-C. See "Local server" below.
