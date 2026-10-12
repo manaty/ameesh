@@ -338,6 +338,9 @@ class AgentWorker(threading.Thread):
         #: L159f4 r2 : le fil de renouvellement du tour (son renouvellement en
         #: cours peut encore prolonger `lease_held_until` après la fin du tour)
         self.heartbeat_thread: threading.Thread | None = None
+        #: r3 : les appels de renouvellement détachés (sans réponse dans
+        #: `call_budget()`) : l'un d'eux peut encore prolonger le bail en base
+        self.renewals: list[threading.Thread] = []
         self.pgid: int | None = None  # groupe du harnais en cours
         #: dernier descripteur de harnais journalisé (chemin, empreinte) — L16
         self.descriptor_seen: tuple[str, str] = ("", "")
@@ -542,8 +545,14 @@ class AgentWorker(threading.Thread):
                     self.runner.lease_ttl)
             except Exception as exc:  # DbError, mais aussi tout imprévu
                 result["error"] = exc
+                return
+            if result["expires"] is not None:
+                # L159f4 r3 : même arrivée après `call_budget()` (appel
+                # détaché), la réponse prolonge la borne locale du bail
+                self.lease_held_until = max(self.lease_held_until, self._held_until())
 
         thread = threading.Thread(target=call, daemon=True)
+        self.renewals = [t for t in self.renewals if t.is_alive()] + [thread]
         thread.start()
         thread.join(timeout=self.call_budget())
         if thread.is_alive():
@@ -4214,12 +4223,16 @@ class Runner:
         # r2 : un renouvellement en cours à la fin du tour peut encore
         # aboutir et prolonger le bail : l'échéance n'est figée qu'une fois
         # le fil de renouvellement fini (la part reste « tenu » entre-temps)
+        # r3 : de même pour un appel de renouvellement détaché (sa réponse
+        # a dépassé `call_budget()`), qui peut encore aboutir en base
         heartbeat = worker.heartbeat_thread
-        while heartbeat is not None and heartbeat.is_alive():
+        pending = [heartbeat] if heartbeat is not None else []
+        while any(t.is_alive() for t in pending + list(worker.renewals)):
             gate.tick()
-            heartbeat.join(self.RELEASE_RETRY_S)
-            if self.stop.is_set():
-                return
+            for thread in pending + list(worker.renewals):
+                thread.join(self.RELEASE_RETRY_S)
+                if self.stop.is_set():
+                    return
         # r1 : l'échéance lue en base n'est pas comparée à l'horloge murale
         # de cet hôte (en avance, elle dirait la part libre bail tenu)
         until = worker.lease_held_until

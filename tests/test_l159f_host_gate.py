@@ -786,6 +786,41 @@ class OnceTurnTest(PgTestCase):
         self.assertEqual(self.events[-1], ("tick", False))
         self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
 
+    def test_a_detached_renewal_is_awaited_before_the_expiry_is_fixed(self):
+        # r3 P2: the renewal committed but answered after `call_budget()`:
+        # the heartbeat has ended, its detached call still extends the bound
+        import threading
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        bounds = {}
+
+        def turn(worker, _wait):
+            runner.lease_ttl = 0.3  # the bound a late answer gives
+            bounds["start"] = time.monotonic()
+            worker.lease_held_until = bounds["start"] + 0.05
+            worker.lease_deadline = time.time() + 60
+            answer = threading.Event()
+
+            def renew(*_args):
+                answer.wait(0.2)  # committed; the answer comes late
+                return time.time() + 60
+            with mock.patch.object(runner_mod.registry, "renew", renew), \
+                    mock.patch.object(worker, "call_budget", return_value=0.01):
+                self.assertEqual(worker._renew_call(), (False, None, None))
+            return True
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease",
+                                  return_value=False):
+            runner.sweep()
+            freed = time.monotonic()
+        # the late answer (after 0.2 s) holds the lease 0.3 s more
+        self.assertGreaterEqual(freed, bounds["start"] + 0.5)
+        self.assertEqual(self.events[-1], ("tick", False))
+        self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
     def test_release_is_tried_even_after_renewal_failures(self):
         # r1 P2: three generic DbErrors at renewal set `lease_lost` before the
         # lease expires; the base still gives it to us, so the return is
