@@ -73,9 +73,9 @@ class MailProjectTests(_Base):
     def test_canon_fallback_only_uses_the_agents_own_canon(self):
         self.db.execute("UPDATE agent_registry SET canon = 'own' WHERE name = 'orch'")
         other = SimpleNamespace(owns=lambda name: name == "other",
-                                agent=lambda name: SimpleNamespace(team="wrong"))
+                                agents=[SimpleNamespace(title="orch", team="wrong")])
         own = SimpleNamespace(owns=lambda name: name == "own",
-                              agent=lambda name: SimpleNamespace(team="right"))
+                              agents=[SimpleNamespace(title="orch", team="right")])
         with mock.patch.object(work, "configured_canons", return_value=[other, own]):
             self.assertEqual(work_projects.mail_project(self.cfg, self.db, "orch", "dev1"),
                              "right")
@@ -135,7 +135,7 @@ class MailProjectTests(_Base):
         self.db.execute("UPDATE agent_registry SET canon = 'own' WHERE name = 'dev1'")
         def canon(team, own=True):
             return SimpleNamespace(owns=lambda name: own and name == "own",
-                                   agent=lambda name: SimpleNamespace(team=team))
+                                   agents=[SimpleNamespace(title="dev1", team=team)])
         with mock.patch.object(work, "configured_canons", return_value=[canon("foreign", False),
                                                                                    canon("own")]):
             self.assertEqual(work_projects.creation_project(self.cfg, self.db, "dev1"), "own")
@@ -151,6 +151,57 @@ class MailProjectTests(_Base):
         view = decisions.ask(self.cfg, self.db, requester="dev1", question="Proceed?",
                              new_lot="Child", source_mail=mail_id)
         self.assertEqual(work.get(self.db, view["lot"])["app"], "parent")
+
+    def test_follow_up_decision_accepts_completed_source_lots(self):
+        for state in ("merged", "closed"):
+            parent = work.add(self.db, title="Parent", app="parent")
+            proc = self.cli("send", "orch", "Proceed?", "--from", "dev1",
+                            "--lot", str(parent["id"]))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            mail_id = self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'notify'"
+                                    " ORDER BY id DESC LIMIT 1")[0]["id"]
+            if state == "closed":
+                work.close(self.db, parent["id"], abandoned=True)
+            else:
+                self.db.execute("UPDATE work_items SET state = %s WHERE id = %s",
+                                (state, parent["id"]))
+            events = work.events(self.db, parent["id"])
+            for requester_project in ("requester", ""):
+                with self.subTest(state=state, requester_project=requester_project):
+                    self.project("dev1", team=requester_project)
+                    view = decisions.ask(self.cfg, self.db, requester="dev1", question="Proceed?",
+                                         new_lot="Follow up", source_mail=mail_id)
+                    self.assertEqual(work.get(self.db, view["lot"])["app"],
+                                     requester_project or "parent")
+                    self.assertEqual(work.get(self.db, parent["id"])["state"], state)
+                    self.assertEqual(work.events(self.db, parent["id"]), events)
+
+    def test_known_requester_project_does_not_resolve_an_unused_parent(self):
+        self.project("dev1", team="requester")
+        with mock.patch("ameesh.assignments.resolve_lot",
+                        side_effect=AssertionError("unused parent lookup")):
+            view = decisions.ask(self.cfg, self.db, requester="dev1", question="Proceed?",
+                                 new_lot="Follow up", parent_lot="unknown old reference")
+        self.assertEqual(work.get(self.db, view["lot"])["app"], "requester")
+
+    def test_duplicate_own_canon_cards_refuse_inheritance_and_skip_backfill(self):
+        self.db.execute("UPDATE agent_registry SET canon = 'own' WHERE name = 'dev1'")
+        cards = [SimpleNamespace(title="dev1", team=p) for p in ("A", "B")]
+        canon = SimpleNamespace(owns=lambda c: c == "own", agents=cards,
+                                agent=lambda name: cards[0])
+        lot = work.add(self.db, title="Ambiguous", assignee="dev1", actor="orch")
+        events = work.events(self.db, lot["id"])
+        with mock.patch.object(work, "configured_canons", return_value=[canon]):
+            with self.assertRaisesRegex(work.WorkError, "ambiguous"):
+                work_projects.creation_project(self.cfg, self.db, "dev1")
+            with self.assertRaisesRegex(work.WorkError, "ambiguous"):
+                work_projects.mail_project(self.cfg, self.db, "dev1", "orch")
+            rows = work_projects.backfill_app(self.cfg, self.db, actor="human:owner")
+            self.assertEqual(rows[0]["status"], "skipped")
+            cards[1].team = "A"
+            self.assertEqual(work_projects.agent_project(self.cfg, self.db, "dev1"), "A")
+        self.assertEqual(work.get(self.db, lot["id"])["app"], "")
+        self.assertEqual(work.events(self.db, lot["id"]), events)
 
     def test_unknown_creation_project_preserves_human_and_unclassified_flows(self):
         self.assertEqual(work_projects.creation_project(self.cfg, self.db, "human:owner"), "")
@@ -263,11 +314,32 @@ class MailProjectTests(_Base):
         lot = work.add(self.db, title="Unclassified")
         binding = SimpleNamespace(name="dev2", ok=True, source="session")
         agent = SimpleNamespace(title="dev2", fiche=SimpleNamespace(data={"roles": ["design"]}))
-        canon = SimpleNamespace(agents=[agent])
+        canon = SimpleNamespace(agents=[agent], owns=lambda c: c is None)
         with mock.patch("ameesh.identity.resolve_binding", return_value=binding), \
                 mock.patch("ameesh.canon.load_configured", return_value=[canon]):
             work_projects.set_app(self.cfg, self.db, lot["id"], "p")
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "dev2")
+
+    def test_foreign_canon_namesake_cannot_grant_correction_roles(self):
+        self.db.execute("UPDATE agent_registry SET canon = 'own' WHERE name = 'dev1'")
+        def canon(ident, role):
+            card = SimpleNamespace(title="dev1", fiche=SimpleNamespace(data={"roles": [role]}))
+            return SimpleNamespace(owns=lambda c: c == ident, agents=[card])
+        own, foreign = canon("own", "worker"), canon("foreign", "design")
+        binding = SimpleNamespace(name="dev1", ok=True, source="session")
+        lot = work.add(self.db, title="Unclassified")
+        events = work.events(self.db, lot["id"])
+        with mock.patch("ameesh.identity.resolve_binding", return_value=binding), \
+                mock.patch("ameesh.canon.load_configured", return_value=[foreign, own]):
+            for action in (lambda: work.corrector(self.cfg, self.db),
+                           lambda: work_projects.set_app(self.cfg, self.db, lot["id"], "p"),
+                           lambda: work_projects.backfill_app(self.cfg, self.db)):
+                with self.assertRaisesRegex(work.WorkError, "correction refused"):
+                    action()
+            own.agents[0].fiche.data["roles"] = ["design"]
+            self.assertEqual(work.corrector(self.cfg, self.db), "dev1")
+        self.assertEqual(work.get(self.db, lot["id"])["app"], "")
+        self.assertEqual(work.events(self.db, lot["id"]), events)
 
     def test_set_app_rejects_missing_lot_or_empty_project(self):
         lot = work.add(self.db, title="Unclassified")

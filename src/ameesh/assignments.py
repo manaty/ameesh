@@ -55,8 +55,16 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     except Exception:
         pass
     try:
+        canons = None
+        if roles is not None:
+            # Correction roles are authority from this agent's own canon,
+            # never from a namesake card in another configured canon.
+            from . import canon, registry
+            row = registry.get(db, name)
+            canons = [c for c in (canon.load_configured(cfg) if cfg is not None else [])
+                      if row is not None and c.owns(row.get("canon"))]
         return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
-                                        roles=roles or su.ORCHESTRATOR_ROLES)
+                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES)
     except Exception:
         return False
 

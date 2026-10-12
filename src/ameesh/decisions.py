@@ -552,11 +552,19 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
             raise DecisionError("--new-lot: empty title")
         try:
             from . import assignments, work_projects
-            parent_ref = parent_lot or mail_lot
-            parent = assignments.resolve_lot(db, parent_ref) if parent_ref else None
-            if parent_ref and parent is None:
-                raise DecisionError("parent work item %s not found" % parent_ref)
-            project = work_projects.creation_project(cfg, db, requester, parent=parent)
+            project = work_projects.creation_project(cfg, db, requester)
+            if not project:
+                parent_ref = parent_lot or mail_lot
+                parent = None
+                if parent_ref:
+                    number = str(parent_ref).strip().lstrip("#")
+                    # A follow-up may inherit from a completed lot. It reads
+                    # its project; it does not assign or reopen that lot.
+                    parent = (work.get(db, int(number)) if number.isdigit()
+                              else assignments.resolve_lot(db, parent_ref))
+                    if parent is None:
+                        raise DecisionError("parent work item %s not found" % parent_ref)
+                project = work_projects.creation_project(cfg, db, requester, parent=parent)
             item = work.add(db, title=title, assignee=requester, actor=requester,
                             source="decision", app=project, cfg=cfg)
         except work.WorkError as exc:
