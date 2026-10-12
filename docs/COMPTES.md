@@ -487,8 +487,8 @@ the turn and before any pause. The runner journal and the team thread say
 change. No `account_switches` row is written, since the shared choice did not
 change.
 
-**Fallback order for a critical agent at its threshold** (this PR covers the
-first two steps):
+**Fallback order for a critical agent at its threshold** (steps 1, 2 and 4
+are in place; step 3 comes with lot #340's last PR):
 
 1. another plan account of the same harness with headroom (§ 4 order);
 2. the harness's default account (`~/.claude`) beyond its implicit 50 % cap.
@@ -503,5 +503,43 @@ first two steps):
    window resets), the agent leaves the default account: continuity only keeps
    a session on an account that is under its ordinary threshold;
 3. another plan harness (Codex), then an API-key harness (DeepSeek), via a
-   rotation with summary. This step is not done yet (lot #340, next PR);
+   rotation with summary. This step is not done yet (lot #340, PR 2b);
 4. pause, once all of the above are exhausted.
+
+**Reserve for the critical agents** (L242b (2)). The other agents stop
+earlier, so that the margin left is for the critical ones:
+
+* on a plan, a non-critical agent stops 10 points below the pace cap
+  (`accounts.RESERVE`). With a 90 % pace cap it stops at 80 %. The short
+  window cap, when set, is lowered the same way. The fixed caps (50 % of the
+  primary, `cap`, `overage_cap`) are not: they hold for everyone. The reason
+  then says "10 points kept for critical agents". This holds with or without
+  declared accounts. It also holds on a host with no critical agent: the
+  reserve is then simply not used;
+* on pay-per-token, a non-critical agent stops at `noncritical_hourly_share`
+  of the mesh hourly cap. The setting is in the host configuration
+  (`AMEESH_NONCRITICAL_HOURLY_SHARE`; between 0 and 1; default 0.75, a
+  mesh-design decision of 2026-10-12): 15 $ of 20 $. A critical agent goes up
+  to the full cap.
+
+**The mesh hourly cap counts the real spend** (mesh-design decision,
+2026-10-12). The pay-per-token spend of the last 60 minutes is the real drop
+of the provider balances (`balance.compare`, see EXPLOITATION.md, "Dépense
+réelle"). Before the first reading and after the last one in the hour, the
+ledger estimate is used, corrected by the real/estimated ratio of the covered
+interval. The ratio is used only when that interval carries at least 0.50 $
+of estimate, and it never goes below 0.1 (`cost.PAID_RATIO_FLOOR`). A harness
+without readings, or unreadable balances, falls back to the estimate.
+`ameesh budget` shows the counted amount next to the estimate.
+
+**A budget pause is shown as one.** The pause reason starts with the account
+that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
+all claude accounts at threshold — …". It is the agent's `status_text`
+("budget : pause (…) until 14:20; …"). `ameesh progress` and the alerts read
+`paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
+
+**Urgent alert** (L242b (5)). When a critical agent is paused on budget
+anyway, the runner marks its status text ("budget : critical agent: …").
+`ameesh alerts` then raises `critical_budget_pause`. The alert is pushed by
+default and urgent, and is mailed (urgent) to the orchestrators of the
+agent's team and to the auditors.
