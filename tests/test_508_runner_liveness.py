@@ -76,6 +76,9 @@ class RunnerLivenessTest(PgTestCase):
         with mock.patch.object(self.db, 'execute', wraps=self.db.execute) as write:
             registry.runner_seen(self.db, self.cfg.host, 'host:123', None)
         self.assertEqual(write.call_count, 1, 'une instruction pour les deux personas')
+        sql = ' '.join(write.call_args.args[0].split())
+        self.assertIn('ORDER BY name FOR UPDATE) s', sql)
+        self.assertIn('WHERE r.name = s.name', sql)
         for name in ['alpha', 'beta']:
             self.assertIsNotNone(registry.get(self.db, name)['runner_seen_ts'])
         for name in ['other', 'external', 'stopped']:
@@ -97,3 +100,8 @@ class RunnerLivenessTest(PgTestCase):
              mock.patch('ameesh.runner.registry.runner_seen'):
             self.runner.report_liveness()
         self.assertEqual(self.runner._runner_seen_next, 220)
+
+    def test_draining_runner_still_reports(self):
+        self.runner.draining.set()
+        self.runner.sweep()
+        self.assertIsNotNone(registry.get(self.db, 'alpha')['runner_seen_ts'])

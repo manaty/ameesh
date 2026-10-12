@@ -158,6 +158,31 @@ def placement_admitted_sql(alias: str = "agent_registry") -> str:
         "governed": canon_governed_sql(a), "a": a}
 
 
+def write_runner_seen(db, host, owner, names, *, admission_sql=None, admission_params=()):
+    """#508 : une écriture groupée, verrous ordonnés comme le cycle de vie hôte.
+
+    Le chemin médié fournit un prédicat d'admission revérifié par l'UPDATE,
+    après l'attente éventuelle d'une révocation concurrente du placement.
+    """
+    if names is not None and not names:
+        return
+    selected = "host = %s AND mode = 'execute' AND status <> 'stopped'"
+    if names is not None:
+        selected += " AND name IN (%s)" % name_list(names)
+    sql = f"""UPDATE agent_registry r
+                SET runner_seen_at = clock_timestamp(),
+                    runner_seen_host = %s, runner_seen_owner = %s
+               FROM (SELECT name FROM agent_registry WHERE {selected}
+                     ORDER BY name FOR UPDATE) s
+              WHERE r.name = s.name AND r.host = %s
+                AND r.mode = 'execute' AND r.status <> 'stopped'"""
+    params = [host, owner, host, host]
+    if admission_sql is not None:
+        sql += " AND (" + admission_sql + ")"
+        params.extend(admission_params)
+    db.execute(sql, tuple(params))
+
+
 # --------------------------------------------------------------------------
 # lignes du registre
 # --------------------------------------------------------------------------
@@ -314,16 +339,7 @@ class Agents(interface.Agents):
         return self.db.query(sql, tuple(params))
 
     def runner_seen(self, host, owner, names) -> None:
-        sql = """UPDATE agent_registry
-                    SET runner_seen_at = clock_timestamp(),
-                        runner_seen_host = %s, runner_seen_owner = %s
-                  WHERE host = %s AND mode = 'execute' AND status <> 'stopped'"""
-        params = [host, owner, host]
-        if names is not None:
-            if not names:
-                return
-            sql += " AND name IN (%s)" % name_list(names)
-        self.db.execute(sql, tuple(params))
+        write_runner_seen(self.db, host, owner, names)
 
     def mark_event_wake(self, name) -> None:
         self.db.execute(

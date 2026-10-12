@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from ..storage.postgres.mailbox import PROJECT_SQL
-from ..storage.postgres.registry import canon_governed_sql, placement_admitted_sql
+from ..storage.postgres.registry import canon_governed_sql, placement_admitted_sql, write_runner_seen
 from .contract import Fence, Operation, agent_name
 from .interfaces import Principal, ScopeError, ScopeRules
 
@@ -175,7 +175,15 @@ class HostScopeRules(ScopeRules):
         wanted = sorted(admitted if names is None else set(names) & admitted)
         if not wanted:
             raise Immediate(None)
-        kw["names"] = wanted
+        admission = canon_governed_sql("r") + " AND " + placement_admitted_sql("r")
+        params = ()
+        if self.credential_modes is not None:
+            admission += " AND coalesce(r.credential_mode, '') = ANY(%s::text[])"
+            params = (sorted(self.credential_modes),)
+        # L'admission lue ci-dessus peut être révoquée avant l'écriture.
+        write_runner_seen(self.db, principal.host, kw["owner"], wanted,
+                          admission_sql=admission, admission_params=params)
+        raise Immediate(None)
 
     def _apply_agents_cwd_used(self, principal, kw, fence):
         # réponse limitée aux agents de l'hôte : le pilote regarde tout le

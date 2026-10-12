@@ -4903,6 +4903,7 @@ class Runner:
     def report_liveness(self) -> None:
         """#508 : une passe vivante, même sans bail ni admission ; au plus
         une requête par intervalle, indépendamment des réveils de courrier."""
+        # Un runner en drain reste vivant et continue cette preuve jusqu'à l'arrêt.
         if self.stop.is_set() or self.dry_run:
             return
         now = time.monotonic()

@@ -24,6 +24,7 @@ import os
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import db as db_mod
 from ameesh import storage
@@ -198,6 +199,21 @@ class ServeurExecTest(PgTestCase):
         self.assertEqual(row["runner_seen_owner"], OWNER)
         self.assertIsNone(self.row("tresorier")["runner_seen_at"])
         self.assertIsNone(row["lease_owner"])
+
+    def test_runner_seen_rechecks_revoked_admission(self):
+        from ameesh.mediated_executor.scope import HostScopeRules
+        original = HostScopeRules.admitted_agents
+
+        def revoke_after_read(rules, principal):
+            admitted = original(rules, principal)
+            rules.db.execute("UPDATE agent_registry SET placement_ok = false"
+                             " WHERE name = 'inge-front'")
+            return admitted
+
+        with mock.patch.object(HostScopeRules, "admitted_agents", revoke_after_read):
+            result = self.op("agents.runner_seen", [HOST, OWNER, None])
+        self.assertEqual(result.status, 200, result.body)
+        self.assertIsNone(self.row("inge-front")["runner_seen_at"])
 
     def test_runner_seen_refuses_foreign_owner_and_session(self):
         result = self.op("agents.runner_seen", [HOST, "host:123", None])
