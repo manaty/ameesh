@@ -32,8 +32,14 @@ class VersionTest(unittest.TestCase):
                 self.assertEqual(hv.parse_version(text), expected)
 
     def test_version_order(self):
-        ordered = [None, "0.2.0-rc.2", "0.2.0", "0.10.0", "1.0", "1.0.1", "2.1.286"]
+        ordered = [None, "0.2.0-alpha", "0.2.0-alpha.1", "0.2.0-rc.2", "0.2.0-rc.10",
+                   "0.2.0-rc.x", "0.2.0", "0.10.0", "1.0", "1.0.1", "1.4.0-rc.1", "1.4",
+                   "2.1.286"]
         self.assertEqual(sorted(reversed(ordered), key=hv.version_key), ordered)
+        # trailing zeros do not count
+        self.assertEqual(hv.version_key("1.4"), hv.version_key("1.4.0"))
+        self.assertEqual(hv.version_key("1"), hv.version_key("1.0.0"))
+        self.assertLess(hv.version_key("1.4.0"), hv.version_key("1.4.1-rc.1"))
 
     def test_probe_fake_harnesses(self):
         with mock.patch.dict(os.environ, FAKE_ENV):
@@ -55,13 +61,23 @@ class VersionTest(unittest.TestCase):
             raise subprocess.TimeoutExpired("claude", 1)
 
         def silent(*_a, **_k):
-            return subprocess.CompletedProcess([], 2, stdout="", stderr="boom\n")
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="boom\n")
+
+        def old_node(*_a, **_k):
+            return subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="codex requires Node.js >=20.0.0\n")
 
         with mock.patch.dict(os.environ, FAKE_ENV):
             self.assertEqual(hv.probe("claude", run=timeout)["error"], "TimeoutExpired")
             item = hv.probe("claude", run=silent)
         self.assertEqual(item["raw"], "boom")
-        self.assertEqual(item["error"], "exit 2, no version")
+        self.assertEqual(item["error"], "exit 0, no version")
+        # a failed start is not a version, even when it names one
+        with mock.patch.dict(os.environ, FAKE_ENV):
+            item = hv.probe("codex", run=old_node)
+        self.assertIsNone(item["version"])
+        self.assertEqual(item["error"], "exit 1")
+        self.assertEqual(item["raw"], "codex requires Node.js >=20.0.0")
 
     def test_latest(self):
         urls = []
@@ -99,6 +115,11 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(table["claude"]["behind"], ["pc", "vm"])
         self.assertEqual(table["claude"]["latest"], "2.1.296")
         self.assertEqual(table["codex"]["behind"], [])
+        # 1.4 and 1.4.0 are the same version
+        same = [{"harness": "dsh", "host": h, "version": v, "observed_ts": None}
+                for h, v in (("pc", "1.4"), ("vm", "1.4.0"))]
+        self.assertFalse(hv.matrix(same)[0]["differs"])
+        self.assertEqual(hv.matrix(same)[0]["behind"], [])
 
 
 class VersionDbTest(PgTestCase):

@@ -46,13 +46,22 @@ def parse_version(text: str | None) -> str | None:
 
 
 def version_key(version: str | None) -> tuple:
-    """Sort key of a version: numbers first, a pre-release before its
-    release; None before everything."""
+    """Sort key of a version, semver rules: release parts compared as
+    numbers, trailing zeros ignored (`1.4` == `1.4.0`); a pre-release
+    before its release; pre-release identifiers compared one by one,
+    numeric ones as numbers and before alphanumeric ones (`rc.2` <
+    `rc.10`), fewer identifiers first. None before everything."""
     if not version:
-        return (-1,)
+        return (0,)
     base, _, pre = version.partition("-")
-    numbers = tuple(int(part) for part in base.split(".") if part.isdigit())
-    return numbers + ((1,) if not pre else (0, pre))
+    numbers = [int(part) for part in base.split(".") if part.isdigit()]
+    while numbers and numbers[-1] == 0:
+        numbers.pop()
+    if not pre:
+        return (1, tuple(numbers), 1, ())
+    ids = tuple((0, int(part), "") if part.isdigit() else (1, 0, part)
+                for part in pre.split("."))
+    return (1, tuple(numbers), 0, ids)
 
 
 def _first_line(text: str) -> str:
@@ -91,9 +100,14 @@ def probe(harness: str, *, run=subprocess.run) -> dict:
         return out
     raw = _first_line(proc.stdout) or _first_line(proc.stderr)
     out["raw"] = raw or None
+    if proc.returncode != 0:
+        # a failed start can name a version that is not the harness's
+        # (`requires Node.js >=20.0.0`): nothing is read
+        out["error"] = "exit %s" % proc.returncode
+        return out
     out["version"] = parse_version(raw)
     if out["version"] is None:
-        out["error"] = "exit %s, no version" % proc.returncode
+        out["error"] = "exit 0, no version"
     return out
 
 
@@ -153,5 +167,5 @@ def matrix(rows: list[dict], latest_versions: dict | None = None, *,
         behind = sorted(host for host, h in hosts.items()
                         if reference and version_key(h["version"]) < version_key(reference))
         out.append({"harness": harness, "hosts": hosts, "newest": newest,
-                    "differs": len(versions) > 1, "latest": last, "behind": behind})
+                    "differs": len({version_key(v) for v in versions}) > 1, "latest": last, "behind": behind})
     return out
