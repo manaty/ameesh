@@ -75,7 +75,7 @@ from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
 from .connectors.git_merge import resolve_gh
-from .plan_git import WORK_TRAILER_RE, partial_lots
+from .plan_git import WORK_TRAILER_RE, partial_lots, short_branch
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$")
 _LOT_LINE_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-lot[ \t]*:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$")
@@ -234,7 +234,8 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     """Ferme les lots dont la PR est fusionnée. Rend le compte rendu."""
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
-                     "--json", "number,headRefName,body,state,mergeCommit,mergedBy,mergedAt,url"])
+                     "--json", "number,headRefName,isCrossRepository,body,state,mergeCommit,mergedBy,"
+                     "mergedAt,url"])
     if not isinstance(prs, list):
         raise GithubError("gh pr list: list expected")
     st = storage.of(db)
@@ -261,9 +262,14 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
         packages = packages_of_pr(pr, idents)
         if not explicit and not packages:
             # L118b : `lot/<id>-…` sans fiche de ce nom désigne le lot <id>
+            # #312 r1 : seulement une branche du dépôt même (pas d'un fork),
+            # et la branche enregistrée du lot s'il en porte une
             head = LOT_HEAD_RE.match(pr.get("headRefName") or "")
-            if head:
-                explicit = [int(head.group(1))]
+            if head and pr.get("isCrossRepository") is False:
+                item = work_mod.get(db, int(head.group(1)))
+                if item is None or not item.get("branch") \
+                        or short_branch(item["branch"]) == pr["headRefName"]:
+                    explicit = [int(head.group(1))]
         if explicit:
             targets = [(i, None) for i in explicit]
         else:

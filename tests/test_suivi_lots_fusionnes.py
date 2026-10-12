@@ -264,6 +264,8 @@ class MergeSweepTest(_Base):
         _git(self.repo, "checkout", "-q", "-b", "develop")
         _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "develop")
         self.agent("claude1", cwd=self.repo)
+        plan_git._pr_body_backoff.clear()           # état du processus
+        self.addCleanup(plan_git._pr_body_backoff.clear)
 
     def commit(self, name):
         with open(os.path.join(self.repo, name), "w") as fh:
@@ -402,6 +404,94 @@ class MergeSweepTest(_Base):
         self.assertEqual(cite("Merge branch 'lot/42-x'\n\nameesh-work-partial: 42"), {})
         self.assertEqual(plan_git.merge_pr_number("Merge pull request #3 from o/lot/42-x"), 3)
         self.assertIsNone(plan_git.merge_pr_number("Merge branch 'lot/42-x'"))
+
+    # --- #312 r1 --------------------------------------------------------
+
+    def test_r1_branche_enregistree_seule_compte(self):
+        # P1 : le lot porte agent/courante, non fusionnée ; la fusion d'une
+        # autre lot/<id>-old ne le ferme pas
+        lot = self.lot()
+        n = lot["id"]
+        work.set_branch(self.db, n, "agent/courante", actor="orch", source="test")
+        _git(self.repo, "checkout", "-q", "-b", "agent/courante", "develop")
+        self.commit("courante")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.merge("lot/%d-old" % n, "Merge branch 'lot/%d-old'" % n)
+        report = self.sync(pr_body=lambda repo, num: "")
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        # la branche enregistrée elle-même, fusionnée par son titre : fermé
+        lot2 = self.lot("deux")
+        work.set_branch(self.db, lot2["id"], "origin/lot/%d-bon" % lot2["id"], actor="orch",
+                        source="test")
+        self.merge("lot/%d-bon" % lot2["id"],
+                   "Merge pull request #4 from manaty/lot/%d-bon" % lot2["id"])
+        self.sync(pr_body=lambda repo, num: "")
+        self.assertEqual(work.get(self.db, lot2["id"])["state"], "merged")
+
+    def test_r1_fusion_locale_partielle_retient_la_branche_implicite(self):
+        # P2 : `ameesh-work-partial` dans le message d'une fusion locale
+        # retient aussi la preuve par la branche implicite
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        self.merge("lot/%d-un" % n, "Merge branch 'lot/%d-un'\n\nameesh-work-partial: %d"
+                   % (n, n))
+        report = self.sync()
+        self.assertEqual(report["results"][0]["how"], "partial")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_r1_corps_illisible_puis_pr_complete_lisible(self):
+        # P2 : le corps toujours illisible de #7 ne cache pas #8, complète
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-a" % n, "Merge pull request #7 from manaty/lot/%d-a" % n)
+        sha = self.merge("lot/%d-b" % n, "Merge pull request #8 from manaty/lot/%d-b" % n)
+        lus = []
+
+        def lire(repo, num):
+            lus.append(num)
+            if num == 7:
+                raise plan_git.GitError("gh: HTTP 404")
+            return "The rest."
+
+        report = self.sync(pr_body=lire)          # un échec de gh par relevé
+        self.assertIn("unreadable", report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(self.sync(pr_body=lire)["merged"], 1)   # #7 recule : #8 lu
+        self.assertEqual(lus, [7, 8])
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+
+    def test_r1_recul_et_plafond_des_lectures_de_gh(self):
+        # P2 : au plus un échec de gh par dépôt et par relevé ; une PR en échec
+        # recule (délai doublé à chaque échec) ; au plus MAX_PR_BODY_READS
+        # lectures par relevé
+        lots = [self.lot("l%d" % i) for i in range(3)]
+        for i, lot in enumerate(lots):
+            self.merge("lot/%d-x" % lot["id"],
+                       "Merge pull request #%d from manaty/lot/%d-x" % (10 + i, lot["id"]))
+        appels = []
+
+        def en_panne(repo, num):
+            appels.append(num)
+            raise plan_git.GitError("gh: timeout")
+
+        for _ in range(4):
+            self.sync(pr_body=en_panne)
+        self.assertEqual(appels, [10, 11, 12])     # rien pendant les reculs
+        key = (self.repo, 10)
+        self.assertEqual(plan_git._pr_body_backoff[key][1], plan_git.PR_BODY_BACKOFF_S)
+        plan_git._pr_body_backoff[key] = (0.0, plan_git._pr_body_backoff[key][1])
+        self.sync(pr_body=en_panne)
+        self.assertEqual(appels, [10, 11, 12, 10])
+        self.assertEqual(plan_git._pr_body_backoff[key][1], 2 * plan_git.PR_BODY_BACKOFF_S)
+        # plafond : une lecture par relevé ; une lecture réussie oublie le recul
+        plan_git._pr_body_backoff.clear()
+        lus = []
+        with mock.patch.object(plan_git, "MAX_PR_BODY_READS", 1):
+            report = self.sync(pr_body=lambda repo, num: lus.append(num) or "")
+        self.assertEqual((len(lus), report["merged"]), (1, 1))
+        self.assertTrue(any("bodies read in this sweep" in r["detail"]
+                            for r in report["results"]))
 
     def test_cited_lots(self):
         cas = {
