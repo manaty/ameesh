@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from fractions import Fraction
 
 from . import NotAvailable, is_linux
 from .process import PROC, _proc_ok, _psutil
@@ -394,6 +395,9 @@ SYSFS = "/sys"
 #: _IOWR(0x94, 30, 4096 bytes)
 BTRFS_IOC_FS_INFO = (2 << 30) | (1024 << 16) | (0x94 << 8) | 31
 BTRFS_IOC_DEV_INFO = (3 << 30) | (4096 << 16) | (0x94 << 8) | 30
+#: offset of `path` in btrfs_ioctl_dev_info_args (devid, uuid, bytes_used,
+#: total_bytes, fsid, unused[377]): empty for a missing device
+BTRFS_DEV_PATH = 8 + 16 + 8 + 8 + 16 + 377 * 8
 #: total_bytes, then every space-info counter the kernel deducts from it
 #: (btrfs_space_info_used, fs/btrfs/space-info.h); bytes_zone_unusable too,
 #: when the kernel has it
@@ -409,15 +413,18 @@ def _int_file(path: str) -> int | None:
         return None
 
 
-def btrfs_fs_info(path: str) -> tuple[str, list[int] | None] | None:
-    """(fsid as hex, size of each device as the filesystem uses it) of the
-    filesystem visible at `path`, through the unprivileged BTRFS_IOC_FS_INFO
-    and BTRFS_IOC_DEV_INFO ioctls on `path` itself: the kernel resolves the
-    path, overmounts and propagated mounts included. None when not btrfs or
-    the ioctls are unavailable; the sizes alone are None when a device does
-    not answer. The size is the device's `total_bytes` in the chunk tree,
-    which can be smaller than the block device (filesystem shrunk, device
-    grown without `btrfs filesystem resize`)."""
+def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
+    """(fsid as hex, (size, allocated bytes) of each device as the
+    filesystem uses it) of the filesystem visible at `path`, through the
+    unprivileged BTRFS_IOC_FS_INFO and BTRFS_IOC_DEV_INFO ioctls on `path`
+    itself: the kernel resolves the path, overmounts and propagated mounts
+    included. None when not btrfs or the ioctls are unavailable; the devices
+    alone are None when one does not answer. The size is the device's
+    `total_bytes` in the chunk tree, which can be smaller than the block
+    device (filesystem shrunk, device grown without `btrfs filesystem
+    resize`); the allocated bytes its `bytes_used`, the chunks carved on it
+    (#252) — all of its size for a missing device (DEV_INFO still answers,
+    with an empty path): nothing can be allocated on it."""
     try:
         import fcntl
         import struct
@@ -432,7 +439,7 @@ def btrfs_fs_info(path: str) -> tuple[str, list[int] | None] | None:
             return None
         max_id, count = struct.unpack_from("=QQ", info)
         fsid = bytes(info[16:32]).hex()
-        sizes: list[int] = []
+        devices: list[tuple[int, int]] = []
         for devid in range(1, max_id + 1):
             dev = bytearray(4096)
             struct.pack_into("=Q", dev, 0, devid)
@@ -440,12 +447,115 @@ def btrfs_fs_info(path: str) -> tuple[str, list[int] | None] | None:
                 fcntl.ioctl(fd, BTRFS_IOC_DEV_INFO, dev)
             except OSError:     # ENODEV: a device id freed by `device remove`
                 continue
-            sizes.append(struct.unpack_from("=Q", dev, 32)[0])
-        return fsid, (sizes if sizes and len(sizes) == count else None)
+            used, size = struct.unpack_from("=QQ", dev, 24)
+            if not dev[BTRFS_DEV_PATH:BTRFS_DEV_PATH + 1].strip(b"\0"):
+                used = size     # #311 r1: a missing device (empty path) takes nothing
+            devices.append((size, used))
+        return fsid, (devices if devices and len(devices) == count else None)
     except struct.error:
         return None
     finally:
         os.close(fd)
+
+
+#: copies of a metadata chunk on distinct devices, per mirrored profile (the
+#: sysfs name of its directory under allocation/<kind>/)
+BTRFS_MIRRORS = {"raid1": 2, "raid1c3": 3, "raid1c4": 4}
+#: parity stripes and minimum devices of a parity profile
+BTRFS_PARITY = {"raid5": (1, 2), "raid6": (2, 3)}
+
+
+def _mirrored(free: list[int], copies: int) -> int:
+    """What chunks of `copies` copies, each copy on a distinct device, can
+    still take of the per-device `free` space: the smallest, for j from 0 to
+    copies - 1, of (free outside the j largest devices) / (copies - j) — for
+    RAID1 min(sum / 2, sum - largest). The kernel caps a chunk (1 GiB of
+    metadata at most) and gives each one the devices with the most room,
+    which spreads it that evenly."""
+    largest = sorted(free, reverse=True)
+    return min((sum(free) - sum(largest[:j])) // (copies - j) for j in range(copies))
+
+
+def _striped_parity(free: list[int], parity: int, devs_min: int) -> int:
+    """What RAID5/6 chunks can still take of the per-device `free` space:
+    each chunk spans every device with room, its stripe the smallest room
+    among them, `parity` of its stripes parity; none below `devs_min`."""
+    left = [f for f in free if f > 0]
+    growth = 0
+    while len(left) >= devs_min:
+        stripe = min(left)
+        growth += stripe * (len(left) - parity)
+        left = [f - stripe for f in left if f > stripe]
+    return growth
+
+
+def _raid10(free: list[int]) -> int:
+    """What RAID10 chunks can still take of the per-device `free` space
+    (#311 r1, r2). The kernel (fs/btrfs/volumes.c, `btrfs_raid_array`:
+    devs_min 2, devs_increment 2 since 5.15) gives each chunk the devices
+    with the most room, as many as there are rounded down to an even number,
+    its stripes equal — the smallest room among them — half of them copies.
+    Unlike RAID1 a small device fills with the others: [100 GiB, 400 MiB x 3]
+    holds 800 MiB, not 1200; and two devices still hold chunks once the
+    others are full.
+
+    Simulated by events, not by chunks (O(n²), however large the devices):
+    with an even number of devices all of them shrink together until the
+    smallest is full; with an odd number the one left out is one of the
+    smallest, those tied at the minimum taking turns (chunk after chunk, a
+    chunk being 1 GiB at most): together they shrink at (t - 1) / t of the
+    others' pace, until a larger device comes down to them or they are full.
+    Exact up to that turn-taking, i.e. to a chunk per device."""
+    above = sorted(f for f in free if f > 0)    # room, before `shift`
+    shift = low = Fraction(0)   # all above shrink alike; the tied smallest: `low`
+    tied = growth = 0
+    while True:
+        if not low:             # the smallest are full: the next ones are
+            tied = 0
+            if above:
+                low = above[0] - shift
+        while above and above[0] - shift == low:
+            above.pop(0)
+            tied += 1
+        n = tied + len(above)
+        if n < 2:
+            return int(growth)
+        if n % 2 == 0:          # every device, until the smallest is full
+            span, pace = low, 1
+        else:                   # the smallest take turns being left out
+            pace = Fraction(tied - 1, tied)
+            span = min(([(above[0] - shift - low) * tied] if above else [])
+                       + ([low / pace] if pace else []))
+        growth += span * (n - n % 2) / 2
+        shift += span
+        low -= span * pace
+
+
+def btrfs_growth(profile: str | None, free: list[int], copies: int) -> int:
+    """What metadata of `profile` (the sysfs name, None when the kernel
+    names none) can still grow into, given each device's unallocated
+    `free` bytes (#252): single and RAID0 all of it, DUP half of each
+    device, a mirror (RAID1, RAID1C3, RAID1C4) only what its copies
+    find on distinct devices, RAID10 what equal stripes on an even number of
+    devices leave (`_raid10`) — two devices, the smaller full, leave RAID1
+    nothing — RAID5/6 the stripes left. An unknown profile reads as
+    `copies` copies (disk_total / total_bytes, rounded up): on one device
+    DUP, on several a mirror, the smaller of what it could be."""
+    if profile in ("single", "raid0"):
+        return sum(free)
+    if profile == "dup":
+        return sum(f // 2 for f in free)
+    if profile in BTRFS_MIRRORS:
+        return _mirrored(free, BTRFS_MIRRORS[profile])
+    if profile == "raid10":
+        return _raid10(free)
+    if profile in BTRFS_PARITY:
+        return _striped_parity(free, *BTRFS_PARITY[profile])
+    if copies <= 1:
+        return sum(free)
+    if len(free) == 1:
+        return free[0] // copies
+    return _mirrored(free, copies)
 
 
 def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None) -> dict:
@@ -467,9 +577,11 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
     every counter the kernel holds unavailable (`bytes_used`,
     `bytes_may_use`, `bytes_reserved`, `bytes_pinned`, `bytes_readonly`,
     `bytes_zone_unusable`), 0 when they exceed it, PLUS the unallocated
-    space divided by its copy factor (`disk_total / total_bytes`: 2 for DUP
-    or RAID1) — btrfs grows metadata into unallocated space, a small
-    metadata group on a filesystem with room to spare is no shortage. Read
+    space metadata can still grow into (`btrfs_growth`: per device and per
+    profile, #252) — btrfs grows metadata into unallocated space, a small
+    metadata group on a filesystem with room to spare is no shortage. The
+    profile is the directory under the metadata kind (`dup`, `raid1`...);
+    during a conversion there are two, the smaller growth is read. Read
     from `metadata` (from `mixed` on a mixed-group filesystem); unknown when
     unallocated is. Not btrfs, not Linux, or unreadable: None (no guard
     fires on an unknown)."""
@@ -479,7 +591,7 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
     found = (fs_info or btrfs_fs_info)(path)
     if found is None:
         return out
-    fsid, sizes = found
+    fsid, devices = found
     if len(fsid) != 32:
         return out
     uuid = "-".join((fsid[:8], fsid[8:12], fsid[12:16], fsid[16:20], fsid[20:]))
@@ -490,9 +602,9 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
     except OSError:
         return out
     carved = [_int_file(os.path.join(allocation, kind, "disk_total")) for kind in kinds]
-    if not kinds or None in carved or not sizes:
+    if not kinds or None in carved or not devices:
         return out
-    unallocated = max(0, sum(sizes) - sum(carved))
+    unallocated = max(0, sum(size for size, _ in devices) - sum(carved))
     out["btrfs_unallocated_bytes"] = unallocated
     meta_kind = os.path.join(allocation, "metadata" if "metadata" in kinds else "mixed")
     meta = [_int_file(os.path.join(meta_kind, name)) for name in BTRFS_UNAVAILABLE]
@@ -501,9 +613,15 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
         return out
     # bytes_zone_unusable only exists from Linux 5.12 (zoned devices)
     zone = _int_file(os.path.join(meta_kind, "bytes_zone_unusable")) or 0
-    # unallocated / copy factor, the factor (disk_total / total_bytes) at least 1
-    out["btrfs_metadata_headroom_bytes"] = (max(0, meta[0] - sum(meta[1:]) - zone)
-                                            + unallocated * meta[0] // max(disk_total, meta[0]))
+    free = [max(0, size - used) for size, used in devices]
+    copies = -(-disk_total // meta[0])
+    try:
+        profiles = [name for name in os.listdir(meta_kind)
+                    if os.path.isdir(os.path.join(meta_kind, name))] or [None]
+    except OSError:
+        profiles = [None]
+    growth = min(btrfs_growth(profile, free, copies) for profile in profiles)
+    out["btrfs_metadata_headroom_bytes"] = max(0, meta[0] - sum(meta[1:]) - zone) + growth
     return out
 
 
