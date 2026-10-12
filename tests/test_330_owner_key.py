@@ -357,15 +357,17 @@ class OwnerKeyGuardTest(_Keys):
     def test_two_first_owner_keys_at_once(self):
         # #326 r2: two transactions, neither seeing the other's owner key
         self.no_key_yet()
-        first = self.db.transaction()
-        first.__enter__()
+        opened = self.db.transaction()
+        first = opened.__enter__()
         first.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
                       "VALUES ('bootstrap', 'human:bootstrap', 'k1', 'owner')")
         outcome = {}
 
+        other = self.connect()      # its own connection: really concurrent
+
         def second():
             try:
-                with self.db.transaction() as tx:
+                with other.transaction() as tx:
                     tx.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
                                "VALUES ('mallory', 'human:mallory', 'k2', 'owner')")
                 outcome["second"] = "committed"
@@ -375,8 +377,9 @@ class OwnerKeyGuardTest(_Keys):
         thread = threading.Thread(target=second)
         thread.start()
         thread.join(2)              # blocked on the unique index until the first ends
-        first.__exit__(None, None, None)
+        opened.__exit__(None, None, None)
         thread.join(30)
+        other.close()
         self.assertIn("key_holders_one_owner", outcome["second"])
         self.assertEqual([r["name"] for r in self.db.query(
             "SELECT name FROM key_holders WHERE key_role = 'owner'")], ["bootstrap"])
