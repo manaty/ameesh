@@ -93,7 +93,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked",
                  # L226a : un identifiant est en échec, ou expire bientôt
-                 "credential_failing", "credential_expiring")
+                 "credential_failing", "credential_expiring",
+                 # L317c : analyse profonde demandée, sans rapport dans les 30 min
+                 "deep_analysis_overdue")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -154,6 +156,7 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "estimate bias",
     "ci_main_red": "CI red on main",
+    "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
     "turn_unpriced": "turn without a known price",
     # L233: briefed to the assignee and the orchestrators (alert_briefs); not

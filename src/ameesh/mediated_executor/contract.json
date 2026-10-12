@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 315,
+  "interface_total": 325,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3710,7 +3710,8 @@
    "turn_resources": "hors du sous-ensemble de l'exécuteur médié",
    "visibility": "visibilité 0029 : serveur seulement",
    "wakeups": "hors du sous-ensemble de l'exécuteur médié",
-   "work": "hors du sous-ensemble de l'exécuteur médié"
+   "work": "hors du sous-ensemble de l'exécuteur médié",
+   "watches": "CI watches: mesh server only"
   },
   "operations": {
    "accounts": [
@@ -3995,6 +3996,7 @@
     "by_package",
     "close",
     "close_merged",
+    "creator",
     "current_delegation",
     "delays",
     "delegate",
@@ -4002,9 +4004,11 @@
     "estimate_history",
     "estimates",
     "events",
+    "events_noted",
     "issue_feed",
     "items",
     "link_package",
+    "lock_deep_analysis",
     "mark_started",
     "measure",
     "measure_candidates",
@@ -4024,13 +4028,22 @@
     "resolve_delegation",
     "returned_delegations",
     "save_measure",
+    "set_app",
     "set_branch",
     "set_branch_head",
     "set_estimate",
     "set_issue_ref",
+    "set_partial_seen",
     "timeline",
     "unassigned_lots",
-    "waiting_episodes"
+    "waiting_episodes",
+    "without_project"
+   ],
+   "watches": [
+    "delete",
+    "deliver",
+    "list",
+    "put"
    ]
   }
  },

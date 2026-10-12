@@ -7,6 +7,12 @@ lot transitions (`work_items`, `work_item_events`), gated actions
 (`actions`), turns and leases from the registry (`agent_registry`, `spend_pending`),
 cost ledger (`turn_costs`). Neither git nor the board is read.
 
+L78 adds `agents[].conversation`: the latest 20 detail entries, the durable
+per-agent cursor and `ameesh-conversation/1` schema. See
+[Conversation log](CONVERSATIONS.md) for producer APIs, retention, the R12
+thread and subscriber cursor recovery. Text requires the explicit content
+supervision role; the raw thread outbox is not exported.
+
 ```
 ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # text, narrow terminal
 ameesh progress --json [--project P] [--since 24h]   # this schema
@@ -36,6 +42,33 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
   open the file, or copy it wherever you want. Atomic write (temporary
   file then rename); to regenerate, rerun the command. Its Refresh button is
   disabled ("open with --serve to refresh").
+
+**The page** (L304, static or served) shows little per screen: tabs
+**Overview** (one card per project, from `overview`: open lots,
+lots merged in the window, pending decisions, 24 h spend, next milestone
+with its progress bar, two warnings at most; then "Watch": overdue or
+urgent decisions, blocked and stale lots), **Gantt** (the roadmap: tasks
+grouped by epic, or by project when they have none, an epic without any
+task keeping its own group, as does a planned epic whose tasks are all
+finished and hidden, groups folded by default unless they hold a
+late task (in progress alone is not enough), with a summary bar and their open, delivered, blocked and late
+counts; delivered and abandoned tasks hidden unless ticked; week zoom fits
+the window on screen, day zoom gives each day a column and scrolls to
+today, `z=day` in the URL; a milestone can narrow the window to the span of all its dates, planned
+and actual, in calendar days; a task opens
+its lot window),
+**Work items**, **Agents** (tables with a text filter and sortable columns;
+merged and closed lots, stopped agents hidden by default), **Budget** and
+**Decisions**. A project selector sits on top (served: the snapshot is read
+again with `?project=`; static: the page filters lots, agents, cards and
+decisions and Gantt tasks, and says that budget, milestones and epics
+cover all projects). Details open
+in **windows** on click (lot: dated milestones, waiting_for, cost, its
+decisions, thread command; agent; milestone: epics and open lots; decision:
+options, recommendation, answer command). Light, dark or system theme
+(remembered by the browser). Open tab, project and auto-refresh live in
+the URL (`#tab=lots&p=demo&auto=1`, `#tab=gantt&z=day`).
+
 * `--serve [--port 8765]` (L304): serves the same page and this JSON from
   a local server, **read-only**, until Ctrl-C. See "Local server" below.
 
@@ -47,7 +80,7 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 
 | Path | Response |
 |---|---|
-| `/` | the page **without data** (no token needed, nothing to protect): it reads `/api/progress.json` with the token; its **Refresh** button reloads it, optionally every 60 s (`#auto` in the URL); "data as of HH:MM" is `generated_ts` |
+| `/` | the page **without data** (no token needed, nothing to protect): it reads `/api/progress.json` with the token; its **Refresh** button fetches it again without reloading (open tab, filters and detail window kept), optionally every 60 s; "data as of HH:MM" is `generated_ts`; a failed fetch is said and the previous data stay. The served page's policy adds `connect-src 'self'` and nothing else |
 | `/api/progress.json` | this schema, with `Authorization: Bearer <token>` only (401 otherwise); `?project=P` takes a project known to the unfiltered snapshot (400 otherwise), empty = all projects |
 
 * **Bound to `127.0.0.1` only**; no option changes the address. The `Host`

@@ -73,6 +73,8 @@
 --       commitments.note (L96)
 --       work_item_events.note
 --       work_item_milestones.note
+--       work_module_milestones.payload
+--       project_modules.schemas, .rules
 --       mesh_approvals.meta (et mesh_approvals_status)
 --       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
 --
@@ -239,6 +241,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'action_class', 'currency', 'reserved_by', 'reserved_at',
         'released_at', 'released_reason'
     ]),
+    -- L78 (0368): conversation cursors and state, without message content.
+    ('conversation_heads', ARRAY['agent', 'seq']),
+    ('conversation_log', ARRAY[
+        'agent', 'seq', 'session', 'turn', 'kind', 'author', 'truncated',
+        'event_id', 'created_at', 'project', 'lot', 'thread_entry'
+    ]),
     ('thread_index', ARRAY[
         'project', 'lot', 'transport', 'host', 'location', 'last_entry_id',
         'last_mailbox_id', 'last_author', 'last_at', 'entries',
@@ -389,6 +397,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('budget_events', ARRAY[
         'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
     ]),
+    -- L121 (0362): the watches ameesh manages (agent, period, host, when)
+    ('agent_watches', ARRAY[
+        'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'
+    ]),
     -- liaisons de session (L41, 0030) : quelle session externe parle au nom
     -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
     ('session_bindings', ARRAY[
@@ -415,6 +427,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('work_item_milestones', ARRAY[
         'id', 'work_item_id', 'kind', 'at', 'sha', 'actor', 'verdict'
     ]),
+    ('project_modules', ARRAY['project', 'module', 'canon', 'types']),
+    ('work_module_milestones', ARRAY[
+        'id', 'work_item_id', 'module', 'kind', 'subject', 'binding_id', 'actor', 'at'
+    ]),
     ('work_items', ARRAY[
         'id', 'type', 'source', 'app', 'title', 'issue_ref', 'workstream',
         'state', 'assignee', 'loops', 'budget_usd', 'spent_usd',
@@ -431,6 +447,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'required_capabilities',
         -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
         'branch', 'branch_target', 'branch_head',
+        -- L118d (0372) : quand le relevé a vu branch_head, et la dernière
+        -- fusion partielle (vue la première fois quand)
+        'branch_head_at', 'partial_merge', 'partial_seen_at',
         -- L157 (0052) : durée estimée (minutes, source courte, auteur,
         -- instant) et début mesuré du travail — de l'ÉTAT, comme les dates
         -- prévues

@@ -279,6 +279,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               now: float | None = None,
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
+              planned_wait: dict | None = None,
               agent_states: dict[str, str] | None = None,
               agent_externals: dict[str, str | None] | None = None) -> dict:
     jalons = _jalons_de_lot(item, events, actions, declared)
@@ -324,7 +325,9 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
                                responsible=(package or {}).get("responsible")),
             agent_states, agent_externals),
         "last_activity_ts": _round(last),
-        "stale": stagnation.stale(item.get("state") or "", last, now, stale_after),
+        "stale": None if planned_wait else
+                 stagnation.stale(item.get("state") or "", last, now, stale_after),
+        "planned_wait": planned_wait,
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
         # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
@@ -622,10 +625,13 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
     states, externals = stagnation.availability_of(st.agents(None))
+    from . import planned_waits
+    holds = planned_waits.read(db, items, now=now, packages=packages)
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])), agent_states=states,
+                      planned_wait=holds.get(int(item["id"])),
                       agent_externals=externals)
             for item in items]
     package_items = st.package_items()
@@ -640,6 +646,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
 
     agent_rows = st.agents(project)
     agents = [build_agent(r, now, read_effort(cfg, r)) for r in agent_rows]
+    from . import conversation
+    conversation.attach_progress(db, agents)
     cost_rows = st.costs(since_ts=since_ts,
                          agents=[r["name"] for r in agent_rows] if project else None)
     if book is None:
@@ -943,9 +951,10 @@ def render_html(snap: dict | None, *, served: bool = False) -> str:
     """La page de référence avec l'instantané embarqué (aucune ressource externe).
 
     `served` (L304) : page de `ameesh progress --serve`, rendue sans données
-    (`snap` None) : elle lit `/api/progress.json` avec le jeton, la politique
-    de sécurité ajoute donc `connect-src 'self'` (rien d'autre). Statique, le
-    bouton Refresh est désactivé et la page ne peut rien demander au réseau.
+    (`snap` None) : elle lit `/api/progress.json` avec le jeton, au chargement
+    puis à chaque Refresh ; la politique de sécurité ajoute donc
+    `connect-src 'self'` (rien d'autre). Statique, le bouton Refresh est
+    désactivé et la page ne peut rien demander au réseau.
 
     Le JSON est inséré dans un `<script type="application/json">` : `<`, `>`
     et `&` y sont échappés en `\\u003c`… pour qu'aucun texte (titre de lot,

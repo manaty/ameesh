@@ -25,8 +25,24 @@ args = sys.argv[1:]
 cmd = args[0]
 fail = os.environ.get("FAKE_DOCKER_FAIL", "")
 if (cmd == "ps" and "ps" in fail) or (
-        cmd == "inspect" and "inspect-mounts" in fail and ".Mounts" in " ".join(args)):
+        cmd == "inspect" and "inspect-mounts" in fail and ".Mounts" in " ".join(args)) or (
+        cmd == "volume" and "volume-" + args[1] in fail):
     sys.exit(1)
+
+def source(vol):
+    # .Source d'un montage : le chemin d'un bind mount, le _data d'un volume
+    return vol if vol.startswith("/") else "/var/lib/docker/volumes/" + vol + "/_data"
+
+def bind_device(vol):
+    # volumes du pilote local montés en bind : FAKE_DOCKER_BINDVOL="nom=/dir;…"
+    pairs = [p.split("=", 1) for p in os.environ.get("FAKE_DOCKER_BINDVOL", "").split(";") if p]
+    return dict(pairs).get(vol, "")
+
+def named():
+    # les volumes montés, plus ceux que plus aucun conteneur ne monte
+    extra = [v for v in os.environ.get("FAKE_DOCKER_VOLUMES", "").split(",") if v]
+    return sorted({v for c in state.values() for v in c["volumes"]
+                   if not v.startswith("/")} | set(extra))
 
 def save():
     with open(state_path, "w") as f:
@@ -45,8 +61,9 @@ if cmd == "inspect":
     elif ".State.Running" in fmt:
         print("true" if c["running"] else "false")
     elif ".Mounts" in fmt:
-        for src in c["volumes"]:
-            print(src)
+        for vol in c["volumes"]:
+            kind, name = ("bind", "") if vol.startswith("/") else ("volume", vol)
+            print("\x1f".join((kind, name, source(vol))))
     elif ".State.Health.Status" in fmt:
         print("healthy")
 elif cmd == "ps":
@@ -58,6 +75,17 @@ elif cmd == "ps":
             continue
         if vol is None or (vol in c["volumes"] and not vol.startswith("/")):
             print(name)
+elif cmd == "volume" and args[1] == "ls":
+    for vol in named():
+        print(vol)
+elif cmd == "volume" and args[1] == "inspect":
+    if args[-1] not in named():
+        sys.exit(1)
+    if ".Options" in opt("-f"):
+        device = bind_device(args[-1])
+        print(("bind" if device else "") + "\x1f" + device)
+    else:
+        print(source(args[-1]))
 elif cmd == "start":
     state[args[1]]["running"] = True
     save()
@@ -163,6 +191,93 @@ class PgUpVolumeTest(unittest.TestCase):
                 self.assertIn("échec", proc.stderr)
                 self.assertFalse(after["B"]["running"])
                 self.assertFalse([c for c in calls if c[0] == "start"])
+
+
+    # L159f3 (#307) : à la création, la source que prendra le conteneur est
+    # comparée à celles des autres conteneurs, que le filtre `volume=` de
+    # docker ne voit pas pour un bind mount
+
+    def assert_creation_refused(self, containers, volume, needle, **env):
+        proc, after, calls = self.run_script(
+            containers, AMEESH_PG_NAME="B", AMEESH_PG_VOLUME=volume,
+            AMEESH_PG_PASSWORD="x", **env)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(needle, proc.stderr)
+        self.assertNotIn("B", after)
+        self.assertFalse([c for c in calls if c[0] == "run"])
+
+    def test_creation_on_a_bind_mount_already_running_is_refused(self):
+        running = {"A": {"running": True, "volumes": ["/srv/pg-data"]}}
+        self.assert_creation_refused(running, "/srv/pg-data", "A")
+
+    def test_creation_on_a_bind_mount_of_a_stopped_container_is_refused(self):
+        # même arrêté, A redémarrerait sur le même répertoire ; le chemin
+        # demandé n'est pas écrit comme docker l'a enregistré
+        stopped = {"A": {"running": False, "volumes": ["/srv/pg-data"]}}
+        self.assert_creation_refused(stopped, "/srv//pg-data/", "A")
+
+    def test_creation_on_the_data_dir_of_a_named_volume_is_refused(self):
+        running = {"A": {"running": True, "volumes": ["a-data"]}}
+        self.assert_creation_refused(
+            running, "/var/lib/docker/volumes/a-data/_data", "A")
+
+    def test_creation_on_a_free_bind_mount_proceeds(self):
+        others = {"A": {"running": True, "volumes": ["/srv/a"]},
+                  "C": {"running": False, "volumes": ["c-data"]}}
+        proc, after, _ = self.run_script(
+            others, AMEESH_PG_NAME="B", AMEESH_PG_VOLUME="/srv/b",
+            AMEESH_PG_PASSWORD="x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(after["B"]["volumes"], ["/srv/b"])
+
+    def test_creation_on_an_existing_free_named_volume_proceeds(self):
+        # B-data existe, aucun conteneur ne le monte plus
+        others = {"A": {"running": True, "volumes": ["/srv/a"]}}
+        proc, after, _ = self.run_script(
+            others, AMEESH_PG_NAME="B", AMEESH_PG_PASSWORD="x",
+            FAKE_DOCKER_VOLUMES="B-data")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(after["B"]["volumes"], ["B-data"])
+
+    def test_a_parent_or_child_directory_is_refused(self):
+        # #322 r1 : /srv contre /srv/pg-data, dans un sens comme dans l'autre
+        for theirs, mine in (("/srv/pg-data", "/srv"), ("/srv", "/srv/pg-data")):
+            with self.subTest(theirs=theirs, mine=mine):
+                running = {"A": {"running": True, "volumes": [theirs]}}
+                self.assert_creation_refused(running, mine, "A")
+        # un voisin au nom proche ne recouvre rien
+        running = {"A": {"running": True, "volumes": ["/srv/pg"]}}
+        proc, after, _ = self.run_script(
+            running, AMEESH_PG_NAME="B", AMEESH_PG_VOLUME="/srv/pg-data",
+            AMEESH_PG_PASSWORD="x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_local_volume_bound_to_a_directory_is_resolved(self):
+        # #322 r1 : `docker volume create -o type=none -o o=bind -o
+        # device=/srv/pg-data` : .Mountpoint n'en donne que le _data
+        bound = "FAKE_DOCKER_BINDVOL"
+        # B en bind direct sur le répertoire d'un volume que A monte
+        running = {"A": {"running": True, "volumes": ["lie"]}}
+        self.assert_creation_refused(running, "/srv/pg-data", "A",
+                                     **{bound: "lie=/srv/pg-data"})
+        # B sur un volume lié au répertoire que A monte en bind
+        running = {"A": {"running": True, "volumes": ["/srv/pg-data"]}}
+        self.assert_creation_refused(running, "lie", "A",
+                                     FAKE_DOCKER_VOLUMES="lie", **{bound: "lie=/srv/pg-data"})
+
+    def test_a_failed_inspection_refuses_the_creation(self):
+        # une inspection en échec (docker ps, montages d'un autre conteneur,
+        # liste ou inspection des volumes) refuse sans rien créer
+        others = {"A": {"running": True, "volumes": ["a-data"]}}
+        for fail, volume in (("ps", "/srv/b"), ("ps", "b-data"),
+                             ("inspect-mounts", "/srv/b"),
+                             ("inspect-mounts", "b-data"),
+                             ("volume-ls", "b-data"),
+                             ("volume-inspect", "b-data")):
+            with self.subTest(fail=fail, volume=volume):
+                self.assert_creation_refused(
+                    others, volume, "échec", FAKE_DOCKER_FAIL=fail,
+                    FAKE_DOCKER_VOLUMES="b-data")
 
 
 if __name__ == "__main__":

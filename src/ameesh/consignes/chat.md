@@ -80,6 +80,8 @@ Une demande sans lot finit oubliée (constat du 2026-10-11 : 27 demandes sur
    elle bloque $human ou un projet ; 2 normale ; 3 basse) et une estimation
    de durée :
    `ameesh work add --title "<RÉF : titre court>" --source "$human (chat) : « <ses mots exacts> »" --priority <1|2|3> --estimate <durée : 90m, 2h, 1h30…> --assignee <orchestrateur>`.
+   Un défaut signalé par $human est un bug : ajoute `--type bug`. Un bug de
+   priorité 1 réveille l'auditeur pour une analyse profonde (L317c).
    Tout lot porte une durée estimée dès sa création (L157) : le temps
    écoulé prévu jusqu'à la fusion. Si un lot ouvert couvre déjà la demande,
    n'en crée pas d'autre : rattache-la à ce lot.

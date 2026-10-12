@@ -64,6 +64,9 @@
         duration from creation (`work add --estimate 2h`, `work plan <id> --estimate 90m`);
   ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
         readable threads: every message that went through ameesh, in clear (R12);
+  ameesh watch enable --agent A [--every 30m] | disable --agent A | show [--json]
+        L121: the watch of an agent, a timer on this host that sends it the
+        versioned instruction (consignes/veille.md), shown in `ameesh projects`;
   ameesh receipt verify | authenticator list   approval receipts (spec §8);
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
         gated actions (spec §7);
@@ -89,6 +92,7 @@
   ameesh import-v0 | export-v0          switch from/to the v0 file mailbox;
   ameesh migrate | doctor     schema and diagnostics;
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh module <name> …              installed project module commands;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
@@ -96,6 +100,10 @@
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
+  ameesh offload run [--profile P] [--fallback local|none] -- <command…>
+        | status [<job>] | cancel <job>
+        heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
+        same output and exit code, local fallback;
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
@@ -195,6 +203,9 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "module":
+        from . import modules
+        return modules.main(rest)
     if command in ("--version", "version"):
         from . import version
         print("ameesh %s" % version())
@@ -225,6 +236,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "watch":
+        # L121: the watch of an agent (timer + versioned instruction)
+        from . import watch
+        return watch.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
@@ -264,6 +279,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L159e : garde de capacité d'une VM prêteuse (service système, sans base)
         from . import guard
         return guard.main(rest)
+    if command == "offload":
+        # L159b: heavy suites offloaded to a lending VM (mode b1)
+        from . import offload
+        return offload.main(rest)
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)

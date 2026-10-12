@@ -2061,7 +2061,29 @@ class AgentWorker(threading.Thread):
         non habilité est remis comme un message normal (et l'abus est journalisé).
         """
         sender = (row.get("sender") or row.get("from") or "").strip()
-        return bool(sender) and sender in self.cfg.interrupt_senders
+        if bool(sender) and sender in self.cfg.interrupt_senders:
+            return True
+        return self._deep_analysis_interrupt(sender, row)
+
+    def _deep_analysis_interrupt(self, sender: str, row: dict) -> bool:
+        """L317c (#315 r1) : la demande d'analyse profonde (`deep_analysis`)
+        perce le tour en cours d'un auditeur — le premier rapport est dû dans
+        les 30 min —, sans `AMEESH_INTERRUPT_SENDERS`. Seulement si le lot a
+        bien une demande sans rapport : un courrier qui imite l'expéditeur
+        `ameesh` n'interrompt rien."""
+        from . import deep_analysis
+        payload = mail.message_payload(row)
+        if sender != deep_analysis.SENDER or not payload.get("deep_analysis"):
+            return False
+        try:
+            if not self.runner.is_auditor(self.name, self.agent):
+                return False
+            found = deep_analysis.status(self.db, int(payload.get("lot") or 0),
+                                         cfg=getattr(self, "cfg", None))
+        except (db_mod.DbError, TypeError, ValueError):
+            return False
+        return bool(found and found["report_ts"] is None
+                    and self.name in found["auditors"])
 
     # -- garde de budget (L13, 0019, R20) ----------------------------------
     def budget_reason(self) -> str:
@@ -2578,7 +2600,6 @@ class AgentWorker(threading.Thread):
         log_async("[%s] %s lifted: healthy account — resuming" % (self.name, texte))
         self._fil_note("Block %s lifted: a healthy account is available again, "
                        "the agent resumes." % texte, meta={"action": "auth_reprise"})
-
         return True
 
     def pick(self) -> dict | None:
@@ -3311,6 +3332,8 @@ class AgentWorker(threading.Thread):
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
         lignes = 0
+        conversation_recorder = None
+        conversation_usage = None
         proc = None
         #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
         #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
@@ -3348,7 +3371,6 @@ class AgentWorker(threading.Thread):
                                  or proc.stdout.readline().strip() != audit_guard.READY):
                 raise _LancementImpossible("auditor scope not validated: memory cap "
                                            "missing or scope creation refused")
-
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
@@ -3362,6 +3384,16 @@ class AgentWorker(threading.Thread):
             if resume and not tue:
                 self.resume_summary = ""  # le résumé a ouvert la session neuve
             log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
+            # L78: the writer owns its connection; harness output never waits
+            # for SQL or the readable thread. ResidentWorker uses the same sink.
+            if getattr(self.db, "driver", "") != "mediated":
+                from .conversation import Recorder
+                conversation_recorder = Recorder(
+                    self.cfg, agent=self.name, turn=turn_id, session=session,
+                    project=fil.project_for(self.cfg, fil.agent_project(self.agent)),
+                    reader=adapter.reader, warn=log_async)
+                conversation_recorder.append("input", spec.get("prompt") or "",
+                                             author="ameesh:runner")
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
                     line = line.rstrip("\n")
@@ -3371,6 +3403,10 @@ class AgentWorker(threading.Thread):
                     events.write(line + "\n")
                     events.flush()
                     parsed = self._parse(adapter, line)
+                    if conversation_recorder is not None:
+                        conversation_recorder.on_event(line, parsed)
+                        if isinstance(parsed.get("usage"), dict):
+                            conversation_usage = parsed["usage"]
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
@@ -3497,6 +3533,16 @@ class AgentWorker(threading.Thread):
             else:
                 self._close_turn_resource(turn_id, pgid)
             self._menage_apres_tour(menage_tour, turn_id, spec)
+            if conversation_recorder is not None:
+                interrupted = (self.lease_lost.is_set() or self.preempting.is_set()
+                               or self.restarting.is_set() or clos)
+                conversation_recorder.finish(
+                    final=conversation_recorder.final_text or "",
+                    status="interrupted" if interrupted else (
+                        "failed" if result_code or error or sys.exc_info()[0] else "completed"),
+                    cost=cost, usage=conversation_usage,
+                    duration_s=max(0, time.time() - started))
+                conversation_recorder.close()
 
         duration = time.time() - started
         self.last_turn_seconds = duration

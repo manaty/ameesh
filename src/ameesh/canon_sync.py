@@ -940,6 +940,9 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
         return AuthenticatorSync(AUTH_REFUSED, "database: %s — transaction rolled back, "
                                                "authenticator registry unchanged" % exc,
                                  canon=key)
+    except ValueError as exc:
+        return AuthenticatorSync(AUTH_REFUSED, "module policy: %s — transaction rolled back" % exc,
+                                 canon=key)
 
 
 def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
@@ -960,10 +963,17 @@ def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
             "registry unchanged — ameesh canon sync --fetch" % ", ".join(ahead[:5])),
             trust=trust, branch=branch, notes=notes, canon=key)
     partial = _partial(canon, unread)
+    from . import modules as project_modules
+    try:
+        project_modules.declarations(canon.federation)
+    except ValueError as exc:
+        return AuthenticatorSync(AUTH_REFUSED, str(exc), canon=key)
     # contrôles faits, verrou détenu : la seule écriture du registre (de CE canon)
     result = receipts._apply_authenticators(
         lock, registry_members(canon), revoke_absent=not partial,
         source_commits={s.member: s.commit for s in canon.sources}, canon=key)
+    if not partial:
+        project_modules.sync(tx, canon)
     _record(tx, last, canon, branch, trust, host, result, key)
     return AuthenticatorSync(AUTH_SYNCED, "", result, partial, trust=trust, branch=branch,
                              notes=notes, canon=key)

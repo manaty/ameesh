@@ -13,6 +13,7 @@ import contextlib
 import http.client
 import io
 import json
+import re
 import threading
 import unittest
 from unittest import mock
@@ -203,21 +204,82 @@ class ServeTest(ServerCase):
         self.assertEqual(self.calls, [None, None])
 
 
-class PageModeTest(unittest.TestCase):
+def _csp(html):
+    return re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', html).group(1)
+
+
+class PageBuilderTest(unittest.TestCase):
+    """Le gabarit (L304) : modes, politique de sécurité, onglets, fenêtre."""
+
     def test_statique_bouton_desactive(self):
         html = progress.render_html(_snap())
         self.assertIn('var MODE = "static";', html)
         self.assertIn("open with --serve to refresh", html)
-        self.assertIn("default-src 'none'", html)
-        self.assertNotIn("connect-src", html)
-        served = progress.render_html(None, served=True)
-        self.assertIn('var MODE = "served";', served)
-        self.assertIn("default-src 'none'; connect-src 'self';", served)
-        # le jeton part en en-tête, jamais en cookie ; couper l'auto garde ?project=
-        self.assertIn('"Authorization": "Bearer " + token', served)
-        self.assertIn('credentials: "omit"', served)
-        self.assertIn("location.pathname + location.search", served)
-        self.assertIn("sessionStorage", served)
+        self.assertNotIn("connect-src", _csp(html))
+
+    def test_servie_relit_l_api_seulement(self):
+        html = progress.render_html(None, served=True)
+        self.assertIn('var MODE = "served";', html)
+        csp = _csp(html)
+        self.assertEqual(csp, "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; "
+                              "script-src 'unsafe-inline'; img-src data:")
+        self.assertIn('var API = "%s"' % progress_serve.API, html)
+        # servie, la page vient sans données
+        blob = re.search(r'<script type="application/json" id="data">(.*?)</script>',
+                         html, re.S).group(1)
+        self.assertIsNone(json.loads(blob))
+        # le jeton part en en-tête, jamais en cookie, et quitte l'URL
+        self.assertIn('"Authorization": "Bearer " + TOKEN', html)
+        self.assertIn('credentials: "omit"', html)
+        self.assertIn("sessionStorage", html)
+        self.assertNotIn("same-origin", html)
+
+    def test_gantt_groupes_et_zoom(self):
+        # L304 PR 3 : groupes repliables, zoom semaine/jour gardé dans l'URL
+        html = progress.render_html(_snap())
+        self.assertIn('el("details", "rm-gr")', html)
+        self.assertIn('"z=day"', html)
+        self.assertIn('[["week", "week"], ["day", "day"]]', html)
+        self.assertIn("delivered and abandoned (", html)
+        # replié sauf s'il porte une tâche en retard (« en cours » ne suffit pas)
+        self.assertIn("group(g.key, title, count, sum, nLate > 0 ||", html)
+        # r1 : une epic sans tâche garde son groupe ; fenêtre de jalon du min au
+        # max de ses dates, en jours calendaires (changement d'heure)
+        self.assertIn("if (hasTask[e.id]) return;", html)
+        # r2 : une epic planifiée garde son groupe quand ses tâches finies sont
+        # masquées ; pas de prototype (epic « constructor ») ; pas de « livré »
+        # vert pour un groupe sans tâche
+        self.assertIn("if (!shown.length && g.rows.length && !(g.epic && hasPlan(g.epic.planned))) return;", html)
+        # lot #396 : « planned » est toujours là, toutes dates nulles l'epic
+        # n'est pas planifiée ; un projet « __proto__ » reste dans le sélecteur
+        self.assertIn("function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }", html)
+        self.assertIn("var seen = Object.create(null);", html)
+        self.assertNotIn("var seen = {};", html)
+        # un harnais « constructor » sans comptes déclarés garde sa jauge
+        self.assertIn('covered = Object.create(null);', html)
+        self.assertNotIn('covered = {};', html)
+        self.assertIn("var hasTask = Object.create(null);", html)
+        self.assertIn('open.length || !g.rows.length ? "" : " done"', html)
+        self.assertIn("f = addDays(midnight(Math.min.apply(null, mts)), -1);", html)
+        self.assertIn("t = addDays(midnight(Math.max.apply(null, mts)), 2);", html)
+        self.assertNotIn('x.state === "en_cours"; });', html)
+
+    def test_onglets_et_fenetre(self):
+        html = progress.render_html(_snap())
+        for tab in ("overview", "gantt", "lots", "agents", "budget", "decisions"):
+            self.assertIn('id="panel-%s"' % tab, html)
+            self.assertIn('["%s", ' % tab, html)
+        self.assertIn('<dialog id="modal"', html)
+        # rien n'entre en HTML : le script ne passe que par textContent
+        self.assertNotIn("innerHTML", html)
+        self.assertNotIn("insertAdjacentHTML", html)
+        self.assertNotIn("document.write", html)
+
+    def test_gabarit_sans_emplacement(self):
+        snap = _snap()
+        with mock.patch("builtins.open", mock.mock_open(read_data="<html></html>")):
+            with self.assertRaises(progress.ProgressError):
+                progress.render_html(snap)
 
 
 class OverviewTest(unittest.TestCase):

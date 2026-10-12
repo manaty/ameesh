@@ -7,6 +7,7 @@ JSON-RPC 2.0 sur l'entrée/sortie standard, messages délimités par des retours
 la ligne. Son comportement se règle par l'environnement :
 
 * `FAKE_ACP_MODE` : `normal` (défaut), `permission`, `load`, `resume`, `hang`,
+  `hang_once` (L75: only the prompts before the first `session/cancel` hang),
   `exit`, `garbage`, `auth`, `noresume`, `fs`, `unknown`, `badresponse`,
   `mute` (ne répond à rien), `badenveloppe` (`FAKE_ACP_CASE` = `id`, `method`,
   `jsonrpc`, `params`, `errorcode`) ;
@@ -15,7 +16,8 @@ la ligne. Son comportement se règle par l'environnement :
   été émis par le pont) ;
 * `FAKE_ACP_IGNORE_SIGTERM=1` : l'agent ignore SIGTERM (le test d'annulation
   peut alors vérifier que le pont envoie `session/cancel` avant de mourir) ;
-* `FAKE_ACP_COST` : coût cumulé annoncé par `usage_update` (défaut 0.02).
+* `FAKE_ACP_COST` : coût cumulé annoncé par `usage_update` (défaut 0.02) ;
+  `FAKE_ACP_COST_STEP` (L75) : cumulé = pas × nombre de prompts.
 
 Sortie : les notifications et réponses que ferait un vrai agent, jamais autre
 chose sur la sortie standard (le protocole l'interdit).
@@ -55,18 +57,19 @@ class FakeAgent:
         self.pending_fs = None
         self.fs_results: list = []
         self.cancelled = False
+        self.prompts = 0
 
     # -- tours -------------------------------------------------------------
     def on_prompt(self, params: dict) -> None:
         self.prompt_id = params.get("_id")
-        trace({"method": "session/prompt"})
+        trace({"method": "session/prompt", "text": ((params.get("prompt") or [{}])[0]).get("text")})
         self.update({"sessionUpdate": "agent_message_chunk",
                      "content": {"type": "text", "text": "bonjour"}})
         self.update({"sessionUpdate": "tool_call", "toolCallId": "c1",
                      "title": "lire un fichier", "kind": "read", "status": "pending"})
         if self.mode == "exit":
             sys.exit(0)
-        if self.mode == "hang":
+        if self.mode == "hang" or (self.mode == "hang_once" and not self.cancelled):
             self.update({"sessionUpdate": "agent_message_chunk",
                          "content": {"type": "text", "text": " en cours"}})
             return  # la fin viendra de session/cancel
@@ -127,7 +130,10 @@ class FakeAgent:
         self.finish()
 
     def finish(self, stop: str = "end_turn") -> None:
+        self.prompts += 1
         cost = float(os.environ.get("FAKE_ACP_COST", "0.02"))
+        if os.environ.get("FAKE_ACP_COST_STEP"):
+            cost = round(float(os.environ["FAKE_ACP_COST_STEP"]) * self.prompts, 6)
         self.update({"sessionUpdate": "usage_update", "used": 1234, "size": 200000,
                      "cost": {"amount": cost, "currency": "USD"}})
         send({"jsonrpc": "2.0", "id": self.prompt_id,
@@ -136,6 +142,7 @@ class FakeAgent:
 
     def on_cancel(self, params: dict) -> None:
         trace({"method": "session/cancel"})
+        self.cancelled = True
         if self.prompt_id is None:
             return
         self.update({"sessionUpdate": "agent_message_chunk",

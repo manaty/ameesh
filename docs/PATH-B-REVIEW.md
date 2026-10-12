@@ -54,7 +54,7 @@ The final main merge retains the optional `held=false` parameter of
 or sends false; the storage UPDATE atomically requires and locks an open
 request. Decision-source/prose reads,
 waiting-episode reads and host-history reads stay refused remotely; the
-315-operation interface is fully classified without increasing the 62
+325-operation interface is fully classified without increasing the 62
 admitted operations. Credential health operations from L226b also stay
 server-only: devices skip local provider health guards and do not report
 relay errors as global provider credential failures.
@@ -104,7 +104,52 @@ Consequently this is an additive minor release, **1.10.0**, rather than
 2.0.0. The package version remains 1.9.0 in this branch; release management
 owns the version change, merge and deployment.
 
-## Validation
+## Owner deployment plan after merge
+
+The owner deploys this path separately from the preceding ordinary-runner
+fix. Record the merged commit, previous workstation and server commits,
+database backup, image digest and signed release manifest before starting.
+Release management prepares the additive minor release (1.10.0 proposed
+above), its version commit and release notes on main. Use that exact commit
+for both installations; publish its immutable annotated `v<version>` tag
+with `deploy/mise-a-jour/poste.sh publier <commit>` only after verification.
+Do not tag the PR head or move an existing tag.
+
+From the reviewed release checkout, the operator uses the existing steps:
+
+1. `deploy/mise-a-jour/poste.sh verifier`, then `sauvegarder`.
+2. `deploy/mise-a-jour/poste.sh migrer <commit>` before either installation;
+   verify migrations 0062, 0063 and 0064, plus all migrations of that commit.
+3. `deploy/mise-a-jour/poste.sh installer <commit>` and `role`, then
+   `deploy/mise-a-jour/vm.sh verifier` and `installer <commit>`.
+   Review/apply the executor role separately using `role-executor.sh` if
+   used by this server; do not grant executor tables to device identities.
+4. Run the ordinary restart/control steps on workstation and server.
+   Configure the mediated API under the server operator's service, with
+   trusted HTTPS, server-side provider/forge credentials and enrollment
+   authentication. `vm.sh redemarrer` manages ordinary runner units; it
+   does not install an API service or configure TLS.
+5. Verify ordinary agents still claim and finish turns, the supervisor
+   excludes secret/hash columns, and `/api/exec/v1` rejects unauthenticated
+   requests. Run the seven-stage isolated trial below before enrolling
+   production devices. Keep its exact commit and evidence directory.
+6. Build and sign the executor image using the release procedure in
+   `IMAGE-EXECUTEUR.md`; verify its digest/signature before use. The owner
+   enrolls the test mesh's host and checks a relay turn, authoritative costs,
+   gate drainage/resumption and revocation. Publish the tag/release after
+   these checks and record the deployed server/image revisions.
+
+On failed verification, stop admission on the mediated API, drain devices
+and revoke enrolled executors while the new server still supports that
+operation. Stop its API service and containers before invoking
+`deploy/mise-a-jour/vm.sh retour` and `deploy/mise-a-jour/poste.sh retour`.
+Retain the additive migrations and audit records. If device cost rows have
+already been written, reconcile spending before reopening ordinary turns:
+older code counts those diagnostic rows. Check the restored commits, normal
+turns and `doctor`; record the failure and retained evidence. Never delete
+the database or reuse an enrollment code as a rollback shortcut.
+
+## Validation of the branch
 
 Run only targeted offline tests on the owner's workstation. CI runs the full
 psycopg suite, the psql driver selection (including the executor server,

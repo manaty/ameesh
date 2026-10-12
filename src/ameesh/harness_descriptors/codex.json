@@ -35,6 +35,7 @@
       "credentials": "auth.json",
       "key_env": "OPENAI_API_KEY"
     },
+    "resident": {"protocol": "codex-app-server", "command": ["--dangerously-bypass-hook-trust", "app-server"], "thread": {"approvalPolicy": "never", "sandbox": "danger-full-access"}, "min_version": "0.159.3"},
     "install": {"note": "binaire `codex` installé par l'hôte ; distribution signée en L17"}
   }
 }

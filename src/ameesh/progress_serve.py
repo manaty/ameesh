@@ -9,7 +9,7 @@ session with `default_transaction_read_only` — a write would fail in the
 database itself.
 
   /                      the page, **without data** (no token needed): it
-                         reads /api/progress.json; Refresh reloads it
+                         reads /api/progress.json, again at each Refresh
   /api/progress.json     the `ameesh-progress/1` snapshot, with
                          `Authorization: Bearer <token>` only (`?project=P`:
                          a known project, 400 otherwise)
