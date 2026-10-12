@@ -945,9 +945,10 @@ def render_html(snap: dict | None, *, served: bool = False) -> str:
     """La page de référence avec l'instantané embarqué (aucune ressource externe).
 
     `served` (L304) : page de `ameesh progress --serve`, rendue sans données
-    (`snap` None) : elle lit `/api/progress.json` avec le jeton, la politique
-    de sécurité ajoute donc `connect-src 'self'` (rien d'autre). Statique, le
-    bouton Refresh est désactivé et la page ne peut rien demander au réseau.
+    (`snap` None) : elle lit `/api/progress.json` avec le jeton, au chargement
+    puis à chaque Refresh ; la politique de sécurité ajoute donc
+    `connect-src 'self'` (rien d'autre). Statique, le bouton Refresh est
+    désactivé et la page ne peut rien demander au réseau.
 
     Le JSON est inséré dans un `<script type="application/json">` : `<`, `>`
     et `&` y sont échappés en `\\u003c`… pour qu'aucun texte (titre de lot,

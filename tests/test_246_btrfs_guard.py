@@ -4,11 +4,13 @@ headroom) from sysfs and closes admission before the floor — offline, on a
 fake /sys tree with the golden values of the 2026-10-11 outage."""
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import shutil
 import struct
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -29,20 +31,24 @@ class FakeHost:
 
     def __init__(self, root: str):
         self.root = root
-        #: what the filesystem ioctls answer on the work path: (fsid, device
-        #: sizes or None), None when not btrfs; btrfs() sets its own
-        self.fs_info: tuple[str, list[int] | None] | None = None
+        #: what the filesystem ioctls answer on the work path: (fsid, (size,
+        #: allocated) per device or None), None when not btrfs; btrfs() sets
+        #: its own
+        self.fs_info: tuple[str, list[tuple[int, int]] | None] | None = None
         self.sysfs = os.path.join(root, "sys")
         self.work = os.path.join(root, "home", "work")
         os.makedirs(self.work)
 
-    def btrfs(self, devices: dict[str, int], disk_total: dict[str, int],
+    def btrfs(self, devices: dict[str, int | tuple[int, int]], disk_total: dict[str, int],
               metadata: tuple[int, int, int], meta_kind: str = "metadata",
-              unavailable: dict[str, int] | None = None, uuid: str = UUID) -> None:
-        """`devices`: name -> size in bytes; `disk_total`: kind -> bytes;
-        `metadata`: (total_bytes, bytes_used, bytes_may_use) of `meta_kind`;
-        `unavailable`: its other counters (bytes_reserved, bytes_pinned,
-        bytes_readonly: 0 by default)."""
+              unavailable: dict[str, int] | None = None, uuid: str = UUID,
+              profiles: tuple[str, ...] = ()) -> None:
+        """`devices`: name -> (size, allocated bytes), or the size alone on
+        a single device (allocated: every `disk_total`); `disk_total`: kind
+        -> bytes; `metadata`: (total_bytes, bytes_used, bytes_may_use) of
+        `meta_kind`; `unavailable`: its other counters (bytes_reserved,
+        bytes_pinned, bytes_readonly: 0 by default); `profiles`: the profile
+        directories under `meta_kind` (none: an unnamed profile)."""
         fs = os.path.join(self.sysfs, "fs", "btrfs", uuid)
         for kind, value in disk_total.items():
             os.makedirs(os.path.join(fs, "allocation", kind), exist_ok=True)
@@ -53,6 +59,12 @@ class FakeHost:
         os.makedirs(os.path.join(fs, "allocation", meta_kind), exist_ok=True)
         for name, value in counters.items():
             self.write(os.path.join(fs, "allocation", meta_kind, name), value)
+        for profile in profiles:
+            os.makedirs(os.path.join(fs, "allocation", meta_kind, profile), exist_ok=True)
+        if len(devices) == 1:
+            devices = {name: value if isinstance(value, tuple)
+                       else (value, sum(disk_total.values()))
+                       for name, value in devices.items()}
         self.fs_info = (uuid.replace("-", ""), list(devices.values()))
 
     @staticmethod
@@ -93,13 +105,14 @@ class ReaderTest(_Tmp):
             reading, resources.thresholds(None)) if b["key"] in resources.BTRFS_KEYS))
 
     def test_several_devices(self):
-        self.host.btrfs({"dm-0": 100 * GIB, "loop0": 4 * GIB},
+        # DUP metadata on two devices: half of each device's unallocated space
+        self.host.btrfs({"dm-0": (100 * GIB, 92 * GIB), "loop0": (4 * GIB, 2 * GIB + 16 * MIB)},
                         {"data": 90 * GIB, "metadata": 4 * GIB, "system": 16 * MIB},
-                        (2 * GIB, GIB, 512 * MIB))
+                        (2 * GIB, GIB, 512 * MIB), profiles=("dup",))
         unallocated = 104 * GIB - 94 * GIB - 16 * MIB
         self.assertEqual(self.host.read(), {
             "btrfs_unallocated_bytes": unallocated,
-            "btrfs_metadata_headroom_bytes": 512 * MIB + unallocated // 2})
+            "btrfs_metadata_headroom_bytes": 512 * MIB + 4 * GIB + GIB - 8 * MIB})
 
     def test_not_btrfs_is_unknown(self):
         # the ioctl fails on the path (ENOTTY): not btrfs, whatever sysfs holds
@@ -109,7 +122,7 @@ class ReaderTest(_Tmp):
                                             "btrfs_metadata_headroom_bytes": None})
 
     def test_unreadable_sysfs_is_unknown(self):
-        self.host.fs_info = (UUID.replace("-", ""), [10 * GIB])
+        self.host.fs_info = (UUID.replace("-", ""), [(10 * GIB, 0)])
         self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
                                             "btrfs_metadata_headroom_bytes": None})
 
@@ -194,6 +207,7 @@ class ReaderTest(_Tmp):
         for disk_total, copies in ((256 * MIB, 1), (768 * MIB, 3)):
             self.host.write(os.path.join(meta, "disk_total"), disk_total)
             unallocated = 64 * GIB - 33 * GIB - 512 * MIB - disk_total
+            self.host.fs_info = (self.host.fs_info[0], [(64 * GIB, 64 * GIB - unallocated)])
             self.assertEqual(self.host.read(), {
                 "btrfs_unallocated_bytes": unallocated,
                 "btrfs_metadata_headroom_bytes": 16 * MIB + unallocated // copies})
@@ -203,6 +217,7 @@ class ReaderTest(_Tmp):
         fsid = bytes.fromhex(UUID.replace("-", ""))
         sizes = {1: 509943480320, 3: 4089446400}
         answer = {"count": 2}
+        missing: set[int] = set()
 
         def ioctl(fd, request, buf):
             if request == platform.host.BTRFS_IOC_FS_INFO:
@@ -214,11 +229,21 @@ class ReaderTest(_Tmp):
             if devid not in sizes:
                 raise OSError(19, "No such device")
             struct.pack_into("=QQ", buf, 24, sizes[devid] // 2, sizes[devid])
+            if devid not in missing:
+                path = ("/dev/sd%s" % "xabc"[devid]).encode()
+                buf[platform.host.BTRFS_DEV_PATH:platform.host.BTRFS_DEV_PATH + len(path)] = path
             return 0
 
         with mock.patch("fcntl.ioctl", ioctl):
             self.assertEqual(platform.host.btrfs_fs_info(self.tmp),
-                             (fsid.hex(), [509943480320, 4089446400]))
+                             (fsid.hex(), [(509943480320, 254971740160),
+                                           (4089446400, 2044723200)]))
+            # #311 r1: a missing device still answers, with an empty path:
+            # nothing can be allocated on it
+            missing.add(3)
+            self.assertEqual(platform.host.btrfs_fs_info(self.tmp),
+                             (fsid.hex(), [(509943480320, 254971740160),
+                                           (4089446400, 4089446400)]))
             # a device that does not answer: the fsid stays, the sizes are unknown
             answer["count"] = 3
             self.assertEqual(platform.host.btrfs_fs_info(self.tmp), (fsid.hex(), None))
@@ -263,6 +288,111 @@ class ReaderTest(_Tmp):
         read.assert_called_once_with(self.host.work)
         self.assertEqual(reading["btrfs_unallocated_bytes"], MIB)
         self.assertEqual(reading["btrfs_metadata_headroom_bytes"], 0)
+
+
+class ProfileGrowthTest(_Tmp):
+    """#252: metadata grows into each device's unallocated space as its
+    profile allows, not into the sum divided by the copy factor."""
+
+    def raid1_smaller_full(self, profiles=("raid1",)) -> None:
+        # codex r4 on #235: two devices, the smaller full, 100 GiB
+        # unallocated on the larger, metadata exhausted (total 4 GiB,
+        # disk_total 8 GiB) — the summed formula read 50 GiB of headroom
+        self.host.btrfs({"sda": (20 * GIB, 20 * GIB), "sdb": (120 * GIB, 20 * GIB)},
+                        {"data": 32 * GIB - 64 * MIB, "metadata": 8 * GIB,
+                         "system": 64 * MIB},
+                        (4 * GIB, 4 * GIB - 256 * MIB, 256 * MIB), profiles=profiles)
+
+    def test_raid1_with_one_device_full_cannot_grow(self):
+        self.raid1_smaller_full()
+        reading = self.host.read()
+        self.assertEqual(reading, {"btrfs_unallocated_bytes": 100 * GIB,
+                                   "btrfs_metadata_headroom_bytes": 0})
+        self.assertEqual([b["key"] for b in resources.breaches(
+            dict(reading, disk_free_bytes=40 * GIB), resources.thresholds(None))
+            if b["key"] in resources.BTRFS_KEYS], ["min_btrfs_metadata_headroom"])
+
+    def test_growth_per_profile(self):
+        # 100, 10 and 10 GiB unallocated on three devices
+        free = [100 * GIB, 10 * GIB, 10 * GIB]
+        for profile, growth in (("single", 120), ("raid0", 120), ("dup", 60),
+                                ("raid1", 20), ("raid10", 20), ("raid1c3", 10),
+                                ("raid1c4", 0), ("raid5", 20), ("raid6", 10)):
+            with self.subTest(profile=profile):
+                self.assertEqual(platform.host.btrfs_growth(profile, free, 2), growth * GIB)
+        # #311 r1: RAID10 stripes equally over an even number of devices — a
+        # large device and three small ones hold 800 MiB, not RAID1's 1200
+        small = [100 * GIB, 400 * MIB, 400 * MIB, 400 * MIB]
+        self.assertEqual(platform.host.btrfs_growth("raid10", small, 2), 800 * MIB)
+        self.assertEqual(platform.host.btrfs_growth("raid1", small, 2), 1200 * MIB)
+        self.assertEqual(platform.host.btrfs_growth("raid10", [100 * GIB], 2), 0)
+        # #311 r2: since 5.15 a RAID10 chunk needs two devices, not four
+        # (volumes.c, btrfs_raid_array: devs_min 2, devs_increment 2): the
+        # pair left with room still holds chunks
+        pairs = [100 * GIB, 100 * GIB, 400 * MIB, 400 * MIB]
+        self.assertEqual(platform.host.btrfs_growth("raid10", pairs, 2), sum(pairs) // 2)
+        self.assertEqual(platform.host.btrfs_growth(
+            "raid10", [768 * MIB, 768 * MIB, 256 * MIB, 256 * MIB], 2), 1024 * MIB)
+        # nearly equal is not equal: two devices hold the smaller one's room
+        self.assertEqual(platform.host.btrfs_growth("raid10", [768 * MIB, 256 * MIB], 2),
+                         256 * MIB)
+        # the kernel spreads mirrored chunks: three equal devices hold RAID1 on
+        # half of their sum, RAID5 on two thirds
+        even = [10 * GIB] * 3
+        self.assertEqual(platform.host.btrfs_growth("raid1", even, 2), 15 * GIB)
+        self.assertEqual(platform.host.btrfs_growth("raid10", even, 2), 15 * GIB)
+        self.assertEqual(platform.host.btrfs_growth("raid5", even, 2), 20 * GIB)
+        # an unnamed profile: its copy factor, DUP on one device, a mirror on several
+        self.assertEqual(platform.host.btrfs_growth(None, free, 1), 120 * GIB)
+        self.assertEqual(platform.host.btrfs_growth(None, [100 * GIB], 2), 50 * GIB)
+        self.assertEqual(platform.host.btrfs_growth(None, free, 2), 20 * GIB)
+        self.assertEqual(platform.host.btrfs_growth(None, free, 3), 10 * GIB)
+
+    def test_raid10_against_the_allocator_chunk_by_chunk(self):
+        # #311 r2: the simulation by events against the allocator itself, one
+        # chunk of one unit at a time — the devices with the most room, as
+        # many as there are rounded down to an even number — on every small case
+        def by_chunks(free):
+            left, growth = list(free), 0
+            while True:
+                room = sorted((f for f in left if f > 0), reverse=True)
+                width = len(room) - len(room) % 2
+                if width < 2:
+                    return growth
+                left = [f - 1 for f in room[:width]] + room[width:]
+                growth += width // 2
+        for count in range(1, 6):
+            for rooms in itertools.combinations_with_replacement(range(9), count):
+                free = [12 * f for f in rooms]
+                with self.subTest(free=free):
+                    self.assertEqual(platform.host.btrfs_growth("raid10", free, 2),
+                                     by_chunks(free))
+        # by events, not by chunks: 501 devices of 50 TiB at once
+        started = time.monotonic()
+        platform.host.btrfs_growth("raid10", [100 * GIB + i * GIB for i in range(501)], 2)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_degraded_raid1_cannot_grow(self):
+        # #311 r1: one of two devices missing (btrfs_fs_info gives it no room):
+        # 100 GiB unallocated on the other is no room for mirrored chunks
+        self.host.btrfs({"sda": (120 * GIB, 20 * GIB), "missing": (120 * GIB, 120 * GIB)},
+                        {"data": 32 * GIB - 64 * MIB, "metadata": 8 * GIB,
+                         "system": 64 * MIB},
+                        (4 * GIB, 4 * GIB - 256 * MIB, 256 * MIB), profiles=("raid1",))
+        self.assertEqual(self.host.read()["btrfs_metadata_headroom_bytes"], 0)
+
+    def test_unnamed_profile_on_several_devices_reads_as_a_mirror(self):
+        self.raid1_smaller_full(profiles=())
+        self.assertEqual(self.host.read()["btrfs_metadata_headroom_bytes"], 0)
+
+    def test_a_conversion_reads_the_smaller_growth(self):
+        # DUP being converted to RAID1, 30 and 10 GiB unallocated: DUP could
+        # take 20 GiB, RAID1 10 GiB
+        self.host.btrfs({"sda": (40 * GIB, 30 * GIB), "sdb": (40 * GIB, 10 * GIB)},
+                        {"data": 36 * GIB, "metadata": 4 * GIB},
+                        (2 * GIB, GIB, 0), profiles=("dup", "raid1"))
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": 40 * GIB,
+                                            "btrfs_metadata_headroom_bytes": 11 * GIB})
 
 
 class FloorsTest(unittest.TestCase):

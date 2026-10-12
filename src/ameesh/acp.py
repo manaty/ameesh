@@ -123,15 +123,17 @@ def _valid_rpc_id(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _validate_message(message: dict) -> None:
+def _validate_message(message: dict, *, header: bool = True) -> None:
     """Valide l'enveloppe JSON-RPC 2.0 d'un message reçu de l'agent.
 
     Lève `AcpError` : un message non conforme n'est **jamais** ignoré, il met
     fin au tour. Sans cela, un `id` non hachable faisait mourir le fil de
     lecture avant d'avoir enregistré la panne, et le tour attendait le délai.
     """
-    if message.get("jsonrpc") != "2.0":
+    if header and message.get("jsonrpc") != "2.0":
         raise AcpError('JSON-RPC message without `jsonrpc: "2.0"`')
+    if not header and "jsonrpc" in message and message["jsonrpc"] != "2.0":
+        raise AcpError("invalid JSON-RPC `jsonrpc`: %r" % (message["jsonrpc"],))
     if "method" in message:
         method = message["method"]
         if not isinstance(method, str) or not method:
@@ -154,6 +156,47 @@ def _validate_message(message: dict) -> None:
             raise AcpError("invalid JSON-RPC `error` object")
 
 
+def stoppable_lines(fd: int, max_chars: int, stop: threading.Event,
+                    poll: float = 0.2):
+    """The lines read on `fd` (with their newline), until EOF or `stop`.
+
+    L75 (codex r2, #325): a resident harness may leave a child that keeps its
+    output open after it is stopped; a blocking `readline` would then never
+    return, and closing the stream under it waits for its lock. Here the
+    reader waits with `poll` (any descriptor number, codex r3) and checks
+    `stop` at each `poll` seconds: the owner sets it, the reader returns, and
+    the stream can be closed. Lines are decoded whole (UTF-8). The callers
+    count characters: a partial line is cut only past `max_chars` characters
+    for sure (4 bytes each at most) and yielded as it stands, for the caller
+    to refuse. POSIX only (the resident processes)."""
+    import select
+    poller = select.poll()
+    poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    limit = 4 * max_chars
+    buffer = b""
+    while not stop.is_set():
+        if not poller.poll(poll * 1000):
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            if buffer:
+                yield buffer.decode("utf-8")
+            return
+        searched = len(buffer)
+        buffer += chunk
+        start = 0
+        while True:
+            end = buffer.find(b"\n", max(start, searched))
+            if end < 0:
+                break
+            yield buffer[start:end + 1].decode("utf-8")
+            start = end + 1
+        buffer = buffer[start:]
+        if len(buffer) > limit:
+            yield buffer.decode("utf-8", "replace")
+            return
+
+
 class JsonRpcPeer:
     """Un agent ACP lancé en sous-processus, et le JSON-RPC qui l'accompagne.
 
@@ -166,8 +209,15 @@ class JsonRpcPeer:
 
     def __init__(self, argv: Sequence[str], *, cwd: str | None = None,
                  env: Mapping[str, str] | None = None,
-                 max_message: int = MAX_MESSAGE_CHARS):
+                 max_message: int = MAX_MESSAGE_CHARS, header: bool = True,
+                 new_session: bool = False, stderr: Any = None, stoppable: bool = False):
         self.argv = list(argv)
+        #: L75: Codex app-server speaks JSON-RPC 2.0 without the `jsonrpc`
+        #: member; ACP requires it, both ways
+        self.header = header
+        #: L75: read with `stoppable_lines`, ended by `stop_reading()`
+        self.stoppable = stoppable
+        self._stop = threading.Event()
         self.max_message = max(1024, int(max_message))
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -182,8 +232,8 @@ class JsonRpcPeer:
         self.fatal: AcpError | None = None
         self.proc = subprocess.Popen(
             self.argv, cwd=cwd, env=dict(env) if env is not None else None,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
-            text=True, bufsize=1,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+            text=True, bufsize=1, start_new_session=new_session,
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -212,6 +262,8 @@ class JsonRpcPeer:
 
     # -- envoi -------------------------------------------------------------
     def _send(self, message: dict) -> None:
+        if not self.header:
+            message = {k: v for k, v in message.items() if k != "jsonrpc"}
         with self._write_lock:
             if self.proc.stdin is None or self.proc.poll() is not None:
                 raise AcpError("the ACP agent is no longer alive")
@@ -280,13 +332,21 @@ class JsonRpcPeer:
                                      "message": "the ACP agent stopped"}
                     pending.event.set()
 
+    def stop_reading(self) -> None:
+        """L75: end a stoppable reader (EOF may never come)."""
+        self._stop.set()
+
     def _read_messages(self) -> None:
         stream = self.proc.stdout
         if stream is None:
             return
+        if self.stoppable:
+            lines = stoppable_lines(stream.fileno(), self.max_message, self._stop)
+        else:
+            lines = iter(lambda: stream.readline(self.max_message + 1), "")
         while True:
             try:
-                line = stream.readline(self.max_message + 1)
+                line = next(lines, "")
                 if line == "":
                     return
                 self.last_message = time.monotonic()
@@ -303,7 +363,7 @@ class JsonRpcPeer:
                                    % line[:200]) from exc
                 if not isinstance(message, dict):
                     raise AcpError("JSON-RPC message is not an object")
-                _validate_message(message)
+                _validate_message(message, header=self.header)
                 self._dispatch(message)
             except AcpError as exc:
                 self._fail(exc)

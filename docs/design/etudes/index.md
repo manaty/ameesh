@@ -16,3 +16,4 @@
 * [macOS and Windows portability](portabilite-mac-windows.md) - What breaks or stops protecting outside Linux, Rust set aside for now, an `ameesh.plateforme` layer that refuses when a guarantee is missing; lots L63–L69.
 * [Governing an organisation's mesh: a local authority](l155-governance-of-a-local-authority.md) - OIDC identity, approver role, deputies and absences, isolation between personas, visibility by relation, memory rights and retention, a page for staff; reuses the parked D1, D2, E1, E2; lots L155a–L155i.
 * [ameesh v2: personas, servers, roles and identity](ameesh-v2.md) - Architecture options and delivery plan, with the 2026-10-11 lot triage and current PR statuses.
+* [Autonomous host provisioning](l232-autonomous-host-provisioning.md) - L232: recoverable agent moves between lots, SSH code and systemd delivery, mesh-store API secrets, per-host OAuth browser approvals, reserved owner decisions and four dated implementation lots.

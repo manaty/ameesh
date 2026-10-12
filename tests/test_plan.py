@@ -415,9 +415,9 @@ class GithubTest(_PlanDb):
         self.gh = FakeGh()
 
     def merged_pr(self, number: int, head: str, body: str = "", merged_at: str | None = None,
-                  login: str = "alice") -> None:
+                  login: str = "alice", cross: bool = False) -> None:
         self.gh.state["prs"]["%s#%d" % (REPO, number)] = {
-            "state": "MERGED", "headRefName": head, "body": body,
+            "state": "MERGED", "headRefName": head, "isCrossRepository": cross, "body": body,
             "mergeCommit": {"oid": SHA}, "mergedBy": {"login": login},
             "mergedAt": merged_at or time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                    time.gmtime(time.time() + 60)),
@@ -455,6 +455,38 @@ class GithubTest(_PlanDb):
         again = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(again["merged"], 0)
         self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()}, {"pr list"})
+
+    def test_sync_github_branche_lot_numero_et_pr_partielle(self):
+        # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR
+        # qui se déclare partielle ne le ferme pas
+        a = work.add(self.db, title="garde")
+        b = work.add(self.db, title="parapluie")
+        self.merged_pr(11, "lot/%d-garde" % a["id"], body="Lot.")
+        self.merged_pr(12, "lot/%d-un" % b["id"],
+                       body="Part.\n\nameesh-work-partial: %d" % b["id"])
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        by_item = {r["work_item"]: r["result"] for r in report["results"]}
+        self.assertEqual(by_item, {a["id"]: "merged"})
+        self.assertEqual(work.get(self.db, b["id"])["state"], "intake")
+
+    def test_sync_github_branche_lot_d_un_fork_ou_d_une_autre_branche(self):
+        # #312 r1 P1 : ni la branche lot/<id>-… d'un fork, ni une autre que
+        # la branche enregistrée du lot ne le ferment
+        a = work.add(self.db, title="fork")
+        b = work.add(self.db, title="enregistrée")
+        work.set_branch(self.db, b["id"], "agent/courante", actor="orch", source="test")
+        c = work.add(self.db, title="la sienne")
+        work.set_branch(self.db, c["id"], "lot/%d-bon" % c["id"], actor="orch", source="test")
+        self.merged_pr(21, "lot/%d-etranger" % a["id"], body="Hi.", cross=True)
+        self.merged_pr(22, "lot/%d-old" % b["id"], body="Old.")
+        self.merged_pr(23, "lot/%d-bon" % c["id"], body="Done.")
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {c["id"]: "merged"})
+        # sans le champ (ancienne réponse de gh) : pas de preuve, rien n'est fermé
+        del self.gh.state["prs"]["%s#21" % REPO]["isCrossRepository"]
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
 
     def issue(self, prefix: str) -> dict:
         found = self.gh.issue(REPO, prefix)

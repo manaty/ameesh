@@ -25,26 +25,82 @@ else
   VOLUME=${AMEESH_PG_VOLUME:-$NAME-data}
 fi
 
+# deux postgres sur un même répertoire de données le corrompent : chaque
+# montage est comparé par le répertoire qu'il désigne sur l'hôte ; toute
+# inspection en échec refuse
+refus() { echo "$1 — refus de $ACTION $NAME" >&2; exit 1; }
+# le répertoire d'un volume nommé ($1, monté en $2) : son `device` quand le
+# pilote local le monte en bind (`-o o=bind,device=/srv/…`), car .Mountpoint
+# n'en dit que le _data ; sinon $2
+source_du_volume() {
+  local opts o device
+  opts=$(docker volume inspect -f '{{index .Options "o"}}{{"\x1f"}}{{index .Options "device"}}' "$1") \
+    || return 1
+  IFS=$'\x1f' read -r o device <<<"$opts"
+  case ",$o," in
+    *,bind,*|*,rbind,*) [ -z "$device" ] || { printf '%s\n' "$device"; return 0; } ;;
+  esac
+  printf '%s\n' "$2"
+}
+# les répertoires montés par un conteneur, un par ligne : la source d'un bind
+# mount, celle d'un volume nommé résolue par `source_du_volume`
+sources() {
+  local lignes type nom src
+  lignes=$(docker inspect -f '{{range .Mounts}}{{.Type}}{{"\x1f"}}{{.Name}}{{"\x1f"}}{{.Source}}{{"\n"}}{{end}}' "$1") \
+    || return 1
+  while IFS=$'\x1f' read -r type nom src; do
+    [ -n "$src" ] || continue
+    if [ "$type" = volume ] && [ -n "$nom" ]; then
+      src=$(source_du_volume "$nom" "$src") || return 1
+    fi
+    printf '%s\n' "$src"
+  done <<<"$lignes"
+}
+# deux répertoires se recouvrent : le même, ou l'un contient l'autre
+# (/srv et /srv/pg-data), dans un sens comme dans l'autre
+recouvre() {
+  [ "$1" = "$2" ] || [ "$1" = / ] || [ "$2" = / ] \
+    || [ "${1#"$2"/}" != "$1" ] || [ "${2#"$1"/}" != "$2" ]
+}
+# forme canonique d'une source (`/srv/pg-data/` ou un lien vers ce dossier
+# désignent le même répertoire) ; telle quelle si realpath échoue
+canon() {
+  local src
+  while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    realpath -m -- "$src" 2>/dev/null || printf '%s\n' "$src"
+  done <<<"$1"
+}
+# refus si un autre conteneur (ceux que liste `docker ps $1`) monte un
+# répertoire qui recouvre l'une des sources de $2
+garde_sources() {
+  local conteneurs autre leurs src miennes leur
+  miennes=$(canon "$2")
+  conteneurs=$(docker ps $1 --format '{{.Names}}') || refus "docker ps en échec"
+  while IFS= read -r autre; do
+    [ -n "$autre" ] && [ "$autre" != "$NAME" ] || continue
+    leurs=$(sources "$autre") || refus "inspection des montages de $autre en échec"
+    leurs=$(canon "$leurs")
+    while IFS= read -r src; do
+      [ -n "$src" ] || continue
+      while IFS= read -r leur; do
+        [ -n "$leur" ] || continue
+        if recouvre "$src" "$leur"; then
+          refus "$src (données de $NAME) recouvre $leur, monté par le conteneur $autre"
+        fi
+      done <<<"$leurs"
+    done <<<"$miennes"
+  done <<<"$conteneurs"
+}
+
 if docker inspect "$NAME" >/dev/null 2>&1; then
   if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
     # un conteneur créé avant ce garde peut partager ses données avec un
     # autre : refus de le démarrer si un autre conteneur en marche monte une
-    # même source (volume nommé ou bind mount, comparés par leur .Source sur
-    # l'hôte) ; toute inspection en échec refuse aussi
-    refus() { echo "$1 — refus de démarrer $NAME" >&2; exit 1; }
-    sources() { docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$1"; }
+    # même source
+    ACTION=démarrer
     miennes=$(sources "$NAME") || refus "inspection des montages de $NAME en échec"
-    en_marche=$(docker ps --format '{{.Names}}') || refus "docker ps en échec"
-    while IFS= read -r autre; do
-      [ -n "$autre" ] && [ "$autre" != "$NAME" ] || continue
-      leurs=$(sources "$autre") || refus "inspection des montages de $autre en échec"
-      while IFS= read -r src; do
-        [ -n "$src" ] || continue
-        if grep -qxF -- "$src" <<<"$leurs"; then
-          refus "$src (données de $NAME) est monté par le conteneur en marche $autre"
-        fi
-      done <<<"$miennes"
-    done <<<"$en_marche"
+    garde_sources "" "$miennes"
     echo "démarrage du conteneur $NAME"
     docker start "$NAME" >/dev/null
   fi
@@ -53,12 +109,32 @@ else
     echo "AMEESH_PG_PASSWORD requis pour créer le banc : aucun mot de passe n'est codé dans le dépôt." >&2
     exit 1
   fi
-  # deux postgres sur un même répertoire de données le corrompent : refus si
-  # un autre conteneur, même arrêté, monte déjà ce volume
-  autres=$(docker ps -a --filter "volume=$VOLUME" --format '{{.Names}}' | tr '\n' ' ')
+  ACTION=créer
+  # refus si un autre conteneur, même arrêté, monte déjà ce volume nommé
+  autres=$(docker ps -a --filter "volume=$VOLUME" --format '{{.Names}}') \
+    || refus "docker ps en échec"
+  autres=$(tr '\n' ' ' <<<"$autres")
   if [ -n "${autres// /}" ]; then
     echo "le volume $VOLUME est déjà monté par : $autres— choisissez AMEESH_PG_VOLUME" >&2
     exit 1
+  fi
+  # le filtre `volume=` ne voit pas la source d'un bind mount (L159f3, #307) :
+  # la source que prendra le conteneur (le chemin d'un bind mount, le _data
+  # d'un volume nommé qui existe déjà) est comparée à celles de tous les
+  # conteneurs, même arrêtés
+  case "$VOLUME" in
+    /*) source_voulue=$VOLUME ;;
+    *)
+      volumes=$(docker volume ls -q) || refus "docker volume ls en échec"
+      source_voulue=
+      if grep -qxF -- "$VOLUME" <<<"$volumes"; then
+        point=$(docker volume inspect -f '{{.Mountpoint}}' "$VOLUME") \
+          && source_voulue=$(source_du_volume "$VOLUME" "$point") \
+          || refus "inspection du volume $VOLUME en échec"
+      fi ;;
+  esac
+  if [ -n "$source_voulue" ]; then
+    garde_sources -a "$source_voulue"
   fi
   echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT, volume $VOLUME)"
   docker run -d --name "$NAME" \

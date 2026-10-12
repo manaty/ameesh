@@ -249,6 +249,33 @@ avec ou sans PR : fusion directe, avance rapide, squash. La cible par défaut
 est celle du dépôt (`git config ameesh.target develop` dans le clone si
 l'équipe n'intègre pas sur la branche par défaut), ou `--target`.
 
+**Branche `lot/<id>-…`** (L118b). Un lot sans branche déclarée prend pour
+branche son unique `lot/<id>` ou `lot/<id>-<sujet>`, locale ou `origin/`.
+Elle est posée sur le lot dès que le relevé la voit en avance sur sa cible.
+La fusion GitHub de cette branche (« Merge pull request #N from
+owner/lot/<id>-… ») ou une fusion locale (« Merge branch 'lot/<id>-…' »)
+ferme le lot, même après la suppression de la branche. Le relevé lit alors le
+corps de la PR (`gh`). Une PR qui ne livre qu'une partie d'un lot parapluie
+(#139) porte dans sa description :
+
+```
+ameesh-work-partial: <numéro du lot>
+```
+
+Le lot reste ouvert jusqu'à la fusion d'une PR qui ne porte pas cette
+ligne (la même ligne dans le message d'une fusion locale le retient aussi,
+tant que la branche n'est pas fusionnée au-delà de cette fusion).
+Si le corps est illisible (`gh` absent ou non connecté), un lot sans
+branche déclarée reste ouvert ; une PR plus récente, lisible et complète,
+le ferme. Une branche déclarée et prouvée fusionnée ferme le lot comme
+avant, et elle seule compte : la fusion d'une autre `lot/<id>-…` ne ferme
+pas un lot qui porte une branche. Un relevé lit au plus 20 corps de PR
+(un corps déjà lu est gardé, sans nouvel appel) ;
+après un échec de `gh`, il n'en lit plus d'autre dans ce dépôt, et la PR en
+échec n'est relue qu'après un délai (1 min, doublé à chaque échec, 1 h au
+plus). `ameesh work sync-github` suit les mêmes règles et ne retient que
+les PR dont la branche est dans le dépôt même, pas dans un fork.
+
 ## Fusion sans PR ni branche déclarée
 
 Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,
@@ -472,6 +499,9 @@ restée 4 h fusionnée sans être déployée :
    consigne de veille ne se contente jamais d'interdire « tout déploiement »
    sans le préparer. Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
+   The watch of an orchestrator is set with `ameesh watch enable --agent
+   <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
+   carries these rules and changes only through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :
@@ -501,3 +531,19 @@ restée 4 h fusionnée sans être déployée :
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
    cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
    étiquette publiée : on pose la suivante.
+7. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
+   `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
+   `v<version>` sur ce commit de `main` (le numéro est celui de son
+   `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent
+   de `docs/versions/<version>.md` tel qu'il est dans `main` (une note se
+   relit et se fusionne avant de publier), sinon de la description de la PR
+   qui a fusionné ce commit (vérifié auprès de GitHub) ; une description
+   illisible arrête la publication. Seule la plus haute version est marquée
+   « Latest ». `poste.sh rattraper` fait de même pour chaque version de
+   l'historique de `main` à qui il manque son étiquette ou sa release ; une
+   étiquette déjà posée sur le distant fait foi et n'est pas déplacée, si son
+   commit porte bien cette version (sinon tout s'arrête). Une étiquette posée
+   ici mais pas poussée est poussée à la relance. `A_BLANC=1` affiche ce qui
+   serait posé, poussé et publié, notes comprises, sans rien écrire, pas même
+   un `git fetch`. Ces deux étapes n'ont besoin que du dépôt et de `gh`, ni
+   du serveur ni de la base.

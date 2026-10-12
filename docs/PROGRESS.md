@@ -42,6 +42,23 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
   open the file, or copy it wherever you want. Atomic write (temporary
   file then rename); to regenerate, rerun the command. Its Refresh button is
   disabled ("open with --serve to refresh").
+
+**The page** (L304, static or served) shows little per screen: tabs
+**Overview** (one card per project, from `overview`: open lots,
+lots merged in the window, pending decisions, 24 h spend, next milestone
+with its progress bar, two warnings at most; then "Watch": overdue or
+urgent decisions, blocked and stale lots), **Gantt** (the roadmap),
+**Work items**, **Agents** (tables with a text filter and sortable columns;
+merged and closed lots, stopped agents hidden by default), **Budget** and
+**Decisions**. A project selector sits on top (served: the snapshot is read
+again with `?project=`; static: the page filters lots, agents, cards and
+decisions, and says that budget and Gantt cover all projects). Details open
+in **windows** on click (lot: dated milestones, waiting_for, cost, its
+decisions, thread command; agent; milestone: epics and open lots; decision:
+options, recommendation, answer command). Light, dark or system theme
+(remembered by the browser). Open tab, project and auto-refresh live in
+the URL (`#tab=lots&p=demo&auto=1`).
+
 * `--serve [--port 8765]` (L304): serves the same page and this JSON from
   a local server, **read-only**, until Ctrl-C. See "Local server" below.
 
@@ -53,7 +70,7 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 
 | Path | Response |
 |---|---|
-| `/` | the page **without data** (no token needed, nothing to protect): it reads `/api/progress.json` with the token; its **Refresh** button reloads it, optionally every 60 s (`#auto` in the URL); "data as of HH:MM" is `generated_ts` |
+| `/` | the page **without data** (no token needed, nothing to protect): it reads `/api/progress.json` with the token; its **Refresh** button fetches it again without reloading (open tab, filters and detail window kept), optionally every 60 s; "data as of HH:MM" is `generated_ts`; a failed fetch is said and the previous data stay. The served page's policy adds `connect-src 'self'` and nothing else |
 | `/api/progress.json` | this schema, with `Authorization: Bearer <token>` only (401 otherwise); `?project=P` takes a project known to the unfiltered snapshot (400 otherwise), empty = all projects |
 
 * **Bound to `127.0.0.1` only**; no option changes the address. The `Host`

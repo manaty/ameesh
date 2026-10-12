@@ -103,6 +103,7 @@ Un seul des trois réglages peut être livré par fichier.
 | `acp` | `{"auth_method": "…", "config": {"model": "…", "effort": "…", "tier": "…"}}` : méthode d'authentification et identifiants d'options de configuration |
 | `accounts` | comptes multiples (L30) : `{"config_env", "default_home", "session_store", "credentials", "key_env"}` |
 | `install` | note déclarative d'installation (la distribution signée est L17) |
+| `resident` | L75, resident mode (decision 0035): see [Resident mode](#resident-mode-l75) |
 
 ### Protocole `acp`
 
@@ -181,6 +182,52 @@ Claude/Codex (0019 §3) : un harnais ACP déclaré `cost.paid_per_token` aliment
 donc le plafond horaire. Les jauges se lisent par la source déclarée
 (`transcript` et `sessions` sont les lecteurs connus ; `balance` renvoie au
 relevé de solde de L26).
+
+### Resident mode (L75)
+
+A resident agent (decision 0035) keeps **one** harness process open between
+turns. The `ameesh.resident` block says how; without it, the agent stays at
+one turn per event. The drivers are in `src/ameesh/resident.py`; the runner
+that uses them (lease, heartbeat, sleep, restart) is L76.
+
+| Key | Content |
+|---|---|
+| `protocol` | `claude-stream-json`, `codex-app-server` or `acp` (an ACP harness is resident in ACP only) |
+| `launcher` | launcher arguments of the resident process; absent: the descriptor's `launcher` |
+| `command` | application arguments; required for `claude-stream-json` and `codex-app-server`; absent in `acp`: the descriptor's `command` for an ACP harness, none for a command-line harness |
+| `new_session` | `claude-stream-json`: flag that names a new session (`["--session-id"]`), so that the session id is known before the first turn |
+| `thread` | `codex-app-server`: fixed parameters of `thread/start` and `thread/resume` (`approvalPolicy`, `sandbox`) |
+| `min_version` | pinned minimum version of the binary (`2.1.286`, `0.2.0-rc.2`); below it, or if the version cannot be read, the agent stays at one turn per event (`resident.availability`); absent: warning `harness-resident-unpinned` |
+
+A command-line harness resident in ACP (dsh) declares its ACP `launcher` or
+`command` (`["--profile", "acp"]`). Pinned in the package (tests of
+2026-10-12): Claude Code 2.1.286, Codex CLI 0.159.3, dsh 0.2.0-rc.2.
+
+Driver interface (`resident.driver_for(adapter, cwd=…, session=…, model=…,
+effort=…, tier=…, on_event=…)`):
+
+| Call | Claude stream-json | Codex app-server | ACP |
+|---|---|---|---|
+| `start()` | `--session-id` (new) or `--resume`; handshake `control_request` `initialize` | `initialize`, `initialized`, `thread/start` or `thread/resume` (`excludeTurns`) | `initialize`, `session/new`, `session/resume` or `session/load`, settings |
+| `send(text)` | `user` line with a `uuid` | `turn/start` (`effort`) | `session/prompt` |
+| `steer(text)` | `user` line written at once: read at the next safe point | `turn/steer` (`expectedTurnId`); refused: a new `turn/start` after the end of the turn | `session/cancel`, then `session/prompt` with the input |
+| `interrupt()` | `control_request` `interrupt` | `turn/interrupt` | `session/cancel` |
+| end of turn | `result` once every input written has been echoed (`--replay-user-messages`) | `turn/completed` | answer to `session/prompt` |
+| `probe()` | process alive | `thread/read` | `session/list` (any answer) |
+| usage | `result.usage`; context of the last call; cost = difference of the cumulative `total_cost_usd` | `thread/tokenUsage/updated.last`, `modelContextWindow` | `usage_update` (`used`, `size`, cumulative cost) |
+
+A turn steered one or more times is **one** logical turn: its `TurnResult`
+lists every input it served (`inputs`), with `status` `completed`,
+`interrupted` or `failed`, the final text, the usage and the cost of the turn.
+Only one turn runs at a time (`ResidentBusy`): holding an input until the end
+of the turn is the caller's choice (decision 0035 §3).
+
+Nothing is granted from the resident client: a Claude `control_request` from
+the harness gets an error, a Codex approval is declined (`decline`, `denied`),
+an ACP permission follows `ameesh.permissions` (deny by default) and `fs/*`
+stays inside the working directory, as in the ACP bridge. The harness runs in
+its own process group (`pgid`); `close()` closes its input, then sends SIGTERM
+and SIGKILL to the group.
 
 ## Canon
 

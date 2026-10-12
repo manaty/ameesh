@@ -13,6 +13,7 @@ import contextlib
 import http.client
 import io
 import json
+import re
 import threading
 import unittest
 from unittest import mock
@@ -203,21 +204,52 @@ class ServeTest(ServerCase):
         self.assertEqual(self.calls, [None, None])
 
 
-class PageModeTest(unittest.TestCase):
+def _csp(html):
+    return re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', html).group(1)
+
+
+class PageBuilderTest(unittest.TestCase):
+    """Le gabarit (L304) : modes, politique de sécurité, onglets, fenêtre."""
+
     def test_statique_bouton_desactive(self):
         html = progress.render_html(_snap())
         self.assertIn('var MODE = "static";', html)
         self.assertIn("open with --serve to refresh", html)
-        self.assertIn("default-src 'none'", html)
-        self.assertNotIn("connect-src", html)
-        served = progress.render_html(None, served=True)
-        self.assertIn('var MODE = "served";', served)
-        self.assertIn("default-src 'none'; connect-src 'self';", served)
-        # le jeton part en en-tête, jamais en cookie ; couper l'auto garde ?project=
-        self.assertIn('"Authorization": "Bearer " + token', served)
-        self.assertIn('credentials: "omit"', served)
-        self.assertIn("location.pathname + location.search", served)
-        self.assertIn("sessionStorage", served)
+        self.assertNotIn("connect-src", _csp(html))
+
+    def test_servie_relit_l_api_seulement(self):
+        html = progress.render_html(None, served=True)
+        self.assertIn('var MODE = "served";', html)
+        csp = _csp(html)
+        self.assertEqual(csp, "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; "
+                              "script-src 'unsafe-inline'; img-src data:")
+        self.assertIn('var API = "%s"' % progress_serve.API, html)
+        # servie, la page vient sans données
+        blob = re.search(r'<script type="application/json" id="data">(.*?)</script>',
+                         html, re.S).group(1)
+        self.assertIsNone(json.loads(blob))
+        # le jeton part en en-tête, jamais en cookie, et quitte l'URL
+        self.assertIn('"Authorization": "Bearer " + TOKEN', html)
+        self.assertIn('credentials: "omit"', html)
+        self.assertIn("sessionStorage", html)
+        self.assertNotIn("same-origin", html)
+
+    def test_onglets_et_fenetre(self):
+        html = progress.render_html(_snap())
+        for tab in ("overview", "gantt", "lots", "agents", "budget", "decisions"):
+            self.assertIn('id="panel-%s"' % tab, html)
+            self.assertIn('["%s", ' % tab, html)
+        self.assertIn('<dialog id="modal"', html)
+        # rien n'entre en HTML : le script ne passe que par textContent
+        self.assertNotIn("innerHTML", html)
+        self.assertNotIn("insertAdjacentHTML", html)
+        self.assertNotIn("document.write", html)
+
+    def test_gabarit_sans_emplacement(self):
+        snap = _snap()
+        with mock.patch("builtins.open", mock.mock_open(read_data="<html></html>")):
+            with self.assertRaises(progress.ProgressError):
+                progress.render_html(snap)
 
 
 class OverviewTest(unittest.TestCase):

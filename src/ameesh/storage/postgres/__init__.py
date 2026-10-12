@@ -36,6 +36,7 @@ from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
 from .threads import Threads
 from .wakeups import Wakeups
+from .watches import Watches
 from .work import WorkItems
 
 
@@ -53,6 +54,7 @@ class PostgresStorage(interface.Storage):
         self.accounts = Accounts(db)
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
+        self.watches = Watches(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)
