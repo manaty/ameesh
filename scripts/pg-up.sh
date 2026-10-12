@@ -16,8 +16,14 @@ USER=${AMEESH_PG_USER:-${AGENT_MESH_PG_USER:-agent_mesh}}
 PASSWORD=${AMEESH_PG_PASSWORD:-${AGENT_MESH_PG_PASSWORD:-}}
 DB=${AMEESH_PG_DB:-${AGENT_MESH_PG_DB:-agent_mesh}}
 #: volume : le banc historique vit dans agent-mesh-pg-data (le conteneur
-#: renommé le garde) ; une machine neuve crée ameesh-pg-data.
-VOLUME=${AMEESH_PG_VOLUME:-ameesh-pg-data}
+#: renommé le garde) ; une machine neuve crée ameesh-pg-data. Un autre nom de
+#: conteneur a son propre volume, ${NAME}-data (L159f2, #278) : deux agents du
+#: même hôte ne partagent jamais un répertoire de données.
+if [ "$NAME" = ameesh-pg ]; then
+  VOLUME=${AMEESH_PG_VOLUME:-ameesh-pg-data}
+else
+  VOLUME=${AMEESH_PG_VOLUME:-$NAME-data}
+fi
 
 if docker inspect "$NAME" >/dev/null 2>&1; then
   if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
@@ -29,7 +35,14 @@ else
     echo "AMEESH_PG_PASSWORD requis pour créer le banc : aucun mot de passe n'est codé dans le dépôt." >&2
     exit 1
   fi
-  echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT)"
+  # deux postgres sur un même répertoire de données le corrompent : refus si
+  # un autre conteneur, même arrêté, monte déjà ce volume
+  autres=$(docker ps -a --filter "volume=$VOLUME" --format '{{.Names}}' | tr '\n' ' ')
+  if [ -n "${autres// /}" ]; then
+    echo "le volume $VOLUME est déjà monté par : $autres— choisissez AMEESH_PG_VOLUME" >&2
+    exit 1
+  fi
+  echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT, volume $VOLUME)"
   docker run -d --name "$NAME" \
     -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$PASSWORD" -e POSTGRES_DB="$DB" \
     -p "127.0.0.1:$PORT:5432" \
