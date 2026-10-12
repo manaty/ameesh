@@ -55,6 +55,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import json
+import math
 import os
 import re
 import signal
@@ -694,6 +695,10 @@ def slice_properties(caps: dict, cpu_count: int | None) -> dict:
     return props
 
 
+#: the transient timer that thaws the slice at the freeze bound, so that a
+#: guard killed during a freeze never leaves the guest frozen
+THAW_UNIT = "ameesh-guard-thaw"
+
 #: which `caps` key each property enforces
 PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
                  "MemoryHigh": "memory_high_mb", "MemoryMax": "memory_mb"}
@@ -704,7 +709,13 @@ class Enforcer:
     caps live as long as the boot, and stay in place if the guard stops) and
     the level 2 freeze with `systemctl freeze` / `thaw`. Never raises: a
     failed command is reported on stderr, and its caps are left out of
-    `caps.enforced`."""
+    `caps.enforced`.
+
+    A freeze holds without the guard: before it, a transient systemd timer
+    (`THAW_UNIT`) is armed to thaw the slice at the freeze bound; no timer,
+    no freeze. A freeze attempted counts as possibly in force until a thaw
+    succeeds: every evaluation below level 2, and the guard's exit, thaw
+    again until it does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
                  log: Callable | None = None):
@@ -712,19 +723,24 @@ class Enforcer:
         self.run = run or subprocess.run
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
-        self.frozen = False
+        self.frozen = False              # possibly frozen: a thaw is owed
+        self.freeze_done = False         # the freeze command succeeded
+        self.armed_until: float | None = None   # bound of the armed thaw timer
 
-    def _systemctl(self, *args: str) -> bool:
+    def _command(self, argv: list[str]) -> bool:
         try:
-            proc = self.run(["systemctl", *args], capture_output=True, text=True, timeout=10)
+            proc = self.run(argv, capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError) as exc:
-            self.log("systemctl %s: %s" % (" ".join(args), exc))
+            self.log("%s: %s" % (" ".join(argv), exc))
             return False
         if proc.returncode != 0:
-            self.log("systemctl %s: code %s %s" % (" ".join(args), proc.returncode,
-                                                  (proc.stderr or "").strip()[:200]))
+            self.log("%s: code %s %s" % (" ".join(argv), proc.returncode,
+                                         (proc.stderr or "").strip()[:200]))
             return False
         return True
+
+    def _systemctl(self, *args: str) -> bool:
+        return self._command(["systemctl", *args])
 
     def agent_units(self) -> list[str]:
         """The loaded agent units of the guest."""
@@ -758,27 +774,58 @@ class Enforcer:
             last.update(changed)
         return set(props)
 
-    def freeze(self, on: bool) -> bool:
-        """Freezes or thaws the guest's slice; True if the slice is as asked."""
-        if on == self.frozen:
+    def _arm_thaw(self, until: float, now: float) -> bool:
+        """(Re)arms the thaw timer at `until`; True if armed."""
+        if self.armed_until == until:
             return True
-        if self._systemctl("freeze" if on else "thaw", self.cfg.slice):
-            self.frozen = on
-            return True
-        return False
+        self._disarm_thaw()
+        seconds = max(1, int(math.ceil(until - now)))
+        if not self._command(["systemd-run", "--unit=%s" % THAW_UNIT, "--collect", "--quiet",
+                              "--on-active=%ds" % seconds, "--timer-property=AccuracySec=1s",
+                              "systemctl", "thaw", self.cfg.slice]):
+            return False
+        self.armed_until = until
+        return True
 
-    def thaw_at_start(self) -> None:
-        """A guard that died during a freeze must not leave the guest frozen
-        (thawing a slice that is not frozen is harmless: the result is not
-        reported)."""
+    def _disarm_thaw(self) -> None:
+        # absent (never armed, or fired): harmless, not reported
         try:
-            self.run(["systemctl", "thaw", self.cfg.slice], capture_output=True, text=True,
-                     timeout=10)
+            self.run(["systemctl", "stop", THAW_UNIT + ".timer"], capture_output=True,
+                     text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             pass
-        self.frozen = False
+        self.armed_until = None
 
-    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
+    def freeze(self, on: bool, until: float | None = None, now: float | None = None) -> bool:
+        """Freezes the guest's slice until `until` (the thaw timer armed
+        first), or thaws it; True if the slice is as asked."""
+        if not on:
+            if not self.frozen:
+                return True
+            if not self._systemctl("thaw", self.cfg.slice):
+                return False          # owed: retried, and the timer still runs
+            self.frozen = self.freeze_done = False
+            self._disarm_thaw()
+            return True
+        now = time.time() if now is None else now
+        if until is None or not self._arm_thaw(until, now):
+            self.log("freeze refused: no thaw timer to bound it")
+            self.freeze(False)
+            return False
+        if not self.freeze_done:
+            # attempted: possibly in force even if the command does not return
+            self.frozen = True
+            self.freeze_done = self._systemctl("freeze", self.cfg.slice)
+        return self.freeze_done
+
+    def thaw_at_start(self) -> None:
+        """A guard that died during a freeze must not leave the guest frozen:
+        the slice counts as possibly frozen until a thaw succeeds (retried
+        at every evaluation below level 2)."""
+        self.frozen = True
+        self.freeze(False)
+
+    def apply(self, state: dict, cpu_count: int | None, now: float | None = None) -> list[str]:
         """Enforces `state` (levels 0 to 2; a drain or a stop thaws and keeps
         the caps); the `caps` keys actually enforced."""
         caps = state.get("caps") or {}
@@ -787,11 +834,16 @@ class Enforcer:
         if caps.get("agent_memory_mb") is not None:
             units = self.agent_units()
             per_agent = {"MemoryMax": "%dM" % int(caps["agent_memory_mb"])}
-            if units and all("MemoryMax" in self._set(u, per_agent) for u in units):
+            # every unit, even after a failure on one of them
+            done = [("MemoryMax" in self._set(u, per_agent)) for u in units]
+            if done and all(done):
                 enforced.add("agent_memory_mb")
-        if self.freeze("freeze" in state):
-            if "freeze" in state:
+        freeze = state.get("freeze")
+        if freeze:
+            if self.freeze(True, freeze.get("until_ts"), now):
                 enforced.add("freeze")
+        else:
+            self.freeze(False)
         return sorted(enforced)
 
 
@@ -843,7 +895,8 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"))
+            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"),
+                                                            now)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
