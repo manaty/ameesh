@@ -33,8 +33,19 @@
 #                        installed one, observe on a first install)
 #   --set-guard-mode M   switch the installed guard (restarts it; observe
 #                        also takes the guard's caps off the guest)
-#   --enable AGENT…      enable and start the runners of these agents
+#   --enable AGENT…      prepare the workspace of these agents (below), then
+#                        enable and start their runners
 #   --disable AGENT…     stop and disable them (their turn drains first)
+#   --canon DIR          with --enable (and --check): a checkout of the canon,
+#                        read at its merged branch by ameesh's own reader, as
+#                        the checkout's owner: each agent's project and work
+#                        folder on --host (under $ROOT/work, refused elsewhere)
+#   --repo P=URL#BRANCH  with --enable: the forge of project P, which the
+#                        canon does not hold (repeatable), https without
+#                        user or token in it, e.g.
+#                        nexlink=https://github.com/manaty/nexlink.git#develop
+#   --dsh-from DIR       with --enable: the ~/.dsh whose hooks.json and
+#                        profiles/ the guest gets (default: the sudo user's)
 #   --check              report the state of everything installed
 #   --uninstall          rollback: drain, stop, remove units and files
 #   --purge              with --uninstall: also secrets, guard config,
@@ -52,10 +63,20 @@
 #   * /etc/tmpfiles.d/ameesh-gate.conf: /run/ameesh-gate/{state,ack};
 #   * /etc/ameesh/guard.json (offer), guard.env (mode), guest.env and
 #     guest-<agent>.env (secrets, 0640 root:ameesh-guest, never overwritten;
-#     --purge removes only those this script created).
+#     --purge removes only those this script created);
+#   * by --enable, once (lot #483): /opt/ameesh/git-credential-guest, the
+#     git credential helper of the guest (it hands git the runner's GH_TOKEN,
+#     which systemd reads in guest-<agent>.env: never written elsewhere,
+#     never printed), named in the guest's ~/.gitconfig for
+#     https://github.com; the guest's ~/.dsh/hooks.json and profiles/,
+#     copied from --dsh-from, refused if a file looks like it holds a secret;
+#     and for each agent, its clone of its project in its work folder,
+#     detached on origin/BRANCH. What is there already is kept (never
+#     fetched, reset nor overwritten); a folder holding something else is
+#     refused. Everything in the guest's home and work is written as the
+#     guest, never by root.
 # Not done here (study §4.2, §4.3): the canon PR (Host `policy.lend`, the
-# guest agents' placements), the host's Postgres login role (L56), the
-# agents' clones under $ROOT/work.
+# guest agents' placements), the host's Postgres login role (L56).
 # `disk_max` is enforced by nothing but the volume's size: a volume bigger
 # than it is refused (--accept-larger-volume overrides), the root filesystem
 # (--allow-rootfs) does not hold it.
@@ -83,13 +104,19 @@ ALLOW_ROOTFS=0
 ACCEPT_LARGER=0
 MODE=install
 PURGE=0
+CANON=""
+declare -A REPOS=()
+DSH_FROM=""
+HELPER=/opt/ameesh/git-credential-guest
+CREDENTIAL_KEY=credential.https://github.com.helper
 
 die() { echo "install-pilot.sh: $*" >&2; exit 1; }
 say() { echo "== $*"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host|--agent|--max-agents|--lend|--root|--path|--guard-mode|--set-guard-mode)
+    --host|--agent|--max-agents|--lend|--root|--path|--guard-mode|--set-guard-mode|\
+    --canon|--repo|--dsh-from)
       [ $# -ge 2 ] || die "$1 needs a value" ;;
   esac
   case "$1" in
@@ -104,8 +131,16 @@ while [ $# -gt 0 ]; do
     --allow-rootfs) ALLOW_ROOTFS=1; shift ;;
     --accept-larger-volume) ACCEPT_LARGER=1; shift ;;
     --dry-run) DRY=1; shift ;;
+    --canon) CANON=$2; shift 2 ;;
+    --repo)
+      [[ "$2" == ?*=?*'#'?* ]] || die "--repo PROJECT=URL#BRANCH, not $2"
+      REPOS[${2%%=*}]=${2#*=}; shift 2 ;;
+    --dsh-from) DSH_FROM=$2; shift 2 ;;
     --check) MODE=check; shift ;;
-    --enable|--disable) MODE=${1#--}; shift; TARGETS=("$@"); break ;;
+    # the agents: every argument up to the next option
+    --enable|--disable)
+      MODE=${1#--}; shift
+      while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do TARGETS+=("$1"); shift; done ;;
     --uninstall) MODE=uninstall; shift ;;
     --purge) PURGE=1; shift ;;
     -h|--help) sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -124,9 +159,31 @@ case "$ROOT" in /*) ;; *) die "--root must be absolute" ;; esac
 case "$ROOT" in *[!A-Za-z0-9/._-]*|*/../*|*/..|*/./*|*/.|*//*|*/) die "invalid --root $ROOT" ;; esac
 case "$ROOT" in /|/home|/tmp|/srv|/root|/opt|/usr|/etc|/var|/run|/mnt) die "--root $ROOT: a directory of its own expected" ;; esac
 [ "$PURGE" = 0 ] || [ "$MODE" = uninstall ] || die "--purge goes with --uninstall"
+[ ${#REPOS[@]} = 0 ] && [ -z "$DSH_FROM" ] || [ "$MODE" = enable ] \
+  || die "--repo and --dsh-from go with --enable"
+[ -z "$CANON" ] || [ "$MODE" = enable ] || [ "$MODE" = check ] \
+  || die "--canon goes with --enable or --check"
+[ "$MODE" != enable ] || [ -n "$CANON" ] \
+  || die "--enable needs --canon DIR: each agent's project and work folder come from it"
+for d in "$CANON" "$DSH_FROM"; do
+  case "$d" in ''|/?*) ;; *) die "$d: an absolute path expected" ;; esac
+done
+# a project's forge: https, a host and a path, no user, port, query nor
+# token in it (git would keep it in .git/config); a plain branch name
+for p in "${!REPOS[@]}"; do
+  valid_name "$p" || die "--repo: invalid project $p"
+  url=${REPOS[$p]%%#*} branch=${REPOS[$p]#*#}
+  [[ "$url" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)+/?$ ]] && [[ "$url" != *..* ]] \
+    || die "--repo $p: $url is not an https URL without user nor token"
+  [[ "$branch" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] && [[ "$branch" != *..* ]] \
+    && [[ "$branch" != */ ]] && [[ "$branch" != *.lock ]] || die "--repo $p: invalid branch $branch"
+done
 # the tests' dry runs read a state of their own; a real run reads only $STATE
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_STATE:-}" ] && STATE=$PILOT_TEST_STATE
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_VENV:-}" ] && VENV=$PILOT_TEST_VENV
+# (and a canon and a ~/.dsh of their own, whatever the runbook names)
+[ "$DRY" = 1 ] && [ -n "$CANON" ] && [ -n "${PILOT_TEST_CANON:-}" ] && CANON=$PILOT_TEST_CANON
+[ "$DRY" = 1 ] && [ -n "$DSH_FROM" ] && [ -n "${PILOT_TEST_DSH:-}" ] && DSH_FROM=$PILOT_TEST_DSH
 # the tests' dry runs see a host of their own, PILOT_TEST_HOST=DIR: its
 # /etc, /opt, /srv and /run are read under DIR, its users in DIR/etc/passwd,
 # its mounts in DIR/proc/self/mountinfo, and systemd is asked nothing; a
@@ -150,6 +207,11 @@ host_says() { [ -z "$HOSTDIR" ] && "$@"; }
 user_exists() {
   if [ -n "$HOSTDIR" ]; then grep -q "^$GUEST:" "$HOSTDIR/etc/passwd" 2>/dev/null
   else id -u "$GUEST" >/dev/null 2>&1; fi
+}
+# the guest's uid (nothing when there is no such user)
+guest_uid() {
+  if [ -n "$HOSTDIR" ]; then awk -F: -v u="$GUEST" '$1 == u { print $3 }' "$HOSTDIR/etc/passwd"
+  else id -u "$GUEST" 2>/dev/null || true; fi
 }
 # the mounts, binds included: read in mountinfo, never guessed (a dry run of
 # the tests may read a mountinfo of its own)
@@ -321,6 +383,134 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# the guests' workspace (lot #483): clone, git credential, dsh profile
+# --------------------------------------------------------------------------
+GHOME=$ROOT/home
+
+# as_guest CMD…: runs CMD as the guest (its HOME, its rights), never as
+# root in a directory the guest can change; from / (root's directory may be
+# unreadable to the guest, and git needs its own); printed under --dry-run
+as_guest() { (cd / && run runuser -u "$GUEST" -- "$@"); }
+
+# canon_workspaces AGENT…: "agent<TAB>project<TAB>folder" for each, read in
+# the canon (--canon) by ameesh's own reader at the canon's merged branch,
+# as the checkout's owner (root would read a git repository it does not
+# own); refused: an agent unknown, without a project or not placed on
+# --host, a folder that is not one directory of its own under $ROOT/work
+canon_workspaces() {
+  local as=()
+  if [ "$(id -u)" = 0 ]; then
+    as=(runuser -u "$(stat -c %U -- "$CANON")" --)
+  fi
+  "${as[@]}" python3 -I - "$CHECKOUT/src" "$CANON" "$HOST" "$ROOT/work" "$@" <<'EOF'
+import os, re, sys
+sys.path.insert(0, sys.argv[1])
+from ameesh import canon
+root, host_name, work = sys.argv[2], sys.argv[3], sys.argv[4]
+c = canon.load(root)
+if not c.readable:
+    sys.exit("canon %s unreadable: %s" % (root, "; ".join(
+        f.message for f in c.load_findings if f.severity == canon.ERROR) or "?"))
+host = canon.find_host([c], host_name)
+if host is None:
+    sys.exit("host %s is not in the canon %s" % (host_name, root))
+bad = []
+for name in sys.argv[5:]:
+    agent = next((a for a in c.agents if a.title == name), None)
+    if agent is None:
+        bad.append("%s: no such agent in the canon" % name); continue
+    if not any(p.agent == name and (host_name in p.host_names()
+                                   or set(p.tags()) & set(host.tags or []))
+               for p in c.placements):
+        bad.append("%s: not placed on %s in the canon (its PR first)" % (name, host_name)); continue
+    projects = agent.effective_projects
+    if not projects:
+        bad.append("%s: no project in the canon" % name); continue
+    folder = host.policy.work_dir(projects[0], name)
+    if not folder:
+        bad.append("%s: %s gives it no work folder (policy.work_dirs)" % (name, host_name)); continue
+    if (os.path.dirname(folder) != work
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", os.path.basename(folder))):
+        bad.append("%s: work folder %s is not a directory of its own in %s"
+                   % (name, folder, work)); continue
+    print("%s\t%s\t%s" % (name, projects[0], folder))
+if bad:
+    sys.exit("\n".join(bad))
+EOF
+}
+
+# the GH_TOKEN of AGENT, from its secrets file (into a variable only: never
+# printed, never in a command line)
+token_of() {
+  local v
+  v=$(sed -n 's/^[[:space:]]*GH_TOKEN=//p' "$(at "$ETC/guest-$1.env")" 2>/dev/null | tail -n 1)
+  v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+  printf '%s' "$v"
+}
+has_token() { [ -n "$(token_of "$1")" ]; }
+
+# origin_of DIR: the origin of the clone in DIR, read in its .git/config
+# (by root, a file the guest owns: read, never run; includes not followed)
+origin_of() {
+  local cfg; cfg=$(at "$1/.git/config")
+  [ -f "$cfg" ] && [ ! -L "$cfg" ] && [ ! -L "$(at "$1")" ] || return 1
+  git -C / config --file "$cfg" --no-includes --get remote.origin.url
+}
+# same_repo URL URL: one repository (a trailing .git or / aside)
+same_repo() {
+  local a=${1%/} b=${2%/}
+  a=${a%.git}; b=${b%.git}
+  [ "${a,,}" = "${b,,}" ]
+}
+
+# the git credential helper of the guest: git asks it, it answers with the
+# runner's GH_TOKEN for https://github.com only
+helper_text() {
+  cat <<'EOF'
+#!/bin/sh
+# install-pilot.sh (L159g, #483): git credential helper of the guest runners.
+# The token is the runner's GH_TOKEN, which systemd reads in
+# /etc/ameesh/guest-<agent>.env: handed to git, never written, never printed.
+[ "$1" = get ] || exit 0
+[ -n "${GH_TOKEN:-}" ] || exit 0
+protocol= host=
+while IFS= read -r line && [ -n "$line" ]; do
+  case "$line" in
+    protocol=*) protocol=${line#protocol=} ;;
+    host=*) host=${line#host=} ;;
+  esac
+done
+[ "$protocol" = https ] && [ "$host" = github.com ] || exit 0
+printf 'username=x-access-token\npassword=%s\n' "$GH_TOKEN"
+EOF
+}
+
+# the files of a dsh profile copied to the guest: hooks.json and the plain
+# files of each profile (no dot file, no link, no subdirectory: no session,
+# key, log nor installed module)
+dsh_files() {
+  local src=$1 f p
+  [ -f "$src/hooks.json" ] && [ ! -L "$src/hooks.json" ] && echo hooks.json
+  for p in "$src"/profiles/*/; do
+    [ -d "$p" ] && [ ! -L "${p%/}" ] || continue
+    valid_name "$(basename "$p")" || continue
+    for f in "$p"*; do
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      case "$(basename "$f")" in *[!A-Za-z0-9._-]*) continue ;; esac
+      echo "profiles/$(basename "$p")/$(basename "$f")"
+    done
+  done
+}
+# looks_secret FILE…: the files that look like they hold a secret (a key,
+# a token, a password); their names only
+looks_secret() {
+  grep -l -I -i -E \
+    -e 'sk-[A-Za-z0-9_-]{16,}' -e 'gh[pousr]_[A-Za-z0-9]{20,}' -e 'github_pat_[A-Za-z0-9_]{20,}' \
+    -e '(api[_-]?key|token|secret|passw(or)?d)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[^"'"'"'[:space:],}]{8,}' \
+    -- "$@" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------------------
 # --check: what is in place (read only)
 # --------------------------------------------------------------------------
 if [ "$MODE" = check ]; then
@@ -365,6 +555,53 @@ EOF
   done
   grep -q '^AMEESH_DSN=.' "$(at "$ETC")/guest.env" 2>/dev/null && ok "AMEESH_DSN set in guest.env" \
     || ko "AMEESH_DSN not set in $ETC/guest.env"
+  # the guests' workspace (#483); a test's host has its files owned by the
+  # test's user, its "root" (and its ameesh-guest, in its passwd)
+  root_uid=0; [ -z "$HOSTDIR" ] || root_uid=$(id -u)
+  guid=$(guest_uid)
+  h=$(at "$HELPER")
+  if [ -f "$h" ] && [ ! -L "$h" ] && [ "$(cat "$h")" = "$(helper_text)" ] \
+     && [ "$(stat -c '%u %a' "$h")" = "$root_uid 755" ]; then
+    ok "$HELPER (git credential helper, root 755)"
+  else ko "$HELPER missing, changed, or not root 755 (--enable writes it)"; fi
+  if git -C / config --file "$(at "$GHOME/.gitconfig")" --no-includes --get-all "$CREDENTIAL_KEY" \
+       2>/dev/null | grep -qxF "$HELPER"; then
+    ok "$GHOME/.gitconfig: $CREDENTIAL_KEY $HELPER"
+  else ko "$GHOME/.gitconfig: no $CREDENTIAL_KEY $HELPER (--enable sets it)"; fi
+  d=$(at "$GHOME/.dsh")
+  if [ -f "$d/hooks.json" ] && [ -d "$d/profiles" ] && [ ! -L "$d" ] \
+     && [ "$(stat -c %u "$d")" = "$guid" ]; then
+    ok "$GHOME/.dsh: hooks.json, profiles $(cd "$d/profiles" && ls | tr '\n' ' ')"
+    mapfile -t files < <(find "$d/hooks.json" "$d/profiles" -maxdepth 2 -type f)
+    for f in $(looks_secret "${files[@]}"); do ko "${f#"$HOSTDIR"} looks like it holds a secret"; done
+  else ko "$GHOME/.dsh: no hooks.json and profiles of the guest's own (--enable copies them)"; fi
+  guests=()
+  for f in "$(at "$ETC")"/guest-*.env; do
+    [ -e "$f" ] || continue
+    a=${f##*/guest-}; a=${a%.env}
+    valid_name "$a" && guests+=("$a")
+  done
+  declare -A folder=()
+  if [ ${#guests[@]} -gt 0 ] && [ -n "$CANON" ]; then
+    if ws=$(canon_workspaces "${guests[@]}" 2>&1); then
+      while IFS=$'\t' read -r a _ dir; do folder[$a]=$dir; done <<<"$ws"
+    else
+      while IFS= read -r line; do ko "canon: $line"; done <<<"$ws"
+    fi
+  elif [ ${#guests[@]} -gt 0 ]; then
+    echo "     (no --canon: each work folder taken for $ROOT/work/<agent>)"
+    for a in "${guests[@]}"; do folder[$a]=$ROOT/work/$a; done
+  fi
+  for a in "${guests[@]}"; do
+    has_token "$a" && ok "GH_TOKEN set in guest-$a.env" || ko "GH_TOKEN not set in $ETC/guest-$a.env"
+    dir=${folder[$a]:-}
+    [ -n "$dir" ] || continue
+    if origin=$(origin_of "$dir") && [ "$(stat -c %u "$(at "$dir")")" = "$guid" ]; then
+      head=$(head -c 200 "$(at "$dir/.git/HEAD")" 2>/dev/null || true)
+      case "$head" in "ref: "*) head=${head#ref: } ;; *) head="detached at ${head:0:12}" ;; esac
+      ok "$dir: a clone of $origin, $head"
+    else ko "$dir: not a clone of the guest's (--enable makes it)"; fi
+  done
   for u in $(runner_units); do
     echo "     $u: $(systemctl is-enabled "$u" 2>/dev/null || true), $(systemctl is-active "$u" 2>/dev/null || true)"
   done
@@ -386,6 +623,82 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
       || die "AMEESH_DSN is not set in $ETC/guest.env (the host's login role, L56)"
     for a in "${TARGETS[@]}"; do
       [ "$DRY" = 1 ] || [ -f "$ETC/guest-$a.env" ] || die "missing $ETC/guest-$a.env"
+    done
+    user_exists || [ "$DRY" = 1 ] || die "no user $GUEST: install first"
+    # everything checked before anything is done: the canon, each project's
+    # forge, the work folders, the tokens, the dsh profile
+    ws=$(canon_workspaces "${TARGETS[@]}") || die "the canon refuses (above): nothing done"
+    clones=()
+    while IFS=$'\t' read -r a project dir; do
+      [ -n "${REPOS[$project]:-}" ] \
+        || die "$a works on $project: give its forge, --repo $project=https://…#BRANCH"
+      if origin=$(origin_of "$dir"); then
+        same_repo "$origin" "${REPOS[$project]%%#*}" \
+          || die "$dir is a clone of $origin, not of ${REPOS[$project]%%#*}: move it away first"
+        echo "kept $dir: a clone of $origin (never fetched nor reset here)"
+        continue
+      fi
+      if ! absent "$dir"; then
+        # (an unreadable folder is never taken for an empty one)
+        not_a_dir "$dir" || ! entries=$(ls -A -- "$(at "$dir")") || [ -n "$entries" ] \
+          && die "$dir is not empty and not a clone of ${REPOS[$project]%%#*}: move it away first"
+      fi
+      if ! has_token "$a"; then
+        [ "$DRY" = 1 ] || die "GH_TOKEN not set in $ETC/guest-$a.env: $dir cannot be cloned"
+        echo "warning: GH_TOKEN not set in $ETC/guest-$a.env (refused for real)"
+      fi
+      clones+=("$a $dir ${REPOS[$project]}")
+    done <<<"$ws"
+    dsh_dst=$GHOME/.dsh
+    copy=()
+    if [ -f "$(at "$dsh_dst/hooks.json")" ] && [ -d "$(at "$dsh_dst/profiles")" ]; then
+      echo "kept $dsh_dst: hooks.json and profiles there already"
+    else
+      if [ -z "$DSH_FROM" ] && [ -z "$HOSTDIR" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        DSH_FROM=$(getent passwd "$SUDO_USER" | cut -d: -f6)/.dsh
+      fi
+      [ -n "$DSH_FROM" ] || die "no dsh profile in $dsh_dst: give --dsh-from DIR (a ~/.dsh)"
+      mapfile -t copy < <(dsh_files "$DSH_FROM")
+      [ "${copy[0]:-}" = hooks.json ] && [ ${#copy[@]} -gt 1 ] \
+        || die "$DSH_FROM: no hooks.json, or no profile in profiles/"
+      secrets=$(cd "$DSH_FROM" && looks_secret "${copy[@]}")
+      [ -z "$secrets" ] || die "not copied, they look like they hold a secret: $(echo $secrets)"
+    fi
+
+    say "the guest's git credential: $HELPER, for https://github.com"
+    helper_text | put "$HELPER" 0755 root:root
+    as_guest git config --file "$GHOME/.gitconfig" --replace-all "$CREDENTIAL_KEY" "$HELPER"
+    if [ ${#copy[@]} -gt 0 ]; then
+      say "the guest's dsh profile: ${copy[*]}, from $DSH_FROM"
+      as_guest install -d -m 0700 "$dsh_dst"
+      # read by root, written by the guest
+      if [ "$DRY" = 1 ]; then
+        echo "+ tar -C $DSH_FROM -cf - ${copy[*]} | runuser -u $GUEST -- tar -C $dsh_dst -xf - --no-same-owner"
+      else
+        (cd / && tar -C "$DSH_FROM" -cf - -- "${copy[@]}" \
+           | runuser -u "$GUEST" -- tar -C "$dsh_dst" -xf - --no-same-owner) \
+          || die "the dsh profile was not copied to $dsh_dst"
+      fi
+    fi
+    for c in "${clones[@]}"; do
+      read -r a dir spec <<<"$c"
+      say "$a: $dir, a clone of ${spec%%#*} detached on origin/${spec#*#}"
+      # the token from its secrets file, in the environment of git only
+      if [ "$DRY" = 1 ]; then
+        echo "+ (GH_TOKEN of $ETC/guest-$a.env in the environment, never on a command line)"
+        token=
+      else
+        token=$(token_of "$a")
+      fi
+      GH_TOKEN=$token GIT_TERMINAL_PROMPT=0 \
+        as_guest git -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" \
+        || die "the clone of ${spec%%#*} failed"
+      as_guest git -C "$dir" checkout --quiet --detach "origin/${spec#*#}" \
+        || die "origin/${spec#*#}: no such branch in ${spec%%#*} ($dir kept, without checkout)"
+    done
+    unset token
+
+    for a in "${TARGETS[@]}"; do
       run systemctl enable --now "ameesh-guest-runner@$a.service"
     done
   else
@@ -434,7 +747,7 @@ if [ "$MODE" = uninstall ]; then
   run rm -f "$UNITS/ameesh-guest-runner@.service" "$UNITS/ameesh-guard.service" \
             "$UNITS/ameesh-guest.slice" "$UNITS/ameesh.slice.d/guest-weight.conf" "$PATH_DROPIN"
   run rmdir --ignore-fail-on-non-empty "$UNITS/ameesh.slice.d" "$(dirname "$PATH_DROPIN")" || true
-  run rm -f "$TMPFILES"
+  run rm -f "$TMPFILES" "$HELPER"
   remove_tree --runtime /run/ameesh-gate || true
   # the guard's runtime caps (systemd keeps them until the reboot)
   remove_tree --runtime "$CONTROL/ameesh-guest.slice.d" || true
@@ -700,7 +1013,8 @@ Next:
   1. fill $ETC/guest.env (AMEESH_DSN) and $ETC/guest-<agent>.env;
   2. $0 --check;
   3. after the canon PR (Host policy.lend, placements of ${AGENTS[*]} on $HOST):
-     $0 --enable ${AGENTS[*]}
+     $0 --enable ${AGENTS[*]} --canon <canon checkout> --repo <project>=https://…#<branch>
+     (their clones, git credential and dsh profile, then their runners)
   4. after a day of observation: $0 --set-guard-mode enforce
 Rollback: $0 --uninstall [--purge]
 EOF

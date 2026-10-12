@@ -157,11 +157,49 @@ deepseek1 move from manaty-mesh-1 to ameesh-agents-1, which keeps
 `max_agents: 0` there. Their runners on manaty-mesh-1 are
 stopped first: an agent runs on one host at a time.
 
+`--enable` first prepares what each guest needs to work (lot #483: the
+three steps bureau did by hand on the first activation), then starts the
+runners. Everything is checked before anything is done:
+
+* **its clone**: the agent's project (`team`, here `nexlink`) and its work
+  folder (`policy.work_dirs`, `/srv/ameesh-guest/work/{agent}`) are read in
+  the canon (`--canon`, at `origin/main`, by ameesh's reader, as the
+  checkout's owner); the canon holds no forge for a project, so `--repo`
+  gives it: `https` only, no user or token in the URL. The guest clones it
+  there, detached on `origin/<branch>`. A folder outside
+  `/srv/ameesh-guest/work`, an agent not placed on the host, a folder
+  holding anything but a clone of that repository: refused. A clone already
+  there is kept as it is (never fetched nor reset);
+* **its git credential**: `/opt/ameesh/git-credential-guest` (root, 0755),
+  named in the guest's `~/.gitconfig` for `https://github.com`. It hands
+  git the runner's `GH_TOKEN`, which systemd reads in
+  `/etc/ameesh/guest-<agent>.env`: the token is never written anywhere else
+  nor printed, and for the clone it goes in git's environment, never on a
+  command line. A clone without `GH_TOKEN` in the agent's file is refused;
+* **the dsh profile**: `hooks.json` and the plain files of
+  `~/.dsh/profiles/*/` from `--dsh-from` (by default the `sudo` user's
+  `~/.dsh`), never its sessions, keys, logs or modules; refused if a file
+  looks like it holds a key, token or password. Kept if the guest has one.
+
+What lands in the guest's home or work is written by the guest
+(`runuser -u ameesh-guest`), never by root. `--check` reports each of them
+(with `--canon`, the folders the canon gives; without, `work/<agent>`).
+
 ```sh
-sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1
-sudo deploy/guest/install-pilot.sh --check
+sudo deploy/guest/install-pilot.sh --dry-run --enable deepseek6 deepseek1 \
+  --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \
+  --repo nexlink=https://github.com/manaty/nexlink.git#develop   # read it all
+sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1 \
+  --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \
+  --repo nexlink=https://github.com/manaty/nexlink.git#develop
+sudo deploy/guest/install-pilot.sh --check --canon /home/ameesh/canon
 systemctl status 'ameesh-guest-runner@*'
 ```
+
+On ameesh-agents-1, where bureau made the clones, the credential and the
+profile by hand on 2026-10-12: the clones and the profile are kept (said
+`kept`), the helper replaces bureau's in `~/.gitconfig` (the same
+`GH_TOKEN`, from the same file), and `--check` shows them all.
 
 After a day of observation without a missed target
 (`ameesh hosts ameesh-agents-1 --report --days 1`):
