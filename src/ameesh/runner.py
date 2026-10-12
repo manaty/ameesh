@@ -135,6 +135,9 @@ def log_async(message: str) -> None:
 
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
+#: L159f : tant que la porte d'hôte n'est pas fixée (canon pas encore lu en
+#: entier), le sync du canon est réessayé à ce pas (secondes)
+GATE_SETTLE_RETRY_S = 30
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
@@ -4269,6 +4272,8 @@ class Runner:
         cours. Un échec — canon, git, base — est journalisé et rend `False`.
         """
         entries = canon_mod.configured(self.cfg)
+        # L159f : aucun canon, aucune fiche Host prêteuse : la porte est fixée
+        self._canon_complete = not entries
         if not entries:
             return True
         db = None
@@ -4335,6 +4340,9 @@ class Runner:
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced)
+            # L159f : la porte d'hôte n'est fixée que sur TOUS les canons
+            # configurés (un hôte prêteur l'est par sa fiche Host, `policy.lend`)
+            self._canon_complete = bool(entries) and len(synced) == len(entries)
             orchestres = getattr(self, "refresh_orchestrators", None)
             if orchestres is not None and synced:
                 orchestres(*synced)
@@ -4349,24 +4357,44 @@ class Runner:
                 except Exception:
                     pass
 
+    def _settle_gate_after_sync(self) -> bool:
+        """L159f : la porte d'hôte n'est fixée (réclamations permises) qu'après
+        un sync qui a lu tous les canons configurés : un canon momentanément
+        illisible ne fait pas d'un hôte prêteur un hôte classique, ouvert."""
+        if getattr(self, "_canon_complete", False):
+            self._gate_settled.set()
+            return True
+        if not self._gate_settled.is_set() and not getattr(self, "_settle_logged", False):
+            self._settle_logged = True
+            log_async("porte d'hôte : canon non lu en entier, aucune réclamation "
+                      "avant un sync complet (nouvel essai toutes les %ds)"
+                      % GATE_SETTLE_RETRY_S)
+        return False
+
     def _canon_sync_loop(self) -> None:
         while not self.stop.is_set():
             self.canon_sync_once()
-            # L159f : réussi ou non, la porte d'hôte est fixée pour ce passage
-            self._gate_settled.set()
-            if self.stop.wait(self.canon_sync_interval):
+            settled = self._settle_gate_after_sync()
+            # avant la première porte fixée, on réessaie vite
+            wait = (self.canon_sync_interval if settled or self.canon_sync_interval <= 0
+                    else min(self.canon_sync_interval, GATE_SETTLE_RETRY_S))
+            if wait <= 0:
+                # pas de sync périodique : seulement jusqu'à la première porte fixée
+                if settled:
+                    return
+                wait = GATE_SETTLE_RETRY_S
+            if self.stop.wait(wait):
                 return
 
     def start_canon_sync(self) -> None:
         """Lance le sync du canon : immédiat, puis périodique (spec §4.4).
 
-        Sans canon configuré ou avec un intervalle nul, il n'y a rien à faire.
+        Sans canon configuré, il n'y a rien à faire. Avec un intervalle nul,
+        le sync n'est refait que jusqu'à la première porte d'hôte fixée (L159f).
         En mode `--once`, le sync est fait en ligne (le fil n'aurait pas le
         temps de tourner) ; sinon un fil dédié s'en charge.
         """
-        if not self.cfg.canon or self.canon_sync_interval <= 0:
-            if self.cfg.canon:
-                self.canon_sync_once()  # seulement au démarrage
+        if not self.cfg.canon:
             self._gate_settled.set()
             return
         if self.once:
@@ -4374,6 +4402,11 @@ class Runner:
             return
         if self.canon_thread is not None:
             return
+        if self.canon_sync_interval <= 0:
+            self.canon_sync_once()  # seulement au démarrage…
+            if self._settle_gate_after_sync():
+                return
+            # … ou jusqu'à la première porte d'hôte fixée (fil ci-dessous)
         self.canon_thread = threading.Thread(
             target=self._canon_sync_loop, daemon=True, name="canon-sync")
         self.canon_thread.start()
