@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L161b — flux des résultats de tests (JSON lignes) et ordre simple.
 
-`scripts/test-parts.py lancer --flux` écrit une ligne par test terminé
-(`ameesh-test-event/1`) ; `--depuis` fait passer d'abord, dans chaque part,
-les modules de test touchés par les fichiers changés ; `scripts/ci-flux.py
+`scripts/test-parts.py run --flow` écrit une ligne par test terminé
+(`ameesh-test-event/1`) ; `--since` fait passer d'abord, dans chaque part,
+les modules de test touchés par les fichiers changés ; `scripts/ci-flow.py
 resume` en fait le résumé du job. La CI publie le flux en artefact.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _charger(nom: str, fichier: str):
 
 
 parts = _charger("test_parts_l161b", "test-parts.py")
-ciflux = _charger("ci_flux_l161b", "ci-flux.py")
+ciflux = _charger("ci_flux_l161b", "ci-flow.py")
 
 
 class OrdreTest(unittest.TestCase):
@@ -51,7 +51,7 @@ class OrdreTest(unittest.TestCase):
     def test_classes(self):
         changes = ["tests/test_change.py", "src/ameesh/resources.py",
                    "scripts/version-only.py", "tests/parts/pilote-psql.txt", "deploy/README.md"]
-        classes = parts.classer(self.mods, changes, tests=self.dossier, ambigus={"README.md"})
+        classes = parts.classify(self.mods, changes, tests=self.dossier, ambigus={"README.md"})
         self.assertEqual(classes["test_change"], ("P0", "tests/test_change.py"))
         for m in ("test_pointe", "test_from"):
             self.assertEqual(classes[m], ("P1", "src/ameesh/resources.py"), m)
@@ -67,13 +67,13 @@ class OrdreTest(unittest.TestCase):
                    "d": ("P0", "tests/d.py"), "e": ("P3", "")}
         pesees = {"a": 1.0, "b": 50.0, "c": 5.0, "d": 90.0, "e": 0.5}
         # le reste garde l'ordre alphabétique, quel que soit son poids
-        self.assertEqual(parts.ordonner(["a", "b", "c", "d", "e"], pesees, classes),
+        self.assertEqual(parts.order(["a", "b", "c", "d", "e"], pesees, classes),
                          ["d", "c", "b", "a", "e"])
         # sans fichiers changés : l'ordre alphabétique d'aujourd'hui
-        self.assertEqual(parts.ordonner(["e", "a", "b"], pesees, {}), ["a", "b", "e"])
+        self.assertEqual(parts.order(["e", "a", "b"], pesees, {}), ["a", "b", "e"])
 
     def test_diff_illisible_ordre_inchange(self):
-        self.assertIsNone(parts.fichiers_changes("ref-qui-n-existe-pas", repo=self.dossier))
+        self.assertIsNone(parts.changed_files("ref-qui-n-existe-pas", repo=self.dossier))
 
 
 def _cas():
@@ -113,13 +113,13 @@ def _cas():
 class FluxTest(unittest.TestCase):
     def _lancer(self, *classes_de_test):
         chemin = pathlib.Path(tempfile.mkdtemp()) / "flux.jsonl"
-        flux = parts.Flux(chemin, {"depot": "manaty/ameesh", "part": "psql 1/1"})
+        flux = parts.Flow(chemin, {"depot": "manaty/ameesh", "part": "psql 1/1"})
         classes = {__name__.rsplit(".", 1)[-1]: ("P1", "src/ameesh/x.py")}
-        cls = type("_R", (parts._Resultat,), {"flux": flux, "classes": classes})
+        cls = type("_R", (parts._Result,), {"flux": flux, "classes": classes})
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(c)
                                    for c in classes_de_test)
         unittest.TextTestRunner(stream=io.StringIO(), resultclass=cls).run(suite)
-        flux.fermer()
+        flux.close()
         return [json.loads(l) for l in chemin.read_text(encoding="utf-8").splitlines()]
 
     def test_une_ligne_par_test(self):
@@ -138,7 +138,7 @@ class FluxTest(unittest.TestCase):
         echec = next(l for l in lignes if l["statut"] == "echec")
         self.assertIn("AssertionError", echec["extrait"])
         self.assertEqual(echec["rejouer"], f"python -m unittest {echec['test']}")
-        self.assertLessEqual(len(echec["extrait"].splitlines()), parts.EXTRAIT_LIGNES)
+        self.assertLessEqual(len(echec["extrait"].splitlines()), parts.EXCERPT_LINES)
         self.assertNotIn("extrait", next(l for l in lignes if l["statut"] == "succes"))
 
     def test_erreur_de_setupclass(self):
@@ -165,7 +165,7 @@ class ResumeTest(unittest.TestCase):
         ]
         f.write_text("".join(json.dumps(l) + "\n" for l in lignes) + '{"v": 1, "ty',
                      encoding="utf-8")
-        texte = ciflux.resume([str(f), str(dossier / "absent.jsonl")])
+        texte = ciflux.summary([str(f), str(dossier / "absent.jsonl")])
         self.assertIn("### Tests psycopg 2/4 : rouge, 1 min 15 s", texte)
         self.assertIn("1 echec, 1 succes ; 1 ligne(s) illisible(s)", texte)
         self.assertIn("`test_a` (P0)", texte)
@@ -177,7 +177,7 @@ class ResumeTest(unittest.TestCase):
         f = pathlib.Path(tempfile.mkdtemp()) / "flux.jsonl"
         f.write_text(json.dumps({"v": 1, "type": "debut", "part": "psql 1/1"}) + "\n",
                      encoding="utf-8")
-        self.assertIn("inachevée", ciflux.resume([str(f)]))
+        self.assertIn("inachevée", ciflux.summary([str(f)]))
 
 
 class WorkflowTest(unittest.TestCase):
@@ -189,13 +189,13 @@ class WorkflowTest(unittest.TestCase):
             job = texte[debut:fin]
             # L161f : l'ordre vient du plan du job « plan », lu par chaque part
             self.assertIn('--plan "$RUNNER_TEMP/plan.json"', job, pilote)
-            self.assertIn('--flux "$RUNNER_TEMP/flux.jsonl"', job, pilote)
+            self.assertIn('--flow "$RUNNER_TEMP/flux.jsonl"', job, pilote)
             self.assertIn(f"name: flux-{pilote}-${{{{ matrix.part }}}}", job, pilote)
             self.assertIn("actions/upload-artifact@v4", job, pilote)
             # résumé (ancre &resume, reprise par *resume) et artefact, même en échec
             self.assertRegex(job, r"- [&*]resume\b", pilote)
             self.assertIn("if: always()\n        uses: actions/upload-artifact@v4", job, pilote)
-        self.assertIn('ci-flux.py resume "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"',
+        self.assertIn('ci-flow.py summary "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"',
                       texte)
 
 

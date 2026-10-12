@@ -423,7 +423,8 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "model": row.get("model") or row.get("turn_model") or None,
         "effort": effort,
         "host": row.get("host") or None,
-        "project": row.get("team") or row.get("chantier") or None,
+        "project": (row.get("team") or row.get("workstream")
+                    or row.get("chantier") or None),
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),

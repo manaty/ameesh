@@ -139,7 +139,7 @@ class Decisions(interface.Decisions):
         rows = self.db.query(
             """
             INSERT INTO agent_registry
-                (name, chantier, harness, host, cwd, session_id, status, status_text,
+                (name, workstream, harness, host, cwd, session_id, status, status_text,
                  mode, responsible, created_by, last_seen, updated_at)
             VALUES (%s, '', %s, %s, %s, NULL, 'idle', %s, 'externe', %s, %s, now(), now())
             ON CONFLICT (name) DO UPDATE SET
