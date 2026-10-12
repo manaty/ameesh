@@ -117,7 +117,7 @@ class LeaderPopenTest(unittest.TestCase):
             fil.start()
             fil.join(2)
             self.assertFalse(fil.is_alive(), "orphan cleanup blocked on the reap lock")
-            self.assertEqual(box, [0])
+            self.assertEqual(box, [None])               # deferred: no exit code yet
             self.assertIsNone(proc.returncode)          # deferred, not dropped
             del proc, box
             gc.collect()                                # __del__ under the held lock
@@ -126,6 +126,31 @@ class LeaderPopenTest(unittest.TestCase):
             lock.release()
         subprocess._cleanup()                           # CPython's retry
         self.assertEqual(_state(pid), "")
+
+    def test_a_deferred_cleanup_stays_in_subprocess_active(self):
+        # codex r5: `_cleanup()` under the held lock keeps the orphan in
+        # `_active`; the next one, once the lock is free, kills its group
+        # (the descendant too) and reaps it
+        proc = resident.spawn_leader(
+            [sys.executable, "-c", "import subprocess, sys; "
+             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+             "sys.exit(0)"], start_new_session=True)
+        self.addCleanup(proc.reap)
+        self.assertEqual(proc.wait(5), 0)
+        time.sleep(0.3)
+        pid = proc.pid
+        subprocess._active.append(proc)                 # as `__del__` leaves it
+        self.addCleanup(lambda: proc in subprocess._active and subprocess._active.remove(proc))
+        with proc._reap_lock:
+            subprocess._cleanup()
+            self.assertIn(proc, subprocess._active)     # not dropped
+            self.assertIsNone(proc.returncode)
+        self.assertFalse(_group_gone(pid, timeout=0.2))  # its descendant still runs
+        subprocess._cleanup()                           # the retry, lock free
+        self.assertNotIn(proc, subprocess._active)
+        self.assertIsNotNone(proc.returncode)
+        self.assertEqual(_state(pid), "")
+        self.assertTrue(_group_gone(pid))
 
     def test_kill_group_signals_under_the_reap_lock(self):
         # codex r3: a reap between poll() and the signal never lets it out

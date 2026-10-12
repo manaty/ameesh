@@ -221,12 +221,15 @@ class LeaderPopen(subprocess.Popen):
             # its group is killed while its number is ours, then it is reaped.
             # Never blocking in a finalizer (codex r4): lock taken elsewhere,
             # `returncode` stays None and CPython keeps the object in
-            # `subprocess._active`, whose next `_cleanup()` retries.
+            # `subprocess._active`, whose next `_cleanup()` retries — as long
+            # as None is returned: `_cleanup()` drops whatever returns an exit
+            # code, reaped or not (codex r5).
             if self._reap_lock.acquire(blocking=False):
                 try:
                     self._reap_locked(0.0)
                 finally:
                     self._reap_lock.release()
+            return self.returncode
         return code
 
     def _wait(self, timeout=None):
