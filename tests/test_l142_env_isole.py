@@ -2,9 +2,10 @@
 """L142 : la suite donne le même verdict sur le poste et en CI.
 
 Un poste « pollué » (configuration ~/.config/ameesh/config.json avec canon et
-humains, ancienne config agent-mesh, variables AMEESH_* d'une session d'agent)
-ne doit rien changer à ce que voient les tests une fois `tests.support`
-importé : ni dans le processus, ni dans les sous-processus (`child_env`).
+humains, ancienne config agent-mesh, variables AMEESH_* d'une session d'agent,
+caches npm/pnpm/yarn/XDG que le ménage redirige) ne doit rien changer à ce que
+voient les tests une fois `tests.support` importé : ni dans le processus, ni
+dans les sous-processus (`child_env`).
 """
 from __future__ import annotations
 
@@ -17,17 +18,28 @@ import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+#: L73 : les caches du poste que la sonde pose. Le ménage les redirige et
+#: respecte un choix déjà posé : la suite ne doit pas les hériter, et un test
+#: qui veut ce cas les pose lui-même.
+CACHE_POLLUE = ("npm_config_cache", "npm_config_store_dir", "pnpm_config_store_dir",
+                "NPM_CONFIG_PRODUCTION", "YARN_CACHE_FOLDER", "XDG_CACHE_HOME")
+
 PROBE = r"""
 import json, os
 from tests import support
 from ameesh import config as config_mod
 cfg = config_mod.load()
 child = config_mod.load(env=support.child_env())
+CACHE = %r
 print(json.dumps({
     "env": sorted(n for n in os.environ
                   if n.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))),
     "child_env": sorted(n for n in support.child_env()
                         if n.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))),
+    "cache": sorted(n for n in CACHE if n in os.environ),
+    "child_cache": sorted(n for n in CACHE if n in support.child_env()),
+    "posed": support.child_env(npm_config_store_dir="/choix/explicite"
+                               ).get("npm_config_store_dir"),
     "humans": [cfg.humans, child.humans],
     "host": [cfg.host, child.host],
     "runner_id": [cfg.runner_id, child.runner_id],
@@ -35,7 +47,7 @@ print(json.dumps({
     "state_dir": [cfg.state_dir, child.state_dir],
     "dsn": cfg.dsn,
 }))
-"""
+""" % (CACHE_POLLUE,)
 
 
 class PosteIsoleTest(unittest.TestCase):
@@ -74,6 +86,9 @@ class PosteIsoleTest(unittest.TestCase):
             AMEESH_CANON="/canon/reel", AMEESH_REQUIRE_RESPONSIBLE="1",
             AMEESH_CONFIG=os.path.join(self.home, ".config", "ameesh", "config.json"),
             AMEESH_TEST_DSN="postgresql://banc@127.0.0.1:1/banc",
+            # L73/L142 : un agent exécuté par ameesh porte les caches que le
+            # ménage redirige ; ils ne changent rien à la vue des tests
+            **{name: "/poste/" + name for name in CACHE_POLLUE},
         )
         propre = self.probe(AMEESH_TEST_DSN="postgresql://banc@127.0.0.1:1/banc")
         self.assertEqual(pollue, propre)
@@ -87,6 +102,11 @@ class PosteIsoleTest(unittest.TestCase):
                      "AMEESH_REQUIRE_RESPONSIBLE", "AMEESH_HUMANS", "AMEESH_STATE"):
             self.assertNotIn(name, pollue["env"])
             self.assertNotIn(name, pollue["child_env"])
+        # les caches du poste non plus, dans le processus comme dans les
+        # sous-processus ; un test qui pose le sien est respecté
+        self.assertEqual(pollue["cache"], [])
+        self.assertEqual(pollue["child_cache"], [])
+        self.assertEqual(pollue["posed"], "/choix/explicite")
         # les réglages du banc, eux, sont conservés
         self.assertIn("AMEESH_TEST_DSN", pollue["env"])
 

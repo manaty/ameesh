@@ -153,6 +153,21 @@ class _Paye(PgTestCase):
 
 
 class PartDuPlafondHoraireTest(_Paye):
+    def test_declaration_appareil_exclue_du_plafond_horaire(self):
+        self.ligne(1.0, 600)
+        storage.of(self.db).turn_costs.insert(
+            agent="ds", harness="deepseek", turn="device-report", model="m",
+            session=None, usd=50.0, cum_usd=None, cum_input_tokens=None,
+            cum_cached_input_tokens=None, cum_output_tokens=None,
+            input_tokens=10, cached_input_tokens=0, output_tokens=5, source="device")
+        # Without balance observations, only the server's ledger line counts.
+        self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 1.0)
+        self.assertEqual(self.book.over("ds", paid_harnesses=["deepseek"], pace=False), "")
+        # Server costs still enforce the cap even alongside a device report.
+        self.ligne(19.0, 300)
+        self.assertIn("(cap 20.00 $)",
+                      self.book.over("ds", paid_harnesses=["deepseek"], pace=False))
+
     def test_un_non_critique_s_arrete_a_75_pour_cent(self):
         self.ligne(16.0, 600)             # pas de relevé : l'estimation
         self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 16.0)
@@ -276,8 +291,10 @@ class AlerteCritiqueTest(PgTestCase):
 class MarqueDeLExecuteurTest(_L30Base):
     def test_la_pause_d_un_critique_est_marquee(self):
         comptes = self._claude_comptes()
+        # sans harnais de repli (L242b (3), testé à part) : la pause reste
         _runner, worker = self._worker("orch", "claude", {"claude": comptes},
-                                       critical_agents=("orch",))
+                                       critical_agents=("orch",),
+                                       critical_fallback_harnesses=())
         try:
             with mock.patch.object(account_turn, "choose", return_value="pause (x) until 14:20"):
                 self.assertFalse(worker.budget_ok())

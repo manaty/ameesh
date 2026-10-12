@@ -149,7 +149,7 @@ class Config:
     dsn: str = DEFAULT_DSN
     schema: str = "public"
     driver: str = "auto"  # auto | psycopg | psql
-    backend: str = "auto"  # auto | pg | file
+    backend: str = "auto"  # auto | pg | file | mediated
     state_dir: str = _expand(DEFAULT_STATE)
     v0_state: str = _expand(DEFAULT_V0_STATE)
     config_dir: str = _expand(DEFAULT_V0_CONFIG)
@@ -180,6 +180,15 @@ class Config:
     #: temps ; un message urgent ou d'un humain réveille tout de suite.
     #: Réglable par agent (`ameesh set <agent> mail_batch=…`). 0 = réveil immédiat.
     mail_batch: float = 90.0
+    #: #408 (L165b, règle 1) : l'exécuteur réveille un agent au repos depuis
+    #: `mail_batch` + `lot_wake_margin` qui détient un lot actionnable
+    #: (`intake`/`build`), avec la consigne de le reprendre ; au plus
+    #: `lot_wake_max` réveils sans effet par lot (backoff doublé, en base),
+    #: puis l'auditeur prend le relais. Désactivable par hôte
+    #: (`AMEESH_LOT_WAKE=0`) ou par agent (`ameesh set <agent> lot_wake=off`).
+    lot_wake: bool = True
+    lot_wake_margin: float = 60.0
+    lot_wake_max: int = 3
     #: plafond (octets UTF-8) de la consigne entière d'un tour de courrier ;
     #: au-delà, les messages les plus récents attendent le tour suivant
     prompt_mail_max: float = 20000.0
@@ -209,6 +218,10 @@ class Config:
     #: 2026-10-12 : 0.75, soit 15 $ sur 20) ; un critique va jusqu'au plafond
     #: plein. Entre 0 et 1 ; une valeur hors bornes : le défaut.
     noncritical_hourly_share: float = 0.75
+    #: L242b (3) : les harnais vers lesquels un agent critique au seuil sur
+    #: tous les comptes du sien tourne, dans l'ordre (un harnais au forfait,
+    #: puis un harnais à clé d'API), par rotation avec résumé. Vide : aucun.
+    critical_fallback_harnesses: tuple[str, ...] = ("codex", "deepseek")
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
@@ -361,9 +374,22 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: L109 : exécuteur médié (`backend: mediated`) — URL du serveur du mesh
+    #: (`/api/exec/v1`) et fichier 0600 du jeton d'accès de l'exécuteur (la
+    #: source réelle du jeton est l'identité de l'exécuteur, L110). Dans la
+    #: VM, la session du harnais reçoit AMEESH_EXEC_URL et AMEESH_EXEC_TOKEN.
+    exec_url: str = ""
+    exec_token_file: str = ""
+    #: L109: mediated host, provider/DB credentials remain on the server.
+    host_mediated: bool = False
+    #: Off-device session backup; storage credentials come from the environment.
+    session_backup: dict = field(default_factory=dict)
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
+    #: #453: duration cap of a heavy command (`ameesh heavy`), seconds or
+    #: `90m`/`2h`; `AMEESH_HEAVY_MAX_S` overrides it; 0 = no cap
+    heavy_max_seconds: float | str = 3600.0
     #: L226a: the `credential_sentinel` key of the host configuration
     #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
     credential_sentinel: dict = field(default_factory=dict)
@@ -377,6 +403,8 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: Neutral memory transport settings; ssh_key names a host-managed key file.
+    persona_memory: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
@@ -462,6 +490,7 @@ def load(env: dict | None = None) -> Config:
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf
     # Fils lisibles : AMEESH_THREADS > `threads_dir` du JSON > `<état>/fils`.
     threads_brut = pick("AMEESH_THREADS", default=cfg.threads_dir)
+    exec_token_file = pick("AMEESH_EXEC_TOKEN_FILE", default=cfg.exec_token_file)
     cfg = replace(
         cfg,
         dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
@@ -487,6 +516,10 @@ def load(env: dict | None = None) -> Config:
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
         mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
                                _as_seconds(cfg.mail_batch, Config.mail_batch)),
+        lot_wake=bool(_as_bool(pick("AMEESH_LOT_WAKE"), cfg.lot_wake, "AMEESH_LOT_WAKE")),
+        lot_wake_margin=_as_seconds(pick("AMEESH_LOT_WAKE_MARGIN"),
+                                    _as_seconds(cfg.lot_wake_margin, Config.lot_wake_margin)),
+        lot_wake_max=max(0, int(_as_float(pick("AMEESH_LOT_WAKE_MAX"), cfg.lot_wake_max))),
         prompt_mail_max=_as_float(pick("AMEESH_PROMPT_MAIL_MAX"), cfg.prompt_mail_max),
         canon_sync_interval=_as_float(
             pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),
@@ -512,6 +545,11 @@ def load(env: dict | None = None) -> Config:
             n.strip() for n in (cfg.critical_agents.split(",")
                                 if isinstance(cfg.critical_agents, str)
                                 else cfg.critical_agents or ()) if str(n).strip()),
+        critical_fallback_harnesses=_as_names(pick("AMEESH_CRITICAL_FALLBACK_HARNESSES"))
+        or tuple(n.strip() for n in (cfg.critical_fallback_harnesses.split(",")
+                                     if isinstance(cfg.critical_fallback_harnesses, str)
+                                     else cfg.critical_fallback_harnesses or ())
+                 if str(n).strip()),
         noncritical_hourly_share=_as_share(
             pick("AMEESH_NONCRITICAL_HOURLY_SHARE"),
             _as_share(cfg.noncritical_hourly_share, Config.noncritical_hourly_share)),
@@ -572,6 +610,8 @@ def load(env: dict | None = None) -> Config:
         shared_sessions=bool(_as_bool(pick("AMEESH_SHARED_SESSIONS",
                                            default=cfg.shared_sessions), False,
                                       "AMEESH_SHARED_SESSIONS")),
+        exec_url=str(pick("AMEESH_EXEC_URL", default=cfg.exec_url) or "").strip(),
+        exec_token_file=_expand(str(exec_token_file)) if exec_token_file else "",
     )
     # L42 (0031) : une liste venue de l'environnement remplace celle du fichier
     env_untrusted = _as_bool(pick("AMEESH_CANON_UNTRUSTED", "AGENT_MESH_CANON_UNTRUSTED",
@@ -621,10 +661,14 @@ def load(env: dict | None = None) -> Config:
         host_gate_ack=_expand(str(gate_ack)) if gate_ack else "",
         host_gate_fallback=str(pick("AMEESH_HOST_GATE_FALLBACK",
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
+        host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
+                                    False, "AMEESH_HOST_MEDIATED")),
         host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
                                         int(cfg.host_gate_drain))),
     )
-    if cfg.host_gate not in ("", "none", "file"):
+    if cfg.host_gate not in (("", "none", "file", "socket")
+                             if cfg.backend == "mediated" or cfg.host_mediated
+                             else ("", "none", "file")):
         raise SystemExit("AMEESH_HOST_GATE invalide : %r (file | none)" % cfg.host_gate)
     if cfg.host_gate_fallback not in ("", "available", "draining", "stopped"):
         raise SystemExit("AMEESH_HOST_GATE_FALLBACK invalide : %r "
@@ -649,8 +693,11 @@ def load(env: dict | None = None) -> Config:
         raise SystemExit("unreadable config: `harness_bins` expects {harness: path}")
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("invalid AGENT_MESH_DRIVER: %r" % cfg.driver)
-    if cfg.backend not in ("auto", "pg", "file"):
+    if cfg.backend not in ("auto", "pg", "file", "mediated"):
         raise SystemExit("invalid AGENT_MESH_BACKEND: %r" % cfg.backend)
+    if cfg.backend == "mediated" and not cfg.exec_url:
+        raise SystemExit("mediated backend: missing server URL (exec_url or "
+                         "AMEESH_EXEC_URL)")
     return cfg
 
 

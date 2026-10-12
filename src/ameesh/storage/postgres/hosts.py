@@ -14,9 +14,11 @@ la base (`now()`) sauf quand un test la fournit.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any
 
 from .. import interface
+from ... import db as db_mod
 
 #: une liste de textes passée en paramètre : `NULL` si vide/None, sinon un
 #: JSON que l'instruction convertit en `text[]`
@@ -45,7 +47,7 @@ READING_COLUMNS = (
     # L159e6 (0361): the guard's last restart, decoded by `_reading`
     "guard_restart::text AS guard_restart, "
     # L159f (0069): host gate the executor obeys
-    "gate_state, gate_seq, gate_reason"
+    "ameesh_host_gate_state(host, gate_state) AS gate_state, gate_seq, gate_reason"
 )
 
 #: L159d (and #246, L159f) columns written by `record`, in this order
@@ -136,7 +138,29 @@ class Hosts(interface.HostResources):
             + (" WHERE host = %s" if host else "") + " ORDER BY id",
             (host,) if host else ())
 
+    @contextmanager
+    def gate_guard(self, host):
+        # Independent connection: the durable effect intent must stay
+        # committed while the gate lock spans the synchronous host call.
+        gate_db = db_mod.connect(self.db.cfg)
+        try:
+            with gate_db.transaction() as tx:
+                self._lock_gate(tx, host)
+                yield Hosts(tx)
+        finally:
+            gate_db.close()
+
+    @staticmethod
+    def _lock_gate(tx, host):
+        tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                 ("host-gate:" + host,))
+
     def record(self, reading) -> dict:
+        with self.db.transaction() as tx:
+            self._lock_gate(tx, reading.get("host") or "")
+            return Hosts(tx)._record(reading)
+
+    def _record(self, reading) -> dict:
         rows = self.db.query(
             """
             INSERT INTO host_resources

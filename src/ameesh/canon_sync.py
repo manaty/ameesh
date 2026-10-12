@@ -162,6 +162,7 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
 CANON_OK = "ok"
 CANON_INVALID = "invalid"
 CANON_UNREADABLE = "unreadable"
+SYNC_INCOMPLETE = "canon-sync-incomplete"
 _DIAGNOSTIC_MAX = 4000
 
 
@@ -182,7 +183,7 @@ class CanonUnreadable(canon_mod.CanonError):
 @dataclass
 class SyncAction:
     agent: str
-    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé
+    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé | différé
     detail: str = ""
     blocked: list[str] = field(default_factory=list)
     #: verdict de placement écrit pour cet agent (C4), s'il en a un
@@ -349,12 +350,15 @@ def assess(canon: Canon, host: str,
     return CANON_OK, ""
 
 
-def known_projects(db: Db) -> set[str]:
+def known_projects(db: Db, cfg=None) -> set[str]:
     """L243 (#435) : les projets connus hors du canon — `github.projects` de
-    l'hôte et les projets des lots (`agent-project-unknown`)."""
+    l'hôte et les projets des lots (`agent-project-unknown`).
+
+    #495: a given `cfg` wins over `db.cfg`; with neither, no declared project."""
     from . import plan_github
     try:
-        declared = set(plan_github.settings_of(db.cfg).projects)
+        declared = set(plan_github.settings_of(
+            cfg if cfg is not None else getattr(db, "cfg", None)).projects)
     except plan_github.SettingsError:
         declared = set()
     return declared | set(storage.of(db).canon.lot_projects())
@@ -1011,11 +1015,11 @@ def _owner_label(value: str | None) -> str:
     return "canon %s" % value if value else "the default canon"
 
 
-def _write_declared(db: Db, name: str, values: dict) -> None:
+def _write_declared(db: Db, name: str, values: dict) -> bool:
     """Écrit les colonnes déclaratives ; `placement_profile` est le profil des
     valeurs écrites (celles que `placement.evaluate` a jugées), calculé par
     `ameesh_placement_profile` dans la même instruction."""
-    storage.of(db).canon.write_declared(name, values)
+    return storage.of(db).canon.write_declared(name, values)
 
 
 def _clear_responsible(db: Db, name: str, host: str, owner=None) -> None:
@@ -1277,15 +1281,29 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             "placement_ref": verdict.ref,
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
             "canon": None if canon.is_default else ident,
+            # Reject writes based on a pre-handoff read, including after the
+            # handoff is terminal. A missing-row read cannot overwrite a row
+            # inserted concurrently by another synchronizer.
+            "_expected_lease_epoch": row["lease_epoch"] if row is not None else -1,
         }
-        if row is None:
-            _write_declared(db, name, values)
-            action = SyncAction(name, "créé")
-        elif _same(row, values):
+        if row is not None and _same(row, values):
             action = SyncAction(name, "inchangé")
         else:
-            _write_declared(db, name, values)
-            action = SyncAction(name, "mis à jour")
+            if not _write_declared(db, name, values):
+                # A claim or handoff advanced the epoch after our read.
+                # Do not replay old placement values against the new epoch,
+                # report success, or reopen admission on an unapplied policy.
+                message = ("policy update for %s deferred: placement or lease changed "
+                           "during synchronization; retry canon sync" % name)
+                findings.append(canon_mod.Finding(
+                    SYNC_INCOMPLETE, canon_mod.ERROR, message,
+                    path=agent.fiche.path, member=agent.fiche.member,
+                    host=host, untrusted=canon.untrusted))
+                status, diagnostic = assess(canon, host, findings)
+                record_state(db, host, status, diagnostic, canon, key=key)
+                actions.append(SyncAction(name, "différé", message, [SYNC_INCOMPLETE]))
+                continue
+            action = SyncAction(name, "créé" if row is None else "mis à jour")
         action.placement = verdict
         if reasons:
             action.blocked = reasons

@@ -184,7 +184,7 @@ class Canon(interface.Canon):
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
-                   status, status_text,
+                   status, status_text, lease_epoch,
                    placement_ok, placement_diagnostic, placement_ref,
                    placement_profile IS NOT DISTINCT FROM __PROFILE__ AS profile_fresh,
                    (status = 'running' AND lease_expires_at > now()) AS in_turn
@@ -201,15 +201,16 @@ class Canon(interface.Canon):
         return [row["app"] for row in self.db.query(
             "SELECT DISTINCT app FROM work_items WHERE coalesce(app, '') <> '' ORDER BY app")]
 
-    def write_declared(self, name, values) -> None:
+    def write_declared(self, name, values) -> bool:
         """Le profil évalué (`placement_profile`) est celui des valeurs écrites
         (celles que `placement.evaluate` a jugées), calculé par
-        `ameesh_placement_profile` dans la même instruction."""
+        `ameesh_placement_profile` dans la même instruction. False signifie
+        que le CAS a refusé l'écriture : aucune politique n'a été appliquée."""
         caps = _caps_param(values["capabilities"])
         ahosts = _caps_param(values.get("admitted_hosts"))
         atags = _caps_param(values.get("admitted_tags"))
         projects = _caps_param(values.get("projects"))
-        self.db.query(
+        rows = self.db.query(
             """
             INSERT INTO agent_registry
                 (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
@@ -248,6 +249,10 @@ class Canon(interface.Canon):
                 placement_profile = excluded.placement_profile,
                 canon           = excluded.canon,
                 updated_at      = now()
+            WHERE agent_registry.lease_epoch = %s
+              AND (excluded.host = agent_registry.host
+                   OR NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
+                                  AND h.state NOT IN ('verified','cancelled')))
             RETURNING name
             """.replace("__CAPS__", _CAPS_SQL)
                .replace("__AHOSTS__", _CAPS_SQL)
@@ -261,8 +266,10 @@ class Canon(interface.Canon):
              values.get("memory_repository"),
              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
-            + profile_params(values) + (values.get("canon"), projects, projects),
+            + profile_params(values) + (values.get("canon"), projects, projects,
+                                       values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
+        return bool(rows)
 
     def clear_responsible(self, name, host, owner=None) -> None:
         guard, params = _owner(owner)
@@ -326,6 +333,8 @@ class Canon(interface.Canon):
                    placement_profile = NULL,
                    updated_at = now()
              WHERE name = %s AND host = %s
+               AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
+                               AND h.state NOT IN ('verified','cancelled'))
             """,
             (target, canon_ref, diagnostic, ref, name, host))
 
@@ -364,6 +373,9 @@ class Canon(interface.Canon):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
                AND verrou.status NOT IN ('running', 'stopped')
+               AND NOT ameesh_handoff_fenced(r.name)
+               AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name
+                               AND h.state NOT IN ('verified','cancelled'))
                AND %s = ANY(verrou.admitted_hosts)
                -- #254 : rien ne part vers un hôte en pause
                AND NOT EXISTS (SELECT 1 FROM host_holds hh
