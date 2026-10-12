@@ -30,6 +30,26 @@ class UnmeasuredTest(unittest.TestCase):
         partial = {k: v for k, v in FULL.items() if k != "guest_mem_bytes"}
         self.assertEqual(resources.unmeasured(partial), ["guest memory (cgroup)"])
 
+    def test_btrfs_volume_without_allocation(self):
+        vols = [{"path": "/srv", "fstype": "btrfs", "btrfs_unallocated_bytes": None,
+                 "btrfs_metadata_headroom_bytes": None},
+                {"path": "/home", "fstype": "btrfs", "btrfs_unallocated_bytes": 1,
+                 "btrfs_metadata_headroom_bytes": 1},
+                {"path": "/", "fstype": "ext4", "btrfs_unallocated_bytes": None,
+                 "btrfs_metadata_headroom_bytes": None}]
+        self.assertEqual(resources.unmeasured(dict(FULL, volumes=vols)),
+                         ["btrfs allocation (/srv)"])
+
+    def test_volume_records_its_fstype(self):
+        mounts = [{"id": 1, "point": "/", "dev": 1, "fstype": "ext4", "source": "x"},
+                  {"id": 2, "point": "/srv", "dev": 2, "fstype": "btrfs", "source": "y"}]
+        with mock.patch.object(resources.platform, "is_linux", return_value=True), \
+                mock.patch.object(resources.platform, "mountinfo", return_value=mounts), \
+                mock.patch.object(resources, "volume_key", side_effect=lambda p: p), \
+                mock.patch.object(resources, "_anchor", return_value=None):
+            vols = resources.volumes(["/srv/a", "/var"])
+        self.assertEqual([v["fstype"] for v in vols], ["btrfs", "ext4"])
+
     def test_every_measure_named_once(self):
         keys = [k for k, _ in resources.MEASURES]
         self.assertEqual(len(keys), len(set(keys)))
