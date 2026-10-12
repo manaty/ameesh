@@ -84,9 +84,12 @@ class VolumeScriptTest(unittest.TestCase):
                            '[ -z "$STUB_LABEL" ] || echo "LABEL=$STUB_LABEL"\n'
                            'echo "TYPE=$STUB_TYPE"\n')
         self.stub("wipefs", '#!/bin/sh\nprintf "%s" "$STUB_WIPEFS"\nexit "${STUB_WIPEFS_RC:-0}"\n')
-        # findmnt: the table holds / and, with STUB_SRC, the mount point
+        # findmnt: the table holds / and, with STUB_SRC, the mount point;
+        # STUB_ELSEWHERE adds lines "SOURCE TARGET" (other mounts)
         self.stub("findmnt", '#!/bin/sh\n' + fail % ("findmnt", "findmnt")
-                             + 'case "$*" in *TARGET*) echo /; [ -z "$STUB_SRC" ] '
+                             + 'case "$*" in *SOURCE,TARGET*) echo "/dev/vda1 /"; [ -z "$STUB_SRC" ] '
+                             '|| echo "$STUB_SRC /srv/ameesh-guest"; printf "%s" "$STUB_ELSEWHERE"; exit 0 ;;\n'
+                             '  *TARGET*) echo /; [ -z "$STUB_SRC" ] '
                              '|| echo /srv/ameesh-guest; exit 0 ;; esac\n'
                              '[ -n "$STUB_SRC" ] || exit 1\n'
                              'case "$*" in *FSTYPE*) echo "ext4 37.1G" ;; *SOURCE*) echo "$STUB_SRC" ;;\n'
@@ -122,7 +125,7 @@ class VolumeScriptTest(unittest.TestCase):
                    STUB_LSBLK="sdb\n", STUB_SIZE=str(40 * 10 ** 9), STUB_TYPE="",
                    STUB_LABEL="", STUB_UUID="", STUB_WIPEFS="", STUB_WIPEFS_RC="0",
                    STUB_BLKID_RC="", STUB_SRC="", STUB_MUUID="", STUB_MLABEL="",
-                   STUB_LABELDEVS=self.disk + "\n", STUB_FAIL="", STUB_RUNNERS="",
+                   STUB_LABELDEVS=self.disk + "\n", STUB_FAIL="", STUB_RUNNERS="", STUB_ELSEWHERE="",
                    VOLUME_TEST_DIR=self.root)
         env.update({"STUB_" + k.upper(): v for k, v in disk.items()})
         if args[0] in ("create", "detach") and project and "--project-id" not in args:
@@ -469,6 +472,48 @@ class VolumeScriptTest(unittest.TestCase):
             self.assertIn("refused", p.stderr)
             self.assertEqual(self.cmds(p), [], disk)
             self.assertNotIn("--- " + self.fstab, p.stdout)
+
+    def test_label_uniqueness_needs_every_device_resolved(self):
+        # codex #436 r3 P1: blkid lists our disk and a path that does not
+        # resolve (realpath fails): refused, never read as "only ours"
+        self.label_line()
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        gone = os.path.join(self.tmp.name, "gone", "sdz")
+        p = self.run_script("mount", "--volume-id", VOL, **ours,
+                            labeldevs="%s\n%s\n" % (self.disk, gone))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("a label not only the volume", p.stderr)
+        self.assertEqual(self.cmds(p), [])
+        self.assertNotIn("--- " + self.fstab, p.stdout)
+
+    def test_mount_refuses_the_volume_mounted_elsewhere(self):
+        # codex #436 r3 P2: the volume already mounted on /srv/other: no
+        # second mount on the guest's root, whatever the fstab line
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        for line in (self.label_line, lambda: self.our_line("u")):
+            with open(self.fstab, "w") as fh:
+                fh.write("LABEL=cloudimg-rootfs / ext4 discard,errors=remount-ro 0 1\n")
+            line()
+            p = self.run_script("mount", "--volume-id", VOL, **ours,
+                                elsewhere="%s /srv/other\n" % self.disk)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("already mounted on /srv/other", p.stderr)
+            self.assertEqual(self.cmds(p), [])
+        # mounted on the guest's root alone: kept (idempotent)
+        p = self.run_script("mount", "--volume-id", VOL, **ours, src=self.disk, muuid="u",
+                            mlabel="ameesh-guest", elsewhere="/dev/sdc /srv/other\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("already mounted", p.stdout)
+
+    def test_check_after_mount_reads_the_new_fstab(self):
+        # codex #436 r3 P2: the line just added is what check reads next,
+        # not the snapshot taken before it
+        p = self.run_script("mount", "--volume-id", VOL)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("%s for /srv/ameesh-guest, as check reads it: "
+                      "UUID=<uuid> /srv/ameesh-guest ext4 %s 0 2\n" % (self.fstab, OPTS), p.stdout)
 
     def test_check_takes_the_label_line_of_the_volume(self):
         # mesh-design #436: `check` says ok for the by-hand line when its

@@ -41,7 +41,8 @@
 # is written last, once every check passed. A volume mounted by hand before
 # (its line LABEL=ameesh-guest, our options) is adopted as it is, line
 # included, once that label is shown to name this volume and no other disk,
-# and the filesystem mounted is the volume's (its UUID). `unmount` and
+# and the filesystem mounted is the volume's (its UUID). A volume mounted
+# anywhere but the mount point is refused, whatever its fstab line. `unmount` and
 # `detach --delete` act only on the pilot's volume: its name, project and
 # size checked first, the mounted filesystem's source and UUID too.
 # Every probe (findmnt, the mount point's listing, lsblk, blockdev, blkid,
@@ -236,12 +237,16 @@ label_is() { [ "$(realpath -e -- "$BYLABEL/$NAME" 2>/dev/null)" = "$1" ]; }
 uuid_is() { [ -n "$1" ] && [ "$(realpath -e -- "$BYUUID/$1" 2>/dev/null)" = "$2" ]; }
 # label_only DEV (root): LABEL=$NAME names DEV and no other disk, every
 # device probed again (blkid without its cache); the line would mount
-# another disk at the next boot otherwise
+# another disk at the next boot otherwise. A device blkid lists that does
+# not resolve is not compared: it refuses (codex #436 r3 P1)
 label_only() {
-  local devs
+  local devs d r
   label_is "$1" || return 1
-  devs=$(blkid -c /dev/null -o device -t "LABEL=$NAME" 2>/dev/null) || return 1
-  [ "$(printf '%s\n' "$devs" | xargs -r -n1 realpath -- | sort -u)" = "$1" ]
+  devs=$(blkid -c /dev/null -o device -t "LABEL=$NAME" 2>/dev/null) && [ -n "$devs" ] || return 1
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    r=$(realpath -e -- "$d" 2>/dev/null) && [ "$r" = "$1" ] || return 1
+  done <<<"$devs"
 }
 # not_ours UUID < fstab: the lines that are neither ours for UUID nor the
 # by-hand line of PILOT-ameesh-agents-1.md (LABEL=ameesh-guest, same options)
@@ -251,18 +256,24 @@ not_ours() {
 }
 # the fstab lines that mount something on $ROOT ($FSTAB_TEXT, read once)
 fstab_root() { printf '%s\n' "$FSTAB_TEXT" | awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p'; }
-# write_fstab < content: /etc/fstab replaced atomically, the first original
-# kept once in $FSTAB.ameesh-guest.orig
+# write_fstab CONTENT: /etc/fstab replaced atomically, the first original
+# kept once in $FSTAB.ameesh-guest.orig; $FSTAB_TEXT then holds the new one
+# (read again; the dry run's, as it would be), never the old snapshot
+# (codex #436 r3 P2)
 write_fstab() {
-  local content
-  content=$(cat)
-  if [ "$DRY" = 1 ]; then printf -- '--- %s\n%s\n---\n' "$FSTAB" "$content"; return; fi
+  local content=$1
+  if [ "$DRY" = 1 ]; then
+    printf -- '--- %s\n%s\n---\n' "$FSTAB" "$content"
+    FSTAB_TEXT=$content
+    return
+  fi
   [ -e "$FSTAB.$NAME.orig" ] || cp -p "$FSTAB" "$FSTAB.$NAME.orig"
   printf '%s\n' "$content" > "$FSTAB.tmp"
   findmnt --verify --tab-file "$FSTAB.tmp" >/dev/null 2>&1 \
     || { rm -f "$FSTAB.tmp"; die "the new $FSTAB does not verify (findmnt --verify): unchanged"; }
   chmod --reference="$FSTAB" "$FSTAB.tmp"
   mv -f "$FSTAB.tmp" "$FSTAB"
+  FSTAB_TEXT=$(cat -- "$FSTAB") && [ -n "$FSTAB_TEXT" ] || die "$FSTAB unread after its replacement"
 }
 # Every probe below must succeed: a probe that fails refuses, it never
 # reads as "nothing there" (codex #436 r2 P1). Called as VAR=$(f …) || exit 1.
@@ -273,6 +284,13 @@ mount_of() {
   all=$(findmnt -rn -o TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
   printf '%s\n' "$all" | grep -qxF "$ROOT" || return 0
   findmnt -n -o "$1" --mountpoint "$ROOT" || die "findmnt $ROOT failed: refused"
+}
+# dev_mounts DEV: where DEV is mounted, one target a line; empty when
+# nowhere (the whole table read, / always in it)
+dev_mounts() {
+  local all
+  all=$(findmnt -rnv -o SOURCE,TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
+  printf '%s\n' "$all" | awk -v d="$1" '$1 == d { print $2 }'
 }
 # dir_state DIR: absent, empty or full; not a directory, or a listing that
 # fails (an I/O error, a permission): refused
@@ -349,6 +367,11 @@ if [ "$MODE" = mount ]; then
   # every check before anything changes: the mount point, its directory, fstab
   have=$(fstab_root)
   src=$(mount_of SOURCE) || exit 1
+  # the volume mounted elsewhere: its data would show in the guest's root
+  # too (codex #436 r3 P2); mounted on $ROOT alone, it is kept as it is
+  elsewhere=$(dev_mounts "$dev") || exit 1
+  elsewhere=$(printf '%s\n' "$elsewhere" | grep -vxF -- "$ROOT" || true)
+  [ -z "$elsewhere" ] || die "$dev is already mounted on $(printf '%s' "$elsewhere" | tr '\n' ' '): refused"
   if [ -n "$src" ]; then
     [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is already a mount point of $src"
     muuid=$(mount_of UUID) || exit 1
@@ -382,7 +405,7 @@ if [ "$MODE" = mount ]; then
     die "$FSTAB already mounts something else on $ROOT: $have"
   fi
   # fstab last, then the mount
-  [ "$have" = "$want" ] || printf '%s\n%s\n' "$FSTAB_TEXT" "$want" | write_fstab
+  [ "$have" = "$want" ] || write_fstab "$(printf '%s\n%s\n' "$FSTAB_TEXT" "$want")"
   if [ -n "$src" ]; then
     echo "$ROOT: already mounted"
   else
@@ -390,7 +413,7 @@ if [ "$MODE" = mount ]; then
     run systemctl daemon-reload
     run mount "$ROOT"
   fi
-  [ "$DRY" = 0 ] || exit 0
+  if [ "$DRY" = 1 ]; then echo "$FSTAB for $ROOT, as check reads it: $(fstab_root)"; exit 0; fi
   MODE=check
 fi
 
@@ -478,7 +501,7 @@ if [ "$MODE" = unmount ]; then
   fi
   if [ -n "$src" ]; then run umount "$ROOT"; else echo "$ROOT: not mounted"; fi
   if [ -n "$(fstab_root)" ]; then
-    printf '%s\n' "$FSTAB_TEXT" | not_ours "$uuid" | write_fstab
+    write_fstab "$(printf '%s\n' "$FSTAB_TEXT" | not_ours "$uuid")"
     run systemctl daemon-reload
   fi
   # (a dry run reads the directory as it is, still mounted)
