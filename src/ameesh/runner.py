@@ -2060,9 +2060,16 @@ class AgentWorker(threading.Thread):
         # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
         # compte et la garde bascule au lieu de mettre en pause.
         raison = account_turn.choose(self, book)
+        # L242b : un non-critique s'arrête plus tôt — sous le rythme (réserve,
+        # sans comptes déclarés ; avec, `accounts.choose` la prend) et à une
+        # part du plafond horaire payé au token du mesh
+        from . import accounts as accounts_mod
+        critique = account_turn.is_critical(self)
+        part = 1.0 if critique else getattr(self.cfg, "noncritical_hourly_share", 0.75)
         if raison is None:
-            return book.over(self.name)
-        return raison or book.over(self.name, pace=False)
+            return book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
+                             hourly_share=part)
+        return raison or book.over(self.name, pace=False, hourly_share=part)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -2099,8 +2106,12 @@ class AgentWorker(threading.Thread):
             self._budget_next_check = maintenant + self.runner.budget_check_interval
             # `paused` n'est pas dans la contrainte de statut (L13 n'a pas de
             # migration) : la pause se lit `blocked` + raison dans `status_text`.
+            # L242b (5) : la pause d'un agent critique est marquée — alerte
+            # urgente `critical_budget_pause`
+            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text="budget : %s" % raison)
+                                status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
+                                                        raison))
             if raison != self._budget_reason:
                 self._budget_reason = raison
                 self._fil_note("Budget pause: %s. No turn until the gauge goes back "
@@ -5734,6 +5745,13 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     if agent.get("status") == "stopped":
         print("agent %s stopped: nothing to attach" % name, file=sys.stderr)
         return 1
+    from . import budget as budget_pause
+    texte = agent.get("status_text") or ""
+    if agent.get("status") == "blocked" and texte.startswith(budget_pause.PAUSE_PREFIX):
+        # L242b (4) : dire la pause budget, pas un arrêt ; la session
+        # interactive reste possible (elle prend le compte actif du harnais)
+        print("agent %s in budget %s" % (name, texte[len(budget_pause.PAUSE_PREFIX):]),
+              file=sys.stderr)
     if (agent.get("host") or "") != cfg.host:
         print("agent %s pinned to %s, not to %s" % (name, agent.get("host") or "?", cfg.host),
               file=sys.stderr)

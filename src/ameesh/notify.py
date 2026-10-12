@@ -96,7 +96,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L317c : analyse profonde demandée, sans rapport dans les 30 min
                  "deep_analysis_overdue",
                  # #411: Docker storage needs an explicit owner cleanup decision.
-                 "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable")
+                 "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
+                 # L242b : un agent critique est en pause budget
+                 "critical_budget_pause")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -168,11 +170,12 @@ TYPE_LABELS = {
     "guard_restart": "agents started again by the capacity guard",
 
     "module_deviation": "module procedure deviation",
+    "critical_budget_pause": "critical agent paused on budget",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing")
+                "credential_failing", "critical_budget_pause")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -1275,6 +1278,8 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
+            if kind in URGENT_TYPES:
+                payload["urgent"] = True        # L242b (5) : le point de l'auditeur
             for field_ in ("module", "rule", "project", "declaration_id", "subject",
                            "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):

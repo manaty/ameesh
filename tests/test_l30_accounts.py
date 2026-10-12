@@ -307,7 +307,8 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now).profile.name, "secondaire")
-        _codex_rollout(items[0].path, 85, now + 3600)  # écoulé 80 % → plafond 90 %
+        # écoulé 80 % → plafond 90 %, 80 % avec la réserve des non-critiques (L242b)
+        _codex_rollout(items[0].path, 75, now + 3600)
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                 now=now + 600, session_account="secondaire")
         self.assertEqual(choix.profile.name, "secondaire")
@@ -316,7 +317,7 @@ class ChoixTest(_Base):
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now + 600).profile.name, "secondaire")
         # le primaire redevient le plus en retard : une nouvelle session y va
-        _codex_rollout(items[1].path, 89, now + 3600)   # 89 % contre 85 %
+        _codex_rollout(items[1].path, 79, now + 3600)   # 79 % contre 75 %
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now + 600).profile.name, "primaire")
 
