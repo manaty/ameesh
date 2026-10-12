@@ -501,3 +501,14 @@ restée 4 h fusionnée sans être déployée :
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
    cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
    étiquette publiée : on pose la suivante.
+7. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
+   `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
+   `v<version>` sur ce commit de `main` (le numéro est celui de son
+   `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent
+   de `docs/versions/<version>.md` s'il existe, sinon de la description de la
+   PR de ce commit. Seule la plus haute version est marquée « Latest ».
+   `poste.sh rattraper` fait de même pour chaque version de l'historique de
+   `main` à qui il manque son étiquette ou sa release ; une étiquette déjà
+   posée fait foi et n'est pas déplacée. `A_BLANC=1` affiche ce qui serait
+   posé, poussé et publié, notes comprises, sans rien toucher. Ces deux étapes
+   n'ont besoin que du dépôt et de `gh`, ni du serveur ni de la base.
