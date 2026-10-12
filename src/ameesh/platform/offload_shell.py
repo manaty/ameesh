@@ -70,6 +70,7 @@ if __name__ == "__main__":
     if _ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
         raise SystemExit("ameesh-offload: prctl(PR_SET_DUMPABLE, 0) failed")
 
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -538,6 +539,41 @@ def _shell_alive(meta: dict) -> bool:
         return False
     recorded = meta.get("shell_start")
     return recorded is None or _proc_identity(pid) == recorded
+
+
+def _signal_shell(meta: dict, sig: int) -> bool:
+    """Signals the job's shell only while it is still that process. The pidfd
+    (Linux 5.3+) is opened first, the identity checked after: if it matches,
+    the pidfd holds that very shell, so a PID reused between the check and
+    the signal is never hit. Only without pidfd support (no API, ENOSYS) do
+    the check and the signal stay two steps (a narrow window); any other
+    failure to open it (EPERM, EMFILE...) raises rather than signal a PID
+    that may have been reused. False when the shell is gone."""
+    pid = meta.get("shell_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    pidfd = None
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            if exc.errno != errno.ENOSYS:
+                raise
+    try:
+        if not _shell_alive(meta):
+            return False
+        if pidfd is None:
+            os.kill(pid, sig)
+        else:
+            signal.pidfd_send_signal(pidfd, sig)
+    except ProcessLookupError:
+        return False
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+    return True
 
 
 def _alive(pid: object) -> bool:
@@ -1123,8 +1159,7 @@ def cmd_cancel(cfg: dict, args: list[str]) -> int:
     if meta is None:
         raise Refused("no job %s" % args[0])
     open(os.path.join(job_dir, "cancel"), "w").close()
-    if _shell_alive(meta):  # never a process that reused the PID
-        os.kill(meta["shell_pid"], signal.SIGTERM)
+    _signal_shell(meta, signal.SIGTERM)  # never a process that reused the PID
     sys.stdout.write("cancelled %s\n" % args[0])
     return 0
 
