@@ -90,6 +90,40 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   `--allow-rootfs` (the guest on `/`, `disk_max` indicative only) is not
   used on this host.
 
+* **An existing volume.** On 2026-10-12 at about 17:40Z,
+  `/srv/ameesh-guest` was found already mounted from an SBS volume
+  (`/dev/disk/by-id/scsi-0SCW_sbs_volume-24f1ba5b-…`), an ext4 labelled
+  `ameesh-guest`, with a by-hand line in `/etc/fstab`:
+
+  ```
+  LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2
+  ```
+
+  The script adopts such a volume as it is, never formatting it and
+  keeping that line: give its id to `mount` (nothing to `create`), then
+  `check`:
+
+  ```sh
+  scw block volume get <volume-id> zone=fr-par-1     # workstation: ameesh-guest, 40 GB, the project
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id> --dry-run
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>
+  sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
+  ```
+
+  It is adopted only when it is shown to be the pilot's: the disk of
+  `<volume-id>` is an ext4 labelled `ameesh-guest`; the label names that
+  disk and no other (udev's `/dev/disk/by-label/ameesh-guest`, and every
+  disk probed again with `blkid`), or the line would mount another disk at
+  the next boot; the filesystem mounted on `/srv/ameesh-guest`, if any, is
+  that disk's, its UUID too. Anything else is refused, nothing changed.
+  `check` says `ok` for the `LABEL=` line on the same conditions (the label
+  and the mounted UUID are the volume's, by udev's links); without
+  `--volume-id` it cannot tell, and says `NOT ok`. `unmount` removes that
+  line like its own, on the same conditions. `create` and `detach` take it
+  only if Scaleway says it is the pilot's (named `ameesh-guest`, 40 GB, in
+  the project: the `scw block volume get` above); otherwise they refuse it,
+  and it is renamed or replaced by hand first.
+
 ## Install (guard in observation, no guest runner started)
 
 `dsh` is in `/opt/node/bin`, which `sudo`'s `secure_path` does not contain:

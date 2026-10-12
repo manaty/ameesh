@@ -38,7 +38,10 @@
 # never guessed. It is formatted only when both probes (blkid, wipefs)
 # succeed and find no signature at all; a probe that fails refuses. An ext4
 # labelled ameesh-guest is kept as is; anything else is refused. /etc/fstab
-# is written last, once every check passed. `unmount` and `detach --delete`
+# is written last, once every check passed. A volume mounted by hand before
+# (its line LABEL=ameesh-guest, our options) is adopted as it is, line
+# included, once that label is shown to name this volume and no other disk,
+# and the filesystem mounted is the volume's (its UUID). `unmount` and `detach --delete`
 # act only on the pilot's volume: its name, project and size checked first,
 # the mounted filesystem's source and UUID too.
 # `disk_max` is not changed here: 40GiB is already install-pilot.sh's default
@@ -58,6 +61,8 @@ DRY=0
 DELETE=0
 FSTAB=/etc/fstab
 BYID=/dev/disk/by-id
+BYLABEL=/dev/disk/by-label
+BYUUID=/dev/disk/by-uuid
 GUARD=/etc/ameesh/guard.json
 
 die() { echo "volume-pilot: $*" >&2; exit 1; }
@@ -95,6 +100,8 @@ case "$SERVER" in ''|*[!A-Za-z0-9._-]*) die "invalid --server $SERVER" ;; esac
 if [ "$DRY" = 1 ]; then
   FSTAB=${VOLUME_TEST_FSTAB:-$FSTAB}
   BYID=${VOLUME_TEST_BYID:-$BYID}
+  BYLABEL=${VOLUME_TEST_BYLABEL:-$BYLABEL}
+  BYUUID=${VOLUME_TEST_BYUUID:-$BYUUID}
   GUARD=${VOLUME_TEST_GUARD:-$GUARD}
 fi
 DIR=$ROOT   # the mount point's directory, read and removed
@@ -218,6 +225,21 @@ fi
 
 # our fstab line, for the filesystem UUID
 fstab_line() { printf 'UUID=%s %s ext4 %s 0 2\n' "$1" "$ROOT" "$OPTS"; }
+# the by-hand line (PILOT-ameesh-agents-1.md, a volume mounted before this
+# script): ours only once its label is shown to be the volume's
+label_line() { printf 'LABEL=%s %s ext4 %s 0 2\n' "$NAME" "$ROOT" "$OPTS"; }
+# label_is DEV / uuid_is UUID DEV: udev's link of that label or UUID is DEV
+label_is() { [ "$(realpath -e -- "$BYLABEL/$NAME" 2>/dev/null)" = "$1" ]; }
+uuid_is() { [ -n "$1" ] && [ "$(realpath -e -- "$BYUUID/$1" 2>/dev/null)" = "$2" ]; }
+# label_only DEV (root): LABEL=$NAME names DEV and no other disk, every
+# device probed again (blkid without its cache); the line would mount
+# another disk at the next boot otherwise
+label_only() {
+  local devs
+  label_is "$1" || return 1
+  devs=$(blkid -c /dev/null -o device -t "LABEL=$NAME" 2>/dev/null) || return 1
+  [ "$(printf '%s\n' "$devs" | xargs -r -n1 realpath -- | sort -u)" = "$1" ]
+}
 # not_ours UUID < fstab: the lines that are neither ours for UUID nor the
 # by-hand line of PILOT-ameesh-agents-1.md (LABEL=ameesh-guest, same options)
 not_ours() {
@@ -242,6 +264,7 @@ write_fstab() {
 mounted_source() { findmnt -n -o SOURCE --mountpoint "$ROOT" 2>/dev/null || true; }
 # the UUID of the filesystem mounted on $ROOT; empty when none
 mounted_uuid() { findmnt -n -o UUID --mountpoint "$ROOT" 2>/dev/null || true; }
+mounted_label() { findmnt -n -o LABEL --mountpoint "$ROOT" 2>/dev/null || true; }
 # probe DEV: sets fstype, label and uuid from blkid's low-level probe; all
 # empty only when blkid says it found nothing (exit 2). Any other failure
 # (I/O error, ambiguous signatures, blkid missing) stops the script.
@@ -294,6 +317,8 @@ if [ "$MODE" = mount ]; then
   src=$(mounted_source)
   if [ -n "$src" ]; then
     [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is already a mount point of $src"
+    [ "$format" = 1 ] || [ "$(mounted_uuid)" = "$uuid" ] \
+      || die "$ROOT: mounted UUID $(mounted_uuid), not the volume's $uuid: refused"
   elif [ -d "$DIR" ] && [ -n "$(ls -A -- "$DIR")" ]; then
     die "$ROOT is not empty on the root disk: the volume would hide it; move it first"
   fi
@@ -310,6 +335,13 @@ if [ "$MODE" = mount ]; then
   want=$(fstab_line "$uuid")
   if [ "$have" = "$want" ]; then
     echo "$FSTAB: $ROOT already there"
+  elif [ "$format" = 0 ] && [ "$have" = "$(label_line)" ]; then
+    # mounted by hand before this script: adopted as is, if the label is
+    # this volume's and no other disk's
+    label_only "$dev" \
+      || die "$FSTAB mounts LABEL=$NAME on $ROOT, a label not only the volume $VOLID's: refused"
+    echo "$FSTAB: $ROOT by LABEL=$NAME, the volume's (adopted, kept as is)"
+    want=$have
   elif [ -n "$have" ]; then
     die "$FSTAB already mounts something else on $ROOT: $have"
   fi
@@ -343,6 +375,18 @@ if [ "$MODE" = check ]; then
   lines=$(fstab_root)
   if [ "$(printf '%s' "$lines" | grep -c . || true)" != 1 ]; then
     echo "$FSTAB: NOT one line for $ROOT"; ok=0
+  elif [ -n "$muuid" ] && [ "$lines" = "$(label_line)" ]; then
+    # the by-hand line: ours when the label and the mounted UUID are the
+    # volume's (udev's links), the mounted filesystem labelled so
+    echo "$FSTAB: $lines"
+    vdev=$(realpath -m -- "$(volume_dev)")
+    if [ -z "$VOLID" ]; then
+      echo "$FSTAB: LABEL=$NAME NOT checked: give --volume-id"; ok=0
+    elif [ "$(mounted_label)" = "$NAME" ] && label_is "$vdev" && uuid_is "$muuid" "$vdev"; then
+      echo "$FSTAB: LABEL=$NAME is the volume $VOLID (UUID $muuid)"
+    else
+      echo "$FSTAB: LABEL=$NAME NOT the volume $VOLID's (mounted label '$(mounted_label)', UUID $muuid)"; ok=0
+    fi
   elif [ -n "$muuid" ] && [ "$lines" != "$(fstab_line "$muuid")" ]; then
     # the line must mount the filesystem mounted now, with our options
     echo "$FSTAB: $lines"
@@ -388,6 +432,10 @@ if [ "$MODE" = unmount ]; then
   # the fstab lines on $ROOT must all be ours before anything changes
   others=$(not_ours "$uuid" < "$FSTAB" | awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p')
   [ -z "$others" ] || die "$FSTAB mounts something else on $ROOT: $others; nothing touched"
+  if fstab_root | grep -qxF "$(label_line)"; then
+    label_only "$dev" \
+      || die "$FSTAB mounts LABEL=$NAME on $ROOT, a label not only the volume $VOLID's: nothing touched"
+  fi
   if [ -n "$src" ]; then run umount "$ROOT"; else echo "$ROOT: not mounted"; fi
   if [ -n "$(fstab_root)" ]; then
     not_ours "$uuid" < "$FSTAB" | write_fstab

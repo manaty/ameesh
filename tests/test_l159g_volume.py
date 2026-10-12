@@ -69,7 +69,9 @@ class VolumeScriptTest(unittest.TestCase):
                            '*) printf "%s" "$STUB_LSBLK" ;; esac\n')
         self.stub("blockdev", '#!/bin/sh\necho "$STUB_SIZE"\n')
         # blkid -p -o export: STUB_BLKID_RC forces a failure; no type, exit 2
+        # blkid -c /dev/null -o device -t LABEL=…: the disks in STUB_LABELDEVS
         self.stub("blkid", '#!/bin/sh\n'
+                           'case "$*" in *"-t LABEL="*) printf "%s" "$STUB_LABELDEVS"; exit 0 ;; esac\n'
                            '[ -z "$STUB_BLKID_RC" ] || { echo "blkid: I/O error" >&2; exit "$STUB_BLKID_RC"; }\n'
                            '[ -n "$STUB_TYPE" ] || exit 2\n'
                            'echo "DEVNAME=$3"\n'
@@ -80,7 +82,8 @@ class VolumeScriptTest(unittest.TestCase):
         # findmnt --mountpoint: nothing mounted unless STUB_SRC
         self.stub("findmnt", '#!/bin/sh\n[ -n "$STUB_SRC" ] || exit 1\n'
                              'case "$*" in *FSTYPE*) echo "ext4 37.1G" ;; *SOURCE*) echo "$STUB_SRC" ;;\n'
-                             '  *UUID*) echo "$STUB_MUUID" ;; *SIZE*) echo 40000000000 ;; esac\n')
+                             '  *UUID*) echo "$STUB_MUUID" ;; *LABEL*) echo "$STUB_MLABEL" ;;\n'
+                             '  *SIZE*) echo 40000000000 ;; esac\n')
         self.byid = os.path.join(d, "by-id")
         os.mkdir(self.byid)
         self.disk = os.path.join(d, "sdb")
@@ -90,6 +93,11 @@ class VolumeScriptTest(unittest.TestCase):
         with open(self.fstab, "w") as fh:
             fh.write("LABEL=cloudimg-rootfs / ext4 discard,errors=remount-ro 0 1\n")
         self.root = os.path.join(d, "srv", "ameesh-guest")
+        # udev's links by label and by UUID: none until a test makes them
+        self.bylabel = os.path.join(d, "by-label")
+        self.byuuid = os.path.join(d, "by-uuid")
+        os.mkdir(self.bylabel)
+        os.mkdir(self.byuuid)
 
     def stub(self, name, body):
         path = os.path.join(self.bin, name)
@@ -100,11 +108,13 @@ class VolumeScriptTest(unittest.TestCase):
     def run_script(self, *args, scw=None, project=PROJ, **disk):
         env = dict(os.environ, PATH=self.bin + ":" + os.environ["PATH"],
                    VOLUME_TEST_FSTAB=self.fstab, VOLUME_TEST_BYID=self.byid,
+                   VOLUME_TEST_BYLABEL=self.bylabel, VOLUME_TEST_BYUUID=self.byuuid,
                    VOLUME_TEST_GUARD=os.path.join(self.tmp.name, "guard.json"),
                    SCW_STUB=json.dumps(scw or {"volumes": [], "servers": [SRV], "attached": []}),
                    STUB_LSBLK="sdb\n", STUB_SIZE=str(40 * 10 ** 9), STUB_TYPE="",
                    STUB_LABEL="", STUB_UUID="", STUB_WIPEFS="", STUB_WIPEFS_RC="0",
-                   STUB_BLKID_RC="", STUB_SRC="", STUB_MUUID="",
+                   STUB_BLKID_RC="", STUB_SRC="", STUB_MUUID="", STUB_MLABEL="",
+                   STUB_LABELDEVS=self.disk + "\n",
                    VOLUME_TEST_DIR=self.root)
         env.update({"STUB_" + k.upper(): v for k, v in disk.items()})
         if args[0] in ("create", "detach") and project and "--project-id" not in args:
@@ -114,6 +124,19 @@ class VolumeScriptTest(unittest.TestCase):
 
     def cmds(self, proc):
         return [line[2:] for line in proc.stdout.splitlines() if line.startswith("+ ")]
+
+    def label_line(self):
+        with open(self.fstab, "a") as fh:
+            fh.write("LABEL=ameesh-guest /srv/ameesh-guest ext4 %s 0 2\n" % OPTS)
+
+    def udev(self, uuid, label_to=None):
+        """udev's links: the label ameesh-guest and UUID to the volume's disk
+        (or the label to LABEL_TO), in place of the links before."""
+        for d in (self.bylabel, self.byuuid):
+            for name in os.listdir(d):
+                os.remove(os.path.join(d, name))
+        os.symlink(label_to or self.disk, os.path.join(self.bylabel, "ameesh-guest"))
+        os.symlink(self.disk, os.path.join(self.byuuid, uuid))
 
     def our_line(self, uuid):
         with open(self.fstab, "a") as fh:
@@ -334,13 +357,85 @@ class VolumeScriptTest(unittest.TestCase):
 
     def test_unmount_removes_the_by_hand_label_line(self):
         # PILOT-ameesh-agents-1.md's manual steps write LABEL=ameesh-guest
-        with open(self.fstab, "a") as fh:
-            fh.write("LABEL=ameesh-guest /srv/ameesh-guest ext4 %s 0 2\n" % OPTS)
+        self.label_line()
+        self.udev("u")
         p = self.run_script("unmount", "--volume-id", VOL, type="ext4", label="ameesh-guest",
                             uuid="u", src=self.disk, muuid="u")
         self.assertEqual(p.returncode, 0, p.stderr)
         written = p.stdout.split("--- %s\n" % self.fstab)[1].split("\n---")[0]
         self.assertNotIn("/srv/ameesh-guest", written)
+
+    def test_mount_adopts_a_volume_mounted_by_hand(self):
+        # mesh-design #436: the volume already mounted with LABEL=ameesh-guest
+        # in fstab (ameesh-agents-1, 2026-10-12): adopted, never formatted,
+        # its line kept as is
+        self.label_line()
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        for mounted in ({"src": self.disk, "muuid": "u", "mlabel": "ameesh-guest"}, {}):
+            p = self.run_script("mount", "--volume-id", VOL, **ours, **mounted)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("by LABEL=ameesh-guest, the volume's (adopted, kept as is)", p.stdout)
+            self.assertIn("already there (kept)", p.stdout)
+            self.assertNotIn("--- " + self.fstab, p.stdout)
+            c = self.cmds(p)
+            self.assertFalse([x for x in c if x.startswith(("mkfs", "wipefs"))], mounted)
+            self.assertEqual(c[-1:], ["mount /srv/ameesh-guest"] if not mounted else [])
+
+    def test_mount_adopts_only_the_volume_s_label(self):
+        # the label names another disk, or this one and another, or the
+        # filesystem mounted is not the volume's: refused, nothing changed
+        self.label_line()
+        other = os.path.join(self.tmp.name, "sdc")
+        open(other, "w").close()
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        cases = ((other, {}),
+                 (None, {"labeldevs": "%s\n%s\n" % (self.disk, other)}),
+                 (None, {"labeldevs": ""}),
+                 (None, {"src": self.disk, "muuid": "w"}))
+        for label_to, disk in cases:
+            self.udev("u", label_to)
+            p = self.run_script("mount", "--volume-id", VOL, **ours, **disk)
+            self.assertNotEqual(p.returncode, 0, disk)
+            self.assertIn("refused", p.stderr)
+            self.assertEqual(self.cmds(p), [], disk)
+            self.assertNotIn("--- " + self.fstab, p.stdout)
+
+    def test_check_takes_the_label_line_of_the_volume(self):
+        # mesh-design #436: `check` says ok for the by-hand line when its
+        # label and the mounted UUID are the volume's
+        self.label_line()
+        self.udev("u")
+        mounted = {"src": self.disk, "muuid": "u", "mlabel": "ameesh-guest"}
+        p = self.run_script("check", "--volume-id", VOL, **mounted)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("LABEL=ameesh-guest is the volume %s (UUID u)" % VOL, p.stdout)
+        self.assertTrue(p.stdout.endswith("ok\n"))
+        # without the volume's id, it cannot be told
+        p = self.run_script("check", **mounted)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("NOT checked: give --volume-id", p.stdout)
+        # another label mounted, another UUID: NOT ok
+        for bad in ({"mlabel": "data"}, {"muuid": "w"}):
+            p = self.run_script("check", "--volume-id", VOL, **dict(mounted, **bad))
+            self.assertEqual(p.returncode, 1, bad)
+            self.assertIn("NOT the volume %s's" % VOL, p.stdout)
+        # the label's link to another disk: NOT ok
+        self.udev("u", os.path.join(self.tmp.name, "sdc"))
+        p = self.run_script("check", "--volume-id", VOL, **mounted)
+        self.assertEqual(p.returncode, 1)
+
+    def test_unmount_leaves_a_label_line_of_another_disk(self):
+        self.label_line()
+        self.udev("u")
+        other = os.path.join(self.tmp.name, "sdc")
+        p = self.run_script("unmount", "--volume-id", VOL, type="ext4", label="ameesh-guest",
+                            uuid="u", src=self.disk, muuid="u",
+                            labeldevs="%s\n%s\n" % (self.disk, other))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not only the volume", p.stderr)
+        self.assertEqual(self.cmds(p), [])
+        self.assertNotIn("--- " + self.fstab, p.stdout)
 
     def test_unmount_touches_only_the_pilot_filesystem(self):
         # codex #436 r1 P2: another filesystem mounted on the root, another
