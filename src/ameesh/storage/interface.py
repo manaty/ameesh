@@ -1960,6 +1960,8 @@ class Operations(Domain):
         part dans `passive_unread`), lot de session (`session_work_item`,
         `session_lot_title`, `session_lot_state`), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
+        lots qui l'occupent (`active_lots`, L165b : assignés, ouverts, ni en
+        `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +
         entrée en cache, `last_turn_session`, `last_turn_recorded_ts`) et
         demande de redémarrage (`restart_requested_ts`)."""

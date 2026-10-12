@@ -40,10 +40,10 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
   concurrents ne prennent pas le même élément.
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
-sans lot depuis `lot_idle_s` (15 min par défaut) prend lui-même le lot non
-assigné le plus prioritaire de SON équipe qu'il sait faire, sans attendre
-qu'on le lui confie (constat du 11/10 : 9 agents Nexlink sur 13 au repos, 3
-lots Nexlink sans agent). Mêmes garde-fous que la file (repos, rien ne
+sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
+lot non assigné le plus prioritaire de SON équipe qu'il sait faire, sans
+attendre qu'on le lui confie (constat du 11/10 : 9 agents Nexlink sur 13 au
+repos, 3 lots Nexlink sans agent). Mêmes garde-fous que la file (repos, rien ne
 l'attend, forfait d'abord, budget, hôte), et en plus :
 
 * seuls les lots `intake` sans assigné, hors file : jamais un lot qui attend
@@ -65,6 +65,11 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   work assign`) ;
 * au plus `lot_max_per_hour` prises par heure glissante, comptées à part de
   la file.
+* **L165b** (constat du 12/10 : 13 agents au repos, 10 lots sans agent, aucun
+  pris) : un lot de l'agent qui attend un autre que lui (`qa`,
+  `waiting_human`, `blocked`), ou dont le début prévu est après aujourd'hui,
+  ne l'occupe pas ; il reste libre tant que son dernier tour n'a laissé ni
+  courrier ni consigne en attente. Le lot qu'il prend, lui, l'occupe.
 
 Le cœur reste générique : rien ici ne nomme un métier. La source d'un élément
 est un texte libre ; le circuit (relecture, vérifications, intégration) est
@@ -218,15 +223,21 @@ def _blocked_hosts(alerts: list) -> set:
             and a.get("host")}
 
 
-def _awaited(row: dict) -> bool:
+def _awaited(row: dict, *, waiting_free: bool = False) -> bool:
     """Un travail attend-il déjà cet agent ? (lot, courrier, consigne, lot de
-    session encore ouvert) — il passe avant toute amélioration."""
-    from . import stagnation
-    if row.get("assigned_lot_id") is not None or int(row.get("unread") or 0):
+    session encore ouvert) — il passe avant toute amélioration. `waiting_free`
+    (L165b, lots de l'équipe) : un lot, de session ou assigné, qui attend un
+    autre que lui (relecture, humain, autre lot) ou commence après aujourd'hui
+    ne l'occupe pas."""
+    from . import sous_utilisation, stagnation
+    if not sous_utilisation.free_of_lots(row, waiting_free=waiting_free) \
+            or int(row.get("unread") or 0):
         return True
     if row.get("has_pending_prompt"):
         return True
     state = row.get("session_lot_state")
+    if waiting_free and state in sous_utilisation.LOTS_WAITING_ON_OTHERS:
+        return False
     return bool(state) and state not in stagnation.DONE_STATES
 
 
@@ -366,10 +377,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # harnais inconnus (descripteurs illisibles) : traité comme payé
         return paid is None or row.get("harness") in paid
 
-    def candidates(threshold: float, skip=()) -> list:
+    def candidates(threshold: float, skip=(), waiting_free: bool = False) -> list:
         out = []
-        for row in sous_utilisation.idle_agents(listing, now, threshold):
-            if row["name"] in skip or _awaited(row) or row.get("host") in blocked:
+        for row in sous_utilisation.idle_agents(listing, now, threshold,
+                                                waiting_free=waiting_free):
+            if row["name"] in skip or _awaited(row, waiting_free=waiting_free) \
+                    or row.get("host") in blocked:
                 continue
             if is_paid(row) and (not allow_paid or balance_low):
                 continue
@@ -392,7 +405,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 orchestras = sous_utilisation.orchestrators(cfg, db, listing)
             except Exception:
                 orchestras = []
-        for row in candidates(lot_idle_s, skip=set(orchestras)):
+        # L165b : un agent dont tous les lots attendent un autre est libre
+        for row in candidates(lot_idle_s, skip=set(orchestras), waiting_free=True):
             if len(taken) >= lot_room or not lots:
                 break
             if not within_budget(row):

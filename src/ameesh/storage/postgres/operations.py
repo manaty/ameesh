@@ -20,6 +20,8 @@ from .mailbox import PASSIVE_SQL
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
+#: L165b : un lot dans ces états attend quelqu'un d'autre que son assigné
+_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 #: L125 : un message passif de la boîte `mb`
 _PASSIVE = PASSIVE_SQL.format(t="mb")
 
@@ -101,6 +103,7 @@ class Operations(interface.Operations):
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
+                   coalesce(al.n, 0)::bigint AS active_lots,
                    -- L60 : Codex compte déjà le cache dans input_tokens
                    (CASE WHEN t.harness = 'codex'
                          THEN greatest(t.input_tokens, t.cached_input_tokens)
@@ -126,6 +129,13 @@ class Operations(interface.Operations):
                   SELECT w.id, w.title, w.state FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                    ORDER BY w.updated_at DESC, w.id DESC LIMIT 1) aw ON true
+              LEFT JOIN LATERAL (
+                  -- L165b : les lots qui occupent l'agent (ni en attente d'un
+                  -- autre, ni prévus pour plus tard)
+                  SELECT count(*) AS n FROM work_items w
+                   WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
+                     AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
+                     AND (w.planned_start IS NULL OR w.planned_start <= current_date)) al ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c

@@ -524,6 +524,7 @@ FIN
 | agent arrêté, mort ou au repos avec du travail | `ameesh resume <agent>` | `ameesh set` ou arrêt par le responsable |
 | session trop grosse, agent qui tourne en rond, **hors tour** | `ameesh restart <agent> --brief -` (brief de reprise court sur l'entrée standard) | la session précédente reste dans l'historique |
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
+| « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
 
