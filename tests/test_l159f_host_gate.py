@@ -700,8 +700,9 @@ class OnceTurnTest(PgTestCase):
             # r4 P1: while the lease is being returned (a slow base), a tick
             # of the controller must still see it held
             runner.host_gate.tick()
-            release(worker)
+            done = release(worker)
             self.events.append(("released", runner.gate_foreground is worker))
+            return done
 
         with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
                 mock.patch.object(runner_mod.AgentWorker, "release_lease", slow_release):
@@ -709,6 +710,173 @@ class OnceTurnTest(PgTestCase):
         self.assertEqual(self.events, [("tick", True), ("turn", True), ("tick", True),
                                        ("released", True), ("tick", False)])
         self.assertTrue(runner.did_turn)
+
+    def test_a_lease_the_base_did_not_take_back_stays_counted(self):
+        # L159f4: release_lease failed (DbError): the lease stays held until
+        # it expires, so the part never says the host free before
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        calls = []
+
+        def flaky_release(worker):
+            calls.append(runner.gate_foreground is worker)
+            return len(calls) >= 3  # the base answers at the third try
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", return_value=True), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease", flaky_release):
+            runner.sweep()
+        self.assertEqual(calls, [True, True, True])
+        ticks = [held for kind, held in self.events if kind == "tick"]
+        self.assertTrue(all(ticks[:-1]), self.events)  # held while not returned
+        self.assertEqual(ticks[-1], False)
+
+    def test_a_lease_never_taken_back_is_held_until_it_expires(self):
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        expiry = {}
+
+        def turn(worker, _wait):
+            # r1 P2: the expiry read in the base is not compared with this
+            # host's wall clock (here 120 s ahead: the base's expiry looks
+            # past); only the monotonic bound taken after the base answered
+            worker.lease_deadline = time.time() - 60
+            worker.lease_held_until = time.monotonic() + 0.3
+            expiry["at"] = worker.lease_held_until
+            return True
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease",
+                                  return_value=False):
+            runner.sweep()
+            freed = time.monotonic()
+        self.assertGreaterEqual(freed, expiry["at"])
+        self.assertEqual(self.events[-1], ("tick", False))
+        self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
+    def test_a_renewal_in_flight_is_awaited_before_the_expiry_is_fixed(self):
+        # r2 P2: the return failed while a renewal was in flight; it ends
+        # after the turn and extends the lease: the wait follows the new bound
+        import threading
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        bounds = {}
+
+        def turn(worker, _wait):
+            worker.lease_held_until = time.monotonic() + 0.05
+
+            def renewal():
+                time.sleep(0.2)  # the base answers after the failed return
+                worker.lease_held_until = bounds["renewed"] = time.monotonic() + 0.3
+            worker.heartbeat_thread = threading.Thread(target=renewal, daemon=True)
+            worker.heartbeat_thread.start()
+            return True
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease",
+                                  return_value=False):
+            runner.sweep()
+            freed = time.monotonic()
+        self.assertGreaterEqual(freed, bounds["renewed"])
+        self.assertEqual(self.events[-1], ("tick", False))
+        self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
+    def _detached_renewal(self, answer, release):
+        """A turn whose renewal outlives `call_budget()`: `answer()` is its
+        late outcome (an expiry, or an exception); `release` the return."""
+        import threading
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        bounds = {}
+
+        def turn(worker, _wait):
+            runner.lease_ttl = 0.3  # the bound a late answer gives
+            bounds["start"] = time.monotonic()
+            worker.lease_held_until = bounds["start"] + 0.05
+            worker.lease_deadline = time.time() + 60
+            with mock.patch.object(runner_mod.registry, "renew", lambda *_a: answer()), \
+                    mock.patch.object(worker, "call_budget", return_value=0.01):
+                self.assertEqual(worker._renew_call(), (False, None, None))
+            return True
+
+        guard = threading.Timer(10, runner.stop.set)  # a wait that never ends fails
+        guard.start()
+        self.addCleanup(guard.cancel)
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease", release):
+            runner.sweep()
+        bounds["freed"] = time.monotonic()
+        return bounds
+
+    def _late(self, outcome):
+        def answer():
+            time.sleep(0.2)  # committed; the answer comes late
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return answer
+
+    def _held_until_the_late_bound(self, bounds):
+        # the late answer (after 0.2 s) holds the lease 0.3 s more
+        self.assertGreaterEqual(bounds["freed"], bounds["start"] + 0.5)
+        self.assertEqual(self.events[-1], ("tick", False))
+        self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
+    def test_a_detached_renewal_is_awaited_before_the_expiry_is_fixed(self):
+        # r3 P2: the renewal committed but answered after `call_budget()`:
+        # the heartbeat has ended, its detached call still extends the bound
+        self._held_until_the_late_bound(self._detached_renewal(
+            self._late(time.time() + 60), lambda _w: False))
+
+    def test_a_detached_renewal_answering_an_error_may_have_committed(self):
+        # r4 P2: committed, then its answer is lost (`Unavailable`): the
+        # bound is extended all the same
+        from ameesh import db as db_mod
+        self._held_until_the_late_bound(self._detached_renewal(
+            self._late(db_mod.Unavailable("connection lost")), lambda _w: False))
+
+    def test_a_stuck_renewal_does_not_stop_the_release_retries(self):
+        # r4 P2: the detached renewal never answers; the base comes back and
+        # takes the return at its third try: the part is freed then
+        import threading
+        stuck = threading.Event()
+        self.addCleanup(stuck.set)
+        calls = []
+
+        def release(_worker):
+            calls.append(time.monotonic())
+            return len(calls) >= 3
+
+        bounds = self._detached_renewal(lambda: stuck.wait(), release)
+        self.assertEqual(len(calls), 3)
+        self.assertLess(bounds["freed"] - bounds["start"], 5)
+        self.assertEqual(self.events[-1], ("tick", False))
+
+    def test_release_is_tried_even_after_renewal_failures(self):
+        # r1 P2: three generic DbErrors at renewal set `lease_lost` before the
+        # lease expires; the base still gives it to us, so the return is
+        # tried (fenced by the epoch) and its failure reported
+        import threading
+        import types
+        from unittest import mock
+        from ameesh import db as db_mod, runner as runner_mod
+        worker = types.SimpleNamespace(
+            watchdog_stop=threading.Event(), lease_lost=threading.Event(),
+            db=None, name="a1", epoch=7, runner=types.SimpleNamespace(runner_id="r1"))
+        worker.lease_lost.set()
+        with mock.patch.object(runner_mod.registry, "release",
+                               side_effect=db_mod.DbError("down")) as release:
+            self.assertFalse(runner_mod.AgentWorker.release_lease(worker))
+        release.assert_called_once_with(None, "a1", "r1", 7)
+        with mock.patch.object(runner_mod.registry, "release", return_value=False):
+            self.assertTrue(runner_mod.AgentWorker.release_lease(worker))  # not ours
 
     def test_a_gate_closed_before_the_turn_runs_none(self):
         from unittest import mock

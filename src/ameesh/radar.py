@@ -217,9 +217,11 @@ class Cache:
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
+        # L160e: stacked replays of the merge queues
+        self.stacks: dict = {}
 
     def trim(self) -> None:
-        for table in (self.merges, self.diffs, self.sizes, self.replays):
+        for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
             while len(table) > MAX_CACHE:
                 table.pop(next(iter(table)))
 
@@ -418,6 +420,7 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
         if not error:
             annotate_resolutions(cfg, db, project, report, lots, cache)
+            report["queue"] = run_queue(cfg, db, project, report, cache)
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
@@ -455,6 +458,16 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
         report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
 
 
+def run_queue(cfg, db, project: Project, report: dict, cache: Cache | None) -> dict:
+    """L160e: order and stacked replay of the merge queues of the project
+    (`ameesh.merge_queue.run_pass`). Never raises."""
+    from . import merge_queue
+    try:
+        return merge_queue.run_pass(cfg, db, project, report, cache=cache)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        return {"targets": {}, "mail": [], "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
 # --------------------------------------------------------------------------
 # courrier (L160c) : passif sur conflit nouveau, réveil seulement s'il bloque
 # --------------------------------------------------------------------------
@@ -484,10 +497,13 @@ def ci_green(rollup) -> bool:
     return True
 
 
-def github_ci(project: Project, gh=None):
-    """La fonction `branche -> {number, url, green} | None` du projet (PR
-    ouverte de la branche), lue avec `gh` ; None si le dépôt GitHub est inconnu.
-    Une erreur de `gh` vaut « pas verte » : le courrier reste passif."""
+def github_ci(project: Project, gh=None, *, strict: bool = False):
+    """La fonction `branche -> {number, url, head, green} | None` du projet
+    (PR ouverte de la branche, `head` : son commit de tête), lue avec `gh` ;
+    None si le dépôt GitHub est inconnu. Une erreur de `gh` vaut « pas
+    verte » : le courrier reste passif. `strict` (entrée en file, L160e) :
+    l'erreur est levée (`plan_github.GithubError`), jamais prise pour « pas
+    de PR »."""
     slug = github_slug(project)
     if not slug:
         return None
@@ -499,12 +515,15 @@ def github_ci(project: Project, gh=None):
             gh = gh or plan_github.Gh()
             rows = plan_github._json(gh, ["pr", "list", "--repo", slug, "--head", branch,
                                           "--state", "open", "--json",
-                                          "number,url,statusCheckRollup"]) or []
+                                          "number,url,headRefOid,statusCheckRollup"]) or []
         except plan_github.GithubError:
+            if strict:
+                raise
             return None
         if not rows:
             return None
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
+                "head": rows[0].get("headRefOid"),
                 "green": ci_green(rows[0].get("statusCheckRollup"))}
     return status
 
@@ -759,6 +778,15 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                                      for h in dup["lots"]),
             "; already in %s: %s" % (dup["target"], dup["in_target"])
             if dup["in_target"] else ""))
+    queue = report.get("queue") or {}
+    if queue.get("error"):
+        out.append("  file : %s" % queue["error"])
+    for target, listed in sorted((queue.get("targets") or {}).items()):
+        out.append("  file vers %s : %s" % (target, ", ".join(
+            "%d. %s%s" % (one["rank"], _lot(one["lot"]),
+                          " (éjecté)" if one["state"] == "ejected" else
+                          " (rejouée)" if (one.get("stack") or {}).get("state") == "replayed"
+                          else "") for one in listed) or "vide"))
     for one in report.get("skipped") or ():
         out.append("  skipped  %s %s: %s" % (_lot(one["work_item"]), one["branch"],
                                              one["reason"]))

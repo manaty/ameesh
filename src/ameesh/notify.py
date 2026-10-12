@@ -95,7 +95,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226a : un identifiant est en échec, ou expire bientôt
                  "credential_failing", "credential_expiring", "module_deviation",
                  # L317c : analyse profonde demandée, sans rapport dans les 30 min
-                 "deep_analysis_overdue")
+                 "deep_analysis_overdue",
+                 # #411: Docker storage needs an explicit owner cleanup decision.
+                 "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -158,6 +160,9 @@ TYPE_LABELS = {
     "ci_main_red": "CI red on main",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
+    "docker_orphan_volumes": "Docker orphan volumes accumulating",
+    "docker_build_cache": "Docker reclaimable build cache above threshold",
+    "docker_storage_unavailable": "Docker storage inventory unavailable",
     "turn_unpriced": "turn without a known price",
     # L233: briefed to the assignee and the orchestrators (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)

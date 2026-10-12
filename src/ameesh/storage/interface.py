@@ -1043,6 +1043,33 @@ class WorkItems(Domain):
         `item_ids`, newest first."""
 
     @abc.abstractmethod
+    def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
+                  actor: str, source: str = "") -> dict | None:
+        """L160e (0058): puts (or puts back) the lot in the merge queue of
+        `target`, state `queued`, with a journal line; `source`: the
+        repository it was queued from (`merge_queue.source_of`). None if the
+        lot is no longer open."""
+
+    @abc.abstractmethod
+    def queue_update(self, item_id: int, *, state: str | None = None,
+                     rank: int | None = None, reason: str | None = None,
+                     landing_sha: str | None = None, note: str = "",
+                     actor: str = "", clear_rank: bool = False) -> dict | None:
+        """L160e (0058): changes the state, rank, reason or landing commit of
+        a queued lot (`queued` and `ejected` clear the landing commit;
+        `ejected` or `clear_rank` clear the rank); a journal line when
+        `note` is given. None if the lot is not queued."""
+
+    @abc.abstractmethod
+    def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
+        """L160e (0058): takes the lot out of the queue, with a journal line."""
+
+    @abc.abstractmethod
+    def queue(self, target: str | None = None) -> list[dict]:
+        """L160e (0058): the queue rows (of `target`, else every target),
+        ranked first, then by arrival."""
+
+    @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
         cible, si la branche du lot est toujours `branch` (et quand, L118d)."""
