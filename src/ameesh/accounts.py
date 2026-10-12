@@ -912,9 +912,16 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 and (ev(p).ok if paced else ev(p).unpaced_ok)]
         if not free:
             return held
-        if not simulate:
-            store.set_auto(host, harness, reason="compte forcé %s au seuil (%s) ; %s libre"
-                           % (active.name, cache[active.name].reason, free[0].name))
+        if not simulate and not store.set_auto(
+                host, harness, expected=active.name,
+                reason="compte forcé %s au seuil (%s) ; %s libre"
+                % (active.name, cache[active.name].reason, free[0].name)):
+            # #295: the row changed since it was read — a human forced another
+            # account meanwhile: that force holds (never lifted in the same turn)
+            row = store.active(host, harness) or {}
+            now_forced = by_name(items, row.get("account"))
+            if row.get("forced") and now_forced is not None:
+                return forced(now_forced)
 
     # 2. continuité : la session garde son compte tant qu'il est sous son seuil
     # (les autres comptes ne sont alors pas relus : rien à choisir)

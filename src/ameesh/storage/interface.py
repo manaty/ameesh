@@ -577,8 +577,13 @@ class Accounts(Domain):
         un autre worker a déjà basculé : rien n'est écrit."""
 
     @abc.abstractmethod
-    def set_auto(self, host: str, harness: str, *, reason: str) -> bool:
-        """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé."""
+    def set_auto(self, host: str, harness: str, *, reason: str,
+                 expected: str | None = None) -> bool:
+        """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
+
+        #295 : `expected` (None = n'importe lequel) est le compte forcé que
+        l'appelant a lu ; faux sans rien écrire si la ligne a changé de compte
+        entre-temps (un forçage humain concurrent n'est pas défait)."""
 
     @abc.abstractmethod
     def holds(self, host: str, harness: str) -> dict[str, dict]:

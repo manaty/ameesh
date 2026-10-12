@@ -61,13 +61,15 @@ class Accounts(interface.Accounts):
                 (host, harness, depart, to, kind, reason, agent))
         return True
 
-    def set_auto(self, host, harness, *, reason) -> bool:
+    def set_auto(self, host, harness, *, reason, expected=None) -> bool:
         with self.db.transaction() as tx:
             rows = tx.query(
                 "select account, forced from account_active"
                 " where host = %s and harness = %s for update", (host, harness))
             if not rows or not rows[0]["forced"]:
                 return False
+            if expected is not None and rows[0]["account"] != expected:
+                return False  # #295: a concurrent human force is kept
             tx.execute(
                 "update account_active set forced = false, updated_at = now()"
                 " where host = %s and harness = %s", (host, harness))
