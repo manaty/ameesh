@@ -182,6 +182,10 @@ class Relecture389Test(_Repli):
 
     def test_le_retour_demande_une_marge(self):
         worker = self.worker()
+        # le repli exige un harnais installé : les faux, pas ceux de l'hôte
+        env = mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN})
+        env.start()
+        self.addCleanup(env.stop)
         try:
             # dernier tour sous claude : pas de marge, il reste sous claude
             worker._state_note("turn_harness", "claude")
