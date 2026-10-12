@@ -24,6 +24,7 @@ test_l157c_dates_mesures  # storage: phase measures (numeric, upsert with coales
 test_l160d_resolutions  # stockage : résolutions préparées (text[] passé en jsonb, upsert, journal dans la même transaction) (L160d)
 test_l162_tmpfs  # stockage : signalements de /tmp filtrés par `kind` (housekeeping.recent, L162)
 test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS sur décisions et jalons (booléens) (L165)
+test_l368_planned_waits  # storage: unbounded activity, item plans and commitment dependencies (L368)
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
 test_l317_project_modules  # storage: transactional module guards, structured evidence and project isolation (L317a)
 test_l56_role_executor  # driver: the creator role is set for several statements, which needs one session (psql: transaction) (L56)

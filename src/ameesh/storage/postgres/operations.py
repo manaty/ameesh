@@ -328,7 +328,7 @@ class Operations(interface.Operations):
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
             """,
-            (int(limit),))
+            (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
