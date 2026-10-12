@@ -263,12 +263,14 @@ ameesh-work-partial: <numéro du lot>
 ```
 
 Le lot reste ouvert jusqu'à la fusion d'une PR qui ne porte pas cette
-ligne (la même ligne dans le message d'une fusion locale le retient aussi).
+ligne (la même ligne dans le message d'une fusion locale le retient aussi,
+tant que la branche n'est pas fusionnée au-delà de cette fusion).
 Si le corps est illisible (`gh` absent ou non connecté), un lot sans
 branche déclarée reste ouvert ; une PR plus récente, lisible et complète,
 le ferme. Une branche déclarée et prouvée fusionnée ferme le lot comme
 avant, et elle seule compte : la fusion d'une autre `lot/<id>-…` ne ferme
-pas un lot qui porte une branche. Un relevé lit au plus 20 corps de PR ;
+pas un lot qui porte une branche. Un relevé lit au plus 20 corps de PR
+(un corps déjà lu est gardé, sans nouvel appel) ;
 après un échec de `gh`, il n'en lit plus d'autre dans ce dépôt, et la PR en
 échec n'est relue qu'après un délai (1 min, doublé à chaque échec, 1 h au
 plus). `ameesh work sync-github` suit les mêmes règles et ne retient que
