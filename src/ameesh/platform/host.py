@@ -234,9 +234,9 @@ def _unescape(field: str) -> str:
 
 
 def mountinfo(path: str | None = None) -> list[dict]:
-    """The mounts of this process (#306): `point`, `dev` (an st_dev value),
-    `fstype`, `source`, from /proc/self/mountinfo (`path`: a file in that
-    format, tests). Read without touching the mount points: a mount behind a
+    """The mounts of this process (#306), in mount order: `id` (the mount
+    id), `point`, `dev` (an st_dev value), `fstype`, `source`, from
+    /proc/self/mountinfo (`path`: a file in that format, tests). Read without touching the mount points: a mount behind a
     directory that denies traversal is listed too. Not Linux, unreadable: []."""
     if path is None:
         if not _proc_ok():
@@ -255,25 +255,52 @@ def mountinfo(path: str | None = None) -> list[dict]:
                     dev = os.makedev(int(major), int(minor))
                 except ValueError:
                     continue
-                out.append({"point": _unescape(fields[4]), "dev": dev,
+                out.append({"id": int(fields[0]) if fields[0].isdigit() else None,
+                            "point": _unescape(fields[4]), "dev": dev,
                             "fstype": rest[0], "source": _unescape(rest[1])})
     except OSError:
         return []
     return out
 
 
+def _under(path: str, point: str) -> bool:
+    return path == point or path.startswith(point.rstrip(os.sep) + os.sep)
+
+
 def covering_mount(path: str, mounts: list[dict] | None = None) -> dict | None:
-    """The deepest mount whose point is `path` or one of its parents, by the
-    path's text alone (no stat: works behind an untraversable directory);
-    the last mounted wins on one point. None without mount table."""
+    """The deepest visible mount whose point is `path` or one of its
+    parents, by the path's text alone (no stat: works behind an
+    untraversable directory). A mount is hidden by any later one on its
+    point or on a parent of it (#289 r1: /rescue mounted over /rescue/fs).
+    None without mount table."""
     path = os.path.abspath(path)
     best = None
     for entry in mountinfo() if mounts is None else mounts:
         point = entry["point"]
-        if path == point or path.startswith(point.rstrip(os.sep) + os.sep):
-            if best is None or len(point) >= len(best["point"]):
-                best = entry
+        if best is not None and _under(best["point"], point):
+            best = None     # mounted over
+        if _under(path, point) and (best is None or len(point) > len(best["point"])):
+            best = entry
     return best
+
+
+def mount_id(path: str) -> int | None:
+    """The id of the mount `path` resolves to (#289 r1), the `mnt_id` the
+    kernel gives an O_PATH descriptor in /proc/self/fdinfo: no read
+    permission needed. None when unreadable or not Linux."""
+    try:
+        fd = os.open(path, getattr(os, "O_PATH", 0) or os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        text = _read(os.path.join(PROC, "self", "fdinfo", str(fd))) or ""
+    finally:
+        os.close(fd)
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key == "mnt_id" and value.strip().isdigit():
+            return int(value)
+    return None
 
 
 # --------------------------------------------------------------------------

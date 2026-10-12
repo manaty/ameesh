@@ -360,7 +360,11 @@ def _anchor(path: str) -> str | None:
     the mount table without stat): when that point is out of reach (a btrfs
     mounted AT /data/private/docker), its filesystem is read through another
     reachable mount of it; None when there is none (the volume is unreadable,
-    never credited to the parent filesystem)."""
+    never credited to the parent filesystem). The mount is looked up on the
+    path with its symlinks resolved, and another mount is used only if the
+    kernel resolves its point to that very mount (`mount_id`: not hidden by
+    a mount over one of its parents) (#289 r1)."""
+    path = os.path.realpath(path)
     current = path
     while True:
         try:
@@ -379,10 +383,8 @@ def _anchor(path: str) -> str | None:
         if other["dev"] != own["dev"] or other["point"] == own["point"] \
                 or platform.covering_mount(other["point"], mounts) is not other:
             continue  # another filesystem, or this mount is overmounted
-        try:
-            os.stat(other["point"])
-        except OSError:
-            continue
+        if other.get("id") is None or platform.mount_id(other["point"]) != other["id"]:
+            continue  # out of reach, or another filesystem shows there
         return other["point"]
     return None
 
@@ -417,7 +419,8 @@ def volume_key(path: str) -> str:
     the path's `_anchor`."""
     anchor = _anchor(path)
     if anchor is None:  # #306: an unreachable mount is a volume of its own
-        return "mount:%d" % platform.covering_mount(path)["dev"]
+        own = platform.covering_mount(os.path.realpath(path), platform.mountinfo())
+        return "mount:%d" % own["dev"]
     found = platform.btrfs_fs_info(_probe(path)) if platform.is_linux() else None
     if found is not None and found[0]:
         return "btrfs:%s" % found[0]
@@ -464,8 +467,10 @@ def worst(vols: list[dict], field: str) -> dict | None:
 
 def tmp_usage(tmps) -> dict:
     """`fs_usage` of the fullest tmpfs among `tmps` (#306: the turns' tmp root
-    can be a tmpfs of its own), else of the last one (the system tmp)."""
-    usages = [fs_usage(p) for p in tmps]
+    can be a tmpfs of its own), else of the last one (the system tmp). A tmp
+    root not created yet is read on its `_anchor`, the filesystem it will be
+    created on (#289 r1)."""
+    usages = [dict(fs_usage(_anchor(p) or p), tmp_path=p) for p in tmps]
     known = [u for u in usages if tmpfs_fraction(u) is not None]
     return max(known, key=tmpfs_fraction) if known else usages[-1]
 
