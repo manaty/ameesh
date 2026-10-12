@@ -78,6 +78,35 @@ class ProofHelperTest(unittest.TestCase):
         self.assertEqual(set(options["env"]), {"PATH", "HOME", "LANG"})
         self.assertEqual(options["cwd"], "/")
 
+    def test_real_worker_drops_root_and_cannot_see_credential_environment(self):
+        import subprocess
+        import sys
+        import shutil
+        import pwd
+        if sys.platform != "linux" or not shutil.which("sudo"):
+            self.skipTest("requires Linux with a noninteractive sudo test runner")
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode:
+            self.skipTest("test runner has no noninteractive root access")
+        account = pwd.getpwnam("nobody")
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder).chmod(0o755)
+            if any(parent.stat().st_mode & 0o001 == 0 for parent in Path(folder).parents):
+                self.skipTest("worker cannot traverse this runner's private temporary directory")
+            artifact = Path(folder, "artifact.py")
+            artifact.write_text("import os\nprint(os.geteuid(), os.environ.get('PGPASSWORD', 'absent'))\n")
+            artifact.chmod(0o644)
+            code = ("import sys, os, json; sys.path.insert(0, sys.argv[1]); "
+                    "from ameesh.modules.it.execution import execute; "
+                    "os.environ['PGPASSWORD'] = 'service-secret'; "
+                    "print(json.dumps(execute(sys.argv[2], runner=sys.executable, execution_user='nobody'))) ")
+            result = subprocess.run(["sudo", "-n", sys.executable, "-I", "-c", code,
+                                     str(Path(__file__).resolve().parents[1] / "src"), str(artifact)],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(result.stdout)
+            self.assertEqual(observed["output"], "%s absent" % account.pw_uid)
+            self.assertEqual(observed["exit_code"], 0)
+
     def test_helper_rejects_unprivileged_start_and_writable_configuration(self):
         with mock.patch("os.geteuid", return_value=1000):
             with self.assertRaisesRegex(ValueError, "requires root"):

@@ -29,6 +29,9 @@ BEGIN
         IF r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls OR r.rolreplication OR r.rolcanlogin THEN
             RAISE EXCEPTION 'module writer groups must be nonadministrative NOLOGIN roles';
         END IF;
+        IF has_schema_privilege(r.oid, current_schema(), 'CREATE') THEN
+            RAISE EXCEPTION 'module writer groups must not create or own schema objects';
+        END IF;
         IF EXISTS (SELECT 1 FROM pg_roles p WHERE p.oid <> r.oid AND pg_has_role(r.oid, p.oid, 'MEMBER')) THEN
             RAISE EXCEPTION 'module writer groups must not inherit another role';
         END IF;

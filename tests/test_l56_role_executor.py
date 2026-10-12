@@ -148,6 +148,33 @@ class RoleExecutorTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
 
+    def test_module_writer_role_contract_and_executor_separation(self):
+        q = db_mod.quote_ident
+        names = ("ameesh_canon_sync", "ameesh_it_proof")
+        existing = {r["rolname"] for r in self.db.query("SELECT rolname FROM pg_roles WHERE rolname IN (%s,%s)", names)}
+        script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+        try:
+            for _ in range(2):
+                proc = subprocess.run(["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                                       "-f", script], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(self.run_script(self.role).returncode, 0)
+            for name in names:
+                self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE ameesh_canon_sync")
+                ModuleStore(tx).replace("", modules.declarations(federation()))
+            # Neither executor nor proof writer is a policy writer.
+            with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE ameesh_it_proof")
+                ModuleStore(tx).replace("", [])
+        finally:
+            for name in names:
+                self.db.execute("DROP OWNED BY %s" % q(name))
+                if name not in existing:
+                    self.db.execute("DROP ROLE %s" % q(name))
+
     def test_isolated_writer_records_observed_execution_without_policy_rights(self):
         import sys
         from pathlib import Path
