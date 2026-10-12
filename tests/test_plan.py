@@ -184,29 +184,29 @@ class PlanUnitTest(unittest.TestCase):
         item = {"state": "qa", "assignee": "ouvrier"}
         none = {"verdict_kind": None, "verdict_current": False, "reviewer": None}
         self.assertEqual(stagnation.waiting(item, none)["label"],
-                         "verdict d'un relecteur (non désigné)")
+                         "verdict from a reviewer (none designated)")
         prior = dict(none, reviewer="relecteur")
-        self.assertEqual(stagnation.waiting(item, prior)["label"], "verdict de relecteur")
+        self.assertEqual(stagnation.waiting(item, prior)["label"], "verdict by relecteur")
         blocked = {"verdict_kind": "blocked", "verdict_current": True}
         self.assertEqual(stagnation.waiting(item, blocked),
-                         {"what": "fix", "who": "ouvrier", "label": "correction de ouvrier"})
+                         {"what": "fix", "who": "ouvrier", "label": "fix by ouvrier"})
         ok = {"verdict_kind": "ok", "verdict_current": True}
         self.assertEqual(stagnation.waiting(item, ok, responsible="human:alice")["label"],
-                         "fusion par human:alice")
+                         "merge by human:alice")
         merge = {"connector": "git-merge", "state": "proposed", "approvers": ["human:bob"]}
         self.assertEqual(stagnation.waiting(item, ok, [merge])["label"],
-                         "approbation de la fusion par human:bob")
+                         "merge approval by human:bob")
         approved = dict(merge, state="approved", proposed_by="agent:orchestre")
         self.assertEqual(stagnation.waiting(item, ok, [approved])["what"], "merge")
         self.assertEqual(stagnation.waiting(item, ok, [dict(merge, state="unknown")])["what"],
                          "merge-outcome")
         self.assertEqual(stagnation.waiting({"state": "waiting_human"}, none,
                                           responsible="human:alice")["label"],
-                         "décision humaine de human:alice")
+                         "human decision by human:alice")
         self.assertEqual(stagnation.waiting({"state": "build", "assignee": "o"}, blocked)["what"],
                          "fix")
         self.assertEqual(stagnation.waiting({"state": "intake"}, none)["label"],
-                         "attribution (lot non assigné)")
+                         "assignment (lot unassigned)")
         self.assertIsNone(stagnation.waiting({"state": "merged"}, none))
         self.assertIsNone(stagnation.waiting({"state": "closed"}, none))
 
@@ -294,7 +294,7 @@ class PackageSyncTest(_PlanDb):
         self.assertEqual(registry.get(self.db, "orchestre")["responsible"], "human:alice")
         with self.assertRaises(work.WorkError) as ctx:
             work.add(self.db, title="x", package="pay-webhook")
-        self.assertIn("retirée", str(ctx.exception))
+        self.assertIn("removed from the canon", str(ctx.exception))
         with self.assertRaises(work.WorkError):
             work.add(self.db, title="x", package="nulle-part")
         with self.assertRaises(work.WorkError) as ctx:
@@ -608,7 +608,7 @@ class ProgressPlanTest(_PlanDb):
         self.assertIsNone(lots[a["id"]]["stale"])
         self.assertEqual(lots[c["id"]]["stale"]["threshold_s"], 6 * 3600)
         self.assertGreaterEqual(lots[c["id"]]["stale"]["idle_s"], 9 * 3600 - 60)
-        self.assertEqual(lots[c["id"]]["waiting_for"]["label"], "travail de ouvrier")
+        self.assertEqual(lots[c["id"]]["waiting_for"]["label"], "work by ouvrier")
         self.assertEqual(lots[d["id"]]["state"], "closed")
         self.assertEqual(lots[d["id"]]["closed"]["reason"], "abandoned")
         self.assertIsNotNone(lots[d["id"]]["closed"]["at_ts"])
