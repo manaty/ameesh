@@ -100,6 +100,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
+   watches         put delete list deliver
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
@@ -546,6 +547,38 @@ class Budgets(Domain):
     def events(self, limit: int, scope: str | None = None) -> list[dict]:
         """Les derniers changements, récents d'abord : scope, window_s,
         old_usd, new_usd, actor, at_ts."""
+
+
+# --------------------------------------------------------------------------
+# watches managed by ameesh (L121, migration 0362)
+# --------------------------------------------------------------------------
+
+class Watches(Domain):
+    """The periodic watches of agents (`ameesh watch`): one row per watched
+    agent, with the host that holds its timer."""
+
+    @abc.abstractmethod
+    def put(self, agent: str, every_s: int, host: str, *, actor: str) -> dict:
+        """Records (or moves) the watch of `agent`; the row written: agent,
+        every_s, host, enabled_by, enabled_ts, last_sent_ts."""
+
+    @abc.abstractmethod
+    def delete(self, agent: str, host: str | None = None) -> dict | None:
+        """Removes the watch of `agent` (only if it is on `host`, when
+        given: a watch moved meanwhile stays); the row removed, None if none."""
+
+    @abc.abstractmethod
+    def list(self, agent: str | None = None) -> list[dict]:
+        """The watches (of `agent` only if given), by agent name."""
+
+    @abc.abstractmethod
+    def deliver(self, agent: str, host: str, send: Callable[[Any], None]) -> dict | None:
+        """One firing, in one transaction: the watch row of `agent` is locked;
+        if it is on `host`, `send(tx)` drops the message in that transaction
+        and `last_sent_ts` is set. A move or
+        a disable from another host waits for the end of the firing. The row
+        read (with `sent` true or false), None if there is no watch; `send`
+        raising rolls the transaction back."""
 
 
 # --------------------------------------------------------------------------
@@ -1750,7 +1783,8 @@ class Projects(Domain):
 
     @abc.abstractmethod
     def board(self, *, max_lots: int) -> dict:
-        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...]}`.
+        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...],
+        "watches": [...]}` (`watches`, L121: agent, every_s, host, last_sent_ts).
 
         `agents` : un élément par agent du registre — name, chantier, team,
         harness, host, provider, credential_mode, status, status_text, mode,
@@ -2460,6 +2494,7 @@ class Storage(abc.ABC):
     accounts: Accounts
     credentials: Credentials
     budgets: Budgets
+    watches: Watches
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys

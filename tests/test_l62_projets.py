@@ -261,7 +261,7 @@ class ProjectsPgTest(PgTestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         with open(page, encoding="utf-8") as fh:
             html = fh.read()
-        self.assertIn('id="projects"', html)
+        self.assertIn('id="panel-overview"', html)  # L304 : cartes de projet, onglet Vue d'ensemble
         self.assertIn('"projects"', progress.render_html(snap))
 
     def test_progress_snapshot_porte_les_projets(self):

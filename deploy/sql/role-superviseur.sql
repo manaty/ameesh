@@ -350,6 +350,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('budget_events', ARRAY[
         'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
     ]),
+    -- L121 (0362): the watches ameesh manages (agent, period, host, when)
+    ('agent_watches', ARRAY[
+        'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'
+    ]),
     -- liaisons de session (L41, 0030) : quelle session externe parle au nom
     -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
     ('session_bindings', ARRAY[

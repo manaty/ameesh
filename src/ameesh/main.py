@@ -64,6 +64,9 @@
         duration from creation (`work add --estimate 2h`, `work plan <id> --estimate 90m`);
   ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
         readable threads: every message that went through ameesh, in clear (R12);
+  ameesh watch enable --agent A [--every 30m] | disable --agent A | show [--json]
+        L121: the watch of an agent, a timer on this host that sends it the
+        versioned instruction (consignes/veille.md), shown in `ameesh projects`;
   ameesh receipt verify | authenticator list   approval receipts (spec §8);
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
         gated actions (spec §7);
@@ -219,6 +222,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "watch":
+        # L121: the watch of an agent (timer + versioned instruction)
+        from . import watch
+        return watch.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
