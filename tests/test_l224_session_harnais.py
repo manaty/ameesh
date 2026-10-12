@@ -143,6 +143,25 @@ class RepriseVerifieeTest(_Base):
         # la session neuve du flux devient celle de l'agent
         self.assertEqual(registry.get(self.db, "md-neuve")["session_id"], "claude-sess-1")
 
+    def test_brief_non_ecrit_sur_disque_il_ouvre_quand_meme_le_tour(self):
+        # #389 r3 : la session refusée ne se garde pas ; un résumé en attente
+        # non écrit (EACCES) reste en mémoire et ouvre le tour
+        _runner, worker = self._worker("md-neuve")
+        registry.set_session(self.db, "md-neuve", CODEX)
+        worker.agent = registry.get(self.db, "md-neuve")
+        reel = os.replace
+
+        def replace(src, dst, *a, **kw):
+            if str(dst) == worker._path(worker.RESUME_PENDING):
+                raise OSError(errno.EACCES, "Permission denied")
+            return reel(src, dst, *a, **kw)
+        with self._env(), mock.patch("os.replace", side_effect=replace):
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(self._reprises(), [None])
+        self.assertIn("session %s unknown to the harness" % CODEX,
+                      " ".join(self.turns()[-1]["argv"]))
+        self.assertFalse(os.path.exists(worker._path(worker.RESUME_PENDING)))
+
     def test_retour_a_la_derniere_session_principale_connue(self):
         _runner, worker = self._worker("md-mere")
         self._session_sur_disque(CLAUDE)

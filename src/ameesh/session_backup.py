@@ -367,6 +367,7 @@ USAGE = """\
 ameesh session list <agent> [--host H]            list off-device session backups
 ameesh session backup <agent> [--force]           back up the current session now
 ameesh session restore <agent> [--session S] [--key K] [--home DIR] [--overwrite]
+                                                  [--allow-other-agent]
                                                   restore the latest backup (or K)
                                                   to the account home (or DIR)
 """
@@ -385,24 +386,44 @@ def _agent_home(cfg, row: dict) -> tuple[str, tuple[str, ...]]:
         patterns
 
 
+def key_owner(key: str) -> str:
+    """Read the persona from the canonical host/persona/session/archive key."""
+    parts = key.split("/")
+    if (len(parts) != 4 or not all(_SAFE.fullmatch(part) for part in parts)
+            or not parts[3].endswith((".tar.gz", ".tar.gz.gpg"))):
+        raise BackupError("invalid backup key: expected host/agent/session/archive.tar.gz[.gpg]")
+    return parts[1]
+
+
 def restore_agent(db, cfg, conf, args) -> tuple[str, str, list[str]]:
-    """Exclude active turns and keep runner claims blocked through extraction."""
+    """Lock both destination and key owner through extraction; refuse active turns."""
+    owner = key_owner(args.key) if args.key else args.agent
+    if owner != args.agent and not getattr(args, "allow_other_agent", False):
+        raise BackupError("backup belongs to %s, not %s: use --allow-other-agent "
+                          "for an explicit cross-agent restore" % (owner, args.agent))
     with db.transaction() as tx:
-        rows = tx.query(
-            "SELECT harness, session_id, session_account, status, "
-            "(lease_owner IS NOT NULL AND (lease_expires_at IS NULL "
-            "OR lease_expires_at > clock_timestamp())) AS leased "
-            "FROM agent_registry WHERE name = %s FOR UPDATE", (args.agent,))
-        if not rows:
-            raise BackupError("unknown agent %s" % args.agent)
-        row = rows[0]
-        if row["status"] == "running" or row["leased"]:
-            raise BackupError("cannot restore an active agent: stop %s first" % args.agent)
+        locked = {}
+        # Stable ordering avoids deadlocks for opposing cross-agent restores.
+        for agent in sorted({args.agent, owner}):
+            rows = tx.query(
+                "SELECT harness, session_id, session_account, status, "
+                "(lease_owner IS NOT NULL AND (lease_expires_at IS NULL "
+                "OR lease_expires_at > clock_timestamp())) AS leased "
+                "FROM agent_registry WHERE name = %s FOR UPDATE", (agent,))
+            if not rows:
+                raise BackupError("unknown agent %s" % agent)
+            row = rows[0]
+            if row["status"] == "running" or row["leased"]:
+                raise BackupError("cannot restore an active agent: stop %s first" % agent)
+            locked[agent] = row
+        row = locked[args.agent]
         home = args.home or _agent_home(cfg, row)[0]
         session = args.session or row.get("session_id")
         key = args.key or latest(conf, agent=args.agent, session=session or "")
         if not key:
             raise BackupError("no backup for %s (session %s)" % (args.agent, session))
+        if key_owner(key) != owner:
+            raise BackupError("backup owner does not match the locked agent")
         return key, home, restore(conf, key, home, overwrite=args.overwrite)
 
 
@@ -423,6 +444,8 @@ def main(argv) -> int:
     p.add_argument("--key")
     p.add_argument("--home")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--allow-other-agent", action="store_true",
+                   help="explicitly allow a key owned by another agent; both agents must be idle")
     args = p.parse_args(rest)
     cfg = load_config()
     try:

@@ -137,15 +137,13 @@ def log_async(message: str) -> None:
 
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
+EXIT_REVOKED = 6
 #: L159f : tant que la porte d'hôte n'est pas fixée (canon pas encore lu en
 #: entier), le sync du canon est réessayé à ce pas (secondes)
 GATE_SETTLE_RETRY_S = 30
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
-#: L242b : rôles de conception au canon (agents critiques, avec les
-#: orchestrateurs et les auditeurs)
-DESIGN_ROLES = ("conception", "design")
 #: L147 (#220 r2) : un conteneur relancé par sa politique (unité du
 #: gestionnaire utilisateur, podman-restart) peut démarrer après l'exécuteur —
 #: aucune ligne n'est soldée moins de BOOT_SETTLE_S après le démarrage de
@@ -429,6 +427,11 @@ class AgentWorker(threading.Thread):
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
         self._account_override = None
+        #: L242b (3) : harnais emprunté par un agent critique au seuil sur le
+        #: sien, `(harnais, compte ou None)`, et harnais imposé au tour de
+        #: résumé d'une rotation de harnais
+        self._borrowed = None
+        self._harness_override = None
         #: dossier de travail absent (L35) : blocage en cours, `cwd` du registre
         #: au dernier échec, attente courante et échéance du prochain essai
         #: complet. Un blocage hérité d'un exécuteur précédent est repris tel
@@ -476,6 +479,7 @@ class AgentWorker(threading.Thread):
         #: L106 : le bail repris était celui d'une session `attach` morte (bail
         #: expiré sans être rendu) : un tour de reprise sur la même session
         self._reprise_attach = bool(str(agent.get("lease_owner") or "").startswith("attach:"))
+        self._resume_load()
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -651,6 +655,9 @@ class AgentWorker(threading.Thread):
         au renouvellement le posent sans que la base ait repris le bail ; le
         retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
+        # L113 : le travail part au serveur sous le bail, puis le dossier est
+        # effacé (même bail perdu : rien ne doit rester sur l'appareil)
+        self._depot_push(final=True)
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
@@ -1013,6 +1020,38 @@ class AgentWorker(threading.Thread):
                 self.stop_group_now("restart requested", grace=1.0)
                 return
 
+    def yield_to_host(self, reason: str) -> None:
+        """Porte d'hôte (L112) : l'échéance du retrait est atteinte, ou l'hôte
+        s'arrête — le tour en cours s'arrête (point de passage unique, grâce
+        brève) ; sa consigne repartira en attente, la session est gardée."""
+        self.host_yield = reason
+        self.wake.set()
+        threading.Thread(target=self.stop_group_now, args=("l'hôte se retire : %s" % reason,),
+                         kwargs={"grace": 1.0}, daemon=True,
+                         name="%s-retrait" % self.name).start()
+
+    def _leave_for_host(self) -> None:
+        """Porte d'hôte fermée (L112) : plus aucun tour ici. État de la
+        session écrit, consigne éventuelle remise en attente, statut dit ;
+        le bail est rendu par `run()` en sortant. Écritures au mieux : si le
+        réseau est déjà coupé, le bail échoit seul et le courrier sera
+        re-livré, signalé."""
+        gate = getattr(self.runner, "host_gate", None)
+        etat = gate.current if gate is not None else None
+        texte = "hôte indisponible (%s, %s) : reprise au retour de l'hôte" % (
+            etat.state if etat else "?", etat.reason if etat else "?")
+        log_async("[%s] l'hôte se retire : bail rendu (%s)" % (self.name, texte))
+        if self.lease_lost.is_set():
+            return
+        try:
+            if self._session_en_attente is not None:
+                self._enregistre_session()
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            row = registry.get(self.db, self.name) or {}
+            if row.get("status") in ("running", "idle", "queued"):
+                registry.set_status(self.db, self.name, "queued", status_text=texte)
+        except db_mod.DbError as exc:
+            log_async("[%s] état de retrait non écrit (%s)" % (self.name, db_mod.explain(exc)))
     def _audit_deadline_monitor(self, done: threading.Event, deadline: float) -> None:
         """L234 : échéance monotone indépendante du flux et de la base.
 
@@ -1092,7 +1131,7 @@ class AgentWorker(threading.Thread):
             os.unlink(self._path("session"))
         except OSError:
             pass
-        self.resume_summary = ""
+        self._resume_drop()
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_reread = 0
@@ -1241,6 +1280,60 @@ class AgentWorker(threading.Thread):
         except OSError:
             pass
 
+    #: le résumé de reprise d'une session oubliée, en attente de la session
+    #: neuve qu'il ouvre (#389 r1 : il survit à une panne de l'exécuteur)
+    RESUME_PENDING = "resume-pending.json"
+
+    def _resume_keep(self, resume: str, origin: str) -> bool:
+        """Le résumé de reprise retenu pour la session neuve : en mémoire et
+        dans l'état local, AVANT l'oubli de l'ancienne session — une panne
+        entre l'oubli et le lancement ne le perd pas (#389 r1). Faux s'il
+        n'a pas pu être écrit : l'appelant garde alors l'ancienne session
+        (#389 r2)."""
+        path = self._path(self.RESUME_PENDING)
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump({"ts": time.time(), "resume": resume, "origin": origin}, fh,
+                          ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(path + ".tmp", path)
+        except OSError as exc:
+            log_async("[%s] resume summary not kept on disk (%s)" % (self.name, exc))
+            try:
+                os.unlink(path + ".tmp")
+            except OSError:
+                pass
+            return False
+        self.resume_summary, self.resume_origin = resume, origin
+        return True
+
+    def _resume_drop(self) -> None:
+        """Le résumé de reprise a ouvert la session neuve, ou n'a plus lieu
+        d'être : oublié, en mémoire et sur disque."""
+        self.resume_summary = ""
+        try:
+            os.unlink(self._path(self.RESUME_PENDING))
+        except OSError:
+            pass
+
+    def _resume_load(self) -> None:
+        """Au démarrage du worker : le résumé de reprise resté en attente, si
+        aucune session n'a été ouverte depuis (sinon il est périmé)."""
+        try:
+            with open(self._path(self.RESUME_PENDING), encoding="utf-8") as fh:
+                pending = json.load(fh)
+        except (OSError, ValueError):
+            return
+        resume = pending.get("resume") if isinstance(pending, dict) else None
+        if not isinstance(resume, str) or not resume or self.current_session():
+            self._resume_drop()
+            return
+        self.resume_summary = resume
+        self.resume_origin = "ameesh" if pending.get("origin") == "ameesh" else "agent"
+        log_async("[%s] pending resume summary recovered (%d characters)"
+                  % (self.name, len(resume)))
+
     def maybe_rotate(self) -> bool:
         """Résume la session courante puis en ouvre une neuve (0018, R19).
 
@@ -1284,6 +1377,11 @@ class AgentWorker(threading.Thread):
         rotation attend : la bascule du prochain tour (`continuity`) résume
         sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
         if not self.budget_ok() or not self.auth_ready():
+            return False
+        if self.turn_harness() != account_turn.session_harness(self):
+            # #389 r1 : le tour partirait sous un autre harnais que celui de
+            # la session (repli L242b, ou retour) — c'est `continuity` qui
+            # change de harnais, avec le résumé sous l'ancien
             return False
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
@@ -1336,17 +1434,21 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
+        if not self._resume_keep(resume, "agent"):
+            self._fil_note("Session rotation cancelled: the resume summary could not "
+                           "be kept on disk. The old session is kept.",
+                           meta={"action": "rotation", "etat": "annulee"})
+            return False
         # L'effacement est fencé par le bail : si un remplaçant a réclamé l'agent
         # entre-temps, sa session n'est pas touchée.
         if not registry.clear_session(self.db, self.name, self.runner.runner_id, self.epoch):
+            self._resume_drop()
             log_async("[%s] rotation cancelled: lease lost before the session was cleared"
                       % self.name)
             self._fil_note("Session rotation cancelled: the lease changed hands "
                            "before clearing; nothing was touched.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
-        self.resume_summary = resume
-        self.resume_origin = "agent"
         try:
             os.unlink(self._path("session"))
         except OSError:
@@ -1413,7 +1515,10 @@ class AgentWorker(threading.Thread):
             log_async("[%s] turn on delegated lot(s): %s"
                       % (self.name, ", ".join("#%d" % i for i in marques)))
         # L157 : le premier tour de l'assigné sur un lot date le début du
-        # travail (durée réelle = fusion − début), une seule fois
+        # travail (durée réelle = fusion − début), une seule fois. Not on a
+        # mediated executor: `work.mark_started` is not in contract 1.1.
+        if getattr(self.runner, "mediated", False):
+            return
         try:
             debuts = estimates.mark_started(self.db, self.name, lots)
         except (db_mod.DbError, ValueError) as exc:
@@ -1689,12 +1794,15 @@ class AgentWorker(threading.Thread):
                 pass
             try:
                 from . import reprise
-                self.resume_summary = reprise.deterministic_brief(
+                brief = reprise.deterministic_brief(
                     self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
                     session=refusee, reason=motif,
                     consigne="This turn's instruction follows this brief: resume your "
                              "work from there.")
-                self.resume_origin = "ameesh"
+                if not self._resume_keep(brief, "ameesh"):
+                    # #389 r3 : la session refusée ne se garde pas — le brief,
+                    # au moins en mémoire, ouvre le tour
+                    self.resume_summary, self.resume_origin = brief, "ameesh"
             except Exception as exc:  # un brief manquant n'empêche pas l'oubli
                 log_async("[%s] deterministic resume brief unavailable (%s)"
                           % (self.name, exc))
@@ -1925,10 +2033,86 @@ class AgentWorker(threading.Thread):
         Le `cwd` est celui de la ligne du registre relue par `pick()` (jamais
         un cache de l'inscription) ; à défaut, adoption bornée d'un worktree
         déplacé (0018), seulement si `adopt`."""
+        if getattr(self.runner, "mediated", False):
+            return self._mediated_workdir()  # L113 : dépôt de travail
         cwd = self.agent.get("cwd")
         if cwd and os.path.isdir(cwd):
             return cwd
         return self.adopt_moved_worktree() if adopt else None
+
+    # -- dépôt de travail de l'exécuteur médié (L113) -------------------------
+    def _depot_dir(self) -> str:
+        """`<AMEESH_EXEC_HOME>/work/<agent>` : un chemin STABLE d'un bail à
+        l'autre (dsh lie sa session au dossier : un chemin par epoch rendait
+        la reprise impossible, essai L115). Le contenu, lui, est refait à
+        chaque prise de bail et effacé à la fin."""
+        from .mediated_executor import device
+        return os.path.join(device.home(), "work", self.name)
+
+    def _depot_fence(self):
+        from .mediated_executor import contract as exec_contract
+        return exec_contract.Fence(self.name, self.runner.runner_id, int(self.epoch))
+
+    def _mediated_workdir(self) -> str | None:
+        """Le dossier de travail d'un exécuteur médié : l'archive du commit
+        rendue par le serveur à la prise du bail (`work_repo.checkout`), sous
+        `<AMEESH_EXEC_HOME>/work/<agent>`. Sans dépôt monté sur le
+        serveur (404) : un dossier vide. None si l'archive est illisible."""
+        from .mediated_executor import work_repo
+        path = self._depot_dir()
+        if getattr(self, "_depot_ready", None) == path and os.path.isdir(path):
+            return path
+        work_repo.wipe(path)  # reste d'un bail précédent (arrêt brutal)
+        transport = getattr(self.db, "transport", None)
+        if not hasattr(transport, "get_work"):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            self._depot_active = False
+            self._depot_ready = path
+            return path
+        try:
+            meta = work_repo.checkout(transport, self._depot_fence(), path)
+            log_async("[%s] dépôt de travail : %s (%s) dans %s"
+                      % (self.name, meta["branch"], meta["commit"][:12], path))
+            self._depot_active = True
+        except db_mod.DbError as exc:
+            if getattr(exc, "code", None) != "op_not_allowed":
+                log_async("[%s] dépôt de travail indisponible : %s" % (self.name, exc))
+                work_repo.wipe(path)
+                return None
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            self._depot_active = False
+            log_async("[%s] aucun dépôt de travail sur le serveur : dossier vide %s"
+                      % (self.name, path))
+        except (work_repo.DepotError, OSError, subprocess.SubprocessError) as exc:
+            log_async("[%s] dépôt de travail illisible : %s" % (self.name, exc))
+            work_repo.wipe(path)
+            return None
+        self._depot_ready = path
+        return path
+
+    def _depot_push(self, *, final: bool = False) -> None:
+        """Après un tour, et à la fin du bail (`final` : travail non commité
+        commité, puis dossier effacé) : les commits de l'appareil partent au
+        serveur, qui pousse la branche de l'agent. Ne lève jamais."""
+        if not getattr(self.runner, "mediated", False):
+            return
+        from .mediated_executor import work_repo
+        path = getattr(self, "_depot_ready", None)
+        try:
+            if path and getattr(self, "_depot_active", False) and os.path.isdir(path) \
+                    and not self.lease_lost.is_set():
+                reply = work_repo.push(self.db.transport, self._depot_fence(), path,
+                                   commit_pending=final)
+                if reply:
+                    log_async("[%s] dépôt de travail : %d commit(s) poussé(s) sur %s (%s)"
+                              % (self.name, reply.get("commits", 0), reply.get("branch"),
+                                 str(reply.get("commit") or "")[:12]))
+        except (db_mod.DbError, work_repo.DepotError, OSError, subprocess.SubprocessError) as exc:
+            log_async("[%s] dépôt de travail : envoi impossible (%s)" % (self.name, exc))
+        finally:
+            if final and path:
+                work_repo.wipe(path)
+                self._depot_ready = None
 
     def _workdir_missing(self, force_status: bool = False) -> bool:
         """Note un dossier absent (L35) ; faux si le bail n'est plus le nôtre.
@@ -2069,19 +2253,41 @@ class AgentWorker(threading.Thread):
             state_dir=self.cfg.state_dir, db=self.db,
             tools={self.name: self.agent.get("harness") or ""},
             **limites.book_kwargs())
-        # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
-        # compte et la garde bascule au lieu de mettre en pause.
-        raison = account_turn.choose(self, book)
-        # L242b : un non-critique s'arrête plus tôt — sous le rythme (réserve,
-        # sans comptes déclarés ; avec, `accounts.choose` la prend) et à une
-        # part du plafond horaire payé au token du mesh
-        from . import accounts as accounts_mod
         critique = account_turn.is_critical(self)
-        part = 1.0 if critique else getattr(self.cfg, "noncritical_hourly_share", 0.75)
+        if not critique:
+            return self._own_reason(book, margin=True)
+        # L242b (3), #389 r1 : sous un harnais emprunté, le retour au sien
+        # demande la marge d'un non-critique (pas d'aller-retour à chaque
+        # franchissement du plafond) — sauf si aucun emprunt n'en a plus
+        retour = account_turn.borrowing(self)
+        raison = self._critical_fallback(self._own_reason(book, margin=retour), limites)
+        if raison and retour:
+            raison = self._own_reason(book, margin=False)
+        return raison
+
+    def _own_reason(self, book, *, margin: bool) -> str:
+        """La raison de pause sur son propre harnais, ou ''. L30 (0027) : avec
+        des comptes déclarés, le rythme se juge compte par compte et la garde
+        bascule au lieu de mettre en pause. L242b : `margin` (un non-critique,
+        ou un critique qui revient d'un emprunt) s'arrête plus tôt — sous le
+        rythme (réserve, sans comptes déclarés ; avec, `accounts.choose` la
+        prend) et à une part du plafond horaire payé au token du mesh."""
+        from . import accounts as accounts_mod
+        raison = account_turn.choose(self, book, margin=margin)
+        part = getattr(self.cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
         if raison is None:
-            return book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
+            return book.over(self.name, reserve=accounts_mod.RESERVE if margin else 0.0,
                              hourly_share=part)
         return raison or book.over(self.name, pace=False, hourly_share=part)
+
+    def _critical_fallback(self, raison: str, limites) -> str:
+        """L242b (3) : la pause budget d'un agent critique cède à un autre
+        harnais qui a de la marge (`account_turn.fallback`) ; jamais une
+        configuration ou un état de comptes illisibles."""
+        if not raison or raison.startswith(("invalid account configuration",
+                                            "account state unavailable")):
+            return raison
+        return account_turn.fallback(self, raison, limites)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -2096,11 +2302,14 @@ class AgentWorker(threading.Thread):
         aveugle (verdict L13 B1).
         """
         self._account = None
+        self._borrowed = None
         if self.runner.budget_limits(self.db).per_hour <= 0:
             # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
             # overage ou au-dessus d'un plafond fixe, quels que soient les
             # réglages de budget — sans autre compte, pas de tour
             raison = account_turn.choose(self, None, pause=False) or ""
+            if raison and account_turn.is_critical(self):
+                raison = self._critical_fallback(raison, self.runner.budget_limits(self.db))
         else:
             # Réparation d'abord : un travail comptable en attente (marqueur
             # persistant) doit être écrit avant d'autoriser le moindre tour ;
@@ -2145,6 +2354,33 @@ class AgentWorker(threading.Thread):
         if issue == "done":
             self.agent = dict(agent, status="idle", status_text="")
             log_async("[%s] budget pause lifted (%s)" % (self.name, texte))
+
+    def turn_harness(self) -> str:
+        """L242b (3) : le harnais de ce tour (`account_turn._harness`) — le
+        sien, ou celui qu'un agent critique emprunte, ou celui d'un résumé de
+        rotation."""
+        return account_turn._harness(self) or "other"
+
+    def _ledger_harness(self) -> str:
+        """Le harnais du dernier tour lancé (noté avant le lancement) : celui
+        de sa ligne de grand livre, même rejouée après une panne."""
+        return self._state_read("turn_harness") or (self.agent or {}).get("harness") or ""
+
+    def _state_note(self, key: str, value: str) -> bool:
+        """Écrit une valeur d'état locale, atomiquement ; jamais fatal. Rend
+        vrai si elle est écrite (#389 r1 : le harnais du tour l'exige)."""
+        path = os.path.join(self.state_dir, key)
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                fh.write(value)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(path + ".tmp", path)
+            return True
+        except OSError as exc:
+            log_async("[%s] state %s not written (%s)" % (self.name, key, exc))
+            return False
 
     def _state_read(self, key: str) -> str:
         """Lit une valeur d'état locale (`model`, `effort`) ; '' si absente."""
@@ -2209,7 +2445,7 @@ class AgentWorker(threading.Thread):
             from . import accounts as accounts_mod
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir, db=self.db,
-                tools={self.name: self.agent.get("harness") or ""},
+                tools={self.name: self._ledger_harness()},
                 # L95 : le journal d'un fil Codex vit dans le dossier du compte
                 codex_homes=accounts_mod.homes(self.cfg, "codex"))
             # Le modèle **du tour** se relit dans les événements du tour, qui sont
@@ -2274,7 +2510,7 @@ class AgentWorker(threading.Thread):
         """
         modele = ""
         try:
-            adapter = adapters.adapter_for(self.agent.get("harness") or "other",
+            adapter = adapters.adapter_for(self._ledger_harness() or "other",
                                            resolve=False)
             with open(self._path("events.jsonl"), encoding="utf-8") as flux:
                 for numero, ligne in enumerate(flux):
@@ -2330,6 +2566,9 @@ class AgentWorker(threading.Thread):
         The separate L232b controller prepares hosts and drains at a lot
         boundary. Only a persisted claim fence stops this source worker.
         """
+        if getattr(self.runner, "mediated", False):
+            # Device relocation is controlled by the mesh server (L109).
+            return False
         from . import handoffs, host_lifecycle, storage, work
         try:
             api = storage.of(self.db)
@@ -2438,7 +2677,11 @@ class AgentWorker(threading.Thread):
         lisible. Le statut ne change pas ; seul le texte dit ce qui retient le
         tour, et seulement quand du travail attend. Fencé par le bail ; ne lève
         jamais. Le journal, lui, ne dit l'attente qu'une fois par épisode de
-        pression, pour tous les agents (`Runner._pressure_episode_update`)."""
+        pression, pour tous les agents (`Runner._pressure_episode_update`).
+        Not on a mediated executor: `leases.hold_note` is not in contract 1.1
+        (the wait stays silent there, as in 1.6.x)."""
+        if getattr(self.runner, "mediated", False):
+            return
         if not self._work_waiting():
             return
         self.runner.pressure_delayed(self.name)
@@ -2464,6 +2707,10 @@ class AgentWorker(threading.Thread):
         texte = getattr(self, "_pressure_text", "")
         if not texte:
             return
+        if getattr(self.runner, "mediated", False):
+            # `leases.release_hold` hors contrat 1.1 : sur un exécuteur médié,
+            # une pause critique n'est pas levée d'elle-même (comme avant L31b)
+            return
         try:
             levee = registry.release_hold(self.db, self.name, self.runner.runner_id,
                                           self.epoch, texte,
@@ -2488,12 +2735,14 @@ class AgentWorker(threading.Thread):
         aucun sain), ou le compte par défaut du harnais ('') sans comptes
         déclarés. En échec : blocage `auth_blocked` (fencé), pas de tour, pas
         d'échec rapide. Sain de nouveau : blocage levé, le tour part."""
-        if self.runner.dry_run:
+        # Provider credentials and their health belong to the relay server.
+        # The device has no account health authority or credential to inspect.
+        if self.runner.mediated or self.runner.dry_run:
             return True
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
             return True  # `account_turn.apply` refusera le tour, avec sa raison
-        harness = self.agent.get("harness") or ""
+        harness = self.turn_harness()
         account = auth_failure.account_name(compte)
         sick = auth_failure.failing(self.db, self.cfg.host, harness).get(account)
         if sick is None:
@@ -2639,7 +2888,8 @@ class AgentWorker(threading.Thread):
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
         # plein tour).
-        account_turn.continuity(self)
+        if not account_turn.continuity(self):
+            return None  # #389 r2 : rotation requise mais annulée, rien consommé
         urgents = mail.unread_urgent(self.db, self.name)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
@@ -2781,7 +3031,7 @@ class AgentWorker(threading.Thread):
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
-        harness = self.agent.get("harness") or "other"
+        harness = self.turn_harness()
         adapter = adapters.adapter_for(harness)
         # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
         # descripteur utilisé est journalisé avec sa provenance et son empreinte,
@@ -2873,6 +3123,14 @@ class AgentWorker(threading.Thread):
         if self._refus_pression:
             self._host_pressure_note(pression)
             return False
+        if self.runner.gate_holds():
+            # L112 : l'hôte se retire entre le choix du tour et son lancement —
+            # une consigne déjà prise repart en attente, rien n'est lancé.
+            try:
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            except db_mod.DbError:
+                pass
+            return False
         if pression.get("blocked"):
             self.runner.pressure_bypassed(self.name)  # orchestrateur ou auditeur
         if not candidats or self.runner.dry_run:
@@ -2946,6 +3204,25 @@ class AgentWorker(threading.Thread):
                 "unavailable). They will be delivered again, flagged as possibly redelivered."
                 % len(incertains),
                 meta={"action": "remise-incertaine", "messages": incertains})
+
+    def _mediated_env(self, env: dict) -> None:
+        """L109 : la session du harnais d'un exécuteur médié parle au serveur
+        avec un jeton de session lié au bail (jamais d'accès à la base) :
+        `AMEESH_BACKEND=mediated`, `AMEESH_EXEC_URL`, `AMEESH_EXEC_TOKEN`.
+        Sans jeton (serveur injoignable), le tour part quand même : seules
+        les commandes `ameesh` de la session échoueront."""
+        from .mediated_executor.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN
+        for name in ("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
+                     "AGENT_MESH_DATABASE_URL", ENV_SESSION_TOKEN):
+            env.pop(name, None)
+        env["AMEESH_BACKEND"] = env["AGENT_MESH_BACKEND"] = "mediated"
+        env[ENV_SERVER_URL] = getattr(self.db, "url", "") or self.cfg.exec_url
+        try:
+            env[ENV_SESSION_TOKEN] = self.runner.session_token_for(
+                self.name, self.runner.runner_id, self.epoch)
+        except db_mod.DbError as exc:
+            log_async("[%s] jeton de session indisponible (%s) : les commandes ameesh de la "
+                      "session échoueront" % (self.name, db_mod.explain(exc)))
 
     def _open_turn_resource(self, turn_id: str, pgid: int | None) -> None:
         """Rattache le groupe du tour (L31, 0028) ; ne casse jamais le tour."""
@@ -3039,7 +3316,10 @@ class AgentWorker(threading.Thread):
     def _run_turn(self, spec: dict) -> bool:
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
-        harness = self.agent.get("harness") or "other"
+        harness = self.turn_harness()
+        # L242b (3) : un harnais emprunté ne prend ni le modèle, ni l'effort,
+        # ni le tier de l'agent (ceux de son harnais) : les défauts du sien
+        emprunte = harness != ((self.agent or {}).get("harness") or "other")
         try:
             adapter = self._adapter()
         except adapters.HarnessMissing as exc:
@@ -3065,28 +3345,36 @@ class AgentWorker(threading.Thread):
             resume = self._resume_prompt()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
-        model = self.agent.get("model") or self._state_read("model")
+        model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
         if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
             # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
             # du descripteur est passé explicitement. Le modèle du tour est
             # alors connu (grand livre au bon tarif, jamais « inconnu ») au
             # lieu de dépendre du profil local du harnais.
             model = adapter.spec.defaults["model"]
-        effort = self._state_read("effort") or self.agent.get("effort") or ""
+        effort = "" if emprunte else (self._state_read("effort")
+                                      or self.agent.get("effort") or "")
         # Tier (L26) : passé par le descripteur du harnais (Codex :
         # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
-        tier = self._state_read("tier") or self.agent.get("tier") or ""
+        tier = "" if emprunte else (self._state_read("tier") or self.agent.get("tier") or "")
         patch = self._path("model.patch.yml") if (model or effort) else None
         # Decision 0029: designate neutral files; the harness manages memory.
         memory_preface = ""
-        if not session and self.agent.get("memory_repository") and not self.runner.dry_run:
+        if self.agent.get("memory_repository") and not self.runner.dry_run:
             try:
-                path = memory_mod.open_copy(self.agent["memory_repository"],
-                                            self.cfg.state_dir, self.name,
-                                            cfg_raw=self.cfg.persona_memory)
-                journal_id = "session-" + uuid.uuid4().hex
-                memory_preface = memory_mod.preface(path, self.name, journal_id)
-            except (memory_mod.MemoryError, OSError, subprocess.SubprocessError) as exc:
+                memory_mod.require_isolation(self.cfg, self.db, self.name)
+                activation = not self.__dict__.get("_memory_activated", False)
+                if activation:
+                    path = memory_mod.open_copy(self.agent["memory_repository"],
+                                                self.cfg.state_dir, self.name,
+                                                cfg_raw=self.cfg.persona_memory)
+                    self._memory_activated = True
+                else:
+                    path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
+                if activation or not session:
+                    journal_id = "session-" + uuid.uuid4().hex
+                    memory_preface = memory_mod.preface(path, self.name, journal_id)
+            except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
                 log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
         resume += memory_preface
         argv = adapter.command(resume + spec["prompt"], session,
@@ -3170,25 +3458,48 @@ class AgentWorker(threading.Thread):
             "AMEESH_TURN_MAIL_MAX": str(self.turn_mail_max()),
         }
         env.update(identite)
+        if getattr(self.runner, "mediated", False):
+            self._mediated_env(env)
         if not account_turn.apply(self, env, compte):
             return False  # profil inutilisable : consigne remise, rien lancé
+        # L111 : exécuteur médié (appareil prêté) — URL du relais de modèle et
+        # jeton de session court, dans l'environnement du harnais seulement ;
+        # sans jeton, pas de tour (jamais de repli sur une clé locale).
+        from . import relay as relay_mod
+        try:
+            relay_env = None
+            if getattr(self.runner, "mediated", False):
+                # le relais est sur le serveur du mesh de CET exécuteur
+                relay_env = {"AMEESH_RELAY_URL": os.environ.get("AMEESH_RELAY_URL", ""),
+                             "AMEESH_EXEC_URL": getattr(self.db, "url", "")
+                             or self.cfg.exec_url}
+            relay_mod.apply_turn_env(env, harness, agent=self.name,
+                                     owner=self.runner.runner_id, epoch=self.epoch,
+                                     turn_id=turn_id, environ=relay_env)
+        except relay_mod.RelayTurnError as exc:
+            log("[%s] %s : tour non lancé" % (self.name, exc))
+            self.fail_turn("relais de modèle indisponible", str(exc))
+            return False
         # L73 : dossier temporaire de l'agent et caches gérés ; worktrees et
         # /tmp relevés avant le tour. Jamais bloquant : un ménage impossible
-        # laisse le tour partir avec l'environnement d'origine.
+        # laisse le tour partir avec l'environnement d'origine. Pas sur un
+        # exécuteur médié : le journal du ménage (`housekeeping.*`) n'est pas
+        # au contrat 1.1, et le dossier de travail est effacé en fin de bail.
         menage_tour = None
-        try:
-            from . import menage as menage_mod
-            # session neuve : dossier temporaire vidé — jamais sous le travail
-            # de fond d'un tour précédent encore en délai de grâce
-            fond = getattr(self.runner, "background", None)
-            menage_tour = menage_mod.Turn.begin(
-                self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                new_session=not session and not (fond and fond.has_jobs(self.name)),
-                base_env=env)
-            env.update(menage_tour.env)
-        except Exception as exc:
-            log("[%s] cleanup before the turn failed (%s)" % (self.name, exc))
-            menage_tour = None
+        if not getattr(self.runner, "mediated", False):
+            try:
+                from . import menage as menage_mod
+                # session neuve : dossier temporaire vidé — jamais sous le travail
+                # de fond d'un tour précédent encore en délai de grâce
+                fond = getattr(self.runner, "background", None)
+                menage_tour = menage_mod.Turn.begin(
+                    self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
+                    new_session=not session and not (fond and fond.has_jobs(self.name)),
+                    base_env=env)
+                env.update(menage_tour.env)
+            except Exception as exc:
+                log("[%s] cleanup before the turn failed (%s)" % (self.name, exc))
+                menage_tour = None
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
@@ -3220,6 +3531,7 @@ class AgentWorker(threading.Thread):
         error: str | None = None
         result_code = 0
         self.last_output = ""
+        self.host_yield = None
         self.last_final = None
         self.summary_display = []
         # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
@@ -3239,6 +3551,13 @@ class AgentWorker(threading.Thread):
         # une trace, on ne dépense pas (fail-closed, L13 B5). Le marqueur est
         # écrit atomiquement et lu au redémarrage ; la session sera résolue par
         # `record` au moment de l'écriture.
+        # L242b (3) : le harnais de la ligne de grand livre de ce tour ; non
+        # écrit, le tour ne part pas (#389 r1) — sa dépense serait comptée
+        # sous un autre harnais, hors du plafond payé au token
+        if not self._state_note("turn_harness", harness) \
+                or self._state_read("turn_harness") != harness:
+            self.fail_turn("accounting unavailable", "turn harness not written")
+            return False
         if not self._compta_marque(events_start, label, model):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
@@ -3271,7 +3590,7 @@ class AgentWorker(threading.Thread):
                              daemon=True).start()
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
-        empreinte = sentinel.launch_fingerprint(self.agent.get("harness") or "", compte, env)
+        empreinte = sentinel.launch_fingerprint(harness, compte, env)
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
@@ -3324,9 +3643,7 @@ class AgentWorker(threading.Thread):
             # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
             # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
             # unique couvre toutes les causes (B5a-P, L11 B2).
-            tue = self.kill_if_stop_requested()
-            if resume and not tue:
-                self.resume_summary = ""  # le résumé a ouvert la session neuve
+            self.kill_if_stop_requested()
             log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
             # L78: the writer owns its connection; harness output never waits
             # for SQL or the readable thread. ResidentWorker uses the same sink.
@@ -3354,6 +3671,13 @@ class AgentWorker(threading.Thread):
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
+                        if resume:
+                            # #389 r2 : le résumé a ouvert une session connue
+                            # (gardé jusque-là : un départ avorté le rejoue)
+                            self._resume_drop()
+                        # L242b (3) : le harnais de la session (rotation au
+                        # changement de harnais, `account_turn.continuity`)
+                        self._state_note("session_harness", harness)
                         # L39 (0030) : le compte d'origine de la session, en
                         # registre avec son id (le marqueur du flux reste la
                         # source des relevés du tour)
@@ -3499,6 +3823,8 @@ class AgentWorker(threading.Thread):
         # L217b : la rotation entre deux tours juge sur ce même compteur
         self.last_turn_context = relus if relus_mesures else None
         self.last_turn_context_session = session_new or session or None
+        if resume and not session_new and not result_code and not error:
+            self._resume_drop()  # tour achevé sans id de session : livré
         if relus_sous_agents:
             log_async("[%s] tokens reread in the turn: %d main thread, %d subagents "
                       "(outside the cap)" % (self.name, relus, relus_sous_agents))
@@ -3526,6 +3852,23 @@ class AgentWorker(threading.Thread):
             # l'état d'un agent qu'un remplaçant a pu reprendre.
             self._avec_reprise("instruction put back in the queue", registry.restore_prompt,
                                self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        if self.host_yield is not None:
+            # L112 : l'hôte se retire — comme une préemption : la consigne
+            # repart en attente, la session est gardée ; le worker rend son
+            # bail au passage suivant (`_leave_for_host`).
+            raison = self.host_yield
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("statut de fin de tour", registry.set_status,
+                               self.db, self.name, "queued",
+                               status_text="tour interrompu : l'hôte se retire (%s)" % raison)
+            self._fil_note(
+                "Tour interrompu après %ds : l'hôte se retire (%s). La consigne repart "
+                "en attente ; le travail reprendra dans la même session au retour de "
+                "l'hôte." % (int(duration), raison),
+                meta={"action": "retrait-hote", "raison": raison,
+                      "tour_s": round(duration, 1)})
             return False
         if self.restarting.is_set() and not preempte and not ok:
             # `ameesh restart` (L26) : le tour est arrêté ; sa consigne repart en
@@ -3595,7 +3938,9 @@ class AgentWorker(threading.Thread):
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
-            raison_auth = auth_failure.classify(
+            # A relay failure cannot report global provider credential health
+            # or create a local credential block on a mediated device.
+            raison_auth = None if self.runner.mediated else auth_failure.classify(
                 error, self.last_final, auth_failure.stderr_tail(stderr_path, start=stderr_debut))
             if raison_auth:
                 # L226b : le compte n'est plus authentifié — ni échec rapide ni
@@ -3603,7 +3948,7 @@ class AgentWorker(threading.Thread):
                 # suivant bascule vers un compte sain, sinon l'agent reste
                 # `auth_blocked` jusqu'au retour d'un compte sain.
                 self.fast_failure = False
-                nom_harnais = self.agent.get("harness") or ""
+                nom_harnais = harness
                 account = auth_failure.account_name(compte)
                 # #210 : l'empreinte du jeton du tour (lue au lancement, pas
                 # maintenant) — la sentinelle ne lève l'échec que pour un autre
@@ -3747,6 +4092,13 @@ class AgentWorker(threading.Thread):
         """Transport the persona session's memory changes at turn end, in the background."""
         if not self.agent.get("memory_repository") or self.runner.dry_run:
             return
+        if not self.__dict__.get("_memory_activated", False):
+            return
+        try:
+            memory_mod.require_isolation(self.cfg, self.db, self.name)
+        except (memory_mod.MemoryError, db_mod.DbError) as exc:
+            log_async("[%s] persona memory disabled: %s" % (self.name, exc))
+            return
         path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
         if not os.path.isdir(os.path.join(path, ".git")):
             return
@@ -3757,12 +4109,15 @@ class AgentWorker(threading.Thread):
         def push_memory() -> None:
             try:
                 r = memory_mod.sync(path, "memory for %s: turn end" % self.name,
-                                     cfg_raw=self.cfg.persona_memory)
+                                     cfg_raw=self.cfg.persona_memory,
+                                     repository=self.agent["memory_repository"])
                 if r["status"] == "pushed":
                     log_async("[%s] persona memory pushed (%s)" % (self.name, r["commit"]))
                 elif r["status"] == "secret":
                     log_async("[%s] memory alert: likely secret in %s; commit refused"
                         % (self.name, ", ".join(r["files"])))
+                elif r["status"] == "destructive":
+                    log_async("[%s] memory alert: destructive deletions refused; copy kept" % self.name)
                 elif r["status"] == "push_rejected":
                     log_async("[%s] memory alert: push rejected; copy kept (%s)"
                         % (self.name, r["error"]))
@@ -3876,6 +4231,7 @@ class AgentWorker(threading.Thread):
                     continue
                 try:
                     reussi = self.run_turn(spec)
+                    self._depot_push()  # L113 : commits du tour au serveur
                 except db_mod.Unavailable as exc:
                     # Panne avant le lancement du harnais (ou après-tour au-delà
                     # du bail) : la consigne éventuellement consommée repartira
@@ -3888,6 +4244,8 @@ class AgentWorker(threading.Thread):
                     self.fast_failures = 0
                     self._host_reason, self._host_delay = "", 0.0  # L106
                     continue
+                if self.host_yield is not None or self.runner.gate_holds():
+                    continue  # L112 : retrait de l'hôte, pas un échec de tour
                 if self.fast_failure:
                     self.fast_failures += 1
                     if self.fast_failures >= self.runner.max_fast_failures:
@@ -4032,6 +4390,19 @@ class Runner:
         self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
+        #: L109 : exécuteur médié — pas de base, le serveur du mesh par
+        #: `/api/exec/v1` (`storage.remote`). Synchronisation du canon, relevé
+        #: des soldes, échéance des délégations et déplacement entre hôtes
+        #: passent au serveur ; l'hôte, l'owner, le bail et les limites
+        #: viennent de `GET /host`. Porte d'hôte (L112) : celle de la
+        #: configuration, sinon `AlwaysAvailable`, relayée au serveur
+        #: (`_mediated_gate`).
+        self.mediated = getattr(db, "driver", None) == "mediated"
+        from .mediated_executor import gate as gate_mod
+        self.gate = gate_mod.AlwaysAvailable()
+        self.host_info = None
+        if self.mediated:
+            self._mediated_setup()
         #: L147 (#220 r2) : prochaine revue des lignes d'avant le démarrage
         #: (horloge monotone), tant que leur solde attend les conteneurs
         self.boot_review_at: float | None = None
@@ -4061,7 +4432,86 @@ class Runner:
         self.gate_foreground = None
         if once or not cfg.canon:
             self._gate_settled.set()
-        self._sync_host_gate(False, None)
+        if self.mediated:
+            from .mediated_executor import host_gate
+            self.host_gate = host_gate.controller_from_config(self, log=log_async)
+            self._mediated_gate()
+            self._gate_settled.set()
+        else:
+            self._sync_host_gate(False, None)
+
+    # -- exécuteur médié (L109) ---------------------------------------------
+    def _mediated_gate(self) -> None:
+        """L112 dans L109 : la porte de l'hôte est relayée au serveur
+        (`PUT /host/availability`) au démarrage, à chaque changement et
+        jusqu'à ce que le serveur l'ait reçue ; sans porte configurée,
+        `AlwaysAvailable` (le serveur doit quand même apprendre que l'hôte
+        est disponible : sans rapport, il le tient pour indisponible)."""
+        from .mediated_executor import gate as gate_mod
+        from .mediated_executor import host_gate
+        sink = host_gate.TransportSink(self.db.transport, log=log_async)
+        if self.host_gate is None:
+            self.host_gate = host_gate.GateController(
+                self, gate_mod.AlwaysAvailable(),
+                drain_s=getattr(self.cfg, "host_gate_drain", 0) or gate_mod.DEFAULT_DRAIN_S,
+                sink=sink, log=log_async)
+        else:
+            self.host_gate.sink = sink
+        self.gate = self.host_gate.gate
+        # jetons de session : un par bail (agent, owner, epoch), il vit tant
+        # que le bail vit ; partagé par la session du harnais et le relais
+        self._session_tokens: dict = {}
+        self._session_tokens_lock = threading.Lock()
+        from . import relay as relay_mod
+        relay_mod.set_session_token_source(
+            lambda agent, owner, epoch, _turn: self.session_token_for(agent, owner, epoch))
+
+    #: un jeton de session vit au plus 12 h (L110) ; renouvelé avant
+    SESSION_TOKEN_REUSE_S = 11 * 3600.0
+
+    def session_token_for(self, agent: str, owner: str, epoch: int) -> str:
+        """Le jeton de session du bail (agent, owner, epoch) : demandé une
+        fois (`POST /session-token`), réutilisé pour la session du harnais
+        et le relais de modèle. Lève `DbError` si le serveur le refuse."""
+        from .mediated_executor import contract as exec_contract
+        key = (agent, owner, int(epoch))
+        now = time.monotonic()
+        with self._session_tokens_lock:
+            for stale in [k for k in self._session_tokens if k[0] == agent and k != key]:
+                del self._session_tokens[stale]
+            hit = self._session_tokens.get(key)
+            if hit is not None and now - hit[0] < self.SESSION_TOKEN_REUSE_S:
+                return hit[1]
+        issued = self.db.session_token(exec_contract.Fence(agent, owner, int(epoch)))
+        with self._session_tokens_lock:
+            self._session_tokens[key] = (now, issued.token)
+        return issued.token
+
+    def _mediated_setup(self) -> None:
+        """La fiche de l'hôte rendue par le serveur (`GET /host`) : hôte fixé
+        à l'enrôlement, owner `exec:<id>:<hôte>:<pid>`, bail imposé, limites
+        (à la place de `resources.host_limits` sur le canon local)."""
+        from . import resources as resources_mod
+        from .mediated_executor import contract as exec_contract
+        info = self.db.host_info()
+        self.host_info = info
+        owner = exec_contract.owner_for(info.executor_id, info.host, os.getpid())
+        self.cfg = dataclasses.replace(self.cfg, host=info.host, runner_id=owner)
+        self.host = info.host
+        self.runner_id = owner
+        if info.lease_ttl_s:
+            self.lease_ttl = float(info.lease_ttl_s)
+        # contrat 1.1 : `limits` = {"max_agents": int|null, "resources":
+        # {seuils de resources.THRESHOLD_KEYS}} (interfaces.HostInfo)
+        limits = dict(info.limits or {})
+        self._host_limits = resources_mod.thresholds(
+            {"resources": dict(limits.get("resources") or {})})
+        self._pressure["limits"] = self._host_limits
+        maximum = limits.get("max_agents")
+        self._host_max_agents = int(maximum) if maximum is not None else None
+        self._host_limits_origin = {"max_agents": "serveur"}
+        self.relocate = False
+
 
     # -- porte d'hôte (L159f) ------------------------------------------------
     def _sync_host_gate(self, lending: bool, offer: dict | None) -> None:
@@ -4114,7 +4564,7 @@ class Runner:
     def gate_frozen_between(self, start: float, end: float) -> float:
         """L159f : secondes de `[start, end]` gelées par la garde de l'hôte."""
         gate = self.host_gate
-        return gate.frozen_between(start, end) if gate is not None else 0.0
+        return gate.frozen_between(start, end) if gate is not None and not getattr(self, "mediated", False) else 0.0
 
     def _gate_slot(self, agent: dict) -> tuple[bool, int | None]:
         """L159f : `caps.max_concurrent` de la porte — agents à la fois sur
@@ -4131,6 +4581,10 @@ class Runner:
         if gate is None:
             return True, None
         cap = gate.max_concurrent()
+        if getattr(self, "mediated", False):
+            with self.lock:
+                running = sum(w.is_alive() for w in self.workers.values())
+            return cap is None or running < cap, None
         pool = self._slot_pool(gate)
         try:
             with self._gate_slots_lock:
@@ -4170,7 +4624,7 @@ class Runner:
         tout de suite, pas à la prochaine réclamation de CET exécuteur (un
         autre exécuteur admettrait au-delà du plafond entre-temps)."""
         gate = self.host_gate
-        if gate is None:
+        if gate is None or getattr(self, "mediated", False):
             return
         pool = self._slot_pool(gate)
         try:
@@ -4195,6 +4649,8 @@ class Runner:
         base est journalisée une fois, jamais fatale à la passe."""
         from . import work as work_mod
 
+        if getattr(self, "mediated", False):
+            return []  # L109 : l'échéance des délégations passe au serveur
         try:
             done = work_mod.expire_delegations(
                 self.db, actor="runner %s" % self.runner_id, dry_run=self.dry_run)
@@ -4388,6 +4844,14 @@ class Runner:
             self.wake_all.set()
             log_async("budget cap changed in the database: reloading")
             return
+        if item.get("channel") == "reset":
+            # L109 : trou de reprise du flux d'événements du serveur — des
+            # réveils ont pu se perdre : chaque worker relit en base.
+            with self.lock:
+                for worker in self.workers.values():
+                    worker.wake.set()
+            self.wake_all.set()
+            return
         if item.get("channel") == CHANNEL_MAIL:
             try:
                 payload = json.loads(item.get("payload") or "{}")
@@ -4576,6 +5040,9 @@ class Runner:
         if self.listener_thread is not None:
             self.listener_thread.join(timeout=2.0)
         self.stopped_threads = list(workers)
+        if getattr(self, "host_gate", None) is not None:
+            self.host_gate.tick()  # dernier acquittement : plus aucun bail
+            self.host_gate.stop()
         # par la file : aucune écriture synchrone sur le chemin d'arrêt avant
         # le repli de `_sortie_sure` (relecture codex2 de 669a6fe, B1)
         log_async("shutdown: %d lease(s) returned, %d turn(s)" % (len(workers), self.turns))
@@ -4589,6 +5056,8 @@ class Runner:
         ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
         cours. Un échec — canon, git, base — est journalisé et rend `False`.
         """
+        if getattr(self, "mediated", False):
+            return True  # L109 : le canon est synchronisé par le serveur
         entries = canon_mod.configured(self.cfg)
         # L159f : aucun canon, aucune fiche Host prêteuse : la porte est fixée
         self._canon_complete = not entries
@@ -4712,6 +5181,9 @@ class Runner:
         En mode `--once`, le sync est fait en ligne (le fil n'aurait pas le
         temps de tourner) ; sinon un fil dédié s'en charge.
         """
+        if getattr(self, "mediated", False):
+            self._gate_settled.set()
+            return  # canon sync is server-side for mediated devices
         if not self.cfg.canon:
             self._gate_settled.set()
             return
@@ -4737,6 +5209,8 @@ class Runner:
         figure dans aucun message : seuls le fournisseur et la raison courte
         de l'échec sont journalisés.
         """
+        if getattr(self, "mediated", False):
+            return 0  # L109 : les soldes sont relevés par le serveur (sans clé ici)
         from . import balance as balance_mod
         # L30 : une source par compte de clé d'API déclaré (sinon l'historique)
         paires = (balance_mod.account_sources(self.cfg) if sources is None
@@ -4773,7 +5247,7 @@ class Runner:
         fournisseur dans l'environnement."""
         from . import balance as balance_mod
         interval = max(0.0, float(self.cfg.balance_interval))
-        if self.once or interval <= 0:
+        if self.once or interval <= 0 or getattr(self, "mediated", False):
             return
         if not any(s.configured() for s, _ in balance_mod.account_sources(self.cfg)):
             return
@@ -4795,6 +5269,13 @@ class Runner:
         Un relevé ne doit jamais empêcher un tour : toute erreur (poste sans
         `/proc`, base indisponible) est journalisée et rend None."""
         from . import resources as resources_mod
+        if getattr(self, "mediated", False):
+            # L109 : relevé auto-déclaré par la connexion distante (`hosts.record`)
+            try:
+                return resources_mod.collect(self.cfg, self.db)
+            except Exception as exc:  # jamais fatal pour l'exécuteur
+                log_async("ressources : relevé impossible (%s)" % type(exc).__name__)
+                return None
         db = None
         try:
             db = db_mod.connect(self.cfg)
@@ -4857,7 +5338,7 @@ class Runner:
         """L120: harness versions read at startup, then every 6 h — on their
         own thread, whatever `AMEESH_RESOURCE_INTERVAL` says (0 disables the
         resource poll, not this). Not in `--once` mode."""
-        if self.once:
+        if self.once or getattr(self, "mediated", False):
             return None
 
         def boucle() -> None:
@@ -4909,8 +5390,8 @@ class Runner:
         périodique (`AMEESH_HOUSEKEEPING_INTERVAL=0`, `--once`). Rend vrai si
         le passage est lancé."""
         interval = float(getattr(self.cfg, "housekeeping_interval", 0) or 0)
-        if interval <= 0 or self.once:
-            return False
+        if interval <= 0 or self.once or getattr(self, "mediated", False):
+            return False  # mediated executor: no local housekeeping (contract 1.1)
 
         def passage() -> None:
             from . import menage as menage_mod
@@ -5047,8 +5528,8 @@ class Runner:
         défaut 300 s ; 0 = aucun). L'exécuteur, et non `notify` : il tourne sur
         chaque hôte, là où sont les dossiers de travail des assignés."""
         interval = max(0.0, float(getattr(self.cfg, "branch_sweep_interval", 0) or 0))
-        if interval <= 0 or self.once:
-            return
+        if interval <= 0 or self.once or getattr(self, "mediated", False):
+            return  # exécuteur médié : `work.open_with_branch` hors contrat 1.1
 
         def boucle() -> None:
             while not self.stop.wait(max(30.0, interval)):
@@ -5060,8 +5541,8 @@ class Runner:
         """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
         600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
         interval = max(0.0, float(getattr(self.cfg, "housekeeping_interval", 0) or 0))
-        if interval <= 0 or self.once:
-            return
+        if interval <= 0 or self.once or getattr(self, "mediated", False):
+            return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
 
         def boucle() -> None:
             while not self.stop.wait(max(30.0, interval)):
@@ -5097,6 +5578,14 @@ class Runner:
             return  # objet factice des tests de `canon_sync_once`
         mine = resources_mod.host_limits(canons, self.host)
         limits = mine["limits"]
+        # L112 : bail court d'un hôte volatil (fiche Host), sinon la config
+        from .mediated_executor import host_gate
+        cfg = getattr(self, "cfg", None)
+        ttl = host_gate.lease_ttl_for(canons, self.host, cfg.lease_ttl if cfg is not None
+                                       else getattr(self, "lease_ttl", 300.0))
+        if ttl != getattr(self, "lease_ttl", ttl):
+            log_async("bail des agents de %s : %ds (fiche Host)" % (self.host, int(ttl)))
+        self.lease_ttl = ttl
         # seuils de TOUS les hôtes des canons : le déplacement (L31) compare les
         # candidats avec les limites physiques de leur propre hôte.
         par_hote: dict = {}
@@ -5128,12 +5617,47 @@ class Runner:
                 self._host_limits = limits
                 self._pressure_at = 0.0
 
+    #: L114b : SIGTERM reçu, retrait à engager par la boucle principale
+    sigterm_requested = False
+
+    def can_drain_on_sigterm(self) -> bool:
+        """L114b : un exécuteur médié doté d'une porte se retire au point sûr
+        sur SIGTERM, au lieu d'arrêter ses tours en 3 s."""
+        return (bool(getattr(self, "mediated", False)) and not self.once
+                and getattr(self, "host_gate", None) is not None)
+
+    def _sigterm_drained(self) -> bool:
+        """Retrait engagé par SIGTERM et terminé (aucun bail détenu). Engage
+        le retrait au premier appel qui suit le signal."""
+        if self.sigterm_requested and not getattr(self, "_draining_for_sigterm", False):
+            self._draining_for_sigterm = True
+            self.host_gate.terminate()
+        if not getattr(self, "_draining_for_sigterm", False):
+            return False
+        with self.lock:
+            alive = [w for w in self.workers.values() if w.is_alive()]
+        return not alive
+
+    def _gate_admits(self, agent: dict) -> bool:
+        """`caps.max_concurrent` de la porte (L112) : agents à la fois sur
+        l'appareil, éphémères compris (la porte compte des processus)."""
+        gate = getattr(self, "host_gate", None)
+        cap = gate.max_concurrent() if gate is not None else None
+        if cap is None:
+            return True
+        with self.lock:
+            running = sum(1 for name, worker in self.workers.items()
+                          if name != (agent or {}).get("name") and worker.is_alive())
+        return running < cap
+
     def admits_new_worker(self, agent: dict) -> bool:
         """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des
         fiches Host de tous les canons) borne le nombre de personas que cet
         exécuteur fait tourner à la fois. Les éphémères n'y comptent pas (ils
         n'ont pas d'admission ; `max_agents` compte des admissions). Sans
         maximum déclaré : pas de borne."""
+        if getattr(self, "mediated", False) and not self._gate_admits(agent):
+            return False  # L112 : `caps.max_concurrent` de la porte
         cap = getattr(self, "_host_max_agents", None)
         if cap is None or (agent or {}).get("ephemeral"):
             return True
@@ -5209,41 +5733,21 @@ class Runner:
         self._audit_canons = tuple(canons)
 
     def is_auditor(self, name: str, agent=None) -> bool:
-        """L234 : persona auditeur ou rôle auditeur/auditor au canon."""
-        from . import alert_briefs
-        if name == alert_briefs.AUDITOR_NAME:
-            return True
-        canons = getattr(self, "_audit_canons", ())
-        from . import auditor as auditor_mod, sous_utilisation as su
-        # Ne consulte le registre que pour un nom candidat ; le worker passe
-        # sa ligne fraîche, ce qui évite une requête sur le chemin de lancement.
-        if name not in su.role_orchestrators(
-                canons, alert_briefs.AUDITOR_ROLES):
-            return False
-        row = agent if agent is not None else registry.get(self.db, name)
-        return bool(row and name in auditor_mod.cards([row], canons))
+        """L234 : persona auditeur ou rôle auditeur/auditor au canon
+        (`auditor.is_auditor`). Le worker passe sa ligne fraîche, ce qui évite
+        une requête sur le chemin de lancement."""
+        from . import auditor as auditor_mod
+        return auditor_mod.is_auditor(self.db, name, getattr(self, "_audit_canons", ()),
+                                      agent)
 
     def is_critical(self, name: str, agent=None) -> bool:
         """L242b : agent critique, jamais en pause budget tant qu'un compte a
-        de la marge — déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS`),
-        orchestrateur (`AMEESH_ALERT_ORCHESTRATORS`, ou rôle au canon),
-        conception (rôle `conception` ou `design` au canon) ou auditeur
-        (`is_auditor`). Un rôle ne compte que dans le canon propriétaire de
-        l'agent : une fiche en conflit dans un autre canon ne le rend pas
-        critique (#324 r1)."""
-        if name in (getattr(self.cfg, "critical_agents", None) or ()):
-            return True
-        if name in getattr(self, "_orchestrators_declared", ()):
-            return True
-        from . import auditor as auditor_mod, sous_utilisation as su
-        canons = getattr(self, "_audit_canons", ())
-        roles = su.ORCHESTRATOR_ROLES + DESIGN_ROLES
-        # le registre n'est lu que pour un nom candidat, comme `is_auditor`
-        if name in su.role_orchestrators(canons, roles):
-            row = agent if agent is not None else registry.get(self.db, name)
-            if row and auditor_mod.owned_card(row, canons, roles) is not None:
-                return True
-        return self.is_auditor(name, agent)
+        de la marge (`auditor.is_critical`, partagé avec L233b)."""
+        from . import auditor as auditor_mod
+        return auditor_mod.is_critical(self.cfg, self.db, name,
+                                       getattr(self, "_audit_canons", ()),
+                                       declared=getattr(self, "_orchestrators_declared", ()),
+                                       agent=agent)
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:
@@ -5420,6 +5924,8 @@ class Runner:
         """L120: read and record the version of the harnesses this runner
         serves, at most every `PROBE_INTERVAL_S`; never raises. Read only:
         a harness is never updated here."""
+        if getattr(self, "mediated", False):
+            return None  # host maintenance is not admitted by contract 1.1
         from . import harness_versions as versions_mod
         now = time.monotonic() if now is None else now
         if now < getattr(self, "_versions_due", 0.0):
@@ -5475,8 +5981,10 @@ class Runner:
         Seules les lignes qui changent sont écrites, par lots ; au plus
         BOOT_REVIEW_MAX_ROWS lignes par passage, la suite au passage suivant
         de la boucle. Rend les lignes restées orphelines. Ne lève jamais."""
-        from . import resources as resources_mod
         self.boot_review_at = None
+        if getattr(self, "mediated", False):
+            return []  # host orphan review belongs to the server/classic runner
+        from . import resources as resources_mod
         boot = resources_mod.boot_time()
         if not boot:
             return []
@@ -5736,6 +6244,9 @@ class Runner:
         reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
+                if self._sigterm_drained():
+                    log_async("retrait terminé après SIGTERM : arrêt")
+                    break
                 if self.draining.is_set() and self._drained():
                     break  # `shutdown` rend les baux et arrête ce qui resterait
                 try:
@@ -5749,6 +6260,12 @@ class Runner:
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
+                    if getattr(exc, "code", None) == "executor_revoked":
+                        # L109 : exécuteur révoqué par le serveur — arrêt, sans
+                        # nouvel essai (les baux sont déjà relâchés côté serveur)
+                        log_async("exécuteur révoqué par le serveur : arrêt (%s)" % exc)
+                        self.revoked = True
+                        break
                     if self.stop.is_set():
                         # arrêt en cours : systemd a pu tuer le `psql` fils
                         # avec nous (« psql : code -15 ») — rien à réessayer
@@ -5769,11 +6286,15 @@ class Runner:
                 if self.max_turns and self.turns >= self.max_turns:
                     log_async("limit of %d turn(s) reached" % self.max_turns)
                     break
-                self.wake_all.wait(timeout=self.poll)
+                self.wake_all.wait(timeout=min(self.poll, 1.0)
+                                   if getattr(self, "_draining_for_sigterm", False)
+                                   else self.poll)
                 self.wake_all.clear()
         finally:
             self.shutdown()
-        return 0
+        # L114 (interface `ameesh-executor/1`, §7) : 6 = exécuteur révoqué,
+        # le lanceur efface le volume et ne relance pas sans nouveau code
+        return EXIT_REVOKED if getattr(self, "revoked", False) else 0
 
 
 # --------------------------------------------------------------------------
@@ -6175,7 +6696,9 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
                 db = db_mod.connect(cfg)
             except db_mod.Unavailable as exc:
                 if not wait or arret.is_set():
-                    print("agent-runner: database unreachable: %s" % exc, file=sys.stderr)
+                    print("agent-runner: %s unreachable: %s"
+                          % ("mesh server" if getattr(cfg, "backend", None) == "mediated"
+                             else "database", exc), file=sys.stderr)
                     return None
                 attente = reprise.echec()
                 log("host not ready: database unreachable at startup (%s) — retrying "
@@ -6205,6 +6728,13 @@ def main(argv: list[str] | None = None) -> int:
               "       agent-runner [--once] [--agents a,b] [--poll S] …  (agent-runner --help)")
         return 0
     cfg = load_config()
+    mediated = cfg.backend == "mediated"
+    if mediated and argv and argv[0] in ("register", "stop"):
+        # L109 : un exécuteur médié ne déclare ni n'arrête d'agent (le
+        # serveur et le canon le font) ; il ne réclame que ce qu'on lui admet
+        print("agent-runner %s : non admis pour un exécuteur médié (backend mediated)"
+              % argv[0], file=sys.stderr)
+        return 2
 
     if argv and argv[0] == "register":
         db = db_mod.connect(cfg)
@@ -6251,6 +6781,10 @@ def main(argv: list[str] | None = None) -> int:
     code = 1
     runner: Runner | None = None
     try:
+        if parsed.migrate and mediated:
+            print("agent-runner : --migrate sans objet pour un exécuteur médié",
+                  file=sys.stderr)
+            return 2
         if parsed.migrate:
             from . import migrations
             migrations.migrate(db, log=log)
@@ -6260,16 +6794,46 @@ def main(argv: list[str] | None = None) -> int:
             print("agent-runner: %s" % exc, file=sys.stderr)
             return 1
         agents = [a for a in (parsed.agents or "").split(",") if a] or None
-        runner = Runner(
-            cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
-            dry_run=parsed.dry_run, max_turns=parsed.max_turns,
-        )
+        try:
+            runner = Runner(
+                cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
+                dry_run=parsed.dry_run, max_turns=parsed.max_turns,
+            )
+        except db_mod.DbError as exc:
+            if not mediated:
+                raise
+            if getattr(exc, "code", None) == "executor_revoked":
+                # L114 (§7) : révoqué avant même la fiche de l'hôte
+                print("agent-runner : exécuteur révoqué par le serveur : %s" % exc,
+                      file=sys.stderr)
+                return EXIT_REVOKED
+            # L109 : la fiche de l'hôte (`GET /host`) est illisible au démarrage
+            print("agent-runner : fiche de l'hôte indisponible : %s" % exc, file=sys.stderr)
+            return 1
 
         def handler(signum, _frame):
             # Signal d'abord ; le journal part par la file : un `print` dans un
             # gestionnaire de signal peut tomber pendant un autre `print` du
-            # fil principal (écriture réentrante sur le même flux). Premier
-            # signal : drainage ; second : arrêt immédiat (`request_stop`).
+            # fil principal (écriture réentrante sur le même flux).
+            if (signum in (signal.SIGTERM, signal.SIGINT) and runner.can_drain_on_sigterm()
+                    and not runner.stop.is_set()):
+                if not runner.sigterm_requested:
+                    # L114b : premier SIGTERM d'un exécuteur médié — retrait au
+                    # point sûr (90 s au plus), puis baux rendus ; un second
+                    # signal arrête tout de suite. Le retrait est engagé par la
+                    # boucle principale (aucun verrou pris ici).
+                    runner.sigterm_requested = True
+                    runner.wake_all.set()
+                    log_async("signal %d reçu : retrait de l'hôte (%ds au plus), puis arrêt"
+                              % (signum, int(runner.host_gate.drain_s)))
+                    return
+                # Second signal during the host withdrawal: immediate stop.
+                runner.stop.set()
+                runner.wake_all.set()
+                log_async("signal %d received: second signal, immediate stop" % signum)
+                return
+            # Classic executor: first signal drains, second stops immediately
+            # (`request_stop`).
             runner.request_stop(signum)
 
         signal.signal(signal.SIGTERM, handler)

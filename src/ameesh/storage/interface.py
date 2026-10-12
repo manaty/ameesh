@@ -467,7 +467,9 @@ class TurnCosts(Domain):
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
                cum_output_tokens: int | None, account: str | None = None,
-               spend_key: str | None = None, void_reason: str | None = None,
+               spend_key: str | None = None, source: str | None = None,
+               executor: str | None = None, lease_owner: str | None = None,
+               lease_epoch: int | None = None, void_reason: str | None = None,
                price_fallback: str | None = None,
                cache_write_tokens: int | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
@@ -478,14 +480,20 @@ class TurnCosts(Domain):
         migration 0043) : la ligne naît écartée des sommes ; `price_fallback`
         (L225, migration 0059) : tour facturé au repli prudent ;
         `cache_write_tokens` (L225, 0059) : écritures de cache Claude du tour ;
-        None = colonne non écrite. Vrai si la ligne est écrite."""
+        None = colonne non écrite. Vrai si la ligne est écrite.
+        `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
+        0064) : `relay` pour la mesure du relais de modèle, `device` pour la
+        déclaration d'un appareil médié (hors plafond) ; None = colonnes non
+        écrites (`source` vaut alors `harness`)."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
               harnesses: Sequence[str] | None, account: str | None = None) -> float:
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
-        ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+        ces harnais seulement si donnés, de ce compte seulement si donné (L30).
+        Les lignes `source = 'device'` (L111) ne comptent jamais : la dépense
+        d'un appareil médié est celle que le relais a mesurée."""
 
     @abc.abstractmethod
     def spent_between(self, from_ts: float, to_ts: float, *,
@@ -1138,7 +1146,20 @@ class WorkItems(Domain):
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`)."""
 
-    # -- délégation à échéance (L40, décision 0030 point 5) -------------------
+    @abc.abstractmethod
+    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+                paused_prefix: str, note_prefix: str, window_s: float,
+                max_per_window: int, note: str, actor: str) -> dict | None:
+        """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
+        transaction sous verrou consultatif (une reprise à la fois pour tout
+        le mesh), journalisée comme `assign` ; None si l'une des conditions
+        ne tient plus au moment d'écrire : le lot a encore l'assigné `current`
+        et l'état `state` (celui contrôlé) ; `current` est encore en pause
+        (`blocked`, `status_text` commençant par `paused_prefix`, ligne
+        verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
+        de `max_per_window` notes commençant par `note_prefix` dans les
+        `window_s` dernières secondes."""
+
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
                  delegated_by: str, within_s: float, note: str, actor: str) -> dict | None:
@@ -1278,6 +1299,22 @@ class WorkItems(Domain):
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et
         `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+
+    @abc.abstractmethod
+    def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
+        """L233b : la dernière ligne de journal du lot dont la note commence
+        par l'un des `prefixes` (une attribution), puis sa ligne la plus
+        ancienne (la création), du plus récent au plus ancien — quelle que
+        soit la longueur du journal."""
+
+    @abc.abstractmethod
+    def handoff_lots(self, assignee: str, limit: int) -> list[dict]:
+        """L233b : les lots `intake` et `build` de `assignee`, hors file
+        d'amélioration, dans l'ordre de `unassigned_lots`. Chaque ligne ajoute
+        `lot_team`, `pending_decision`, `decision_milestone` (comme
+        `unassigned_lots`), `package_team` (équipe de la fiche, pour
+        `projects.lot_project`) et `frozen_ts` (dernier jalon de gel, None
+        sans gel)."""
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod

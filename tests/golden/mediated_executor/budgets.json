@@ -1,0 +1,42 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "family": "budgets",
+ "cases": [
+  {
+   "name": "budgets.limits/ok",
+   "op": "budgets.limits",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "budgets.limits",
+     "args": [],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "scope": "mesh",
+       "window_s": 3600,
+       "usd": 5.0,
+       "set_by": "human:responsable",
+       "updated_ts": 1791553600.12
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

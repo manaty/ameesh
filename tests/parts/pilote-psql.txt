@@ -16,6 +16,10 @@
 
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
+test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
+test_l110_enrollment  # storage: invitation consumption, token issuance, revocation and lease release
+test_l111_relay  # storage: authoritative relay costs, budget checks and device cost exclusion
+test_l112_host_gate  # storage: host availability, claim admission and withdrawal
 test_l118c_mail_projects  # storage: journaled project correction in one transaction and missing-project query (L118c)
 test_l122_numeros_de_migration  # stockage : réservation des numéros de migration (verrou consultatif, index unique) (L122)
 test_l124_decisions  # stockage : domaine `decisions` (agent_mailbox, jsonb) et vue par projet (L124)
@@ -37,6 +41,7 @@ test_l368_planned_waits  # storage: unbounded activity, item plans and commitmen
 test_l385_work_dependencies  # storage: serialized dependency graph, rollback, audit and blocker states (L385)
 test_l52_persona_sessions  # storage: session history SQL, resume and lease-fenced rotation (L52)
 test_l53_restore_guard  # storage: restoration refuses active leases and blocks concurrent claims through extraction (L53)
+test_l54_memory_runner  # storage: memory isolation and designation/sync through a fake-harness turn (L54)
 test_l56_role_executor  # driver: the creator role is set for several statements, which needs one session (psql: transaction) (L56)
 test_l59_activity  # storage: bounded timeline SQL, timestamps, voided costs and delegation resolution (L59)
 test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)
