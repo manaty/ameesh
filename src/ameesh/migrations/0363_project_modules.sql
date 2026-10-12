@@ -26,8 +26,36 @@ create table work_module_milestones (
 create index work_module_milestones_item_idx
     on work_module_milestones (work_item_id, module, kind, id desc);
 
+-- Executor default ACLs may apply to this new table. Remove policy DML
+-- from every existing non-owner grantee; the dedicated sync group is
+-- granted explicitly by the isolated-writer deployment contract.
+do $$
+declare grantee record;
+begin
+    for grantee in select distinct a.grantee, r.rolname
+        from pg_class c cross join lateral aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a
+        left join pg_roles r on r.oid = a.grantee
+        where c.oid = 'project_modules'::regclass and a.grantee <> c.relowner
+          and coalesce(r.rolname, '') <> 'ameesh_canon_sync' loop
+        execute 'revoke insert, update, delete on project_modules from ' ||
+            case when grantee.grantee = 0 then 'PUBLIC' else quote_ident(grantee.rolname) end;
+    end loop;
+end $$;
+
+-- No caller-controlled setting can confer writer provenance. Only the
+-- migration owner (bootstrap/tests) or an isolated database role may write.
+create function ameesh_module_writer(role_name text) returns boolean language sql stable as $$
+    select current_user::regrole = c.relowner
+        or exists (select 1 from pg_roles r where r.rolname = role_name
+                   and pg_has_role(current_user, r.oid, 'USAGE'))
+    from pg_class c where c.oid = 'project_modules'::regclass
+$$;
+
 create function ameesh_module_policy_lock() returns trigger language plpgsql as $$
 begin
+    if not ameesh_module_writer('ameesh_canon_sync') then
+        raise exception 'module policies require the isolated canon sync role';
+    end if;
     perform pg_advisory_xact_lock(hashtext('ameesh-module-project'),
         hashtext(case when TG_OP = 'DELETE' then OLD.project else NEW.project end));
     if TG_OP = 'UPDATE' and (OLD.project, OLD.module, OLD.canon)
@@ -52,7 +80,9 @@ declare
     current_subject record;
     admitted boolean := item.type in ('bug', 'evolution', 'improvement');
 begin
-    perform pg_advisory_xact_lock(hashtext('ameesh-module-project'), hashtext(project_name));
+    if exists (select 1 from project_modules where project = project_name) then
+        perform pg_advisory_xact_lock_shared(hashtext('ameesh-module-project'), hashtext(project_name));
+    end if;
     for policy in select * from project_modules where project = project_name loop
         if policy.types ? item.type then admitted := true; end if;
         for requirement in select value from jsonb_array_elements(policy.rules) loop
@@ -134,6 +164,9 @@ begin
     end if;
     definition := policy.schemas->NEW.kind;
     if definition is null then raise exception 'unknown module milestone %', NEW.kind; end if;
+    if definition ? 'writer_role' and not ameesh_module_writer(definition->>'writer_role') then
+        raise exception 'module evidence requires the isolated writer role';
+    end if;
     for field in select jsonb_array_elements_text(coalesce(definition->'strings','[]')) loop
         if jsonb_typeof(NEW.payload->field) is distinct from 'string'
             or btrim(NEW.payload->>field) = '' then

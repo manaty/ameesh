@@ -32,12 +32,13 @@ class ModuleConfigurationTest(unittest.TestCase):
             store.work.close_merged.side_effect = db_mod.DbError("database connection lost")
             with self.assertRaises(db_mod.DbError):
                 work.close_merged(mock.Mock(), 1)
-    def test_it_cli_parses_artifact_options_after_lot_and_preserves_program_arguments(self):
-        with mock.patch.object(it, "prove", return_value={"id": 1}) as prove:
+    def test_it_cli_parses_artifact_options_after_lot_and_requests_isolated_execution(self):
+        with mock.patch.object(it, "item", return_value={"app": "acme"}), \
+                mock.patch("ameesh.modules.it.proof_service.request", return_value={"id": 1}) as request:
             it.main(mock.Mock(), ["proof", "123", "--artifact", "/artifact", "--runner", "python3",
                                  "--", "--help", "quoted argument"], actor="tester")
-        prove.assert_called_once_with(mock.ANY, 123, "/artifact", actor="tester", runner="python3",
-                                      arguments=["--help", "quoted argument"], timeout=60)
+        request.assert_called_once_with("acme", 123, "/artifact", runner="python3",
+                                        arguments=["--help", "quoted argument"], timeout=60)
 
     def test_only_named_project_is_enabled(self):
         entries = modules.declarations(federation())
@@ -233,6 +234,32 @@ class LifecycleGateTest(PgTestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, ["refused"])
         self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
+
+    def test_independent_lots_do_not_block_each_other_with_or_without_module(self):
+        for project, kind in (("acme", "release"), ("plain", "evolution")):
+            first = work.add(self.db, title="one", type=kind, app=project)["id"]
+            second = work.add(self.db, title="two", type=kind, app=project)["id"]
+            finished = threading.Event()
+            errors = []
+
+            def update_other():
+                other = db_mod.connect(self.cfg)
+                try:
+                    other.execute("UPDATE work_items SET title = 'other' WHERE id = %s", (second,))
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    other.close()
+                    finished.set()
+
+            with self.db.transaction() as tx:
+                tx.execute("UPDATE work_items SET title = 'first' WHERE id = %s", (first,))
+                thread = threading.Thread(target=update_other, daemon=True)
+                thread.start()
+                self.assertTrue(finished.wait(5), "independent lot blocked on project lock")
+                tx.execute("UPDATE work_items SET title = 'then second' WHERE id = %s", (second,))
+            thread.join(10)
+            self.assertEqual(errors, [])
 
     def test_changed_delivery_blocks_promotion(self):
         self.prove()

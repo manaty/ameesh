@@ -24,15 +24,24 @@ def digest(artifact):
     return str(path), sha.hexdigest()
 
 
-def execute(artifact, *, runner=None, arguments=(), timeout=60):
+def execute(artifact, *, runner=None, arguments=(), timeout=60, execution_user=None):
     if not math.isfinite(timeout) or not 0 < timeout <= 3600:
         raise ValueError("execution timeout must be between 0 and 3600 seconds")
     path, sha = digest(artifact)
     # The artifact is always an argv operand, never just a claim in a note.
     command = ([runner] if runner else []) + [path] + list(arguments)
     started = time.monotonic()
+    isolation = {}
+    if execution_user is not None:
+        import pwd
+        account = pwd.getpwnam(execution_user)
+        if os.name != "posix" or os.geteuid() != 0 or account.pw_uid == 0:
+            raise ValueError("proof worker requires root service and a non-root execution user")
+        isolation = dict(user=account.pw_uid, group=account.pw_gid, extra_groups=[],
+                         cwd="/", env={"PATH": "/usr/bin:/bin", "HOME": account.pw_dir,
+                                       "LANG": "C.UTF-8"}, umask=0o077)
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          start_new_session=(os.name == "posix")) as process:
+                          start_new_session=(os.name == "posix"), **isolation) as process:
         output = bytearray()
 
         def drain():

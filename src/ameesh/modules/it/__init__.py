@@ -15,6 +15,7 @@ def descriptor():
             "proof": {"strings": ["artifact", "sha256", "output"],
                       "arrays": ["command"], "equals": {"exit_code": 0},
                       "subject_field": "sha256", "binding_kind": "delivery",
+                      "writer_role": "ameesh_it_proof",
                       "patterns": {"sha256": "^[0-9a-f]{64}$"}},
         },
         "rules": [{"types": list(TYPES), "states": ["merged", "promoted"],
@@ -44,7 +45,7 @@ def declare(db, item_id, artifact, *, actor):
                                   {"artifact": path, "sha256": sha}, actor=actor)
 
 
-def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60):
+def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60, execution_user=None):
     from .execution import digest, execute
     from ..storage import ModuleStore
     item(db, item_id)
@@ -54,7 +55,8 @@ def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60
         raise ValueError("declare the delivered artifact before running its proof")
     if digest(artifact)[1] != delivery["subject"]:
         raise ValueError("artifact differs from the declared delivery; nothing executed")
-    evidence = execute(artifact, runner=runner, arguments=arguments, timeout=timeout)
+    evidence = execute(artifact, runner=runner, arguments=arguments, timeout=timeout,
+                       execution_user=execution_user)
     if evidence["sha256"] != delivery["subject"]:
         raise ValueError("executed artifact differs from the declared delivery")
     # The database rechecks this exact declaration under the item lock.
@@ -87,7 +89,10 @@ def main(db, argv, *, actor):
     elif args.operation == "delivery":
         row = declare(db, args.lot, args.artifact, actor=actor)
     else:
-        row = prove(db, args.lot, args.artifact, actor=actor, runner=args.runner,
-                    arguments=arguments, timeout=args.timeout)
+        from .proof_service import request
+        project_row = item(db, args.lot)
+        project = project_row.get("app") or project_row.get("workstream") or ""
+        row = request(project, args.lot, args.artifact, runner=args.runner,
+                      arguments=arguments, timeout=args.timeout)
     print(json.dumps(row, ensure_ascii=False, default=str))
     return 0

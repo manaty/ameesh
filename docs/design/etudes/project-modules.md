@@ -44,3 +44,22 @@ Validation covers project isolation, inactive modules, malformed canon,
 missing/wrong/stale evidence, successful execution, failed and timed-out
 execution, artifact changes, review GO, both terminal transitions and automatic
 merge paths. Database checks run in CI on both supported drivers.
+
+# Review r1 correction (12 October 2026, mesh-design mail 9262)
+
+The initial payload validation did not establish execution provenance: an
+executor could forge evidence or remove rules through its table grants.
+Policy writes now require the isolated canon-sync role (or migration owner),
+and the executor role contract revokes and audits policy DML. Evidence schemas
+name an isolated writer role; the SQL milestone guard checks current database
+role membership, never a caller-controlled GUC. The IT CLI submits execution
+inputs to a fixed one-shot privileged helper; the helper uses a project-private
+connection and drops artifact execution to an unprivileged UID with no inherited
+groups or environment credentials. Approved interpreters come from protected
+project configuration. Installation is described in deploy/it-proof/README.md.
+
+Active projects take a shared project lock for lifecycle validation; policy
+writes take its exclusive counterpart. Projects without active modules take
+no project lock, and independent lots no longer serialize or deadlock merely
+because they share a project. Declaration/evidence ordering remains protected
+by the lot row lock.
