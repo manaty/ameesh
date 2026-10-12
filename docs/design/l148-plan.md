@@ -4,10 +4,13 @@ Status: **plan, no code**. Work item **#469 (L148a)**, preparation for **#147 (L
 Author: `mty-amh-impl-04` (implementation agent, DeepSeek harness), 2026-10-12.
 Base: `origin/main` at `4a056a97` (2026-10-12). Language: English, as requested.
 
-Revision, 2026-10-12 17:48 UTC: `origin/main` has moved to `27ef6b49` (PR #216, Path B, merged
-just after the snapshot). The inventory below is still valid on `27ef6b49` — the French names it
-lists were re-checked there — but §3's open-PR table is the `4a056a97` snapshot: #216 no longer
-counts, and the remaining conflict set must be re-read with `gh pr list` before each stage (§6).
+Revision, 2026-10-12 17:54 UTC: `origin/main` has moved to `27ef6b49` (PR #216, Path B, merged
+just after the snapshot). The inventory below was re-anchored on `27ef6b49`: the 54 `file:line`
+references that had moved are updated, the three migrations and eight tables #216 added are
+counted (68 migration files, 64 tables, still no French name among them), and the new
+definitions and CLI options #216 introduced were checked: all English. What remains a
+`4a056a97` snapshot is §3's open-PR table and §2.2's `refs` column: #216 no longer counts in the
+conflict set, which must be re-read with `gh pr list` before each stage (§6).
 
 This document is the deliverable of #469. It inventories the French identifiers still on
 `origin/main`, maps each of them to the open pull requests that touch the same files, and
@@ -19,9 +22,9 @@ It changes no code.
 - **Production code (`src/ameesh`):** 85 French function/class names, 5 French module names.
 - **Tests:** 2 090 French function/class names in 155 files (mostly `test_*` sentence names), plus 22 French module names.
 - **Dev scripts:** 28 French function names in 4 files, plus 4 French file names.
-- **Database:** 1 French column outside the kept domain term (`agent_registry.chantier`); 56 tables, all English. No French table name.
+- **Database:** 1 French column outside the kept domain term (`agent_registry.chantier`); 64 tables, all English. No French table name.
 - **Migrations:** 14 applied migration file names are French. **They are never renamed**; new migrations get English names.
-- **CLI:** 26 French options (several already have an English alias), 11 French subcommands, 6 French positional names.
+- **CLI:** 27 French options (several already have an English alias), 11 French subcommands, 6 French positional names.
 - **Config:** no French configuration-file key; 6 canon model fields named `fiche`. The `organisation` key is British English, not French-only.
 - **Adjacent:** ~17 French JSON/API keys and 6 stored value vocabularies.
 - **Open PRs:** 16 at 2026-10-12 17:2x UTC. Nine of them touch `runner.py`, which alone holds
@@ -61,7 +64,8 @@ It changes no code.
 - SQL: parsed from `src/ameesh/migrations/*.sql` (`create table`, `alter table ... add column`,
   `create index/trigger/function/view`), which is the schema source of truth on `origin/main`.
 - Open PRs: `gh pr list` + `gh api .../pulls/<n>/files --paginate` on 2026-10-12; PRs #216 and
-  #394 are stacked (104 and 99 files) and appear in most `src/` rows.
+  #394 were stacked (104 and 99 files) and appeared in most `src/` rows; #216 has since merged
+  (revision note), #394 is still open.
 - Local variables, instance attributes and French strings/comments are **not** enumerated (see §6).
 
 ## 2. Inventory
@@ -130,28 +134,28 @@ It changes no code.
 | background.py:82                  | lignee                   | lineage                  | 3    | #216, #394, #428                                     |                            |
 | background.py:230                 | boucle                   | loop / <context>_loop    | 12   | #216, #394, #428                                     | 6 local loop functions     |
 | canon.py:738                      | Fiche                    | Card                     | 28   | #216, #394                                           |                            |
-| canon.py:1131                     | fiche                    | card_dict                | 303  | #216, #394                                           | nested helper in to_dict() |
-| canon.py:1992                     | _read_fiches             | _read_cards              | 2    | #216, #394                                           |                            |
-| canon.py:2022                     | _fiche                   | _card                    | 3    | #216, #394                                           |                            |
-| canon.py:2600                     | host_fiches              | host_cards               | 2    | #216, #394                                           |                            |
+| canon.py:1144                     | fiche                    | card_dict                | 303  | #216, #394                                           | nested helper in to_dict() |
+| canon.py:2005                     | _read_fiches             | _read_cards              | 2    | #216, #394                                           |                            |
+| canon.py:2035                     | _fiche                   | _card                    | 3    | #216, #394                                           |                            |
+| canon.py:2632                     | host_fiches              | host_cards               | 2    | #216, #394                                           |                            |
 | chat.py:73                        | consigne                 | instruction              | 63   | —                                                    |                            |
-| cli.py:583                        | lire                     | read                     | 31   | #216, #394, #417                                     |                            |
-| cli.py:616                        | _Remise                  | _Delivery                | 2    | #216, #394, #417                                     | mail reservation handover  |
-| cli.py:634                        | prendre                  | take                     | 2    | #216, #394, #417                                     |                            |
-| cli.py:651                        | solder                   | settle                   | 3    | #216, #394, #417                                     |                            |
-| cli.py:659                        | abandonner               | abandon                  | 2    | #216, #394, #417                                     |                            |
-| cli.py:672                        | avis_borne               | bounded_notice           | 3    | #216, #394, #417                                     |                            |
-| cli.py:680                        | avis_borne_travail       | bounded_notice_work      | 3    | #216, #394, #417                                     |                            |
-| cli.py:697                        | _travail_du_tour         | _turn_work               | 3    | #216, #394, #417                                     |                            |
-| cli.py:734                        | _tour_ecrit              | _turn_written            | 4    | #216, #394, #417                                     |                            |
-| cli.py:746                        | _attente                 | _pending                 | 3    | #216, #394, #417                                     |                            |
-| cli.py:751                        | reste                    | remaining                | 33   | #216, #394, #417                                     |                            |
-| exploitation.py:694               | humain                   | human                    | 14   | #194, #216, #326, #394, #420, #424                   | nested predicate           |
-| exploitation.py:1076              | politique                | policy                   | 6    | #194, #216, #326, #394, #420, #424                   | nested memoised lookup     |
+| cli.py:589                        | lire                     | read                     | 31   | #216, #394, #417                                     |                            |
+| cli.py:622                        | _Remise                  | _Delivery                | 2    | #216, #394, #417                                     | mail reservation handover  |
+| cli.py:640                        | prendre                  | take                     | 2    | #216, #394, #417                                     |                            |
+| cli.py:657                        | solder                   | settle                   | 3    | #216, #394, #417                                     |                            |
+| cli.py:665                        | abandonner               | abandon                  | 2    | #216, #394, #417                                     |                            |
+| cli.py:678                        | avis_borne               | bounded_notice           | 3    | #216, #394, #417                                     |                            |
+| cli.py:686                        | avis_borne_travail       | bounded_notice_work      | 3    | #216, #394, #417                                     |                            |
+| cli.py:703                        | _travail_du_tour         | _turn_work               | 3    | #216, #394, #417                                     |                            |
+| cli.py:740                        | _tour_ecrit              | _turn_written            | 4    | #216, #394, #417                                     |                            |
+| cli.py:752                        | _attente                 | _pending                 | 3    | #216, #394, #417                                     |                            |
+| cli.py:757                        | reste                    | remaining                | 33   | #216, #394, #417                                     |                            |
+| exploitation.py:696               | humain                   | human                    | 14   | #194, #216, #326, #394, #420, #424                   | nested predicate           |
+| exploitation.py:1078              | politique                | policy                   | 6    | #194, #216, #326, #394, #420, #424                   | nested memoised lookup     |
 | grand_livre.py:264                | _claude_cumul            | _claude_cumulative       | 2    | —                                                    |                            |
 | grand_livre.py:306                | _codex_cumul             | _codex_cumulative        | 2    | —                                                    |                            |
 | identity.py:179                   | chantier_of              | workstream_of            | 10   | —                                                    |                            |
-| mail.py:198                       | _tronque                 | _truncate                | 2    | #216, #394                                           |                            |
+| mail.py:207                       | _tronque                 | _truncate                | 2    | #216, #394                                           |                            |
 | menage.py:1104                    | ouvrir                   | open_path                | 3    | —                                                    | nested chmod helper        |
 | menage.py:2505                    | cmd_menage               | cmd_housekeeping         | 5    | —                                                    |                            |
 | mesh_cli.py:555                   | _host_menage             | _host_housekeeping       | 2    | #194, #326, #412, #417, #420                         |                            |
@@ -171,42 +175,42 @@ It changes no code.
 | roadmap_dev.py:59                 | en_cours                 | in_progress              | 9    | —                                                    |                            |
 | roadmap_dev.py:67                 | etat_generique           | generic_state            | 3    | —                                                    |                            |
 | runner.py:57                      | _duree                   | _duration                | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:170                     | _ecrire_sans_attendre    | _write_without_waiting   | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:188                     | _sortie_sure             | _safe_exit               | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:211                     | _LancementImpossible     | _LaunchImpossible        | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:221                     | Reprise                  | Backoff                  | 10   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | retry backoff, not resume  |
-| runner.py:238                     | en_panne                 | failed                   | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise property           |
-| runner.py:241                     | echec                    | failure                  | 19   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise method             |
-| runner.py:248                     | duree                    | duration                 | 18   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise method             |
-| runner.py:251                     | retablie                 | recovered                | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise method             |
-| runner.py:523                     | _fil_note                | _thread_note             | 29   | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1619                    | _panne_de_base           | _database_failure        | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1646                    | _base_retablie           | _base_restored           | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1652                    | _avec_reprise            | _with_resume             | 19   | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1682                    | _restaure_consigne       | _restore_instruction     | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1700                    | _enregistre_session      | _record_session          | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1713                    | _ecarte_session_fille    | _discard_child_session   | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1722                    | _ecarte_session_inconnue | _discard_unknown_session | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1732                    | _ecarte_session          | _discard_session         | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1782                    | _session_connue          | _session_known           | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1821                    | connue                   | known                    | 17   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | nested predicate           |
-| runner.py:1839                    | _avertit_session         | _warn_session            | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:1941                    | _echec_d_hote            | _host_failure            | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2228                    | _leve_pause_budget       | _clear_budget_pause      | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2278                    | _compta_en_attente       | _accounting_pending      | 4    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2295                    | _compta_marque           | _accounting_mark         | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2314                    | _compta_ecrit            | _accounting_write        | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2370                    | _compta_repare           | _accounting_repair       | 4    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2387                    | _annonce_des_evenements  | _announce_events         | 4    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2414                    | _compta_annonce          | _accounting_announce     | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2432                    | _compta_termine          | _accounting_done         | 6    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2921                    | _budget_courrier         | _mail_budget             | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:2933                    | _courrier_spec           | _mail_spec               | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:3030                    | _livre_courrier          | _deliver_mail            | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:3101                    | _menage_apres_tour       | _housekeeping_after_turn | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:3811                    | _note_courrier_borne     | _mail_note_bounded       | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:6130                    | battement                | heartbeat                | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
-| runner.py:6144                    | veilleur                 | watchdog                 | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:171                     | _ecrire_sans_attendre    | _write_without_waiting   | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:189                     | _sortie_sure             | _safe_exit               | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:212                     | _LancementImpossible     | _LaunchImpossible        | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:222                     | Reprise                  | Backoff                  | 10   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | retry backoff, not resume  |
+| runner.py:239                     | en_panne                 | failed                   | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise property           |
+| runner.py:242                     | echec                    | failure                  | 19   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise method             |
+| runner.py:249                     | duree                    | duration                 | 18   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise method             |
+| runner.py:252                     | retablie                 | recovered                | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 | Reprise method             |
+| runner.py:524                     | _fil_note                | _thread_note             | 29   | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1658                    | _panne_de_base           | _database_failure        | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1685                    | _base_retablie           | _base_restored           | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1691                    | _avec_reprise            | _with_resume             | 19   | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1721                    | _restaure_consigne       | _restore_instruction     | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1739                    | _enregistre_session      | _record_session          | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1752                    | _ecarte_session_fille    | _discard_child_session   | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1761                    | _ecarte_session_inconnue | _discard_unknown_session | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1771                    | _ecarte_session          | _discard_session         | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1821                    | _session_connue          | _session_known           | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1860                    | connue                   | known                    | 17   | #194, #216, #394, #417, #420, #421, #422, #423, #424 | nested predicate           |
+| runner.py:1878                    | _avertit_session         | _warn_session            | 5    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:1980                    | _echec_d_hote            | _host_failure            | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2343                    | _leve_pause_budget       | _clear_budget_pause      | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2393                    | _compta_en_attente       | _accounting_pending      | 4    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2410                    | _compta_marque           | _accounting_mark         | 7    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2429                    | _compta_ecrit            | _accounting_write        | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2485                    | _compta_repare           | _accounting_repair       | 4    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2502                    | _annonce_des_evenements  | _announce_events         | 4    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2529                    | _compta_annonce          | _accounting_announce     | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:2547                    | _compta_termine          | _accounting_done         | 6    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:3047                    | _budget_courrier         | _mail_budget             | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:3059                    | _courrier_spec           | _mail_spec               | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:3164                    | _livre_courrier          | _deliver_mail            | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:3254                    | _menage_apres_tour       | _housekeeping_after_turn | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:4007                    | _note_courrier_borne     | _mail_note_bounded       | 3    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:6512                    | battement                | heartbeat                | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
+| runner.py:6526                    | veilleur                 | watchdog                 | 2    | #194, #216, #394, #417, #420, #421, #422, #423, #424 |                            |
 | storage/postgres/mailbox.py:201   | _bail_sql                | _lease_sql               | 3    | —                                                    |                            |
 | storage/postgres/mailbox.py:215   | _bail_params             | _lease_params            | 3    | —                                                    |                            |
 | storage/postgres/operations.py:30 | _sans_compte_nul         | _without_null_account    | 3    | #420, #422                                           |                            |
@@ -252,7 +256,7 @@ blocking production work, and asks mesh-design whether it is in scope at all.
 
 ### 2.3 Database: tables, columns, other objects
 
-- **Tables: 0 French** among the 56 tables created by migrations.
+- **Tables: 0 French** among the 64 tables created by migrations.
 - **Columns:** 1 French column outside the kept domain term, plus 5 `lot` columns:
 
 | object                  | suggested            | comment                                                                                                                                                   |
@@ -265,7 +269,7 @@ blocking production work, and asks mesh-design whether it is in scope at all.
 
 ### 2.4 Migration file names (applied — never renamed)
 
-14 of the 65 migration file names are French. `src/ameesh/migrations/*.sql` are applied
+14 of the 68 migration file names are French. `src/ameesh/migrations/*.sql` are applied
 migrations: **their file names and contents are never renamed** (rule repeated in the lot).
 A new migration that renames a DB object is a **new file with an English name**.
 
@@ -291,36 +295,37 @@ docs outside `schema_migrations` rows.
 
 ### 2.5 CLI options, commands and positionals
 
-**Options — 26** (English alias already present in brackets):
+**Options — 27** (English alias already present in brackets):
 
-| current         | suggested                    | refs | defined in                | open PRs on those files                                    |
-|-----------------|------------------------------|------|---------------------------|------------------------------------------------------------|
-| --chantier      | --workstream                 | 5    | runner.py, reprise.py (2) | #194, #216, #377, #394, #417, #420, #421, #422, #423, #424 |
-| --consigne      | --instruction                | 6    | chat.py                   | —                                                          |
-| --debut         | --start                      | 11   | plan_cli.py               | —                                                          |
-| --fin           | --end                        | 10   | plan_cli.py               | —                                                          |
-| --livraison     | --delivery                   | 9    | plan_cli.py               | —                                                          |
-| --depend-de     | --depends-on                 | 4    | roadmap.py                | —                                                          |
-| --externe       | --external                   | 18   | mesh_cli.py (2)           | #194, #326, #412, #417, #420                               |
-| --fiche         | --card                       | 2    | roadmap.py                | —                                                          |
-| --organisation  | --organization               | 2    | serve.py                  | —                                                          |
-| --porteur       | --owner                      | 2    | roadmap.py                | —                                                          |
-| --pour          | --due                        | 14   | roadmap.py (2)            | —                                                          |
-| --projet        | --project                    | 4    | roadmap.py                | —                                                          |
-| --tache         | drop (unused alias of --lot) | 1    | roadmap.py                | —                                                          |
-| --carte         | --map                        | 5    | scripts/test-parts.py     | —                                                          |
-| --liste         | --list                       | 13   | scripts/test-parts.py     | —                                                          |
-| --pilote        | --driver                     | 12   | scripts/test-parts.py (2) | —                                                          |
-| --durees-sortie | --output-durations           | 5    | scripts/test-parts.py     | —                                                          |
-| --depuis        | --since                      | 7    | scripts/test-parts.py     | —                                                          |
-| --flux          | --flow                       | 13   | scripts/test-parts.py     | —                                                          |
-| --etiquette     | --label                      | 2    | scripts/test-parts.py     | —                                                          |
-| --mesure        | --measure                    | 7    | scripts/test-parts.py     | —                                                          |
-| --nom           | --name                       | 5    | scripts/ci-flux.py        | —                                                          |
-| --intervalle    | --interval                   | 1    | scripts/ci-flux.py        | —                                                          |
-| --duree-max     | --max-duration               | 1    | scripts/ci-flux.py        | —                                                          |
-| --sortie        | --output                     | 3    | scripts/carte.py          | —                                                          |
-| --precedente    | --previous                   | 3    | scripts/carte.py          | —                                                          |
+| current         | suggested                          | refs | defined in                | open PRs on those files                                    |
+|-----------------|------------------------------------|------|---------------------------|------------------------------------------------------------|
+| --chantier      | --workstream                       | 5    | runner.py, reprise.py (2) | #194, #216, #377, #394, #417, #420, #421, #422, #423, #424 |
+| --consigne      | --instruction                      | 6    | chat.py                   | —                                                          |
+| --debut         | --start                            | 11   | plan_cli.py               | —                                                          |
+| --fin           | --end                              | 10   | plan_cli.py               | —                                                          |
+| --livraison     | --delivery                         | 9    | plan_cli.py               | —                                                          |
+| --deploiement   | drop (unused alias of --livraison) | 1    | plan_cli.py               | —                                                          |
+| --depend-de     | --depends-on                       | 4    | roadmap.py                | —                                                          |
+| --externe       | --external                         | 18   | mesh_cli.py (2)           | #194, #326, #412, #417, #420                               |
+| --fiche         | --card                             | 2    | roadmap.py                | —                                                          |
+| --organisation  | --organization                     | 2    | serve.py                  | —                                                          |
+| --porteur       | --owner                            | 2    | roadmap.py                | —                                                          |
+| --pour          | --due                              | 14   | roadmap.py (2)            | —                                                          |
+| --projet        | --project                          | 4    | roadmap.py                | —                                                          |
+| --tache         | drop (unused alias of --lot)       | 1    | roadmap.py                | —                                                          |
+| --carte         | --map                              | 5    | scripts/test-parts.py     | —                                                          |
+| --liste         | --list                             | 13   | scripts/test-parts.py     | —                                                          |
+| --pilote        | --driver                           | 12   | scripts/test-parts.py (2) | —                                                          |
+| --durees-sortie | --output-durations                 | 5    | scripts/test-parts.py     | —                                                          |
+| --depuis        | --since                            | 7    | scripts/test-parts.py     | —                                                          |
+| --flux          | --flow                             | 13   | scripts/test-parts.py     | —                                                          |
+| --etiquette     | --label                            | 2    | scripts/test-parts.py     | —                                                          |
+| --mesure        | --measure                          | 7    | scripts/test-parts.py     | —                                                          |
+| --nom           | --name                             | 5    | scripts/ci-flux.py        | —                                                          |
+| --intervalle    | --interval                         | 1    | scripts/ci-flux.py        | —                                                          |
+| --duree-max     | --max-duration                     | 1    | scripts/ci-flux.py        | —                                                          |
+| --sortie        | --output                           | 3    | scripts/carte.py          | —                                                          |
+| --precedente    | --previous                         | 3    | scripts/carte.py          | —                                                          |
 
 **Subcommands — 11** (reference counts are omitted: `menage`, `resume`, `blocs`, `sortie` etc.
 collide with the module name or an English word, so a count would be meaningless):
