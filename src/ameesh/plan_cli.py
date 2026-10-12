@@ -88,7 +88,7 @@ def add_parsers(work_sub, func) -> None:
     p_plan.add_argument("--debut", "--start", dest="debut", default=None,
                         help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
     p_plan.add_argument("--fin", "--end", dest="fin", default=None, help="planned end")
-    p_plan.add_argument("--livraison", "--deploiement", "--delivery", dest="livraison",
+    p_plan.add_argument("--livraison", "--delivery", dest="livraison",
                         default=None, help="planned delivery or deployment")
     p_plan.add_argument("--source", default=None,
                         help="where the date comes from (conversation, decision, message...); "

@@ -908,7 +908,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--projet", "--project", dest="project", default=None)
     p_add.add_argument("--porteur", "--owner", dest="owner", default=None,
                        help="who owns it (agent or human:<id>)")
-    p_add.add_argument("--lot", "--tache", dest="lot", default=None,
+    p_add.add_argument("--lot", dest="lot", default=None,
                        help="existing task it is attached to")
     p_add.add_argument("--fiche", dest="package", default=None, help="WorkPackage")
     p_add.add_argument("--source-type", dest="source_kind", default="conversation",
