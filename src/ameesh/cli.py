@@ -3,7 +3,7 @@
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
   agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
-                 [--estimate 2h]] [--queue]
+                 [--estimate 2h] [--app PROJECT]] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
@@ -213,6 +213,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     expires = None
     lot = None
     new_lot = None
+    app = None
     kind = "notify"
     urgent = False
     args = list(args)
@@ -231,7 +232,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--ack"]
     explicit_sender = "--from" in args
     estimate = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate"):
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -248,6 +249,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 new_lot = value if value is not None else ""
             elif flag == "--estimate":
                 estimate = value if value is not None else ""
+            elif flag == "--app":
+                app = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -278,7 +281,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
-              "[--new-lot \"title\" [--estimate 2h]] [--kind request|reply|notify|event] "
+              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT]] [--kind request|reply|notify|event] "
               "[--urgent] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
               file=sys.stderr)
@@ -291,6 +294,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if new_lot is not None and not new_lot.strip():
         print("--new-lot: empty title", file=sys.stderr)
+        return 2
+    if app is not None and new_lot is None:
+        print("--app goes with --new-lot (to correct an existing lot: "
+              "ameesh work set-app <id> <project>)", file=sys.stderr)
+        return 2
+    if app is not None and not app.strip():
+        print("--app: empty project", file=sys.stderr)
         return 2
     if estimate is not None and new_lot is None:
         print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
@@ -411,7 +421,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate)
+                estimate=estimate, app=app)
         except assignments.AssignmentError as exc:
             print("message not dropped — %s" % exc, file=sys.stderr)
             return 2

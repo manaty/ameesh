@@ -145,6 +145,19 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 .rm-today { position: absolute; top: -3px; bottom: -3px; width: 0; border-left: 2px solid var(--critical); }
 .rm-detail { color: var(--ink-2); font-size: .76rem; margin-top: 2px; overflow-wrap: anywhere; }
 .rm-detail a { color: inherit; }
+.rm-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 4px 0 8px; font-size: .82rem; }
+.rm-controls .seg button { font: inherit; padding: 2px 10px; border: 1px solid var(--axis); background: var(--surface); color: var(--ink); cursor: pointer; }
+.rm-controls .seg button:first-child { border-radius: 4px 0 0 4px; }
+.rm-controls .seg button:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+.rm-controls .seg button[aria-pressed="true"] { background: var(--ink); color: var(--page); }
+.rm-scroll { overflow-x: auto; }
+.rm-gr { border-top: 1px solid var(--grid); }
+.rm-gr > summary { cursor: pointer; padding: 6px 0; list-style-position: inside; }
+.rm-gr > summary .rm-label { display: inline-flex; width: calc(100% - 2em); font-weight: 600; }
+.rm-gr > summary .meta { font-weight: 400; }
+.rm-gr .rm-row { padding-left: 14px; }
+/* zoom jour : libellés et détails restent visibles pendant le défilement */
+.rm-inner .rm-label, .rm-inner .rm-detail { position: sticky; left: 0; max-width: calc(100vw - 48px); }
 .st-late { color: var(--critical); } .st-proposed { color: var(--warning); border-style: dashed; }
 .st-done { color: var(--good); }
 /* L304 : en-tête, onglets, cartes de projet, tables, fenêtres de détail */
@@ -275,6 +288,8 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   var S = {tab: "overview", p: "", auto: false};
   var VIEW = {lots: {q: "", all: false, sort: null}, agents: {q: "", all: false, sort: null},
               decisions: {q: "", sort: null}};
+  // Gantt : zoom (dans l'URL, z=day), jalon choisi, tâches terminées, groupes ouverts
+  var G = {zoom: "week", ms: "", done: false, open: {}};
   var KNOWN = [];          // projets vus (le sélecteur garde « tous » et les autres)
   var modalAt = null;      // fenêtre ouverte, rouverte après un rafraîchissement
   (function () {
@@ -283,6 +298,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       var i = kv.indexOf("="), k = i < 0 ? kv : kv.slice(0, i), v = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1));
       if (k === "tab" && TABS.some(function (t) { return t[0] === v; })) S.tab = v;
       else if (k === "p") S.p = v;
+      else if (k === "z" && v === "day") G.zoom = "day";
       else if (k === "auto" || k === "auto=1") S.auto = MODE === "served";
       else if (k === "t" && MODE === "served") TOKEN = v;
     });
@@ -297,6 +313,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     var parts = ["tab=" + S.tab];
     if (S.p) parts.push("p=" + encodeURIComponent(S.p));
     if (S.auto) parts.push("auto=1");
+    if (G.zoom === "day") parts.push("z=day");
     try { history.replaceState(null, "", "#" + parts.join("&")); } catch (e) { location.hash = parts.join("&"); }
   }
   function stored(k, v) {
@@ -379,7 +396,8 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   }
   function partialScope() { return S.p && MODE !== "served" && D.project !== S.p; }
   function learnProjects() {
-    var seen = {};
+    // sans prototype : un projet « __proto__ » ou « constructor » reste dans le sélecteur
+    var seen = Object.create(null);
     KNOWN.concat((D.overview || []).map(function (c) { return c.project; }))
       .concat((D.lots || []).map(function (l) { return l.project; }))
       .concat(D.project ? [D.project] : []).concat(S.p ? [S.p] : [])
@@ -744,7 +762,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
 
   // -- onglets ---------------------------------------------------------------
   function note(box) {
-    if (partialScope()) box.appendChild(el("p", "meta", "Static page: budget and Gantt cover all projects."));
+    if (partialScope()) box.appendChild(el("p", "meta", "Static page: budget, milestones and epics cover all projects."));
   }
   var RENDER = {
     overview: function (box) {
@@ -1024,26 +1042,12 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   }
 
   // -- feuille de route (L96) : epics, jalons, tâches, engagements et décisions
-  //    attendues sur une frise en jours ; prévu (pointillé) face au réel (plein)
+  //    attendues sur une frise en jours ; prévu (pointillé) face au réel (plein).
+  //    L304 : tâches groupées par epic (à défaut par projet), groupes repliés,
+  //    zoom semaine (la fenêtre tient dans l'écran) ou jour (défilement)
   function renderRoadmap(panel) {
     var R = D.roadmap;
     if (!R) { panel.appendChild(el("p", "empty", "Roadmap left out (--no-gantt).")); return; }
-    var legend = el("div", "legend");
-    legend.setAttribute("aria-hidden", "true");
-    [["border:1px dashed var(--phase-build);height:10px", "planned"], ["background:var(--phase-build)", "actual, in progress"],
-     ["background:var(--phase-merge)", "actual, delivered"], ["background:var(--critical)", "past the planned date"],
-     ["background:var(--ink);width:9px;height:9px;transform:rotate(45deg)", "planned delivery"],
-     ["border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)", "commitment due date"],
-     ["background:var(--warning);width:9px;height:9px;border-radius:50%", "pending decision"],
-     ["background:var(--critical);width:2px;height:12px", "today"]].forEach(function (x) {
-      var s = el("span"), i = el("i"); i.setAttribute("style", x[0]); s.appendChild(i);
-      s.appendChild(document.createTextNode(x[1])); legend.appendChild(s);
-    });
-    panel.appendChild(legend);
-    var ax = el("div", "axis"); ax.id = "rm-axis"; ax.setAttribute("aria-hidden", "true"); panel.appendChild(ax);
-    var rb = el("div"); rb.id = "roadmap"; panel.appendChild(rb);
-    var f = R.window.from_ts, t = R.window.to_ts, sp = Math.max(1, t - f);
-    function px(ts) { return Math.min(100, Math.max(0, (ts - f) / sp * 100)); }
     function dayTs(iso) {
       if (!iso) return null;
       var p = String(iso).split("-");
@@ -1056,12 +1060,83 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
                soumise: "submitted", verdict: "verdict", livree: "delivered"};
     var ST = {en_cours: "in progress", a_valider: "to validate", validee: "validated", bloquee: "blocked",
               livree: "delivered", abandonnee: "abandoned"};
-    var axis = document.getElementById("rm-axis"), days = Math.round(sp / 86400);
-    var stepDays = [1, 2, 7, 14, 28].filter(function (k) { return days / k <= Math.max(2, Math.floor((axis.clientWidth || 320) / 56)); })[0] || 28;
+    var ENDED = {livree: true, abandonnee: true};
+
+    // jours calendaires (minuit local) et non 86 400 s : le 25/10 dure 25 h
+    function midnight(ts) { var d = new Date(ts * 1000); d.setHours(0, 0, 0, 0); return d.getTime() / 1000; }
+    function addDays(ts, n) { var d = new Date(ts * 1000); d.setDate(d.getDate() + n); return d.getTime() / 1000; }
+    // fenêtre : celle de l'instantané, ou celle d'un jalon choisi, du jour la
+    // plus tôt au jour le plus tard de toutes ses dates (prévues et réelles),
+    // un jour de marge de chaque côté
+    var ms = (R.milestones || []).filter(function (m) { return m.id === G.ms; })[0] || null;
+    var f = midnight(R.window.from_ts), t = R.window.to_ts;
+    if (ms) {
+      var mts = [dayTs(ms.planned.start), dayTs(ms.planned.end), dayTs(ms.planned.delivery),
+                 ms.real && ms.real.debut, ms.real && ms.real.livree].filter(Boolean);
+      if (mts.length) {
+        f = addDays(midnight(Math.min.apply(null, mts)), -1);
+        t = addDays(midnight(Math.max.apply(null, mts)), 2);
+      }
+    }
+    var sp = Math.max(86400, t - f), days = Math.max(1, Math.round(sp / 86400));
+    function px(ts) { return Math.min(100, Math.max(0, (ts - f) / sp * 100)); }
+
+    var tasks = (R.tasks || []).filter(function (x) { return inScope(x.project); });
+    var nEnded = tasks.filter(function (x) { return ENDED[x.state]; }).length;
+
+    // commandes : zoom, fenêtre de jalon, tâches terminées, tout déplier
+    var bar = el("div", "rm-controls");
+    var zoom = el("span", "seg");
+    zoom.setAttribute("role", "group"); zoom.setAttribute("aria-label", "zoom");
+    [["week", "week"], ["day", "day"]].forEach(function (z) {
+      var b = el("button", null, z[1]); b.type = "button";
+      b.setAttribute("aria-pressed", G.zoom === z[0] ? "true" : "false");
+      b.addEventListener("click", function () { G.zoom = z[0]; saveHash(); renderAll(); });
+      zoom.appendChild(b);
+    });
+    bar.appendChild(zoom);
+    if ((R.milestones || []).length) {
+      var lab = el("label", null, "window "), sel = el("select");
+      var o0 = el("option", null, "whole snapshot"); o0.value = ""; sel.appendChild(o0);
+      R.milestones.forEach(function (m) {
+        var o = el("option", null, m.id + " " + m.title); o.value = m.id; o.selected = m.id === G.ms; sel.appendChild(o);
+      });
+      sel.addEventListener("change", function () { G.ms = sel.value; renderAll(); });
+      lab.appendChild(sel); bar.appendChild(lab);
+    }
+    var dl = el("label"), dc = el("input"); dc.type = "checkbox"; dc.checked = G.done;
+    dc.addEventListener("change", function () { G.done = dc.checked; renderAll(); });
+    dl.appendChild(dc); dl.appendChild(document.createTextNode(" delivered and abandoned (" + nEnded + ")"));
+    bar.appendChild(dl);
+    var all = el("button", null, "expand all"); all.type = "button";
+    bar.appendChild(all);
+    panel.appendChild(bar);
+
+    var legend = el("div", "legend");
+    legend.setAttribute("aria-hidden", "true");
+    [["border:1px dashed var(--phase-build);height:10px", "planned"], ["background:var(--phase-build)", "actual, in progress"],
+     ["background:var(--phase-merge)", "actual, delivered"], ["background:var(--critical)", "past the planned date"],
+     ["background:var(--ink);width:9px;height:9px;transform:rotate(45deg)", "planned delivery"],
+     ["border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)", "commitment due date"],
+     ["background:var(--warning);width:9px;height:9px;border-radius:50%", "pending decision"],
+     ["background:var(--critical);width:2px;height:12px", "today"]].forEach(function (x) {
+      var s = el("span"), i = el("i"); i.setAttribute("style", x[0]); s.appendChild(i);
+      s.appendChild(document.createTextNode(x[1])); legend.appendChild(s);
+    });
+    panel.appendChild(legend);
+
+    // zoom jour : une colonne de 34 px par jour, la frise défile ; semaine : elle tient dans l'écran
+    var scroller = el("div", "rm-scroll"), inner = el("div", "rm-inner");
+    if (G.zoom === "day") inner.style.minWidth = (days * 34) + "px";
+    scroller.appendChild(inner); panel.appendChild(scroller);
+    var axis = el("div", "axis"); axis.setAttribute("aria-hidden", "true"); inner.appendChild(axis);
+    var box = el("div"); box.id = "roadmap"; inner.appendChild(box);
+    var stepDays = G.zoom === "day" ? 1
+      : [1, 2, 7, 14, 28].filter(function (k) { return days / k <= Math.max(2, Math.floor((panel.clientWidth || 320) / 56)); })[0] || 28;
     var ticks = [];
     for (var d = new Date(f * 1000); d.getTime() / 1000 < t; d.setDate(d.getDate() + stepDays)) ticks.push(d.getTime() / 1000);
     ticks.forEach(function (ts) { var s = el("span", null, dmTs(ts)); s.style.left = px(ts) + "%"; axis.appendChild(s); });
-    var box = document.getElementById("roadmap");
+
     function track(parts) {
       var tr = el("div", "rm-track");
       tr.setAttribute("role", "img");
@@ -1075,8 +1150,8 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
         }
         if (!p.a || !p.b || p.b < f || p.a > t) return;
         var a = px(p.a), z = px(p.b);
-        var bar = el("div", p.cls); bar.style.left = a + "%"; bar.style.width = Math.max(0.6, z - a) + "%";
-        tr.appendChild(bar);
+        var b = el("div", p.cls); b.style.left = a + "%"; b.style.width = Math.max(0.6, z - a) + "%";
+        tr.appendChild(b);
       });
       var n = el("div", "rm-today"); n.style.left = px(todayTs) + "%"; tr.appendChild(n);
       return tr;
@@ -1097,6 +1172,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       head.appendChild(el("span", "chip st-late", l.open ? "⚠ " + l.days + " d late"
         : "delivered " + l.days + " d late"));
     }
+    function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }
     function planBars(p, real, ended) {
       var ps = dayTs(p.start), pe = dayTs(p.end), pd = dayTs(p.delivery);
       var parts = [];
@@ -1115,12 +1191,22 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       if (real && real.livree) parts.push({mark: true, at: real.livree, cls: "done", title: "delivered " + dmTs(real.livree)});
       return parts;
     }
-    function group(title, rows, render) {
-      if (!rows || !rows.length) return;
-      box.appendChild(el("div", "rm-group", title + " (" + rows.length + ")"));
-      rows.forEach(render);
+    // un groupe = <details> ; ouvert ou fermé, il le reste d'un rafraîchissement à l'autre
+    var groups = [];
+    function group(key, title, count, summaryTrack, openByDefault) {
+      var det = el("details", "rm-gr"), sum = el("summary");
+      det.open = G.open[key] !== undefined ? G.open[key] : openByDefault;
+      det.addEventListener("toggle", function () { G.open[key] = det.open; });
+      var head = el("div", "rm-label");
+      head.appendChild(el("span", "t", title));
+      head.appendChild(el("span", "meta", count));
+      sum.appendChild(head);
+      if (summaryTrack) sum.appendChild(summaryTrack);
+      det.appendChild(sum); box.appendChild(det);
+      groups.push({key: key, det: det});
+      return det;
     }
-    function pkgRow(p) {
+    function pkgRow(into, p) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", p.id));
       head.appendChild(el("span", "t", p.title));
@@ -1132,15 +1218,14 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       row.appendChild(track(planBars(p.planned, pr, false)));
       var det = el("div", "rm-detail", planned(p.planned));
       source(det, p.source);
-      row.appendChild(det); box.appendChild(row);
+      row.appendChild(det); into.appendChild(row);
     }
-    group("Milestones", R.milestones, pkgRow);
-    group("Epics", R.epics, pkgRow);
-    group("Tasks", R.tasks, function (x) {
+    function taskRow(into, x) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", "#" + x.id));
-      head.appendChild(el("span", "t", x.title + (x.epic ? " [" + x.epic + "]" : "")));
-      head.appendChild(el("span", "chip st-" + (x.state === "livree" ? "done" : "active"), ST[x.state] || x.state));
+      var tt = el("span", "t"); tt.appendChild(link(x.title, function () { openModal("lot", x.id); }));
+      head.appendChild(tt);
+      head.appendChild(el("span", "chip st-" + (x.state === "livree" ? "done" : x.state === "bloquee" ? "blocked" : "active"), ST[x.state] || x.state));
       late(head, x.late);
       row.appendChild(head);
       row.appendChild(track(planBars(x.planned, x.real, x.state === "abandonnee")));
@@ -1151,37 +1236,114 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       source(det, x.source);
       if (x.commitments.length) det.appendChild(document.createTextNode(" · commitment(s) "
         + x.commitments.map(function (i) { return "e" + i; }).join(", ")));
-      row.appendChild(det); box.appendChild(row);
+      row.appendChild(det); into.appendChild(row);
+    }
+
+    if ((R.milestones || []).length) {
+      var gm = group("milestones", "Milestones", R.milestones.length + "", null, true);
+      R.milestones.forEach(function (p) { pkgRow(gm, p); });
+    }
+    // tâches par epic, à défaut par projet ; les groupes les plus chargés d'abord
+    var EPIC = Object.create(null);
+    (R.epics || []).forEach(function (e) { EPIC[e.id] = e; });
+    var byKey = Object.create(null), order = [];
+    // une epic sans aucune tâche a son groupe quand même (sa barre prévue) ;
+    // celle dont les tâches sont toutes hors du projet choisi n'en a pas ;
+    // sans prototype, un identifiant « constructor » ou « toString » compte aussi
+    var hasTask = Object.create(null);
+    (R.tasks || []).forEach(function (x) { if (x.epic) hasTask[x.epic] = true; });
+    (R.epics || []).forEach(function (e) {
+      if (hasTask[e.id]) return;
+      byKey["epic:" + e.id] = {key: "epic:" + e.id, rows: [], epic: e, title: null}; order.push("epic:" + e.id);
     });
+    tasks.forEach(function (x) {
+      var k = x.epic ? "epic:" + x.epic : x.project ? "project:" + x.project : "none";
+      if (!byKey[k]) { byKey[k] = {key: k, rows: [], epic: x.epic ? EPIC[x.epic] || {id: x.epic, title: x.epic} : null,
+                                   title: x.epic ? null : x.project ? "project " + x.project : "no epic, no project"}; order.push(k); }
+      byKey[k].rows.push(x);
+    });
+    order.map(function (k) { return byKey[k]; }).sort(function (a, b) {
+      var oa = a.rows.filter(function (x) { return !ENDED[x.state]; }).length, ob = b.rows.filter(function (x) { return !ENDED[x.state]; }).length;
+      return (a.key === "none") - (b.key === "none") || (!!b.epic - !!a.epic) || ob - oa;
+    }).forEach(function (g) {
+      var open = g.rows.filter(function (x) { return !ENDED[x.state]; });
+      var shown = G.done ? g.rows : open;
+      // une epic planifiée garde son groupe (ses dates) même si ses tâches finies sont masquées ;
+      // « planned » toujours présent, il faut au moins une date non nulle
+      if (!shown.length && g.rows.length && !(g.epic && hasPlan(g.epic.planned))) return;
+      var nLate = g.rows.filter(function (x) { return x.late && x.late.open; }).length;
+      var nBlocked = g.rows.filter(function (x) { return x.state === "bloquee"; }).length;
+      var nDone = g.rows.filter(function (x) { return x.state === "livree"; }).length;
+      var count = [open.length + " open", nDone + " delivered", nBlocked ? nBlocked + " blocked" : "", nLate ? nLate + " late" : ""]
+        .filter(Boolean).join(" · ");
+      // synthèse : du premier début au dernier terme des tâches affichées
+      var a = null, z = null;
+      var bars = shown.map(function (x) { return planBars(x.planned, x.real, x.state === "abandonnee"); });
+      if (g.epic && g.epic.planned) bars.push(planBars(g.epic.planned, g.epic.real, false));
+      bars.forEach(function (parts) {
+        parts.forEach(function (p) {
+          var lo = p.mark ? p.at : p.a, hi = p.mark ? p.at : p.b;
+          if (lo && (a === null || lo < a)) a = lo;
+          if (hi && (z === null || hi > z)) z = hi;
+        });
+      });
+      var sum = track(a !== null ? [{a: a, b: Math.max(z, a + 3600), cls: "rm-real" + (nLate ? " late" : open.length || !g.rows.length ? "" : " done")}] : []);
+      var title = g.epic ? "epic " + g.epic.id + " " + (g.epic.title || "") : g.title;
+      // déplié d'office seulement s'il porte une tâche en retard, ou si l'epic
+      // l'est (mesh-design, n°9311) : « en cours » ne suffit pas
+      var det = group(g.key, title, count, sum, nLate > 0 || !!(g.epic && g.epic.late && g.epic.late.open));
+      if (g.epic && g.epic.planned) pkgRow(det, g.epic);
+      shown.forEach(function (x) { taskRow(det, x); });
+    });
+
+    var commitments = (R.commitments || []).filter(function (c) { return inScope(c.project); });
     var CST = {proposed: "proposed, to validate", open: "open", done: "kept", cancelled: "cancelled"};
-    group("Commitments", R.commitments, function (c) {
-      var row = el("div", "rm-row"), head = el("div", "rm-label");
-      head.appendChild(el("span", "lot-id", "e" + c.id));
-      head.appendChild(el("span", "t", c.what));
-      head.appendChild(el("span", "chip st-" + (c.fulfilled ? "done" : c.status === "proposed" ? "proposed" : "active"),
-        c.fulfilled ? "kept" : CST[c.status] || c.status));
-      late(head, c.late);
-      row.appendChild(head);
-      row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "due " + dm(c.due)}]));
-      var det = el("div", "rm-detail", ["due " + dm(c.due), c.owner || "", c.project ? "project " + c.project : "",
-        c.lot ? "task #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
-        .filter(Boolean).join(" · "));
-      source(det, c.source);
-      row.appendChild(det); box.appendChild(row);
+    if (commitments.length) {
+      var gc = group("commitments", "Commitments", commitments.length + "", null, true);
+      commitments.forEach(function (c) {
+        var row = el("div", "rm-row"), head = el("div", "rm-label");
+        head.appendChild(el("span", "lot-id", "e" + c.id));
+        head.appendChild(el("span", "t", c.what));
+        head.appendChild(el("span", "chip st-" + (c.fulfilled ? "done" : c.status === "proposed" ? "proposed" : "active"),
+          c.fulfilled ? "kept" : CST[c.status] || c.status));
+        late(head, c.late);
+        row.appendChild(head);
+        row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "due " + dm(c.due)}]));
+        var det = el("div", "rm-detail", ["due " + dm(c.due), c.owner || "", c.project ? "project " + c.project : "",
+          c.lot ? "task #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
+          .filter(Boolean).join(" · "));
+        source(det, c.source);
+        row.appendChild(det); gc.appendChild(row);
+      });
+    }
+    var expected = (R.decisions || []).filter(function (c) { return inScope(c.project); });
+    if (expected.length) {
+      var gd = group("decisions", "Pending decisions", expected.length + "", null, true);
+      expected.forEach(function (c) {
+        var row = el("div", "rm-row"), head = el("div", "rm-label");
+        head.appendChild(el("span", "lot-id", c.id ? "e" + c.id : "#" + c.lot));
+        head.appendChild(el("span", "t", c.what));
+        if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposed, to validate"));
+        row.appendChild(head);
+        row.appendChild(track([{mark: true, at: c.due ? dayTs(c.due) + 43200 : todayTs, cls: "decision"}]));
+        var det = el("div", "rm-detail", (c.due ? "due " + dm(c.due) : "no date") + (c.owner ? " · " + c.owner : ""));
+        source(det, c.source);
+        row.appendChild(det); gd.appendChild(row);
+      });
+    }
+    if (!groups.length)
+      box.appendChild(el("p", "empty", tasks.length ? "Every task is delivered or abandoned; tick the box above to see them."
+        : "Nothing to plan: no open task, no planned date, no commitment."));
+    var anyClosed = groups.some(function (g) { return !g.det.open; });
+    all.textContent = anyClosed ? "expand all" : "collapse all";
+    all.addEventListener("click", function () {
+      var to = groups.some(function (g) { return !g.det.open; });
+      groups.forEach(function (g) { g.det.open = to; G.open[g.key] = to; });
+      all.textContent = to ? "collapse all" : "expand all";
     });
-    group("Pending decisions", R.decisions, function (c) {
-      var row = el("div", "rm-row"), head = el("div", "rm-label");
-      head.appendChild(el("span", "lot-id", c.id ? "e" + c.id : "#" + c.lot));
-      head.appendChild(el("span", "t", c.what));
-      if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposed, to validate"));
-      row.appendChild(head);
-      row.appendChild(track([{mark: true, at: c.due ? dayTs(c.due) + 43200 : todayTs, cls: "decision"}]));
-      var det = el("div", "rm-detail", (c.due ? "due " + dm(c.due) : "no date") + (c.owner ? " · " + c.owner : ""));
-      source(det, c.source);
-      row.appendChild(det); box.appendChild(row);
-    });
-    if (!R.tasks.length && !R.epics.length && !R.milestones.length && !R.commitments.length && !R.decisions.length)
-      box.appendChild(el("p", "empty", "Nothing to plan: no open task, no planned date, no commitment."));
+    // zoom jour : la frise s'ouvre sur aujourd'hui
+    if (G.zoom === "day" && scroller.clientWidth)
+      scroller.scrollLeft = Math.max(0, inner.scrollWidth * px(todayTs) / 100 - scroller.clientWidth / 2);
   }
 
   if (MODE === "served") {

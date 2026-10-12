@@ -12,7 +12,11 @@ le reste du code. Un sous-module par sujet :
   moisson d'un enfant, environnement initial d'un processus (L124) ;
 * `terminal` : le terminal de l'humain ;
 * `host` : mémoire, swap, charge, alimentation, système de fichiers,
-  allocation btrfs (#246).
+  allocation btrfs (#246) ;
+* `offload_shell` : le côté VM du déport (L159b), Linux seulement par
+  construction ; script autonome (bibliothèque standard seule, aucun import
+  d'ameesh), installé seul et lancé en `python3 -I` : il lit `/proc`
+  lui-même.
 
 Appuyé sur psutil (roues binaires Linux, macOS, Windows) ; sous Linux, un
 repli par `/proc` reste en place si psutil est absent.

@@ -909,6 +909,19 @@ class WorkItems(Domain):
     """Lots et journal de leurs transitions (ledger de reprise)."""
 
     @abc.abstractmethod
+    def set_app(self, item_id: int, app: str, *, actor: str,
+                if_empty: bool = False, assignee: str | None = None) -> dict | None:
+        """L118c: journaled project correction, atomically with its old value."""
+
+    @abc.abstractmethod
+    def without_project(self) -> list[dict]:
+        """L118c: open lots with empty app, once per id, including waiting_human."""
+
+    @abc.abstractmethod
+    def creator(self, item_id: int) -> str:
+        """Actor of the first journal entry, without truncating long journals."""
+
+    @abc.abstractmethod
     def add(self, *, type: str, source: str, app: str, title: str, body: str,  # noqa: A002
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
@@ -2074,11 +2087,12 @@ class Operations(Domain):
         title, state, updated_ts, du plus récemment modifié au plus ancien."""
 
     @abc.abstractmethod
-    def open_lots_activity(self, limit: int) -> list[dict]:
+    def open_lots_activity(self, limit: int | None) -> list[dict]:
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee. Les plus anciennement actifs d'abord."""
+        assignee. Les plus anciennement actifs d'abord. `limit=None` lit
+        toute la vérité avant le filtrage des attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:

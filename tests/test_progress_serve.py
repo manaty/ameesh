@@ -234,6 +234,33 @@ class PageBuilderTest(unittest.TestCase):
         self.assertIn("sessionStorage", html)
         self.assertNotIn("same-origin", html)
 
+    def test_gantt_groupes_et_zoom(self):
+        # L304 PR 3 : groupes repliables, zoom semaine/jour gardé dans l'URL
+        html = progress.render_html(_snap())
+        self.assertIn('el("details", "rm-gr")', html)
+        self.assertIn('"z=day"', html)
+        self.assertIn('[["week", "week"], ["day", "day"]]', html)
+        self.assertIn("delivered and abandoned (", html)
+        # replié sauf s'il porte une tâche en retard (« en cours » ne suffit pas)
+        self.assertIn("group(g.key, title, count, sum, nLate > 0 ||", html)
+        # r1 : une epic sans tâche garde son groupe ; fenêtre de jalon du min au
+        # max de ses dates, en jours calendaires (changement d'heure)
+        self.assertIn("if (hasTask[e.id]) return;", html)
+        # r2 : une epic planifiée garde son groupe quand ses tâches finies sont
+        # masquées ; pas de prototype (epic « constructor ») ; pas de « livré »
+        # vert pour un groupe sans tâche
+        self.assertIn("if (!shown.length && g.rows.length && !(g.epic && hasPlan(g.epic.planned))) return;", html)
+        # lot #396 : « planned » est toujours là, toutes dates nulles l'epic
+        # n'est pas planifiée ; un projet « __proto__ » reste dans le sélecteur
+        self.assertIn("function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }", html)
+        self.assertIn("var seen = Object.create(null);", html)
+        self.assertNotIn("var seen = {};", html)
+        self.assertIn("var hasTask = Object.create(null);", html)
+        self.assertIn('open.length || !g.rows.length ? "" : " done"', html)
+        self.assertIn("f = addDays(midnight(Math.min.apply(null, mts)), -1);", html)
+        self.assertIn("t = addDays(midnight(Math.max.apply(null, mts)), 2);", html)
+        self.assertNotIn('x.state === "en_cours"; });', html)
+
     def test_onglets_et_fenetre(self):
         html = progress.render_html(_snap())
         for tab in ("overview", "gantt", "lots", "agents", "budget", "decisions"):
