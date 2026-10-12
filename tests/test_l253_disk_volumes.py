@@ -237,7 +237,7 @@ class DockerRootTest(_Tmp):
 
 class VolumesTest(_Tmp):
     def fake(self, fsids: dict, free: dict, btrfs: dict):
-        """Patches the readers: btrfs fsid, free space and allocation per path."""
+        """Fake disks and healthy non-disk readings, independent of runner load."""
         def fs_info(path):
             for prefix, fsid in fsids.items():
                 if path.startswith(prefix):
@@ -260,7 +260,21 @@ class VolumesTest(_Tmp):
         return [mock.patch.object(platform, "is_linux", return_value=True),
                 mock.patch.object(platform, "btrfs_fs_info", side_effect=fs_info),
                 mock.patch.object(resources, "btrfs_usage", side_effect=usage),
-                mock.patch.object(resources, "disk_free", side_effect=disk)]
+                mock.patch.object(resources, "disk_free", side_effect=disk),
+                mock.patch.object(resources, "load1", return_value=0.0),
+                mock.patch.object(resources, "cpu_count", return_value=4),
+                mock.patch.object(resources, "_meminfo", return_value={
+                    "mem_total_bytes": 32 * GIB, "mem_available_bytes": 16 * GIB,
+                    "swap_used_bytes": 0}),
+                mock.patch.object(resources, "tmp_usage", return_value={}),
+                mock.patch.object(resources, "power", return_value={}),
+                mock.patch.object(resources, "psi", return_value={
+                    "psi_cpu_some": 0.0, "psi_mem_some": 0.0,
+                    "psi_mem_full": 0.0, "psi_io_some": 0.0}),
+                mock.patch.object(resources, "guest_cgroups", return_value=[]),
+                mock.patch.object(resources, "guest_memory", return_value=0),
+                mock.patch.object(resources._CPU_METER, "read", return_value={
+                    "app_cpu": 0.0, "guest_cpu": 0.0, "cpu_window_s": 1.0})]
 
     def test_dedupe_by_btrfs_fsid(self):
         ssd, state, cache = self.dir("ssd"), self.dir("system", "state"), \
