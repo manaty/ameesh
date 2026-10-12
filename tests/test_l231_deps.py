@@ -18,7 +18,9 @@ from ameesh import deps, menage
 from . import support  # noqa: F401  (isolated environment, L142)
 
 # the real ones, before _Base patches them
-node_version, node_bin = deps.node_version, deps.node_bin
+toolchain = deps.toolchain
+#: a fake npm's first line: it installs into `--prefix` like the real one
+PREFIX = 'd=.; p=; for a in "$@"; do [ "$p" = --prefix ] && d="$a"; p="$a"; done; cd "$d"'
 
 LOCK = {"name": "app", "lockfileVersion": 3,
         "packages": {"": {"name": "app", "dependencies": {"left-pad": "^1.0.0"}},
@@ -81,8 +83,10 @@ class _Base(unittest.TestCase):
         self.base = self._tmp.name
         self.cache = os.path.join(self.base, "cache")
         os.makedirs(self.cache)
-        self.patches = [mock.patch.object(deps, "node_version", return_value="v26"),
-                        mock.patch.object(deps, "node_bin", return_value=""),
+        self.patches = [mock.patch.object(
+                            deps, "toolchain", side_effect=lambda pkg_dir=None, env=None: {
+                                "node": "v26", "bindir": "", "npm": None,
+                                "npm_version": "11"}),
                         mock.patch.object(deps, "_say")]
         for patch in self.patches:
             patch.start()
@@ -431,6 +435,7 @@ def _fake_npm(directory: str, log: str, *, sleeper: bool = False) -> str:
     with open(path, "w") as fh:
         fh.write("#!/bin/sh\n"
                  "echo \"$* NODE_ENV=${NODE_ENV:-} OMIT=${npm_config_omit:-}\" >> %s\n"
+                 "d=.; p=; for a in \"$@\"; do [ \"$p\" = --prefix ] && d=\"$a\"; p=\"$a\"; done; cd \"$d\"\n"
                  "mkdir -p node_modules/left-pad && echo x > node_modules/left-pad/i.js\n"
                  % log)
         if sleeper:
@@ -732,25 +737,31 @@ class NexlinkVerificationTests(_Base):
         self.assertEqual(deps.fill_env({})["SHARP_IGNORE_GLOBAL_LIBVIPS"], "1")
 
     def _toolchains(self):
-        """A version manager stand-in: `node` answers by the directory it runs
-        in (`.pin`: node 22 and its npm 10, else node 26 and its npm 11); each
-        npm logs its own path when it installs."""
+        """A version manager stand-in, answering by the directory it runs in
+        (`.pin`: node 22 and its npm 10.9, else node 26 and its npm 11.19):
+        `node`, and `shim-npm`, an npm shim with no npm beside the node; each
+        npm logs its own path and the directory it ran from when installing."""
         fakebin = os.path.join(self.base, "fakebin")
         os.makedirs(fakebin)
         log = os.path.join(self.base, "npm-ran.log")
+        install = ('echo "$0 $PWD" >> %s\n%s\nmkdir -p node_modules/x\n'
+                   % (log, PREFIX))
         for major, npm in (("22", "10.9"), ("26", "11.19")):
             bindir = os.path.join(self.base, "node%s" % major, "bin")
             os.makedirs(bindir)
-            path = os.path.join(bindir, "npm")
-            with open(path, "w") as fh:
-                fh.write('#!/bin/sh\nif [ "$1" = --version ]; then echo %s; exit 0; fi\n'
-                         'echo "$0" >> %s\nmkdir -p node_modules/x\n' % (npm, log))
-            os.chmod(path, 0o755)
+            with open(os.path.join(bindir, "npm"), "w") as fh:
+                fh.write('#!/bin/sh\nif [ "$1" = --version ]; then echo %s; exit 0; fi\n%s'
+                         % (npm, install))
+            os.chmod(os.path.join(bindir, "npm"), 0o755)
         with open(os.path.join(fakebin, "node"), "w") as fh:
             fh.write('#!/bin/sh\nif [ -f .pin ]; then v=22; else v=26; fi\n'
-                     'case "$1" in --version) echo v$v;; -p) echo %s/node$v/bin/node;; esac\n'
-                     % self.base)
-        os.chmod(os.path.join(fakebin, "node"), 0o755)
+                     'case "$1" in --version) echo v$v;; -p) printf "v$v\\n%s/node$v/bin/node\\n";; '
+                     'esac\n' % self.base)
+        with open(os.path.join(fakebin, "shim-npm"), "w") as fh:
+            fh.write('#!/bin/sh\nif [ "$1" = --version ]; then '
+                     '[ -f .pin ] && echo 10.9 || echo 11.19; exit 0; fi\n%s' % install)
+        for name in ("node", "shim-npm"):
+            os.chmod(os.path.join(fakebin, name), 0o755)
         deps._probes.clear()
         self.addCleanup(deps._probes.clear)
         return fakebin, log
@@ -761,51 +772,74 @@ class NexlinkVerificationTests(_Base):
         open(os.path.join(pinned, ".pin"), "w").close()
         loose = _package(os.path.join(self.base, "wt"))
         root = deps.nm_root(self.cache)
-        environ = {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}
-        with mock.patch.dict(os.environ, environ), \
-                mock.patch.object(deps, "node_version", node_version), \
-                mock.patch.object(deps, "node_bin", node_bin):
+        with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}), \
+                mock.patch.object(deps, "toolchain", toolchain):
             os.environ.pop("AMEESH_REAL_NPM", None)
             self.assertEqual((deps.node_version(pinned), deps.npm_version(pinned)),
                              ("v22", "10.9"))
             self.assertEqual((deps.node_version(loose), deps.npm_version(loose)),
                              ("v26", "11.19"))
             self.assertNotEqual(deps.cache_key(pinned), deps.cache_key(loose))
-            marker = deps.fill(pinned, root, deps.cache_key(pinned))
-            # the npm binary that ran is the one the key asked
+            done = deps.link_package(pinned, self.cache)
+            # the npm binary that ran is the one the key asked, from the package
             with open(log) as fh:
-                self.assertEqual(fh.read().split(), [os.path.join(self.base, "node22/bin/npm")])
-            self.assertEqual((marker["node"], marker["npm"]), ("v22", "10.9"))
-            # the turn's AMEESH_REAL_NPM (a version manager's shim, answering by
-            # its cwd) does not override the npm beside the package's node...
-            shim = os.path.join(self.base, "node26/bin/npm")
+                self.assertEqual(fh.read().split(),
+                                 [os.path.join(self.base, "node22/bin/npm"), pinned])
+            self.assertEqual(deps.read_marker(deps.entry_of(root, done["key"]))["npm"], "10.9")
+            self.assertTrue(os.path.islink(os.path.join(pinned, "node_modules")))
+            # the turn's AMEESH_REAL_NPM (a shim answering by its cwd) does not
+            # override the npm beside the package's node...
+            shim = os.path.join(fakebin, "shim-npm")
             os.environ["AMEESH_REAL_NPM"] = shim
-            deps._probes.clear()
-            self.assertEqual(deps.npm_version(pinned), "10.9")
-            # ...and is the npm of key AND fill when that node has none beside it
+            self.assertEqual(deps.toolchain(pinned)["npm"],
+                             os.path.join(self.base, "node22/bin/npm"))
+            # ...and without one, the shim runs from the package's directory for
+            # the fill as for the key: npm 10.9 both times, never the cache's 11
             os.unlink(os.path.join(self.base, "node22/bin/npm"))
+            os.unlink(os.path.join(pinned, "node_modules"))
             deps._probes.clear()
-            self.assertEqual(deps.npm_version(pinned), "11.19")
             os.unlink(log)
-            deps.fill(pinned, root, deps.cache_key(pinned))
+            tool = deps.toolchain(pinned)
+            self.assertEqual((tool["npm"], tool["npm_version"]), (shim, "10.9"))
+            marker = deps.fill(pinned, root, deps.cache_key(pinned, label="other", tool=tool),
+                               tool=tool)
             with open(log) as fh:
-                self.assertEqual(fh.read().split(), [shim])
+                self.assertEqual(fh.read().split(), [shim, pinned])
+            self.assertEqual(marker["npm"], "10.9")
 
-    def test_r1_4_probes_are_not_kept_past_their_ttl(self):
+    def test_r1_4_toolchain_is_one_entry_not_kept_past_its_ttl(self):
         fakebin, _log = self._toolchains()
         pkg = _package(os.path.join(self.base, "main"))
         pin = os.path.join(pkg, ".pin")
         open(pin, "w").close()
         with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}), \
-                mock.patch.object(deps, "node_version", node_version), \
-                mock.patch.object(deps, "node_bin", node_bin):
+                mock.patch.object(deps, "toolchain", toolchain):
             before = deps.cache_key(pkg)
             os.unlink(pin)                  # the pin changes at the same path
             self.assertEqual(deps.cache_key(pkg), before)         # within the TTL
+            self.assertEqual(deps.toolchain(pkg)["bindir"], os.path.join(self.base, "node22/bin"))
             with mock.patch.object(deps.time, "monotonic",
                                    return_value=time.monotonic() + deps.PROBE_TTL_S + 1):
                 self.assertNotEqual(deps.cache_key(pkg), before)
-                self.assertEqual(deps.node_version(pkg), "v26")
+                tool = deps.toolchain(pkg)
+                # version and binary expire together: never v26 with node22/bin
+                self.assertEqual((tool["node"], tool["bindir"], tool["npm_version"]),
+                                 ("v26", os.path.join(self.base, "node26/bin"), "11.19"))
+
+    def test_r2_1_a_node_modules_made_during_a_failed_fill_is_kept(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        fake = FakeInstaller(fail_in=[self.cache])
+
+        def installer(directory, env=None, *, lock_fd=None):
+            if directory.startswith(self.cache):
+                os.makedirs(os.path.join(pkg, "node_modules", "mine"))  # a local npm ci
+            fake(directory, env, lock_fd=lock_fd)
+
+        done = deps.link_package(pkg, self.cache, installer=installer)
+        self.assertEqual(done["status"], "local-kept")
+        self.assertIn("fake", done["reason"])
+        self.assertEqual(len(fake.calls), 1)            # no fallback npm ci in the package
+        self.assertTrue(os.path.isdir(os.path.join(pkg, "node_modules", "mine")))
 
     def test_r1_1_a_node_modules_made_during_the_fill_is_kept(self):
         pkg = _package(os.path.join(self.base, "w1"))

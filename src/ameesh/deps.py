@@ -162,77 +162,63 @@ def nm_root(cache_root: str) -> str:
     return os.path.join(cache_root, NM_DIR)
 
 
-#: how long a toolchain probe is kept (seconds): one command or one turn
-#: start asks several times, the runner lives for days and a package's pin
-#: can change at the same path
+#: how long a package's toolchain is kept (seconds): one command or one
+#: turn start asks several times, the runner lives for days and a package's
+#: pin can change at the same path
 PROBE_TTL_S = 10.0
 _probes: dict = {}
+#: in the environment given to the installer: the directory npm ci runs FROM
+#: (the package's: a version manager picks the same node and npm as for the
+#: key), installing into the temporary entry with `--prefix`; never passed on
+FILL_FROM = "AMEESH_FILL_FROM"
 
 
-def _version(command: list[str], cwd: str | None = None, path: str | None = None) -> str:
+def _probe(command: list[str], cwd: str | None = None, path: str | None = None) -> str:
     """The output of a toolchain probe run in `cwd` (where a version manager
-    such as mise or asdf picks the version), "" if it fails; kept PROBE_TTL_S."""
-    memo = (tuple(command), cwd, path)
+    such as mise or asdf picks the version), "" if it fails."""
+    env = None if path is None else dict(os.environ, PATH=path)
+    try:
+        return subprocess.run(command, capture_output=True, text=True, cwd=cwd, env=env,
+                              timeout=20).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def toolchain(pkg_dir: str | None = None, env: dict | None = None) -> dict:
+    """The node and npm the package runs with, resolved TOGETHER from its
+    directory and kept PROBE_TTL_S as one entry, so that a key and its fill
+    never mix two pins: `node` (`v26.8.1`), `bindir` (its directory, "" if
+    unknown), `npm` (the npm beside that node, else `$AMEESH_REAL_NPM` or
+    the real npm of PATH, possibly a version manager's shim: the fill runs it
+    from the package's directory too) and `npm_version`. Native modules are
+    built for that node; that npm decides the layout of the tree."""
+    env = os.environ if env is None else env
+    memo = (pkg_dir, env.get("PATH"), env.get("AMEESH_REAL_NPM"))
     hit = _probes.get(memo)
     if hit is not None and time.monotonic() - hit[0] < PROBE_TTL_S:
-        return hit[1]
-    env = None
-    if path is not None:
-        env = dict(os.environ, PATH=path)
-    try:
-        out = subprocess.run(command, capture_output=True, text=True, cwd=cwd, env=env,
-                             timeout=20).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    _probes[memo] = (time.monotonic(), out)
-    return out
+        return dict(hit[1])
+    lines = _probe(["node", "-p", "process.version + '\\n' + process.execPath"],
+                   pkg_dir).splitlines()
+    version = lines[0].strip() if lines else ""
+    execpath = lines[1].strip() if len(lines) > 1 else ""
+    bindir = os.path.dirname(execpath) if os.path.isabs(execpath) else ""
+    beside = os.path.join(bindir, "npm") if bindir else ""
+    npm = beside if beside and os.access(beside, os.X_OK) else real_npm(env)
+    path = bindir + os.pathsep + env.get("PATH", "") if bindir else None
+    tool = {"node": version, "bindir": bindir, "npm": npm,
+            "npm_version": _probe([npm, "--version"], pkg_dir, path) if npm else ""}
+    _probes[memo] = (time.monotonic(), tool)
+    return dict(tool)
 
 
 def node_version(pkg_dir: str | None = None) -> str:
-    """Version of the `node` the package runs with (`v26.8.1`), "" without
-    node: asked from the package's directory. Native modules are built for
-    it."""
-    return _version(["node", "--version"], pkg_dir)
-
-
-def node_bin(pkg_dir: str) -> str:
-    """Directory of the `node` binary the package runs with, "" if unknown.
-    The fill puts it first on PATH: run from the cache, a version manager
-    would pick the machine default, not the package's pin (#249: nexlink's
-    main checkout pins node 22 in an untracked mise.local.toml, the machine
-    default is 26)."""
-    path = _version(["node", "-p", "process.execPath"], pkg_dir)
-    return os.path.dirname(path) if os.path.isabs(path) else ""
-
-
-def _node_path(pkg_dir: str) -> str | None:
-    """PATH with the package's node first, None if its node is unknown."""
-    bindir = node_bin(pkg_dir)
-    return bindir + os.pathsep + os.environ.get("PATH", "") if bindir else None
-
-
-def package_npm(pkg_dir: str | None = None, env: dict | None = None) -> str | None:
-    """The npm binary of the package, the SAME for its key and its fill: the
-    npm beside the package's node (where a version manager's shim leads from
-    the package's directory; the shim itself, run from the cache, would
-    answer the machine default, and the turn's `$AMEESH_REAL_NPM` is that
-    shim), else `$AMEESH_REAL_NPM`, else the real npm of PATH; in `env`
-    (default: this process's environment)."""
-    env = os.environ if env is None else env
-    bindir = node_bin(pkg_dir) if pkg_dir else ""
-    beside = os.path.join(bindir, "npm") if bindir else ""
-    if beside and os.access(beside, os.X_OK):
-        return beside
-    return real_npm(env)
+    """Version of the `node` the package runs with (`toolchain`)."""
+    return toolchain(pkg_dir)["node"]
 
 
 def npm_version(pkg_dir: str | None = None) -> str:
-    """Version of the package's npm (`11.19.0`, `package_npm`), "" without
-    npm: it decides the layout of the tree."""
-    npm = package_npm(pkg_dir)
-    if not npm:
-        return ""
-    return _version([npm, "--version"], pkg_dir, _node_path(pkg_dir) if pkg_dir else None)
+    """Version of the npm the package runs with (`toolchain`)."""
+    return toolchain(pkg_dir)["npm_version"]
 
 
 def _lifecycle(pkg_dir: str) -> dict:
@@ -306,7 +292,7 @@ def _safe_name(name: str) -> str:
 
 
 def cache_key(pkg_dir: str, *, node: str | None = None, npm: str | None = None,
-              label: str | None = None) -> str:
+              label: str | None = None, tool: dict | None = None) -> str:
     """sha256 of what decides the content of `node_modules`: the key files
     (`key_files`), the lifecycle scripts, the package's path in its
     repository (`package_label`), the install mode (INSTALL_ARGS), the node
@@ -318,8 +304,10 @@ def cache_key(pkg_dir: str, *, node: str | None = None, npm: str | None = None,
         digest.update(label.encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
 
     feed("version", KEY_VERSION.encode())
-    feed("node", (node_version(pkg_dir) if node is None else node).encode())
-    feed("npm", (npm_version(pkg_dir) if npm is None else npm).encode())
+    if node is None or npm is None:
+        tool = tool or toolchain(pkg_dir)
+    feed("node", (tool["node"] if node is None else node).encode())
+    feed("npm", (tool["npm_version"] if npm is None else npm).encode())
     feed("platform", ("%s/%s" % (platform.SYSTEM, platform.machine())).encode())
     feed("label", (package_label(pkg_dir) if label is None else label).encode())
     feed("mode", " ".join(INSTALL_ARGS).encode())
@@ -518,13 +506,18 @@ def npm_ci(directory: str, env: dict | None = None, *, lock_fd: int | None = Non
     (INSTALL_ARGS), gently (nice), cache first. `lock_fd`, the fill lock, is
     inherited by npm and its install scripts: the lock outlives this process
     until the last of them exits."""
+    origin = (env or {}).get(FILL_FROM)
     env = fill_env(env)
     command = [real_npm(env) or "npm", *INSTALL_ARGS, *FILL_OPTIONS]
+    cwd = directory
+    if origin and os.path.isdir(origin):
+        # from the package's directory, into `directory`
+        cwd, command = origin, command + ["--prefix", directory]
     nice = shutil.which("nice")
     if nice:
         command = [nice, "-n", "10"] + command
     try:
-        done = subprocess.run(command, cwd=directory, env=env, capture_output=True,
+        done = subprocess.run(command, cwd=cwd, env=env, capture_output=True,
                               text=True, pass_fds=(lock_fd,) if lock_fd is not None else ())
     except OSError as exc:
         raise FillError("npm ci could not start: %s" % exc)
@@ -534,9 +527,10 @@ def npm_ci(directory: str, env: dict | None = None, *, lock_fd: int | None = Non
 
 
 def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | None = None,
-         wait: float = FILL_WAIT_S) -> dict:
+         wait: float = FILL_WAIT_S, tool: dict | None = None) -> dict:
     """Fill the entry `key` from `pkg_dir` if it is not complete yet; returns
-    its marker. Raises FillError (lock not obtained, install failed)."""
+    its marker. `tool`: the toolchain the key was made with (`toolchain`).
+    Raises FillError (lock not obtained, install failed)."""
     os.makedirs(root, mode=0o755, exist_ok=True)
     entry = entry_of(root, key)
     marker = read_marker(entry)
@@ -566,14 +560,15 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
             dest = os.path.join(stage, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy2(os.path.join(pkg_dir, rel), dest)
-        # the package's node first on PATH and the npm its key was made with
+        # the toolchain of the key: its node first on PATH, its npm, run from
+        # the package's directory (a version manager's shim picks the same)
         env = dict(os.environ if env is None else env)
-        bindir = node_bin(pkg_dir)
-        if bindir:
-            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
-        npm = package_npm(pkg_dir, env)
-        if npm:
-            env["AMEESH_REAL_NPM"] = npm
+        tool = tool or toolchain(pkg_dir, env)
+        if tool["bindir"]:
+            env["PATH"] = tool["bindir"] + os.pathsep + env.get("PATH", "")
+        if tool["npm"]:
+            env["AMEESH_REAL_NPM"] = tool["npm"]
+        env[FILL_FROM] = os.path.abspath(pkg_dir)
         started = time.time()
         try:
             installer(stage, env, lock_fd=lock.fileno())
@@ -591,8 +586,8 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
                     os.rmdir(current)
             files, size = _seal(modules)
             marker = {"schema": SCHEMA, "key": key, "package": name, "label": name,
-                      "source": os.path.abspath(pkg_dir), "node": node_version(pkg_dir),
-                      "npm": npm_version(pkg_dir), "mode": " ".join(INSTALL_ARGS),
+                      "source": os.path.abspath(pkg_dir), "node": tool["node"],
+                      "npm": tool["npm_version"], "mode": " ".join(INSTALL_ARGS),
                       "created": time.time(),
                       "install_s": round(time.time() - started, 1),
                       "files": files, "bytes": size}
@@ -708,11 +703,13 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
         return dict(result, status="no-lockfile")
     root = nm_root(cache_root)
     label = package_label(pkg_dir)
-    key = cache_key(pkg_dir, label=label)
+    tool = toolchain(pkg_dir, env)        # once: the key and the fill agree
+    key = cache_key(pkg_dir, label=label, tool=tool)
     target = entry_modules(root, key, label)
     link = os.path.join(pkg_dir, NODE_MODULES)
     result.update(key=key, target=target)
-    if os.path.lexists(link) and not os.path.islink(link):
+    had_real = os.path.lexists(link) and not os.path.islink(link)
+    if had_real:
         if not replace:
             return dict(result, status="local-kept")
     elif os.path.islink(link) and os.readlink(link) == target and \
@@ -724,9 +721,13 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
         if not fill_missing:
             return dict(result, status="not-cached")
         try:
-            fill(pkg_dir, root, key, installer=installer, env=env, wait=wait)
+            fill(pkg_dir, root, key, installer=installer, env=env, wait=wait, tool=tool)
             filled = True
         except FillError as exc:
+            if os.path.isdir(link) and not os.path.islink(link) and \
+                    not (replace and had_real):
+                # created during the failed fill (a local npm ci): never redone
+                return dict(result, status="local-kept", reason=str(exc))
             if os.path.islink(link):
                 os.unlink(link)
             try:
