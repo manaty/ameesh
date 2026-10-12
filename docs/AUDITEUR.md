@@ -85,7 +85,11 @@ Le cœur de l'auditeur reste générique. À chaque passage court, lire aussi
 projet, le lot et la référence de la déclaration concernée. Suivre la règle
 et l'action du module ; ne jamais exécuter un artefact pour compléter un audit.
 Le circuit `ameesh notify` transmet le constat au canal configuré du
-propriétaire, aux orchestrateurs du projet et à l'auditeur. Une décision
+propriétaire, aux orchestrateurs du projet et aux auditeurs déclarés par rôle
+dans le canon, affectés à ce projet ou sans projet (auditeurs globaux).
+Le nom `auditeur` seul ne donne pas accès aux constats des modules ; aucun
+repli vers les agents d'un autre projet. Sans destinataire agent, le canal
+propriétaire reste le circuit de signalement. Une décision
 nécessaire ensuite passe par `ameesh decide`, jamais par courrier libre au
 propriétaire. Au passage suivant, vérifier que le constat a disparu après
 la correction, ou expliquer la preuve encore manquante.

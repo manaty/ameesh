@@ -29,12 +29,14 @@ AUDITOR_ROLES = ("auditeur", "auditor")
 AUDITOR_NAME = "auditeur"
 
 
-def auditors(listing: list, canons=None) -> list:
+def auditors(listing: list, canons=None, *, explicit_only=False) -> list:
     """Les auditeurs du registre : l'agent `auditeur`, et ceux dont la fiche
-    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`)."""
+    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`).
+    `explicit_only` exige ce rôle, sans autorisation implicite par le nom."""
     names = {row["name"] for row in listing}
     found = sous_utilisation.role_orchestrators(canons or [], AUDITOR_ROLES)
-    found.add(AUDITOR_NAME)
+    if not explicit_only:
+        found.add(AUDITOR_NAME)
     return sorted(n for n in found if n in names)
 
 
@@ -137,8 +139,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     orchestras = list(alert.get("orchestrators") or ())
     if kind == "module_deviation":
         text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
-        out = {o: text for o in orchestras if o in by_name}
-        audit_text = text
+        project = alert.get("project")
+        if not project:
+            return {}
+        out = {o: text for o in orchestras
+               if o in by_name and by_name[o].get("chantier") == project}
+        for name in auditor_names or ():
+            if name in by_name and by_name[name].get("chantier") in (None, "", project):
+                out.setdefault(name, text)
+        return out
     elif kind == "idle_capacity":
         out = sous_utilisation.orchestrator_briefs(alert, listing, lot_titles)
         audit_text = _for_auditor(alert)

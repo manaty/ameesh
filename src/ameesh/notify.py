@@ -1224,9 +1224,10 @@ class Notifier:
             from . import canon as canon_mod
             try:
                 canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
-            except Exception:  # noqa: BLE001 - sans canon : l'agent `auditeur` seul
+            except Exception:  # noqa: BLE001 - aucun auditeur explicite sans canon
                 canons = []
             auditors = alert_briefs.auditors(listing, canons)
+            module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
@@ -1238,7 +1239,9 @@ class Notifier:
                     item = storage.of(db).work.get(int(lot))
                     if item:
                         titles[int(lot)] = item.get("title") or ""
-                briefs = alert_briefs.briefs(alert, listing, titles, auditors)
+                briefs = alert_briefs.briefs(
+                    alert, listing, titles,
+                    module_auditors if kind == "module_deviation" else auditors)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 continue

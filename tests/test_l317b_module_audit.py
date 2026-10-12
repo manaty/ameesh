@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """IT audit evidence and the generic human/agent reporting circuit."""
 from pathlib import Path
+import dataclasses
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -17,6 +19,11 @@ def missing(**changes):
     return dict(id=42, title="Release", type="release", state="qa", assignee="dev",
                 declaration_id=17, declaration_ts=100., created_ts=90., subject="a" * 64,
                 proved=False, **changes)
+
+
+def auditor_canon(*names):
+    return SimpleNamespace(agents=[SimpleNamespace(
+        title=name, fiche=SimpleNamespace(data={"roles": ["auditor"]})) for name in names])
 
 
 class AuditReportingTest(unittest.TestCase):
@@ -61,11 +68,27 @@ class AuditReportingTest(unittest.TestCase):
         self.assertEqual(set(briefs), {"orch", "auditeur"})
         self.assertIn("execution proof", briefs["orch"])
 
-    def test_unknown_project_orchestrator_falls_back_to_known_orchestrators(self):
+    def test_missing_project_orchestrator_never_falls_back(self):
+        listing = [{"name": "orch", "chantier": "other"}, {"name": "global-orch"}]
         with mock.patch.object(modules, "audit", return_value=[self.finding()]), \
-                mock.patch("ameesh.sous_utilisation.orchestrators", return_value=["orch"]):
-            alerts = exploitation._module_deviations(None, mock.Mock(), [{"name": "orch"}])
-        self.assertEqual(alerts[0]["orchestrators"], ["orch"])
+                mock.patch("ameesh.sous_utilisation.orchestrators", return_value=["orch", "global-orch"]):
+            alerts = exploitation._module_deviations(None, mock.Mock(), listing)
+        self.assertEqual(alerts[0]["orchestrators"], [])
+        self.assertEqual(alert_briefs.briefs(alerts[0], listing), {})
+
+    def test_briefs_recheck_scope_and_only_explicit_auditors_have_access(self):
+        listing = [{"name": "orch", "chantier": "other"}, {"name": "auditeur"},
+                   {"name": "local-audit", "chantier": "acme"},
+                   {"name": "other-audit", "chantier": "other"}, {"name": "global-audit"}]
+        names = alert_briefs.auditors(
+            listing, [auditor_canon("local-audit", "other-audit", "global-audit")],
+            explicit_only=True)
+        self.assertNotIn("auditeur", names)
+        alert = dict(self.finding(), orchestrators=["orch", "missing"])
+        self.assertEqual(set(alert_briefs.briefs(alert, listing, auditor_names=names)),
+                         {"local-audit", "global-audit"})
+        self.assertEqual(alert_briefs.briefs(dict(alert, project=None), listing,
+                                           auditor_names=names), {})
 
     def test_new_declaration_and_other_rule_are_new_episodes_but_assignment_is_not(self):
         alert = self.finding()
@@ -144,10 +167,13 @@ class AuditEvidenceTest(PgTestCase):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
         sender = notify.DrySender()
         ncfg = notify.parse_config({"default_human": "human:owner", "default": ["desktop"]})
-        notifier = notify.Notifier(self.cfg, ncfg, sender=sender, log=lambda text: None, clock=lambda: 200.)
+        self.db.execute("UPDATE agent_registry SET chantier = 'acme' WHERE name = 'orch'")
+        cfg = dataclasses.replace(self.cfg, canon="test-canon")
+        notifier = notify.Notifier(cfg, ncfg, sender=sender, log=lambda text: None, clock=lambda: 200.)
         alert = dict(self.findings()[0], orchestrators=["orch"])
-        notifier.run_pass(self.db, current=[alert])
-        notifier.run_pass(self.db, current=[alert])
+        with mock.patch("ameesh.canon.load_configured", return_value=[auditor_canon("auditeur")]):
+            notifier.run_pass(self.db, current=[alert])
+            notifier.run_pass(self.db, current=[alert])
         self.assertEqual(len(sender.sent), 1)
         self.assertIn("IT procedure deviation", sender.sent[0][1].body)
         mails = self.db.query("SELECT recipient, kind, payload FROM agent_mailbox ORDER BY id")
@@ -157,4 +183,24 @@ class AuditEvidenceTest(PgTestCase):
         notifier.run_pass(self.db, current=self.findings())
         self.assertEqual(len(sender.sent), 2)
         self.assertIn("resolved", sender.sent[-1][1].body)
+        self.assertEqual(notifier.state["briefs"], {})
+
+    def test_no_project_recipient_reports_to_owner_without_cross_project_events(self):
+        for name in ("orch-b", "audit-b", "auditeur"):
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET chantier = 'other' WHERE name != 'auditeur'")
+        listing = registry.overview(self.db)
+        with mock.patch("ameesh.sous_utilisation.orchestrators", return_value=["orch-b"]):
+            alerts = exploitation._module_deviations(self.cfg, self.db, listing)
+        sender = notify.DrySender()
+        ncfg = notify.parse_config({"default_human": "human:owner", "default": ["desktop"]})
+        notifier = notify.Notifier(dataclasses.replace(self.cfg, canon="test-canon"), ncfg,
+                                   sender=sender, log=lambda text: None, clock=lambda: 200.)
+        # Even stale or injected orchestrator candidates must be scope checked at send time.
+        alerts[0]["orchestrators"] = ["orch-b"]
+        with mock.patch("ameesh.canon.load_configured", return_value=[auditor_canon("audit-b")]):
+            notifier.run_pass(self.db, current=alerts)
+        self.assertEqual(len(sender.sent), 1)
+        self.assertIn("IT procedure deviation", sender.sent[0][1].body)
+        self.assertEqual(self.db.query("SELECT recipient, payload FROM agent_mailbox"), [])
         self.assertEqual(notifier.state["briefs"], {})

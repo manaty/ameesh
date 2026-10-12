@@ -104,10 +104,13 @@ resolves the finding on the next pass. Auditing never executes an artifact.
 
 Findings retain the lot, project, module, rule and current declaration ID.
 The existing notifier sends them to the owner's configured alert channel
-and briefs the project's orchestrators and the auditor through event mail.
+and briefs the project's orchestrators and explicitly declared auditors through event mail.
 A project matches the registry's project identity, independently of the
-assignee's team; when no project orchestrator is known, known orchestrators
-receive the report. The alert's identity includes the declaration so a
+assignee's team. Auditors require an `auditeur`/`auditor` canon role and must
+belong to the project or have no project identity (global auditor). There is
+no fallback to agents of other projects or to the implicit `auditeur` name;
+without an eligible agent, the owner's alert channel receives the finding.
+The alert's identity includes the declaration so a
 new delivery starts a new episode rather than reusing a previous notice.
 No automatic decision request is needed: the owner's alert channel is the
 authorized reporting route. A missing channel is reported by the notifier's
