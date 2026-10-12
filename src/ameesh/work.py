@@ -24,6 +24,9 @@ aux orchestrateurs ou agents de conception, `corrector`) ; l'acteur d'une
 commande `work` est l'identité liée de la session, jamais vide
 (`resolve_actor`).
 
+L233: a lot enters `waiting_human` only while an owner decision request is
+open for it (`ameesh decide ask` moves it there); `move` refuses otherwise.
+
 Le SQL est dans le stockage (`storage.of(db).work`, spec §10).
 """
 from __future__ import annotations
@@ -81,6 +84,13 @@ PRIORITIES = (1, 2, 3)
 PRIORITY_LABELS = {1: "haute", 2: "normale", 3: "basse"}
 #: L157b : taille déclarée du changement d'un lot (petit, moyen, gros)
 SIZES = ("s", "m", "l")
+#: L233: a lot enters `waiting_human` only while an owner decision request
+#: (`ameesh decide ask`) is open for it; a decision written in prose in mail
+#: never counts (the owner was shown lots "waiting for them" with no question)
+WAITING_WITHOUT_QUESTION = (
+    "refused: lot %(id)s enters waiting_human only through an open owner decision "
+    "request — ameesh decide ask --lot %(id)s --question \"…\" --option a=\"…\" (the "
+    "lot moves to waiting_human by itself); a decision written in a mail never counts")
 
 #: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité)
 ITEM_COLUMNS = _pg.ITEM_COLUMNS
@@ -877,16 +887,23 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "aucune",
                " — état posé par erreur : ameesh work move %s %s --correct \"raison\""
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
+    if state == "waiting_human" and not storage.of(db).decisions.pending_for_lot(str(item_id)):
+        raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
     returning_loop = current == "qa" and state == "build"
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(
-            "boucle qa → build épuisée (%d) : mettre le lot en blocked ou waiting_human"
-            % MAX_QA_LOOPS)
+            "boucle qa → build épuisée (%d) : mettre le lot en blocked, ou poser la question "
+            "au propriétaire : ameesh decide ask --lot %s --question \"…\""
+            % (MAX_QA_LOOPS, item_id))
 
+    held = state == "waiting_human"
     row = storage.of(db).work.move(
         item_id, state, current=current, loops=1 if returning_loop else 0,
-        note=note or ("%s → %s" % (current, state)), actor=actor)
+        note=note or ("%s → %s" % (current, state)), actor=actor, held=held)
     if row is None:
+        if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
+            # the request was answered or withdrawn meanwhile
+            raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
         raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
     return row
 

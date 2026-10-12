@@ -213,7 +213,7 @@ class DemandeTest(_Base):
                         "répondre : ameesh decide 1"):
             self.assertIn(attendu, texte)
         # le lot tenu par la demande n'est pas répété parmi les lots en attente
-        self.assertNotIn("lots en attente d'un humain", texte)
+        self.assertNotIn("with no question asked", texte)
         # sans identité d'agent : refus, rien n'est déposé
         proc = self.mesh("decide", "ask", "--lot", "RT-9", "--question", "x ?",
                          env=self.mesh_env())

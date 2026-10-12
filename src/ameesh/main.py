@@ -68,12 +68,14 @@
         actions sous porte (spec §7) ;
   ameesh decisions [--all] [--for human:ID] [--json]
         décisions qui attendent un humain, tous projets confondus : demandes
-        des agents (L124, la plus ancienne d'abord), actions sous porte, lots
-        en attente (C10) ;
+        des agents (L124, la plus ancienne d'abord), actions sous porte ; apart,
+        decisions written in prose in mail and lots waiting with no question
+        (L233, not requests) ;
   ameesh decide ask (--lot <id|réf> | --new-lot "titre") --question "…"
         --option a="…" [--option b="…"] [--recommend a --why "…"] [--urgent]
-        [--by 2h] [--needs-signature]
-        un agent demande une décision au propriétaire (lot en waiting_human) ;
+        [--by 2h] [--needs-signature] [--from-mail <id>]
+        un agent demande une décision au propriétaire (lot en waiting_human,
+        the only way in — L233) ;
   ameesh decide <id> <option | "texte libre"> [--key FICHIER | --signed]
         | withdraw <id> | show <id>
         réponse de l'humain (jamais d'un agent), renvoyée au demandeur par
