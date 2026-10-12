@@ -614,7 +614,8 @@ def gh_pr_body(repo: str, number: int) -> str:
     return (data or {}).get("body") or ""
 
 
-def _moved_past(repo: str, seen: str | None, tip: str, merge: dict) -> bool:
+def _moved_past(repo: str, seen: str | None, seen_ts: float | None, tip: str,
+                merge: dict) -> bool:
     """#312 r2, L118d : la branche a-t-elle livré du travail au-delà de la
     fusion partielle `merge` ? Il faut que le relevé l'ait vue en avance sur
     sa cible avec une pointe `seen` (`branch_head`) qui n'était pas dans la
@@ -622,14 +623,17 @@ def _moved_past(repo: str, seen: str | None, tip: str, merge: dict) -> bool:
     entrée dans la cible (ancêtre de la pointe fusionnée `tip`). Une branche
     seulement avancée jusqu'à la cible, sans travail nouveau, n'y suffit pas :
     son nouveau sommet est la fusion partielle elle-même ou la suite de la
-    cible."""
+    cible. #346 r1 : la pointe doit avoir été relevée APRÈS la fusion
+    (`seen_ts`, horloge de la base, au-delà de `CLOCK_SLACK_S`), et toute
+    erreur de git laisse le lot ouvert (« non ancêtre » : code 1 seulement)."""
     parents = merge.get("parents") or []
-    if len(parents) < 2 or not seen:
+    if len(parents) < 2 or not seen or seen_ts is None \
+            or float(seen_ts) <= float(merge["ts"]) + CLOCK_SLACK_S:
         return False
-    if _git(repo, "merge-base", "--is-ancestor", seen, parents[1]).returncode == 0:
-        return False                         # vue avant la fusion partielle
-    if _git(repo, "merge-base", "--is-ancestor", seen, merge["sha"]).returncode == 0:
-        return False                         # rien de plus que la cible d'alors
+    for outside in (parents[1], merge["sha"]):
+        # ni dans la branche fusionnée, ni dans la cible d'alors
+        if _git(repo, "merge-base", "--is-ancestor", seen, outside).returncode != 1:
+            return False
     return _git(repo, "merge-base", "--is-ancestor", seen, tip).returncode == 0
 
 
@@ -808,7 +812,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # implicite attend de savoir ; une fusion partielle retient toujours
             proven = bool(found and found["merged"] and row.get("branch"))
             if partial and found and found["merged"] and found["tip"] \
-                    and _moved_past(repo, row.get("branch_head"), found["tip"], partial[0]):
+                    and _moved_past(repo, row.get("branch_head"), row.get("branch_head_ts"),
+                                    found["tip"], partial[0]):
                 # #312 r2 : seule la dernière fusion de la branche compte ; la
                 # branche vue depuis en avance, puis fusionnée (avance rapide),
                 # a livré la suite (L118d : pas une simple avance jusqu'à la cible)

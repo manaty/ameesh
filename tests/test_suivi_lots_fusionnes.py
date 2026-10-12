@@ -528,8 +528,50 @@ class MergeSweepTest(_Base):
         self.commit("la-suite")
         _git(self.repo, "checkout", "-q", "develop")
         self.assertEqual(self.sync()["results"][0]["how"], "partial")   # vue en avance
+        self.seen_later(n)
         _git(self.repo, "merge", "-q", "--ff-only", branch)
         self.assertEqual(self.sync()["merged"], 1)
+
+    def seen_later(self, lot_id, seconds=3600):
+        """La pointe en avance a été relevée `seconds` après la fusion
+        partielle (le banc fait tout dans la même minute)."""
+        self.db.execute("UPDATE work_items SET branch_head_at = now() + make_interval("
+                        "secs => %s) WHERE id = %s", (seconds, lot_id))
+
+    def test_l118d_r1_pointe_vue_avant_la_fusion_partielle(self):
+        # #346 r1 P1 : S vu en avance, la branche ramenée à P et fusionnée
+        # partiellement (M), puis S fusionné dans la cible par une autre
+        # branche, et la branche du lot avancée jusqu'à la cible : ouvert
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        branch = "lot/%d-un" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("p")
+        p = _git(self.repo, "rev-parse", "HEAD")
+        self.commit("s")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.sync()                                               # S vu en avance
+        s = work.get(self.db, n)["branch_head"]
+        _git(self.repo, "branch", "-q", "-f", "autre", s)
+        _git(self.repo, "branch", "-q", "-f", branch, p)          # poussée forcée à P
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n), branch)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", "autre")
+        _git(self.repo, "branch", "-q", "-f", branch, "develop")  # avance rapide
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        # la même pointe relevée après la fusion partielle ferme le lot
+        self.seen_later(n)
+        self.assertEqual(self.sync()["merged"], 1)
+
+    def test_l118d_r1_erreur_git_garde_le_lot_ouvert(self):
+        # #346 r1 P2 : une ascendance illisible (code 128) n'est pas une preuve
+        merge = {"sha": "m" * 40, "ts": 0.0, "parents": ["a" * 40, "b" * 40]}
+        codes = iter([128, 128, 0])
+        with mock.patch.object(plan_git, "_git", side_effect=lambda *a: subprocess.
+                               CompletedProcess(a, next(codes))):
+            self.assertFalse(plan_git._moved_past(self.repo, "s" * 40, 10_000.0, "s" * 40,
+                                                  merge))
 
     def test_l118d_avance_jusqu_a_la_cible_sans_travail_nouveau(self):
         # #312 r3 : après une fusion partielle, la branche est avancée jusqu'à

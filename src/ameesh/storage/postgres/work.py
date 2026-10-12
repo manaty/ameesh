@@ -21,6 +21,7 @@ ITEM_COLUMNS = """
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head, migration,
+    extract(epoch from branch_head_at)::float8 as branch_head_ts,
     estimate_minutes, estimate_source, estimate_by, change_size,
     extract(epoch from estimate_at)::float8 as estimate_ts,
     extract(epoch from started_at)::float8 as started_ts,
@@ -516,10 +517,12 @@ class WorkItems(interface.WorkItems):
                 "UPDATE work_items SET"
                 "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
                 "                          THEN NULL ELSE branch_head END,"
+                "       branch_head_at = CASE WHEN branch IS DISTINCT FROM %%s"
+                "                             THEN NULL ELSE branch_head_at END,"
                 "       branch = %%s, branch_target = %%s, updated_at = now()"
                 " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
                 " RETURNING %s" % ITEM_COLUMNS,
-                (branch, branch, target, int(item_id)))
+                (branch, branch, branch, target, int(item_id)))
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
@@ -595,9 +598,10 @@ class WorkItems(interface.WorkItems):
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible
         (sans journal ni `updated_at` : un relevé n'est pas une activité du
-        lot). Conditionné à la branche lue : rien si elle a changé."""
+        lot), et quand (L118d, 0372). Conditionné à la branche lue : rien si
+        elle a changé."""
         rows = self.db.query(
-            "UPDATE work_items SET branch_head = %s"
+            "UPDATE work_items SET branch_head = %s, branch_head_at = now()"
             " WHERE id = %s AND branch = %s AND branch_head IS DISTINCT FROM %s"
             " RETURNING id", (head, int(item_id), branch, head))
         return bool(rows)
