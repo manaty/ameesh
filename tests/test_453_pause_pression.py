@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#453 — host pressure relieves the host: the tool processes of a paused
-agent are frozen (SIGSTOP, SIGCONT on resume), and a heavy command has a
-duration cap. Real process groups; no database for the heavy cap."""
+"""#453 — a heavy command has a duration cap, and a test suite a turn
+launches outside `ameesh heavy` gets the same cap from the runner. Real
+process groups; no database."""
 from __future__ import annotations
 
 import os
@@ -111,226 +111,183 @@ def _wait(predicate, timeout=10.0) -> bool:
     return predicate()
 
 
-#: a fake harness: a session leader with a shell running a tool (which starts
-#: a command in a process group of its own, like `ameesh heavy`), and a
-#: non-shell child (an MCP server); writes the pids it started
+def _gone(pid: int) -> bool:
+    return _state(pid) in (None, "Z")
+
+
+class SuiteRecognitionTest(unittest.TestCase):
+    def test_suites_on_the_executable_and_its_arguments(self):
+        from ameesh.suite_cap import argv_of, is_heavy, is_suite
+        for argv in (["node", "/x/node_modules/.bin/jest", "--runInBand"],
+                     ["node", "--max-old-space-size=4096", "/x/node_modules/jest/bin/jest.js"],
+                     ["npx", "vitest", "run"], ["python3", "-m", "pytest", "tests"],
+                     ["python", "-m", "unittest", "tests.test_x"], ["/usr/bin/pytest", "-x"],
+                     ["npm", "test"], ["npm", "run", "test"], ["pnpm", "test", "--", "-w", "2"],
+                     ["yarn", "test:e2e"], ["node", "/usr/bin/npm", "test"],
+                     ["pnpm", "exec", "vitest"], ["go", "test", "./..."], ["cargo", "test"],
+                     ["/bin/sh", "/w/node_modules/.bin/jest"], argv_of(["npm test"])):
+            with self.subTest(argv=argv):
+                self.assertTrue(is_suite(argv))
+        for argv in (["rg", "pytest", "README.md"], ["python", "analysis.py", "--label", "jest"],
+                     ["node", "server.js"], ["npm", "run", "build"], ["vim", "jest.config.js"],
+                     ["python", "-m", "ameesh", "list"], ["git", "log", "--grep", "test"],
+                     ["python3", "-c", "import pytest"], ["bash", "-c", "npm test"],
+                     ["grep", "-r", "jest", "."], argv_of(["npm run build"])):
+            with self.subTest(argv=argv):
+                self.assertFalse(is_suite(argv))
+        for argv in (["ameesh", "heavy", "--", "npm", "test"],
+                     ["/home/u/.local/bin/ameesh", "heavy", "--nice", "0", "--", "jest"],
+                     ["python3", "-m", "ameesh", "heavy", "--", "pytest"],
+                     ["/venv/bin/python3", "/home/u/.local/bin/ameesh", "heavy", "--", "jest"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(is_heavy(argv))
+        for argv in (["ameesh", "list"], ["rg", "ameesh heavy"], ["python", "heavy.py"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(is_heavy(argv))
+
+
+#: a "jest" suite: it starts a child that ignores SIGTERM (it outlives the
+#: suite, reparented, unless SIGKILLed through its handle)
+JEST = """#!/bin/sh
+(trap '' TERM; exec sleep 120) &
+echo $! > "$0.child.$$"
+wait
+"""
+#: `ameesh heavy` stand-in: runs its command (after `heavy --`)
+AMEESH = """#!/bin/sh
+shift 2
+"$@" &
+wait
+"""
+#: a fake harness: a suite leading its own group, a suite in the harness's
+#: group, a suite under `ameesh heavy`, and a script that only mentions jest
 HARNESS = r"""
-import os, subprocess, sys, time
-out = sys.argv[1]
-mcp = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-time.sleep(float(sys.argv[2]))        # the harness's start-up, then the tool
-tool = subprocess.Popen(["bash", "-c", "exec python3 -c 'import subprocess, sys, time; "
-                         "c = subprocess.Popen([sys.executable, \"-c\", \"import time; "
-                         "time.sleep(120)\"], process_group=0); "
-                         "open(sys.argv[1], \"w\").write(str(c.pid)); time.sleep(120)' %s.heavy"
-                         % out])
-open(out, "w").write("%d %d" % (tool.pid, mcp.pid))
+import subprocess, sys, time
+d = sys.argv[1]
+propre = subprocess.Popen([d + "/jest"], process_group=0)
+dedans = subprocess.Popen([d + "/jest"])
+lourd = subprocess.Popen([d + "/ameesh", "heavy", "--", d + "/jest"])
+autre = subprocess.Popen([sys.executable, d + "/analysis.py", "--label", "jest"])
+open(d + "/pids", "w").write("%d %d %d %d" % (propre.pid, dedans.pid, lourd.pid, autre.pid))
 time.sleep(120)
 """
 
 
 @unittest.skipUnless(os.path.isdir("/proc"), "Linux /proc")
-class FreezeTest(unittest.TestCase):
+class SuiteCapTest(unittest.TestCase):
     def setUp(self):
-        from ameesh import pressure_freeze
-        self.mod = pressure_freeze
-        self.dir = tempfile.mkdtemp(prefix="ameesh-453-gel-")
-        out = os.path.join(self.dir, "pids")
-        patch = mock.patch.object(pressure_freeze, "HARNESS_STARTUP_S", 0.5)
-        patch.start()
-        self.addCleanup(patch.stop)
-        self.harness = subprocess.Popen([sys.executable, "-c", HARNESS, out, "1.0"],
+        from ameesh import suite_cap
+        self.mod = suite_cap
+        self.dir = d = tempfile.mkdtemp(prefix="ameesh-453-cap-")
+        for name, text in (("jest", JEST), ("ameesh", AMEESH),
+                           ("analysis.py", "import time\ntime.sleep(120)\n")):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(text)
+            os.chmod(os.path.join(d, name), 0o755)
+        self.harness = subprocess.Popen([sys.executable, "-c", HARNESS, d],
                                         start_new_session=True)
         self.addCleanup(self._kill_all)
-        self.assertTrue(_wait(lambda: os.path.exists(out + ".heavy")
-                              and os.path.exists(out) and open(out).read()))
-        with open(out) as fh:
-            self.tool, self.mcp = map(int, fh.read().split())
-        self.assertTrue(_wait(lambda: open(out + ".heavy").read().strip()))
-        with open(out + ".heavy") as fh:
-            self.heavy = int(fh.read())
-        self.verdict = {"blocked": True, "critical": True, "breaches": []}
-        self.notes: list = []
-        self.worker = SimpleNamespace(
-            proc=SimpleNamespace(pid=self.harness.pid), agent={"priority": 0},
-            _held_by_pressure=lambda v: bool(v.get("blocked")),
-            _fil_note=lambda text, meta=None: self.notes.append((text, meta)))
-        self.runner = SimpleNamespace(
-            workers={"a1": self.worker}, host="h1", db=None, cfg=SimpleNamespace(),
-            background=SimpleNamespace(entries=[]),
-            host_pressure=lambda: dict(self.verdict))
-        self.logs: list = []
-        self.freezer = self.mod.Freezer(self.runner, log=self.logs.append)
+        self.assertTrue(_wait(lambda: os.path.exists(d + "/pids")
+                              and os.path.getsize(d + "/pids") > 0))
+        with open(d + "/pids") as fh:
+            self.propre, self.dedans, self.lourd, self.autre = map(int, fh.read().split())
+        self.assertTrue(_wait(lambda: len(self._children()) == 3))
+        self.sent, self.notes = [], []
+        worker = SimpleNamespace(proc=SimpleNamespace(pid=self.harness.pid), agent={},
+                                 _fil_note=lambda text, meta=None: self.notes.append(text))
+        self.runner = SimpleNamespace(workers={"a1": worker}, host="h1", db=None,
+                                      cfg=SimpleNamespace(),
+                                      background=SimpleNamespace(entries=[]))
+        self.cap = suite_cap.SuiteCap(self.runner, log=lambda *_: None)
+
+    def _children(self) -> dict[int, int]:
+        """{pid of the jest process: pid of its TERM-ignoring child}"""
+        out = {}
+        for name in os.listdir(self.dir):
+            if ".child." in name:
+                with open(os.path.join(self.dir, name)) as fh:
+                    text = fh.read().strip()
+                if text:
+                    out[int(name.rsplit(".", 1)[1])] = int(text)
+        return out
 
     def _kill_all(self):
         import signal
-        for pid in (getattr(self, "heavy", None), getattr(self, "tool", None),
-                    getattr(self, "mcp", None)):
-            if pid:
-                for sig in (signal.SIGCONT, signal.SIGKILL):
-                    try:
-                        os.kill(pid, sig)
-                    except OSError:
-                        pass
-        self.harness.kill()
+        for pid in list(self._children().values()):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.killpg(self.harness.pid, signal.SIGKILL)
+        except OSError:
+            pass
         self.harness.wait()
 
-    def test_turn_tools_spare_the_harness_and_its_mcp_server(self):
-        from ameesh import platform
-        tools = self.mod.turn_tools(platform.process_table(), self.harness.pid)
-        self.assertIn(self.tool, tools)
-        self.assertIn(self.heavy, tools, "its own process group, still a tool of the turn")
-        self.assertNotIn(self.harness.pid, tools)
-        self.assertNotIn(self.mcp, tools)
+    def _tick(self, *nows):
+        with mock.patch.dict(os.environ, {"AMEESH_HEAVY_MAX_S": "1"}), \
+                mock.patch("ameesh.mail.send",
+                           side_effect=lambda *a, **k: self.sent.append(a)):
+            return [self.cap.tick(now=n) for n in nows]
 
-    def test_freeze_then_resume_when_the_pressure_goes_down(self):
-        with mock.patch.dict(os.environ, {"AMEESH_PRESSURE_FREEZE_MAX_S": ""}):
-            self.freezer.tick()
-            self.assertTrue(_wait(lambda: _state(self.tool) == "T"
-                                  and _state(self.heavy) == "T"))
-            self.assertNotEqual(_state(self.harness.pid), "T")
-            self.assertNotEqual(_state(self.mcp), "T")
-            self.assertIn("frozen (SIGSTOP)", self.notes[-1][0])
-            self.verdict = {"blocked": True, "critical": False, "breaches": []}
-            self.freezer.tick()
-            self.assertTrue(_wait(lambda: _state(self.tool) != "T"
-                                  and _state(self.heavy) != "T"))
-            self.assertIn("resumed (SIGCONT)", self.notes[-1][0])
-            self.assertEqual(self.freezer.frozen, {})
-
-    def test_not_frozen_when_the_agent_is_not_paused(self):
-        self.worker.agent = {"priority": 1}       # not paused: it only waits
-        self.freezer.tick()
+    def test_a_suite_outside_heavy_and_all_its_processes_are_stopped_past_the_cap(self):
+        time.sleep(1.2)
+        debut = time.time()
+        stopped = self._tick(debut)[0]
+        self.assertEqual(sorted(stopped), sorted([self.propre, self.dedans]))
+        self.assertEqual(self.cap.capped[self.propre].pgid, self.propre,
+                         "a suite leading its own group: signalled on its group too")
+        self.assertIsNone(self.cap.capped[self.dedans].pgid,
+                          "the harness's group is never signalled")
+        self.assertTrue(_wait(lambda: _gone(self.propre) and _gone(self.dedans)))
+        enfants = self._children()
+        survivants = [enfants[self.propre], enfants[self.dedans]]
         time.sleep(0.3)
-        self.assertNotEqual(_state(self.tool), "T")
-        self.worker.agent = {"priority": 0}
-        self.worker._held_by_pressure = lambda v: False    # orchestrator, auditor
-        self.freezer.tick()
-        time.sleep(0.3)
-        self.assertNotEqual(_state(self.tool), "T")
+        self.assertFalse(any(_gone(p) for p in survivants),
+                         "they ignore SIGTERM, reparented once their suite is gone")
+        self._tick(debut + self.mod.TERM_GRACE_S)
+        self.assertTrue(_wait(lambda: all(_gone(p) for p in survivants)))
+        self.assertEqual(self.cap.capped, {})
+        # never under ameesh heavy (its own cap), never a script that names jest
+        lourd = [p for j, p in enfants.items() if j not in (self.propre, self.dedans)]
+        self.assertTrue(lourd and not _gone(lourd[0]))
+        self.assertFalse(_gone(self.lourd))
+        self.assertFalse(_gone(self.autre))
+        self.assertFalse(_gone(self.harness.pid))
+        self.assertEqual(self.sent[0][1:3], ("ameesh", "a1"))
+        self.assertIn("Test suite stopped after", self.sent[0][3])
+        self.assertIn("ameesh heavy", self.notes[-1])
 
-    def test_frozen_too_long_the_tools_are_stopped_and_the_agent_told(self):
-        sent = []
-        with mock.patch.dict(os.environ, {"AMEESH_PRESSURE_FREEZE_MAX_S": "60"}), \
-                mock.patch("ameesh.mail.send", side_effect=lambda *a, **k: sent.append(a)):
-            debut = time.time()
-            self.freezer.tick(now=debut)
-            self.assertTrue(_wait(lambda: _state(self.tool) == "T"))
-            self.freezer.tick(now=debut + 61)
-            self.freezer.tick(now=debut + 61 + self.mod.TERM_GRACE_S)
-            self.assertTrue(_wait(lambda: _state(self.heavy) in (None, "Z")))
-            self.assertTrue(_wait(lambda: _state(self.tool) in (None, "Z")))
-        self.assertEqual(sent[0][1:3], ("ameesh", "a1"))
-        self.assertIn("stopped (SIGTERM, then SIGKILL)", sent[0][3])
-        self.assertTrue(_state(self.harness.pid) not in (None, "Z", "T"))
+    def test_under_the_cap_nothing_is_stopped(self):
+        with mock.patch.dict(os.environ, {"AMEESH_HEAVY_MAX_S": "3600"}):
+            self.assertEqual(self.cap.tick(), [])
+        with mock.patch.dict(os.environ, {"AMEESH_HEAVY_MAX_S": "0"}):
+            self.cap._at = float("-inf")
+            self.assertEqual(self.cap.tick(), [])
 
-    def test_background_work_in_grace_is_frozen_too(self):
-        self.runner.workers = {"a1": SimpleNamespace(
-            proc=None, agent={"priority": 0}, _held_by_pressure=lambda v: True,
-            _fil_note=lambda text, meta=None: None)}
-        self.runner.background.entries = [SimpleNamespace(
-            state="running", pgid=self.harness.pid, lineage={self.harness.pid},
-            agent="a1", turn_id="t" * 16)]
-        self.freezer.tick()
-        self.assertTrue(_wait(lambda: _state(self.heavy) == "T"
-                              and _state(self.mcp) == "T"))
-        self.assertEqual(self.freezer.thaw_all("test"), len(self.freezer.frozen) or 4)
-        self.assertTrue(_wait(lambda: _state(self.heavy) != "T"))
-
-
-class TestCommandTest(unittest.TestCase):
-    def test_recognised_suites(self):
-        from ameesh.pressure_freeze import HEAVY_COMMAND, TEST_COMMAND
-        for line in ("node /x/node_modules/.bin/jest --runInBand", "npx vitest run",
-                     "python3 -m pytest tests", "python -m unittest tests.test_x",
-                     "npm test", "npm run test", "pnpm test -- -w 2", "yarn test:e2e",
-                     "go test ./...", "cargo test", "/usr/bin/pytest -x"):
-            with self.subTest(line=line):
-                self.assertTrue(TEST_COMMAND.search(line))
-        for line in ("node server.js", "npm run build", "vim jest.config.js",
-                     "python -m ameesh list", "git log --grep test"):
-            with self.subTest(line=line):
-                self.assertFalse(TEST_COMMAND.search(line))
-        for line in ("ameesh heavy -- npm test", "/home/u/.local/bin/ameesh heavy --nice 0 "
-                     "-- jest", "python3 -m ameesh heavy -- pytest"):
-            with self.subTest(line=line):
-                self.assertTrue(HEAVY_COMMAND.search(line))
-
-
-#: a fake harness whose tool is a "jest" suite, and one under `ameesh heavy`
-SUITES = r"""
-import subprocess, sys, time
-out = sys.argv[1]
-time.sleep(float(sys.argv[2]))
-seule = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "jest"])
-heavy = subprocess.Popen(["bash", "-c", "%s -c 'import subprocess, sys, time; "
-                          "subprocess.Popen([sys.executable, \"-c\", \"import time; "
-                          "time.sleep(120)\", \"jest\"]); time.sleep(120)' ameesh heavy --"
-                          % sys.executable])
-open(out, "w").write("%d %d" % (seule.pid, heavy.pid))
-time.sleep(120)
-"""
+    def test_the_runner_s_own_group_is_never_a_candidate(self):
+        jest = subprocess.Popen([os.path.join(self.dir, "jest")])     # our own group
+        self.addCleanup(lambda: (jest.kill(), jest.wait()))
+        time.sleep(1.2)
+        stopped = self._tick(time.time())[0]
+        self.assertNotIn(jest.pid, stopped)
+        self.assertFalse(_gone(jest.pid))
 
 
 @unittest.skipUnless(os.path.isdir("/proc"), "Linux /proc")
-class TestCapTest(unittest.TestCase):
-    def test_a_suite_outside_heavy_is_stopped_past_the_cap(self):
-        from ameesh import pressure_freeze
-        out = os.path.join(tempfile.mkdtemp(prefix="ameesh-453-cap-"), "pids")
-        harness = subprocess.Popen([sys.executable, "-c", SUITES, out, "0.6"],
-                                   start_new_session=True)
-        self.addCleanup(lambda: (os.killpg(harness.pid, 9), harness.wait()))
-        self.assertTrue(_wait(lambda: os.path.exists(out) and open(out).read()))
-        with open(out) as fh:
-            seule, sous_heavy = map(int, fh.read().split())
-        sent, notes = [], []
-        worker = SimpleNamespace(proc=SimpleNamespace(pid=harness.pid), agent={},
-                                 _held_by_pressure=lambda v: False,
-                                 _fil_note=lambda text, meta=None: notes.append(text))
-        runner = SimpleNamespace(workers={"a1": worker}, host="h1", db=None,
-                                 cfg=SimpleNamespace(), background=SimpleNamespace(entries=[]),
-                                 host_pressure=lambda: {})
-        freezer = pressure_freeze.Freezer(runner, log=lambda *_: None)
-        time.sleep(1.2)
-        with mock.patch.dict(os.environ, {"AMEESH_HEAVY_MAX_S": "1"}), \
-                mock.patch.object(pressure_freeze, "HARNESS_STARTUP_S", 0.3), \
-                mock.patch("ameesh.mail.send", side_effect=lambda *a, **k: sent.append(a)):
-            freezer.tick()
-            self.assertTrue(_wait(lambda: _state(seule) in (None, "Z")))
-        self.assertTrue(_state(sous_heavy) not in (None, "Z"), "ameesh heavy has its own cap")
-        self.assertEqual(sent[0][1:3], ("ameesh", "a1"))
-        self.assertIn("Test suite stopped after", sent[0][3])
-        self.assertIn("ameesh heavy", notes[-1])
-
-
-class SafeguardTest(unittest.TestCase):
-    def test_database_clients_are_never_frozen(self):
-        from ameesh import pressure_freeze as pf
-        self.assertTrue(pf.holds_db(1, "psql", set()))
-        self.assertEqual(pf.db_port(SimpleNamespace(dsn="postgresql://u@10.0.0.1:55432/db")),
-                         55432)
-        self.assertEqual(pf.db_port(SimpleNamespace(dsn="host=x port=6543 dbname=a")), 6543)
-        self.assertEqual(pf.db_port(SimpleNamespace(dsn="")), 5432)
-        proc = tempfile.mkdtemp(prefix="ameesh-453-proc-")
-        os.makedirs(os.path.join(proc, "net"))
-        os.makedirs(os.path.join(proc, "42", "fd"))
-        with open(os.path.join(proc, "net", "tcp"), "w") as fh:
-            fh.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
-                     "retrnsmt   uid  timeout inode\n"
-                     "   0: 0100007F:9C40 0100007F:D8B8 01 00000000:00000000 00:00000000 "
-                     "00000000  1000        0 777 1 0 20 4 30 10 -1\n")
-        os.symlink("socket:[777]", os.path.join(proc, "42", "fd", "3"))
-        inodes = pf._db_sockets(55480, proc=proc)
-        self.assertEqual(inodes, {"777"})
-        self.assertTrue(pf.holds_db(42, "node", inodes, proc=proc))
-        self.assertFalse(pf.holds_db(42, "node", pf._db_sockets(5432, proc=proc), proc=proc))
-
-    def test_the_runner_and_its_group_are_never_targets(self):
-        from ameesh import pressure_freeze as pf
-        me, group = os.getpid(), os.getpgrp()
-        table = [{"pid": 900001, "ppid": 1, "pgid": 900001, "name": "claude", "start": 0.0,
-                  "zombie": False},
-                 {"pid": me, "ppid": 900001, "pgid": group, "name": "bash", "start": 50.0,
-                  "zombie": False}]
-        self.assertEqual(pf.turn_tools(table, 900001), set())
-        self.assertEqual(pf.group_tools(table, group), set())
+class HandleTest(unittest.TestCase):
+    def test_a_handle_is_only_opened_on_the_process_seen_in_the_table(self):
+        from ameesh import platform
+        from ameesh.suite_cap import Handle
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        start = platform.start_time(proc.pid)
+        self.assertIsNone(Handle.open(proc.pid, start + 0.5), "another process (reused PID)")
+        self.assertIsNone(Handle.open(proc.pid, None))
+        h = Handle.open(proc.pid, start)
+        self.assertIsNotNone(h)
+        self.assertTrue(h.send(0))
+        proc.kill()
+        proc.wait()
+        self.assertFalse(h.send(0), "gone: the handle never reaches another process")
+        h.close()

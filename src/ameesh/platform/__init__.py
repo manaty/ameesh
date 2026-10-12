@@ -85,10 +85,9 @@ def machine() -> str:
 
 
 from .process import (alive, ancestry, become_subreaper, boot_time, children,  # noqa: E402
-                      command_line, environ, env_values, fd_path, holders, open_fd_count,
-                      process_table,
-                      reap, socket_inodes, start_time, same_start, tcp_sockets_to,
-                      ticks_to_epoch, user_paths, UserPaths)
+                      command_argv, command_line, environ, env_values, fd_path, holders,
+                      open_fd_count, process_table,
+                      reap, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402
 from .host import (CGROUP_ROOT, btrfs_allocation, btrfs_fs_info, cgroup_cpu_seconds,  # noqa: E402
                    cgroup_memory_bytes, cpu_busy_seconds, load_average, memory, mount_of, parse_pressure,
@@ -99,7 +98,7 @@ __all__ = [
     "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ",
     "env_values", "fd_path",
     "children", "holders", "open_fd_count", "process_table", "reap", "start_time", "same_start",
-    "socket_inodes", "tcp_sockets_to",
+    "command_argv",
     "ticks_to_epoch", "human_tty", "load_average", "memory", "mount_of", "power",
     "CGROUP_ROOT", "cgroup_cpu_seconds", "cgroup_memory_bytes", "cpu_busy_seconds",
     "parse_pressure", "pressure", "user_paths", "UserPaths",

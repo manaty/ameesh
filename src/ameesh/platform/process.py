@@ -385,40 +385,21 @@ def command_line(pid: int) -> str:
         return ""
 
 
-def tcp_sockets_to(port: int, proc: str | None = None) -> set[str]:
-    """#453 : inodes des sockets TCP de l'hôte connectées au port distant
-    `port` (Linux, `/proc/net/tcp{,6}`) ; vide ailleurs."""
-    proc = PROC if proc is None else proc
-    out: set[str] = set()
-    for name in ("tcp", "tcp6"):
+def command_argv(pid: int) -> list[str]:
+    """#453 : les arguments de `pid`, un par élément (vide si illisible,
+    disparu, zombie) : une commande se reconnaît à son exécutable et à ses
+    arguments, jamais à sa ligne aplatie."""
+    ps = _psutil()
+    if ps is not None:
         try:
-            with open(os.path.join(proc, "net", name), encoding="ascii") as fh:
-                next(fh, None)
-                for row in fh:
-                    fields = row.split()
-                    if len(fields) > 9 and int(fields[2].rsplit(":", 1)[1], 16) == port:
-                        out.add(fields[9])
-        except (OSError, ValueError, IndexError):
-            continue
-    return out
-
-
-def socket_inodes(pid: int, proc: str | None = None) -> set[str] | None:
-    """#453 : inodes des sockets ouvertes par `pid` ; None si illisible."""
-    fds = os.path.join(PROC if proc is None else proc, str(int(pid)), "fd")
+            return [str(a) for a in ps.Process(int(pid)).cmdline()]
+        except Exception:
+            return []
     try:
-        entries = os.listdir(fds)
+        with open(os.path.join(PROC, str(int(pid)), "cmdline"), "rb") as fh:
+            return [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
     except OSError:
-        return None
-    out: set[str] = set()
-    for fd in entries:
-        try:
-            link = os.readlink(os.path.join(fds, fd))
-        except OSError:
-            continue
-        if link.startswith("socket:[") and link.endswith("]"):
-            out.add(link[8:-1])
-    return out
+        return []
 
 
 def become_subreaper() -> bool:

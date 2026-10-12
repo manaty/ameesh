@@ -367,9 +367,6 @@ class Config:
     #: #453: duration cap of a heavy command (`ameesh heavy`), seconds or
     #: `90m`/`2h`; `AMEESH_HEAVY_MAX_S` overrides it; 0 = no cap
     heavy_max_seconds: float | str = 3600.0
-    #: #453: tool processes frozen by a critical pressure pause longer than
-    #: this (seconds) are stopped; `AMEESH_PRESSURE_FREEZE_MAX_S`; 0 = never
-    pressure_freeze_max: float = 900.0
     #: L226a: the `credential_sentinel` key of the host configuration
     #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
     credential_sentinel: dict = field(default_factory=dict)
