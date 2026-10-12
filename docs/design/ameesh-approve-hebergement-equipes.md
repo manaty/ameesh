@@ -1,115 +1,115 @@
 ---
 type: Specification
-title: "ameesh-approve : trois hébergements, une identité WebAuthn par équipe"
+title: "ameesh-approve: three hosting options, one WebAuthn identity per team"
 status: stable
 author: codex3
 date: 2026-10-05
-source: "décision produit du propriétaire (2026-10-05 06:22), voir la décision 0026 ; rédigé par codex3, intégré par mesh-design"
+source: "product decision by the owner (2026-10-05 06:22), see decision 0026; written by codex3, integrated by mesh-design"
 ---
 
-# Portée et décision rapportée
+# Scope and reported decision
 
-Une équipe choisit où tourne son service d'approbation humaine : sur son PC
-avec relais Nexlink et petit abonnement, sur une page Nexlink dédiée, ou sur
-son propre serveur. Ces choix concernent **ameesh-approve** ; le placement des
-exécuteurs et de leur base reste une configuration distincte
-([0011](decisions/0011-hebergement-configurable.md)). Le montant et les
-conditions de l'abonnement ne sont pas spécifiés ici.
+A team chooses where its human approval service runs: on its PC
+with a Nexlink relay and a small subscription, on a dedicated Nexlink page, or on
+its own server. These choices concern **ameesh-approve**; the placement of
+runners and their database remains a separate configuration
+([0011](decisions/0011-hebergement-configurable.md)). The amount and
+terms of the subscription are not specified here.
 
-Ce document précise le contrat à réaliser. Les primitives existantes sont
-vérifiées sur `private/main` 148bd01 ; le provisionnement des trois offres,
-l'allocation des domaines et la bascule automatique ne sont pas implémentés
-par cette spécification. La décision [0017](decisions/0017-approbation-via-page-nexlink.md)
-décrit le choix initial du chantier sur `ameesh.nexlink.ph`, remplacé par la
-décision rapportée à 06:30 : notre installation utilise
-`manaty.ameesh.nexlink.ph`. `ameesh.nexlink.ph` est réservé : ni RP ID ni contenu,
-comme tout apex de zone d'approbation. [0025](decisions/0025-une-session-par-lot.md)
-concerne les sessions d'agents et ne règle pas cet hébergement.
+This document specifies the contract to deliver. The existing primitives are
+verified on `private/main` 148bd01; provisioning of the three offers,
+domain allocation and automatic switchover are not implemented
+by this specification. Decision [0017](decisions/0017-approbation-via-page-nexlink.md)
+describes the project's initial choice of `ameesh.nexlink.ph`, superseded by the
+decision reported at 06:30: our installation uses
+`manaty.ameesh.nexlink.ph`. `ameesh.nexlink.ph` is reserved: no RP ID and no content,
+like any approval zone apex. [0025](decisions/0025-une-session-par-lot.md)
+concerns agent sessions and does not settle this hosting question.
 
-# Contrat par équipe
+# Per-team contract
 
-Décision Q1 rapportée à 06:38 : l'équipe est une entité ameesh autonome,
-avec identité stable propre et **lien optionnel** vers une page Nexlink.
-Une installation indépendante, notamment mode 3, ne nécessite pas de page,
-de compte ni d'abonnement Nexlink. L'identité d'équipe n'est donc pas un
-`page_id` obligatoire ; l'association de page relève du connecteur Nexlink,
-conformément à [0003](decisions/0003-ameesh-et-nexlink.md).
+Decision Q1 reported at 06:38: the team is an autonomous ameesh entity,
+with its own stable identity and an **optional link** to a Nexlink page.
+An independent installation, notably mode 3, requires no Nexlink page,
+account or subscription. The team identity is therefore not a mandatory
+`page_id`; page association belongs to the Nexlink connector,
+in accordance with [0003](decisions/0003-ameesh-et-nexlink.md).
 
-Pour démarrer avec Nexlink, rattacher l'équipe à une page est le parcours
-simple : nom par défaut `<handle>.<zone>`, approbateurs humains = admins de
-la page, abonnement de la page. Le handle choisit le nom **initial** ; un
-renommage de page ne change pas silencieusement l'hôte ni le RP ID déjà enrôlé.
-L'association authentifiée page/équipe doit être explicite et stable. Le
-traitement d'une page déjà associée à une autre équipe reste à spécifier ;
-aucune fusion de registres de confiance automatique.
+To get started with Nexlink, attaching the team to a page is the simple
+path: default name `<handle>.<zone>`, human approvers = admins of
+the page, the page's subscription. The handle chooses the **initial** name; a
+page rename does not silently change the host or the already enrolled RP ID.
+The authenticated page/team association must be explicit and stable. The
+handling of a page already associated with another team remains to be specified;
+no automatic merging of trust registries.
 
-Réciproquement, **toute nouvelle page Nexlink vient avec ameesh installé**.
-Le provisionnement à la création prépare l'équipe, le canon, le stockage
-isolé, la configuration et le runtime de ses processus métier ; en mode 2,
-ils sont provisionnés sur le serveur de page avec approve séparé des agents.
-Installation ne signifie ni enrôlement d'un humain à sa place, ni achat
-implicite d'un hébergement payant, ni publication d'approve avant sa recette.
-L'enrôlement reste la cérémonie humaine ; une page peut être installée avec
-approbation en attente, sans exécuter les actions exigeant un reçu. Le sort
-des pages existantes nécessite un lot de reprise idempotent, pas un effet
-implicite de la création d'une nouvelle page.
+Conversely, **every new Nexlink page comes with ameesh installed**.
+Provisioning at creation prepares the team, the canon, isolated
+storage, configuration and the runtime of its business processes; in mode 2,
+they are provisioned on the page server with approve separated from the agents.
+Installation means neither enrolling a human on their behalf, nor an implicit
+purchase of paid hosting, nor publishing approve before its acceptance testing.
+Enrollment remains the human ceremony; a page can be installed with
+approval pending, without executing actions that require a receipt. The fate
+of existing pages requires an idempotent migration lot, not an implicit
+effect of creating a new page.
 
-Les admins sont la source des droits humains du connecteur : leur identité
-et leurs authentificateurs sont reliés au canon, sans faire d'un agent un
-approbateur humain. Admission, retrait et changement d'admin doivent être
-propagés avec provenance vérifiable ; un retrait interdit les nouvelles
-approbations et l'exécution de reçus qui n'ont plus l'autorité requise. Les
-délais et contrôles aux étapes demande/signature/exécution sont à spécifier
-dans ce pont, avant de remplacer les contrôles du canon par une projection.
+Admins are the source of the connector's human rights: their identity
+and their authenticators are linked to the canon, without making an agent a
+human approver. Admission, removal and change of admin must be
+propagated with verifiable provenance; a removal forbids new
+approvals and the execution of receipts that no longer have the required authority. The
+delays and checks at the request/signature/execution stages are to be specified
+in this bridge, before replacing the canon's checks with a projection.
 
-Une instance sert les projets d'une équipe, ses humains autorisés et ses
-exécuteurs, éventuellement sur plusieurs PC. Plusieurs équipes sur une même
-machine conservent des instances, identités système, secrets, états et accès
-aux données séparés. Aucun routage d'équipe ne dépend d'un `team_id` fourni
-librement par un client, d'un chemin ou du seul `action_id`.
+An instance serves a team's projects, its authorized humans and its
+runners, possibly across several PCs. Several teams on the same
+machine keep separate instances, system identities, secrets, states and data
+access. No team routing depends on a `team_id` freely supplied
+by a client, on a path, or on the `action_id` alone.
 
-Le service lit lui-même les actions et le registre de confiance dans la base
-ameesh de l'équipe (`AMEESH_DSN`, `AMEESH_SCHEMA`). Cette base peut être distante.
-Il affiche son résumé, recueille approbation/refus et produit un reçu lié à
-l'action, avec échéance et nonce. Il écrit ses demandes, liens, reçus et
-propositions d'enrôlement dans son état privé ; il ne modifie pas les actions
-et ne consomme pas leur nonce. L'exécuteur récupère et vérifie le reçu avant
-de l'utiliser sous la porte des actions.
+The service itself reads the actions and the trust registry in the team's ameesh
+database (`AMEESH_DSN`, `AMEESH_SCHEMA`). This database may be remote.
+It displays its summary, collects approval/refusal and produces a receipt bound to
+the action, with expiry and nonce. It writes its requests, links, receipts and
+enrollment proposals to its private state; it does not modify actions
+and does not consume their nonce. The runner retrieves and verifies the receipt before
+using it under the actions gate.
 
-Le code actuel n'a pas de filtre d'équipe dans `DbActionSource` : **une base
-ou un schéma isolé par équipe et un accès DB limité à ce périmètre sont requis**.
-Un simple filtre de projet côté interface ne constitue pas cette isolation.
-Le canon de confiance et ses identités humaines doivent correspondre au même
-périmètre ; une fédération partagée demande un contrat d'autorisation distinct.
-Le rôle superviseur L25 n'est pas le rôle d'approve : il exclut les contenus
-nécessaires pour afficher une action. Les droits DB propres à approve restent
-à définir et à relire avant déploiement.
+The current code has no team filter in `DbActionSource`: **a database
+or schema isolated per team and DB access limited to that scope are required**.
+A mere project filter on the interface side does not constitute such isolation.
+The trust canon and its human identities must match the same
+scope; a shared federation requires a separate authorization contract.
+The L25 supervisor role is not the approve role: it excludes the content
+needed to display an action. Approve's own DB rights remain
+to be defined and reviewed before deployment.
 
-Chaque équipe reçoit un hôte canonique `H`, réservé durablement au service :
+Each team receives a canonical host `H`, durably reserved for the service:
 
-| Paramètre | Valeur requise |
+| Parameter | Required value |
 |---|---|
-| `rp_id` / `AMEESH_APPROVE_RP_ID` | `H`, sans schéma, port ni chemin |
-| `origins` / `AMEESH_APPROVE_ORIGINS` | exactement `https://H` en exploitation |
-| `public_url` | `https://H`, pour les liens humains |
-| `approve_url` / `AMEESH_APPROVE_URL` | URL de l'API de cette instance : boucle locale ou HTTPS |
-| `approve_token_file` / `AMEESH_APPROVE_TOKEN_FILE` côté client | fichier privé du jeton de demande de cette équipe |
-| `token_file`, `state_dir`, `proposals_dir` côté service | fichiers/dossiers privés, utilisateur dédié |
+| `rp_id` / `AMEESH_APPROVE_RP_ID` | `H`, without scheme, port or path |
+| `origins` / `AMEESH_APPROVE_ORIGINS` | exactly `https://H` in production |
+| `public_url` | `https://H`, for human links |
+| `approve_url` / `AMEESH_APPROVE_URL` | URL of this instance's API: loopback or HTTPS |
+| `approve_token_file` / `AMEESH_APPROVE_TOKEN_FILE` on the client side | private file holding this team's request token |
+| `token_file`, `state_dir`, `proposals_dir` on the service side | private files/directories, dedicated user |
 
-`approve_url` est l'adresse machine de `POST /requests` et `GET /receipts/<id>` ;
-`public_url` est l'adresse des pages ouvertes par les humains. Le jeton permet
-de demander et récupérer, jamais de signer ; la passkey privée reste dans
-l'authentificateur humain. Plusieurs PC d'une équipe peuvent utiliser le
-service ; le code actuel utilise un jeton de service unique, pas des jetons
-révocables individuellement par PC.
+`approve_url` is the machine address of `POST /requests` and `GET /receipts/<id>`;
+`public_url` is the address of the pages opened by humans. The token allows
+requesting and retrieving, never signing; the private passkey stays in
+the human's authenticator. Several PCs of a team can use the
+service; the current code uses a single service token, not tokens
+individually revocable per PC.
 
-La politique doit être identique dans **le service et tous les vérificateurs** :
-`actions.policy_from_env` lit RP ID/origines dans l'environnement, indépendamment
-du JSON du service. Le provisionneur configure les deux, puis contrôle leur
-concordance ; modifier seulement `approve_url` ne modifie pas la confiance.
+The policy must be identical in **the service and all verifiers**:
+`actions.policy_from_env` reads RP ID/origins from the environment, independently
+of the service's JSON. The provisioner configures both, then checks that they
+match; changing only `approve_url` does not change trust.
 
-Exemple de configuration existante pour une instance hébergée, avec `H`
-illustratif à confirmer côté Nexlink :
+Example of an existing configuration for a hosted instance, with an illustrative `H`
+to be confirmed on the Nexlink side:
 
 ```json
 {
@@ -122,182 +122,182 @@ illustratif à confirmer côté Nexlink :
 }
 ```
 
-Le service reste en boucle locale derrière un mandataire HTTPS, dans les trois
-modes. `api_via_public` vaut `false` par défaut ; le mettre à `true` dans le
-JSON autorise l'API sous l'hôte public, avec son authentification par jeton.
-Ce n'est pas une option d'environnement ou de CLI existante. L'API doit être
-joignable par les exécuteurs autorisés ; l'accès peut aussi rester privé.
+The service stays on loopback behind an HTTPS proxy, in all three
+modes. `api_via_public` defaults to `false`; setting it to `true` in the
+JSON allows the API under the public host, with its token authentication.
+This is not an existing environment or CLI option. The API must be
+reachable by authorized runners; access can also remain private.
 
-# Domaines et isolation WebAuthn
+# Domains and WebAuthn isolation
 
-RP ID propre à chaque équipe : ni `ameesh.nexlink.ph/<équipe>`, ni RP ID parent
-commun `ameesh.nexlink.ph` ou `nexlink.ph`. Les RP ID des équipes sont également
-**sans relation ancêtre/descendant**. L'hôte `H` et ses sous-domaines ne servent
-aucun contenu ou code contrôlé par une autre équipe ; la page dédiée est le
-service d'approbation, sans HTML de contenu Nexlink sur la même origine.
+An RP ID specific to each team: neither `ameesh.nexlink.ph/<team>`, nor a common parent RP ID
+`ameesh.nexlink.ph` or `nexlink.ph`. The teams' RP IDs also have
+**no ancestor/descendant relationship**. The host `H` and its subdomains serve
+no content or code controlled by another team; the dedicated page is the
+approval service, with no Nexlink content HTML on the same origin.
 
-WebAuthn lie les credentials au RP ID, pas au chemin d'URL ; son RP ID reste
-fixe pendant la vie du credential. Un suffixe parent valide peut être demandé
-depuis un sous-domaine : choisir `H` exactement évite de partager cette portée
-avec les équipes voisines. Voir la [définition W3C du RP ID](https://www.w3.org/TR/webauthn-3/#rp-id)
-et le [modèle de l'authentificateur](https://www.w3.org/TR/webauthn-3/#sctn-authenticator-data).
+WebAuthn binds credentials to the RP ID, not to the URL path; their RP ID stays
+fixed for the lifetime of the credential. A valid parent suffix can be requested
+from a subdomain: choosing exactly `H` avoids sharing that scope
+with neighboring teams. See the [W3C definition of the RP ID](https://www.w3.org/TR/webauthn-3/#rp-id)
+and the [authenticator model](https://www.w3.org/TR/webauthn-3/#sctn-authenticator-data).
 
-La séparation des RP ID ne remplace pas les contrôles d'origine, de `Host` et
-des demandes intersites. Le service vérifie déjà l'origine exacte et refuse
-`Sec-Fetch-Site: same-site` pour les POST navigateur ; aucune permission
-globale de sous-domaines ou de CORS ne doit être ajoutée. Les siblings Nexlink
-peuvent rester dans le même site navigateur : l'arbitrage sous-domaines sous
-`nexlink.ph` versus domaine d'approbation séparé reste côté Nexlink.
-Pas de cookies partagés avec `Domain=nexlink.ph` ; aucune exception de domaine
-parent ni configuration « related origins » commune aux équipes.
-Le service actuel n'utilise pas de cookies. Si une façade en introduit, ils
-doivent être préfixés `__Host-` (Secure, Path=/, sans Domain), avec contrôles
-d'origine conservés ; cela ne remplace pas l'analyse same-site/PSL de Nexlink.
+Separating RP IDs does not replace origin, `Host` and
+cross-site request checks. The service already verifies the exact origin and refuses
+`Sec-Fetch-Site: same-site` for browser POSTs; no global
+subdomain or CORS permission must be added. Nexlink siblings
+may remain in the same browser site: the trade-off between subdomains under
+`nexlink.ph` and a separate approval domain remains on the Nexlink side.
+No cookies shared with `Domain=nexlink.ph`; no parent domain
+exception nor "related origins" configuration common to teams.
+The current service uses no cookies. If a front end introduces them, they
+must be prefixed `__Host-` (Secure, Path=/, no Domain), with origin
+checks kept; this does not replace Nexlink's same-site/PSL analysis.
 
-# Trois modes, mêmes données et protocole
+# Three modes, same data and protocol
 
-| Mode | Service et exposition | Appel des exécuteurs |
+| Mode | Service and exposure | Runner calls |
 |---|---|---|
-| PC + relais Nexlink | utilisateur dédié sur le PC, boucle locale ; tunnel sortant vers le relais, HTTPS sur `H` ; abonnement Nexlink | PC hôte : `http://127.0.0.1:8765`, API publique fermée ; autres PC : accès privé ou API HTTPS explicitement ouverte et authentifiée |
-| Page Nexlink dédiée | instance isolée sur le serveur de page, boucle locale derrière son mandataire, HTTPS sur le même `H` | URL API HTTPS et jeton ; accès du service à la base/registre de l'équipe |
-| Serveur de l'équipe | équipe opératrice du service, état et HTTPS ; domaine de l'équipe choisi à l'adoption | config client URL HTTPS et fichier de jeton, sans dépendance obligatoire au relais Nexlink |
+| PC + Nexlink relay | dedicated user on the PC, loopback; outbound tunnel to the relay, HTTPS on `H`; Nexlink subscription | host PC: `http://127.0.0.1:8765`, public API closed; other PCs: private access or HTTPS API explicitly opened and authenticated |
+| Dedicated Nexlink page | isolated instance on the page server, loopback behind its proxy, HTTPS on the same `H` | HTTPS API URL and token; service access to the team's database/registry |
+| Team's server | team operates the service, state and HTTPS; team's domain chosen at adoption | client config with HTTPS URL and token file, no mandatory dependency on the Nexlink relay |
 
-En mode serveur propre, « configurer l'URL » décrit le client ameesh ; le
-serveur doit déjà disposer du service, de sa base/registre, des secrets et de
-TLS. Héberger le service ailleurs ne copie pas automatiquement la base ameesh.
+In own-server mode, "configure the URL" describes the ameesh client; the
+server must already have the service, its database/registry, secrets and
+TLS. Hosting the service elsewhere does not automatically copy the ameesh database.
 
-# Enrôlement et changement de mode
+# Enrollment and mode change
 
-Fixer `H` avant l'enrôlement. Un administrateur autorisé lance
-`ameesh-approve enroll-link --approver human:<id>` sous l'utilisateur du
-service ; l'humain ouvre le lien sur son appareil et crée sa passkey.
-L'enrôlement écrit une proposition, jamais une clé directement active en base :
-PR du canon relue, puis synchronisation du registre. La première approbation
-réelle contrôle équipe, origine, RP ID, empreinte de l'action et consommation
-unique du nonce. Le harnais d'installation prépare cette configuration ; les
-gestes d'autorité et les dépenses restent humains ([0011](decisions/0011-hebergement-configurable.md)).
+Fix `H` before enrollment. An authorized administrator runs
+`ameesh-approve enroll-link --approver human:<id>` as the service
+user; the human opens the link on their device and creates their passkey.
+Enrollment writes a proposal, never a key directly active in the database:
+reviewed canon PR, then registry synchronization. The first real
+approval checks team, origin, RP ID, action fingerprint and single
+consumption of the nonce. The installation harness prepares this configuration; acts
+of authority and spending remain human ([0011](decisions/0011-hebergement-configurable.md)).
 
-Changer **l'emplacement** tout en gardant `H`, HTTPS, RP ID, origine et registre
-permet de conserver les passkeys. Ce n'est pas un transfert de clé privée :
-les credential ID et clés publiques de l'équipe restent au canon/registre,
-les clés privées restent dans les appareils. Conserver seulement le nom d'hôte
-sans restaurer le registre ne suffit pas.
+Changing **the location** while keeping `H`, HTTPS, RP ID, origin and registry
+allows the passkeys to be kept. This is not a private key transfer:
+the team's credential IDs and public keys stay in the canon/registry,
+the private keys stay on the devices. Keeping only the host name
+without restoring the registry is not enough.
 
-Procédure de bascule à fournir par le provisionneur :
+Switchover procedure to be provided by the provisioner:
 
-1. Préparer la cible isolée, accès à la même base et au même canon, configuration
-   RP/origine identique ; vérifier le certificat de `H` avant la bascule.
-2. Suspendre les nouvelles demandes et vider les actions en cours. Laisser
-   expirer/terminer les liens d'approbation et d'enrôlement, puis arrêter l'ancien
-   écrivain. Une équipe ne possède qu'une instance active dans ce profil.
-3. Transférer l'état privé durable et les propositions non intégrées avec leurs
-   permissions ; conserver la base des nonces consommés, les actions et le
-   registre courant. Aucun retour à une sauvegarde antérieure des nonces ou des
-   liens consommés, y compris lors d'un retour arrière.
-4. Basculer routage/DNS de **`H`**, garder le contrôle du nom ; mettre à jour
-   seulement `approve_url` si le point d'entrée machine change. Distribuer un
-   nouveau jeton et révoquer l'ancien si nécessaire ; ne pas élargir RP/origines.
-5. Vérifier une approbation avec une passkey déjà enrôlée et le refus du rejeu,
-   reprendre les demandes ; retour arrière avec état courant et écrivain unique.
+1. Prepare the isolated target, with access to the same database and the same canon, identical
+   RP/origin configuration; verify the certificate of `H` before switchover.
+2. Suspend new requests and drain in-flight actions. Let
+   approval and enrollment links expire/complete, then stop the old
+   writer. A team has only one active instance in this profile.
+3. Transfer the durable private state and unintegrated proposals with their
+   permissions; keep the database of consumed nonces, the actions and the
+   current registry. No reverting to an earlier backup of consumed nonces or
+   links, including during a rollback.
+4. Switch the routing/DNS of **`H`**, keep control of the name; update
+   only `approve_url` if the machine entry point changes. Distribute a
+   new token and revoke the old one if needed; do not widen RP/origins.
+5. Verify an approval with an already enrolled passkey and the refusal of replay,
+   resume requests; rollback with current state and a single writer.
 
-Décision du propriétaire rapportée à 06:30 : **le nom Nexlink reste le même
-entre les modes 1 et 2 ; il n'est pas conservé en mode 3**. Nexlink ne route
-pas vers le serveur propre et ne maintient pas le nom pour l'équipe après
-l'abonnement. Une équipe visant le mode 3 utilise son domaine dès l'adoption.
-Le changement d'un nom Nexlink vers ce domaine change le RP ID : réenrôlement
-assumé. La recette de bascule sans réenrôlement ci-dessus ne s'applique qu'à
-un déplacement conservant effectivement le nom, notamment mode 1 ↔ mode 2.
-Le maintien d'un tombstone empêchant l'attribution à une autre équipe n'est
-pas un droit de continuer à utiliser ou à faire router le nom.
+Owner decision reported at 06:30: **the Nexlink name stays the same
+between modes 1 and 2; it is not kept in mode 3**. Nexlink does not route
+to the own server and does not maintain the name for the team after
+the subscription. A team aiming for mode 3 uses its own domain from adoption.
+Changing from a Nexlink name to that domain changes the RP ID: re-enrollment
+accepted. The switchover acceptance test without re-enrollment above only applies to
+a move that actually keeps the name, notably mode 1 ↔ mode 2.
+Maintaining a tombstone preventing assignment to another team is
+not a right to keep using the name or having it routed.
 
-Si `H` change (ex. `equipe-a.nexlink.ph` vers `approve.equipe-a.example`), **ce n'est pas
-une migration sans réenrôlement** avec le code actuel : nouvelle cérémonie sur
-le nouveau domaine, nouvelles propositions revues et politique mise à jour.
-Ne pas remplacer le RP ID parent pour recycler les anciennes passkeys. Le cas
-du chantier, s'il a déjà été enrôlé sous `ameesh.nexlink.ph`, suit cette procédure
-pour passer à `manaty.ameesh.nexlink.ph` ; ne pas réattribuer l'apex ni y servir
-du contenu. Aucun réenrôlement réel ni changement DNS n'est fait par ce document.
+If `H` changes (e.g. `equipe-a.nexlink.ph` to `approve.equipe-a.example`), **this is not
+a migration without re-enrollment** with the current code: new ceremony on
+the new domain, new reviewed proposals and updated policy.
+Do not replace the parent RP ID to recycle old passkeys. The project's
+case, if it has already been enrolled under `ameesh.nexlink.ph`, follows this procedure
+to move to `manaty.ameesh.nexlink.ph`; do not reassign the apex or serve
+content on it. No real re-enrollment or DNS change is performed by this document.
 
-# À fournir côté Nexlink
+# To be provided on the Nexlink side
 
-- Identité d'équipe indépendante avec association optionnelle de page,
-  provisionnement idempotent à la création d'une page (sur son serveur en
-  mode 2), projection authentifiée des admins et de leurs retraits vers
-  l'autorité ameesh ; aucune dépendance de ce parcours pour le mode autonome.
-- Choix de namespace après analyse same-site ; attribution exclusive de `H`
-  à une équipe, hôte conservé entre modes 1/2, domaine propre dès l'adoption
-  du mode 3 et règles de non-réattribution ; apex réservé sans RP ID ni contenu.
-- Mode PC : mapping `H` → tunnel/port/clé dédiés ; canal sortant, clé limitée
-  à cette redirection, arrêt de l'abonnement et PC hors ligne sans contournement.
-- Mode page : instance réellement isolée, secret/état/sauvegardes propres,
-  accès sécurisé à la base ameesh de l'équipe, séparation des exécutants d'agents.
-- HTTPS/certificat sur le même `H` entre modes 1/2 et domaine propre en mode 3, routage exact par hôte,
-  conservation de `Host`, contrôle des en-têtes de mandataire, aucun cache ni
-  journal des jetons/liens/corps ; exposition API authentifiée ou accès privé.
-- Contrat de provisionnement retournant hôte/origine/URL API et moyen privé de
-  remise du jeton ; abonnement et dépenses sous approbation humaine. Aucun prix
-  ni endpoint de provisionnement nouveau n'est inventé dans cette spec.
+- Independent team identity with optional page association,
+  idempotent provisioning on page creation (on its server in
+  mode 2), authenticated projection of admins and their removals to
+  the ameesh authority; no dependency on this path for autonomous mode.
+- Namespace choice after same-site analysis; exclusive assignment of `H`
+  to one team, host kept between modes 1/2, own domain from adoption
+  of mode 3 and non-reassignment rules; reserved apex with no RP ID or content.
+- PC mode: mapping `H` → dedicated tunnel/port/key; outbound channel, key limited
+  to this forwarding, end of subscription and offline PC without workaround.
+- Page mode: truly isolated instance, own secret/state/backups,
+  secure access to the team's ameesh database, separation from agent runners.
+- HTTPS/certificate on the same `H` between modes 1/2 and own domain in mode 3, exact host routing,
+  preservation of `Host`, control of proxy headers, no caching or
+  logging of tokens/links/bodies; authenticated API exposure or private access.
+- Provisioning contract returning host/origin/API URL and a private means of
+  delivering the token; subscription and spending under human approval. No price
+  or new provisioning endpoint is invented in this spec.
 
-Si Nexlink adopte les routes dynamiques de l'étude multi-équipe de Nexlink,
-le snapshot doit porter une version, une preuve de complétude et une validité
-bornée. Un HTTP200 avec liste syntaxiquement valide mais partielle doit être
-refusé ; les associations équipe/hôte ne se réaffectent pas silencieusement.
-Les retraits explicites et la rotation de clé doivent être représentables sans
-contourner les limites de variation ; une configuration conservée après panne
-ne prolonge pas indéfiniment une autorisation échue. Le protocole et ces sondes
-sont à fixer avant R1–R3. Une quarantaine de 90 jours n'est pas une garantie de
-non-réattribution d'un RP ID déjà utilisé : la réservation durable du nom et
-la fin d'abonnement n'accorde aucun maintien du routage vers le serveur propre.
+If Nexlink adopts the dynamic routes from Nexlink's multi-team study,
+the snapshot must carry a version, a proof of completeness and a bounded
+validity. An HTTP200 with a syntactically valid but partial list must be
+refused; team/host associations are not silently reassigned.
+Explicit removals and key rotation must be representable without
+bypassing the variation limits; a configuration kept after an outage
+does not indefinitely extend an expired authorization. The protocol and these probes
+are to be fixed before R1–R3. A 90-day quarantine is not a guarantee of
+non-reassignment of an already used RP ID: durable reservation of the name and
+the end of subscription grant no continued routing to the own server.
 
-# Cohérence avec les agents de page natifs
+# Consistency with native page agents
 
-L'[architecture Nexlink §3.2i](https://github.com/manaty/nexlink/blob/599863f/docs/architecture/decentralisation.md#32i-page-agents-owner-2026-10-02)
-prévoit les agents de modération, écriture, filtrage, mise en valeur et
-administration **sur la page**, avec endpoint LLM compatible OpenAI,
-permissions bornées, actions expliquées et contestables. Le pont ameesh
-reprend ces identités, règles et journaux : il ne crée pas une deuxième
-équipe d'agents exécutant les mêmes jobs ni un deuxième budget facturé.
-Les contenus et règles restent dans le périmètre de la page, aucune lecture
-transverse aux équipes ni accès aux contenus E2E.
+The [Nexlink architecture §3.2i](https://github.com/manaty/nexlink/blob/599863f/docs/architecture/decentralisation.md#32i-page-agents-owner-2026-10-02)
+provides moderation, writing, filtering, highlighting and
+administration agents **on the page**, with an OpenAI-compatible LLM endpoint,
+bounded permissions, explained and contestable actions. The ameesh bridge
+takes over these identities, rules and logs: it does not create a second
+team of agents running the same jobs nor a second billed budget.
+Content and rules stay within the page's scope, with no cross-team
+reads nor access to E2E content.
 
-Nexlink conserve identité, API de page, droits, règles métier et audit ;
-ameesh apporte exécution, sessions, baux, budget et vérification d'autorité
-(0003). Le choix act/propose/off des agents natifs et les classes d'action
-ameesh doivent être raccordés explicitement, sans élargir l'autonomie ni
-imposer arbitrairement un reçu à chaque action déjà autorisée. Un seul
-réclamant effectif par job et un identifiant corrélant job/action/tour
-doivent empêcher la double exécution. Ce pont est à construire et relire ;
-ce document ne remplace ni le worker natif actuel ni son mécanisme de claim.
+Nexlink keeps identity, page API, rights, business rules and audit;
+ameesh provides execution, sessions, leases, budget and authority verification
+(0003). The act/propose/off choice of native agents and ameesh action classes
+must be wired explicitly, without widening autonomy or
+arbitrarily requiring a receipt for every already authorized action. A single
+effective claimant per job and an identifier correlating job/action/turn
+must prevent double execution. This bridge is to be built and reviewed;
+this document replaces neither the current native worker nor its claim mechanism.
 
-# Recette et écarts à implémenter
+# Acceptance testing and gaps to implement
 
-Recette exigée avant offre publique : deux équipes A/B, plusieurs PC pour A ;
-une passkey, origine, jeton ou action de B ne vaut jamais pour A. Refuser RP ID
-parent, hôte partagé par chemin, contenu non fiable sur `H` ou sous `H`, et
-POST navigateur venant d'un sibling. Vérifier les trois modes, DB distante
-indisponible = refus, état privé isolé, migration à `H` constant sans enrôlement,
-ancien lien consommé non réutilisable et changement d'hôte nécessitant enrôlement.
-Ajouter : création de page rejouée sans doublon d'équipe/job, installation
-autonome sans page, ajout/retrait d'admin avec révocation effective, rattachement
-à la bonne page et job natif exécuté une seule fois avec budget/audit corrélés.
+Acceptance testing required before a public offer: two teams A/B, several PCs for A;
+a passkey, origin, token or action of B never counts for A. Refuse parent
+RP ID, host shared by path, untrusted content on `H` or under `H`, and
+browser POSTs coming from a sibling. Verify the three modes, remote DB
+unavailable = refusal, isolated private state, migration with constant `H` without enrollment,
+old consumed link not reusable and host change requiring enrollment.
+Add: replayed page creation without duplicate team/job, autonomous
+installation without a page, admin addition/removal with effective revocation, attachment
+to the right page and native job executed exactly once with correlated budget/audit.
 
-À réaliser : provisionnement et allocation d'équipe, contrôle du profil
-RP ID égal à `H` et origine unique (la validation actuelle accepte aussi un
-sous-domaine du RP ID), concordance de la politique des vérificateurs, droits DB
-approve dédiés, bascule/sauvegarde/arrêt du nom Nexlink. Cette spec n'ajoute aucune
-clé inconnue au JSON actuel ; le choix du mode et l'identité d'équipe seront
-des paramètres du provisionneur, dont le format reste à spécifier.
+To be done: team provisioning and allocation, profile check of
+RP ID equal to `H` and single origin (current validation also accepts a
+subdomain of the RP ID), matching of the verifiers' policy, dedicated approve DB
+rights, switchover/backup/shutdown of the Nexlink name. This spec adds no
+unknown key to the current JSON; the mode choice and the team identity will be
+provisioner parameters, whose format remains to be specified.
 
-Réalisé côté ameesh par le lot L27 (guide d'exploitation :
-[héberger ameesh-approve](../profils/heberger-ameesh-approve.md)) : profil
-strict par défaut (RP ID égal à l'hôte de l'unique origine `https://H` et de
-`public_url`, zones et hôtes réservés refusés avec leurs parents) et profil
-« compatible » explicite pour les essais ; `GET /health` et
-`ameesh approve-check` pour la concordance de la politique ; `approve_url`
-distincte de `public_url`, API publique seulement par `api_via_public` écrit
-dans le JSON ; TLS local facultatif pour une passerelle en passthrough
-(certificat de `H` déposé sur l'appareil, rechargé à chaud) ;
-`deploy/sql/role-approve.sql` ; recette A/B dans
-`tests/test_approve_equipes.py`. Restent côté Nexlink ou provisionneur :
-allocation des hôtes, ACME, tunnels, bascule outillée. Ce lot ajoute au JSON
-les clés `profile`, `reserved_zones`, `reserved_hosts`, `tls_cert`, `tls_key`.
+Done on the ameesh side by lot L27 (operations guide:
+[hosting ameesh-approve](../profils/heberger-ameesh-approve.md)): strict
+profile by default (RP ID equal to the host of the single origin `https://H` and of
+`public_url`, reserved zones and hosts refused along with their parents) and an explicit
+"compatible" profile for trials; `GET /health` and
+`ameesh approve-check` for policy matching; `approve_url`
+distinct from `public_url`, public API only via `api_via_public` written
+in the JSON; optional local TLS for a passthrough gateway
+(certificate of `H` deployed on the device, hot-reloaded);
+`deploy/sql/role-approve.sql`; A/B acceptance test in
+`tests/test_approve_equipes.py`. Remaining on the Nexlink or provisioner side:
+host allocation, ACME, tunnels, tooled switchover. This lot adds to the JSON
+the keys `profile`, `reserved_zones`, `reserved_hosts`, `tls_cert`, `tls_key`.

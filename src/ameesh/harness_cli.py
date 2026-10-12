@@ -20,7 +20,7 @@ import json
 import os
 import sys
 
-from . import harnesses
+from . import harnesses, storage
 from .harnesses import ERROR, Finding
 
 
@@ -85,6 +85,17 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
     print("commande       : %s" % (" ".join(descriptor.command) or "—"))
     if descriptor.attach:
         print("interactif     : %s" % (" ".join(descriptor.interactive) or "—"))
+        rule = descriptor.interactive_permission
+        if rule:
+            print("permission     : %s (default %s%s%s)" % (
+                " ".join(rule["flag"]), rule["default"] or "—",
+                ", env: %s" % ", ".join(rule["env"]) if rule["env"] else "",
+                ", fallback: %s" % rule["fallback"] if rule["fallback"] else ""))
+            if rule.get("choices"):
+                print("allowed modes  : %s%s" % (
+                    ", ".join(rule["choices"]),
+                    " (%s: agent setting only)" % ", ".join(rule["explicit_only"])
+                    if rule.get("explicit_only") else ""))
     else:
         print("interactif     : non déclaré (attach indisponible)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))
@@ -161,6 +172,59 @@ def cmd_check(cfg, args: argparse.Namespace) -> int:
     return 1 if descriptor is None else 0
 
 
+def _age(seconds) -> str:
+    if seconds is None:
+        return "?"
+    for unit, size in (("d", 86400), ("h", 3600), ("min", 60)):
+        if seconds >= size:
+            return "%d %s ago" % (seconds // size, unit)
+    return "%d s ago" % seconds
+
+
+def cmd_versions(cfg, args: argparse.Namespace) -> int:
+    """`ameesh harness versions` (L120): the version of each harness per
+    host, the differences between hosts and, with `--latest`, the latest
+    release. `--probe` first reads the versions of this host."""
+    from . import adapters, harness_versions
+    from .mesh_cli import _open
+
+    db = _open(cfg)
+    try:
+        if args.probe:
+            adapters.configure(cfg)
+            for item in harness_versions.probe_and_record(db, cfg.host, harnesses.known_ids()):
+                if item["error"] and item["path"] is not None:
+                    print("probe      : %s (%s) %s" % (item["harness"], item["path"],
+                                                      item["error"]), file=sys.stderr)
+        rows = storage.of(db).hosts.harness_versions(args.host)
+    finally:
+        db.close()
+    latest = ({h: harness_versions.latest(h) for h in {r["harness"] for r in rows}}
+              if args.latest else None)
+    table = harness_versions.matrix(rows, latest)
+    if args.json:
+        print(json.dumps({"schema": "ameesh-harness-versions/1", "harnesses": table},
+                         ensure_ascii=False, sort_keys=True))
+        return 0
+    if not table:
+        print("no harness version recorded yet (runners read them at start; "
+              "`ameesh harness versions --probe` reads this host now)")
+        return 0
+    for item in table:
+        notes = []
+        if item["differs"]:
+            notes.append("hosts differ")
+        if args.latest:
+            notes.append("latest %s" % (item["latest"] or "unknown"))
+        if item["behind"]:
+            notes.append("behind: %s" % ", ".join(item["behind"]))
+        print("%s%s" % (item["harness"], "  (%s)" % "; ".join(notes) if notes else ""))
+        for host, h in sorted(item["hosts"].items()):
+            print("  %-24s %-14s %s  (read %s)" % (
+                host, h["version"] or "?", h["path"] or "", _age(h["age_s"])))
+    return 0
+
+
 def add_parsers(sub) -> None:
     """Branche `harness …` sur le parseur de mesh_cli."""
     p_harness = sub.add_parser("harness", help="descripteurs de harnais (L16)")
@@ -179,3 +243,13 @@ def add_parsers(sub) -> None:
     p_check.add_argument("fichier")
     p_check.add_argument("--json", action="store_true")
     p_check.set_defaults(func=cmd_check)
+
+    p_versions = harness_sub.add_parser(
+        "versions", help="harness versions per host, differences, latest release (L120)")
+    p_versions.add_argument("--host", default=None, help="one host only")
+    p_versions.add_argument("--latest", action="store_true",
+                            help="compare with the latest release (npm registry)")
+    p_versions.add_argument("--probe", action="store_true",
+                            help="read the versions of this host first, and record them")
+    p_versions.add_argument("--json", action="store_true")
+    p_versions.set_defaults(func=cmd_versions)

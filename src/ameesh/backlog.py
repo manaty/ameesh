@@ -99,7 +99,7 @@ RESERVED_CAPABILITIES = ("decision", "production")
 HARNESS_PREFIX = "harness:"
 TAKE_WINDOW_S = 3600.0
 #: alertes qui empêchent une prise sur l'hôte de l'agent
-HOST_BLOCKING_ALERTS = ("host_pressure", "host_power_low", "host_not_ready")
+HOST_BLOCKING_ALERTS = ("host_pressure", "host_power_low", "host_not_ready", "host_disk_low")
 SENDER = "ameesh"
 
 

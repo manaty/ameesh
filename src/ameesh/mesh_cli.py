@@ -332,6 +332,17 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                           if latest.get("battery_percent") is not None else "",
                           limits.get("min_battery_percent"),
                           limits.get("stop_battery_percent")))
+            if latest.get("btrfs_unallocated_bytes") is not None \
+                    or latest.get("btrfs_metadata_headroom_bytes") is not None:
+                # #246: btrfs allocation, which `disque` (statvfs) does not show
+                print("  btrfs      non alloué %s (seuil %s%s) ; marge des métadonnées %s "
+                      "(seuil %s%s)" % (
+                          _fmt_bytes(latest.get("btrfs_unallocated_bytes")),
+                          _fmt_bytes(limits.get("min_btrfs_unallocated")),
+                          tag("min_btrfs_unallocated"),
+                          _fmt_bytes(latest.get("btrfs_metadata_headroom_bytes")),
+                          _fmt_bytes(limits.get("min_btrfs_metadata_headroom")),
+                          tag("min_btrfs_metadata_headroom")))
 
             for line in _host_measure_lines(latest, limits.get("lend")):
                 print(line)
@@ -1350,9 +1361,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
-#: `effort` et `tier` avant L26)
+#: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
+#: interactive sessions (`ameesh attach`), also local
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
-            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch")
+            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
+            "permission_mode")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1422,7 +1435,7 @@ def cmd_set(cfg: Config, args) -> int:
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
     """
-    from . import adapters
+    from . import adapters, harnesses
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
@@ -1440,7 +1453,8 @@ def cmd_set(cfg: Config, args) -> int:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
-                      "turn_grace_seconds=20m|0 mail_batch=90s|2m|0"
+                      "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
+                      "permission_mode=auto|acceptEdits|…"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1490,9 +1504,25 @@ def cmd_set(cfg: Config, args) -> int:
                     print("mail_batch invalide : %r (ex. 90s, 2m, 0 = réveil immédiat)"
                           % valeur, file=sys.stderr)
                     return 2
+            if cle == "permission_mode" and valeur:
+                # codex r3 (#182): checked against the agent harness's allowlist
+                harness = agent.get("harness") or ""
+                descriptor = harnesses.get(harness)
+                rule = descriptor.interactive_permission if descriptor else {}
+                if not rule:
+                    print("permission_mode: harness %r declares no interactive "
+                          "permission mode" % harness, file=sys.stderr)
+                    return 2
+                allowed = rule.get("choices") or ()
+                if not harnesses.PERMISSION_MODE_RE.match(valeur) \
+                        or (allowed and valeur not in allowed):
+                    print("invalid permission_mode: %r (%s)"
+                          % (valeur, " | ".join(allowed) or "e.g. auto, acceptEdits"),
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier", "mail_batch"):
+            if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
@@ -1501,7 +1531,8 @@ def cmd_set(cfg: Config, args) -> int:
                     storage.of(db).agents.clear_model(args.agent)
         if "mode" in valeurs:
             registry.set_mode(db, args.agent, valeurs["mode"] or "execute")
-        reglages = {k: v for k, v in valeurs.items() if k not in ("model", "mode")}
+        reglages = {k: v for k, v in valeurs.items()
+                    if k not in ("model", "mode", "permission_mode")}
         if reglages:
             storage.of(db).operations.set_settings(args.agent, reglages)
         agent = registry.get(db, args.agent) or {}
@@ -1537,10 +1568,14 @@ def cmd_set(cfg: Config, args) -> int:
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
                  grace_txt, regroupement_txt))
-        if "mail_batch" in valeurs and (agent.get("host") or "") not in ("", cfg.host):
-            print("attention : mail_batch est lu dans l'état local de l'hôte de l'agent "
-                  "(%s), pas dans la base : lancez ce réglage sur %s"
-                  % (agent.get("host"), agent.get("host")), file=sys.stderr)
+        for local in ("mail_batch", "permission_mode"):
+            if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
+                print("warning: %s is read from the local state of the agent's host "
+                      "(%s), not from the database: run this setting on %s"
+                      % (local, agent.get("host"), agent.get("host")), file=sys.stderr)
+        if valeurs.get("permission_mode"):
+            print("interactive permission mode (attach): %s"
+                  % valeurs["permission_mode"])
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1987,6 +2022,9 @@ def build_parser() -> argparse.ArgumentParser:
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     from . import budget as budget_mod
     budget_mod.add_parsers(sub)
+    # L131 : suites lourdes plafonnées par hôte
+    from . import heavy as heavy_mod
+    heavy_mod.add_parser(sub)
 
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")

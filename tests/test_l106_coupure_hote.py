@@ -643,6 +643,249 @@ class CoupureTest(PgTestCase):
                    if a["type"] == "orphan_resource"]
         self.assertIn(avant, [a["turn"] for a in alertes])
 
+    def test_tour_d_avant_le_redemarrage_sans_conteneur_solde(self):
+        # L147 : aucun groupe de processus ne survit au redémarrage ; sans
+        # conteneur, la ligne est soldée, plus signalée orpheline
+        turns = storage.of(self.db).turn_resources
+        seul = "tour-seul-%s" % uuid.uuid4().hex[:6]
+        deja = "tour-deja-%s" % uuid.uuid4().hex[:6]
+        turns.open_turn(seul, "a1", self.cfg.host, pgid=4242, label="l")
+        turns.open_turn(deja, "a2", self.cfg.host, pgid=4343, label="l")
+        turns.mark_orphan(deja)        # signalée par un démarrage précédent
+        self.db.execute("UPDATE turn_resources SET started_at = now() - interval '2 hours'"
+                        " WHERE turn_id IN (%s, %s)", (seul, deja))
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch.object(resources, "boot_time", return_value=time.time() - 3600), \
+                mock.patch.object(runner_mod, "log"):
+            restes = [r["turn_id"] for r in runner.report_boot_orphans()]
+        # (une ligne d'un autre test, avec conteneur, peut rester orpheline)
+        self.assertNotIn(seul, restes)
+        self.assertNotIn(deja, restes)
+        for turn in (seul, deja):
+            self.assertEqual(turns.get(turn)["status"], "done")
+        alertes = [a["turn"] for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "orphan_resource"]
+        self.assertNotIn(seul, alertes)
+        self.assertNotIn(deja, alertes)
+
+    def _avant_le_demarrage(self, *turn_ids) -> None:
+        self.db.execute("UPDATE turn_resources SET started_at = now() - interval '2 hours'"
+                        " WHERE turn_id IN (%s)" % ", ".join(["%s"] * len(turn_ids)),
+                        turn_ids)
+
+    def _revue_au_demarrage(self, runtime=None) -> list:
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch.object(resources, "boot_time", return_value=time.time() - 3600), \
+                mock.patch.object(runner, "container_runtime", return_value=runtime), \
+                mock.patch.object(runner_mod, "log"):
+            return [r["turn_id"] for r in runner.report_boot_orphans()]
+
+    def test_tour_interrompu_sans_conteneur_note_interroge_le_moteur(self):
+        # codex r1 P2 : un tour interrompu ne note aucun conteneur (relevé en
+        # fin de tour) ; celui que sa politique relance après le redémarrage
+        # se lit par l'étiquette du tour
+        turns = storage.of(self.db).turn_resources
+        relance = "tour-relance-%s" % uuid.uuid4().hex[:6]
+        mort = "tour-mort-%s" % uuid.uuid4().hex[:6]
+        for turn in (relance, mort):
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(relance, mort)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = [
+            {"id": "c-relance", "name": "pg", "image": "postgres", "created": "",
+             "labels": {"ameesh.turn": relance}},
+            {"id": "c-autre", "name": "x", "image": "x", "created": "", "labels": {}}]
+        restes = self._revue_au_demarrage(moteur)
+        self.assertIn(relance, restes)
+        self.assertNotIn(mort, restes)
+        self.assertEqual(turns.get(relance)["status"], "orphan")
+        self.assertEqual(turns.get(mort)["status"], "done")
+        moteur.list_all.assert_called_once_with()       # un seul relevé
+        alertes = [a["turn"] for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "orphan_resource"]
+        self.assertIn(relance, alertes)
+
+    def test_juste_apres_le_demarrage_le_solde_attend_les_conteneurs(self):
+        # codex r2 P2 : l'exécuteur démarre avant l'unité qui relance le
+        # conteneur étiqueté ; le moteur ne liste encore rien — la ligne n'est
+        # pas soldée, la revue est refaite et voit le conteneur arrivé
+        turns = storage.of(self.db).turn_resources
+        relance = "tour-tardif-%s" % uuid.uuid4().hex[:6]
+        mort = "tour-fini-%s" % uuid.uuid4().hex[:6]
+        for turn in (relance, mort):
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(relance, mort)
+        runner = Runner(self.cfg, self.db, once=True)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+
+        def revue(uptime):
+            with mock.patch.object(resources, "boot_time", return_value=time.time() - uptime), \
+                    mock.patch.object(runner, "container_runtime", return_value=moteur), \
+                    mock.patch.object(runner, "_user_manager_state", return_value="running"), \
+                    mock.patch.object(runner_mod, "log"):
+                return [r["turn_id"] for r in runner.report_boot_orphans()]
+
+        self.assertEqual(revue(60), [])
+        for turn in (relance, mort):
+            self.assertEqual(turns.get(turn)["status"], "running")
+        self.assertIsNotNone(runner.boot_review_at)
+        moteur.list_all.assert_not_called()     # #220 r3 : aucun relevé avant le feu vert
+        # le conteneur arrive ; la revue suivante, délai passé, le voit
+        moteur.list_all.return_value = [
+            {"id": "c-tardif", "name": "pg", "image": "postgres", "created": "",
+             "labels": {"ameesh.turn": relance}}]
+        self.assertIn(relance, revue(runner_mod.BOOT_SETTLE_S + 1))
+        self.assertEqual(turns.get(relance)["status"], "orphan")
+        self.assertEqual(turns.get(mort)["status"], "done")
+        self.assertIsNone(runner.boot_review_at)
+
+    def _revue(self, runner, uptime, moteur, etat="running"):
+        with mock.patch.object(resources, "boot_time", return_value=time.time() - uptime), \
+                mock.patch.object(runner, "container_runtime", return_value=moteur), \
+                mock.patch.object(runner, "_user_manager_state",
+                                  side_effect=etat if callable(etat) else lambda: etat), \
+                mock.patch.object(runner_mod, "log"):
+            return [r["turn_id"] for r in runner.report_boot_orphans()]
+
+    def _xmin(self, turn_id) -> str:
+        return str(self.db.query("SELECT xmin::text AS x FROM turn_resources"
+                                 " WHERE turn_id = %s", (turn_id,))[0]["x"])
+
+    def test_le_moteur_est_releve_apres_le_feu_vert(self):
+        # codex r3 P2 : à la 12e minute l'unité démarre encore ; le conteneur
+        # arrive au moment où le gestionnaire passe `running` — un relevé pris
+        # AVANT ce contrôle était vide et soldait la ligne pour de bon
+        turns = storage.of(self.db).turn_resources
+        tour = "tour-course-%s" % uuid.uuid4().hex[:6]
+        turns.open_turn(tour, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(tour)
+        runner = Runner(self.cfg, self.db, once=True)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+
+        def demarre():
+            moteur.list_all.return_value = [
+                {"id": "c-course", "name": "pg", "image": "postgres", "created": "",
+                 "labels": {"ameesh.turn": tour}}]
+            return "running"
+
+        self.assertIn(tour, self._revue(runner, 12 * 60, moteur, demarre))
+        self.assertEqual(turns.get(tour)["status"], "orphan")
+
+    def test_une_revue_n_ecrit_que_ce_qui_change(self):
+        # codex r3 P2 : les orphelines déjà signalées et toujours là ne sont
+        # pas réécrites ; une revue différée n'écrit rien du tout
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        vivantes = ["tour-vivant-%s-%d" % (jeton, i) for i in range(3)]
+        for turn in vivantes:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+            turns.mark_orphan(turn)
+        neuve = "tour-neuf-%s" % jeton
+        turns.open_turn(neuve, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(*vivantes, neuve)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = [
+            {"id": "c-%s" % t, "name": "x", "image": "x", "created": "",
+             "labels": {"ameesh.turn": t}} for t in vivantes + [neuve]]
+        avant = {t: self._xmin(t) for t in vivantes + [neuve]}
+        runner = Runner(self.cfg, self.db, once=True)
+        self.assertEqual(self._revue(runner, 60, moteur), [])          # différée
+        self.assertEqual({t: self._xmin(t) for t in avant}, avant)
+        restes = self._revue(runner, 3600, moteur)
+        self.assertTrue(set(vivantes + [neuve]) <= set(restes))
+        self.assertEqual({t: self._xmin(t) for t in vivantes}, {t: avant[t] for t in vivantes})
+        self.assertNotEqual(self._xmin(neuve), avant[neuve])            # running -> orphan
+        self.assertEqual(turns.get(neuve)["status"], "orphan")
+        apres = {t: self._xmin(t) for t in avant}
+        self._revue(runner, 3600, moteur)
+        self.assertEqual({t: self._xmin(t) for t in avant}, apres)
+
+    def test_au_plus_un_lot_de_lignes_par_passage(self):
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        mortes = ["tour-mort-%s-%d" % (jeton, i) for i in range(5)]
+        for turn in mortes:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+            turns.mark_orphan(turn)
+        self._avant_le_demarrage(*mortes)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch.object(runner_mod, "BOOT_ORPHAN_PAGE", 2), \
+                mock.patch.object(runner_mod, "BOOT_REVIEW_MAX_ROWS", 2):
+            self._revue(runner, 3600, moteur)
+            self.assertIsNotNone(runner.boot_review_at)       # la suite, sans attendre
+            self.assertLessEqual(runner.boot_review_at, time.monotonic())
+            for _ in range(20):
+                if runner.boot_review_at is None:
+                    break
+                self._revue(runner, 3600, moteur)
+        self.assertIsNone(runner.boot_review_at)
+        for turn in mortes:
+            self.assertEqual(turns.get(turn)["status"], "done", turn)
+
+    def test_le_solde_attend_le_gestionnaire_utilisateur(self):
+        runner = Runner(self.cfg, self.db, once=True)
+        for uptime, etat, pret in ((runner_mod.BOOT_SETTLE_S - 1, "running", False),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "starting", False),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "initializing", False),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "running", True),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "degraded", True),
+                                   (runner_mod.BOOT_SETTLE_S + 1, None, True),
+                                   (runner_mod.BOOT_SETTLE_MAX_S, "starting", True)):
+            with self.subTest(uptime=uptime, etat=etat), \
+                    mock.patch.object(runner, "_user_manager_state", return_value=etat):
+                self.assertEqual(runner._boot_settle_ready(uptime), pret)
+
+    def test_moteur_muet_un_tour_interrompu_reste_signale(self):
+        turns = storage.of(self.db).turn_resources
+        tour = "tour-muet-%s" % uuid.uuid4().hex[:6]
+        turns.open_turn(tour, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(tour)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = None
+        self.assertIn(tour, self._revue_au_demarrage(moteur))
+        self.assertEqual(turns.get(tour)["status"], "orphan")
+
+    def test_toutes_les_orphelines_d_avant_le_demarrage_par_page(self):
+        # codex r1 P2 : plus de 500 orphelines, ou 500 plus récentes qui
+        # survivent — chaque ligne d'avant le démarrage est revue
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        anciennes = ["tour-ancien-%s-%d" % (jeton, i) for i in range(5)]
+        recentes = ["tour-recent-%s-%d" % (jeton, i) for i in range(3)]
+        for turn in anciennes + recentes:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+            turns.mark_orphan(turn)
+        self._avant_le_demarrage(*anciennes)
+        with mock.patch.object(runner_mod, "BOOT_ORPHAN_PAGE", 2):
+            restes = self._revue_au_demarrage()
+        for turn in anciennes:
+            self.assertEqual(turns.get(turn)["status"], "done", turn)
+            self.assertNotIn(turn, restes)
+        for turn in recentes:                 # ouvertes depuis : pas touchées
+            self.assertEqual(turns.get(turn)["status"], "orphan", turn)
+        page = turns.orphans_started_before(self.cfg.host, time.time(), 0, 2)
+        self.assertEqual(len(page), 2)
+        self.assertLess(int(page[0]["id"]), int(page[1]["id"]))
+
+    def test_agent_place_sur_un_autre_hote_rendu_entre_deux_tours(self):
+        # L147 : le canon a placé l'agent ailleurs pendant que ce worker
+        # tenait son bail — il le rend, l'autre hôte peut le réclamer
+        self.register("migrant", "claude", cwd=self._cwd("migrant"))
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "migrant", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "migrant"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        self.assertEqual(worker.placed_elsewhere(), "")
+        self.db.execute("UPDATE agent_registry SET host = 'autre-hote' WHERE name = 'migrant'")
+        self.assertEqual(worker.placed_elsewhere(), "autre-hote")
+        with mock.patch.object(runner_mod, "log"):
+            worker.run()
+        self.assertIsNone(registry.get(self.db, "migrant").get("lease_owner"))
+
     def test_doctor_signale_un_agent_mene_sans_unite(self):
         self.register("sansunite", "claude", cwd=self._cwd("sansunite"))
         self.register("avecunite", "claude", cwd=self._cwd("avecunite"))
@@ -674,6 +917,7 @@ class CoupureTest(PgTestCase):
         self.assertIn("harnais    : deepseek [dsh1] → %s" % os.path.join(FAKEBIN, "dsh"),
                       proc.stdout)
         self.assertIn("interpréteur python3", proc.stdout)
+        self.assertIn("version 9.9.9", proc.stdout)  # L120
         proc = self.cli("doctor", "--harness",
                         env=self.env(AMEESH_DSH_BIN=os.path.join(self.tmp, "absent")))
         self.assertEqual(proc.returncode, 1)

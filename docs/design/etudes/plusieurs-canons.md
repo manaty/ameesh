@@ -1,111 +1,111 @@
 ---
 type: Study
-title: "Étude — plusieurs canons sur un même hôte (deux organisations)"
-description: "Pourquoi ameesh ne sait lire qu'un canon, ce qui casse si l'on en synchronise deux, et le modèle retenu : un canon identifié par sa fédération, des effets de synchronisation bornés à ce canon ; lots L42–L45."
+title: "Study — several canons on the same host (two organisations)"
+description: "Why ameesh can only read one canon, what breaks if two are synchronised, and the chosen model: a canon identified by its federation, synchronisation effects bounded to that canon; lots L42–L45."
 status: stable
 tags: [canon, federation, multi-canon, synchronisation, placement]
 generated: { by: "claude3/claude-opus-5-5", at: "2026-10-07T15:30:00+02:00" }
 sources:
-  - { resource: "decisions/0005-canon-okf.md", title: "Décision 0005 (canon OKF fédéré)" }
-  - { resource: "decisions/0008-agents-dans-le-canon.md", title: "Décision 0008 (agents dans le canon)" }
-  - { resource: "decisions/0029-persona-et-session.md", title: "Décision 0029 (persona, admissions)" }
+  - { resource: "decisions/0005-canon-okf.md", title: "Decision 0005 (federated OKF canon)" }
+  - { resource: "decisions/0008-agents-dans-le-canon.md", title: "Decision 0008 (agents in the canon)" }
+  - { resource: "decisions/0029-persona-et-session.md", title: "Decision 0029 (persona, admissions)" }
 ---
 
-# Contexte
+# Context
 
-Le propriétaire travaille avec deux canons à la fois : manaty
-(`~/canon`, fédération `manaty`) et celui d'une seconde organisation, appelée
-ici « Acme » (`~/development/acme/home`, fédération `acme-ingenierie`). Demande d'un agent de cette organisation, 2026-10-07 : un de ses agents ne
-peut pas être déclaré, et `ameesh agent spawn … --by <agent>` échoue (« pas
-d'humain responsable résolu », R14). Le propriétaire classe le besoin « très
-important ».
+The owner works with two canons at once: manaty
+(`~/canon`, federation `manaty`) and that of a second organisation, called
+here "Acme" (`~/development/acme/home`, federation `acme-ingenierie`). Request from an agent of that organisation, 2026-10-07: one of its agents
+cannot be declared, and `ameesh agent spawn … --by <agent>` fails (« pas
+d'humain responsable résolu », "no responsible human resolved", R14). The owner rates the need "very
+important".
 
-# Ce que le code suppose
+# What the code assumes
 
-Un seul canon, partout, et aucune trace de l'identité d'une fédération.
+A single canon, everywhere, and no trace of a federation's identity.
 
-* **Configuration** : `canon` et `canon_ref` sont des chaînes
-  (`config.py:141-147`). Tous les appelants passent par
-  `canon.from_config(cfg)` : exécuteur, `canon` CLI, `mesh`, `exploitation`.
-* **Identité** : l'`id` de `federation.yaml` n'est lu que pour l'affichage.
-  Une fiche est référencée `membre:chemin@commit`. Or les deux fédérations
-  nomment leur racine `home` : les références se confondent.
-* **Synchronisation** (`canon_sync.sync`) :
-  - Elle lit toutes les lignes du registre de l'hôte, quelle que soit leur
-    origine.
-  - Elle **arrête** (`stop_removed`) toute ligne dont la fiche n'est pas dans
-    le canon synchronisé et dont le membre est lu. Synchroniser A arrête donc
-    les agents de B, et réciproquement, à chaque passe de l'exécuteur.
-  - `sync_packages` retire de même les paquets de travail de l'autre canon.
-* **État** : `canon_state` a pour clé l'hôte seul, et la réclamation exige
-  `status = 'ok'` pour l'hôte. Un canon invalide bloque donc **tous** les
-  agents de l'hôte, quel que soit leur canon.
-* **Authentificateurs** : le journal des synchronisations est une séquence
-  globale qui exige la descendance des commits racines. B est refusé après A.
-  `revoke_absent` révoque les humains absents du canon synchronisé.
-* **Noms** : `agent_registry.name` est la clé primaire. Hôtes, membres,
-  équipes et paquets ont aussi des noms globaux.
-* **Le canon Acme est invalide pour ameesh.** Ses
-  `org/agent-harness/agents/*.md` portent `type: Agent`, mais ce sont des
-  définitions de sous-agents Claude Code (`name`, `tools`), sans `title`.
-  `fiche-title-missing` est une erreur bloquante globale.
+* **Configuration**: `canon` and `canon_ref` are strings
+  (`config.py:141-147`). All callers go through
+  `canon.from_config(cfg)`: runner, `canon` CLI, `mesh`, `exploitation`.
+* **Identity**: the `id` in `federation.yaml` is only read for display.
+  A card is referenced as `membre:chemin@commit`. But both federations
+  name their root `home`: the references collide.
+* **Synchronisation** (`canon_sync.sync`):
+  - It reads all rows of the host's registry, whatever their
+    origin.
+  - It **stops** (`stop_removed`) any row whose card is not in
+    the synchronised canon and whose member is read. Synchronising A therefore stops
+    B's agents, and vice versa, on every runner pass.
+  - `sync_packages` likewise removes the work packages of the other canon.
+* **State**: `canon_state` is keyed by the host alone, and claiming requires
+  `status = 'ok'` for the host. An invalid canon therefore blocks **all**
+  agents of the host, whatever their canon.
+* **Authenticators**: the synchronisation log is a global sequence
+  that requires the root commits to descend from one another. B is refused after A.
+  `revoke_absent` revokes humans absent from the synchronised canon.
+* **Names**: `agent_registry.name` is the primary key. Hosts, members,
+  teams and packages also have global names.
+* **The Acme canon is invalid for ameesh.** Its
+  `org/agent-harness/agents/*.md` carry `type: Agent`, but they are
+  Claude Code sub-agent definitions (`name`, `tools`), without `title`.
+  `fiche-title-missing` is a global blocking error.
 
-# Décision proposée
+# Proposed decision
 
-1. **Liste de canons.** La configuration de l'hôte porte
-   `canons: [{path, ref, untrusted}]` (ou `AMEESH_CANONS`). `canon` et
-   `canon_ref` restent acceptés comme liste à un élément. Le **premier** canon
-   est le canon par défaut.
-2. **Un canon est identifié par sa fédération** (`federation.yaml` `id`).
-   * Les références deviennent `<fédération>/<membre>:<chemin>@<commit>`.
-   * Le registre, les paquets de travail, l'état du canon et le journal des
-     authentificateurs portent une colonne `canon` (migration 0032).
-   * Les lignes existantes, sans canon, appartiennent au canon par défaut.
-3. **Chaque synchronisation ne touche que son canon.**
-   * Arrêts, effacements de responsable, retraits de paquets et révocations
-     ne visent que les lignes de ce canon.
-   * L'état est tenu par `(hôte, canon)`, et la réclamation regarde l'état
-     du canon de l'agent : fermeture **par canon**, plus globale.
-4. **Les noms restent globaux ; le premier canon qui déclare un nom le garde.**
-   Un nom d'agent déclaré par un second canon y devient une erreur limitée à
-   cette fiche (`canon-name-conflict`), jamais une prise de contrôle. Même
-   règle pour les identifiants de paquets.
-   Un nom **libéré** (fiche retirée de son canon, agent arrêté) peut être
-   repris par un autre canon : c'est ainsi qu'un agent change de canon sans
-   perdre sa boîte.
-5. **Humains par canon.** `human:<id>` se résout dans le canon de l'agent.
-   * Un humain qui travaille dans les deux canons y a une fiche `Member` dans
-     chacun.
-   * Ses authentificateurs sont synchronisés par canon et ne sont révoqués
-     que par le canon qui les a déclarés.
-6. **Hôte décrit par chaque canon.**
-   * Chaque canon qui place des agents sur `pc-smichea` y a sa fiche `Host`.
-   * L'admission d'un agent se juge avec la fiche de son canon.
-   * Les limites physiques que l'exécuteur applique (`max_agents`, seuils de
-     ressources) sont **les plus strictes** des fiches de l'hôte.
-7. **Périmètre ameesh dans un canon partagé.** `federation.yaml` peut déclarer
-   `extensions: {ameesh: {scope: <dossier>}}` (L47 : seule clé libre du
-   schéma OKF Federation). Les fiches du profil ameesh (`Agent`, `Host`,
-   `Placement`, `Member`, `WorkPackage`) ne sont alors lues que sous ce
-   dossier. Les `type: Agent` étrangers ailleurs dans le canon, comme les
-   sous-agents Claude Code d'Acme, sont ignorés. Sans cette clé,
-   tout le canon est lu, comme aujourd'hui pour manaty.
+1. **List of canons.** The host configuration carries
+   `canons: [{path, ref, untrusted}]` (or `AMEESH_CANONS`). `canon` and
+   `canon_ref` remain accepted as a one-element list. The **first** canon
+   is the default canon.
+2. **A canon is identified by its federation** (`federation.yaml` `id`).
+   * References become `<fédération>/<membre>:<chemin>@<commit>`.
+   * The registry, work packages, canon state and the authenticator
+     log carry a `canon` column (migration 0032).
+   * Existing rows, without a canon, belong to the default canon.
+3. **Each synchronisation touches only its own canon.**
+   * Stops, responsible-human clearings, package removals and revocations
+     target only the rows of that canon.
+   * State is kept per `(hôte, canon)`, and claiming looks at the state
+     of the agent's canon: closure **per canon**, no longer global.
+4. **Names remain global; the first canon that declares a name keeps it.**
+   An agent name declared by a second canon becomes there an error limited to
+   that card (`canon-name-conflict`), never a takeover. Same
+   rule for package identifiers.
+   A **released** name (card removed from its canon, agent stopped) can be
+   taken over by another canon: this is how an agent changes canon without
+   losing its mailbox.
+5. **Humans per canon.** `human:<id>` resolves in the agent's canon.
+   * A human who works in both canons has a `Member` card in
+     each.
+   * Their authenticators are synchronised per canon and are only revoked
+     by the canon that declared them.
+6. **Host described by each canon.**
+   * Each canon that places agents on `pc-smichea` has its `Host` card there.
+   * An agent's admission is judged against the card of its canon.
+   * The physical limits the runner applies (`max_agents`, resource
+     thresholds) are **the strictest** of the host's cards.
+7. **ameesh scope in a shared canon.** `federation.yaml` may declare
+   `extensions: {ameesh: {scope: <dossier>}}` (L47: the only free key of the
+   OKF Federation schema). Cards of the ameesh profile (`Agent`, `Host`,
+   `Placement`, `Member`, `WorkPackage`) are then read only under that
+   folder. Foreign `type: Agent` elsewhere in the canon, such as Acme's
+   Claude Code sub-agents, are ignored. Without this key,
+   the whole canon is read, as today for manaty.
 
-# Plan de lots
+# Lot plan
 
-| Lot | Contenu | Risque |
+| Lot | Content | Risk |
 |---|---|---|
-| **L42** — identité et synchronisation bornée | liste de canons ; `canon` sur registre, paquets et état (migration 0032) ; références qualifiées ; suppressions et retraits limités au canon synchronisé ; `canon_state` par `(hôte, canon)` et prédicat de réclamation par canon ; conflit de nom local à la fiche ; l'exécuteur synchronise chaque canon | élevé (cœur) |
-| **L43** — périmètre et hôte par canon | `ameesh.scope` ; admission avec la fiche `Host` du canon de l'agent ; limites physiques = les plus strictes ; `spawn` cherche le créateur dans tous les canons | moyen |
-| **L44** — authentificateurs par canon | journal par canon, révocation limitée au canon déclarant, `ref` de confiance par canon | élevé (confiance) |
-| **L45** — outillage et accueil d'Acme | `canon check/show/sync` multi-canon (`--canon <id>`) ; documentation ; PR sur acme/home : `ameesh: {scope: ameesh}`, fiches `Member` smichea, `Host` pc-smichea, `Agent` acme-docs et acme-securite-docs, admissions | faible |
+| **L42** — identity and bounded synchronisation | list of canons; `canon` on registry, packages and state (migration 0032); qualified references; deletions and removals limited to the synchronised canon; `canon_state` per `(hôte, canon)` and claim predicate per canon; name conflict local to the card; the runner synchronises each canon | high (core) |
+| **L43** — scope and host per canon | `ameesh.scope`; admission with the `Host` card of the agent's canon; physical limits = the strictest; `spawn` looks for the creator in all canons | medium |
+| **L44** — authenticators per canon | log per canon, revocation limited to the declaring canon, trusted `ref` per canon | high (trust) |
+| **L45** — tooling and onboarding of Acme | multi-canon `canon check/show/sync` (`--canon <id>`); documentation; PR on acme/home: `ameesh: {scope: ameesh}`, `Member` card smichea, `Host` pc-smichea, `Agent` acme-docs and acme-securite-docs, admissions | low |
 
-Ordre : L42, puis L43 et L44 en parallèle, puis L45.
+Order: L42, then L43 and L44 in parallel, then L45.
 
-# En attendant
+# In the meantime
 
-Aucun agent d'une autre organisation n'est déclaré dans le canon manaty, même
-à titre provisoire : chaque organisation déclare ses agents dans son propre
-canon, une fois L42–L45 déployés. Ne pas créer d'agent avec
-`--by mesh-design` : il hériterait du responsable et de l'équipe ameesh, ce
-qui fausse R14.
+No agent of another organisation is declared in the manaty canon, even
+provisionally: each organisation declares its agents in its own
+canon, once L42–L45 are deployed. Do not create an agent with
+`--by mesh-design`: it would inherit the ameesh responsible human and team, which
+skews R14.

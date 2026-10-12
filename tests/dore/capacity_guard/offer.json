@@ -1,0 +1,240 @@
+{
+ "schema": "ameesh-capacity-golden/1",
+ "family": "offer",
+ "cases": [
+  {
+   "why": "the study's offer",
+   "lend": {
+    "cpu_max": 3,
+    "cpu_weight": 10,
+    "memory_max": "14GiB",
+    "agent_memory_max": "4.5GiB",
+    "disk_max": "80GiB",
+    "windows": [
+     "mon-fri 18:00-14:00 UTC",
+     "sat-sun"
+    ],
+    "reclaim": {
+     "memory_available_min": "6GiB",
+     "cpu_pressure_max": "20%",
+     "memory_pressure_max": "2%",
+     "busy_units": [
+      "actions.runner.*"
+     ],
+     "busy_max": 4
+    },
+    "drain_seconds": 90,
+    "calm_seconds": 600
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920,
+    "cpu_weight": 10,
+    "agent_memory_max": 4831838208,
+    "windows": [
+     "mon-fri 18:00-14:00 UTC",
+     "sat-sun"
+    ],
+    "reclaim": {
+     "memory_available_min": 6442450944,
+     "cpu_pressure_max": 20.0,
+     "memory_pressure_max": 2.0,
+     "busy_units": [
+      "actions.runner.*"
+     ],
+     "busy_max": 4
+    },
+    "drain_seconds": 90,
+    "calm_seconds": 600
+   }
+  },
+  {
+   "why": "the three caps only: defaults for the delays",
+   "lend": {
+    "cpu_max": 1.5,
+    "memory_max": 4294967296,
+    "disk_max": "20GB"
+   },
+   "offer": {
+    "cpu_max": 1.5,
+    "memory_max": 4294967296,
+    "disk_max": 20000000000,
+    "drain_seconds": 90,
+    "calm_seconds": 600
+   }
+  },
+  {
+   "why": "an IANA zone and a window across the week end",
+   "lend": {
+    "cpu_max": 2,
+    "memory_max": "8GiB",
+    "disk_max": "40GiB",
+    "windows": "fri-mon 20:00-07:00 Europe/Paris"
+   },
+   "offer": {
+    "cpu_max": 2.0,
+    "memory_max": 8589934592,
+    "disk_max": 42949672960,
+    "windows": [
+     "fri-mon 20:00-07:00 Europe/Paris"
+    ],
+    "drain_seconds": 90,
+    "calm_seconds": 600
+   }
+  },
+  {
+   "why": "a cap missing: nothing lent",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "14GiB"
+   },
+   "problems": [
+    "`disk_max` required"
+   ]
+  },
+  {
+   "why": "cpu_max is a number",
+   "lend": {
+    "cpu_max": "3",
+    "memory_max": "14GiB",
+    "disk_max": "80GiB"
+   },
+   "problems": [
+    "`cpu_max`"
+   ]
+  },
+  {
+   "why": "unreadable size",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "lots",
+    "disk_max": "80GiB"
+   },
+   "problems": [
+    "`memory_max`"
+   ]
+  },
+  {
+   "why": "per-agent cap above the whole guest",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "agent_memory_max": "6GiB",
+    "disk_max": "80GiB"
+   },
+   "problems": [
+    "`agent_memory_max` above"
+   ]
+  },
+  {
+   "why": "unreadable window",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "disk_max": "80GiB",
+    "windows": [
+     "weekdays"
+    ]
+   },
+   "problems": [
+    "`windows`"
+   ]
+  },
+  {
+   "why": "weight out of bounds",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "disk_max": "80GiB",
+    "cpu_weight": 0
+   },
+   "problems": [
+    "`cpu_weight`"
+   ]
+  },
+  {
+   "why": "pressure in percent",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "disk_max": "80GiB",
+    "reclaim": {
+     "cpu_pressure_max": "120%"
+    }
+   },
+   "problems": [
+    "`reclaim.cpu_pressure_max`"
+   ]
+  },
+  {
+   "why": "busy_max needs busy_units",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "disk_max": "80GiB",
+    "reclaim": {
+     "busy_max": 2
+    }
+   },
+   "problems": [
+    "`reclaim.busy_max` without `busy_units`"
+   ]
+  },
+  {
+   "why": "not a mapping",
+   "lend": "yes",
+   "problems": [
+    "mapping expected"
+   ]
+  },
+  {
+   "why": "a size too large for a float is no size (never an unbounded cap)",
+   "lend": {
+    "cpu_max": 1,
+    "memory_max": "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999GiB",
+    "disk_max": "10GiB"
+   },
+   "problems": [
+    "`memory_max`"
+   ]
+  },
+  {
+   "why": "cpu_max with more digits than a float holds (1 and 400 zeros) is refused, never an error",
+   "lend": {
+    "cpu_max": 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,
+    "memory_max": "1GiB",
+    "disk_max": "10GiB"
+   },
+   "problems": [
+    "`cpu_max`"
+   ]
+  },
+  {
+   "why": "a reclaim percentage with more digits than a float holds (1 and 400 zeros) is refused, never an error",
+   "lend": {
+    "cpu_max": 1,
+    "memory_max": "1GiB",
+    "disk_max": "10GiB",
+    "reclaim": {
+     "cpu_pressure_max": 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+    }
+   },
+   "problems": [
+    "`reclaim.cpu_pressure_max`"
+   ]
+  },
+  {
+   "why": "drain_seconds with more digits than a float holds is refused (it is added to a time)",
+   "lend": {
+    "cpu_max": 1,
+    "memory_max": "1GiB",
+    "disk_max": "10GiB",
+    "drain_seconds": 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+   },
+   "problems": [
+    "`drain_seconds`"
+   ]
+  }
+ ]
+}

@@ -260,6 +260,7 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
         parts.append(adapters.MAIL_REMAINING % remaining)
     parts.append(footer)
     parts.append(adapters.TMP_NOTE)  # L162 : $TMPDIR, jamais /tmp en dur
+    parts.append(adapters.HEAVY_NOTE)  # L131 : suites lourdes plafonnées par hôte
     return "\n\n".join(parts)
 
 
