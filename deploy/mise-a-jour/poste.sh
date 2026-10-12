@@ -383,10 +383,13 @@ etiquettes_distantes() {
     { brut[$2] = $1 }
     END { for (t in brut) print ((t in pele) ? pele[t] : brut[t]), t }'
 }
-# le distant, lu une fois : main et les étiquettes (fetch, sauf à blanc)
+# le distant, lu une fois : main (fetch, sauf à blanc) et les étiquettes
+# (ls-remote) ; aucune étiquette locale n'est touchée avant que les notes de
+# la version publiée soient validées (#348 r2) : publier ne rapatrie que la
+# sienne, ensuite
 lire_distant() {
   [ -z "${DISTANTES+x}" ] || return 0
-  a_blanc || git -C "$DEPOT" fetch -q --tags "$DISTANT"
+  a_blanc || git -C "$DEPOT" fetch -q --no-tags "$DISTANT" "+refs/heads/main:refs/remotes/$DISTANT/main"
   DISTANTES=$(etiquettes_distantes)
 }
 commit_distant() { awk -v t="$1" '$2 == t { print $1 }' <<<"$DISTANTES"; }
@@ -474,6 +477,9 @@ publier() {
   fi
   if [ -n "$distant" ]; then
     [ "$distant" = "$sha" ] || { echo "$tag est déjà posée sur ${distant:0:7}, pas ${sha:0:7} : une étiquette publiée ne se déplace pas (une nouvelle version passe par un nouveau numéro dans pyproject.toml)" >&2; exit 1; }
+    # rapatriée ici seulement maintenant, les notes validées
+    a_blanc || git -C "$DEPOT" fetch -q --no-tags "$DISTANT" "refs/tags/$tag:refs/tags/$tag" \
+      || { echo "$tag est posée ici autrement que sur le distant : à examiner (git tag -d $tag si elle est fausse)" >&2; exit 1; }
     echo "étiquette : déjà posée"
   else
     if ici=$(git -C "$DEPOT" rev-parse -q --verify "refs/tags/$tag^{commit}"); then
