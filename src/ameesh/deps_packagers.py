@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L248b : packages whose release needs a local node_modules tree."""
+import io
 import json
 import os
 import shlex
@@ -18,21 +19,29 @@ DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peer
 def _script_commands(script):
     """Command positions in simple shell pipelines and npm/npx invocations.
 
-    Keep quotes until after splitting: an echoed ';' is not a separator.
+    POSIX shlex handles quoting and escapes, including within assignments.
+    Inspect each token's source spelling to distinguish operators from quoted
+    or escaped arguments that shlex also returns as ';', '|', etc.
     This is declaration detection, not an interpreter for shell programs.
     """
-    lexer = shlex.shlex(script, posix=False, punctuation_chars=";&|()\n")
+    # shlex's punctuation_chars=True set, plus shell command newlines.
+    lexer = shlex.shlex(io.StringIO(script), posix=True,
+                        punctuation_chars="();<>|&\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments = [[]]
+    start = 0
     for word in lexer:
-        if word and all(char in ";&|()\n" for char in word):
+        # Punctuation lookahead is held by shlex rather than consumed as part
+        # of this token; subtract it to recover the original token spelling.
+        end = lexer.instream.tell() - len(lexer._pushback_chars)
+        spelling = script[start:end].strip(" \t\r")
+        start = end
+        if spelling and all(char in ";&|()\n" for char in spelling):
             segments.append([])
         else:
             segments[-1].append(word)
-    for segment in segments:
-        words = [shlex.split(word)[0] if word[:1] in ("'", '"') else word
-                 for word in segment]
+    for words in segments:
         while words and "=" in words[0] and not words[0].startswith("-"):
             words.pop(0)  # leading environment assignments
         if not words:

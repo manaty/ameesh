@@ -120,6 +120,33 @@ class PackagerTests(l231._Base):
         self.assertIn((child, "unlinked"), [(item["package"], item["status"]) for item in done])
         self.assertFalse(os.path.lexists(os.path.join(child, "node_modules")))
 
+    def test_escaped_separator_is_an_argument_and_keeps_the_shared_link(self):
+        pkg = self.package()
+        root = Path(pkg).parent
+        l231._git(str(root), "init", "-q", "-b", "main")
+        deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+        target = os.readlink(os.path.join(pkg, "node_modules"))
+        for script in (r"echo \; electron-builder", r"echo \| electron-builder",
+                       r"echo \& electron-builder", r"echo \;electron-builder"):
+            with self.subTest(script=script):
+                Path(root, "package.json").write_text(json.dumps({"scripts": {"x": script}}))
+                self.assertEqual(deps._packagers(pkg), [])
+                self.assertEqual(deps.link_ready(pkg, self.cache), [])
+                self.assertEqual(os.readlink(os.path.join(pkg, "node_modules")), target)
+
+    def test_quoted_assignment_keeps_packager_detection_and_removes_legacy_link(self):
+        pkg = self.package()
+        root = Path(pkg).parent
+        l231._git(str(root), "init", "-q", "-b", "main")
+        deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+        Path(root, "package.json").write_text(json.dumps({"scripts": {
+            "dist": 'LABEL="desktop release" npx electron-builder --projectDir app'}}))
+        self.assertEqual(deps._packagers(pkg), ["electron-builder"])
+        self.assertEqual(deps.link_package(pkg, self.cache)["status"], "packager-refused")
+        self.assertIn("electron-builder", deps._status(pkg, self.cache)[0]["warning"])
+        self.assertEqual(deps.link_ready(pkg, self.cache)[0]["status"], "unlinked")
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+
     def test_unlink_discovers_children_under_locked_and_unlocked_root_manifest(self):
         for command, locked in (("unlink", False), ("local", True)):
             with self.subTest(command=command, locked=locked):
