@@ -43,6 +43,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import dataclasses
+import fcntl
 import json
 import math
 import os
@@ -214,6 +215,65 @@ def _atomic_write(path: str, data: dict) -> None:
         json.dump(data, fh, ensure_ascii=False, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, path)
+
+
+class SlotPool:
+    """`caps.max_concurrent` per HOST, not per runner: each agent running on
+    the host holds one slot, a file locked with `flock` in a folder every
+    runner of the host shares (default: `slots/` in the ack folder, the
+    guest's own; the guard reads `ack.json` only). Counting and taking happen
+    under the pool's lock: two runners never both see the last free slot. A
+    lock dies with its process: a runner killed frees its slots."""
+
+    def __init__(self, directory: str):
+        self.directory = directory
+
+    def _open(self, name: str) -> int:
+        return os.open(os.path.join(self.directory, name),
+                       os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+
+    def acquire(self, cap: int) -> Optional[int]:
+        """A held slot (an fd, to `release`), or None when `cap` agents already
+        run on the host. Raises OSError when the folder is unusable."""
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        pool = self._open(".lock")
+        try:
+            fcntl.flock(pool, fcntl.LOCK_EX)
+            held, free = 0, None
+            names = sorted(n for n in os.listdir(self.directory) if n.startswith("slot-"))
+            for name in names:
+                fd = self._open(name)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    held += 1
+                    os.close(fd)
+                    continue
+                if free is None:
+                    free = fd
+                else:
+                    os.close(fd)
+            if held >= cap:
+                if free is not None:
+                    os.close(free)
+                return None
+            if free is None:
+                index = 0
+                while "slot-%d" % index in names:
+                    index += 1
+                free = self._open("slot-%d" % index)
+                fcntl.flock(free, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return free
+        finally:
+            os.close(pool)
+
+    @staticmethod
+    def release(slot: Optional[int]) -> None:
+        if slot is not None:
+            try:
+                os.close(slot)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
