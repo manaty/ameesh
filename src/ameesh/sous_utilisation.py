@@ -390,7 +390,8 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
     `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
     au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
     `idle_capacity`, `backlog_empty` et la prise automatique (L119) ;
-    `waiting_free` : voir `free_of_lots` (L165b)."""
+    `waiting_free` : voir `free_of_lots` (L165b), et une consigne en attente
+    occupe l'agent, comme pour la prise (`backlog._awaited`)."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -400,6 +401,8 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
         if not _awake_runner(row) or int(row.get("unread") or 0):
             continue
         if not free_of_lots(row, waiting_free=waiting_free):
+            continue
+        if waiting_free and row.get("has_pending_prompt"):
             continue
         since = idle_since(row)
         if not since or now - since < idle_s:

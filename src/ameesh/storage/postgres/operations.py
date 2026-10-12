@@ -101,6 +101,7 @@ class Operations(interface.Operations):
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
                    coalesce(m.n_passive, 0)::bigint AS passive_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
+                   coalesce(sw.planned_start > current_date, false) AS session_lot_later,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
                    coalesce(al.n, 0)::bigint AS active_lots,
@@ -122,7 +123,7 @@ class Operations(interface.Operations):
                     FROM agent_mailbox mb
                    WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
               LEFT JOIN LATERAL (
-                  SELECT w.title, w.state FROM work_items w
+                  SELECT w.title, w.state, w.planned_start FROM work_items w
                    WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
                                      THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (

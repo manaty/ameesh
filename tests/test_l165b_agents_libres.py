@@ -63,8 +63,24 @@ class PriseTest(_Libres):
         plus_tard = self.tenu("dev7", "intake")
         self.db.execute("UPDATE work_items SET planned_start = current_date + 2"
                         " WHERE id = %s", (plus_tard["id"],))
+        # #318 r1 : lot de session de l'agent, il ne le retient pas non plus
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s"
+                        " WHERE name = 'dev7'", (str(plus_tard["id"]),))
+        self.assertTrue({r["name"]: r for r in self.listing()}["dev7"]["session_lot_later"])
         lot = self.lot("à prendre")
         self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
+
+    def test_lot_de_session_prevu_aujourd_hui_occupe(self):
+        self.agent("dev7", team="nexlink")
+        self.agent("claude2", team="autre")
+        session = self.tenu("claude2", "build", title="lot de session d'un autre")
+        self.db.execute("UPDATE work_items SET planned_start = current_date"
+                        " WHERE id = %s", (session["id"],))
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s"
+                        " WHERE name = 'dev7'", (str(session["id"]),))
+        self.assertFalse({r["name"]: r for r in self.listing()}["dev7"]["session_lot_later"])
+        self.lot("à prendre")
+        self.assertEqual(self.take(), [])
 
     def test_courrier_en_attente_ou_lot_de_session_en_cours(self):
         self.agent("dev7", team="nexlink")
@@ -113,6 +129,20 @@ class IdleCapacityTest(_Libres):
         self.assertIn("#%d \"sans agent\"" % lot["id"], briefs["mesh-design"])
         self.assertIn("ameesh work assign <lot> <agent>", briefs["auditeur"])
         self.assertIn("level 1", briefs["auditeur"])
+
+    def test_une_consigne_en_attente_occupe(self):
+        # #318 r1 : comme pour la prise, l'agent n'est pas annoncé libre
+        self.agent("orchestrateur", team="nexlink", status="running")
+        self.agent("dev7", team="nexlink")
+        self.agent("dev4", team="nexlink")
+        self.tenu("dev7", "qa")
+        self.tenu("dev4", "qa")
+        self.db.execute("UPDATE agent_registry SET pending_prompt = 'fais ceci'"
+                        " WHERE name = 'dev4'")
+        self.lot("sans agent")
+        alerts = sous_utilisation.idle_capacity(
+            self.db, self.listing(), time.time(), ["orchestrateur"])
+        self.assertEqual([a["agents"] for a in alerts], [["dev7"]])
 
     def test_sans_lot_en_attente_l_auditeur_n_a_pas_de_geste(self):
         text = alert_briefs._for_auditor({"detail": "x", "lots": []})

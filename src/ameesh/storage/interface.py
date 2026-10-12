@@ -1958,7 +1958,8 @@ class Operations(Domain):
         `turn_label` du marqueur comptable), non-lus qui ouvriront un tour
         (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
         part dans `passive_unread`), lot de session (`session_work_item`,
-        `session_lot_title`, `session_lot_state`), lot assigné ouvert le plus
+        `session_lot_title`, `session_lot_state`, `session_lot_later` : son
+        début prévu est après aujourd'hui), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
         lots qui l'occupent (`active_lots`, L165b : assignés, ouverts, ni en
         `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui),

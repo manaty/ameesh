@@ -236,7 +236,8 @@ def _awaited(row: dict, *, waiting_free: bool = False) -> bool:
     if row.get("has_pending_prompt"):
         return True
     state = row.get("session_lot_state")
-    if waiting_free and state in sous_utilisation.LOTS_WAITING_ON_OTHERS:
+    if waiting_free and (state in sous_utilisation.LOTS_WAITING_ON_OTHERS
+                         or row.get("session_lot_later")):
         return False
     return bool(state) and state not in stagnation.DONE_STATES
 
