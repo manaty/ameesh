@@ -87,7 +87,7 @@ class MailLinksLotsTest(_Base):
 
     def test_new_lot_cree_et_assigne(self):
         proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
-                         "--new-lot", "CI plus rapide", "--estimate", "2h")
+                         "--new-lot", "CI plus rapide", "--estimate", "2h", "--app", "p")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = work.list_items(self.db, assignee="dev2")
         self.assertEqual([(r["title"], r["branch"]) for r in rows],

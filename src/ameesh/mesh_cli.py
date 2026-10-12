@@ -803,7 +803,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     if args.work_command == "move" and getattr(args, "correct", None) is not None:
         args.actor = work.corrector(cfg, db, args.actor)
         return
-    if args.work_command in _OWN_ACTOR or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -1100,6 +1100,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
             print("note ajoutée au lot #%d" % args.id)
+            return 0
+        if args.work_command == "set-app":
+            from . import work_projects
+            item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
+            print("lot #%d: project %s" % (item["id"], item["app"]))
             return 0
         if args.work_command == "milestone":
             row = work.milestone(
@@ -1830,6 +1835,13 @@ def build_parser() -> argparse.ArgumentParser:
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
+
+    pw_app = work_sub.add_parser("set-app", help="correct a lot's project, with a journal entry")
+    pw_app.add_argument("id", type=int)
+    pw_app.add_argument("project")
+    pw_app.add_argument("--actor", default="",
+                        help="human, orchestrator or design agent; default: bound session")
+    pw_app.set_defaults(func=cmd_work)
     pw_ms = work_sub.add_parser(
         "milestone", help="déclarer un jalon de la frise (gel, verdict) — R19")
     pw_ms.add_argument("id", type=int)

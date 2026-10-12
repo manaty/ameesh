@@ -361,7 +361,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertIn("estimation obligatoire", proc.stderr)
         self.assertEqual(work.list_items(self.db), [])
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",
-                        "Avec durée", "--estimate", "45m", env=env)
+                        "Avec durée", "--estimate", "45m", "--app", "p", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         item = work.list_items(self.db)[0]
         self.assertEqual((item["title"], item["estimate_minutes"], item["estimate_by"]),
