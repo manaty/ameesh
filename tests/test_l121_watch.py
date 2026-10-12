@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import stat
+import subprocess
 import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import db as db_mod
 from ameesh import fil, projects, storage, watch
 
 from .support import PgTestCase
@@ -45,9 +48,37 @@ class TextTest(unittest.TestCase):
         self.assertIn('ExecStart="/home/u/.local/bin/ameesh" watch send --agent mesh-design',
                       service)
         self.assertIn('Environment="PATH=/usr/bin:/bin"', service)
+        # codex r1 (#303): the host's ameesh environment, then the watch's
+        # pinned variables (the later file wins in systemd)
+        self.assertIn("EnvironmentFile=-%h/.config/ameesh/env\n"
+                      "EnvironmentFile=-/units/ameesh-watch-mesh-design.env\n",
+                      watch.units("mesh-design", 1800, "/a", "/b", "/units")
+                      ["ameesh-watch-mesh-design.service"])
         timer = found["ameesh-watch-mesh-design.timer"]
         self.assertIn("OnActiveSec=1800\nOnUnitActiveSec=1800\n", timer)
         self.assertIn("WantedBy=timers.target", timer)
+
+
+    def test_pinned_env(self):
+        text = watch.pinned_env({"AMEESH_DSN": 'postgres://u:p"a\\s$x`y@h/db',
+                                 "AMEESH_HOST": "laptop", "AGENT_MESH_SCHEMA": "s",
+                                 "AMEESH_EMPTY": "", "HOME": "/home/u", "AMEESH_POLL": "3"})
+        self.assertEqual(text, 'AMEESH_DSN="postgres://u:p\\"a\\\\s\\$x\\`y@h/db"\n'
+                               'AGENT_MESH_SCHEMA="s"\nAMEESH_HOST="laptop"\n')
+        self.assertEqual(watch.pinned_env({}), "")
+        with self.assertRaises(watch.WatchError):
+            watch.pinned_env({"AMEESH_DSN": "a\nb"})
+
+    def test_linger(self):
+        def answer(code=0, out="", err=""):
+            return lambda argv, **kw: mock.Mock(returncode=code, stdout=out, stderr=err)
+        self.assertIsNone(watch.linger_warning(answer(out="yes\n"), "u"))
+        self.assertIn("linger is off for u", watch.linger_warning(answer(out="no\n"), "u"))
+        for run in (answer(code=1, err="no such user"), answer(out="")):
+            self.assertIn("unreadable", watch.linger_warning(run, "u"))
+        def fails(argv, **kw):
+            raise FileNotFoundError("loginctl")
+        self.assertIn("enable-linger u", watch.linger_warning(fails, "u"))
 
 
 class WatchTest(PgTestCase):
@@ -56,7 +87,9 @@ class WatchTest(PgTestCase):
         self.register("w121", "claude")
         self.units = tempfile.mkdtemp(prefix="ameesh-l121-")
         self.addCleanup(shutil.rmtree, self.units, True)
-        self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin"}
+        self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin",
+                    "AMEESH_DSN": "postgres://u:secret@db/x", "AMEESH_HOST": "laptop"}
+        self.linger = "yes"
         self.calls: list = []
         self.here = dataclasses.replace(self.cfg, host="laptop")
         patcher = mock.patch.object(watch.platform, "is_linux", return_value=True)
@@ -64,6 +97,8 @@ class WatchTest(PgTestCase):
         self.addCleanup(patcher.stop)
 
     def run_(self, argv, **kw):
+        if argv[0] == "loginctl":
+            return mock.Mock(returncode=0, stdout=self.linger + "\n", stderr="")
         self.calls.append(argv[2:])
         return mock.Mock(returncode=0, stdout="", stderr="")
 
@@ -77,7 +112,14 @@ class WatchTest(PgTestCase):
         warnings, note = self.enable()
         self.assertEqual(warnings, [])
         self.assertEqual(sorted(os.listdir(self.units)),
-                         ["ameesh-watch-w121.service", "ameesh-watch-w121.timer"])
+                         ["ameesh-watch-w121.env", "ameesh-watch-w121.service",
+                          "ameesh-watch-w121.timer"])
+        # the variables set at enable are pinned for the timer, owner only
+        env_file = os.path.join(self.units, "ameesh-watch-w121.env")
+        with open(env_file, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), 'AMEESH_DSN="postgres://u:secret@db/x"\n'
+                                        'AMEESH_HOST="laptop"\n')
+        self.assertEqual(stat.S_IMODE(os.stat(env_file).st_mode), 0o600)
         self.assertEqual(self.calls, [["daemon-reload"],
                                       ["enable", "ameesh-watch-w121.timer"],
                                       ["restart", "ameesh-watch-w121.timer"]])
@@ -114,18 +156,87 @@ class WatchTest(PgTestCase):
         with self.assertRaises(watch.WatchError):
             watch.disable(self.here, self.db, "w121", run=self.run_, env=self.env)
 
+    def test_linger_off_is_a_warning(self):
+        self.linger = "no"
+        warnings, _ = self.enable()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("loginctl enable-linger", warnings[0])
+        self.assertEqual(len(storage.of(self.db).watches.list()), 1)  # enabled all the same
+
     def test_a_watch_moved_to_another_host(self):
-        self.enable(cfg=dataclasses.replace(self.cfg, host="vm"))
+        vm = dataclasses.replace(self.cfg, host="vm")
+        vm_units = tempfile.mkdtemp(prefix="ameesh-l121-vm-")
+        self.addCleanup(shutil.rmtree, vm_units, True)
+        vm_env = dict(self.env, **{watch.UNIT_DIR_ENV: vm_units})
+        with mock.patch.object(watch.fil, "record"):
+            watch.enable(vm, self.db, "w121", 1800, run=self.run_, env=vm_env,
+                         actor="human:owner")
         warnings, _ = self.enable(every=3600)
         self.assertEqual(len(warnings), 1)
         self.assertIn("moves from vm to laptop", warnings[0])
         self.assertEqual(storage.of(self.db).watches.list("w121")[0]["every_s"], 3600)
         # the timer left on vm sends nothing
         sent = []
-        self.assertIn("is on laptop", watch.send(dataclasses.replace(self.cfg, host="vm"),
-                                                 self.db, "w121",
+        self.assertIn("is on laptop", watch.send(vm, self.db, "w121",
                                                  mail_send=lambda argv: sent.append(argv) or 0))
         self.assertEqual(sent, [])
+        # codex r1 (#303): disable on the old host removes its timer only;
+        # the watch, now on laptop, stays
+        with mock.patch.object(watch.fil, "record") as note:
+            warnings = watch.disable(vm, self.db, "w121", run=self.run_, env=vm_env,
+                                     actor="human:owner")
+        self.assertEqual(os.listdir(vm_units), [])
+        self.assertIn("only the timer of vm was removed", warnings[0])
+        self.assertIn("stays on laptop", note.call_args.kwargs["text"])
+        self.assertEqual(storage.of(self.db).watches.list("w121")[0]["host"], "laptop")
+        self.assertEqual(watch.send(self.here, self.db, "w121",
+                                    mail_send=lambda argv: sent.append(argv) or 0),
+                         "instruction sent to w121")
+        # from a host with no timer left: the watch itself is disabled
+        with mock.patch.object(watch.fil, "record"):
+            warnings = watch.disable(vm, self.db, "w121", run=self.run_, env=vm_env,
+                                     actor="human:owner")
+        self.assertIn("its timer stays on laptop", warnings[0])
+        self.assertEqual(storage.of(self.db).watches.list(), [])
+
+    def test_delete_keeps_a_watch_moved_meanwhile(self):
+        self.enable()
+        watches = storage.of(self.db).watches
+        self.assertIsNone(watches.delete("w121", "vm"))
+        self.assertEqual(len(watches.list("w121")), 1)
+        self.assertEqual(watches.delete("w121", "laptop")["host"], "laptop")
+
+    def test_a_firing_holds_the_watch_until_it_is_sent(self):
+        # codex r1 (#303): the host check and the sending are one transaction;
+        # a move from another host waits for the end of the firing
+        self.enable()
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        moves = []
+
+        def mail_send(argv):
+            try:
+                # one statement: the psql driver runs each in its own session
+                other.execute("set lock_timeout = '300ms';"
+                              " update agent_watches set host = 'vm' where agent = 'w121'")
+                moves.append("moved")
+            except db_mod.DbError as exc:
+                moves.append("blocked: %s" % exc)
+            return 0
+        self.assertEqual(watch.send(self.here, self.db, "w121", mail_send=mail_send),
+                         "instruction sent to w121")
+        self.assertEqual(len(moves), 1)
+        self.assertTrue(moves[0].startswith("blocked"), moves)
+        # moved after the firing: the next firing from laptop sends nothing
+        other.execute("update agent_watches set host = 'vm' where agent = 'w121'")
+        self.assertIn("is on vm", watch.send(self.here, self.db, "w121",
+                                             mail_send=lambda argv: self.fail("sent")))
+        # a failed send leaves last_sent_ts untouched (rolled back)
+        other.execute("update agent_watches set host = 'laptop', last_sent_at = null"
+                      " where agent = 'w121'")
+        with self.assertRaises(watch.WatchError):
+            watch.send(self.here, self.db, "w121", mail_send=lambda argv: 3)
+        self.assertIsNone(storage.of(self.db).watches.list("w121")[0]["last_sent_ts"])
 
     def test_refusals_and_the_hand_written_unit(self):
         with self.assertRaises(watch.WatchError):

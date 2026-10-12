@@ -19,9 +19,14 @@ class Watches(interface.Watches):
             " host = excluded.host, enabled_by = excluded.enabled_by, enabled_at = now()"
             " returning " + _COLUMNS, (agent, int(every_s), host, actor))[0]
 
-    def delete(self, agent) -> dict | None:
-        rows = self.db.query(
-            "delete from agent_watches where agent = %s returning " + _COLUMNS, (agent,))
+    def delete(self, agent, host=None) -> dict | None:
+        if host is None:
+            rows = self.db.query(
+                "delete from agent_watches where agent = %s returning " + _COLUMNS, (agent,))
+        else:
+            rows = self.db.query(
+                "delete from agent_watches where agent = %s and host = %s returning "
+                + _COLUMNS, (agent, host))
         return rows[0] if rows else None
 
     def list(self, agent=None) -> list:
@@ -30,6 +35,17 @@ class Watches(interface.Watches):
         return self.db.query(
             "select " + _COLUMNS + " from agent_watches where agent = %s", (agent,))
 
-    def sent(self, agent) -> None:
-        self.db.execute(
-            "update agent_watches set last_sent_at = now() where agent = %s", (agent,))
+    def deliver(self, agent, host, send) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query("select " + _COLUMNS + " from agent_watches where agent = %s"
+                            " for update", (agent,))
+            if not rows:
+                return None
+            row = dict(rows[0], sent=False)
+            if row["host"] != host:
+                return row
+            send()
+            tx.execute("update agent_watches set last_sent_at = now() where agent = %s",
+                       (agent,))
+            row["sent"] = True
+            return row

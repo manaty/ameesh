@@ -100,7 +100,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
-   watches         put delete list sent
+   watches         put delete list deliver
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
@@ -563,16 +563,21 @@ class Watches(Domain):
         every_s, host, enabled_by, enabled_ts, last_sent_ts."""
 
     @abc.abstractmethod
-    def delete(self, agent: str) -> dict | None:
-        """Removes the watch of `agent`; the row removed, None if none."""
+    def delete(self, agent: str, host: str | None = None) -> dict | None:
+        """Removes the watch of `agent` (only if it is on `host`, when
+        given: a watch moved meanwhile stays); the row removed, None if none."""
 
     @abc.abstractmethod
     def list(self, agent: str | None = None) -> list[dict]:
         """The watches (of `agent` only if given), by agent name."""
 
     @abc.abstractmethod
-    def sent(self, agent: str) -> None:
-        """Notes that the instruction was just sent (`last_sent_ts`)."""
+    def deliver(self, agent: str, host: str, send: Callable[[], None]) -> dict | None:
+        """One firing, in one transaction: the watch row of `agent` is locked;
+        if it is on `host`, `send()` runs and `last_sent_ts` is set. A move or
+        a disable from another host waits for the end of the firing. The row
+        read (with `sent` true or false), None if there is no watch; `send`
+        raising rolls the transaction back."""
 
 
 # --------------------------------------------------------------------------

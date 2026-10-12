@@ -40,6 +40,16 @@ UNIT_PREFIX = "ameesh-watch-"
 LEGACY_PREFIX = "ameesh-veille-"
 #: the directory of the user units (tests: a temporary one)
 UNIT_DIR_ENV = "AMEESH_SYSTEMD_USER_DIR"
+#: the configuration of the timer's commands: ameesh's environment file of the
+#: host (the runner's convention), then the variables pinned at enable, which win
+HOST_ENV_FILE = "%h/.config/ameesh/env"
+#: variables that choose the database, the host and the configuration: those
+#: set when the watch is enabled are pinned in its environment file (codex r1,
+#: #303: a timer firing with the defaults reads another database, or skips
+#: delivery because the host differs)
+PINNED_ENV = tuple(prefix + name for name in (
+    "CONFIG", "DSN", "DATABASE_URL", "SCHEMA", "DRIVER", "BACKEND", "HOST", "STATE",
+    "THREADS") for prefix in ("AMEESH_", "AGENT_MESH_"))
 CONSIGNE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "consignes", "veille.md")
 
@@ -86,16 +96,41 @@ def unit_name(agent: str, suffix: str) -> str:
     return "%s%s.%s" % (UNIT_PREFIX, agent, suffix)
 
 
-def units(agent: str, every_s: int, ameesh: str, path: str) -> dict[str, str]:
-    """The service and the timer of the watch of `agent`."""
+def env_name(agent: str) -> str:
+    """The environment file of the watch of `agent`, next to its units."""
+    return "%s%s.env" % (UNIT_PREFIX, agent)
+
+
+def pinned_env(env: dict) -> str:
+    """The environment file of a watch: the `PINNED_ENV` variables set in
+    `env`, in systemd's quoting. A value on several lines is refused."""
+    lines = []
+    for name in PINNED_ENV:
+        value = env.get(name)
+        if not value:
+            continue
+        if "\n" in value or "\r" in value:
+            raise WatchError("%s spans several lines: cannot pin it for the timer" % name)
+        quoted = "".join("\\" + c if c in '\\"`$' else c for c in value)
+        lines.append('%s="%s"' % (name, quoted))
+    return "".join(line + "\n" for line in lines)
+
+
+def units(agent: str, every_s: int, ameesh: str, path: str,
+          directory: str = "") -> dict[str, str]:
+    """The service and the timer of the watch of `agent` (`directory`: where
+    its environment file is written)."""
     service = (
         "[Unit]\n"
         "Description=ameesh watch of %(agent)s (L121, written by ameesh watch enable)\n"
         "[Service]\n"
         "Type=oneshot\n"
         "Environment=\"PATH=%(path)s\"\n"
+        "EnvironmentFile=-%(host_env)s\n"
+        "EnvironmentFile=-%(own_env)s\n"
         "ExecStart=\"%(ameesh)s\" watch send --agent %(agent)s\n"
-        % {"agent": agent, "ameesh": ameesh, "path": path})
+        % {"agent": agent, "ameesh": ameesh, "path": path, "host_env": HOST_ENV_FILE,
+           "own_env": os.path.join(directory, env_name(agent))})
     timer = (
         "[Unit]\n"
         "Description=ameesh watch of %(agent)s, every %(every)s\n"
@@ -125,6 +160,26 @@ def _systemctl(run: Callable, *args: str) -> None:
     if proc.returncode != 0:
         raise WatchError("systemctl --user %s: code %s %s" % (
             " ".join(args), proc.returncode, (proc.stderr or "").strip()[:200]))
+
+
+def linger_warning(run: Callable, user: str) -> str | None:
+    """Why the timer may not run while its owner is away: linger off, or
+    unreadable (codex r1, #303). A user timer stops with the last session of
+    its user unless linger is on."""
+    hint = "run `loginctl enable-linger %s` so that the watch runs while you are away" % user
+    try:
+        proc = run(["loginctl", "show-user", user, "-p", "Linger", "--value"],
+                   capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "linger of %s unreadable (%s): %s" % (user, exc, hint)
+    value = (proc.stdout or "").strip()
+    if proc.returncode != 0 or value not in ("yes", "no"):
+        return "linger of %s unreadable (loginctl: code %s %s): %s" % (
+            user, proc.returncode, (proc.stderr or value).strip()[:120], hint)
+    if value == "no":
+        return ("linger is off for %s: the timer stops when your last session ends; %s"
+                % (user, hint))
+    return None
 
 
 def authorize(cfg: Config, db, agent: str) -> str:
@@ -182,10 +237,15 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
             "a hand-written watch of %s is still installed: systemctl --user disable --now "
             "%s%s.timer (then remove its unit files)" % (agent, LEGACY_PREFIX, agent))
     os.makedirs(directory, exist_ok=True)
-    path = (env or os.environ).get("PATH") or "/usr/local/bin:/usr/bin:/bin"
-    for name, text in units(agent, every_s, _ameesh_binary(), path).items():
+    source = os.environ if env is None else env
+    path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    files = units(agent, every_s, _ameesh_binary(), path, directory)
+    # the pinned variables may hold a DSN with its password: owner only
+    files[env_name(agent)] = pinned_env(dict(source))
+    for name, text in files.items():
         tmp = os.path.join(directory, "." + name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, os.path.join(directory, name))
     _systemctl(run, "daemon-reload")
@@ -193,6 +253,10 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
     _systemctl(run, "enable", unit_name(agent, "timer"))
     _systemctl(run, "restart", unit_name(agent, "timer"))
     storage.of(db).watches.put(agent, every_s, host, actor=actor)
+    import getpass
+    linger = linger_warning(run, getpass.getuser())
+    if linger:
+        warnings.append(linger)
     _note(cfg, db, agent, actor,
           "Watch of %s enabled on %s by %s: every %s, instruction consignes/veille.md."
           % (agent, host, actor, every_text(every_s)),
@@ -202,23 +266,39 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
 
 def disable(cfg: Config, db, agent: str, *, run: Callable = subprocess.run,
             env: dict | None = None, actor: str | None = None) -> list[str]:
-    """Removes the timer of this host (if any) and the watch; notes it."""
+    """Removes the timer of this host (if any), and the watch when it is this
+    host's, or when no timer is left here (`disable` from any host); notes it.
+
+    On a host that is not the watch's (codex r1, #303), only the local units
+    go: the watch moved since and its timer keeps running where it is now."""
     actor = actor or authorize(cfg, db, agent)
     warnings = []
+    host = cfg.host or ""
     directory = unit_dir(env)
     timer = os.path.join(directory, unit_name(agent, "timer"))
-    if os.path.exists(timer):
+    local = os.path.exists(timer)
+    rows = storage.of(db).watches.list(agent)
+    if not rows and not local:
+        raise WatchError("no watch of %s" % agent)
+    if local:
         _systemctl(run, "disable", "--now", unit_name(agent, "timer"))
-        for suffix in ("timer", "service"):
+        for name in (unit_name(agent, "timer"), unit_name(agent, "service"), env_name(agent)):
             try:
-                os.remove(os.path.join(directory, unit_name(agent, suffix)))
+                os.remove(os.path.join(directory, name))
             except FileNotFoundError:
                 pass
         _systemctl(run, "daemon-reload")
-    removed = storage.of(db).watches.delete(agent)
-    if removed is None and not os.path.exists(timer):
-        raise WatchError("no watch of %s" % agent)
-    host = cfg.host or ""
+    if rows and rows[0]["host"] != host and local:
+        warnings.append("the watch of %s is on %s: only the timer of %s was removed; the "
+                        "watch keeps running there" % (agent, rows[0]["host"], host))
+        _note(cfg, db, agent, actor, "Old timer of the watch of %s removed from %s by %s; "
+              "the watch stays on %s." % (agent, host, actor, rows[0]["host"]),
+              state="cleaned", host=host)
+        return warnings
+    removed = storage.of(db).watches.delete(agent, rows[0]["host"]) if rows else None
+    if rows and removed is None:
+        raise WatchError("the watch of %s changed meanwhile (`ameesh watch show --agent %s`)"
+                         % (agent, agent))
     if removed is not None and removed["host"] != host:
         warnings.append("its timer stays on %s, where it sends nothing more; remove it "
                         "there with the same command" % removed["host"])
@@ -229,20 +309,24 @@ def disable(cfg: Config, db, agent: str, *, run: Callable = subprocess.run,
 
 def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> str:
     """One firing: the instruction to `agent` when its watch is recorded for
-    this host; else nothing (disabled, or moved). What happened, in words."""
-    rows = storage.of(db).watches.list(agent)
-    if not rows:
-        return "no watch of %s: nothing sent (ameesh watch disable --agent %s removes " \
-               "this timer)" % (agent, agent)
-    if rows[0]["host"] != (cfg.host or ""):
-        return "the watch of %s is on %s: nothing sent from here" % (agent, rows[0]["host"])
+    this host; else nothing (disabled, or moved). The host check and the
+    sending are one transaction on the watch row (codex r1, #303): a move or a
+    disable waits for the firing, and a firing after them sends nothing. What
+    happened, in words."""
     if mail_send is None:
         from . import cli
         mail_send = cli.main
-    code = mail_send(["send", agent, consigne(agent), "--from", SENDER])
-    if code != 0:
-        raise WatchError("sending the instruction to %s failed (code %s)" % (agent, code))
-    storage.of(db).watches.sent(agent)
+
+    def deliver() -> None:
+        code = mail_send(["send", agent, consigne(agent), "--from", SENDER])
+        if code != 0:
+            raise WatchError("sending the instruction to %s failed (code %s)" % (agent, code))
+    row = storage.of(db).watches.deliver(agent, cfg.host or "", deliver)
+    if row is None:
+        return "no watch of %s: nothing sent (ameesh watch disable --agent %s removes " \
+               "this timer)" % (agent, agent)
+    if not row["sent"]:
+        return "the watch of %s is on %s: nothing sent from here" % (agent, row["host"])
     return "instruction sent to %s" % agent
 
 
