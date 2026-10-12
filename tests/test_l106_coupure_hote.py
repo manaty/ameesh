@@ -826,6 +826,41 @@ class CoupureTest(PgTestCase):
         for turn in mortes:
             self.assertEqual(turns.get(turn)["status"], "done", turn)
 
+    def test_la_limite_par_passage_vaut_aussi_pour_les_lignes_running(self):
+        # L147b (codex r4 de #220) : des lignes `running` d'avant le démarrage
+        # (et une page plus grande que la limite) — chaque passage en revoit
+        # au plus BOOT_REVIEW_MAX_ROWS, running et orphan comprises
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        actives = ["tour-actif-%s-%d" % (jeton, i) for i in range(5)]
+        orphelines = ["tour-orph-%s-%d" % (jeton, i) for i in range(3)]
+        for turn in actives + orphelines:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+        for turn in orphelines:
+            turns.mark_orphan(turn)
+        self._avant_le_demarrage(*actives, *orphelines)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+        runner = Runner(self.cfg, self.db, once=True)
+        lots = []
+        reel = type(turns).settle_many
+
+        def compte(self_, ids):
+            lots.append(len(ids))
+            return reel(self_, ids)
+
+        with mock.patch.object(runner_mod, "BOOT_ORPHAN_PAGE", 10), \
+                mock.patch.object(runner_mod, "BOOT_REVIEW_MAX_ROWS", 2), \
+                mock.patch.object(type(turns), "settle_many", compte):
+            for _ in range(20):
+                self._revue(runner, 3600, moteur)
+                if runner.boot_review_at is None:
+                    break
+        self.assertIsNone(runner.boot_review_at)
+        self.assertTrue(lots and max(lots) <= 2, lots)
+        for turn in actives + orphelines:
+            self.assertEqual(turns.get(turn)["status"], "done", turn)
+
     def test_le_solde_attend_le_gestionnaire_utilisateur(self):
         runner = Runner(self.cfg, self.db, once=True)
         for uptime, etat, pret in ((runner_mod.BOOT_SETTLE_S - 1, "running", False),
@@ -885,6 +920,33 @@ class CoupureTest(PgTestCase):
         with mock.patch.object(runner_mod, "log"):
             worker.run()
         self.assertIsNone(registry.get(self.db, "migrant").get("lease_owner"))
+
+    def test_place_ailleurs_pendant_une_rotation_aucun_tour_de_travail(self):
+        # L147b (codex r4 de #220) : le tour de résumé d'une rotation passe
+        # après le contrôle de placement ; le canon déplace l'agent pendant ce
+        # tour — aucun tour de travail ne part de l'ancien hôte, la consigne
+        # reste en attente, le bail est rendu
+        self.register("tournant", "claude", cwd=self._cwd("tournant"))
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "tournant", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "tournant"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        registry.set_pending_prompt(self.db, "tournant", "travail")
+
+        def rotation():
+            worker.summary_turns += 1        # le tour de résumé a eu lieu…
+            self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
+                            " WHERE name = 'tournant'")   # …et le canon a déplacé l'agent
+            return True
+
+        with mock.patch.object(worker, "maybe_rotate", side_effect=rotation), \
+                mock.patch.object(worker, "run_turn") as tour, \
+                mock.patch.object(runner_mod, "log"):
+            worker.run()
+        tour.assert_not_called()
+        ligne = registry.get(self.db, "tournant")
+        self.assertEqual(ligne["pending_prompt"], "travail")
+        self.assertIsNone(ligne.get("lease_owner"))
 
     def test_doctor_signale_un_agent_mene_sans_unite(self):
         self.register("sansunite", "claude", cwd=self._cwd("sansunite"))

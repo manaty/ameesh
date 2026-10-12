@@ -148,6 +148,8 @@ BOOT_SETTLE_MAX_S = 1800.0
 BOOT_REVIEW_EVERY_S = 60.0
 #: #220 r3 : lignes revues au plus par passage (la suite au passage suivant)
 BOOT_REVIEW_MAX_ROWS = 2000
+#: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
+BOOT_REVIEW_START = ("running", 0)
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -388,6 +390,9 @@ class AgentWorker(threading.Thread):
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
         self.suite: str | None = None
         self.rotation_forcee: str | None = None
+        #: L147b : tours de résumé de rotation faits par ce worker (le placement
+        #: est relu après une passe qui en a fait un)
+        self.summary_turns = 0
         #: raison de la clôture du dernier tour (L105), None s'il a fini seul
         self.last_turn_closed: str | None = None
         #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
@@ -900,6 +905,21 @@ class AgentWorker(threading.Thread):
     def idle_due(self) -> bool:
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
 
+    def _moved_during_rotation(self, spec: dict | None) -> bool:
+        """L147b (codex r4 de #220) : une rotation a fait un tour de résumé
+        depuis le dernier contrôle de placement ; si le canon a placé l'agent
+        ailleurs pendant ce tour, aucun tour de travail ne part d'ici. La
+        consigne prise par `pick()` est remise en attente (le courrier n'est
+        pas consommé par `pick()`). Vrai : le worker rend son bail."""
+        ailleurs = self.placed_elsewhere()
+        if not ailleurs:
+            return False
+        if spec and spec.get("kind") == "prompt":
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        log("[%s] placed on host %s, not %s, during a session rotation: no work turn "
+            "here, lease released" % (self.name, ailleurs, self.runner.host))
+        return True
+
     def placed_elsewhere(self) -> str:
         """L147: the host the registry places this agent on, when it is not
         this runner's host ('' otherwise, or for an agent without a host)."""
@@ -1198,6 +1218,7 @@ class AgentWorker(threading.Thread):
         ancienne = self.current_session()
         log_async("[%s] session rotation (%s)" % (self.name, raison))
         self._refus_pression = False
+        self.summary_turns += 1         # L147b : un tour a eu lieu (placement relu)
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
         if not ok and self._refus_pression:
             # la pression est venue entre le choix et le lancement : la
@@ -3550,8 +3571,11 @@ class AgentWorker(threading.Thread):
                             "current turn" % (self.name, ailleurs, self.runner.host))
                         break
                     self.apply_restart_if_requested()
+                    resumes = self.summary_turns
                     self.maybe_rotate()
                     spec = self.rotate_for_lot(self.pick())
+                    if self.summary_turns != resumes and self._moved_during_rotation(spec):
+                        break
                 except db_mod.Unavailable as exc:
                     self._panne_de_base(exc, "choosing the turn")
                     continue
@@ -3720,8 +3744,8 @@ class Runner:
         #: L147 (#220 r2) : prochaine revue des lignes d'avant le démarrage
         #: (horloge monotone), tant que leur solde attend les conteneurs
         self.boot_review_at: float | None = None
-        #: et l'id d'où reprend la revue suivante (0 : depuis le début)
-        self._boot_review_after = 0
+        #: et où reprend la revue suivante (phase, dernier id)
+        self._boot_review_after = BOOT_REVIEW_START
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -4832,26 +4856,34 @@ class Runner:
             return []
         try:
             turns = storage.of(self.db).turn_resources
-            after = self._boot_review_after
-            rows = turns.stale_running(max(0.0, time.time() - boot), self.host) \
-                if not after else []
+            # L147b : les lignes `running` puis les `orphan`, page par page,
+            # toutes deux dans la même limite par passage
+            phase, after = self._boot_review_after
+            rows: list = []
             more = False
             while True:
-                if len(rows) >= BOOT_REVIEW_MAX_ROWS:
+                room = BOOT_REVIEW_MAX_ROWS - len(rows)
+                if room <= 0:
                     more = True
                     break
-                page = turns.orphans_started_before(self.host, boot, after, BOOT_ORPHAN_PAGE)
+                size = min(BOOT_ORPHAN_PAGE, room)
+                lister = (turns.running_started_before if phase == "running"
+                          else turns.orphans_started_before)
+                page = lister(self.host, boot, after, size)
                 rows += page
-                if len(page) < BOOT_ORPHAN_PAGE:
+                if len(page) < size:
+                    if phase == "running":
+                        phase, after = "orphan", 0
+                        continue
                     break
                 after = int(page[-1]["id"])
             if not rows:
-                self._boot_review_after = 0
+                self._boot_review_after = BOOT_REVIEW_START
                 return []
             if not self._boot_settle_ready(time.time() - boot):
                 # #220 r3 : ni relevé du moteur ni écriture avant le feu vert —
                 # un relevé vide pris pendant le démarrage solderait à tort
-                self._boot_review_after = 0
+                self._boot_review_after = BOOT_REVIEW_START
                 self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
                 log("%d turn(s) from before the reboot: review deferred, containers "
                     "may still be restarted (host booted %ds ago); next "
@@ -4886,10 +4918,10 @@ class Runner:
                     % (len(kept) - len(newly)))
             if more:
                 # la suite au prochain passage de la boucle, sans attendre
-                self._boot_review_after = after
+                self._boot_review_after = (phase, after)
                 self.boot_review_at = time.monotonic()
             else:
-                self._boot_review_after = 0
+                self._boot_review_after = BOOT_REVIEW_START
             return kept
         except db_mod.DbError as exc:
             log_async("resources from before the reboot not checked (%s); next "
