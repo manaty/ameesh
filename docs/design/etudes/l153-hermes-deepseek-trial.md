@@ -93,7 +93,7 @@ test), well under the cap.
     `~/.hermes` and adds `~/.local/bin` to `~/.bashrc`. It was not run for
     this trial: Hermes was installed by the route below, with `HERMES_HOME`
     in the temporary folder. Check on ameesh-agents-1 after the trial
-    (2026-10-12, about 11:25Z): `~/.bashrc` is byte-identical to
+    (2026-10-12, re-checked 11:10Z): `~/.bashrc` is byte-identical to
     `/etc/skel/.bashrc` (`diff` empty, same SHA-256), has no `hermes` or
     `.local/bin` line, and its change time (`stat -c %z`, 2026-10-11
     01:59Z, same instant as `~/.profile`) predates the trial; `~/.hermes`
