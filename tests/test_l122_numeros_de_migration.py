@@ -271,6 +271,57 @@ class ReservationTest(PgTestCase):
         self.assertEqual((rows[0]["a"], rows[0]["b"], rows[0]["c"]),
                          ("manaty/nexlink", None, None))
 
+    def _rejoue_0390(self, *rows):
+        """Les réservations `rows` (migration, dépôt, issue) posées avant 0390,
+        puis 0390 rejouée : son déclencheur, sa contrainte et son index sont
+        retirés d'abord, la colonne reste (un dépôt déjà donné). Le schéma de la
+        classe est rendu tel quel ensuite, réservations libérées."""
+        path = os.path.join(migrations.MIGRATIONS_DIR, "0390_work_item_migration_repo.sql")
+        with open(path, encoding="utf-8") as fh:
+            sql = fh.read()
+        undo = ("DROP TRIGGER IF EXISTS work_items_migration_repo_fill ON work_items;"
+                " ALTER TABLE work_items DROP CONSTRAINT IF EXISTS work_items_migration_repo_check;"
+                " DROP INDEX IF EXISTS work_items_migration_repo_idx;")
+        ids = []
+
+        def restore():
+            self.db.script(undo)
+            for i in ids:
+                self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
+                                " WHERE id = %s", (i,))
+            self.db.script(sql)
+
+        self.addCleanup(restore)
+        self.db.script(undo)
+        for number, repo, issue in rows:
+            lot = work.add(self.db, title="avant 0390", app="nexlink", issue_ref=issue,
+                           actor="mesh-design")
+            ids.append(lot["id"])
+            self.db.execute("UPDATE work_items SET migration = %s, migration_repo = %s"
+                            " WHERE id = %s", (number, repo, lot["id"]))
+        self.db.script(sql)
+        return [work.get(self.db, i)["migration_repo"] for i in ids]
+
+    def test_0390_garde_un_depot_deja_donne(self):
+        """#443 r2 P2 : un dépôt déjà donné sans issue ne fait pas échouer 0390,
+        un dépôt en majuscules est ramené en minuscules (la contrainte l'accepte),
+        un dépôt vide prend celui de l'issue."""
+        self.assertEqual(
+            self._rejoue_0390((389, "manaty/nexlink", None),
+                              (390, "Manaty/Nexlink", "manaty/nexlink#7"),
+                              (391, " ", "Manaty/Nexlink#8"),
+                              (None, "manaty/nexlink", None)),
+            ["manaty/nexlink", "manaty/nexlink", "manaty/nexlink", None])
+        with self.assertRaises(DbError):
+            self.db.execute("UPDATE work_items SET migration = 390,"
+                            " migration_repo = 'MANATY/NEXLINK' WHERE id = %d"
+                            % self._lot("nx", "manaty/nexlink", 9)["id"])
+
+    def test_0390_refuse_une_reservation_sans_depot(self):
+        with self.assertRaises(DbError) as ctx:
+            self._rejoue_0390((389, None, None))
+        self.assertIn("without a repository", str(ctx.exception))
+
     def test_la_base_garantit_l_unicite(self):
         """Hors de l'outil, la contrainte refuse un doublon (dépôt, numéro)."""
         a, b = self._lot("a"), self._lot("b")

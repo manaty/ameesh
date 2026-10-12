@@ -14,15 +14,21 @@ language sql immutable as $$
                            from '^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[0-9]+$'))
 $$;
 
--- les réservations existantes : le dépôt de l'issue du lot. Aucun espace de
--- noms inventé : une réservation sans dépôt connu arrête la migration (le lot
--- se rattache par `ameesh work link`, ou la réservation se libère, avant).
+-- les réservations existantes : leur dépôt s'il est déjà donné (ramené en
+-- minuscules, un dépôt vide n'en est pas un), sinon celui de l'issue du lot.
+-- Aucun espace de noms inventé : une réservation sans dépôt connu arrête la
+-- migration (le lot se rattache par `ameesh work link`, ou la réservation se
+-- libère, avant).
+update work_items
+   set migration_repo = nullif(lower(btrim(migration_repo, E' \t\n\r\f\v')), '')
+ where migration_repo is not null;
 do $$
 declare orphans text;
 begin
     select string_agg('#' || id || ' (' || migration || ')', ', ' order by id) into orphans
       from work_items
-     where migration is not null and work_items_issue_repo(issue_ref) is null;
+     where migration is not null and migration_repo is null
+       and work_items_issue_repo(issue_ref) is null;
     if orphans is not null then
         raise exception 'migration 0390: reserved migration numbers without a repository '
                         '(issue owner/repo#N): %; link the issues or release them first', orphans;
@@ -30,6 +36,8 @@ begin
 end $$;
 update work_items set migration_repo = work_items_issue_repo(issue_ref)
  where migration is not null and migration_repo is null;
+update work_items set migration_repo = null
+ where migration is null and migration_repo is not null;
 
 -- un client d'avant #443 pose `migration` sans dépôt (et la libère sans
 -- l'effacer) : le dépôt de l'issue est pris pour lui, et sa réservation tombe
@@ -40,7 +48,7 @@ language plpgsql as $$
 begin
     if new.migration is null then
         new.migration_repo := null;
-    elsif new.migration_repo is not null then
+    elsif nullif(btrim(new.migration_repo, E' \t\n\r\f\v'), '') is not null then
         new.migration_repo := lower(btrim(new.migration_repo, E' \t\n\r\f\v'));
     else
         new.migration_repo := work_items_issue_repo(new.issue_ref);
