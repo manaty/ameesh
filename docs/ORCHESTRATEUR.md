@@ -264,9 +264,10 @@ ameesh-work-partial: <numéro du lot>
 
 Le lot reste ouvert jusqu'à la fusion d'une PR qui ne porte pas cette
 ligne (la même ligne dans le message d'une fusion locale le retient aussi,
-tant que le relevé n'a pas vu, après cette fusion, la branche en avance
-avec du travail nouveau, puis ce travail entrer dans la cible ; une branche
-seulement avancée jusqu'à la cible ne ferme pas le lot).
+tant que le relevé n'a pas vu, après avoir vu cette fusion, la branche en
+avance avec du travail nouveau, puis ce travail entrer dans la cible ; la
+date git de la fusion ne compte pas ; une branche seulement avancée jusqu'à
+la cible ne ferme pas le lot).
 Si le corps est illisible (`gh` absent ou non connecté), un lot sans
 branche déclarée reste ouvert ; une PR plus récente, lisible et complète,
 le ferme. Une branche déclarée et prouvée fusionnée ferme le lot comme

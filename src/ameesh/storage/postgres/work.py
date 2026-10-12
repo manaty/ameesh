@@ -22,6 +22,7 @@ ITEM_COLUMNS = """
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head, migration,
     extract(epoch from branch_head_at)::float8 as branch_head_ts,
+    partial_merge, extract(epoch from partial_seen_at)::float8 as partial_seen_ts,
     estimate_minutes, estimate_source, estimate_by, change_size,
     extract(epoch from estimate_at)::float8 as estimate_ts,
     extract(epoch from started_at)::float8 as started_ts,
@@ -598,12 +599,25 @@ class WorkItems(interface.WorkItems):
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible
         (sans journal ni `updated_at` : un relevé n'est pas une activité du
-        lot), et quand (L118d, 0372). Conditionné à la branche lue : rien si
-        elle a changé."""
+        lot), et quand (L118d, 0372, horloge de la base). Une pointe inchangée
+        est relevée de nouveau si son instant précède la dernière fusion
+        partielle vue (#346 r2) : elle est encore là après cette fusion.
+        Conditionné à la branche lue : rien si elle a changé."""
         rows = self.db.query(
-            "UPDATE work_items SET branch_head = %s, branch_head_at = now()"
-            " WHERE id = %s AND branch = %s AND branch_head IS DISTINCT FROM %s"
+            "UPDATE work_items SET branch_head = %s, branch_head_at = clock_timestamp()"
+            " WHERE id = %s AND branch = %s AND (branch_head IS DISTINCT FROM %s"
+            "       OR branch_head_at IS NULL OR branch_head_at <= partial_seen_at)"
             " RETURNING id", (head, int(item_id), branch, head))
+        return bool(rows)
+
+    def set_partial_seen(self, item_id, sha) -> bool:
+        """#346 r2 : retient la dernière fusion partielle du lot et l'instant
+        (horloge de la base) où le relevé l'a vue la première fois ; rien si
+        c'est déjà elle (sans journal ni `updated_at`)."""
+        rows = self.db.query(
+            "UPDATE work_items SET partial_merge = %s, partial_seen_at = clock_timestamp()"
+            " WHERE id = %s AND partial_merge IS DISTINCT FROM %s"
+            " RETURNING id", (sha, int(item_id), sha))
         return bool(rows)
 
     def open_for_sweep(self, limit) -> list[dict]:

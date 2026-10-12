@@ -615,20 +615,21 @@ def gh_pr_body(repo: str, number: int) -> str:
 
 
 def _moved_past(repo: str, seen: str | None, seen_ts: float | None, tip: str,
-                merge: dict) -> bool:
+                merge: dict, merge_seen_ts: float | None) -> bool:
     """#312 r2, L118d : la branche a-t-elle livré du travail au-delà de la
     fusion partielle `merge` ? Il faut que le relevé l'ait vue en avance sur
     sa cible avec une pointe `seen` (`branch_head`) qui n'était pas dans la
-    branche fusionnée (second parent de `merge`), et que cette pointe soit
+    branche fusionnée (second parent) ni dans la cible d'alors, puis la voir
     entrée dans la cible (ancêtre de la pointe fusionnée `tip`). Une branche
     seulement avancée jusqu'à la cible, sans travail nouveau, n'y suffit pas :
     son nouveau sommet est la fusion partielle elle-même ou la suite de la
-    cible. #346 r1 : la pointe doit avoir été relevée APRÈS la fusion
-    (`seen_ts`, horloge de la base, au-delà de `CLOCK_SLACK_S`), et toute
-    erreur de git laisse le lot ouvert (« non ancêtre » : code 1 seulement)."""
+    cible. #346 : la pointe doit avoir été relevée (`seen_ts`) après que le
+    relevé a vu la fusion (`merge_seen_ts`), deux instants de l'horloge de la
+    base, jamais une date git, que son auteur choisit ; et toute erreur de git
+    laisse le lot ouvert (« non ancêtre » : code 1 seulement)."""
     parents = merge.get("parents") or []
-    if len(parents) < 2 or not seen or seen_ts is None \
-            or float(seen_ts) <= float(merge["ts"]) + CLOCK_SLACK_S:
+    if len(parents) < 2 or not seen or seen_ts is None or merge_seen_ts is None \
+            or float(seen_ts) <= float(merge_seen_ts):
         return False
     for outside in (parents[1], merge["sha"]):
         # ni dans la branche fusionnée, ni dans la cible d'alors
@@ -811,9 +812,14 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # quand le corps est illisible (hôte sans gh) : seule la preuve
             # implicite attend de savoir ; une fusion partielle retient toujours
             proven = bool(found and found["merged"] and row.get("branch"))
+            if partial and partial[0]["sha"] != row.get("partial_merge") and not dry_run:
+                # #346 r2 : l'instant où le relevé voit la fusion partielle
+                # pour la première fois, à l'horloge de la base
+                st.work.set_partial_seen(lot, partial[0]["sha"])
+                row = dict(row, partial_merge=partial[0]["sha"], partial_seen_ts=None)
             if partial and found and found["merged"] and found["tip"] \
                     and _moved_past(repo, row.get("branch_head"), row.get("branch_head_ts"),
-                                    found["tip"], partial[0]):
+                                    found["tip"], partial[0], row.get("partial_seen_ts")):
                 # #312 r2 : seule la dernière fusion de la branche compte ; la
                 # branche vue depuis en avance, puis fusionnée (avance rapide),
                 # a livré la suite (L118d : pas une simple avance jusqu'à la cible)
@@ -842,8 +848,13 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         entry.update(how=found["how"], ref=found["ref"], detail=found["detail"], result="open",
                      repo=repo)
         if not found["merged"]:
-            if branch and found["ahead"] and found["tip"] \
-                    and found["tip"] != row.get("branch_head") and not dry_run:
+            stale = row.get("branch_head_ts") is None or (
+                row.get("partial_merge") and (row.get("partial_seen_ts") is None
+                                              or row["branch_head_ts"] <= row["partial_seen_ts"]))
+            if branch and found["ahead"] and found["tip"] and not dry_run \
+                    and (found["tip"] != row.get("branch_head") or stale):
+                # #346 r2 : une pointe inchangée relevée avant la fusion
+                # partielle l'est de nouveau, puisqu'elle est encore là
                 if implicit:
                     # L118b : la branche implicite devient celle du lot (journal)
                     try:
