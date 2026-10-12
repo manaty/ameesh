@@ -618,17 +618,18 @@ def _local_session(cfg: Config, row: dict) -> str | None:
 
 def _critical(cfg: Config, row: dict) -> bool:
     """L242c : comme `Runner.is_critical` — déclaré, ou rôle critique de sa
-    fiche dans son canon propriétaire."""
-    from . import sous_utilisation as su
+    fiche dans son canon propriétaire ; canon illisible : le repli
+    (`sous_utilisation.CRITICAL_FALLBACK`, #424 r1)."""
+    from . import canon as canon_mod, sous_utilisation as su
     if row["name"] in (getattr(cfg, "critical_agents", None) or ()) \
             or row["name"] in su.declared_orchestrators():
         return True
+    configured = bool(canon_mod.configured(cfg))
     try:
-        from . import canon as canon_mod
-        canons = canon_mod.load_configured(cfg) if getattr(cfg, "canon", None) else []
+        canons = canon_mod.load_configured(cfg) if configured else []
     except Exception:
         canons = []
-    return su.critical_by_role(row, canons)
+    return su.critical_verdict(row, canons, configured=configured)[0]
 
 
 def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:

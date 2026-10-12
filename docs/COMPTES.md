@@ -457,13 +457,23 @@ critical_roles: [orchestrateur, conception, auditeur, relecture]
 ```
 
 That list is the default when the key is absent; an empty list makes no
-role critical. Each role also matches its usual synonym: `orchestrator`,
-`design`, `auditor`, `review` or `reviewer`. The `auditeur` agent without a
-card is critical while `auditeur` is a critical role.
+role critical. A role and its usual synonym match each other both ways:
+`orchestrateur` and `orchestrator`, `conception` and `design`, `auditeur` and
+`auditor`, `relecture` and `review` or `reviewer`. The `auditeur` agent
+without a card is critical while `auditeur` is a critical role.
 
 A role counts only on the card in the agent's own canon, against that
-canon's `critical_roles`. A conflicting card with the same name in another
-canon never makes an agent critical.
+canon's `critical_roles`, and only as the canon validated it: a `roles:`
+value that `ameesh canon check` rejects (`agent-roles-invalid`) gives no
+role. A conflicting card with the same name in another canon never makes an
+agent critical.
+
+**Unreadable canon.** When the agent's own canon cannot be loaded or read,
+its criticality is never lowered silently: the runner keeps the last
+verdict it read, and without one, `orchestrateur`, `mesh-design` and the
+`auditeur` agent stay critical (plus `critical_agents`). `ameesh alerts`
+raises `critical_roles_unreadable` for each configured canon that cannot be
+read on the host.
 
 Two declarations still make an agent critical whatever its roles:
 

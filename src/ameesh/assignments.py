@@ -37,11 +37,11 @@ class AssignmentError(RuntimeError):
 
 def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
-    fiche Agent du canon dont `roles` nomme un orchestrateur
-    (`sous_utilisation.orchestrators`), ou — tant qu'aucune fiche ne déclare
-    de rôles (L242c) — agent qui a confié des lots dans les 30 derniers
-    jours. `roles` : les rôles du canon qui comptent (défaut : orchestrateur ;
-    `work.CORRECTOR_ROLES` ajoute les agents de conception)."""
+    fiche Agent de son canon propriétaire dont `roles` nomme un orchestrateur
+    (`sous_utilisation.orchestrators`), ou — tant que son organisation ne
+    déclare aucun rôle (L242c) — agent qui a confié des lots dans les 30
+    derniers jours. `roles` : les rôles du canon qui comptent (défaut :
+    orchestrateur ; `work.CORRECTOR_ROLES` ajoute les agents de conception)."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -49,29 +49,15 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     if name in declared:
         return True
     try:
-        from . import canon
-        configured = canon.load_configured(cfg) if cfg is not None else []
+        from . import canon, registry
+        canons = canon.load_configured(cfg) if cfg is not None else []
+        row = registry.get(db, name) if db is not None else None
     except Exception:
-        configured = []
-    if not su.roles_declared(configured):
-        try:
-            if name in {su._bare(n) for n in storage.of(db).operations.assigners(
-                    since_s=su.ASSIGNERS_SINCE_S)}:
-                return True
-        except Exception:
-            pass
+        canons, row = [], None
+    row = dict(row or {}, name=name)
     try:
-        canons = configured
-        if roles is not None:
-            # Correction roles are authority from this agent's own canon,
-            # never from a namesake card in another configured canon.
-            from . import registry
-            row = registry.get(db, name)
-            canons = [c for c in configured
-                      if row is not None and c.owns(row.get("canon"))]
-        return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
-                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES,
-                                        deduce=False)
+        return name in su.orchestrators(cfg, db, [row], declared=(), canons=canons,
+                                        roles=roles or su.ORCHESTRATOR_ROLES)
     except Exception:
         return False
 

@@ -98,7 +98,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #411: Docker storage needs an explicit owner cleanup decision.
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
-                 "critical_budget_pause")
+                 "critical_budget_pause",
+                 # L242c : canon illisible, rôles critiques tenus
+                 "critical_roles_unreadable")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -171,6 +173,7 @@ TYPE_LABELS = {
 
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    "critical_roles_unreadable": "canon unreadable: critical roles held",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

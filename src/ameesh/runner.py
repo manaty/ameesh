@@ -5195,19 +5195,34 @@ class Runner:
         de la marge. L242c : déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS` :
         la surcharge explicite ; `AMEESH_ALERT_ORCHESTRATORS`), sinon par un
         rôle critique de sa fiche, dans son canon propriétaire seulement
-        (`sous_utilisation.critical_by_role` : `critical_roles` de
-        l'organisation, défaut orchestrateur, conception, auditeur, relecture)."""
+        (`critical_roles` de l'organisation, défaut orchestrateur, conception,
+        auditeur, relecture). Canon propriétaire illisible (#424 r1) : le
+        dernier verdict lu, sinon `sous_utilisation.CRITICAL_FALLBACK`."""
         if name in (getattr(self.cfg, "critical_agents", None) or ()):
             return True
         if name in getattr(self, "_orchestrators_declared", ()):
             return True
-        from . import sous_utilisation as su
+        from . import canon as canon_mod, sous_utilisation as su
         canons = getattr(self, "_audit_canons", ())
+        known = self.__dict__.setdefault("_critical_known", {})
         # le registre n'est lu que pour un nom candidat, comme `is_auditor`
-        if name not in su.critical_candidates(canons):
+        # (tous les canons configurés chargés : un absent ne dit rien)
+        if (getattr(self, "_canon_complete", True) and not known.get(name)
+                and all(getattr(c, "readable", True) for c in canons)
+                and name not in su.critical_candidates(canons)):
             return False
         row = agent if agent is not None else registry.get(self.db, name)
-        return su.critical_by_role(dict(row or {}, name=name), canons)
+        verdict, unknown = su.critical_verdict(
+            dict(row or {}, name=name), canons,
+            configured=bool(canon_mod.configured(self.cfg)), known=known.get(name))
+        if not unknown:
+            known[name] = verdict
+        elif self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
+            self._critical_held[name] = verdict
+            log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
+                      % (name, "critical" if verdict else "not critical",
+                         "last known" if name in known else "default"))
+        return verdict
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:

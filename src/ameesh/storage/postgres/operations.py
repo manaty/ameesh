@@ -89,6 +89,7 @@ class Operations(interface.Operations):
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    r.last_error,  -- L106 : le détail de « hôte non prêt »
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    (r.lease_owner IS NOT NULL

@@ -106,6 +106,10 @@ CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
 #: L242c : les autres noms reconnus d'un rôle dans `roles`/`role` d'une fiche
 ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
                  "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
+_ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in aliases}
+#: L242c (#424 r1) : canon propriétaire illisible et aucun verdict connu —
+#: critiques par défaut (avec la persona auditeur et `critical_agents`)
+CRITICAL_FALLBACK = ("orchestrateur", "mesh-design", "auditeur")
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -322,70 +326,128 @@ def _bare(name: str) -> str:
 def role_orchestrators(canons, roles=None) -> set:
     """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
     (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
-    `roles` donnés."""
-    wanted = {str(r).strip().lower() for r in (roles or ORCHESTRATOR_ROLES)}
+    `roles` donnés (synonymes dans les deux sens, L242c)."""
+    wanted = {_canonical(r) for r in (roles or ORCHESTRATOR_ROLES)}
     found = set()
     for canon in canons or []:
         for agent in getattr(canon, "agents", None) or []:
-            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
-            fiche_roles = data.get("roles") or data.get("role") or []
-            if isinstance(fiche_roles, str):
-                fiche_roles = [fiche_roles]
-            if any(str(r).strip().lower() in wanted for r in fiche_roles):
+            if wanted & set(_card_roles(agent)):
                 found.add(agent.title)
     return found
 
 
-def _card_roles(data) -> list:
-    named = (data or {}).get("roles") or (data or {}).get("role") or []
-    return [named] if isinstance(named, str) else list(named)
+def _canonical(role) -> str:
+    """Le nom d'un rôle, en minuscules, synonyme ramené au rôle (L242c,
+    #424 r1 : `review` et `relecture` se reconnaissent dans les deux sens)."""
+    role = str(role).strip().lower()
+    return _ROLE_OF.get(role, role)
+
+
+def _card_roles(agent) -> list:
+    """Les rôles d'une fiche Agent tels que le canon les a validés (`roles`
+    analysé : une valeur invalide n'en donne aucun, #424 r1), sinon `role:`
+    s'il est un texte ; ramenés à leur nom (`_canonical`). Une fiche sans
+    analyse (objet factice) : le frontmatter, liste de textes ou texte."""
+    data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+    if hasattr(agent, "roles"):
+        named = agent.roles
+    else:
+        named = data.get("roles")
+        if isinstance(named, str):
+            named = [named]
+        elif not (isinstance(named, list) and all(isinstance(r, str) for r in named)):
+            named = None
+    if named is None:
+        single = data.get("role")
+        named = [single] if isinstance(single, str) else []
+    return [role for role in (_canonical(r) for r in named) if role]
 
 
 def roles_declared(canons) -> bool:
     """L242c : une fiche Agent d'un des canons déclare-t-elle des rôles ?
-    Alors seuls les rôles désignent orchestrateurs et agents critiques (plus
-    de déduction par les lots confiés)."""
-    return any(_card_roles(getattr(getattr(agent, "fiche", None), "data", None))
+    Alors seuls les rôles désignent ses orchestrateurs (plus de déduction par
+    les lots confiés)."""
+    return any(_card_roles(agent)
                for canon in canons or [] for agent in getattr(canon, "agents", None) or [])
+
+
+def _owners(row, canons) -> list:
+    """Les canons propriétaires de `row` (un canon sans `owns` : tous)."""
+    return [c for c in canons or []
+            if getattr(c, "owns", None) is None or c.owns((row or {}).get("canon"))]
+
+
+def _card(canon, name):
+    return next((a for a in getattr(canon, "agents", None) or [] if a.title == name), None)
+
+
+def deduces(row, canons) -> bool:
+    """L242c (#424 r1) : la déduction par les lots confiés vaut pour un agent
+    dont l'organisation (son canon propriétaire) ne déclare aucun rôle."""
+    return not roles_declared(_owners(row, canons))
+
+
+def card_role(row, canons, roles) -> bool:
+    """La fiche de l'agent `row`, dans son canon propriétaire seulement, nomme-
+    t-elle l'un des `roles` ? Une fiche homonyme d'un autre canon ne compte
+    jamais (#324 r1, #424 r1)."""
+    wanted = {_canonical(r) for r in roles}
+    for canon in _owners(row, canons):
+        if not getattr(canon, "readable", True):
+            continue
+        definition = _card(canon, row["name"])
+        if definition is not None and wanted & set(_card_roles(definition)):
+            return True
+    return False
 
 
 def critical_roles(canon) -> tuple:
     """L242c : les rôles critiques d'une organisation (`critical_roles` de son
-    federation.yaml, liste ; vide : aucun), sinon `CRITICAL_ROLES` ; en
-    minuscules, synonymes compris."""
+    federation.yaml, liste ; vide : aucun), sinon `CRITICAL_ROLES` ; chacun
+    ramené à son nom (`_canonical`)."""
     declared = (getattr(canon, "federation", None) or {}).get("critical_roles")
     if isinstance(declared, str):
         declared = [declared]
     if not isinstance(declared, (list, tuple)):
         declared = CRITICAL_ROLES
-    out = []
-    for role in declared:
-        role = str(role).strip().lower()
-        if role:
-            out += [role, *ROLE_SYNONYMS.get(role, ())]
-    return tuple(dict.fromkeys(out))
+    return tuple(dict.fromkeys(role for role in (_canonical(r) for r in declared
+                                                 if isinstance(r, str)) if role))
 
 
-def critical_by_role(row, canons) -> bool:
-    """L242c : l'agent du registre `row` porte-t-il un rôle critique dans la
-    fiche de son canon propriétaire (une fiche en conflit dans un autre canon
-    ne compte pas, #324 r1) ? La persona `auditeur` sans fiche l'est tant que
-    le rôle auditeur est critique (sans canon : les rôles par défaut)."""
+def critical_by_role(row, canons) -> bool | None:
+    """L242c : l'agent du registre `row` porte-t-il un rôle critique de son
+    organisation, dans la fiche de son canon propriétaire ? La persona
+    `auditeur` l'est sans fiche tant que le rôle auditeur est critique.
+    None (#424 r1) : son canon propriétaire n'est pas chargé ou illisible —
+    inconnu, jamais « non » (`critical_verdict`)."""
     from .alert_briefs import AUDITOR_NAME
-    owners = [c for c in canons or [] if getattr(c, "readable", True)
-              and c.owns(row.get("canon"))]
-    if row.get("name") == AUDITOR_NAME and any(
-            "auditeur" in critical_roles(c) for c in owners or [None]):
-        return True
+    owners = _owners(row, canons)
+    if not owners or not all(getattr(c, "readable", True) for c in owners):
+        return None
     for canon in owners:
-        definition = canon.agent(row["name"])
-        if definition is None:
-            continue
-        wanted = set(critical_roles(canon))
-        if any(str(r).strip().lower() in wanted
-               for r in _card_roles(definition.fiche.data)):
+        roles = critical_roles(canon)
+        if row.get("name") == AUDITOR_NAME and "auditeur" in roles:
+            return True
+        if card_role(row, [canon], roles):
             return True
     return False
+
+
+def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
+    """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
+    l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
+    illisible (#424 r1) : le dernier verdict lu (`known`), sinon
+    `CRITICAL_FALLBACK` — jamais une baisse silencieuse ; la surcharge
+    `critical_agents` se juge avant."""
+    from .alert_briefs import AUDITOR_NAME
+    if not configured and not canons:
+        return row.get("name") == AUDITOR_NAME, False
+    verdict = critical_by_role(row, canons)
+    if verdict is not None:
+        return verdict, False
+    if known is not None:
+        return bool(known), True
+    return row.get("name") in CRITICAL_FALLBACK, True
 
 
 def critical_candidates(canons) -> set:
@@ -408,13 +470,14 @@ def declared_orchestrators(env=None) -> set:
 
 
 def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
-                  roles=ORCHESTRATOR_ROLES, deduce: bool | None = None) -> list:
+                  roles=ORCHESTRATOR_ROLES) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
-    `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
-    a confié des lots (délégation ou `work assign`) dans les 30 derniers
-    jours — tant qu'aucune fiche ne déclare de rôles (L242c ; `deduce` le
-    tranche pour l'appelant). Seulement des agents du registre."""
+    `role`) nomme un orchestrateur (ou l'un des `roles` donnés) dans le canon
+    propriétaire de l'agent (#424 r1), ou agent qui a confié des lots
+    (délégation ou `work assign`) dans les 30 derniers jours — tant que son
+    organisation ne déclare aucun rôle (L242c, `deduces`). Seulement des
+    agents du registre."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -423,15 +486,15 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    found |= role_orchestrators(canons, roles)
-    if deduce if deduce is not None else not roles_declared(canons):
-        # L242c : la déduction par les lots confiés, seulement tant qu'aucune
-        # fiche ne déclare de rôles
+    found |= {row["name"] for row in listing if card_role(row, canons, roles)}
+    deducing = [row for row in listing if deduces(row, canons)]
+    if deducing:
         try:
-            found |= {_bare(n) for n in storage.of(db).operations.assigners(
+            assigners = {_bare(n) for n in storage.of(db).operations.assigners(
                 since_s=ASSIGNERS_SINCE_S)}
         except Exception:
-            pass
+            assigners = set()
+        found |= {row["name"] for row in deducing if row["name"] in assigners}
     # L123 : le chat du propriétaire transmet, il ne répartit pas
     from .chat import is_chat_agent
     chats = {row["name"] for row in listing if is_chat_agent(row)}
