@@ -126,7 +126,7 @@ def _origin_url(path: str) -> str:
 
 
 def _clone(repository: str, path: str, env: dict) -> None:
-    proc = _git(os.path.dirname(path), "clone", "-q", "--no-local", "--", repository, path,
+    proc = _git(os.path.dirname(path), "clone", "-q", "--no-local", "--template=", "--", repository, path,
                 env=env, check=False)
     if proc.returncode != 0:
         raise MemoryError("memory clone failed: %s" % proc.stderr.strip()[-300:])
