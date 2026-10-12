@@ -527,8 +527,9 @@ names (names in §2.1/§2.2/§2.5). Also update `.github/workflows/carte.yml`, `
 Tests and CI call these scripts; do it in one PR so the workflow never sees a half-renamed tool.
 
 **2c — free-file function renames.** `identity.py` (`chantier_of` → `workstream_of`),
-`chat.py` (`consigne` → `instruction`), `plan_github.py` (`fiche_link` → `card_link`),
-`progress.py` (2 names), `roadmap_dev.py` (5 names), `storage/postgres/mailbox.py` (2 names).
+`chat.py` (`consigne` → `instruction`) and `watch.py` (same name), `plan_github.py`
+(`fiche_link` → `card_link`), `progress.py` (2 names), `roadmap_dev.py` (5 names).
+`storage/postgres/mailbox.py` (2 names) was already done in stage 1a (§1a, free files).
 Add aliases where the name is exported (`old = new`) and delete them in the cleanup PR.
 
 ### Stage 3 — database: `chantier` → `workstream` (2 migrations + 2 PRs)
