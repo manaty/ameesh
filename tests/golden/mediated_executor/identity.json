@@ -1,0 +1,129 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "family": "identity",
+ "enroll": {
+  "request": {
+   "method": "POST",
+   "path": "/api/exec/v1/enroll",
+   "body": {
+    "schema": "ameesh-exec-enroll/1",
+    "code": "K7QF-2M9D-XW4P-8RTA-J3NC-5HVB",
+    "public_key": {
+     "kty": "EC",
+     "crv": "P-256",
+     "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+     "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+    },
+    "proof": "<ES256 base64url sur JCS({code, public_key, server_url})>",
+    "device_attestation": null,
+    "label": "portable (VM Compute)"
+   }
+  },
+  "response": {
+   "status": 201,
+   "body": {
+    "executor_id": "7f3a9c2e4b1d6058",
+    "mesh": "mesh-exemple",
+    "host": "anna-portable",
+    "server_time": 1791640000.12
+   }
+  }
+ },
+ "token": {
+  "request": {
+   "method": "POST",
+   "path": "/api/exec/v1/token",
+   "body": {
+    "assertion": "<JWS ES256 (signature JOSE r||s) : iss=7f3a9c2e4b1d6058, aud=https://mesh.exemple, iat, exp<=iat+60, jti>"
+   }
+  },
+  "response": {
+   "status": 200,
+   "body": {
+    "schema": "ameesh-exec-token/1",
+    "access_token": "amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "token_type": "Bearer",
+    "expires_ts": 1791640600.12
+   }
+  }
+ },
+ "session_token": {
+  "request": {
+   "method": "POST",
+   "path": "/api/exec/v1/session-token",
+   "headers": {
+    "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "body": {
+    "fence": {
+     "agent": "inge-front",
+     "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+     "epoch": 42
+    }
+   }
+  },
+  "response": {
+   "status": 200,
+   "body": {
+    "schema": "ameesh-exec-session-token/1",
+    "access_token": "ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "token_type": "Bearer",
+    "expires_ts": 1791640090.12
+   }
+  }
+ },
+ "host": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/host",
+   "headers": {
+    "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   }
+  },
+  "response": {
+   "status": 200,
+   "body": {
+    "schema": "ameesh-exec-host/1",
+    "host": "anna-portable",
+    "mesh": "mesh-exemple",
+    "executor_id": "7f3a9c2e4b1d6058",
+    "limits": {
+     "max_agents": 1,
+     "resources": {
+      "min_mem_available": 536870912,
+      "max_swap_used": 1073741824,
+      "max_load": 4.0,
+      "min_disk_free": 2147483648
+     }
+    },
+    "lease_ttl_s": 90.0,
+    "lease_renew_s": 30.0,
+    "harnesses": [
+     "dsh"
+    ],
+    "models": [
+     "deepseek-chat"
+    ],
+    "agents": [
+     "inge-front"
+    ],
+    "available": true,
+    "contract_version": "1.1.0"
+   }
+  }
+ },
+ "health": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/health"
+  },
+  "response": {
+   "status": 200,
+   "body": {
+    "schema": "ameesh-exec-health/1",
+    "contract": "1.1.0",
+    "server_ts": 1791640000.12
+   }
+  }
+ }
+}

@@ -341,8 +341,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("copy: invalid agent name %r" % name, file=sys.stderr)
             return 2
         if bk.kind == "pg":
-            from . import registry
-            if registry.get(bk.db, name) is None:
+            from . import undeliverable
+            if undeliverable.registry_rows(bk.db, [name])[name] is None:
                 print("copy refused: unknown agent: %s (nothing dropped)" % name,
                       file=sys.stderr)
                 return 2
@@ -412,10 +412,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # L118 : le courrier qui confie du travail est lié à un lot (avant le
     # dépôt : une attribution refusée ne dépose rien)
     thread_meta = None
+    if new_lot is not None and getattr(bk, "mediated", False):
+        print("--new-lot is unavailable in mediated contract 1.1; create and assign "
+              "the work item on the server before sending mail", file=sys.stderr)
+        return 2
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
         print("--new-lot requires the database and a single recipient", file=sys.stderr)
         return 2
-    if bk.kind == "pg" and dest != "all":
+    # Contract 1.1 permits a thread label, but not assignment or work creation.
+    # The server remains responsible for linking and assigning work items.
+    if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
         from . import assignments, plan_git
         try:
             linked = assignments.link_message(
@@ -895,10 +901,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                   % (binding.name, binding.reason), file=sys.stderr)
         return 0
     name = binding.name
+    if not getattr(bk, "hook_delivery", True):
+        # Mediated session hooks leave delivery to the executor's next turn.
+        return 0
     attendu = hook_foreign_harness(tool)
     if attendu:
-        # L224 : un id de session ne vient que du harnais de l'agent ; le
-        # courrier non plus n'est remis qu'à lui.
+        # Only the agent's own harness may register sessions or deliver mail.
         _foreign_hook_refused(cfg, bk, name, tool, attendu, data.get("session_id"))
         return 0
     # L166 : sous bail, la session de l'agent est celle que l'exécuteur lit
