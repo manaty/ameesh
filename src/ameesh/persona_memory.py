@@ -8,6 +8,8 @@ session performs consolidation. No paid model calls or native memory store."""
 from __future__ import annotations
 
 import os
+import logging
+import tempfile
 import re
 import shutil
 import shlex
@@ -48,7 +50,7 @@ def isolation_policy(cfg, canon_id: str | None = None) -> str:
             source = next((s for s in canon.sources if s.member == host.fiche.member), None)
             if source is not None and source.mode == "git":
                 branch = canon_mod.remote_branch(source.repo, source.rev)
-                approved = canon_mod.git_commit(source.repo, branch) if branch else None
+                approved = canon_mod.git_commit(source.repo, "refs/remotes/" + branch) if branch else None
                 if approved and canon_mod.git_contains(source.repo, source.commit, approved):
                     return "shared-uid-accepted"
     return "required"
@@ -124,22 +126,34 @@ def open_copy(repository: str, state_dir: str, agent: str, *, cfg_raw=None) -> s
     env = _git_env(cfg_raw)
     if os.path.lexists(path) and os.path.realpath(path) != os.path.abspath(path):
         raise MemoryError("memory copy contains a symlink in its path")
-    if os.path.isdir(os.path.join(path, ".git")):
+    existing = os.path.isdir(os.path.join(path, ".git"))
+    if existing:
         _safe_copy(path, repository)
-        os.chmod(path, 0o700)
-        _git(path, "pull", "--rebase", "--autostash", "-q", env=env)
-        _safe_copy(path, repository)
-        return path
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    proc = subprocess.run(["git", "clone", "-q", "--", repository, path], capture_output=True,
-                          text=True, timeout=GIT_TIMEOUT, env=env)
-    if proc.returncode != 0:
-        shutil.rmtree(path, ignore_errors=True)
-        raise MemoryError("memory clone failed: %s" % proc.stderr.strip()[-300:])
-    os.chmod(path, 0o700)
-    _safe_copy(path, repository)
-    _git(path, "config", "user.name", agent)
-    _git(path, "config", "user.email", "%s@personas.ameesh.invalid" % agent)
+    # A stopped persona's entire copy, including Git configuration and local
+    # commits, is writable by any peer sharing its UID. Never autostash/rebase
+    # that state into the next activation; reconstruct from the published repo.
+    with tempfile.TemporaryDirectory(prefix="ameesh-memory-activation-") as staging:
+        fresh = os.path.join(staging, "copy")
+        proc = subprocess.run(["git", "clone", "-q", "--", repository, fresh], capture_output=True,
+                              text=True, timeout=GIT_TIMEOUT, env=env)
+        if proc.returncode != 0:
+            raise MemoryError("memory clone failed: %s" % proc.stderr.strip()[-300:])
+        _safe_copy(fresh, repository)
+        os.chmod(fresh, 0o700)
+        _git(fresh, "config", "user.name", agent)
+        _git(fresh, "config", "user.email", "%s@personas.ameesh.invalid" % agent)
+        if existing:
+            changed = (_git(path, "rev-parse", "HEAD").stdout.strip()
+                       != _git(fresh, "rev-parse", "HEAD").stdout.strip()
+                       or bool(_git(path, "status", "--porcelain", "--untracked-files=all").stdout))
+            if changed:
+                logging.getLogger(__name__).warning(
+                    "[%s] memory activation: discarded local state; restored published repository", agent)
+            shutil.rmtree(path)
+        elif os.path.lexists(path):
+            raise MemoryError("memory path exists without a safe repository")
+        shutil.move(fresh, path)
     return path
 
 
@@ -227,6 +241,12 @@ def _outgoing_guard(path: str) -> dict | None:
 def sync(path: str, message: str, *, cfg_raw=None, repository: str | None = None) -> dict:
     """Commit changes and push, preserving the working copy on failure."""
     _safe_copy(path, repository)
+    url = repository or _git(path, "remote", "get-url", "origin").stdout.strip()
+    branch = _git(path, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    target = _git(path, "config", "--get", "branch." + branch + ".merge").stdout.strip()
+    if not target.startswith("refs/heads/"):
+        raise MemoryError("memory copy has no upstream branch")
+    tracking = "refs/remotes/origin/" + target[len("refs/heads/"):]
     _git(path, "add", "-A")
     deleted = set(filter(None, _git(path, "diff", "--cached", "--name-only",
                                     "--diff-filter=D", "-z").stdout.split("\0")))
@@ -246,17 +266,22 @@ def sync(path: str, message: str, *, cfg_raw=None, repository: str | None = None
     # Retry an earlier committed-but-unpushed turn even when no file changed.
     ahead = _git(path, "rev-list", "--count", "@{u}..HEAD", check=False)
     env = _git_env(cfg_raw)
-    push = _git(path, "push", "-q", env=env, check=False)
+    push = _git(path, "push", "-q", "--", url, "HEAD:" + target, env=env, check=False)
     if push.returncode != 0:
-        pull = _git(path, "pull", "--rebase", "-q", env=env, check=False)
+        pull = _git(path, "fetch", "-q", "--", url, "+" + target + ":" + tracking,
+                    env=env, check=False)
+        if pull.returncode == 0:
+            pull = _git(path, "rebase", "-q", tracking, env=env, check=False)
         if pull.returncode == 0:
             _safe_copy(path, repository)
             refused = _outgoing_guard(path)
             if refused:
                 return refused
-        push = _git(path, "push", "-q", env=env, check=False) if pull.returncode == 0 else pull
+        push = _git(path, "push", "-q", "--", url, "HEAD:" + target, env=env, check=False) if pull.returncode == 0 else pull
     if push.returncode != 0:
         return {"status": "push_rejected", "error": (push.stderr or "").strip()[-300:]}
+    # Explicit-URL pushes do not update origin's tracking ref automatically.
+    _git(path, "fetch", "-q", "--", url, "+" + target + ":" + tracking, env=env)
     if not changed and ahead.returncode == 0 and ahead.stdout.strip() == "0":
         return {"status": "unchanged"}
     return {"status": "pushed", "commit": _git(path, "rev-parse", "--short", "HEAD").stdout.strip()}
@@ -335,12 +360,13 @@ def main(argv) -> int:
             return 2
         require_isolation(cfg, db, agent)
         if sub == "consolidate":
-            if not os.path.isdir(os.path.join(path, ".git")):
-                path = open_copy(repo, cfg.state_dir, agent, cfg_raw=cfg.persona_memory)
+            path = open_copy(repo, cfg.state_dir, agent, cfg_raw=cfg.persona_memory)
             _safe_copy(path, repo)
             mail.send(db, "memory", agent, consolidation_prompt(path), kind="request")
             print("memory turn requested for %s" % agent)
             return 0
+        if os.path.isdir(os.path.join(path, ".git")):
+            path = open_copy(repo, cfg.state_dir, agent, cfg_raw=cfg.persona_memory)
         r = close(path, cfg_raw=cfg.persona_memory, repository=repo)
         print("copy for %s: %s" % (agent, r["status"]))
         return 0 if r["status"] in ("removed", "absent") else 1

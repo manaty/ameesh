@@ -64,6 +64,28 @@ class MemoryRunnerTest(PgTestCase):
         names = subprocess.check_output(["git", "-C", self.bare, "ls-tree", "-r", "--name-only", "main"], text=True)
         self.assertIn("journal/session-", names)
 
+    def test_resumed_activation_discards_inactive_persona_forgery(self):
+        path = pm.open_copy(self.bare, self.cfg.state_dir, "memory-a")
+        with open(os.path.join(path, "MEMORY.md"), "w") as fh:
+            fh.write("forged by an inactive peer")
+        for args in (("add", "-A"), ("commit", "-qm", "forged while stopped")):
+            subprocess.run(["git", "-C", path, *args], check=True)
+        self.worker.agent["session_id"] = "resumed-session"
+        with mock.patch.object(self.worker, "_session_connue", return_value=lambda _: True), \
+                self.assertLogs(pm.__name__, level="WARNING"):
+            self._turn()
+        self.assertNotIn("forged", pm.index_text(path))
+        self.assertIn("Durable project fact", pm.index_text(path))
+        remote = subprocess.check_output(["git", "-C", self.bare, "show", "main:MEMORY.md"], text=True)
+        self.assertNotIn("forged", remote)
+        self.assertIn("PERSONA MEMORY", " ".join(self.turns()[0]["argv"]))
+
+    def test_failed_activation_never_syncs_local_copy(self):
+        with mock.patch.object(pm, "open_copy", side_effect=pm.MemoryError("offline")), \
+                mock.patch.object(pm, "sync") as sync:
+            self._turn()
+        sync.assert_not_called()
+
     def test_active_peer_disables_designation_and_sync(self):
         registry.upsert(self.db, "memory-b", harness="codex", host=self.cfg.host, mode="execute")
         self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = 'memory-b'")
@@ -88,6 +110,7 @@ class MemoryRunnerTest(PgTestCase):
             fh.write("durable note")
         other = os.path.join(self.tmp, "other.git")
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", other], check=True)
+        self.worker._memory_activated = True
         self.worker.agent["memory_repository"] = other
         with mock.patch.object(pm, "_git", wraps=pm._git) as git:
             self.worker._sync_memory()

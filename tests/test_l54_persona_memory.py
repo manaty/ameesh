@@ -203,6 +203,42 @@ class WorkingCopyTest(_Repository):
         self.assertNotIn("new.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
         self.assertEqual(git(path, "diff", "--cached", "--name-only"), "")
 
+    def test_activation_discards_inactive_peer_edits_and_commits(self):
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                path = self.open_copy()
+                with open(os.path.join(path, "MEMORY.md"), "w") as fh:
+                    fh.write("forged inactive persona memory")
+                with open(os.path.join(path, "forged.md"), "w") as fh:
+                    fh.write("untracked forged note")
+                if committed:
+                    git(path, "add", "-A")
+                    git(path, "commit", "-qm", "peer forgery")
+                with mock.patch.object(pm.logging, "getLogger") as logger:
+                    self.assertEqual(self.open_copy(), path)
+                self.assertNotIn("forged", pm.index_text(path))
+                self.assertFalse(os.path.exists(os.path.join(path, "forged.md")))
+                logger.return_value.warning.assert_called_once()
+                self.assertIn("discarded local state", logger.return_value.warning.call_args.args[0])
+                self.assertEqual(pm.sync(path, "resume")["status"], "unchanged")
+                self.assertEqual(git(path, "rev-parse", "HEAD"), git(self.bare, "rev-parse", "main"))
+
+    def test_push_ignores_pushurl_and_pushremote(self):
+        path = self.open_copy()
+        other = os.path.join(self.tmp, "other.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.bare, other], check=True)
+        before = git(other, "rev-parse", "main")
+        git(path, "remote", "add", "elsewhere", other)
+        git(path, "config", "remote.origin.pushurl", other)
+        git(path, "config", "branch.main.pushRemote", "elsewhere")
+        git(path, "config", "remote.pushDefault", "elsewhere")
+        with open(os.path.join(path, "note.md"), "w") as fh:
+            fh.write("durable persona note")
+        self.assertEqual(pm.sync(path, "turn", repository=self.bare)["status"], "pushed")
+        self.assertEqual(git(other, "rev-parse", "main"), before)
+        self.assertIn("note.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
+        self.assertEqual(pm.close(path, repository=self.bare)["status"], "removed")
+
     def test_repository_change_does_not_reuse_old_persona_memory(self):
         path = self.open_copy()
         other = os.path.join(self.tmp, "other.git")
@@ -225,6 +261,9 @@ class IsolationPolicyTest(_Repository):
         git(seed, "add", "-A")
         git(seed, "commit", "-qm", "owner exception")
         self.assertEqual(pm.isolation_policy(cfg), "required")
+        git(seed, "tag", "origin/main")
+        self.assertEqual(pm.isolation_policy(cfg), "required")
+        git(seed, "tag", "-d", "origin/main")
         git(seed, "push", "-q")
         git(seed, "fetch", "-q")
         self.assertEqual(pm.isolation_policy(cfg), "shared-uid-accepted")
@@ -247,7 +286,7 @@ class ExecutorTest(_Repository):
             fh.write("- a durable fact\n")
         logs = []
         worker = types.SimpleNamespace(
-            name="verif-a", agent={"memory_repository": self.bare},
+            _memory_activated=True, name="verif-a", agent={"memory_repository": self.bare},
             runner=types.SimpleNamespace(dry_run=False), db=mock.Mock(),
             cfg=types.SimpleNamespace(state_dir=self.state, persona_memory={}))
         import ameesh.runner as runner_mod

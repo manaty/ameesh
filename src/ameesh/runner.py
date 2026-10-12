@@ -2971,14 +2971,20 @@ class AgentWorker(threading.Thread):
         patch = self._path("model.patch.yml") if (model or effort) else None
         # Decision 0029: designate neutral files; the harness manages memory.
         memory_preface = ""
-        if not session and self.agent.get("memory_repository") and not self.runner.dry_run:
+        if self.agent.get("memory_repository") and not self.runner.dry_run:
             try:
                 memory_mod.require_isolation(self.cfg, self.db, self.name)
-                path = memory_mod.open_copy(self.agent["memory_repository"],
-                                            self.cfg.state_dir, self.name,
-                                            cfg_raw=self.cfg.persona_memory)
-                journal_id = "session-" + uuid.uuid4().hex
-                memory_preface = memory_mod.preface(path, self.name, journal_id)
+                activation = not self.__dict__.get("_memory_activated", False)
+                if activation:
+                    path = memory_mod.open_copy(self.agent["memory_repository"],
+                                                self.cfg.state_dir, self.name,
+                                                cfg_raw=self.cfg.persona_memory)
+                    self._memory_activated = True
+                else:
+                    path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
+                if activation or not session:
+                    journal_id = "session-" + uuid.uuid4().hex
+                    memory_preface = memory_mod.preface(path, self.name, journal_id)
             except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
                 log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
         resume += memory_preface
@@ -3606,6 +3612,8 @@ class AgentWorker(threading.Thread):
     def _sync_memory(self) -> None:
         """Transport the persona session's memory changes at turn end, in the background."""
         if not self.agent.get("memory_repository") or self.runner.dry_run:
+            return
+        if not self.__dict__.get("_memory_activated", False):
             return
         try:
             memory_mod.require_isolation(self.cfg, self.db, self.name)
