@@ -136,6 +136,14 @@ JOURNAL_CLOSE_TIMEOUT = 2.0
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
+#: L147 (#220 r2) : un conteneur relancé par sa politique (unité du
+#: gestionnaire utilisateur, podman-restart) peut démarrer après l'exécuteur —
+#: aucune ligne n'est soldée moins de BOOT_SETTLE_S après le démarrage de
+#: l'hôte, ni tant que le gestionnaire utilisateur démarre encore (au plus
+#: BOOT_SETTLE_MAX_S) ; la revue est refaite toutes les BOOT_REVIEW_EVERY_S
+BOOT_SETTLE_S = 600.0
+BOOT_SETTLE_MAX_S = 1800.0
+BOOT_REVIEW_EVERY_S = 60.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -3495,6 +3503,9 @@ class Runner:
         self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
+        #: L147 (#220 r2) : prochaine revue des lignes d'avant le démarrage
+        #: (horloge monotone), tant que leur solde attend les conteneurs
+        self.boot_review_at: float | None = None
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -4496,8 +4507,13 @@ class Runner:
         sa politique de redémarrage), ou invérifiable faute de moteur, reste
         orpheline et signalée (alerte `orphan_resource`). Rien n'est supprimé.
         Toutes les orphelines d'avant le démarrage sont revues, page par page.
+        #220 r2 : juste après le démarrage, un conteneur que sa politique va
+        relancer n'est peut-être pas encore là — tant que `_boot_settle_ready`
+        est faux, une ligne sans conteneur en cours n'est pas soldée mais
+        laissée telle quelle, et la revue est refaite (`boot_review_at`).
         Rend les lignes restées orphelines. Ne lève jamais."""
         from . import resources as resources_mod
+        self.boot_review_at = None
         boot = resources_mod.boot_time()
         if not boot:
             return []
@@ -4513,9 +4529,13 @@ class Runner:
                 after = int(page[-1]["id"])
             runtime = self.container_runtime()
             running = self._running_containers(runtime) if rows else {}
-            kept = []
+            settle = self._boot_settle_ready(time.time() - boot) if rows else True
+            kept, deferred = [], 0
             for row in rows:
                 alive = self._containers_alive(running, runtime, row)
+                if alive is not None and not alive and not settle:
+                    deferred += 1           # revue au prochain passage
+                    continue
                 if alive is not None and not alive:
                     turns.settle(row["turn_id"])
                     log("tour %s de %s d'avant le redémarrage de l'hôte : groupe %s "
@@ -4529,11 +4549,40 @@ class Runner:
                     % (row["turn_id"], row.get("agent"), row.get("pgid") or "?",
                        ", conteneurs %s" % ", ".join(alive or row["containers"])
                        if row.get("containers") else ""))
+            if deferred:
+                self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
+                log("%d tour(s) d'avant le redémarrage sans conteneur en cours : solde "
+                    "différé, des conteneurs peuvent encore être relancés (hôte démarré "
+                    "il y a %ds) ; nouvelle revue dans %ds"
+                    % (deferred, int(time.time() - boot), int(BOOT_REVIEW_EVERY_S)))
             return kept
         except db_mod.DbError as exc:
-            log_async("ressources d'avant le redémarrage non vérifiées (%s)"
-                      % db_mod.explain(exc))
+            log_async("ressources d'avant le redémarrage non vérifiées (%s) ; nouvelle "
+                      "revue dans %ds" % (db_mod.explain(exc), int(BOOT_REVIEW_EVERY_S)))
+            self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
             return []
+
+    def _boot_settle_ready(self, uptime: float) -> bool:
+        """#220 r2 : les conteneurs relancés au démarrage ont-ils eu le temps
+        de l'être ? Pas avant BOOT_SETTLE_S de fonctionnement, ni tant que le
+        gestionnaire utilisateur démarre encore ses unités (celles qui
+        relancent les conteneurs) ; au-delà de BOOT_SETTLE_MAX_S, oui."""
+        if uptime < BOOT_SETTLE_S:
+            return False
+        if uptime >= BOOT_SETTLE_MAX_S:
+            return True
+        return self._user_manager_state() not in ("initializing", "starting")
+
+    @staticmethod
+    def _user_manager_state() -> str | None:
+        """L'état du gestionnaire systemd de l'utilisateur
+        (`systemctl --user is-system-running`), None sans systemd."""
+        try:
+            out = subprocess.run(["systemctl", "--user", "is-system-running"],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() or None
 
     @staticmethod
     def _running_containers(runtime) -> dict | None:
@@ -4595,6 +4644,8 @@ class Runner:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
                     log_async("garde d'alimentation en échec (%s)" % type(exc).__name__)
+                if self.boot_review_at is not None and time.monotonic() >= self.boot_review_at:
+                    self.report_boot_orphans()      # #220 r2 : solde différé
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:

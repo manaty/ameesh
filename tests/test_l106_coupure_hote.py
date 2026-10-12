@@ -705,6 +705,53 @@ class CoupureTest(PgTestCase):
                    if a["type"] == "orphan_resource"]
         self.assertIn(relance, alertes)
 
+    def test_juste_apres_le_demarrage_le_solde_attend_les_conteneurs(self):
+        # codex r2 P2 : l'exécuteur démarre avant l'unité qui relance le
+        # conteneur étiqueté ; le moteur ne liste encore rien — la ligne n'est
+        # pas soldée, la revue est refaite et voit le conteneur arrivé
+        turns = storage.of(self.db).turn_resources
+        relance = "tour-tardif-%s" % uuid.uuid4().hex[:6]
+        mort = "tour-fini-%s" % uuid.uuid4().hex[:6]
+        for turn in (relance, mort):
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(relance, mort)
+        runner = Runner(self.cfg, self.db, once=True)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+
+        def revue(uptime):
+            with mock.patch.object(resources, "boot_time", return_value=time.time() - uptime), \
+                    mock.patch.object(runner, "container_runtime", return_value=moteur), \
+                    mock.patch.object(runner, "_user_manager_state", return_value="running"), \
+                    mock.patch.object(runner_mod, "log"):
+                return [r["turn_id"] for r in runner.report_boot_orphans()]
+
+        self.assertEqual(revue(60), [])
+        for turn in (relance, mort):
+            self.assertEqual(turns.get(turn)["status"], "running")
+        self.assertIsNotNone(runner.boot_review_at)
+        # le conteneur arrive ; la revue suivante, délai passé, le voit
+        moteur.list_all.return_value = [
+            {"id": "c-tardif", "name": "pg", "image": "postgres", "created": "",
+             "labels": {"ameesh.turn": relance}}]
+        self.assertIn(relance, revue(runner_mod.BOOT_SETTLE_S + 1))
+        self.assertEqual(turns.get(relance)["status"], "orphan")
+        self.assertEqual(turns.get(mort)["status"], "done")
+        self.assertIsNone(runner.boot_review_at)
+
+    def test_le_solde_attend_le_gestionnaire_utilisateur(self):
+        runner = Runner(self.cfg, self.db, once=True)
+        for uptime, etat, pret in ((runner_mod.BOOT_SETTLE_S - 1, "running", False),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "starting", False),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "initializing", False),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "running", True),
+                                   (runner_mod.BOOT_SETTLE_S + 1, "degraded", True),
+                                   (runner_mod.BOOT_SETTLE_S + 1, None, True),
+                                   (runner_mod.BOOT_SETTLE_MAX_S, "starting", True)):
+            with self.subTest(uptime=uptime, etat=etat), \
+                    mock.patch.object(runner, "_user_manager_state", return_value=etat):
+                self.assertEqual(runner._boot_settle_ready(uptime), pret)
+
     def test_moteur_muet_un_tour_interrompu_reste_signale(self):
         turns = storage.of(self.db).turn_resources
         tour = "tour-muet-%s" % uuid.uuid4().hex[:6]
