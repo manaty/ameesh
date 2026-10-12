@@ -47,6 +47,17 @@ quiesce the old epoch, including the outstanding enable request, before a
 retry can proceed. The adapter must not use the controller’s database
 connection from its enable worker.
 
+A controller process allows at most four outstanding enable workers;
+`AMEESH_HANDOFF_ENABLE_WORKERS` configures 1–64 before startup. A worker
+retains its permit after a timeout until its adapter call actually returns.
+Each advance reserves capacity before revalidation or any journal/effect
+change. At saturation, it leaves the operation at its existing checkpoint
+(a new handoff stays planned), creates no effect intent, changes no fence,
+and logs `handoff-enable-capacity-exhausted` as an operator warning.
+Progress resumes when a worker exits. Permanently stalled workers require
+host reconciliation and controller recovery; ordinary retry cannot bypass
+the process limit.
+
 | State | Next action and proof |
 | --- | --- |
 | planned | Prepare tools, caps and credentials without enabling execution |

@@ -220,6 +220,67 @@ class HandoffTest(PgTestCase):
             finished.wait(5)
             other.close()
 
+    def test_worker_capacity_defers_next_handoff_without_effect_and_recovers(self):
+        pool = threading.BoundedSemaphore(2)
+        operations = [self.request()]
+        for name in ("dev2", "dev3"):
+            registry.upsert(self.db, name, harness="codex", host="source", cwd="/work/source")
+            self.db.execute("UPDATE agent_registry SET admitted_hosts=ARRAY['source','target'] WHERE name=%s",
+                            (name,))
+            registry.claim(self.db, name, "runner", ttl_seconds=300)
+            operations.append(self.request(name))
+        for index in range(2):
+            for _ in range(7):
+                operations[index] = self.advance(operations[index])
+            self.assertEqual(operations[index]["state"], "activated")
+
+        release = threading.Event()
+        finished = [threading.Event(), threading.Event()]
+        calls = []
+
+        def enable(intent):
+            index = len(calls)
+            calls.append(intent["id"])
+            try:
+                release.wait(5)
+                return True
+            finally:
+                finished[index].set()
+
+        try:
+            with mock.patch.object(handoffs, "_ENABLE_WORKERS", pool), mock.patch.object(
+                    handoffs, "ENABLE_TIMEOUT", 0.05), mock.patch.object(
+                    self.adapter, "enable", side_effect=enable):
+                for op in operations[:2]:
+                    held = self.advance(op)
+                    self.assertEqual((held["state"], held["fenced"]), ("held", True))
+                    self.assertEqual(held["evidence"]["pending_effect"]["name"], "enable")
+                before = self.api.handoffs.get(operations[2]["id"])
+                with self.assertLogs("ameesh.handoffs", level="WARNING") as alerts:
+                    deferred = self.advance(operations[2])
+                self.assertIn("handoff-enable-capacity-exhausted", alerts.output[0])
+                self.assertEqual(deferred, before)
+                self.assertEqual(self.api.handoffs.get(before["id"]), before)
+                self.assertEqual((deferred["state"], deferred["fenced"]), ("planned", False))
+                self.assertNotIn("pending_effect", deferred["evidence"])
+                self.assertEqual(len(calls), 2)
+                self.assertFalse(pool.acquire(blocking=False))
+
+                release.set()
+                for done in finished:
+                    self.assertTrue(done.wait(2))
+                # Permits return only after callbacks actually exit, never
+                # when the controller deadline expires.
+                self.assertTrue(pool.acquire(timeout=2))
+                self.assertTrue(pool.acquire(timeout=2))
+                pool.release()
+                pool.release()
+                self.assertEqual(self.advance(deferred)["state"], "prepared")
+        finally:
+            release.set()
+            for done in finished:
+                done.wait(5)
+
     def candidate(self, name="dev"):
         return handoffs.plan(self.db, registry.get(self.db, name), limits_for=lambda host:self.limits)
 

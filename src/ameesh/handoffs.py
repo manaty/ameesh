@@ -7,6 +7,7 @@ its enrolled host/approved artifact policy, and return only allowlisted proofs.
 """
 from __future__ import annotations
 
+import logging
 import math
 from functools import wraps
 import os
@@ -26,6 +27,21 @@ MAX_AGE = 60
 SAMPLES = 3
 COOLDOWN = 1800
 ENABLE_TIMEOUT = 60.0
+LOG = logging.getLogger(__name__)
+
+
+def _enable_worker_limit():
+    try:
+        limit = int(os.environ.get("AMEESH_HANDOFF_ENABLE_WORKERS", "4"))
+        if 1 <= limit <= 64:
+            return limit
+    except ValueError:
+        pass
+    LOG.warning("invalid AMEESH_HANDOFF_ENABLE_WORKERS; using 4")
+    return 4
+
+
+_ENABLE_WORKERS = threading.BoundedSemaphore(_enable_worker_limit())
 SHA = re.compile(r"^[0-9a-f]{40,64}$")
 STEPS = {"planned": ("prepare", "prepared"), "drained": ("publish", "published"),
          "published": ("transfer", "transferred"), "transferred": ("session", "session_ready"),
@@ -237,7 +253,34 @@ def _adapter_call(adapter, step, op):
         raise HandoffError("host adapter failed: " + step) from None
 
 
-def _enable_bounded(adapter, intent):
+
+class _EnableSlot:
+    def __init__(self, pool):
+        self.pool = pool
+        self.started = False
+
+
+def _enable_capacity(function):
+    @wraps(function)
+    def step(db, operation, adapter, **kwargs):
+        op = storage.of(db).handoffs.get(operation)
+        if not op or op["state"] in ("verified", "cancelled", "held"):
+            return function(db, operation, adapter, **kwargs)
+        pool = _ENABLE_WORKERS
+        if not pool.acquire(blocking=False):
+            LOG.warning("handoff-enable-capacity-exhausted: operation %s deferred", operation)
+            return op
+        slot = _EnableSlot(pool)
+        try:
+            return function(db, operation, adapter, enable_slot=slot, **kwargs)
+        finally:
+            # A timed-out worker retains its permit until it actually exits.
+            if not slot.started:
+                pool.release()
+    return step
+
+
+def _enable_bounded(adapter, intent, slot):
     """Bound the gate critical section even if the adapter never returns.
 
     The worker has no journal access. A late result cannot clear the intent
@@ -250,9 +293,16 @@ def _enable_bounded(adapter, intent):
             outcome.put((True, _adapter_call(adapter, "enable", intent)))
         except HandoffError as exc:
             outcome.put((False, exc))
+        finally:
+            slot.pool.release()
 
     worker = threading.Thread(target=run, name="handoff-enable", daemon=True)
-    worker.start()
+    slot.started = True
+    try:
+        worker.start()
+    except Exception:
+        slot.started = False
+        raise HandoffError("destination enable worker could not start") from None
     try:
         ok, result = outcome.get(timeout=ENABLE_TIMEOUT)
     except queue.Empty:
@@ -275,7 +325,7 @@ def _serialized(function):
     return step
 
 
-def _effect(api, adapter, step, op):
+def _effect(api, adapter, step, op, *, enable_slot=None):
     if step not in ("revalidate", "restore_source"):
         # The domain API is bound to the same controller DB; host readings
         # come through storage, not through an adapter's cached admission.
@@ -297,7 +347,7 @@ def _effect(api, adapter, step, op):
                 api.finish_effect(op["id"], intent["controller_epoch"])
                 raise HandoffError("destination host gate closed, stale or reservation expired")
             try:
-                result = _enable_bounded(adapter, intent)
+                result = _enable_bounded(adapter, intent, enable_slot)
             except HandoffError:
                 # Fence uncertain execution before withdrawal publication
                 # is allowed past the boundary. Keep pending_effect intact.
@@ -311,8 +361,9 @@ def _effect(api, adapter, step, op):
     return result
 
 
+@_enable_capacity
 @_serialized
-def advance(db, operation, adapter):
+def advance(db, operation, adapter, *, enable_slot=None):
     """One recoverable step. L232b supplies the enrolled, idempotent host adapter.
 
     prepare, stop_source, publish, transfer, session, admit, enable, verify
@@ -348,7 +399,7 @@ def advance(db, operation, adapter):
             op = api.unfence(operation, state, state)
             if op is None:
                 raise HandoffError("destination admission changed before enable")
-            if _effect(api, adapter, "enable", op) is not True:
+            if _effect(api, adapter, "enable", op, enable_slot=enable_slot) is not True:
                 raise HandoffError("destination executor not enabled")
         step, next_state = STEPS[state]
         result = _effect(api, adapter, step, op)
