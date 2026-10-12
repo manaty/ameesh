@@ -550,4 +550,7 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
             else:
                 row["previous"] = (done or {}).get("previous")
         rows.append(row)
+    if not dry_run:
+        from . import relay
+        rows.extend(relay.probe_credentials(cfg, db, environ=environ))
     return rows
