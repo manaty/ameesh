@@ -235,7 +235,9 @@ every finding and sync line is then tagged `[NON APPROUVÉ]`.
 ameesh canon check [--host H] [--json] [--canon DIR] [--ref REV] [--fetch]   # exit 1 on any error
 ameesh canon show  [--json] …                                     # cards read, and from which commit
 ameesh canon sync  [--host H] [--json] …                          # canon → registry of host H
-ameesh agent spawn <name> --by <creator> --ttl 2h [--cwd DIR] [--prompt TEXT]
+ameesh agent name  --role R [--project P …] [--json]              # next free <org>-<repo>-<role>-<seq>
+ameesh agent spawn [name] --by <creator> --ttl 2h [--role R] [--project P …] [--cwd DIR] [--prompt TEXT]
+ameesh canon agent name|spawn …                                   # same commands, canonical place (L243, #468)
 ```
 
 | Setting | Meaning |
@@ -260,7 +262,14 @@ over. Agents registered by hand (no `canon_ref`) and ephemeral agents are left
 alone. `agent spawn` creates an ephemeral agent whose `responsible` is copied
 from its creator at creation (R14), with capabilities ⊆ `{read, propose}` (and
 ⊆ the creator's), a mandatory expiry (max 7 days, never beyond an ephemeral
-creator's). A fictitious example canon lives in [`examples/canon/`](examples/canon/).
+creator's). Without a name it takes `--role`/`--project` and generates one from
+`extensions.ameesh.naming` (`org`, `projects`, `roles` in `federation.yaml`),
+the same generator as `ameesh agent name`; the harness never appears in a name,
+and a number already attributed to a card or a registry row is never reused.
+Two repos never share a segment and one repo keeps the same segment in every
+canon; an unreadable configured canon refuses generation (its reservations are
+unknown) rather than propose a name that may be taken.
+A fictitious example canon lives in [`examples/canon/`](examples/canon/).
 
 **Canon state, fail closed (§4.1).** Every `canon sync` records the canon's
 status for the host in `canon_state`: `ok`, `invalid` (read, but an error
@@ -356,9 +365,9 @@ on the measured durations of `tests/parts/durees.json`): on a pull request,
 `psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
 `tests/parts/pilote-psql.txt`; the full `psql` suite (6 parts) runs on pushes
 to `main` and `release/*`. The `tests` job aggregates the parts. Each part
-streams its results, one JSON line per test (`--flux`, schema
+streams its results, one JSON line per test (`--flow`, schema
 `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
-the job summary (`scripts/ci-flux.py resume`). A `plan` job reads the measured
+the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
 test → code map once per run (`scripts/test-plan.py`, L161f) and every part
 runs from that plan: the test modules impacted by the change (changed code
 blocks, data files, directories, tables) run first, nothing is skipped; map

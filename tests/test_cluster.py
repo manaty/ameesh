@@ -72,6 +72,7 @@ CONTENUS = {
     # L232a (0371) : plans, preuves et détails de travail, sans secrets
     "host_handoffs": {"plan", "evidence"},
     "host_handoff_events": {"detail"},
+    "host_lifecycle_agents": {"missing"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.

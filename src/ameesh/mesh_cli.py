@@ -33,7 +33,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
-  agent-mesh menage [--dry-run | --apply] [--json]       agent cleanup (L73)
+  agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
@@ -60,6 +60,7 @@ from . import migrations, placement, registry
 from . import fil, signing, storage, work
 from .config import Config
 from .db import Db
+from .deprecated import HiddenAliasParser
 
 USAGE_HINT = "agent-mesh: %s"
 
@@ -640,10 +641,16 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
     return ci.cmd_ci(cfg, args)
 
 
+def cmd_housekeeping(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh housekeeping` (L73, L148) : voir `ameesh.housekeeping.cmd_housekeeping`."""
+    from . import housekeeping
+    return housekeeping.cmd_housekeeping(cfg, args)
+
+
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
-    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
-    from . import menage
-    return menage.cmd_menage(cfg, args)
+    """`ameesh menage` (L73), déprécié (L148) : alias caché de `housekeeping`."""
+    sys.stderr.write("menage is deprecated, use housekeeping\n")
+    return cmd_housekeeping(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -1124,7 +1131,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
-            return backlog.run(db, args)
+            return backlog.run(db, args, cfg)
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)
@@ -1938,11 +1945,21 @@ def cmd_models_discover(cfg, args) -> int:
     return 1 if failures and not getattr(args, "dry_run", False) else 0
 
 
+#: L148 : commandes encore acceptées pour la transition mais absentes de
+#: l'aide (`menage` → `housekeeping`), retirées au stage 7. argparse affiche
+#: les choix en clair dans la ligne d'usage : `build_parser` lui donne la
+#: liste visible par `metavar`.
+HIDDEN_COMMANDS = frozenset({"menage"})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-mesh", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command")
+    # L148 : les sous-parseurs héritent de `HiddenAliasParser`, pour que les
+    # alias cachés (ancienne graphie d'une option) ne captent jamais une
+    # abréviation visible ni n'apparaissent dans un message d'ambiguïté.
+    sub = parser.add_subparsers(dest="command", parser_class=HiddenAliasParser)
 
     p_list = sub.add_parser("list", help="mesh list: all agents")
     p_list.add_argument("--json", action="store_true")
@@ -1965,8 +1982,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="window of --report, in days (default 7)")
     p_hosts.set_defaults(func=cmd_hosts)
 
-    p_menage = sub.add_parser(
-        "menage", help="cleanup of what agents create (L73); dry run by default")
+    p_housekeeping = sub.add_parser(
+        "housekeeping", help="cleanup of what agents create (L73); dry run by default")
+    mode = p_housekeeping.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="show only (default): nothing is removed")
+    mode.add_argument("--apply", action="store_true",
+                      help="apply (human or runner only, never an agent "
+                           "session)")
+    p_housekeeping.add_argument("--by", default="", help="who triggers it (log), e.g. human:alice")
+    p_housekeeping.add_argument("--json", action="store_true", help="`ameesh-menage/1` report")
+    p_housekeeping.set_defaults(func=cmd_housekeeping)
+
+    # L148 : `ameesh menage` reste accepté (une ligne sur stderr) ; sans
+    # `help=`, il ne figure pas dans la liste des commandes.
+    p_menage = sub.add_parser("menage")
     mode = p_menage.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="show only (default): nothing is removed")
@@ -2370,6 +2400,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="files changed since REF (ref..HEAD + working tree)")
     canon_cli._canon_options(p_review)
     p_review.set_defaults(func=cmd_review_class)
+
+    # L148 : la ligne d'usage liste les sous-commandes en clair, y compris
+    # celles cachées ; on lui donne la liste visible (retirée au stage 7).
+    sub.metavar = "{%s}" % ",".join(
+        name for name in sub.choices if name not in HIDDEN_COMMANDS)
     return parser
 
 

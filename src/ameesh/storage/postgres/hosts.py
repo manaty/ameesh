@@ -47,7 +47,7 @@ READING_COLUMNS = (
     # L159e6 (0361): the guard's last restart, decoded by `_reading`
     "guard_restart::text AS guard_restart, "
     # L159f (0069): host gate the executor obeys
-    "gate_state, gate_seq, gate_reason"
+    "ameesh_host_gate_state(host, gate_state) AS gate_state, gate_seq, gate_reason"
 )
 
 #: L159d (and #246, L159f) columns written by `record`, in this order

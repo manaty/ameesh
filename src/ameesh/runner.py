@@ -773,6 +773,16 @@ class AgentWorker(threading.Thread):
             proc = self.proc
         if proc is None:
             return
+        if (not group and not hasattr(proc, "reap")
+                and getattr(self, "_background_handles", None) is not None):
+            # Safe-point closure polls/reaps the harness here, before the main
+            # stream reader reaches its wait. Capture while it still owns PGID.
+            captured = self.runner.background.capture_before_wait(proc, wait=False)
+            for pid, handle in captured.items():
+                if pid in self._background_handles:
+                    handle.close()
+                else:
+                    self._background_handles[pid] = handle
         pgid = self._group(proc) if group else None
         if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
@@ -2692,12 +2702,16 @@ class AgentWorker(threading.Thread):
         The separate L232b controller prepares hosts and drains at a lot
         boundary. Only a persisted claim fence stops this source worker.
         """
-        if not getattr(self.runner, "relocate", False) or getattr(self.runner, "mediated", False):
+        if getattr(self.runner, "mediated", False):
             # Device relocation is controlled by the mesh server (L109).
             return False
-        from . import handoffs, storage, work
+        from . import handoffs, host_lifecycle, storage, work
         try:
-            active = storage.of(self.db).handoffs.active(self.name)
+            api = storage.of(self.db)
+            demand = api.host_lifecycle.demand(self.name, self.agent["host"])
+            if not getattr(self.runner, "relocate", False) and demand is None:
+                return False
+            active = api.handoffs.active(self.name)
             if active:
                 if active["fenced"]:
                     self.stopping.set()
@@ -2705,9 +2719,20 @@ class AgentWorker(threading.Thread):
                     return True
                 return False
             queued = bool(self.agent.get("pending_prompt") or work.open_lots(self.db, self.name))
+            missing = []
+            def ready(agent, target):
+                result = host_lifecycle.readiness(
+                    self.db, agent, target, adapter=getattr(self.runner, "_lifecycle_adapter", None),
+                    requirements_for=getattr(self.runner, "_lifecycle_requirements", None))
+                missing.extend(result["missing"])
+                return result
             candidate = handoffs.plan(self.db, self.agent,
-                                      limits_for=self.runner.handoff_limits_for, queued=queued)
+                                      limits_for=self.runner.handoff_limits_for, queued=queued,
+                                      demand=demand, readiness_for=ready if demand else None)
             if candidate is None:
+                if demand:
+                    api.host_lifecycle.progress(demand["host"], demand["generation"], self.name,
+                                                operation=None, missing=sorted(set(missing)) or ["fresh_admitted_capacity"])
                 return False
             remote = subprocess.run(["git", "-C", self.agent.get("cwd") or "", "remote", "get-url", "origin"],
                                     check=True, text=True, capture_output=True, timeout=10).stdout.strip()
@@ -3472,7 +3497,8 @@ class AgentWorker(threading.Thread):
                 % (self.name, turn_id[:8], exc))
             return False
 
-    def _close_turn_resource(self, turn_id: str, pgid: int | None) -> None:
+    def _close_turn_resource(self, turn_id: str, pgid: int | None, *,
+                             survives: bool = False) -> None:
         """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
 
         Un groupe encore vivant après l'arrêt escaladé, ou un conteneur qui
@@ -3481,9 +3507,10 @@ class AgentWorker(threading.Thread):
         if not getattr(self, "_turn_open", False):
             return
         self._turn_open = False
-        self._release_resource(turn_id, pgid)
+        self._release_resource(turn_id, pgid, survives=survives)
 
-    def _release_resource(self, turn_id: str, pgid: int | None) -> None:
+    def _release_resource(self, turn_id: str, pgid: int | None, *,
+                          survives: bool = False) -> None:
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
         if runtime is not None:
@@ -3491,7 +3518,7 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = bool(conteneurs) or bool(pgid and self._group_alive(pgid))
+        orphelin = survives or bool(conteneurs) or bool(pgid and self._group_alive(pgid))
         try:
             storage.of(self.db).turn_resources.close_turn(
                 turn_id, orphan=orphelin, containers=conteneurs or None)
@@ -4032,6 +4059,8 @@ class AgentWorker(threading.Thread):
         conversation_recorder = None
         conversation_usage = None
         proc = None
+        background_handles = {}
+        self._background_handles = background_handles
         #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
         #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
         stderr_debut = None
@@ -4242,6 +4271,14 @@ class AgentWorker(threading.Thread):
                         self.stop_group_now("lease lost during the turn", grace=0, hard=True)
                         break
             if rp is None:
+                if (not self.runner.once and self.turn_grace_seconds() > 0
+                        and not self._urgent_end()):
+                    captured = self.runner.background.capture_before_wait(proc)
+                    for pid, handle in captured.items():
+                        if pid in background_handles:
+                            handle.close()
+                        else:
+                            background_handles[pid] = handle
                 result_code = proc.wait()
             else:
                 result_code, erreur_resident = self._resident_result(
@@ -4261,15 +4298,19 @@ class AgentWorker(threading.Thread):
             # sans lot — garde un délai de grâce (`background`). Sinon, ou
             # sans délai, le nettoyage habituel, tout de suite.
             fond = None
+            handoff_failed = False
             try:
                 if (rp is None and proc is not None and pgid and proc.poll() is not None
                         and not self.runner.once and self.turn_grace_seconds() > 0
                         and not self._urgent_end()):
-                    fond = self.runner.background.survivors(turn_id, pgid)
+                    fond = self.runner.background.survivors(
+                        turn_id, pgid, handles=background_handles)
             except Exception as exc:  # dans le doute, le nettoyage d'avant
                 log_async("[%s] background work of turn %s not examined (%s)"
                           % (self.name, turn_id[:8], exc))
+                handoff_failed = True
                 fond = None
+            cleanup_survives = handoff_failed
             if fond is None and rp is None:
                 # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
                 # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
@@ -4284,9 +4325,22 @@ class AgentWorker(threading.Thread):
             if fond is not None:
                 self.runner.background.start(
                     agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
-                    containers=fond[1], grace_s=self.turn_grace_seconds())
-            else:
-                self._close_turn_resource(turn_id, pgid)
+                    containers=fond[1], grace_s=self.turn_grace_seconds(),
+                    handles=background_handles)
+            elif rp is None:
+                if background_handles:
+                    from .background import Entry
+                    # A failed handoff must not discard detached live targets.
+                    # Clean through their pidfds and retain uncertainty even
+                    # when all known handles exit successfully.
+                    cleanup = Entry(agent=self.name, turn_id=turn_id, pgid=pgid,
+                                    ended=0, deadline=0, grace_s=0,
+                                    handles=background_handles,
+                                    unverified=handoff_failed or any(
+                                        h.live() for h in background_handles.values()))
+                    cleanup_survives |= self.runner.background._kill(cleanup)
+                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives)
+            self._background_handles = None
             self._menage_apres_tour(menage_tour, turn_id, spec)
             if conversation_recorder is not None:
                 interrupted = (self.lease_lost.is_set() or self.preempting.is_set()
@@ -5770,8 +5824,10 @@ class Runner:
         try:
             db = db_mod.connect(self.cfg)
             gate = self.host_gate
-            return resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
-                                         gate=gate.snapshot() if gate is not None else None)
+            reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
+                                            gate=gate.snapshot() if gate is not None else None)
+            Runner.host_lifecycle_once(self, db)
+            return reading
         except Exception as exc:  # jamais fatal pour l'exécuteur
             log_async("resources: reading failed (%s)" % type(exc).__name__)
             return None
@@ -5781,6 +5837,24 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def host_lifecycle_once(self, db) -> None:
+        """Drive durable requests with the enrolled helper, or record its named gap."""
+        from . import handoffs, host_lifecycle
+        try:
+            api = storage.of(db).host_lifecycle
+            api.detect_losses(actor=self.runner_id,
+                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+                              critical=host_lifecycle.critical_names(self.cfg, db))
+            api.expire_returns()
+            for control in api.listing():
+                if control["mode"] in ("draining", "returning", "lost"):
+                    host_lifecycle.advance_host(
+                        db, control["host"], limits_for=self.handoff_limits_for,
+                        adapter=getattr(self, "_lifecycle_adapter", None),
+                        requirements_for=getattr(self, "_lifecycle_requirements", None))
+        except (db_mod.DbError, handoffs.HandoffError, ValueError):
+            log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
     def start_resource_poll(self) -> None:
         """Relevé périodique des ressources (`AMEESH_RESOURCE_INTERVAL`,
