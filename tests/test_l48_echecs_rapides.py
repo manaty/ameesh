@@ -66,7 +66,7 @@ class EchecsRapidesTest(PgTestCase):
         row = registry.get(self.db, "rapide")
         self.assertEqual(row["status"], "stopped")
         self.assertEqual(row["stop_reason"], "erreur")
-        self.assertIn("3 échecs rapides", row["status_text"])
+        self.assertIn("3 consecutive fast failures", row["status_text"])
         self.assertEqual(row["pending_prompt"], "tour")  # la consigne reste en attente
 
     def test_un_succes_remet_la_serie_a_zero(self):

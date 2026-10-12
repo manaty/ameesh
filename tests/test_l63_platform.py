@@ -125,9 +125,9 @@ class PlatformTest(unittest.TestCase):
             for nom, ctx in self.variants:
                 with self.subTest(nom), ctx():
                     found = {h["pid"]: h for h in platform.holders(chemin, "sid-l63-xyz")}
-                    self.assertEqual(found[tient.pid]["why"], "fichier ouvert")
+                    self.assertEqual(found[tient.pid]["why"], "open file")
                     self.assertIn(nomme.pid, found)
-                    self.assertIn("ligne de commande", found[nomme.pid]["why"])
+                    self.assertIn("command line", found[nomme.pid]["why"])
                     # les PID exclus (ascendance d'adopt) ne comptent pas par leur
                     # ligne de commande
                     exclus = platform.holders(chemin, "sid-l63-xyz", exclude=[nomme.pid])
@@ -149,7 +149,7 @@ class PlatformTest(unittest.TestCase):
             for nom, ctx in self.variants:
                 with self.subTest(nom), ctx():
                     found = {h["pid"]: h for h in platform.holders(dossier)}
-                    self.assertEqual(found[enfant.pid]["why"], "dossier courant")
+                    self.assertEqual(found[enfant.pid]["why"], "working directory")
 
     def test_os_muet_leve_not_available(self):
         """Ni psutil ni /proc : jamais de liste vide, jamais de None muet."""
@@ -254,20 +254,20 @@ class AdoptFailClosedTest(PgTestCase):
         with mock.patch.object(platform, "holders", side_effect=muet):
             with self.assertRaises(reprise.RepriseError) as ctx:
                 reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex")
-            self.assertIn("impossible de vérifier", str(ctx.exception))
+            self.assertIn("cannot check", str(ctx.exception))
             self.assertEqual(registry.get(self.db, "coord")["mode"], "externe")
             avert: list[str] = []
             out = reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex",
                                 force=True, warn=avert.append)
         self.assertTrue(out["forced"])
-        self.assertTrue(any("sans vérifier" in a for a in avert))
-        self.assertTrue(any("sans vérifier" in n for n in out["notes"]))
+        self.assertTrue(any("without checking" in a for a in avert))
+        self.assertTrue(any("without checking" in n for n in out["notes"]))
         texte = []
         for racine, _d, fichiers in os.walk(self.cfg.threads_root):
             for nom in fichiers:
                 with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as fh:
                     texte.append(fh.read())
-        self.assertIn("sans vérifier qu'elle est fermée", "\n".join(texte))
+        self.assertIn("without checking that it is closed", "\n".join(texte))
         self.assertEqual(registry.get(self.db, "coord")["mode"], "execute")
 
 

@@ -48,7 +48,7 @@ class RunnerTest(PgTestCase):
                 self.assertEqual(row["session_id"], attendu["session"])
                 self.assertEqual(int(row["turns"]), 1)
                 self.assertEqual(row["status"], "idle")
-                self.assertIn("consigne", row["status_text"])
+                self.assertIn("instruction", row["status_text"])
                 # l'événement brut du harnais est journalisé sur disque
                 events = os.path.join(self.state, name, "events.jsonl")
                 self.assertTrue(os.path.exists(events))
@@ -91,9 +91,9 @@ class RunnerTest(PgTestCase):
         self.assertEqual(proc.returncode, 0)
         row = registry.get(self.db, "sansharnais")
         self.assertEqual(row["status"], "blocked")
-        self.assertIn("introuvable", row["last_error"])
+        self.assertIn("not found", row["last_error"])
         self.assertEqual(self.turns(), [])
-        self.assertEqual(proc.stdout.count("introuvable"), 1)
+        self.assertEqual(proc.stdout.count("not found"), 1)
 
     def test_consigne_restauree_apres_echec_au_demarrage(self):
         """Sonde codex3 (6) : un tour qui ne démarre pas ne perd pas sa consigne."""
@@ -162,10 +162,10 @@ class RunnerTest(PgTestCase):
         codes = sorted([premier.returncode, second.returncode])
         self.assertEqual(codes, [0, 3], "codes %r\n%s\n%s" % (codes, sortie1, sortie2))
         self.assertEqual(len(self.turns()), 1, "un seul tour doit avoir lieu")
-        gagnant = [s for s in (sortie1, sortie2) if "bail acquis" in s]
-        perdant = [s for s in (sortie1, sortie2) if "bail acquis" not in s]
+        gagnant = [s for s in (sortie1, sortie2) if "lease acquired" in s]
+        perdant = [s for s in (sortie1, sortie2) if "lease acquired" not in s]
         self.assertEqual(len(gagnant), 1)
-        self.assertIn("aucun travail disponible", perdant[0])
+        self.assertIn("no work available", perdant[0])
         self.assertEqual(int(registry.get(self.db, "coureur")["turns"]), 1)
         # le gagnant a rendu le bail en sortant
         self.assertIsNone(registry.get(self.db, "coureur")["lease_owner"])
@@ -216,7 +216,7 @@ class RunnerTest(PgTestCase):
             # (« échéance du bail atteinte »). Dans les deux cas le harnais est
             # arrêté et le tour n'est pas compté.
             self.wait_for(
-                lambda: any(("bail perdu" in l or "échéance du bail atteinte" in l)
+                lambda: any(("lease lost" in l or "lease deadline reached" in l)
                             for l in lignes),
                 timeout=10)
             self.assertLess(
@@ -230,7 +230,7 @@ class RunnerTest(PgTestCase):
         # `print` à la finalisation faisait abandonner CPython (SIGABRT, core).
         time.sleep(0.2)  # le fil lecteur finit de recueillir la sortie
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, "".join(lignes)))
-        self.assertNotIn("sortie immédiate", "".join(lignes))  # arrêt propre, sans repli
+        self.assertNotIn("exiting immediately", "".join(lignes))  # arrêt propre, sans repli
         # end_turn est fencé : le tour volé n'est pas compté
         self.assertEqual(int(registry.get(self.db, "vole")["turns"]), 0)
 
@@ -314,7 +314,7 @@ class RunnerTest(PgTestCase):
             self.assertLess(time.monotonic() - debut, 15.0)
             self.assertEqual(code, 0, "".join(lignes))
             time.sleep(0.2)
-            self.assertTrue(any("arrêt : 0 bail" in l for l in lignes), "".join(lignes))
+            self.assertTrue(any("shutdown: 0 lease" in l for l in lignes), "".join(lignes))
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -363,7 +363,7 @@ class RunnerTest(PgTestCase):
                 proc.wait(timeout=10)
         self.assertLess(time.monotonic() - debut, 25.0)
         self.assertEqual(proc.returncode, 0, sortie)
-        self.assertIn("message pour dort : réveil du tour", sortie)
+        self.assertIn("message for dort: waking the turn", sortie)
         tours = self.turns()
         self.assertEqual(len(tours), 1, sortie)
         # le contenu du message est dans la consigne (pas un renvoi vers inbox)
@@ -617,7 +617,7 @@ class RunnerTest(PgTestCase):
             sortie, _ = proc.communicate(timeout=10)
         # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
-        self.assertNotIn("sortie immédiate", sortie)
+        self.assertNotIn("exiting immediately", sortie)
         row = registry.get(self.db, "perdu")
         self.assertEqual(row["pending_prompt"], "consigne du tour perdu")
         self.assertIsNone(row["current_prompt"])

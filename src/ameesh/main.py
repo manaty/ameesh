@@ -1,109 +1,108 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh — la commande du mesh, et ses sous-commandes.
+"""ameesh — the mesh command, and its subcommands.
 
-  ameesh --version | version  la version du paquet installé ;
+  ameesh --version | version  version of the installed package;
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
-        la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
-        harnais l'appellent) ; `send` refuse un destinataire inconnu (noms
-        proches proposés) ou arrêté (sauf --queue) ;
-  ameesh mail forward <ancien> <nouveau> [--dry-run]
-        re-livre le courrier en attente d'un agent arrêté à un agent vivant ;
+        the mailbox; `agent-mail` remains an alias (harness hooks call it);
+        `send` refuses an unknown recipient (close names suggested) or a
+        stopped one (unless --queue);
+  ameesh mail forward <old> <new> [--dry-run]
+        re-delivers the pending mail of a stopped agent to a live agent;
   ameesh mail <bind|unbind|bindings>
-        liaison explicite d'une session externe à un agent (L41, 0030) ;
-  ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste
-        un alias ;
+        explicit binding of an external session to an agent (L41, 0030);
+  ameesh run [options]        the machine's runner; `agent-runner` remains
+        an alias;
   ameesh attach <agent> [--wait] [--ttl S]
-        une session interactive sur le bail de l'agent, même session (C9) ;
-  ameesh list | show          observabilité (hôte, bail, non-lus, budget, clé) ;
-  ameesh key …                clés publiques (propriétaire / agent) ;
-  ameesh approve | approvals | verify   approbations signées ;
-  ameesh work …               lots (work_items) ; `work backlog add|list` : file
-        d'amélioration continue, prise par les agents au repos (L119, 0037) ;
-        `work unrecorded [--since 24h] [--json]` : demandes d'humains (courrier,
-        réponses aux décisions, chat) rattachées à aucun lot (L130) ;
-  ameesh cost …               coût des tours, usage par tour, jauges et leur
-        historique, solde du fournisseur payé au token (`cost turns|gauges|balance`) ;
-  ameesh accounts list | use <harnais> <compte> | auto [harnais]
-        comptes multiples par fournisseur : actif, jauges, forçage (L30) ;
+        an interactive session on the agent's lease, same session (C9);
+  ameesh list | show          observability (host, lease, unread, budget, key);
+  ameesh key …                public keys (owner / agent);
+  ameesh approve | approvals | verify   signed approvals;
+  ameesh work …               work items; `work backlog add|list`: continuous
+        improvement queue, picked up by idle agents (L119, 0037);
+        `work unrecorded [--since 24h] [--json]`: human requests (mail,
+        decision answers, chat) not attached to any work item (L130);
+  ameesh cost …               turn cost, per-turn usage, gauges and their
+        history, pay-per-token provider balance (`cost turns|gauges|balance`);
+  ameesh accounts list | use <harness> <account> | auto [harness]
+        multiple accounts per provider: active, gauges, override (L30);
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
         | unset [--per-hour] [--per-day] [--agent A]
-        plafonds de budget du mesh, en base, relus à chaud (L70) ;
-  ameesh heavy [--nice N] -- <commande> | --status [--json]
-        heavy suite (tests, build) in one of the host's capped slots (L131) ;
+        mesh budget caps, stored in the database, reloaded live (L70);
+  ameesh heavy [--nice N] -- <command> | --status [--json]
+        heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
         context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
         turn_grace_seconds=20m|0
-        réglages d'exécution, effet au prochain tour ;
-  ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
+        run settings, effective from the next turn;
+  ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
-        alertes POUSSÉES à l'humain responsable (bureau, ntfy, Slack ;
-        clé `notify` de la configuration de l'hôte ; L38) ;
-  ameesh restart <agent> --brief FICHIER|-   session neuve sur un brief ;
+        alerts PUSHED to the responsible human (desktop, ntfy, Slack;
+        `notify` key of the host configuration; L38);
+  ameesh restart <agent> --brief FILE|-   fresh session on a brief;
   ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account C]
-        [--cwd D] [--brief FICHIER|-] [--force]
-        une session interactive existante (fermée) passe sous l'exécuteur (L39) ;
-  ameesh resume <agent> [--brief FICHIER|-] [--fresh]
-        relance un agent arrêté, mort ou au repos : même session si le compte
-        du prochain tour peut la reprendre, sinon brief de reprise déterministe ;
-  ameesh interrupt <agent> <message…>   interruption directe (expéditeurs habilités) ;
-  ameesh progress [--json] [--html FICHIER] [--project P] [--since 24h]
-        avancement : lots, agents, jalons, budget (schéma ameesh-progress/1) ;
+        [--cwd D] [--brief FILE|-] [--force]
+        an existing (closed) interactive session moves under the runner (L39);
+  ameesh resume <agent> [--brief FILE|-] [--fresh]
+        restarts a stopped, dead or idle agent: same session if the next
+        turn's account can resume it, otherwise a deterministic resume brief;
+  ameesh interrupt <agent> <message…>   direct interruption (authorized senders);
+  ameesh progress [--json] [--html FILE] [--project P] [--since 24h]
+        progress: work items, agents, milestones, budget (schema ameesh-progress/1);
   ameesh projects [--json] [--project P] [--all]
-        projets en cours : agents, état, lot en cours, non-lus, dépense 24 h,
-        forfait ou token, lots sans agent (schéma ameesh-projects/1, L62) ;
-  ameesh plan add "quoi" --pour J [--projet P] [--lot N] [--source S] | list
+        active projects: agents, state, current work item, unread, 24 h spend,
+        plan or token, work items without an agent (schema ameesh-projects/1, L62);
+  ameesh plan add "what" --pour DATE [--projet P] [--lot N] [--source S] | list
         | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
-        feuille de route : engagements datés, propositions tirées des décisions,
-        Gantt texte (schéma ameesh-roadmap/1, L96) ; dates prévues d'une
-        tâche ou d'une fiche : `ameesh work plan <id> --debut J --fin J --livraison J` ;
+        roadmap: dated commitments, proposals drawn from decisions,
+        text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
+        task or a card: `ameesh work plan <id> --debut DATE --fin DATE --livraison DATE`;
   ameesh work estimates [--app P] [--json]
-        L157 : écarts réel/estimé des lots livrés (médiane, p80) par type de
-        lot et par auteur d'estimation ; tout lot porte une durée estimée dès
-        sa création (`work add --estimate 2h`, `work plan <id> --estimate 90m`) ;
-  ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
-        les fils lisibles : tout message passé par ameesh, en clair (R12) ;
-  ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
+        L157: actual/estimated gaps of delivered work items (median, p80) by
+        type and by estimate author; every work item carries an estimated
+        duration from creation (`work add --estimate 2h`, `work plan <id> --estimate 90m`);
+  ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
+        readable threads: every message that went through ameesh, in clear (R12);
+  ameesh receipt verify | authenticator list   approval receipts (spec §8);
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
-        actions sous porte (spec §7) ;
+        gated actions (spec §7);
   ameesh decisions [--all] [--for human:ID] [--json]
-        décisions qui attendent un humain, tous projets confondus : demandes
-        des agents (L124, la plus ancienne d'abord), actions sous porte ; apart,
-        decisions written in prose in mail and lots waiting with no question
-        (L233, not requests) ;
-  ameesh decide ask (--lot <id|réf> | --new-lot "titre") --question "…"
+        decisions waiting for a human, across all projects: agent requests
+        (L124, oldest first), gated actions; apart, decisions written in prose
+        in mail and work items waiting with no question (L233, not requests);
+  ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
         --option a="…" [--option b="…"] [--recommend a --why "…"] [--urgent]
         [--by 2h] [--needs-signature] [--from-mail <id>]
-        un agent demande une décision au propriétaire (lot en waiting_human,
-        the only way in — L233) ;
-  ameesh decide <id> <option | "texte libre"> [--key FICHIER | --signed]
+        an agent asks the owner for a decision (work item in waiting_human,
+        the only way in — L233);
+  ameesh decide <id> <option | "free text"> [--key FILE | --signed]
         | withdraw <id> | show <id>
-        réponse de l'humain (jamais d'un agent), renvoyée au demandeur par
-        courrier ; retrait par le demandeur ; détail et preuve (L124) ;
+        the human's answer (never an agent's), sent back to the requester by
+        mail; withdrawal by the requester; detail and proof (L124);
   ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
-        l'agent de conversation du propriétaire : décisions de tous les
-        projets, réponses, demandes transmises aux orchestrateurs ; ne prend
-        jamais la session d'un autre agent (L123) ;
+        the owner's conversation agent: decisions of all projects, answers,
+        requests forwarded to orchestrators; never takes another agent's
+        session (L123);
   ameesh approve-check [--url U] [--json]
-        concordance RP ID/origines entre ameesh-approve et ce vérificateur ;
-  ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
-  ameesh migrate | doctor     schéma et diagnostic ;
-  ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
-  ameesh harness list|show|check|versions  harnesses (L16, L120) ;
-  ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
-  ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
-  ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
-  ameesh deps link|local|status|entries node_modules shared per lockfile (#248) ;
-  ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
-  ameesh guard check|run|drain          garde de capacité d'une VM prêteuse (L159e) ;
-  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
+        RP ID/origin agreement between ameesh-approve and this verifier;
+  ameesh import-v0 | export-v0          switch from/to the v0 file mailbox;
+  ameesh migrate | doctor     schema and diagnostics;
+  ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh harness list|show|check|versions  harnesses (L16, L120);
+  ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
+  ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
+  ameesh deps link|local|status|entries node_modules shared per lockfile (#248);
+  ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
+  ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
+  ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
 
-Le service d'approbation humaine (spec §9) est une commande séparée,
-`ameesh-approve` (python -m ameesh.approve), lancée sous son propre
-utilisateur Unix.
+The human approval service (spec §9) is a separate command,
+`ameesh-approve` (python -m ameesh.approve), run under its own
+Unix user.
 
-Rien d'autre : ce fichier ne fait que router vers les modules, pour que
-`agent-mail` et `agent-runner` continuent de fonctionner à l'identique.
+Nothing else: this file only routes to the modules, so that
+`agent-mail` and `agent-runner` keep working exactly as before.
 """
 from __future__ import annotations
 
@@ -253,7 +252,7 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)
-    print("ameesh : sous-commande inconnue %r" % command, file=sys.stderr)
+    print("ameesh: unknown subcommand %r" % command, file=sys.stderr)
     print(__doc__)
     return 2
 

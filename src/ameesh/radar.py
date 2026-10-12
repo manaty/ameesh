@@ -93,42 +93,42 @@ def parse_settings(raw) -> Settings:
     if raw is None or raw == {}:
         return Settings()
     if not isinstance(raw, dict):
-        raise SettingsError("`radar` : objet JSON attendu")
+        raise SettingsError("`radar`: JSON object expected")
     unknown = sorted(set(map(str, raw)) - set(SETTINGS_KEYS))
     if unknown:
-        raise SettingsError("`radar` : clé(s) inconnue(s) %s (admise : %s)"
+        raise SettingsError("`radar`: unknown key(s) %s (allowed: %s)"
                             % (", ".join(unknown), ", ".join(SETTINGS_KEYS)))
     declared = raw.get("projects") or {}
     if not isinstance(declared, dict):
-        raise SettingsError("`radar.projects` : objet {\"projet\": {\"repo\": …}} attendu")
+        raise SettingsError("`radar.projects`: object {\"project\": {\"repo\": …}} expected")
     projects: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`radar.projects.%s`" % name
         if not _NAME_RE.match(name):
-            raise SettingsError("%s : nom de projet invalide (lettres, chiffres, . _ -)"
+            raise SettingsError("%s: invalid project name (letters, digits, . _ -)"
                                 % where)
         if isinstance(value, str):
             value = {"repo": value}
         if not isinstance(value, dict):
-            raise SettingsError("%s : objet {\"repo\": chemin} attendu" % where)
+            raise SettingsError("%s: object {\"repo\": path} expected" % where)
         extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
         if extra:
-            raise SettingsError("%s : clé(s) inconnue(s) %s (admises : %s)"
+            raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
                                 % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
         repo = value.get("repo")
         if not isinstance(repo, str) or not repo.strip():
-            raise SettingsError("%s.repo : chemin du dépôt attendu" % where)
+            raise SettingsError("%s.repo: repository path expected" % where)
         texts = {}
         for key in ("migrations", "target", "github"):
             text = value.get(key) or ""
             if not isinstance(text, str):
-                raise SettingsError("%s.%s : texte attendu" % (where, key))
+                raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
-            raise SettingsError("%s.github : dépôt « owner/repo » attendu" % where)
+            raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"])
@@ -156,9 +156,9 @@ def _scratch_git(repo: str, objects: str, scratch: str, *args: str):
         return subprocess.run(cmd, cwd=repo, capture_output=True, env=env,
                               timeout=GIT_TIMEOUT, check=False)
     except subprocess.TimeoutExpired as exc:
-        raise GitError("git %s : délai dépassé" % args[0]) from exc
+        raise GitError("git %s: timed out" % args[0]) from exc
     except OSError as exc:
-        raise GitError("git %s : %s" % (args[0], exc.strerror or exc)) from exc
+        raise GitError("git %s: %s" % (args[0], exc.strerror or exc)) from exc
 
 
 def _lines(proc) -> list[str]:
@@ -232,7 +232,7 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
     if not objects:
-        raise GitError("%s n'est pas un dépôt git lisible" % repo)
+        raise GitError("%s is not a readable git repository" % repo)
     if default_target is None:
         default_target = plan_git.default_target(repo)
     branches: list[dict] = []
@@ -249,11 +249,11 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         target = row.get("branch_target") or default_target
         head = plan_git._commit(repo, target) if target else None
         if head is None:
-            skipped.append(dict(entry, reason="cible %s introuvable" % (target or "—")))
+            skipped.append(dict(entry, reason="target %s not found" % (target or "—")))
             continue
         base = plan_git._out(repo, "merge-base", tip, head)
         if not base:
-            skipped.append(dict(entry, reason="aucune base commune avec %s" % target))
+            skipped.append(dict(entry, reason="no common base with %s" % target))
             continue
         if base == tip:
             continue                      # aucun travail propre : rien à fusionner
@@ -545,70 +545,70 @@ def _files(files) -> str:
 
 def _who(branches: dict, lot: int) -> str:
     one = branches.get(lot) or {}
-    return "#%d « %s » (%s, %s)" % (lot, one.get("title") or "", one.get("branch") or "?",
-                                    one.get("assignee") or "non assigné")
+    return "#%d \"%s\" (%s, %s)" % (lot, one.get("title") or "", one.get("branch") or "?",
+                                     one.get("assignee") or "unassigned")
 
 
 def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
                  merged=()) -> str:
     """Le courrier du radar pour l'assigné de `lot`."""
     mine = branches.get(lot) or {}
-    head = "Radar de conflits, lot #%d « %s »" % (lot, mine.get("title") or "")
+    head = "Conflict radar, lot #%d \"%s\"" % (lot, mine.get("title") or "")
     if ci is not None:
-        return ("%s : ta PR #%s est verte mais ne peut pas fusionner, ta branche %s est "
-                "en conflit avec %s sur %s%s. Intègre %s dans ta branche et résous le "
-                "conflit." % (head, ci.get("number"), mine.get("branch") or "?",
+        return ("%s: your PR #%s is green but cannot merge: your branch %s "
+                "conflicts with %s on %s%s. Merge %s into your branch and resolve the "
+                "conflict." % (head, ci.get("number"), mine.get("branch") or "?",
                               conflict["target"], _files(conflict["files"]),
-                              " (%s y est entré)" % ", ".join("#%d" % n for n in merged)
+                              " (%s landed there)" % ", ".join("#%d" % n for n in merged)
                               if merged else "", conflict["target"]))
     if conflict["kind"] == "pair":
         other = [n for n in conflict["lots"] if n != lot][0]
         resolver = conflict.get("resolver") or {}
         if resolver.get("lot") == lot:
-            todo = ("C'est à toi de préparer la résolution (%s), au fil du travail : "
-                    "`ameesh work resolve %d --with %d` ; ta branche ne change pas."
+            todo = ("You prepare the resolution (%s), as you go: "
+                    "`ameesh work resolve %d --with %d`; your branch does not change."
                     % (RESOLVER_REASONS.get(resolver.get("reason"), resolver.get("reason")),
                        lot, other))
         elif resolver.get("lot") == other:
-            todo = ("Le lot #%d prépare la résolution (%s) : rien à faire pour toi."
+            todo = ("Lot #%d prepares the resolution (%s): nothing to do for you."
                     % (other, RESOLVER_REASONS.get(resolver.get("reason"),
                                                    resolver.get("reason"))))
         else:
-            todo = ("Le second des deux à entrer dans %s devra résoudre."
+            todo = ("Whichever of the two lands in %s second will have to resolve."
                     % conflict["target"])
-        return ("%s : ta branche et celle du lot %s se fusionnent en conflit sur %s. Rien "
-                "ne bloque encore. %s Tu seras réveillé si l'autre lot entre dans %s avant "
-                "toi et que ta PR est verte."
+        return ("%s: your branch and the one of lot %s conflict on %s when merged. "
+                "Nothing is blocked yet. %s You will be woken up if the other lot lands in "
+                "%s before you and your PR is green."
                 % (head, _who(branches, other), _files(conflict["files"]), todo,
                    conflict["target"]))
     if conflict["kind"] == "stale":
         other = [n for n in conflict["pair"] if n != lot][0]
-        return ("%s : ta résolution préparée avec le lot %s (%s) ne couvre plus le conflit, "
-                "qui a changé sur %s. Refais-la : `ameesh work resolve %d --with %d` (les "
-                "blocs inchangés reviennent résolus)."
+        return ("%s: your resolution prepared with lot %s (%s) no longer covers the "
+                "conflict, which changed on %s. Redo it: `ameesh work resolve %d --with %d` "
+                "(unchanged hunks come back resolved)."
                 % (head, _who(branches, other), conflict["commit"][:12],
                    _files(conflict["files"]), lot, other))
     if conflict["kind"] == "target":
-        return ("%s : ta branche %s ne fusionne plus proprement dans %s (conflit sur %s). "
-                "Intègre %s dans ta branche avant ta demande de fusion ; tu seras réveillé "
-                "si ta PR est verte et toujours bloquée."
+        return ("%s: your branch %s no longer merges cleanly into %s (conflict on %s). "
+                "Merge %s into your branch before your merge request; you will be woken up "
+                "if your PR is green and still blocked."
                 % (head, mine.get("branch") or "?", conflict["target"],
                    _files(conflict["files"]), conflict["target"]))
     others = [_who(branches, n) for n in conflict["lots"] if n != lot]
-    return ("%s : le numéro de migration %s est en double (%s)%s%s. Prends le premier "
-            "numéro libre de %s et signale-le à l'autre lot."
+    return ("%s: migration number %s is duplicated (%s)%s%s. Take the first free "
+            "number of %s and tell the other lot."
             % (head, conflict["number"], _files(conflict["files"]),
-               " ; aussi pris par le lot %s" % ", ".join(others) if others else "",
-               " ; déjà dans %s : %s" % (conflict["target"], conflict["in_target"])
+               "; also taken by lot %s" % ", ".join(others) if others else "",
+               "; already in %s: %s" % (conflict["target"], conflict["in_target"])
                if conflict.get("in_target") else "", conflict["target"]))
 
 
 #: why a lot is the resolver of a pair (L160d), for the mail
 RESOLVER_REASONS = {
-    "priority": "l'autre lot est plus prioritaire et fusionnera d'abord",
-    "state": "l'autre lot est plus avancé et fusionnera d'abord",
-    "smaller change": "ton changement est le plus petit dans les fichiers en conflit",
-    "newer lot": "ton lot est le plus récent",
+    "priority": "the other lot has a higher priority and will merge first",
+    "state": "the other lot is further along and will merge first",
+    "smaller change": "your change is the smallest in the conflicting files",
+    "newer lot": "your lot is the most recent",
 }
 
 
@@ -719,17 +719,17 @@ def _lot(n) -> str:
 def render(report: dict, *, everything: bool = False) -> list[str]:
     s = summary(report)
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(report.get("ts") or 0))
-    out = ["%s : passage du %s UTC (%.1f s), %d branche(s), %d paire(s) de même cible, "
-           "%d qui se recouvrent, %d en conflit (%d préparée(s), %d périmée(s)), "
-           "%d lot(s) en conflit avec leur cible, %d numéro(s) de migration en double"
+    out = ["%s: pass of %s UTC (%.1f s), %d branch(es), %d pair(s) with the same target, "
+           "%d overlapping, %d in conflict (%d prepared, %d stale), "
+           "%d lot(s) in conflict with their target, %d duplicate migration number(s)"
            % (report.get("project"), when, report.get("duration_s") or 0, s["branches"],
               s["pairs_checked"], s["overlap"] + s["conflict"] + s["prepared"] + s["stale"],
               s["conflict"] + s["prepared"] + s["stale"], s["prepared"], s["stale"],
               s["target_conflict"], s["migration_duplicates"])]
     if report.get("error"):
-        out.append("  erreur : %s" % report["error"])
+        out.append("  error: %s" % report["error"])
     if report.get("resolution_error"):
-        out.append("  résolutions : %s" % report["resolution_error"])
+        out.append("  resolutions: %s" % report["resolution_error"])
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
@@ -739,28 +739,28 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
         out.append("  %-8s %s %s  %s%s%s" % (
             pair["state"], _lot(pair["lots"][0]), _lot(pair["lots"][1]),
             ", ".join(files[:6]) + (" …" if len(files) > 6 else ""),
-            "  [résolveur %s : %s]" % (_lot(resolver["lot"]), resolver["reason"])
+            "  [resolver %s: %s]" % (_lot(resolver["lot"]), resolver["reason"])
             if resolver else "",
-            "  [résolution %s par %s%s]" % (
+            "  [resolution %s by %s%s]" % (
                 resolution["commit"][:12], _lot(resolution["by"]),
-                ", reste : %s" % ", ".join(resolution["remaining"][:6])
+                ", remaining: %s" % ", ".join(resolution["remaining"][:6])
                 if resolution.get("remaining") else
-                ", rejeu %s" % resolution["replay"]
+                ", replay %s" % resolution["replay"]
                 if resolution.get("replay") not in ("prepared", "stale") else "")
             if resolution else ""))
     for one in report.get("against_target") or ():
         if one["state"] == "clean" and not everything:
             continue
-        out.append("  %-8s %s contre %s  %s" % (one["state"], _lot(one["work_item"]),
+        out.append("  %-8s %s against %s  %s" % (one["state"], _lot(one["work_item"]),
                                                 one["target"], ", ".join(one["files"][:6])))
     for dup in report.get("migrations") or ():
-        out.append("  migration %s : %s%s" % (
+        out.append("  migration %s: %s%s" % (
             dup["number"], ", ".join("%s (%s)" % (_lot(h["work_item"]), h["path"])
                                      for h in dup["lots"]),
-            " ; déjà dans %s : %s" % (dup["target"], dup["in_target"])
+            "; already in %s: %s" % (dup["target"], dup["in_target"])
             if dup["in_target"] else ""))
     for one in report.get("skipped") or ():
-        out.append("  ignoré   %s %s : %s" % (_lot(one["work_item"]), one["branch"],
+        out.append("  skipped  %s %s: %s" % (_lot(one["work_item"]), one["branch"],
                                              one["reason"]))
     return out
 
@@ -779,9 +779,9 @@ def cmd_conflicts(cfg, args) -> int:
                          indent=1))
         return 0
     if not reports:
-        print("aucun passage du radar sur cet hôte (%s) : l'hôte désigné déclare "
-              "`radar.projects` dans sa configuration%s"
-              % (directory, ", projet %s" % args.project if args.project else ""))
+        print("no radar pass on this host (%s): the designated host declares "
+              "`radar.projects` in its configuration%s"
+              % (directory, ", project %s" % args.project if args.project else ""))
         return 0
     for report in reports:
         print("\n".join(render(report, everything=args.all)))

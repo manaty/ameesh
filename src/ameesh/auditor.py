@@ -21,7 +21,7 @@ def load_all(cfg, *, strict=True):
     for entry in canon_mod.configured(cfg):
         loaded = canon_mod.from_config(cfg, entry=entry)
         if strict and not _readable(loaded):
-            raise canon_mod.CanonError("canon illisible ou périmètre incomplet : %s" % entry.path)
+            raise canon_mod.CanonError("canon unreadable or scope incomplete: %s" % entry.path)
         out.append(loaded)
     canon_mod.check_identities(out)
     return out

@@ -29,7 +29,7 @@ class WorkTest(PgTestCase):
         item = self._add()
         with self.assertRaises(work.WorkError) as ctx:
             work.move(self.db, item["id"], "merged")  # intake → merged : sauté
-        self.assertIn("transition refusée", str(ctx.exception))
+        self.assertIn("transition refused", str(ctx.exception))
         work.move(self.db, item["id"], "build")
         with self.assertRaises(work.WorkError):
             work.move(self.db, item["id"], "intake")  # retour interdit
@@ -54,7 +54,7 @@ class WorkTest(PgTestCase):
         work.move(self.db, item["id"], "qa")
         with self.assertRaises(work.WorkError) as ctx:
             work.move(self.db, item["id"], "build")  # 3e retour refusé
-        self.assertIn("épuisée", str(ctx.exception))
+        self.assertIn("exhausted", str(ctx.exception))
         # on peut encore bloquer ou attendre un humain
         self.assertEqual(work.move(self.db, item["id"], "blocked")["state"], "blocked")
         hold_for_owner(self.db, item["id"])
@@ -68,7 +68,7 @@ class WorkTest(PgTestCase):
         self.assertEqual([e["state"] for e in events], ["build", "build", "intake"])
         self.assertEqual(events[0]["note"], "question au propriétaire")
         self.assertEqual(events[1]["note"], "je prends")
-        self.assertEqual(events[2]["note"], "création")
+        self.assertEqual(events[2]["note"], "created")
 
     def test_validations(self):
         with self.assertRaises(work.WorkError):
@@ -185,9 +185,9 @@ class DelaysTest(PgTestCase):
         self.assertGreaterEqual(row["freeze_to_review_s"], 0)
         self.assertGreaterEqual(row["freeze_to_merge_s"], row["freeze_to_review_s"])
         self.assertGreaterEqual(row["total_s"], row["request_to_freeze_s"])
-        self.assertEqual(work.last_milestone(row)[0], "fusion")
+        self.assertEqual(work.last_milestone(row)[0], "merge")
         self.assertEqual([label for label, _v in work.durations(row)],
-                         ["demande → gel", "gel → revue", "gel → fusion", "total"])
+                         ["request → freeze", "freeze → review", "freeze → merge", "total"])
 
     def test_jalons_manuels_refuses(self):
         item = self._add("Refus")
@@ -214,19 +214,19 @@ class DelaysTest(PgTestCase):
         self.assertIsNone(row["merged_ts"])
         self.assertIsNone(row["total_s"])
         self.assertEqual(row["verdicts"], 0)
-        self.assertEqual(work.last_milestone(row)[0], "demande")
+        self.assertEqual(work.last_milestone(row)[0], "request")
 
     def test_jalon_courant_gel_puis_revue(self):
         item = self._add("En revue")
         work.move(self.db, item["id"], "build")
         work.milestone(self.db, item["id"], "frozen", sha="a" * 40)
         row = work.timeline(self.db, item["id"])
-        self.assertEqual(work.last_milestone(row)[0], "gel")
+        self.assertEqual(work.last_milestone(row)[0], "freeze")
         self.assertIsNotNone(row["frozen_ts"])
         self.assertIsNone(row["reviewed_ts"])
         work.milestone(self.db, item["id"], "verdict", verdict="blocked")
         row = work.timeline(self.db, item["id"])
-        self.assertEqual(work.last_milestone(row)[0], "revue")
+        self.assertEqual(work.last_milestone(row)[0], "review")
         self.assertIsNotNone(row["reviewed_ts"])
         self.assertIsNone(row["merged_ts"])
 

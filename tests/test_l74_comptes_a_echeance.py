@@ -67,14 +67,14 @@ class ChoixParEcheanceTest(_Base):
         _codex_deux_fenetres(items[1].path, (0, now + 52 * 60), (5, now + 6 * JOUR))
         choix = self._choisir(items, now)
         self.assertEqual(choix.profile.name, "secondaire")
-        self.assertIn("codex-10080min 5 % utilisé (rythme 24 %), le plus en retard "
-                      "sur son rythme ; avant : primaire codex-10080min 20 % utilisé",
+        self.assertIn("codex-10080min 5% used (pace 24%), furthest behind "
+                      "its pace; ahead of: primaire codex-10080min 20% used",
                       choix.why)
         self.assertEqual(choix.switched["kind"], "bascule")
         self.assertEqual([(b["from_account"], b["to_account"]) for b in self._bascules()],
                          [("primaire", "secondaire")])
         # le journal des bascules porte la raison du choix
-        self.assertIn("le plus en retard sur son rythme", self.db.query(
+        self.assertIn("furthest behind its pace", self.db.query(
             "SELECT reason FROM account_switches")[0]["reason"])
 
     def test_egalite_ordre_declare(self):
@@ -117,7 +117,7 @@ class ChoixParEcheanceTest(_Base):
         _codex_rollout(items[1].path, 93, now - 60)            # fenêtre échue
         choix = self._choisir(items, now)
         self.assertEqual(choix.profile.name, "secondaire")
-        self.assertIn("relevé échu", choix.why)
+        self.assertIn("stale reading", choix.why)
         jauge = accounts.gauges_of(self._book(), items[1], items)[0]
         self.assertEqual(jauge.used_at(now), 0.0)
         self.assertAlmostEqual(jauge.used, 0.93)
@@ -131,7 +131,7 @@ class ChoixParEcheanceTest(_Base):
         second = [r for r in lignes if r["account"] == "secondaire"][0]
         self.assertEqual(second["gauges"][0]["used"], 0.0)
         self.assertAlmostEqual(second["gauges"][0]["last_used"], 1.0)
-        self.assertIn("dernier relevé 100%", accounts.format_rows(lignes))
+        self.assertIn("last reading 100%", accounts.format_rows(lignes))
 
     def _codex_comptes_brut(self):
         return [{"name": "primaire", "path": os.path.join(self.tmp, "comptes", "codex-1")},
@@ -160,14 +160,14 @@ class ChoixParEcheanceTest(_Base):
         choix = self._choisir(items, now, session_account="primaire")
         self.assertEqual(choix.profile.name, "primaire")
         self.assertTrue(choix.kept)
-        self.assertIn("continuité", choix.why)
+        self.assertIn("continuity", choix.why)
         self.assertEqual(self._bascules(), [])                 # rien ne change en base
         # le compte de la session atteint son seuil : le plus en retard
         _codex_rollout(items[0].path, 95, now + 3 * HEURE)
         choix = self._choisir(items, now, session_account="primaire")
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertFalse(choix.kept)
-        self.assertIn("primaire au seuil", choix.why)
+        self.assertIn("primaire at threshold", choix.why)
 
     def test_tous_au_seuil_pause(self):
         items = self._items()
@@ -176,7 +176,7 @@ class ChoixParEcheanceTest(_Base):
         _codex_rollout(items[1].path, 97, now + 30 * 60)
         choix = self._choisir(items, now, session_account="primaire")
         self.assertIsNone(choix.profile)
-        self.assertIn("tous les comptes codex au seuil", choix.reason)
+        self.assertIn("all codex accounts at threshold", choix.reason)
 
     def test_simulation_sans_ecriture(self):
         items = self._items()
@@ -209,11 +209,11 @@ class RapportTest(_Base):
         self.assertTrue(second["next"])
         self.assertFalse([r for r in lignes if r["account"] == "primaire"][0]["next"])
         texte = accounts.format_rows(lignes)
-        self.assertIn("perdu à la remise à zéro si rien ne change : codex-300min 100 % "
-                      "dans 52 min", texte)
-        self.assertIn("prochain choix pour une nouvelle session : codex-10080min 5 % "
-                      "utilisé (rythme 24 %), le plus en retard sur son rythme ; avant : "
-                      "primaire codex-10080min 20 % utilisé (rythme 53 %)", texte)
+        self.assertIn("lost at reset if nothing changes: codex-300min 100% "
+                      "in 52 min", texte)
+        self.assertIn("next choice for a new session: codex-10080min 5% "
+                      "used (pace 24%), furthest behind its pace; ahead of: "
+                      "primaire codex-10080min 20% used (pace 53%)", texte)
         # lecture seule : aucun relevé écrit (L71)
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM quota_gauge_readings")[0]["n"],
                          0)
@@ -221,7 +221,7 @@ class RapportTest(_Base):
     def test_duree_lisible(self):
         self.assertEqual(accounts.duration(52 * 60), "52 min")
         self.assertEqual(accounts.duration(3 * HEURE + 600), "3 h 10")
-        self.assertEqual(accounts.duration(2 * JOUR + 4 * HEURE), "2 j 4 h")
+        self.assertEqual(accounts.duration(2 * JOUR + 4 * HEURE), "2 d 4 h")
 
 
 class ExecuteurTest(_Base):
@@ -254,9 +254,9 @@ class ExecuteurTest(_Base):
                 self.assertEqual(self.turns()[-1]["compte"]["CODEX_HOME"],
                                  comptes[1]["path"])
             texte = "\n".join(journal)
-            self.assertIn("[cxa] compte codex : primaire — continuité", texte)
-            self.assertIn("[cxb] compte codex : secondaire — codex-300min 0 % utilisé "
-                          "(rythme 90 %), le plus en retard sur son rythme", texte)
+            self.assertIn("primaire — continuity", texte)
+            self.assertIn("secondaire — codex-300min 0% used "
+                          "(pace 90%), furthest behind its pace", texte)
             # cxb a maintenant sa session sur le secondaire : continuité,
             # journalisée une fois, pas à chaque sondage
             avant = len(journal)
@@ -264,7 +264,8 @@ class ExecuteurTest(_Base):
                 account_turn.choose(neuf)
                 account_turn.choose(neuf)
             self.assertEqual(len(journal), avant + 1)
-            self.assertIn("[cxb] compte codex : secondaire — continuité", journal[-1])
+            self.assertIn("secondaire — continuity", journal[-1])
+            self.assertTrue(journal[-1].startswith("[cxb] "), journal[-1])
         finally:
             ancien.watchdog_stop.set()
             neuf.watchdog_stop.set()

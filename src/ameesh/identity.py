@@ -58,16 +58,16 @@ class Binding:
     def describe(self) -> str:
         if self.ok:
             return "%s (%s)" % (self.name, self.source)
-        return "non lié" + (" : %s" % self.reason if self.reason else "")
+        return "unbound" + (": %s" % self.reason if self.reason else "")
 
     def describe_session(self) -> str:
         """La liaison de session, en une ligne (vide hors source `session`)."""
         row = self.session or {}
         if not row:
             return ""
-        return "liaison %s %s sur %s, pid %s, par %s" % (
+        return "binding %s %s on %s, pid %s, by %s" % (
             row.get("harness"), row.get("session_id"), row.get("host"),
-            row.get("pid") or "non contrôlé", row.get("created_by") or "?")
+            row.get("pid") or "not checked", row.get("created_by") or "?")
 
 
 def aliases(cfg: Config) -> list[tuple[str, str, str]]:
@@ -118,7 +118,7 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
     if not name:
         return _session_binding(cfg, db, harness, session_id)
     if not NAME_RE.match(name):
-        return Binding(reason="AGENT_MAIL_NAME absente (le runner la pose pour le harnais)")
+        return Binding(reason="AGENT_MAIL_NAME not set (the runner sets it for the harness)")
     runner_id = os.environ.get("AMEESH_RUNNER_ID") or os.environ.get("AGENT_MESH_RUNNER_ID") or ""
     epoch_text = (os.environ.get("AMEESH_LEASE_EPOCH")
                   or os.environ.get("AGENT_MESH_LEASE_EPOCH") or "")
@@ -127,7 +127,7 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
             epoch = int(epoch_text)
         except ValueError:
             return Binding(name=name, source="runner", runner_id=runner_id,
-                           reason="AMEESH_LEASE_EPOCH illisible")
+                           reason="unreadable AMEESH_LEASE_EPOCH")
         from . import registry  # import tardif : identity ne dépend pas de la base
         ok, reason = registry.lease_matches(db, name, runner_id, epoch)
         return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,
@@ -135,8 +135,8 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
     return Binding(name=name, source="explicit", ok=True)
 
 
-_UNBOUND = ("AGENT_MAIL_NAME absente (le runner la pose pour le harnais) et aucune "
-            "liaison de session (ameesh mail bind)")
+_UNBOUND = ("AGENT_MAIL_NAME not set (the runner sets it for the harness) and no "
+            "session binding (ameesh mail bind)")
 
 
 def _session_binding(cfg: Config, db, harness: str | None,
@@ -152,7 +152,7 @@ def _session_binding(cfg: Config, db, harness: str | None,
         if session_id is not None or harness is not None:
             row, why = sb.for_hook(cfg, db, harness or "", session_id or "")
             if row is None:
-                return Binding(reason="AGENT_MAIL_NAME absente et " + why)
+                return Binding(reason="AGENT_MAIL_NAME not set and " + why)
             if why:
                 return Binding(name=row["agent"], source="session", session=row,
                                reason=why)
@@ -167,12 +167,12 @@ def _session_binding(cfg: Config, db, harness: str | None,
             # requête) a trouvé une base non migrée — c'est l'erreur à dire,
             # pas « non lié »
             raise
-        return Binding(reason="liaison de session illisible (%s)"
+        return Binding(reason="unreadable session binding (%s)"
                        % " ".join(str(exc).split())[:120])
     if holder:
         return Binding(name=row["agent"], source="session", session=row,
-                       reason="%s est mené par l'exécuteur (bail vivant de %s) : "
-                              "la liaison de session ne vaut plus" % (row["agent"], holder))
+                       reason="%s is driven by the runner (live lease of %s): "
+                              "the session binding no longer applies" % (row["agent"], holder))
     return Binding(name=row["agent"], source="session", session=row, ok=True)
 
 

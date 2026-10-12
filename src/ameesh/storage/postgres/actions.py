@@ -217,5 +217,5 @@ class Actions(interface.Actions):
                    last_note = %s
              WHERE action_id = %s AND state IN ('proposed', 'approved', 'failed')
             RETURNING action_id
-            """, (by or "", note or "annulée", action_id))
+            """, (by or "", note or "cancelled", action_id))
         return bool(rows)

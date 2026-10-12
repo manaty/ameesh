@@ -97,8 +97,8 @@ class ProfilsTest(unittest.TestCase):
         sans = _dossier(os.path.join(self.tmp, "sans"))
         bon = _dossier(os.path.join(self.tmp, "bon"), creds=".credentials.json")
         p = lambda chemin: accounts.Profile("claude", "x", path=chemin)  # noqa: E731
-        self.assertTrue(any("non privé" in m for m in accounts.check(p(ouvert))))
-        self.assertTrue(any("identifiants absents" in m for m in accounts.check(p(sans))))
+        self.assertTrue(any("not private" in m for m in accounts.check(p(ouvert))))
+        self.assertTrue(any("credentials missing" in m for m in accounts.check(p(sans))))
         self.assertEqual(accounts.check(p(bon)), [])
         self.assertTrue(accounts.check(p(os.path.join(self.tmp, "absent"))))
         codex = accounts.Profile("codex", "c", path=_dossier(
@@ -112,7 +112,7 @@ class ProfilsTest(unittest.TestCase):
         os.chmod(cle, 0o644)
         prof = accounts.Profile("deepseek", "a", kind="api_key_env",
                                 env="DEEPSEEK_API_KEY", key_file=cle)
-        self.assertTrue(any("trop ouvert" in m for m in accounts.check(prof)))
+        self.assertTrue(any("too permissive" in m for m in accounts.check(prof)))
         with self.assertRaises(accounts.AccountError) as ctx:
             accounts.apply_env({}, prof)
         self.assertNotIn("cle-factice-a", str(ctx.exception))
@@ -276,7 +276,7 @@ class ChoixTest(_Base):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertEqual(choix.switched["kind"], "bascule")
-        self.assertIn("primaire au seuil", choix.switched["reason"])
+        self.assertIn("primaire at threshold", choix.switched["reason"])
         self.assertEqual(storage.of(self.db).accounts.holds(self.cfg.host, "codex"), {})
         # avant la remise à zéro : le primaire est toujours au seuil
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now + 60)
@@ -328,7 +328,7 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
-        self.assertIn("tous les comptes codex au seuil", choix.reason)
+        self.assertIn("all codex accounts at threshold", choix.reason)
         self.assertIn("primaire", choix.reason)
         self.assertIn("secondaire", choix.reason)
 
@@ -364,7 +364,7 @@ class ChoixTest(_Base):
                                        by="human:test"))
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
-        self.assertIn("forcé", choix.reason)
+        self.assertIn("forced", choix.reason)
         with self.assertRaises(accounts.AccountError):
             accounts.force(self.db, self.cfg.host, "codex", items, "inconnu", by="human:test")
         self.assertEqual([b["kind"] for b in self._bascules()],
@@ -379,7 +379,7 @@ class ChoixTest(_Base):
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
-        self.assertIn("non privé", choix.reason)
+        self.assertIn("not private", choix.reason)
 
 
 class ExecuteurTest(_Base):
@@ -405,8 +405,8 @@ class ExecuteurTest(_Base):
                               for b in self._bascules()],
                              [("primaire", "secondaire", "bascule", "cl")])
             fil = self._fil()
-            self.assertIn("Bascule de compte claude : primaire → secondaire", fil)
-            self.assertIn("reprise telle quelle", fil)
+            self.assertIn("Account switch claude: primaire → secondaire", fil)
+            self.assertIn("resumed as is", fil)
             # le grand livre attribue chaque tour à son compte
             lignes = self.db.query("SELECT account FROM turn_costs WHERE agent = 'cl'"
                                    " ORDER BY id")
@@ -430,13 +430,13 @@ class ExecuteurTest(_Base):
             # … puis le tour sous le nouveau, session neuve ouverte par le résumé
             self.assertEqual(tours[1]["compte"]["CLAUDE_CONFIG_DIR"], comptes[1]["path"])
             self.assertNotIn("--resume", tours[1]["argv"])
-            self.assertIn("Reprise de session après rotation", tours[1]["argv"][-1])
+            self.assertIn("Session resumed after rotation", tours[1]["argv"][-1])
             # le résumé de l'agent, encadré : sa propre note, sans autorité
             self.assertEqual(tours[0]["argv"][-1], adapters.SUMMARY_PROMPT)
-            self.assertIn("le résumé que tu as écrit toi-même", tours[1]["argv"][-1])
-            self.assertIn('auteur="toi-même, session précédente" autorite="aucune"',
+            self.assertIn("the summary you wrote yourself", tours[1]["argv"][-1])
+            self.assertIn('author="yourself, previous session" authority="none"',
                           tours[1]["argv"][-1])
-            self.assertIn("rotation avec résumé", self._fil().lower())
+            self.assertIn("rotation with resume summary", self._fil().lower())
         finally:
             worker.watchdog_stop.set()
 
@@ -456,7 +456,7 @@ class ExecuteurTest(_Base):
             self.assertEqual(tours[1]["compte"]["CODEX_HOME"], comptes[1]["path"])
             self.assertNotIn("resume", tours[1]["argv"])       # fil neuf, sous le secondaire
             fil = self._fil()
-            self.assertIn("ne peut pas être reprise sous le compte secondaire", fil)
+            self.assertIn("cannot be resumed under account secondaire", fil)
         finally:
             worker.watchdog_stop.set()
 
@@ -493,7 +493,7 @@ class ExecuteurTest(_Base):
             self.assertIsNone(self._tour(worker))
             ligne = registry.get(self.db, "cx2")
             self.assertEqual(ligne["status"], "blocked")
-            self.assertIn("tous les comptes codex au seuil", ligne["status_text"])
+            self.assertIn("all codex accounts at threshold", ligne["status_text"])
             self.assertEqual(self.turns(), [])
         finally:
             worker.watchdog_stop.set()
@@ -642,7 +642,7 @@ class IsolementTest(_Base):
             self.assertEqual(len(self.turns()), 0, "un dossier invalide a lancé un harnais")
             ligne = registry.get(self.db, "invalid-dir")
             self.assertEqual(ligne["status"], "blocked")
-            self.assertIn("dossier absent", ligne["last_error"] or "")
+            self.assertIn("missing directory", ligne["last_error"] or "")
             self.assertEqual(ligne["pending_prompt"], "travail")
         finally:
             worker.watchdog_stop.set()
@@ -659,7 +659,7 @@ class IsolementTest(_Base):
                 os.chmod(comptes[0]["path"], 0o755)  # entre le choix et le lancement
                 self.assertFalse(worker.run_turn(spec))
             self.assertEqual(self.turns(), [])
-            self.assertIn("non privé", registry.get(self.db, "apres-choix")["last_error"])
+            self.assertIn("not private", registry.get(self.db, "apres-choix")["last_error"])
         finally:
             worker.watchdog_stop.set()
 
@@ -723,7 +723,7 @@ class SoldesEtCliTest(_Base):
         with mock.patch.dict(os.environ, {"AMEESH_TEST_CLE_B": "cle-factice-b"}):
             choix = accounts.choose(self.db, self.cfg.host, "deepseek", items, book)
         self.assertEqual(choix.profile.name, "cle-b")
-        self.assertIn("solde du compte", choix.switched["reason"])
+        self.assertIn("account balance", choix.switched["reason"])
         # deux séries distinctes : pas de « dépense » entre deux clés
         self.assertEqual(balance.spend(rows)["hourly"], [])
 
@@ -769,7 +769,7 @@ class SoldesEtCliTest(_Base):
                                    env=env).returncode, 1)
         proc = self.mesh("accounts", "auto", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("automatique", proc.stdout)
+        self.assertIn("automatic", proc.stdout)
         # `ameesh cost` : compte actif et jauges par compte
         os.makedirs(os.path.join(self.cfg.state_dir, "cxa"), exist_ok=True)
         with open(os.path.join(self.cfg.state_dir, "cxa", "tool"), "w",
@@ -778,7 +778,7 @@ class SoldesEtCliTest(_Base):
         proc = self.mesh("cost", "report", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("codex/secondaire", proc.stdout)
-        self.assertIn("comptes (hôte", proc.stdout)
+        self.assertIn("accounts (host", proc.stdout)
         proc = self.mesh("cost", "report", "--json", env=env)
         ligne = json.loads(proc.stdout)[0]
         self.assertEqual(ligne["account"], "secondaire")
@@ -790,7 +790,7 @@ class SoldesEtCliTest(_Base):
         env = self.env(AMEESH_CONFIG=self._config({"claude": [{"name": "a"}, {"name": "a"}]}))
         proc = self.mesh("accounts", "list", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("en double", proc.stderr)
+        self.assertIn("duplicate account", proc.stderr)
 
 
 if __name__ == "__main__":

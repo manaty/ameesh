@@ -69,7 +69,7 @@ def parse_listing(
             source=provider,
             complete=False,
             raw=raw,
-            detail="réponse en erreur : rien n'est retiré",
+            detail="error response: nothing is removed",
         )
     models = []
     for entry in _entries(payload):
@@ -89,7 +89,7 @@ def parse_listing(
     detail = ""
     if _has_more(payload) and not pagination_followed:
         complete = False
-        detail = "pagination non suivie : liste partielle, rien n'est retiré"
+        detail = "pagination not followed: partial list, nothing is removed"
     return SourceResult(
         source=provider, complete=complete, models=tuple(models), raw=raw, detail=detail
     )

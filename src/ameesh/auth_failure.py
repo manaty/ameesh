@@ -91,7 +91,8 @@ def account_name(profile) -> str:
 
 
 def status_text(harness: str, account: str) -> str:
-    return "%s %s/%s" % (STATUS_PREFIX, harness, account or "(défaut)")
+    return "%s %s/%s" % (STATUS_PREFIX, harness, account or "(default)")
+
 
 
 def failing(db, host: str, harness: str) -> dict[str, dict]:
