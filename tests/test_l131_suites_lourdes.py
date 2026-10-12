@@ -270,6 +270,46 @@ class RunChildTest(unittest.TestCase):
         self.assertIn(b"got yes", out)
         self.assertIn(b"fg True", out)       # the wrapper took the terminal back
 
+    def test_the_terminal_left_to_the_shell_stays_with_it(self):
+        # L131d (codex r2 of #266): stopped, sent to the background and left
+        # to exit, the command leaves the foreground with the shell — the
+        # wrapper's cleanup must not take it from the shell
+        import pty
+        import termios
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
+        child = ("import os, signal, sys; signal.signal(signal.SIGTTOU, signal.SIG_IGN); "
+                 "fd = os.open('/dev/tty', os.O_RDWR); os.tcsetpgrp(fd, int(sys.argv[1]))")
+        # the "shell": a group of its own, not a child of the wrapper (its
+        # cleanup would stop it), reparented to init before heavy.run
+        code = ("import os, signal, sys, time, types; from ameesh import heavy\n"
+                "r, w = os.pipe()\n"
+                "if os.fork() == 0:\n"
+                "    if os.fork() == 0:\n"
+                "        os.setpgid(0, 0); os.write(w, b'%8d' % os.getpid()); time.sleep(30)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+                "shell = int(os.read(r, 8))\n"
+                "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1)\n"
+                "rc = heavy.run(cfg, [sys.executable, '-c', sys.argv[2], str(shell)], nice=0)\n"
+                "print('shell keeps it', os.tcgetpgrp(0) == shell, flush=True)\n"
+                "os.kill(shell, signal.SIGKILL)\n"
+                "raise SystemExit(rc)\n")
+
+        def controlling():
+            import fcntl
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child],
+                                stdin=slave, stdout=slave, stderr=slave, env=env,
+                                start_new_session=True, preexec_fn=controlling)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        out = self._read_until(master, b"shell keeps it ", 20)
+        self.assertEqual(proc.wait(timeout=20), 0, out)
+        self.assertIn(b"shell keeps it True", out + self._read_until(master, b"True", 2))
+
     def _on_pty(self, child: str, *, stdin_null: bool = False):
         """The wrapper as a session leader on a new pty (its controlling
         terminal, wrapper in the foreground): (process, master fd)."""
@@ -435,6 +475,30 @@ class TreeReviewR1Test(unittest.TestCase):
                                                clock=self._clock()))
         self.assertEqual(killed, [(21, signal.SIGTERM), (21, signal.SIGKILL)])
         self.assertEqual(err.getvalue().count("process 20 "), 1)
+
+    def test_a_fork_churn_does_not_delay_the_signals_nor_the_deadline(self):
+        # L131d (codex r2 of #266): every read reaps a zombie — the one that
+        # just forked its replacement — and lists that replacement
+        from ameesh import platform
+        pids = iter(range(100, 10000))
+        reads = []
+
+        def churn():
+            reads.append(1)
+            if len(reads) > 500:
+                raise AssertionError("drain stuck in the churn")
+            return [{"pid": next(pids), "zombie": True}, {"pid": next(pids), "zombie": False}]
+
+        killed = []
+        with mock.patch.object(platform, "children", side_effect=churn), \
+                mock.patch.object(platform, "reap", return_value=0), \
+                mock.patch.object(heavy.os, "kill",
+                                  side_effect=lambda pid, sig: killed.append((pid, sig))):
+            self.assertFalse(heavy._drain_tree(1, grace=3, sleep=lambda s: None,
+                                               clock=self._clock()))
+        self.assertEqual(killed[0], (101, signal.SIGTERM))   # the first read signals
+        self.assertIn(signal.SIGKILL, [sig for _, sig in killed])
+        self.assertLess(len(reads), 30)
 
     def _suspend(self, owners):
         owner = iter(owners)

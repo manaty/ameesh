@@ -604,7 +604,7 @@ class Accounts(Domain):
 
 
 # --------------------------------------------------------------------------
-# credential health (L226a/L226b, migration 0060)
+# credential health (L226a/L226b, migrations 0060 and 0068)
 # --------------------------------------------------------------------------
 
 class Credentials(Domain):
@@ -614,21 +614,36 @@ class Credentials(Domain):
 
     @abc.abstractmethod
     def report(self, host: str, harness: str, account: str, state: str, *,
-               reason: str = "", source: str, expires_at: float | None = None) -> dict:
+               reason: str = "", source: str, expires_at: float | None = None,
+               fingerprint: str | None = None,
+               expect_failures: int | None = None) -> dict:
         """Records `state` (healthy | failing | unknown) from `source`
         (sentinel | turn | manual); `failing_since` is kept while failing and
         cleared otherwise; `expires_at` (epoch, None = unknown) is the
-        credential's forecast expiry, overwritten on each report. Returns
-        {state, previous} (previous: None if new)."""
+        credential's forecast expiry, overwritten on each report. A `failing`
+        report stamps `last_failure_at`, stores `fingerprint` (of the
+        credential that failed, never the credential) and counts one more
+        failure. Any other report with `expect_failures` lands only if the
+        failure count is still that one (0 for a missing row). Returns
+        {state, previous} (previous: None if new), or {skipped: True}."""
+
+    @abc.abstractmethod
+    def annotate(self, host: str, harness: str, account: str, reason: str, *,
+                 expect_failures: int) -> bool:
+        """#210 r4: replaces the `reason` of a `failing` row (adds the fix
+        command to a failure a turn detected), nothing else, and only if the
+        failure count is still `expect_failures`. True if written."""
 
     @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
-        checked_ts, failing_since_ts, expires_ts."""
+        checked_ts, failing_since_ts, expires_ts, last_failure_ts,
+        failing_fingerprint, failures."""
 
     @abc.abstractmethod
     def listing(self, host: str | None = None) -> list[dict]:
-        """Every row (of a host, or of all hosts)."""
+        """Every row (of a host, or of all hosts), without
+        `failing_fingerprint`: only columns the supervisor role reads."""
 
 
 # --------------------------------------------------------------------------

@@ -224,37 +224,46 @@ def _drain_group(pgid: int, *, grace: float | None = None, sleep=time.sleep,
     return _group_gone(pgid)
 
 
-def _tree_children(leader: int) -> list[int] | None:
-    """L131c: the wrapper's live children other than the command, once the
-    wrapper is a child subreaper — every orphaned descendant is reparented to
-    it, so a live descendant always means a live child: one read of the
-    kernel's list, no scan to race with a fork chain. Zombies (but the
-    command's) are reaped on the way, and the list is read again after a
-    read that reaped one (#266 r1): a child that forked a replacement and
-    exited after the list was read had it reparented before turning zombie.
-    None if the list is not available."""
+def _tree_read(leader: int) -> tuple[list[int], bool] | None:
+    """L131c: one read of the wrapper's children other than the command,
+    once the wrapper is a child subreaper — every orphaned descendant is
+    reparented to it, so a live descendant always means a live child. The
+    live pids, and whether a zombie (but the command's) was reaped on the
+    way: a child that forked a replacement and exited after the list was
+    read had it reparented before turning zombie, so only a read that reaps
+    nothing is conclusive (#266 r1). None if the list is not available."""
     from . import platform
-    while True:
-        try:
-            rows = platform.children()
-        except platform.NotAvailable:
-            return None
-        live = []
-        reaped = False
-        for row in rows:
-            if row["pid"] == leader:
-                continue
-            if row["zombie"]:
-                reaped = platform.reap(row["pid"]) is not None or reaped
-                continue
-            live.append(row["pid"])
-        if not reaped:
-            return live
+    try:
+        rows = platform.children()
+    except platform.NotAvailable:
+        return None
+    live = []
+    reaped = False
+    for row in rows:
+        if row["pid"] == leader:
+            continue
+        if row["zombie"]:
+            reaped = platform.reap(row["pid"]) is not None or reaped
+            continue
+        live.append(row["pid"])
+    return live, reaped
 
 
-def _tree_gone(leader: int) -> bool:
-    """No live descendant on two consecutive reads (#266 r1)."""
-    return not _tree_children(leader) and not _tree_children(leader)
+def _tree_gone(leader: int, reads: int = 10) -> bool:
+    """No live descendant on two consecutive conclusive reads (#266 r1),
+    within `reads` reads: a fork churn cannot hold the caller (L131d)."""
+    quiet = 0
+    for _ in range(reads):
+        read = _tree_read(leader)
+        if read is None:
+            return True
+        live, reaped = read
+        quiet = quiet + 1 if not live and not reaped else 0
+        if quiet >= 2:
+            return True
+        if live:
+            return False
+    return False
 
 
 def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
@@ -262,7 +271,10 @@ def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
     """L131c: stops every descendant the command left (its group or not:
     nothing escapes a subreaper), each signalled by pid — a child's pid
     cannot be reused before its parent reaps it. SIGTERM, then SIGKILL after
-    `grace`, then `grace` more; True when none is left. A descendant that
+    `grace`, then `grace` more; True when none is left on two consecutive
+    conclusive reads. Every read signals what it lists and the deadline is
+    checked after each one, so a fork churn that keeps reaping zombies
+    neither delays the signals nor the escalation (L131d). A descendant that
     may not be signalled (its credentials changed: setuid) is said once and
     the others are still stopped (#266 r1)."""
     grace = GROUP_GRACE_S if grace is None else grace
@@ -270,13 +282,16 @@ def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
     for signum in (signal.SIGTERM, signal.SIGKILL):
         sent: set = set()
         deadline = clock() + grace
+        quiet = 0
         while True:
-            live = _tree_children(leader)
-            if not live and _tree_gone(leader):
+            read = _tree_read(leader)
+            if read is None:
                 return True
-            if clock() >= deadline:
-                break
-            for pid in live or ():
+            live, reaped = read
+            quiet = quiet + 1 if not live and not reaped else 0
+            if quiet >= 2:
+                return True
+            for pid in live:
                 if pid not in sent:   # a grandchild reparented since
                     try:
                         os.kill(pid, signum)
@@ -289,7 +304,10 @@ def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
                                   "be signalled (credentials changed)" % pid,
                                   file=sys.stderr)
                     sent.add(pid)
-            sleep(0.1)
+            if clock() >= deadline:
+                break
+            if live:
+                sleep(0.1)
     return _tree_gone(leader)
 
 
@@ -397,7 +415,7 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         _note_child(fh, child.pid)
         for signum in pending:
             relay(signum, None)
-        if tree and _tree_children(child.pid) is not None:
+        if tree and _tree_read(child.pid) is not None:
             code = _wait_unreaped(child, tty)
             drained = _drain_tree(child.pid)
         else:
@@ -411,8 +429,12 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         return code if code >= 0 else 128 - code
     finally:
         if tty is not None:
+            # L131d: the terminal is taken back only from the command's group
+            # (or kept): stopped, sent to the background and left to exit, the
+            # command leaves it with the shell, which must keep it
             try:
-                os.tcsetpgrp(tty, os.getpgrp())
+                if child is None or os.tcgetpgrp(tty) in (os.getpgrp(), child.pid):
+                    os.tcsetpgrp(tty, os.getpgrp())
             except OSError:
                 pass
             os.close(tty)
