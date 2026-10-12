@@ -11,6 +11,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 from ameesh import harnesses, session_backup as sb
 from ameesh.runner import AgentWorker
@@ -80,6 +81,33 @@ class SessionFilesTest(_Tmp):
             with self.assertRaises(sb.BackupError):
                 sb.session_paths(self.home, DSH, invalid)
 
+    def test_rollout_symlink_to_account_credentials_ignored(self):
+        secret = os.path.join(self.home, "auth.json")
+        write_file(secret, "private-account-token")
+        rollout = os.path.join(self.home, "sessions/day/rollout-s1.jsonl")
+        os.makedirs(os.path.dirname(rollout))
+        os.symlink(secret, rollout)
+        self.assertEqual(sb.session_paths(self.home, ("sessions/*/rollout-{session}.jsonl",), "s1"), [])
+        with self.assertRaises(sb.BackupError):
+            sb.archive(self.home, [rollout])
+
+    def test_session_directory_symlink_inside_home_ignored(self):
+        os.symlink(os.path.join(self.home, "sessions/--directory--", SESSION),
+                   os.path.join(self.home, "sessions/--directory--/alias"))
+        self.assertEqual(sb.session_paths(self.home, DSH, "alias"), [])
+
+    def test_archive_omits_nested_credential_links(self):
+        secret = os.path.join(self.home, "auth.json")
+        write_file(secret, "private-account-token")
+        session = os.path.join(self.home, "sessions/--directory--", SESSION)
+        os.symlink(secret, os.path.join(session, "credential.json"))
+        data = sb.archive(self.home, [session])
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            self.assertFalse(any(m.issym() or m.islnk() for m in tar.getmembers()))
+            self.assertFalse(any("credential" in m.name for m in tar.getmembers()))
+            self.assertNotIn(b"private-account-token", b"".join(
+                tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()))
+
     def test_link_outside_home_ignored(self):
         outside = os.path.join(self.tmp, "outside")
         os.makedirs(outside)
@@ -146,7 +174,7 @@ class RoundTripTest(_Tmp):
 class EncryptionTest(_Tmp):
     def setUp(self) -> None:
         super().setUp()
-        self.gnupg = tempfile.mkdtemp(prefix="g", dir="/tmp")
+        self.gnupg = tempfile.mkdtemp(prefix="g")
         self.addCleanup(shutil.rmtree, self.gnupg, True)
         os.chmod(self.gnupg, 0o700)
         previous = os.environ.get("GNUPGHOME")
@@ -261,6 +289,48 @@ class S3EndpointTest(unittest.TestCase):
             with self.subTest(endpoint=endpoint), self.assertRaises(sb.BackupError):
                 sb._s3(self.cfg, dict(self.env, AMEESH_BACKUP_S3_ENDPOINT=endpoint))
 
+    def test_s3_credentials_use_private_config_for_all_requests(self):
+        env = dict(self.env, AMEESH_BACKUP_S3_ENDPOINT="https://objects.example.test")
+        configs = []
+        def request(argv, **kwargs):
+            self.assertNotIn("--user", argv)
+            self.assertFalse(any(value in " ".join(argv) for value in ("test-access", "test-secret")))
+            path = argv[argv.index("--config") + 1]
+            configs.append(path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with open(path) as fh:
+                self.assertEqual(fh.read(), 'user = "test-access:test-secret"\n')
+            return subprocess.CompletedProcess(argv, 0, b"<ListBucketResult/>", b"")
+        with mock.patch.object(sb.subprocess, "run", side_effect=request) as run:
+            sb.put(self.cfg, "a/s/1", b"upload", env)
+            self.assertEqual(run.call_args.kwargs["input"], b"upload")
+            sb.get(self.cfg, "a/s/1", env)
+            sb.list_keys(self.cfg, "", env)
+        self.assertEqual(len(configs), 3)
+        self.assertTrue(all(not os.path.exists(path) for path in configs))
+
+    def test_timeout_and_error_messages_do_not_expose_credentials(self):
+        configs = []
+        def timeout(argv, **kwargs):
+            configs.append(argv[argv.index("--config") + 1])
+            raise subprocess.TimeoutExpired(argv, 1, stderr=b"test-access:test-secret")
+        with mock.patch.object(sb.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(sb.BackupError) as err:
+                sb._curl(["https://objects.example.test"], user="test-access:test-secret")
+        self.assertEqual(str(err.exception), "S3 storage timed out")
+        self.assertFalse(os.path.exists(configs[0]))
+        with mock.patch.object(sb.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 22, b"", b"test-access test-secret test-access:test-secret")):
+            with self.assertRaises(sb.BackupError) as err:
+                sb._curl(["https://objects.example.test"], user="test-access:test-secret")
+        self.assertNotIn("test-access", str(err.exception))
+        self.assertNotIn("test-secret", str(err.exception))
+
+    def test_credential_controls_rejected(self):
+        for user in ("access:secret\nverbose", "access:secret\r", "access:secret\x00"):
+            with self.subTest(user=user), self.assertRaises(sb.BackupError):
+                sb._curl([], user=user)
+
     def test_listing_decodes_xml_and_encodes_continuation_token(self):
         from unittest.mock import patch
         env = dict(self.env, AMEESH_BACKUP_S3_ENDPOINT="https://objects.example.test")
@@ -273,6 +343,23 @@ class S3EndpointTest(unittest.TestCase):
 
 
 class RestoreSafetyTest(_Tmp):
+    def test_incomplete_or_corrupt_gzip_rejected_before_overwrite(self):
+        cfg = self.conf()
+        data = sb.archive(self.home, sb.session_paths(self.home, DSH, SESSION))
+        elsewhere = os.path.join(self.tmp, "restored")
+        destination = os.path.join(elsewhere, "sessions/--directory--", SESSION,
+                                   "session.v4.jsonl.zstd")
+        write_file(destination, "keep-existing-session")
+        bad_crc = bytearray(data)
+        bad_crc[-8] ^= 1
+        for damaged in (data[:-8], data[:-1], bytes(bad_crc)):
+            with self.subTest(length=len(damaged)):
+                sb.put(cfg, "pc/a/s/bad.tar.gz", damaged)
+                with self.assertRaisesRegex(sb.BackupError, "gzip stream"):
+                    sb.restore(cfg, "pc/a/s/bad.tar.gz", elsewhere, overwrite=True)
+                with open(destination) as fh:
+                    self.assertEqual(fh.read(), "keep-existing-session")
+
     def test_rejects_special_files_and_links(self):
         for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE):
             with self.subTest(kind=kind):
