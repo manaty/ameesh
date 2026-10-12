@@ -29,11 +29,20 @@ of the guest's slice and of its agents' units (`systemctl set-property
 agent), and level 2 freezes the slice through a transient service that
 freezes, sleeps until the bound and thaws (systemd owns the freeze; stopped
 when the level drops, when the guard stops and when it starts). `caps.enforced` lists
-what is actually in force. `--observe` decides and publishes only. The wait
-for the drain and the stop come with tranche 3.
+what is actually in force. `--observe` decides and publishes only.
+
+The drain and the stop (tranche 3): a drain thaws and waits for the guest's
+`drained` acknowledgement; at its deadline the offloaded jobs
+(`ameesh-job-*.scope`, which do not acknowledge) are stopped; 30 s later
+without the acknowledgement, level 4 kills the agents' units and the jobs
+(`systemctl kill`) then stops the guest's slice (`systemctl stop`); the guard
+does not start them again when the level drops. `ameesh guard drain`
+asks the running guard for a drain (`--for`, `--cancel`), through a request
+file it reads at every evaluation.
 
     ameesh guard check [--config F] [--json]       one measure, the decision, the state
     ameesh guard run [--observe] [--config F]      the loop; writes the state file
+    ameesh guard drain [--for S | --cancel]        asks the running guard for a drain
 
 Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
 
@@ -41,6 +50,8 @@ Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
      "state_path": "/run/ameesh-gate/state/state.json",
      "ack_path": "/run/ameesh-gate/ack/ack.json",
      "slice": "ameesh-guest.slice", "agent_units": "ameesh-guest-runner@*.service",
+     "job_units": "ameesh-job-*.scope",
+     "drain_request_path": "/run/ameesh-gate/drain.json",
      "work_path": "/srv/ameesh-guest",
      "lend": {"cpu_max": 3, "cpu_weight": 10, "memory_max": "14GiB",
               "agent_memory_max": "4.5GiB", "disk_max": "80GiB",
@@ -72,6 +83,7 @@ from .platform import host
 
 SCHEMA_HOST_STATE = "ameesh-host-state/1"
 SCHEMA_HOST_ACK = "ameesh-host-ack/1"
+SCHEMA_DRAIN_REQUEST = "ameesh-guard-drain/1"
 GUARD_KIND = "ameesh-guard"
 DEFAULT_CONFIG = "/etc/ameesh/guard.json"
 DEFAULT_STATE_PATH = "/run/ameesh-gate/state/state.json"
@@ -79,6 +91,9 @@ DEFAULT_ACK_PATH = "/run/ameesh-gate/ack/ack.json"
 #: the guest's slice and its agents' units (study §2.1)
 DEFAULT_SLICE = "ameesh-guest.slice"
 DEFAULT_AGENT_UNITS = "ameesh-guest-runner@*.service"
+#: the offloaded jobs (mode b, study §1.8) and the manual drain request
+DEFAULT_JOB_UNITS = "ameesh-job-*.scope"
+DEFAULT_DRAIN_REQUEST_PATH = "/run/ameesh-gate/drain.json"
 #: the guest's work directory (study §3): its free disk is what the guest uses
 DEFAULT_WORK_PATH = "/srv/ameesh-guest"
 
@@ -260,6 +275,8 @@ class GuardConfig:
     ack_path: str = DEFAULT_ACK_PATH
     slice: str = DEFAULT_SLICE
     agent_units: str = DEFAULT_AGENT_UNITS
+    job_units: str = DEFAULT_JOB_UNITS
+    drain_request_path: str = DEFAULT_DRAIN_REQUEST_PATH
     work_path: str = DEFAULT_WORK_PATH
 
 
@@ -287,6 +304,9 @@ def load_config(path: str | None = None) -> GuardConfig:
                        ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
                        slice=slice_name,
                        agent_units=str(raw.get("agent_units") or DEFAULT_AGENT_UNITS),
+                       job_units=str(raw.get("job_units") or DEFAULT_JOB_UNITS),
+                       drain_request_path=str(raw.get("drain_request_path")
+                                              or DEFAULT_DRAIN_REQUEST_PATH),
                        work_path=str(raw.get("work_path") or DEFAULT_WORK_PATH))
 
 
@@ -390,6 +410,8 @@ def raw_level(offer: Offer, signals: dict, now: float) -> tuple[int, str]:
     open_, _end = window_end(offer, now)
     mem = signals.get("mem_available_bytes")
     mem_min = offer.memory_available_min
+    if signals.get("drain_requested"):
+        return 3, "manual"
     if not open_:
         return 3, "window_end"
     if mem_min is not None and (mem is None or mem < mem_min):
@@ -425,11 +447,17 @@ def decide(offer: Offer, signals: dict, previous: Decision, now: float, *,
            drained: bool = False) -> Decision:
     """The next decision (§1.6): up at once, down after `calm_seconds` under
     the current level; a freeze lasts `FREEZE_MAX_S` at most, then drains; a
-    drain not acknowledged `STOP_GRACE_S` after its deadline stops."""
+    drain not acknowledged `STOP_GRACE_S` after its deadline stops. A manual
+    drain ends with its request when the host is healthy."""
     level, reason = raw_level(offer, signals, now)
     _open, end = window_end(offer, now)
     current = previous.level
     if level > current:
+        return Decision(level, reason, now, None, end)
+    if current >= 3 and previous.reason == "manual" and level < 3:
+        # a manual drain expired or cancelled, on a healthy host: its episode
+        # ends at once, at level 3 as at level 4 (no stop, no kill retried,
+        # no hysteresis: the application never asked)
         return Decision(level, reason, now, None, end)
     # same or lower: hold the current level, counting the calm
     if current == 2:
@@ -803,6 +831,8 @@ class Enforcer:
         self.frozen = False              # possibly frozen: a thaw is owed
         self.freeze_done = False         # the slice read `frozen` after a start
         self.freeze_unit = freeze_unit(cfg.slice)
+        self.jobs_stopped = False        # the drain's deadline is past: jobs stopped
+        self.guest_stopped = False       # level 4: slice killed and stopped
         #: why this slice is never touched (system slice, holds the guard)
         self.refused = refused_slice(cfg.slice, cgroup)
         #: the freeze episode: its since_ts, the boot, and its bound on the
@@ -954,14 +984,45 @@ class Enforcer:
         self.frozen = True
         self.freeze(False)
 
-    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
-        """Enforces `state` (levels 0 to 2; a drain or a stop thaws and keeps
-        the caps); the `caps` keys actually enforced, and `freeze` when the
-        slice reads frozen. A refused slice is never touched."""
+    def stop_jobs(self) -> bool:
+        """Stops the offloaded jobs (they do not acknowledge a drain)."""
+        return self._systemctl("stop", self.cfg.job_units)
+
+    def stop_guest(self) -> bool:
+        """Level 4: kills the agents' units and the jobs (`systemctl kill`,
+        aimed at the units: not every systemd kills a slice), then stops the
+        slice, its units with it. Done once both succeeded (a unit pattern
+        that matches nothing is not a failure)."""
+        killed = self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units,
+                                 self.cfg.job_units)
+        stopped = self._systemctl("stop", self.cfg.slice)
+        return killed and stopped
+
+    def apply(self, state: dict, cpu_count: int | None,
+              now: float | None = None) -> list[str]:
+        """Enforces `state`: caps at every level, freeze at level 2; a drain
+        thaws, and stops the jobs at its deadline; a stop kills and stops the
+        guest's slice. Each is done once, retried while it fails. The `caps`
+        keys actually enforced, and `freeze` when the slice reads frozen. A
+        refused slice is never touched.
+
+        `now` is the instant `state` was decided at: the deadline is judged
+        on the same clock as the decision (a manual request's expiry
+        included), never on a later one (codex #238 r4)."""
         if self.refused:
             self.log("slice %s refused: %s; nothing enforced" % (self.cfg.slice, self.refused))
             return []
+        now = self.clock() if now is None else now
         caps = state.get("caps") or {}
+        level = state.get("level", 0)
+        deadline = state.get("drain_deadline_ts")
+        if level < 3:
+            self.jobs_stopped = self.guest_stopped = False
+        elif not self.jobs_stopped and (level == 4 or (
+                deadline is not None and now >= deadline)):
+            self.jobs_stopped = self.stop_jobs()
+        if level == 4 and not self.guest_stopped:
+            self.guest_stopped = self.stop_guest()
         done = self._set(self.cfg.slice, slice_properties(caps, cpu_count))
         enforced = {PROPERTY_CAPS[p] for p in done}
         if caps.get("agent_memory_mb") is not None:
@@ -978,6 +1039,52 @@ class Enforcer:
         else:
             self.freeze(False)
         return sorted(enforced)
+
+
+# --------------------------------------------------------------------------
+# manual drain (`ameesh guard drain`)
+# --------------------------------------------------------------------------
+
+def drain_requested(path: str, now: float) -> bool:
+    """A drain asked with `ameesh guard drain` and not yet over."""
+    request = read_json(path)
+    if not request or request.get("schema") != SCHEMA_DRAIN_REQUEST:
+        return False
+    until = request.get("until_ts")
+    return until is None or (_number(until) and now < until)
+
+
+def drain_until(now: float, seconds) -> float:
+    """The end of a drain asked for `seconds`: a finite number > 0 whose end
+    is a date (codex #238 r5: `--for inf` wrote `until_ts: Infinity`, a
+    drain no `--cancel` printed). ValueError otherwise."""
+    if not _number(seconds) or seconds <= 0:
+        raise ValueError("positive number of seconds expected")
+    until = now + seconds
+    try:
+        dt.datetime.fromtimestamp(until, dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("%s seconds: the end is not a date" % seconds) from None
+    return until
+
+
+def request_drain(path: str, now: float, seconds: float | None) -> dict:
+    """Writes the drain request (until `now + seconds`, or until cancelled);
+    ValueError, before anything is written, for a duration `drain_until`
+    refuses."""
+    until = None if seconds is None else drain_until(now, seconds)
+    request = {"schema": SCHEMA_DRAIN_REQUEST, "ts": now, "until_ts": until}
+    write_state(path, request)
+    return request
+
+
+def cancel_drain(path: str) -> bool:
+    """Removes the drain request; False if there was none."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1017,8 +1124,12 @@ class Guard:
 
     def step(self) -> dict:
         """One evaluation: measure, decide, write when changed or due."""
+        reading = self.signals(self.clock())
+        # measuring takes time: the request's expiry, the decision and the
+        # drain deadline are judged on the clock read after it, right
+        # before enforcing (codex #238 r4)
         now = self.clock()
-        reading = self.signals(now)
+        reading["drain_requested"] = drain_requested(self.cfg.drain_request_path, now)
         ack = read_ack(self.cfg.ack_path)
         # an acknowledgement holds for the whole drain episode: a seq the
         # guard published since the drain began, whatever changed since
@@ -1031,7 +1142,7 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            enforced = self.enforcer.apply(state, reading.get("cpu_count"))
+            enforced = self.enforcer.apply(state, reading.get("cpu_count"), now)
             # the schema's caps.enforced lists caps only: the freeze says it itself
             state["caps"]["enforced"] = [k for k in enforced if k != "freeze"]
             if state.get("freeze") is not None:
@@ -1076,6 +1187,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--observe", action="store_true",
                      help="decide and publish the state, enforce nothing")
     run.add_argument("--once", action="store_true", help="one evaluation, then exit")
+    drain = sub.add_parser("drain", help="ask the running guard for a drain")
+    drain.add_argument("--config")
+    span = drain.add_mutually_exclusive_group()
+    span.add_argument("--for", dest="seconds", type=float, metavar="SECONDS",
+                      help="drain for this long (default: until --cancel)")
+    span.add_argument("--cancel", action="store_true", help="withdraw the request")
     return parser
 
 
@@ -1089,6 +1206,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         now = time.time()
         reading = read_signals(cfg, now)
+        reading["drain_requested"] = drain_requested(cfg.drain_request_path, now)
         decision = decide(cfg.offer, reading, Decision(since_ts=now), now)
         state = build_state(cfg, decision, 0, now, reading=reading)
         if args.json:
@@ -1098,6 +1216,23 @@ def main(argv: list[str] | None = None) -> int:
                   % (decision.level, LEVEL_NAMES[decision.level], state["state"],
                      state["reason"]))
             print("caps: %s" % json.dumps(state["caps"], sort_keys=True))
+        return 0
+    if args.command == "drain":
+        if args.cancel:
+            found = cancel_drain(cfg.drain_request_path)
+            print("drain request %s" % ("withdrawn" if found else "absent: nothing to withdraw"))
+            return 0
+        try:
+            request = request_drain(cfg.drain_request_path, time.time(), args.seconds)
+        except ValueError as exc:
+            print("ameesh guard: --for: %s" % exc, file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print("ameesh guard: %s: %s" % (cfg.drain_request_path, exc), file=sys.stderr)
+            return 1
+        until = request["until_ts"]
+        print("drain requested %s" % ("until --cancel" if until is None else "until %s" % (
+            dt.datetime.fromtimestamp(until, dt.timezone.utc).isoformat(timespec="seconds"))))
         return 0
     guard = Guard(cfg, observe=args.observe)
     signal.signal(signal.SIGTERM, _terminate)
