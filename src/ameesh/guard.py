@@ -459,11 +459,16 @@ def decide(offer: Offer, signals: dict, previous: Decision, now: float, *,
            drained: bool = False) -> Decision:
     """The next decision (§1.6): up at once, down after `calm_seconds` under
     the current level; a freeze lasts `FREEZE_MAX_S` at most, then drains; a
-    drain not acknowledged `STOP_GRACE_S` after its deadline stops."""
+    drain not acknowledged `STOP_GRACE_S` after its deadline stops. A manual
+    drain ends with its request when the host is healthy."""
     level, reason = raw_level(offer, signals, now)
     _open, end = window_end(offer, now)
     current = previous.level
     if level > current:
+        return Decision(level, reason, now, None, end)
+    if current == 3 and previous.reason == "manual" and level < 3:
+        # a manual drain expired or cancelled, on a healthy host: its episode
+        # ends at once (no stop, no hysteresis: the application never asked)
         return Decision(level, reason, now, None, end)
     # same or lower: hold the current level, counting the calm
     if current == 2:
@@ -879,9 +884,12 @@ class Enforcer:
     def stop_guest(self) -> bool:
         """Level 4: kills the agents' units and the jobs (`systemctl kill`,
         aimed at the units: not every systemd kills a slice), then stops the
-        slice, its units with it. Done once the slice is stopped."""
-        self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units, self.cfg.job_units)
-        return self._systemctl("stop", self.cfg.slice)
+        slice, its units with it. Done once both succeeded (a unit pattern
+        that matches nothing is not a failure)."""
+        killed = self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units,
+                                 self.cfg.job_units)
+        stopped = self._systemctl("stop", self.cfg.slice)
+        return killed and stopped
 
     def apply(self, state: dict, cpu_count: int | None, now: float | None = None) -> list[str]:
         """Enforces `state`: caps at every level, freeze at level 2; a drain

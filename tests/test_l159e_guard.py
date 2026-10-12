@@ -738,6 +738,54 @@ class DrainStopTest(unittest.TestCase):
         self.assertEqual(g.step()["state"], "stopped")
         self.assertEqual(self.calls, [])
 
+    def test_failed_kill_is_retried(self):
+        # codex #238 r1: SIGKILL fails, the slice stop works: the kill is
+        # retried at the next evaluation
+        failing = [True]
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            bad = failing[0] and argv[1] == "kill"
+            return mock.Mock(returncode=1 if bad else 0, stdout="", stderr="")
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None)
+        state = {"level": 4, "caps": {}, "drain_deadline_ts": None}
+        enforcer.apply(state, 4, 2000.0)
+        failing[0] = False
+        enforcer.apply(state, 4, 2005.0)
+        enforcer.apply(state, 4, 2010.0)
+        self.assertEqual(len([c for c in self.calls if c[1] == "kill"]), 2)
+
+    def test_ended_manual_drain_never_escalates(self):
+        # codex #238 r1: drain --for 60 on a healthy host: level 3 at t=0,
+        # expired at 60; no job stop at 100, no kill at 130
+        for end in ("expires", "cancel"):
+            self.calls.clear()
+            self.clock[0] = 1000.0
+            if os.path.exists(self.cfg.state_path):
+                os.remove(self.cfg.state_path)
+            guard.request_drain(self.cfg.drain_request_path, 1000.0,
+                                60 if end == "expires" else None)
+            g = self.guard()
+            self.assertEqual(g.step()["level"], 3)
+            self.clock[0] = 1060.0
+            if end == "cancel":
+                guard.cancel_drain(self.cfg.drain_request_path)
+            self.assertEqual(g.step()["level"], 0, end)
+            for t in (1100.0, 1130.0, 1135.0):
+                self.clock[0] = t
+                self.assertEqual(g.step()["state"], "available", end)
+            self.assertEqual(self.stops(), [], end)
+        # the request gone but the application short of memory: the drain goes on
+        guard.request_drain(self.cfg.drain_request_path, 2000.0, 10)
+        self.clock[0] = 2000.0
+        g = self.guard()
+        self.assertEqual(g.step()["level"], 3)
+        self.reading["mem_available_bytes"] = 1 * GIB
+        self.clock[0] = 2020.0
+        self.assertEqual(g.step()["level"], 3)
+        self.clock[0] = 2130.0
+        self.assertEqual(g.step()["state"], "stopped")
+
     def test_manual_drain(self):
         path = self.cfg.drain_request_path
         self.assertFalse(guard.drain_requested(path, 0.0))
