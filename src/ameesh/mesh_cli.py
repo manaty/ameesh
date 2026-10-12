@@ -257,14 +257,13 @@ def _host_hold(cfg: Config, args: argparse.Namespace) -> int:
     if args.hold and args.release:
         print("ameesh hosts: --hold or --release, not both", file=sys.stderr)
         return 2
-    now = time.time()
     if args.hold:
         if not args.until or not (args.reason or "").strip():
             print("ameesh hosts: --hold needs --until (a hold always ends) and --reason",
                   file=sys.stderr)
             return 2
         try:
-            until = host_holds.parse_until(args.until, now)
+            seconds, until_ts = host_holds.parse_until(args.until)
         except host_holds.HoldError as exc:
             print("ameesh hosts: %s" % exc, file=sys.stderr)
             return 2
@@ -281,15 +280,28 @@ def _host_hold(cfg: Config, args: argparse.Namespace) -> int:
             return 1
         hosts = storage.of(db).hosts
         if args.hold:
-            hold = hosts.hold(args.host, until_ts=until, reason=args.reason.strip(),
-                              author=author)
-            text = "host %s on hold until %s: %s — alerts about its agents muted" % (
-                args.host, time.strftime("%Y-%m-%d %H:%M", time.localtime(until)),
-                hold["reason"])
+            if not host_holds.known(cfg, db, args.host):
+                print("ameesh hosts: %s is neither a Host of the canon nor a host of the "
+                      "registry" % args.host, file=sys.stderr)
+                return 1
+            # the bounds are the database's (its clock, not the caller's)
+            hold = hosts.hold(args.host, seconds=seconds, until_ts=until_ts,
+                              reason=args.reason.strip(), author=author)
+            if hold is None:
+                print("ameesh hosts: %s" % (
+                    host_holds.TOO_LONG if seconds is not None else
+                    "--until: %s is past, or more than %d h ahead (database time)"
+                    % (args.until.strip(), host_holds.MAX_HOLD_S // 3600)), file=sys.stderr)
+                return 2
+            text = "host %s on hold until %s: %s — alerts about its agents muted, no new " \
+                "work placed there" % (
+                    args.host, time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(float(hold["until_ts"]))),
+                    hold["reason"])
             if args.json:
                 print(json.dumps(dict(hold, action="hold"), ensure_ascii=False))
         else:
-            if not hosts.release(args.host):
+            if not hosts.release(args.host, author=author):
                 print("ameesh hosts: %s is not on hold" % args.host, file=sys.stderr)
                 return 1
             text = "host %s: hold lifted — its alerts are back" % args.host
@@ -297,8 +309,12 @@ def _host_hold(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps({"host": args.host, "action": "release"}))
         if not args.json:
             print(text)
-        # the readable thread of the project keeps the gesture
-        fil.record(cfg, db, sender=author, recipients=(), text=text)
+        # the history is `host_hold_events` (same transaction); the project
+        # thread keeps a readable copy, and its loss is said
+        if fil.record(cfg, db, sender=author, recipients=(), text=text) is None:
+            print("ameesh hosts: done and kept in host_hold_events, but not written "
+                  "to the project thread", file=sys.stderr)
+            return 1
         return 0
     finally:
         db.close()

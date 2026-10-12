@@ -2228,12 +2228,21 @@ class HostResources(Domain):
         base) : host, reason, author, created_ts, until_ts."""
 
     @abc.abstractmethod
-    def hold(self, host: str, *, until_ts: float, reason: str, author: str) -> dict:
-        """#254 : pose (ou remplace) la pause de `host` jusqu'à `until_ts`."""
+    def hold(self, host: str, *, reason: str, author: str, seconds: float | None = None,
+             until_ts: float | None = None) -> dict | None:
+        """#254 : pose (ou remplace) la pause de `host`, pour `seconds` ou
+        jusqu'à `until_ts`, bornée à l'heure de la base (après maintenant,
+        24 h au plus) ; None hors de ces bornes. L'historique
+        (`host_hold_events`) est écrit dans la même transaction."""
 
     @abc.abstractmethod
-    def release(self, host: str) -> bool:
-        """#254 : lève la pause de `host` ; faux s'il n'y en avait pas."""
+    def release(self, host: str, *, author: str) -> bool:
+        """#254 : lève la pause de `host` (historique compris) ; faux s'il
+        n'y en avait pas."""
+
+    @abc.abstractmethod
+    def hold_events(self, host: str | None = None) -> list[dict]:
+        """#254 : l'historique des pauses et levées, dans l'ordre."""
 
     @abc.abstractmethod
     def record(self, reading: dict) -> dict:
