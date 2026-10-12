@@ -10,10 +10,13 @@
 -- readable copy). A hold that ends by expiry leaves no event: it is read
 -- past, never deleted. Repeatable, and upgrades a base that applied 0392.
 
--- a hold already outside the bound (none expected: the CLI capped it) ends now
+-- a hold already outside the bound (none expected: the CLI capped it) ends:
+-- its end is cut to the bound, or to one second after it was set; the row
+-- itself stays (an expired hold leaves no event either, it is read past)
 update host_holds set until = least(until, created_at + interval '24 hours')
  where until > created_at + interval '24 hours';
-delete from host_holds where until <= created_at;
+update host_holds set until = created_at + interval '1 second'
+ where until <= created_at;
 
 do $$
 begin
