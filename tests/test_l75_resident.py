@@ -707,6 +707,36 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(turn.result.inputs, ("a", "b"))
         self.assertIn("ECHO:steered", turn.result.final)
 
+    def test_a_steer_refused_before_the_interrupt_admission_is_not_served(self):
+        # codex r5 (#387): a refused steer queues its follow-up between the
+        # call to interrupt() and the admission of the request: the admission
+        # drops it, and the interrupted turn does not report it as served
+        driver = self.driver(env={"FAKE_CODEX_STEER_REFUSE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        self.until(lambda: driver._turn_id)
+        interrupt = driver._interrupt
+        entered, steered = threading.Event(), threading.Event()
+
+        def in_the_gap(*args, **kwargs):
+            entered.set()
+            self.assertTrue(steered.wait(10))
+            return interrupt(*args, **kwargs)
+
+        done: list = []
+        with mock.patch.object(driver, "_interrupt", in_the_gap):
+            other = threading.Thread(target=lambda: done.append(driver.interrupt()))
+            other.start()
+            self.assertTrue(entered.wait(10))
+            driver.steer("follow", input_id="b")
+            self.assertEqual(driver._followups, [("b", "follow")])
+            steered.set()
+            other.join(10)
+        self.assertEqual(done, [True])
+        result = self.wait(turn)
+        self.assertEqual(result.inputs, ("a",))
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
     def test_a_steer_refused_after_the_interrupt_never_opens_a_turn(self):
         # codex r2 (#325): the interrupted end is recorded before the steer's
         # refusal comes back: the steered input is not served, no new turn

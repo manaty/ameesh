@@ -362,16 +362,19 @@ class ResidentDriver:
             turn = self._turn
             if turn is None:
                 return False
-            # dropped follow-ups were never given to the harness: not served
-            # (codex r1, #325), the caller serves them again
-            self._unconfirmed.update(input_id for input_id, _text in self._followups)
-            self._followups.clear()
 
         def admit():
             # lock held, at the admission of the request itself: the state
             # put back is the one seen there, not a snapshot that another
-            # refused interrupt may roll back in between (codex r4, #387)
+            # refused interrupt may roll back in between (codex r4, #387);
+            # follow-ups queued until then are dropped here too (codex r5)
             previous = (self._interrupting, turn.interrupted)
+            dropped = list(self._followups)
+            added = {input_id for input_id, _text in dropped} - self._unconfirmed
+            # dropped follow-ups were never given to the harness: not served
+            # (codex r1, #325), the caller serves them again
+            self._unconfirmed.update(added)
+            self._followups.clear()
             self._interrupting = True
             turn.interrupted = True
 
@@ -382,6 +385,8 @@ class ResidentDriver:
                 # in between (codex r3)
                 if self._turn is turn:
                     self._interrupting, turn.interrupted = previous
+                    self._followups[:0] = dropped
+                    self._unconfirmed.difference_update(added)
             return undo
 
         try:
