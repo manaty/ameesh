@@ -60,6 +60,7 @@ from . import migrations, placement, registry
 from . import fil, signing, storage, work
 from .config import Config
 from .db import Db
+from .deprecated import HiddenAliasParser
 
 USAGE_HINT = "agent-mesh: %s"
 
@@ -1940,7 +1941,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-mesh", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command")
+    # L148 : les sous-parseurs héritent de `HiddenAliasParser`, pour que les
+    # alias cachés (ancienne graphie d'une option) ne captent jamais une
+    # abréviation visible ni n'apparaissent dans un message d'ambiguïté.
+    sub = parser.add_subparsers(dest="command", parser_class=HiddenAliasParser)
 
     p_list = sub.add_parser("list", help="mesh list: all agents")
     p_list.add_argument("--json", action="store_true")
