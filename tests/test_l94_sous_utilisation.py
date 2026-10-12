@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
 from ameesh import exploitation, mail, notify, registry, storage, sous_utilisation, work
 
@@ -133,7 +134,7 @@ class PlanUnderusedTest(_Base):
         self.assertEqual(out[0]["responsible"], "human:proprio")
         self.assertIn("idle claude agents: claude1", out[0]["detail"])
         # #325: without a balance reading, the figure is ameesh's estimate
-        self.assertIn("about $12.50 estimated per token over 24 h (no balance reading)",
+        self.assertIn("about $12.50 estimated per token over 24 h (no usable balance reading)",
                       out[0]["detail"])
         self.assertNotIn("paid per token", out[0]["detail"])
         self.assertEqual(exploitation._format_alert(out[0])[:33],
@@ -153,6 +154,17 @@ class PlanUnderusedTest(_Base):
         [alerte] = self.alertes()
         self.assertIn("$4.00 paid per token over 24 h (provider balances)", alerte["detail"])
         self.assertNotIn("12.50", alerte["detail"])
+
+    def test_estimate_stays_when_balances_fail(self):
+        # #325: unreadable balances leave the labelled estimate, not nothing
+        self.jauge("claude", "seven_day", 0.10, 3 * JOUR, 7 * JOUR)
+        self.agent("claude1")
+        self.agent("deepseek1", "deepseek", status="running")
+        self.db.execute("INSERT INTO turn_costs (agent, harness, model, usd) "
+                        "VALUES ('deepseek1', 'deepseek', 'deepseek-pro', 12.5)")
+        with mock.patch("ameesh.balance.compare", side_effect=RuntimeError("unreadable")):
+            [alerte] = self.alertes()
+        self.assertIn("about $12.50 estimated per token over 24 h", alerte["detail"])
 
     def test_cle_de_dedoublonnage_par_compte(self):
         self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")

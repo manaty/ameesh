@@ -148,17 +148,20 @@ def _paid_spend(db, paid, seconds: float = 86400.0) -> tuple | None:
     if not paid:
         return None
     from . import balance
+    now = time.time()
     try:
-        now = time.time()
         real = [entry for entry in balance.compare(db, paid, now - seconds, now)
                 if entry["provider"] in paid and entry["currency"] == "USD"]
+    except Exception:
+        real = []                       # balances unreadable: the estimate for all
+    try:
         rest = [h for h in paid if h not in {entry["provider"] for entry in real}]
         estimated = (float(storage.of(db).turn_costs.spent(seconds, agent="all",
                                                            harnesses=rest))
                      if rest else 0.0)
-        return (sum(entry["real_spent"] for entry in real) if real else None), estimated
     except Exception:
         return None
+    return (sum(entry["real_spent"] for entry in real) if real else None), estimated
 
 
 def _common_responsible(rows) -> str | None:
@@ -276,8 +279,8 @@ def plan_underused(db, listing: list, now: float, *,
                 if real:
                     parts.append("$%.2f paid per token over 24 h (provider balances)" % real)
                 if estimated:
-                    parts.append("about $%.2f estimated per token over 24 h (no balance "
-                                 "reading)" % estimated)
+                    parts.append("about $%.2f estimated per token over 24 h (no usable "
+                                 "balance reading)" % estimated)
                 if parts:
                     detail += "; meanwhile, " + ", plus ".join(parts)
             responsible = _common_responsible(
