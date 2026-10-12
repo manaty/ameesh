@@ -347,27 +347,51 @@ def disk_paths(cfg, policy=None) -> list[str]:
     return paths
 
 
-def _anchor(path: str) -> str:
+def _within(path: str, point: str) -> bool:
+    return path == point or path.startswith(point.rstrip(os.sep) + os.sep)
+
+
+def _anchor(path: str) -> str | None:
     """`path`, or its nearest ancestor that can be stat'ed: a missing dir (a
     cache not created yet) or one behind a dir that denies traversal
-    (/data/private/docker) is read on the filesystem of that ancestor."""
+    (/data/private/docker) is read on the filesystem of that ancestor.
+
+    #306: never above the path's own mount point (`covering_mount`, read in
+    the mount table without stat): when that point is out of reach (a btrfs
+    mounted AT /data/private/docker), its filesystem is read through another
+    reachable mount of it; None when there is none (the volume is unreadable,
+    never credited to the parent filesystem)."""
     current = path
     while True:
         try:
             os.stat(current)
-            return current
+            break
         except OSError:
             parent = os.path.dirname(current.rstrip(os.sep)) or os.sep
             if parent == current:
                 return path
             current = parent
+    mounts = platform.mountinfo() if platform.is_linux() else []
+    own = platform.covering_mount(path, mounts)
+    if own is None or _within(current, own["point"]):
+        return current
+    for other in mounts:
+        if other["dev"] != own["dev"] or other["point"] == own["point"] \
+                or platform.covering_mount(other["point"], mounts) is not other:
+            continue  # another filesystem, or this mount is overmounted
+        try:
+            os.stat(other["point"])
+        except OSError:
+            continue
+        return other["point"]
+    return None
 
 
 def _probe(path: str) -> str:
     """`path` (or its `_anchor`), or its nearest parent ON THE SAME FILESYSTEM
     that can be opened: the btrfs ioctls open the path (docker's root is not
     readable by the executor); never a parent across a mount point."""
-    path = _anchor(path)
+    path = _anchor(path) or path
     try:
         dev = os.stat(path).st_dev
     except OSError:
@@ -391,11 +415,14 @@ def volume_key(path: str) -> str:
     subvolumes of one btrfs are one volume, their st_dev differ), else its
     st_dev, else the path itself (unreadable: sampled on its own); read on
     the path's `_anchor`."""
+    anchor = _anchor(path)
+    if anchor is None:  # #306: an unreachable mount is a volume of its own
+        return "mount:%d" % platform.covering_mount(path)["dev"]
     found = platform.btrfs_fs_info(_probe(path)) if platform.is_linux() else None
     if found is not None and found[0]:
         return "btrfs:%s" % found[0]
     try:
-        return "dev:%d" % os.stat(_anchor(path)).st_dev
+        return "dev:%d" % os.stat(anchor).st_dev
     except OSError:
         return "path:%s" % path
 
@@ -404,7 +431,8 @@ def volumes(paths) -> list[dict]:
     """One entry per distinct filesystem among `paths` (#253), in the order
     of `paths`: `path` (the first that names it), `paths`, `disk_free_bytes`,
     `btrfs_unallocated_bytes`, `btrfs_metadata_headroom_bytes` (None when
-    unreadable or not btrfs)."""
+    unreadable or not btrfs); `unreadable` when the filesystem cannot be
+    reached at all (#306)."""
     out: list[dict] = []
     seen: dict[str, dict] = {}
     for path in paths or ():
@@ -416,9 +444,13 @@ def volumes(paths) -> list[dict]:
             if path not in seen[key]["paths"]:
                 seen[key]["paths"].append(path)
             continue
-        probe = _probe(path)
-        volume = {"path": path, "paths": [path], "disk_free_bytes": disk_free(probe)}
-        volume.update(btrfs_usage(probe))
+        volume = {"path": path, "paths": [path]}
+        if _anchor(path) is None:  # #306: out of reach, read as unknown
+            volume.update(dict.fromkeys(f for _floor, f in VOLUME_FLOORS), unreadable=True)
+        else:
+            probe = _probe(path)
+            volume["disk_free_bytes"] = disk_free(probe)
+            volume.update(btrfs_usage(probe))
         seen[key] = volume
         out.append(volume)
     return out

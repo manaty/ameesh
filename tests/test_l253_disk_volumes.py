@@ -128,6 +128,31 @@ class TmpfsRootsTest(_Tmp):
                                               tmp=system)["tmp_path"], system)
 
 
+class MountinfoTest(_Tmp):
+    """#306: the mount table, read without touching the mount points."""
+
+    def test_parse_and_deepest_covering_mount(self):
+        path = os.path.join(self.tmp, "mountinfo")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("33 2 0:30 /@ / rw,relatime shared:1 - btrfs /dev/mapper/root rw\n"
+                     "60 33 0:30 /@home /home rw shared:2 - btrfs /dev/mapper/root rw\n"
+                     "70 33 259:3 / /data/my\\040disk rw - ext4 /dev/nvme1n1p1 rw\n"
+                     "71 70 0:44 / /data/my\\040disk/private/docker rw shared:9"
+                     " master:3 - btrfs /dev/sdb rw\n"
+                     "garbage\n")
+        table = platform.mountinfo(path)
+        self.assertEqual([m["point"] for m in table],
+                         ["/", "/home", "/data/my disk", "/data/my disk/private/docker"])
+        self.assertEqual(table[2]["dev"], os.makedev(259, 3))
+        self.assertEqual((table[3]["fstype"], table[3]["source"]), ("btrfs", "/dev/sdb"))
+        deep = platform.covering_mount("/data/my disk/private/docker/overlay2", table)
+        self.assertEqual(deep["dev"], os.makedev(0, 44))
+        self.assertEqual(platform.covering_mount("/data/my disk/x", table)["point"],
+                         "/data/my disk")
+        self.assertEqual(platform.covering_mount("/homework", table)["point"], "/")
+        self.assertEqual(platform.mountinfo(os.path.join(self.tmp, "none")), [])
+
+
 class DockerRootTest(_Tmp):
     def run_docker(self, stdout="/var/lib/docker\n", code=0):
         return subprocess.CompletedProcess([], code, stdout=stdout, stderr="")
@@ -251,6 +276,47 @@ class VolumesTest(_Tmp):
         vol = resources.volumes([missing])[0]
         self.assertEqual(vol["path"], missing)
         self.assertEqual(vol["disk_free_bytes"], 50 * GIB)
+
+    def test_mount_behind_an_untraversable_dir_never_read_on_its_parent(self):
+        """#306 (1): a btrfs mounted AT /data/private/docker, `private` denying
+        traversal: the docker volume is read through another reachable mount
+        of its filesystem, else unreadable — never on the healthy /data."""
+        data = self.dir("data")
+        docker = self.dir("data", "private", "docker")
+        other = self.dir("dockerfs")
+        private = os.path.dirname(docker)
+        os.chmod(private, 0)
+        self.addCleanup(os.chmod, private, 0o700)
+        try:
+            os.stat(docker)
+            self.skipTest("running as root")
+        except OSError:
+            pass
+        table = [{"point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"point": data, "dev": 2, "fstype": "btrfs", "source": "/dev/b"},
+                 {"point": docker, "dev": 3, "fstype": "btrfs", "source": "/dev/c"}]
+        patches = self.fake({data: FSID_SYSTEM, other: FSID_SSD},
+                            {data: 70 * GIB, other: 30 * GIB},
+                            {data: (300 * GIB, 5 * GIB), other: (0, 1 * GIB)})
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        with mock.patch.object(platform, "mountinfo", return_value=table):
+            self.assertIsNone(resources._anchor(docker))
+            vols = resources.volumes([data, docker])
+        self.assertEqual([v["path"] for v in vols], [data, docker])
+        self.assertTrue(vols[1]["unreadable"])
+        self.assertIsNone(vols[1]["btrfs_unallocated_bytes"])
+        self.assertEqual(vols[0]["btrfs_unallocated_bytes"], 300 * GIB)
+        # the same filesystem also mounted where the executor can reach it
+        table.append({"point": other, "dev": 3, "fstype": "btrfs", "source": "/dev/c"})
+        with mock.patch.object(platform, "mountinfo", return_value=table):
+            self.assertEqual(resources._probe(docker), other)
+            reading = resources.sample("pc", paths=[data, docker], now=1.0)
+        self.assertEqual(reading["btrfs_unallocated_bytes"], 0)
+        limits = resources.thresholds({"resources": {"min_btrfs_unallocated": "10GiB"}})
+        found = {b["key"]: b for b in resources.breaches(reading, limits)}
+        self.assertEqual(found["min_btrfs_unallocated"]["path"], docker)
 
     def test_sample_takes_the_worst_reading_per_floor(self):
         ssd, state = self.dir("ssd"), self.dir("system", "state")

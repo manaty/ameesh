@@ -10,6 +10,7 @@ l'appelant sache que rien n'a été lu.
 from __future__ import annotations
 
 import os
+import re
 import time
 
 from . import NotAvailable, is_linux
@@ -224,6 +225,54 @@ def mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
         if real == point or real.startswith(root + os.sep) or point in ("/", os.sep):
             if best is None or len(point) > len(best[0]):
                 best = (point, fstype)
+    return best
+
+
+def _unescape(field: str) -> str:
+    """A path field of /proc/self/mountinfo (octal escapes: `\\040` etc.)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def mountinfo(path: str | None = None) -> list[dict]:
+    """The mounts of this process (#306): `point`, `dev` (an st_dev value),
+    `fstype`, `source`, from /proc/self/mountinfo (`path`: a file in that
+    format, tests). Read without touching the mount points: a mount behind a
+    directory that denies traversal is listed too. Not Linux, unreadable: []."""
+    if path is None:
+        if not _proc_ok():
+            return []
+        path = os.path.join(PROC, "self", "mountinfo")
+    out: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                head, sep, tail = line.partition(" - ")
+                fields, rest = head.split(), tail.split()
+                if not sep or len(fields) < 5 or len(rest) < 2:
+                    continue
+                major, _, minor = fields[2].partition(":")
+                try:
+                    dev = os.makedev(int(major), int(minor))
+                except ValueError:
+                    continue
+                out.append({"point": _unescape(fields[4]), "dev": dev,
+                            "fstype": rest[0], "source": _unescape(rest[1])})
+    except OSError:
+        return []
+    return out
+
+
+def covering_mount(path: str, mounts: list[dict] | None = None) -> dict | None:
+    """The deepest mount whose point is `path` or one of its parents, by the
+    path's text alone (no stat: works behind an untraversable directory);
+    the last mounted wins on one point. None without mount table."""
+    path = os.path.abspath(path)
+    best = None
+    for entry in mountinfo() if mounts is None else mounts:
+        point = entry["point"]
+        if path == point or path.startswith(point.rstrip(os.sep) + os.sep):
+            if best is None or len(point) >= len(best["point"]):
+                best = entry
     return best
 
 
