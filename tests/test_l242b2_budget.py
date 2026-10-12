@@ -32,6 +32,30 @@ class ReserveForfaitTest(_Comptes):
         self.jauge("secondaire", 70)
         self.assertEqual(self.choose().profile.name, "secondaire")
 
+    def test_le_plafond_court_ne_depasse_pas_le_rythme_reserve(self):
+        # #373 r1 : plafond court 90 %, 1 % de la fenêtre écoulé
+        profil = accounts.parse({"codex": [
+            {"name": "primaire"}, dict(self.secondaire, short_window_cap=0.9)]})["codex"][1]
+        jauge = cost.Gauge("codex", "codex-300min", 0.20, self.now + 0.99 * 5 * HEURE,
+                           5 * HEURE)
+        cap, label = accounts.limits(profil, [jauge], self.now, reserve=True)["codex-300min"]
+        self.assertAlmostEqual(cap, 0.01, places=3)
+        self.assertEqual(label, "pace cap")
+        cap, label = accounts.limits(profil, [jauge], self.now)["codex-300min"]
+        self.assertEqual((cap, label), (0.9, "short window cap"))
+
+    def test_sans_comptes_declares_la_pause_dit_compte_et_heure(self):
+        # #373 r1 : jauge à 96 % qui se remet à zéro dans 30 min
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        jauge = cost.Gauge("codex", "five_hour", 0.96, self.now + 1800, 5 * HEURE)
+        with mock.patch.object(book, "gauges", return_value=[jauge]), \
+                mock.patch.object(book, "clock", return_value=self.now):
+            raison = book.pace_exceeded("codex", accounts.RESERVE)
+        heure = time.strftime("%H:%M", time.localtime(self.now + 1800))
+        self.assertTrue(raison.startswith(
+            "pause (account (default), five_hour 96 %%) until %s; plan codex five_hour" % heure),
+            raison)
+
     def test_la_reserve_ne_touche_pas_les_plafonds_fixes(self):
         limits = accounts.limits(self.items[1], [], self.now, reserve=True)
         self.assertEqual(limits, {})
@@ -68,19 +92,20 @@ class _Paye(PgTestCase):
         self.book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db, hourly_usd=20.0,
                                   tools={"ds": "deepseek"})
 
-    def ligne(self, usd, ago_s, agent="ds"):
+    def ligne(self, usd, ago_s, agent="ds", account=None):
         storage.of(self.db).turn_costs.insert(
             agent=agent, harness="deepseek", turn="t", model="m", session=None, usd=usd,
             cum_usd=None, cum_input_tokens=None, cum_cached_input_tokens=None,
-            cum_output_tokens=None, input_tokens=10, cached_input_tokens=0, output_tokens=5)
+            cum_output_tokens=None, input_tokens=10, cached_input_tokens=0, output_tokens=5,
+            account=account)
         self.db.execute("UPDATE turn_costs SET recorded_at = now() - make_interval(secs => %s)"
                         " WHERE id = (SELECT max(id) FROM turn_costs)", (float(ago_s),))
 
-    def solde(self, total, ago_s):
+    def solde(self, total, ago_s, account=None):
         self.db.execute(
-            "INSERT INTO provider_balances (provider, currency, total, observed_at)"
-            " VALUES ('deepseek', 'USD', %s, now() - make_interval(secs => %s))",
-            (total, float(ago_s)))
+            "INSERT INTO provider_balances (provider, currency, total, observed_at, account)"
+            " VALUES ('deepseek', 'USD', %s, now() - make_interval(secs => %s), %s)",
+            (total, float(ago_s), account))
 
 
 class PartDuPlafondHoraireTest(_Paye):
@@ -134,6 +159,25 @@ class BaisseReelleTest(_Paye):
         self.solde(99.9, 10 * 60)
         self.ligne(4.0, 5 * 60)
         self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 0.1 + 4.0, places=3)
+
+    def test_un_compte_releve_ne_couvre_pas_les_autres(self):
+        # #373 r1 (P1) : A relevé baisse de 1 $, B sans relevé dépense 20 $
+        self.solde(50.0, 40 * 60, account="A")
+        self.ligne(1.0, 30 * 60, account="A")
+        self.solde(49.0, 20 * 60, account="A")
+        self.ligne(20.0, 25 * 60, account="B")
+        self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 21.0, places=3)
+        self.assertIn("15.00 $ for a non-critical agent", self.book.over("ds", hourly_share=0.75))
+
+    def test_seule_la_part_dans_l_heure_compte(self):
+        # #373 r1 : relevés à -83 et -10 min, baisse de 16 $ dépensée à -66 min
+        self.solde(100.0, 83 * 60)
+        self.ligne(16.0, 66 * 60)
+        self.solde(84.0, 10 * 60)
+        self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 0.0, places=3)
+        # sans estimation pour la répartir : au prorata du temps (50 min sur 73)
+        self.db.execute("DELETE FROM turn_costs")
+        self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 16.0 * 50 / 73, places=1)
 
     def test_soldes_illisibles_l_estimation(self):
         self.ligne(5.0, 600)

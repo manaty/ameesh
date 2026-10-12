@@ -137,6 +137,8 @@ PACE_CEILING = 0.90
 #: L242b : plancher du rapport réel/estimé qui corrige l'estimation entre deux
 #: relevés de solde (`CostBook.paid_hour`) — jamais une dépense comptée nulle
 PAID_RATIO_FLOOR = 0.10
+#: L242b : le compte d'une pause sans comptes déclarés (comme `auth_blocked`)
+DEFAULT_ACCOUNT_LABEL = "(default)"
 
 #: Bornes de lecture des journaux : on ne charge jamais un fichier entier, les
 #: sessions des harnais grossissent sans fin.
@@ -767,7 +769,14 @@ class CostBook:
         now = self.clock()
         for gauge in self.gauges(harness):
             if gauge.exceeded(now, reserve):
-                return ("plan %s %s: %.0f%% used with %.0f%% of the window "
+                # L242b (4), #373 r1 : la pause en court d'abord, comme avec
+                # des comptes déclarés (`accounts.pause_label`) ; sans compte
+                # déclaré, c'est le compte par défaut du harnais
+                head = ("pause (account %s, %s %.0f %%) until %s; " % (
+                    DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
+                    time.strftime("%H:%M", time.localtime(float(gauge.resets_at))))
+                    if gauge.resets_at else "")
+                return head + ("plan %s %s: %.0f%% used with %.0f%% of the window "
                         "elapsed (pace cap %.0f%%%s)" % (
                             harness, gauge.key, gauge.used * 100,
                             gauge.elapsed(now) * 100,
@@ -1239,46 +1248,89 @@ class CostBook:
     def paid_hour(self, paid: Sequence[str]) -> float:
         """L242b (décision de mesh-design du 2026-10-12) : la dépense payée au
         token du mesh sur les 60 dernières minutes, comptée sur la **baisse
-        réelle des soldes** (`balance.compare`) des fournisseurs relevés.
-        Hors de l'intervalle couvert par les relevés (avant le premier, après
-        le dernier), l'estimation du grand livre, corrigée par le rapport
-        réel/estimé de l'intervalle couvert (s'il porte sur au moins
-        `balance.GAP_MIN_USD` estimés ; jamais sous `PAID_RATIO_FLOOR`). Un
-        harnais sans relevé, ou des soldes illisibles : l'estimation seule."""
+        réelle des soldes**, série par série (fournisseur, compte) :
+
+        * chaque baisse entre deux relevés compte pour sa part dans l'heure,
+          répartie comme l'estimation du grand livre de CE compte sur
+          l'intervalle (au prorata du temps s'il porte moins de
+          `balance.GAP_MIN_USD` estimés) ;
+        * hors de l'intervalle couvert par ses relevés, l'estimation du
+          compte, corrigée par son rapport réel/estimé (s'il porte au moins
+          `balance.GAP_MIN_USD` estimés ; jamais sous `PAID_RATIO_FLOOR`) ;
+        * un compte sans relevé : son estimation, telle quelle (#373 r1 : un
+          compte relevé ne couvre jamais les autres). Une série sans compte
+          nommé couvre les lignes qu'aucune série nommée ne couvre.
+
+        Soldes ou grand livre illisibles : l'estimation seule."""
         ledger_hour = self.spent("all", 3600, harnesses=paid)
         if self.db is None or not paid:
             return ledger_hour
-        from . import balance
-        now = self.clock()
+        # l'heure réelle, comme les relevés et le grand livre (datés par la
+        # base) — pas `self.clock`, l'horloge des jauges
+        now = time.time()
         start = now - 3600.0
         try:
-            real = [entry for entry in balance.compare(self.db, paid, start, now)
-                    if entry["provider"] in paid and entry["currency"] == "USD"]
-            if not real:
-                return ledger_hour
-            ledger = storage.of(self.db).turn_costs
-            total = 0.0
-            for entry in real:
-                estimated = entry.get("estimated_usd") or 0.0
-                ratio = 1.0
-                if estimated >= balance.GAP_MIN_USD:
-                    ratio = max(PAID_RATIO_FLOOR, entry["real_spent"] / estimated)
-                outside = 0.0
-                covered_from = float(entry.get("start_ts") or start)
-                covered_to = float(entry.get("end_ts") or now)
-                if covered_from > start:
-                    outside += ledger.spent_between(start, covered_from,
-                                                    harnesses=[entry["provider"]])
-                if covered_to < now:
-                    outside += ledger.spent_between(covered_to, now,
-                                                    harnesses=[entry["provider"]])
-                total += max(0.0, float(entry["real_spent"])) + outside * ratio
-            rest = [h for h in paid if h not in {entry["provider"] for entry in real}]
-            if rest:
-                total += self.spent("all", 3600, harnesses=rest)
-            return total
+            return self._paid_hour(list(paid), start, now)
         except Exception:  # noqa: BLE001 - soldes illisibles : l'estimation
             return ledger_hour
+
+    def _paid_hour(self, paid: list, start: float, now: float) -> float:
+        from . import balance
+        rows = storage.of(self.db).operations.balances(provider=None, since_s=3600.0 + 1.0)
+        series: dict = {}
+        for row in sorted(rows, key=lambda r: float(r["observed_ts"])):
+            if row["provider"] in paid and row["currency"] == "USD" \
+                    and float(row["observed_ts"]) <= now:
+                series.setdefault((row["provider"], row.get("account")), []).append(row)
+        series = {key: points for key, points in series.items() if len(points) >= 2}
+        oldest = min([float(points[0]["observed_ts"]) for points in series.values()]
+                     + [start])
+        lines = storage.of(self.db).turn_costs.paid_lines(max(oldest, now - 86400.0),
+                                                          harnesses=paid)
+
+        def estimated(mine, low, high):
+            return sum(float(line["usd"]) for line in mine if low < float(line["ts"]) <= high)
+
+        total = 0.0
+        for harness in paid:
+            own = {acct: pts for (prov, acct), pts in series.items() if prov == harness}
+            named = {acct for acct in own if acct is not None}
+            spent = [line for line in lines if line["harness"] == harness]
+            covered = set(named) | ({None} if None in own else set())
+            for acct, points in own.items():
+                mine = [line for line in spent
+                        if (line.get("account") == acct if acct is not None
+                            else line.get("account") not in named)]
+                real_all = real_in = 0.0
+                for prev, cur in zip(points, points[1:]):
+                    low, high = float(prev["observed_ts"]), float(cur["observed_ts"])
+                    drop = max(0.0, float(prev["total"]) - float(cur["total"]))
+                    real_all += drop
+                    if high <= start or not drop:
+                        continue
+                    pair = estimated(mine, low, high)
+                    if low >= start:
+                        share = 1.0
+                    elif pair >= balance.GAP_MIN_USD:
+                        share = estimated(mine, start, high) / pair
+                    else:
+                        share = (high - start) / (high - low)
+                    real_in += drop * share
+                first = float(points[0]["observed_ts"])
+                last = float(points[-1]["observed_ts"])
+                est_all = estimated(mine, first, last)
+                ratio = 1.0
+                if est_all >= balance.GAP_MIN_USD:
+                    ratio = max(PAID_RATIO_FLOOR, real_all / est_all)
+                outside = estimated(mine, start, min(first, now)) \
+                    + estimated(mine, max(last, start), now)
+                total += real_in + outside * ratio
+            # les comptes qu'aucune série ne couvre : leur estimation
+            if None not in covered:
+                total += sum(float(line["usd"]) for line in spent
+                             if float(line["ts"]) > start
+                             and line.get("account") not in named)
+        return total
 
     def over(self, agent: str = "all", *,
              paid_harnesses: Sequence[str] | None = None, pace: bool = True,

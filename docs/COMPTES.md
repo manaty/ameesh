@@ -510,8 +510,10 @@ are in place; step 3 comes with lot #340's last PR):
 earlier, so that the margin left is for the critical ones:
 
 * on a plan, a non-critical agent stops 10 points below the pace cap
-  (`accounts.RESERVE`). With a 90 % pace cap it stops at 80 %. The short
-  window cap, when set, is lowered the same way. The fixed caps (50 % of the
+  (`accounts.RESERVE`). With a 90 % pace cap it stops at 80 %: min(80 %,
+  elapsed), no head start above the linear pace (mesh-design, 2026-10-12).
+  The short window cap, when set, is lowered the same way, and never exceeds
+  min(80 %, elapsed) for a non-critical agent. The fixed caps (50 % of the
   primary, `cap`, `overage_cap`) are not: they hold for everyone. The reason
   then says "10 points kept for critical agents". This holds with or without
   declared accounts. It also holds on a host with no critical agent: the
@@ -524,18 +526,28 @@ earlier, so that the margin left is for the critical ones:
 
 **The mesh hourly cap counts the real spend** (mesh-design decision,
 2026-10-12). The pay-per-token spend of the last 60 minutes is the real drop
-of the provider balances (`balance.compare`, see EXPLOITATION.md, "Dépense
-réelle"). Before the first reading and after the last one in the hour, the
-ledger estimate is used, corrected by the real/estimated ratio of the covered
-interval. The ratio is used only when that interval carries at least 0.50 $
-of estimate, and it never goes below 0.1 (`cost.PAID_RATIO_FLOOR`). A harness
-without readings, or unreadable balances, falls back to the estimate.
-`ameesh budget` shows the counted amount next to the estimate.
+of the provider balances, **account by account** (each API key has its own
+balance series):
+
+* a drop between two readings counts only for its part inside the hour. It
+  is split like the ledger estimate of that account over the interval, or in
+  proportion to time when the interval carries less than 0.50 $ of estimate;
+* outside the interval covered by an account's readings, its ledger estimate
+  counts, corrected by its real/estimated ratio. The ratio is used only when
+  the covered interval carries at least 0.50 $ of estimate, and it never goes
+  below 0.1 (`cost.PAID_RATIO_FLOOR`);
+* an account without readings counts its estimate as is: an account with
+  readings never covers the others. A balance series with no account name
+  covers the ledger lines that no named series covers.
+
+Unreadable balances fall back to the estimate. `ameesh budget` shows the
+counted amount next to the estimate.
 
 **A budget pause is shown as one.** The pause reason starts with the account
 that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
 all claude accounts at threshold — …". It is the agent's `status_text`
-("budget : pause (…) until 14:20; …"). `ameesh progress` and the alerts read
+("budget : pause (…) until 14:20; …"). Without declared accounts the
+account is `(default)`, the harness's own. `ameesh progress` and the alerts read
 `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
 
 **Urgent alert** (L242b (5)). When a critical agent is paused on budget

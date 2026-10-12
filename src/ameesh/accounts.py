@@ -632,16 +632,22 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
     non-critical agent): the pace cap, or the short window cap that replaces
-    it, is lowered by `RESERVE`; the fixed caps are not.
+    it, is lowered by `RESERVE`, and never exceeds the pace cap minus
+    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
     out = {}
     for gauge in gauges:
+        pace = (max(0.0, gauge.pace_cap(now) - cut), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
+            if reserve:
+                # #373 r1 : jamais au-dessus du rythme moins la réserve,
+                # min(80 %, écoulé), même quand le plafond court le remplace
+                base = min(base, pace, key=lambda pair: pair[0])
         else:
-            base = (max(0.0, gauge.pace_cap(now) - cut), "pace cap")
+            base = pace
         out[gauge.key] = min([base, *fixed], key=lambda pair: pair[0])
     return out
 
