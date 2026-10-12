@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 import unittest
 
@@ -84,6 +85,83 @@ class UnitsTest(unittest.TestCase):
 
     def test_guest_slice_is_measured(self):
         self.assertIn("ameesh-guest.slice", resources.GUEST_SLICES)
+
+
+class InstallPilotTest(unittest.TestCase):
+    """deploy/guest/install-pilot.sh: what the owner runs on the host (dry
+    runs only: nothing is installed by the tests)."""
+    SCRIPT = os.path.join(GUEST, "install-pilot.sh")
+
+    def dry(self, *args, stdin=None):
+        return subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", *args],
+                              capture_output=True, text=True, input=stdin)
+
+    def test_guard_unit(self):
+        u = unit("ameesh-guard.service")
+        self.assertNotIn("User", u)                      # root: set-property, freeze, kill
+        self.assertEqual(u["Slice"], ["system.slice"])   # never inside the slice it caps
+        self.assertIn("guard run $AMEESH_GUARD_ARGS", u["ExecStart"][0])
+        env = dict(v.partition("=")[::2] for v in u["Environment"])
+        self.assertEqual(env["AMEESH_GUARD_ARGS"], "--observe")
+        self.assertEqual(env["AMEESH_GUARD_CONFIG"], "/etc/ameesh/guard.json")
+
+    def test_gate_directories(self):
+        with open(os.path.join(GUEST, "ameesh-gate.tmpfiles.conf"), encoding="utf-8") as fh:
+            lines = [l.split() for l in fh if l.strip() and not l.startswith("#")]
+        dirs = {l[1]: l[2:5] for l in lines}
+        self.assertEqual(dirs["/run/ameesh-gate/state"], ["0755", "root", "root"])
+        self.assertEqual(dirs["/run/ameesh-gate/ack"][1:], ["ameesh-guest", "ameesh-guest"])
+        # the runner's ReadWritePaths needs the ack directory to exist
+        runner = unit("ameesh-guest-runner@.service")
+        self.assertIn("/run/ameesh-gate/ack", runner["ReadWritePaths"][0])
+
+    def test_install_dry_run(self):
+        subprocess.run(["bash", "-n", self.SCRIPT], check=True)
+        res = self.dry("--allow-rootfs", "--agent", "deepseek5")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn("useradd --system", out)
+        self.assertIn('"host": "vm-test"', out)
+        self.assertIn("AMEESH_GUARD_ARGS=--observe", out)
+        self.assertIn("/etc/ameesh/guest-deepseek5.env (0640 root:ameesh-guest)", out)
+        # the offer is checked by the installed guard before it is enabled
+        self.assertLess(out.index("guard check --config /etc/ameesh/guard.json"),
+                        out.index("systemctl enable --now ameesh-guard.service"))
+        # no guest runner is started by the install
+        self.assertNotIn("enable --now ameesh-guest-runner@", out)
+
+    def test_an_invalid_offer_is_refused(self):
+        res = self.dry("--allow-rootfs", "--lend", "/dev/stdin", stdin='{"cpu_max": 2}')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("`memory_max` required", res.stderr)
+
+    def test_arguments_are_checked(self):
+        for args in (["--enable", "x;rm"], ["--purge"], ["--set-guard-mode"],
+                     ["--set-guard-mode", "on"], ["--root", "srv"]):
+            res = self.dry(*args)
+            self.assertNotEqual(res.returncode, 0, args)
+
+    def test_enable_and_guard_mode(self):
+        res = self.dry("--enable", "deepseek5", "deepseek6")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("systemctl enable --now ameesh-guest-runner@deepseek6.service", res.stdout)
+        res = self.dry("--set-guard-mode", "enforce")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("AMEESH_GUARD_ARGS=\n", res.stdout)
+        self.assertIn("systemctl restart ameesh-guard.service", res.stdout)
+
+    def test_uninstall_follows_the_study_order(self):
+        res = self.dry("--uninstall", "--purge")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        # runners and guard stop before their units are removed
+        self.assertLess(out.index("disable --now ameesh-guard.service"),
+                        out.index("rm -f /etc/systemd/system/ameesh-guest-runner@.service"))
+        self.assertIn("rm -f /etc/tmpfiles.d/ameesh-gate.conf", out)
+        self.assertIn("rm -f /etc/ameesh/guard.json /etc/ameesh/guest.env", out)
+        # only what the script recorded as its own goes (none here)
+        self.assertNotIn("userdel", out)
+        self.assertNotIn("rm -rf /opt/ameesh/venv", out)
 
 
 def reading(ts, **over):
