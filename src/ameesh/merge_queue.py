@@ -240,7 +240,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
     target = row.get("branch_target") or plan_git.default_target(repo)
-    return {"target": target, "frozen_sha": tip, "pr": (status or {}).get("number")}
+    return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"], "pr": (status or {}).get("number")}
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
@@ -251,7 +251,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
     ready = readiness(db, lot, repo, ci=ci, clone=clone)
     row = storage.of(db).work.queue_add(
-        lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
+        lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
         source=source_of(repo), note="merge queue of %s: queued at %s%s" % (
             ready["target"], ready["frozen_sha"][:12],
             ", PR #%s green" % ready["pr"] if ready["pr"] else ""), actor=actor)

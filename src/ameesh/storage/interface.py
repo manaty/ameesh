@@ -1051,7 +1051,7 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str, source: str = "") -> dict | None:
+                  actor: str, source: str = "", frozen_id: int | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1063,7 +1063,7 @@ class WorkItems(Domain):
                      landing_sha: str | None = None, note: str = "",
                      actor: str = "", clear_rank: bool = False,
                      lease: tuple | None = None,
-                     freeze: tuple | None = None) -> dict | None:
+                     freeze: tuple | None = None, entry: tuple | None = None) -> dict | None:
         """L160e (0058): changes the state, rank, reason or landing commit of
         a queued lot (`queued` and `ejected` clear the landing commit;
         `ejected` or `clear_rank` clear the rank); a journal line when
@@ -1072,7 +1072,10 @@ class WorkItems(Domain):
         lease holds (`merge_locks`, not expired), in the same statement.
         `freeze` (#194 r8): `(frozen_sha, landing_sha)` — the write happens
         only while the lot is still `landing` on that freeze and that
-        landing commit (a merge that happened, recorded without its lease)."""
+        landing commit (a merge that happened, recorded without its lease).
+        `entry` (#517): `(generation, target, frozen_id, frozen_sha)` compares
+        the admission identity and current latest freeze, with or without a
+        lease. Freeze insertion and this comparison share the lot row lock."""
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:

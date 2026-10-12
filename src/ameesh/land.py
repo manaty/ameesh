@@ -318,12 +318,15 @@ class _Landing:
     stale holder's writes fail, and it reports `busy`; the lease is released
     once, at the end (`land_head`)."""
 
-    def __init__(self, db, project, row, key, owner, epoch, locks):
+    def __init__(self, db, project, row, key, owner, epoch, locks, projects=()):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
         self.key, self.owner, self.epoch, self.locks = key, owner, epoch, locks
         self.release = False
+        self.projects = projects
+        self.entry = tuple(row.get(k) for k in
+                           ("generation", "target", "frozen_id", "frozen_sha"))
 
     @property
     def lease(self):
@@ -342,7 +345,7 @@ class _Landing:
         return False
 
     def write(self, **kw) -> bool:
-        return self.ops.queue_update(self.lot, lease=self.lease, **kw) is not None
+        return self.ops.queue_update(self.lot, lease=self.lease, entry=self.entry, **kw) is not None
 
     def eject(self, reason: str, todo: str, **extra) -> dict:
         self.release = True
@@ -360,17 +363,33 @@ class _Landing:
                      "message_id": sent, "result": "ejected"}, **extra)
 
     def record(self, reason: str, note: str, *, state: str = "landed") -> str:
+        # Once the remote merge may have happened, persistence errors must
+        # never send execution back through the pre-merge retry/reset path.
+        for _ in range(2):
+            try:
+                return self._record(reason, note, state=state)
+            except Exception as exc:  # noqa: BLE001 - post-merge fact, retry once
+                error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        merge_queue._wake(self.db, self.row.get("assignee"), self.lot,
+                          "Merge outcome could not be recorded after two attempts: %s. %s. "
+                          "Check the remote merge and queue by hand." % (reason, error),
+                          {"project": self.project.name, "target": self.row["target"],
+                           "kind": "land", "lot": self.lot, "reason": UNCERTAIN + error})
+        return "unrecorded"
+
+    def _record(self, reason: str, note: str, *, state: str = "landed") -> str:
         """#194 r8: a merge that happened is a fact, recorded whatever became
         of the lease: under the lease; else under the freeze (the lot still
         `landing` on the same freeze and landing commit); else — a newer
         freeze or entry is there, never overwritten — as history only, a
         line in the lot's journal. Returns `lease`, `freeze` or `history`."""
         row = self.row
-        if self.write(state=state, reason=reason, note=note, actor=work.SYSTEM_SENDER):
+        freeze = (row["frozen_sha"], row.get("landing_sha"))
+        if self.write(state=state, reason=reason, note=note, actor=work.SYSTEM_SENDER, freeze=freeze):
             return "lease"
         if self.ops.queue_update(self.lot, state=state, reason=reason, note=note,
                                  actor=work.SYSTEM_SENDER,
-                                 freeze=(row["frozen_sha"], row.get("landing_sha"))) is not None:
+                                 freeze=freeze, entry=self.entry) is not None:
             return "freeze"
         self.ops.note(self.lot, row.get("item_state") or "", "%s (history: %s)" % (reason, note),
                       work.SYSTEM_SENDER)
@@ -380,9 +399,6 @@ class _Landing:
         self.release = True
         row, project = self.row, self.project
         reason = "merged by ameesh (%s)" % merged["sha"][:12]
-        # #194 r8: pushed or merged — the lease lost since changes nothing to it
-        how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
-            row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
         gates_text = ", ".join("`%s`" % g for g in project.gates)
         _passive(self.db, row.get("assignee"), self.lot, (
             "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on "
@@ -392,9 +408,12 @@ class _Landing:
                "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
                if merged.get("state") == "replayed" else "", gates_text)),
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
+        how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
+            row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
         return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr},
-                    **({"warning": "lease lost: recorded as history only (a newer entry is "
-                        "queued)"} if how == "history" else {}))
+                    **({"warning": "queue entry changed: recorded as history only (a newer entry is "
+                        "queued)"} if how == "history" else {"warning": "remote merge succeeded; recording failed"}
+                       if how == "unrecorded" else {}))
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
@@ -404,6 +423,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     from . import radar, resolutions
     locks = locks if locks is not None else {}
     lot = int(row["work_item_id"])
+    projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work
     epoch = ops.land_lock(key, owner, LOCK_TTL_S, epoch=locks.get(key)) \
@@ -414,7 +434,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         locks.pop(key, None)
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
-    landing = _Landing(db, project, row, key, owner, epoch, locks)
+    landing = _Landing(db, project, row, key, owner, epoch, locks, projects)
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     slug = radar.github_slug(project) if project.land == "pr" else None
@@ -446,14 +466,22 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     branch = _branch_of(row["target"])
     lease_ref = (getattr(project, "lease_ref", "") or LEASE_REF) + branch
     mine = None
-    if project.land == "local" and radar.lease_collides(
-            getattr(project, "lease_ref", "") or LEASE_REF, branch):
-        # #194 r8: the lease ref would move the target itself, before the gates
-        landing.release = True
-        return {"lot": lot, "result": "error", "error": (
-            "lease ref %s collides with the target %s: nothing written; set "
-            "radar.projects.%s.lease_ref under %s" % (
-                lease_ref, branch, project.name, " or ".join(radar.LEASE_NAMESPACES)))}
+    if project.land == "local":
+        prefix = getattr(project, "lease_ref", "") or LEASE_REF
+        targets = {branch}
+        for other in landing.projects:
+            targets.add(other.target or plan_git.default_target(other.repo))
+        # Queue targets can differ from settings (a lot's branch_target).
+        # Reserve lease namespaces across all configured projects/queues,
+        # even if two checkout paths happen to hide the same remote.
+        targets.update(r["target"] for r in landing.ops.queue())
+        collision = next((t for t in sorted(targets) if radar.lease_collides(prefix, t)), None)
+        if collision is not None:
+            landing.release = True
+            return {"lot": lot, "result": "error", "error": (
+                "lease ref %s collides with the target %s: nothing written; set "
+                "radar.projects.%s.lease_ref under %s" % (
+                    lease_ref, collision, project.name, " or ".join(radar.LEASE_NAMESPACES)))}
     if project.land == "local":
         # #194 r6: the remote lease ref is the lock itself, taken (compare and
         # swap) BEFORE any write of this holder; the database expiry only
@@ -657,20 +685,21 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     except Exception as exc:  # noqa: BLE001 - the merge may have happened
         now, after, unread = None, None, "%s: %s" % (type(exc).__name__, str(exc)[:200])
     if error is not None:
+        if error.startswith(TIMED_OUT) and (now is None or now["state"] != "MERGED"):
+            detail = unread if now is None else (
+                "read-back state %s; remote operation may complete later" % now["state"])
+            return _merged_in_doubt(landing, status["number"], None,
+                                    "%s; %s" % (error[:200], detail), pending=True)
         if now is not None and now["state"] != "MERGED":
             # #194 r3: the branch holds the merge commit; the lot stays
             # `landing` with it (and the lease: a lasting refusal raises
             # `merge_blocked`); a merge completed later is found by `pr_merged`
             landing.write(reason="PR merge refused (%s): retried" % error[:200])
             return {"lot": lot, "result": "retry", "error": error}
-        if now is None and not error.startswith(TIMED_OUT):
+        if now is None:
             landing.write(reason="PR merge refused (%s), PR unreadable (%s): retried"
                           % (error[:200], unread))
             return {"lot": lot, "result": "retry", "error": error}
-        if now is None:
-            # timed out, and unreadable: merged or not, nobody knows yet
-            return _merged_in_doubt(landing, status["number"], None, "%s; %s" % (
-                error[:200], unread), pending=True)
     return _after_merge(landing, status["number"], after, unread)
 
 
@@ -692,7 +721,7 @@ UNCERTAIN = "UNCERTAIN: "
 def _merged_in_doubt(landing: _Landing, pr, after, unread, *, pending=False) -> dict:
     """The PR is merged, but into another base (retargeted inside the last
     window) or its base cannot be read back; `pending`: its merge call timed
-    out and nothing can be read (merged or not). The warning goes first,
+    out and completion is still unknown (OPEN or unreadable). The warning goes first,
     whatever happens to the lease; then the fact, under the lease or the
     freeze, else as history only — never over a newer freeze (#194 r8).
     `land_uncertain` alerts on it. Pending, the lot stays `landing` (the next
@@ -700,7 +729,7 @@ def _merged_in_doubt(landing: _Landing, pr, after, unread, *, pending=False) -> 
     row, lot, branch = landing.row, landing.lot, _branch_of(landing.row["target"])
     reason = (WRONG_BASE + "PR #%s merged into %s, not %s: check it by hand"
               % (pr, after, branch)) if after else (
-        UNCERTAIN + "PR #%s merge timed out, its state unreadable (%s): read again at the "
+        UNCERTAIN + "PR #%s merge timed out, completion uncertain (%s): read again at the "
         "next pass, check it by hand" % (pr, unread)) if pending else (
         UNCERTAIN + "PR #%s merged, base unreadable after the merge (%s): check it by hand"
         % (pr, unread))
@@ -743,6 +772,7 @@ def uncertain(db, now: float | None = None) -> list[dict]:
                 continue
             seen.add(lot)
             out.append(dict(queued.get(lot) or {}, work_item_id=lot,
+                            assignee=event.get("assignee"),
                             reason=event["note"], updated_ts=event.get("created_ts")))
     return out
 

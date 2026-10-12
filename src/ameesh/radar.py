@@ -189,6 +189,16 @@ def parse_settings(raw) -> Settings:
                                  github=texts["github"], land=land,
                                  gates=tuple(g.strip() for g in gates), merge_method=method,
                                  lease_ref=lease_ref)
+    # Lease namespaces are reserved across the whole configuration. Checkout
+    # paths and remote aliases must not let one project's lease overwrite
+    # another project's target, including projects whose landing is off.
+    for holder in projects.values():
+        if holder.land != "local":
+            continue
+        for other in projects.values():
+            if other.target and lease_collides(holder.lease_ref, other.target):
+                raise SettingsError("`radar.projects.%s.lease_ref`: %s collides with the target %s of %s"
+                                    % (holder.name, holder.lease_ref, other.target, other.name))
     return Settings(projects=projects)
 
 

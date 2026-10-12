@@ -41,7 +41,7 @@ class FakeQueue(FakeWork):
                     item_state=item.get("state"), branch=item.get("branch"),
                     assignee=item.get("assignee"))
 
-    def queue_add(self, item_id, *, target, frozen_sha, note, actor, source=""):
+    def queue_add(self, item_id, *, target, frozen_sha, note, actor, source="", frozen_id=None):
         if self.lots[item_id]["state"] in ("merged", "promoted", "closed"):
             return None
         self.clock += 1
@@ -49,16 +49,19 @@ class FakeQueue(FakeWork):
                                     "frozen_sha": frozen_sha, "state": "queued", "rank": None,
                                     "landing_sha": None,
                                     "reason": "", "queued_by": actor, "queued_ts": self.clock,
-                                    "source": source}
+                                    "source": source, "generation": self.clock, "frozen_id": frozen_id}
         self.notes.append((item_id, note, actor))
         return self._row(item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False, lease=None, freeze=None):
+                     note="", actor="", clear_rank=False, lease=None, freeze=None, entry=None):
         q = self.queue_rows.get(item_id)
         if q is None:
             return None
         if lease is not None and not getattr(self, "lease_ok", lambda lease: True)(lease):
+            return None
+        if entry is not None and tuple(q.get(k) for k in (
+                "generation", "target", "frozen_id", "frozen_sha")) != entry:
             return None
         if freeze is not None and (q["state"], q["frozen_sha"], q.get("landing_sha")) != (
                 "landing", *freeze):
@@ -81,7 +84,7 @@ class FakeQueue(FakeWork):
         self.notes.append((item_id, text, actor))
 
     def events_noted(self, prefix, since_ts):
-        return [{"work_item_id": i, "note": n, "actor": a, "created_ts": self.clock}
+        return [{"work_item_id": i, "note": n, "actor": a, "created_ts": self.clock, "assignee": self.lots[i].get("assignee")}
                 for i, n, a in self.notes if n.startswith(prefix)]
 
     def queue_remove(self, item_id, *, note, actor):

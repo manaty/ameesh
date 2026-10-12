@@ -828,12 +828,119 @@ class Review194r8Test(_Land):
         self.assertEqual(again["result"], "landed", again)
         self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
 
-    def test_merge_timeout_not_merged_is_retried(self):
+    def test_merge_timeout_open_remains_uncertain(self):
         gh, locks, sha = self.landing()
-        fake, _ = self.merging(gh, merges=False, readable=True)
+        fake, state = self.merging(gh, merges=False, readable=True)
         done = self.land(4, gh=fake, locks=locks)
-        self.assertEqual(done["result"], "retry", done)
+        self.assertEqual(done["result"], "uncertain", done)
         self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
+        self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.UNCERTAIN))
+        self.assertIn("state OPEN", done["reason"])
+        self.assertIn("complete later", self.sent[-1][1])
+        self.assertTrue(locks)
+        state["merged"] = True
+        again = self.land(4, gh=lambda args, timeout=60: fake(args, timeout)
+                          if args[:2] != ["pr", "merge"] else self.fail("merged twice"), locks=locks)
+        self.assertEqual(again["result"], "landed", again)
+
+    def test_valid_lease_never_marks_a_replacement_entry_landed(self):
+        for change in ("generation", "frozen_id", "target", "removed-and-reentered"):
+            with self.subTest(change=change):
+                _git(self.repo, "push", "-q", "-f", "origin", "lot/4-d")
+                gh, locks, sha = self.landing()
+                replacement = {}
+
+                def replace_entry(args, timeout=60):
+                    if args[:2] == ["pr", "merge"]:
+                        row = self.fake.queue_rows[4]
+                        if change == "removed-and-reentered":
+                            old = dict(row)
+                            self.fake.queue_remove(4, note="removed", actor="r2")
+                            self.fake.queue_add(4, target=old["target"], frozen_sha=old["frozen_sha"],
+                                                frozen_id=old["frozen_id"], note="reentered", actor="r2")
+                            row = self.fake.queue_rows[4]
+                            row.update(state="landing", landing_sha=sha)
+                        elif change == "target":
+                            row["target"] = "release"
+                        else:
+                            row[change] += 1
+                        replacement.update(row)
+                        self.assertTrue(self.locks.holds(("p:main", "runner-1", locks["p:main"])))
+                    return gh(args, timeout=timeout)
+                done = self.land(4, gh=replace_entry, locks=locks)
+                self.assertEqual(done["result"], "landed", done)
+                self.assertEqual(self.fake.queue_rows[4], replacement)
+                self.assertIn("history", done.get("warning", ""))
+                self.assertIn("history:", self.fake.notes[-1][1])
+
+    def test_post_merge_recording_error_retries_without_resetting_queue(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                _git(self.repo, "push", "-q", "-f", "origin", "lot/4-d")
+                gh, locks, sha = self.landing()
+                update = self.fake.queue_update
+                attempts = []
+                notice_before_record = []
+
+                def flaky(item, **kw):
+                    if kw.get("state") == "landed":
+                        attempts.append(True)
+                        notice_before_record.append(any("merged by ameesh" in body for _, body, _ in self.sent))
+                        if persistent or len(attempts) == 1:
+                            raise OSError("transient recording failure")
+                    return update(item, **kw)
+                with mock.patch.object(self.fake, "queue_update", side_effect=flaky):
+                    done = self.land(4, gh=gh, locks=locks)
+                self.assertEqual(done["result"], "landed", done)
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(notice_before_record, [True, True])
+                self.assertEqual(self.fake.queue_rows[4]["state"], "landing" if persistent else "landed")
+                if persistent:
+                    self.assertIn("recording failed", done["warning"])
+                    self.assertIn("could not be recorded", self.sent[-1][1])
+
+    def test_cross_project_lease_namespace_collision_is_rejected(self):
+        raw = {"projects": {
+            "p": {"repo": self.repo, "target": "main", "land": "local",
+                  "gates": ["true"], "lease_ref": "ameesh-land/"},
+            "q": {"repo": self.repo, "target": "ameesh-land/main"}}}
+        with self.assertRaisesRegex(radar.SettingsError, "collides.*ameesh-land/main"):
+            radar.parse_settings(raw)
+        # Bypass settings validation: landing itself still refuses the write.
+        project = dataclasses.replace(self.project, land="local", lease_ref="refs/heads/ameesh-land/")
+        other = radar.Project(name="q", repo=self.repo, target="ameesh-land/main")
+        self.project = project
+        self.queued(4)
+        _git(self.origin, "branch", "ameesh-land/main", "main")
+        before = _git(self.origin, "rev-parse", "ameesh-land/main")
+        with mock.patch.object(radar, "settings_of", return_value=radar.Settings(projects={"p": project, "q": other})):
+            done = self.land(4)
+        self.assertEqual(done["result"], "error", done)
+        self.assertIn("collides with the target ameesh-land/main", done["error"])
+        self.assertEqual(_git(self.origin, "rev-parse", "ameesh-land/main"), before)
+        # A per-lot target absent from settings is protected too.
+        self.queued(3)
+        self.fake.queue_rows[3]["target"] = "ameesh-land/main"
+        done = self.land(4)
+        self.assertEqual(done["result"], "error", done)
+        self.assertEqual(_git(self.origin, "rev-parse", "ameesh-land/main"), before)
+
+    def test_history_only_alert_keeps_the_human_responsible(self):
+        from ameesh import exploitation, notify
+        self.fake.lots[4]["assignee"] = "human:alice"
+        gh, locks, sha = self.landing()
+
+        def removed(args, timeout=60):
+            if args[:2] == ["pr", "merge"]:
+                self.fake.queue_remove(4, note="removed", actor="r2")
+                gh.base = "release"
+            return gh(args, timeout=timeout)
+        done = self.land(4, gh=removed, locks=locks)
+        self.assertEqual(done["recorded"], "history", done)
+        alert, = exploitation._land_uncertain(None)
+        self.assertEqual((alert.get("agent"), alert.get("responsible")), (None, "human:alice"))
+        router = notify.Router.__new__(notify.Router)
+        self.assertEqual(router.resolve(alert), ("human:alice", "alerte"))
 
     def test_alerts_reach_a_human_assignee(self):
         from ameesh import exploitation, notify
@@ -844,7 +951,7 @@ class Review194r8Test(_Land):
         store.work.events_noted.return_value = []
         with mock.patch.object(storage, "of", return_value=store):
             alert = exploitation._land_uncertain(None)[0]
-        self.assertEqual((alert["agent"], alert["responsible"]), (None, "human:alice"))
+        self.assertEqual((alert.get("agent"), alert.get("responsible")), (None, "human:alice"))
         router = notify.Router.__new__(notify.Router)
         self.assertEqual(router.resolve(alert), ("human:alice", "alerte"))
         store.work.queue.return_value = [{
@@ -942,6 +1049,84 @@ class LeaseDbTest(PgTestCase):
         self.assertIsNotNone(ops.queue_update(lot, state="landed",
                                               freeze=("a" * 40, "c" * 40)))
         self.assertEqual(ops.queue()[0]["state"], "landed")
+
+    def test_admission_identity_fences_held_and_lost_lease_writes(self):
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="admission identity")["id"]
+        frozen = ops.add_milestone(lot, "frozen", sha="a" * 40, actor="t", verdict=None, note="frozen")
+        row = ops.queue_add(lot, target="main", frozen_sha="a" * 40,
+                            frozen_id=frozen["id"], note="queued", actor="t")
+        entry = tuple(row[k] for k in ("generation", "target", "frozen_id", "frozen_sha"))
+        epoch = ops.land_lock("id:main", "r1", 60)
+        lease = ("id:main", "r1", epoch)
+        ops.queue_update(lot, state="landing", landing_sha="c" * 40, lease=lease, entry=entry)
+        # Same SHA refrozen without requeue: current milestone must match too.
+        newer = ops.add_milestone(lot, "frozen", sha="a" * 40, actor="t", verdict=None, note="again")
+        for bail in (lease, None):
+            self.assertIsNone(ops.queue_update(lot, state="landed", lease=bail, entry=entry,
+                                             freeze=("a" * 40, "c" * 40)))
+        self.assertIsNone(ops.queue_add(lot, target="main", frozen_sha="a" * 40,
+                                       frozen_id=frozen["id"], note="stale admission", actor="t"))
+        row = ops.queue_add(lot, target="main", frozen_sha="a" * 40,
+                            frozen_id=newer["id"], note="requeued", actor="t")
+        current = tuple(row[k] for k in ("generation", "target", "frozen_id", "frozen_sha"))
+        self.assertNotEqual(current[0], entry[0])
+        ops.queue_update(lot, state="landing", landing_sha="c" * 40, entry=current)
+        for index, value in ((0, entry[0]), (1, "release"), (2, frozen["id"]), (3, "b" * 40)):
+            wrong = list(current)
+            wrong[index] = value
+            for bail in (lease, None):
+                self.assertIsNone(ops.queue_update(lot, state="landed", lease=bail, entry=tuple(wrong),
+                                                 freeze=("a" * 40, "c" * 40)))
+        # Removal/re-entry with identical target, freeze and SHA is distinct.
+        ops.queue_remove(lot, note="removed", actor="t")
+        row = ops.queue_add(lot, target="main", frozen_sha="a" * 40,
+                            frozen_id=newer["id"], note="reentered", actor="t")
+        replacement = tuple(row[k] for k in ("generation", "target", "frozen_id", "frozen_sha"))
+        ops.queue_update(lot, state="landing", landing_sha="c" * 40, entry=replacement)
+        for bail in (lease, None):
+            self.assertIsNone(ops.queue_update(lot, state="landed", lease=bail, entry=current,
+                                             freeze=("a" * 40, "c" * 40)))
+        self.assertIsNotNone(ops.queue_update(lot, state="landed", lease=lease, entry=replacement,
+                                              freeze=("a" * 40, "c" * 40)))
+
+    def test_history_query_includes_owner_after_queue_removal(self):
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="historical owner")["id"]
+        self.db.execute("UPDATE work_items SET assignee = 'human:alice' WHERE id = %s", (lot,))
+        ops.note(lot, "intake", land.UNCERTAIN + "merged (history: uncertain merge)", "t")
+        event, = ops.events_noted(land.UNCERTAIN, 0)
+        self.assertEqual(event["assignee"], "human:alice")
+        alert, = land.uncertain(self.db)
+        self.assertEqual(alert["assignee"], "human:alice")
+
+    def test_entry_write_waits_for_a_concurrent_refreeze(self):
+        import threading
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="refreeze lock")["id"]
+        ops.add_milestone(lot, "frozen", sha="a" * 40, actor="t", verdict=None, note="first")
+        row = ops.queue_add(lot, target="main", frozen_sha="a" * 40, note="queued", actor="t")
+        entry = tuple(row[k] for k in ("generation", "target", "frozen_id", "frozen_sha"))
+        ops.queue_update(lot, state="landing", entry=entry)
+        other = self.connect()
+        result = {}
+        def write():
+            result["row"] = ops.queue_update(lot, state="landed", entry=entry, freeze=("a" * 40, None))
+        try:
+            with other.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE", (lot,))
+                tx.execute("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note)"
+                           " VALUES (%s, 'frozen', %s, 't', 'second')", (lot, "a" * 40))
+                writer = threading.Thread(target=write)
+                writer.start()
+                writer.join(timeout=0.5)
+                self.assertTrue(writer.is_alive())
+            writer.join(timeout=30)
+            self.assertFalse(writer.is_alive())
+        finally:
+            other.close()
+        self.assertIsNone(result.get("row"))
+        self.assertEqual(ops.queue()[0]["state"], "landing")
 
     def test_queue_write_waits_for_the_lease_row(self):
         """#194 r6: the guarded write locks the lease row: an acquisition in

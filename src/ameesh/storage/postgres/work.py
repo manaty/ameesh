@@ -36,7 +36,7 @@ ITEM_COLUMNS = """
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
     q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
-    q.queued_by, q.source,
+    q.queued_by, q.source, q.generation, q.frozen_id,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -528,11 +528,11 @@ class WorkItems(interface.WorkItems):
         pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         return self.db.query(
             """
-            SELECT id, work_item_id, state, note, actor,
-                   extract(epoch from created_at)::float8 as created_ts
-              FROM work_item_events
-             WHERE note LIKE %s AND created_at >= to_timestamp(%s)
-             ORDER BY id
+            SELECT e.id, e.work_item_id, e.state, e.note, e.actor, w.assignee,
+                   extract(epoch from e.created_at)::float8 as created_ts
+              FROM work_item_events e JOIN work_items w ON w.id = e.work_item_id
+             WHERE e.note LIKE %s AND e.created_at >= to_timestamp(%s)
+             ORDER BY e.id
             """,
             (pattern, float(since_ts)),
         )
@@ -689,31 +689,42 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="") -> dict | None:
+                  source="", frozen_id=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state FROM work_items WHERE id = %s"
-                           " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
+                           " AND state NOT IN ('merged', 'promoted', 'closed')"
+                           " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
+            latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+                              " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+            latest_id = latest[0]["id"] if latest else None
+            if frozen_id is not None and frozen_id != latest_id:
+                return None
             tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source)"
-                " VALUES (%s, %s, %s, %s, %s)"
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
-                "   source = excluded.source,"
-                "   landing_sha = NULL,"
+                "   source = excluded.source, frozen_id = excluded.frozen_id,"
+                "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
                 "   updated_at = now()",
-                (int(item_id), target, frozen_sha, actor or "", source or ""))
+                (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return self._queue_row(tx, item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
                      note="", actor="", clear_rank=False, lease=None,
-                     freeze=None) -> dict | None:
+                     freeze=None, entry=None) -> dict | None:
         key, owner, epoch = lease if lease is not None else (None, None, None)
         frozen, landing = freeze if freeze is not None else (None, None)
+        generation, target, frozen_id, entry_sha = entry if entry is not None else (None,) * 4
         with self.db.transaction() as tx:
+            if entry is not None:
+                # Same lock as add_milestone/queue_add: read the latest freeze
+                # after waiting for any concurrent refreeze to finish.
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             # #194 r6: the lease row is locked by the same statement (an
             # acquisition waits for this write, or this write sees its new
             # epoch), its expiry read on the wall clock, not the transaction's
@@ -732,10 +743,15 @@ class WorkItems(interface.WorkItems):
                 # and same landing commit (a new freeze is never overwritten)
                 "   AND (%s::text IS NULL OR (state = 'landing' AND frozen_sha = %s"
                 "        AND landing_sha IS NOT DISTINCT FROM %s))"
+                "   AND (NOT %s OR (generation = %s AND target = %s"
+                "        AND frozen_id IS NOT DISTINCT FROM %s AND frozen_sha = %s"
+                "        AND frozen_id IS NOT DISTINCT FROM (SELECT id FROM work_item_milestones"
+                "          WHERE work_item_id = %s AND kind = 'frozen'"
+                "          ORDER BY at DESC, id DESC LIMIT 1)))"
                 " RETURNING work_item_id",
                 (key, owner, epoch, state, state == "ejected" or bool(clear_rank), rank,
                  state or "", landing_sha, reason, int(item_id), key, frozen, frozen,
-                 landing))
+                 landing, entry is not None, generation, target, frozen_id, entry_sha, int(item_id)))
             if not rows:
                 return None
             if note:
