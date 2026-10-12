@@ -373,15 +373,22 @@ f=$ETAT/$4.unite
 if [ ! -e \$f ] && [ -e $ETAT/$4.remise ]; then echo "$3 déjà remise dans son état d'avant : rien à faire"; exit 0; fi
 [ -s \$f ] || { echo "état d'avant de $3 inconnu (\$f) : rien n'est touché, à remettre à la main" >&2; exit 1; }
 read -r activation activite < \$f
+# activation remise telle quelle, puis relue : un échec laisse l'état gardé
+# (le retour se relance), jamais une unité activée qui devait ne pas l'être
 case "\$activation" in
   enabled) $1 systemctl $2 enable $3 ;;
-  *) $1 systemctl $2 disable $3 2>/dev/null || true ;;
+  enabled-runtime) $1 systemctl $2 disable $3; $1 systemctl $2 enable --runtime $3 ;;
+  disabled) $1 systemctl $2 disable $3 ;;
+  *) echo "activation d'avant de $3 non prise en charge (« \$activation ») : rien n'est touché, à remettre à la main" >&2; exit 1 ;;
 esac
+relue=\$($1 systemctl $2 is-enabled $3 2>/dev/null || true)
+[ "\$relue" = "\$activation" ] || { echo "$3 : activation \$relue après remise, \$activation attendu : état d'avant gardé, relancer le retour" >&2; exit 1; }
 if [ "\$activite" = active ]; then
   $1 systemctl $2 start $3; sleep 10
-  $1 systemctl $2 is-active --quiet $3 || { echo "$3 ne démarre pas" >&2; exit 1; }
+  $1 systemctl $2 is-active --quiet $3 || { echo "$3 ne démarre pas : état d'avant gardé" >&2; exit 1; }
 else
   $1 systemctl $2 stop $3
+  ! $1 systemctl $2 is-active --quiet $3 || { echo "$3 toujours active après l'arrêt : état d'avant gardé" >&2; exit 1; }
 fi
 mv \$f $ETAT/$4.remise  # une relance du retour ne refuse pas
 echo "$3 remise dans son état d'avant : \$activation, \$activite"
