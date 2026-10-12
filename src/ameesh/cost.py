@@ -140,6 +140,18 @@ PAID_RATIO_FLOOR = 0.10
 #: L242b : le compte d'une pause sans comptes déclarés (comme `auth_blocked`)
 DEFAULT_ACCOUNT_LABEL = "(default)"
 
+
+def until_label(ts: float, now: float | None = None) -> str:
+    """L'heure de fin d'une pause : « 14:20 », précédée de la date si ce
+    n'est pas aujourd'hui (#373 r2 : une pause de deux jours n'affiche pas
+    une heure qui semble à 30 min)."""
+    end = time.localtime(float(ts))
+    if time.strftime("%Y-%m-%d", end) == time.strftime(
+            "%Y-%m-%d", time.localtime(time.time() if now is None else now)):
+        return time.strftime("%H:%M", end)
+    return time.strftime("%d/%m %H:%M", end)
+
+
 #: Bornes de lecture des journaux : on ne charge jamais un fichier entier, les
 #: sessions des harnais grossissent sans fin.
 TAIL_BYTES = 4_000_000
@@ -767,23 +779,29 @@ class CostBook:
         moins `reserve` pour un agent non critique (L242b (2)).
         """
         now = self.clock()
-        for gauge in self.gauges(harness):
-            if gauge.exceeded(now, reserve):
-                # L242b (4), #373 r1 : la pause en court d'abord, comme avec
-                # des comptes déclarés (`accounts.pause_label`) ; sans compte
-                # déclaré, c'est le compte par défaut du harnais
-                head = ("pause (account %s, %s %.0f %%) until %s; " % (
-                    DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
-                    time.strftime("%H:%M", time.localtime(float(gauge.resets_at))))
-                    if gauge.resets_at else "")
-                return head + ("plan %s %s: %.0f%% used with %.0f%% of the window "
-                        "elapsed (pace cap %.0f%%%s)" % (
-                            harness, gauge.key, gauge.used * 100,
-                            gauge.elapsed(now) * 100,
-                            max(0.0, gauge.pace_cap(now) - reserve) * 100,
-                            ", %.0f points kept for critical agents" % (reserve * 100)
-                            if reserve else ""))
-        return ""
+        held = [gauge for gauge in self.gauges(harness) if gauge.exceeded(now, reserve)]
+        if not held:
+            return ""
+        # L242b (4), #373 r1 : la pause en court d'abord, comme avec des
+        # comptes déclarés (`accounts.pause_label`) ; sans compte déclaré,
+        # c'est le compte par défaut du harnais. #373 r2 : la pause dure
+        # jusqu'à la remise à zéro la plus tardive des fenêtres qui bloquent
+        # — aucune date si l'une d'elles n'est pas datée.
+        head = ""
+        if all(gauge.resets_at for gauge in held):
+            gauge = max(held, key=lambda g: float(g.resets_at))
+            head = "pause (account %s, %s %.0f %%) until %s; " % (
+                DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
+                until_label(gauge.resets_at, now))
+        else:
+            gauge = held[0]
+        return head + ("plan %s %s: %.0f%% used with %.0f%% of the window "
+                       "elapsed (pace cap %.0f%%%s)" % (
+                           harness, gauge.key, gauge.used * 100,
+                           gauge.elapsed(now) * 100,
+                           max(0.0, gauge.pace_cap(now) - reserve) * 100,
+                           ", %.0f points kept for critical agents" % (reserve * 100)
+                           if reserve else ""))
 
     # -- comptabilité par tour ---------------------------------------------
     def baseline(self, agent: str, harness: str, session: str | None = None) -> dict:
@@ -1283,10 +1301,13 @@ class CostBook:
                     and float(row["observed_ts"]) <= now:
                 series.setdefault((row["provider"], row.get("account")), []).append(row)
         series = {key: points for key, points in series.items() if len(points) >= 2}
+        # tout l'intervalle depuis le plus ancien relevé, sans coupure (#373
+        # r2) : une estimation écartée ferait paraître toute la baisse dans
+        # l'heure. Il reste borné : `balances` ne rend, avant l'heure, que le
+        # dernier relevé de chaque série.
         oldest = min([float(points[0]["observed_ts"]) for points in series.values()]
                      + [start])
-        lines = storage.of(self.db).turn_costs.paid_lines(max(oldest, now - 86400.0),
-                                                          harnesses=paid)
+        lines = storage.of(self.db).turn_costs.paid_lines(oldest, harnesses=paid)
 
         def estimated(mine, low, high):
             return sum(float(line["usd"]) for line in mine if low < float(line["ts"]) <= high)

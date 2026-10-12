@@ -6,6 +6,9 @@ ce plafond horaire se compte sur la baisse réelle des soldes (décision de
 mesh-design du 2026-10-12)."""
 from __future__ import annotations
 
+import json
+import os
+import re
 import time
 from unittest import mock
 
@@ -56,6 +59,25 @@ class ReserveForfaitTest(_Comptes):
             "pause (account (default), five_hour 96 %%) until %s; plan codex five_hour" % heure),
             raison)
 
+    def test_la_pause_dure_jusqu_a_la_remise_la_plus_tardive(self):
+        # #373 r2 : five_hour à 96 % (remise dans 30 min), seven_day à 96 %
+        # (remise dans 2 j) : en pause 2 jours, pas 30 min
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        court = cost.Gauge("codex", "five_hour", 0.96, self.now + 1800, 5 * HEURE)
+        long = cost.Gauge("codex", "seven_day", 0.96, self.now + 2 * 86400, 7 * 86400)
+        with mock.patch.object(book, "gauges", return_value=[court, long]), \
+                mock.patch.object(book, "clock", return_value=self.now):
+            raison = book.pace_exceeded("codex")
+        fin = time.strftime("%d/%m %H:%M", time.localtime(self.now + 2 * 86400))
+        self.assertTrue(raison.startswith(
+            "pause (account (default), seven_day 96 %%) until %s; plan codex seven_day" % fin),
+            raison)
+        # une fenêtre qui bloque sans date : aucune heure annoncée
+        sans_date = cost.Gauge("codex", "seven_day", 0.96, None, 7 * 86400)
+        with mock.patch.object(book, "gauges", return_value=[court, sans_date]), \
+                mock.patch.object(book, "clock", return_value=self.now):
+            self.assertTrue(book.pace_exceeded("codex").startswith("plan codex five_hour"))
+
     def test_la_reserve_ne_touche_pas_les_plafonds_fixes(self):
         limits = accounts.limits(self.items[1], [], self.now, reserve=True)
         self.assertEqual(limits, {})
@@ -72,6 +94,28 @@ class AffichageDeLaPauseTest(_Comptes):
         self.assertTrue(pause.reason.startswith("pause (account "), pause.reason)
         self.assertIn(") until %s; all codex accounts at threshold" % heure, pause.reason)
         self.assertRegex(pause.reason, r"codex-300min (96|97) %")
+
+    def test_la_pause_d_un_compte_dit_sa_fenetre_la_plus_longue(self):
+        # #373 r2 : deux fenêtres au seuil sur chaque compte, la semaine se
+        # remet à zéro dans 2 j : c'est elle que la pause annonce
+        for home in (self.home, self.secondaire["path"]):
+            dossier = os.path.join(home, "sessions", "2026", "10", "05")
+            os.makedirs(dossier, exist_ok=True)
+            with open(os.path.join(dossier, "rollout-test.jsonl"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "session_meta", "payload": {"id": "x"}}) + "\n")
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count", "rate_limits": {
+                        "plan_type": "pro",
+                        "primary": {"used_percent": 96, "window_minutes": 300,
+                                    "resets_at": self.now + 1800},
+                        "secondary": {"used_percent": 96, "window_minutes": 10080,
+                                      "resets_at": self.now + 2 * 86400}}}}) + "\n")
+        pause = self.choose()
+        self.assertIsNone(pause.profile)
+        fin = time.strftime("%d/%m %H:%M", time.localtime(self.now + 2 * 86400))
+        self.assertRegex(pause.reason, r"^pause \(account \w+, codex-10080min 96 %%\) "
+                                       r"until %s; " % re.escape(fin))
 
     def test_une_pause_budget_n_est_jamais_un_arret(self):
         for status, lease in (("blocked", False), ("running", False), ("idle", False)):
@@ -179,11 +223,27 @@ class BaisseReelleTest(_Paye):
         self.db.execute("DELETE FROM turn_costs")
         self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 16.0 * 50 / 73, places=1)
 
+    def test_des_releves_espaces_lisent_tout_l_intervalle(self):
+        # #373 r2 : relevés à -48 h et -10 min, baisse de 40 $ ; 30 $ estimés
+        # à -30 h et 10 $ à -30 min : 10 $ dans l'heure, pas 40 $
+        self.solde(100.0, 48 * HEURE)
+        self.ligne(30.0, 30 * HEURE)
+        self.ligne(10.0, 30 * 60)
+        self.solde(60.0, 10 * 60)
+        self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 10.0, places=3)
+        self.assertEqual(self.book.over("ds"), "")
+
     def test_soldes_illisibles_l_estimation(self):
-        self.ligne(5.0, 600)
-        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db, hourly_usd=20.0)
-        with mock.patch("ameesh.balance.compare", side_effect=RuntimeError("down")):
-            self.assertAlmostEqual(book.paid_hour(["deepseek"]), 5.0)
+        # #373 r2 (P3) : les relevés disent 0 $ (solde immobile) ; leur
+        # lecture échoue : l'estimation seule (5 $)
+        self.solde(100.0, 50 * 60)
+        self.ligne(5.0, 30 * 60)
+        self.solde(100.0, 10 * 60)
+        self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 0.0, places=3)
+        operations = type(storage.of(self.db).operations)
+        with mock.patch.object(operations, "balances", side_effect=RuntimeError("down")) as lu:
+            self.assertAlmostEqual(self.book.paid_hour(["deepseek"]), 5.0)
+        lu.assert_called()
 
 
 class AlerteCritiqueTest(PgTestCase):

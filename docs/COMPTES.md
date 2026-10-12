@@ -546,7 +546,9 @@ counted amount next to the estimate.
 **A budget pause is shown as one.** The pause reason starts with the account
 that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
 all claude accounts at threshold — …". It is the agent's `status_text`
-("budget : pause (…) until 14:20; …"). Without declared accounts the
+("budget : pause (…) until 14:20; …"). An account held by several windows
+frees when the last of them resets: the label names that window, and the
+date when it is not today ("until 14/10 09:00"). Without declared accounts the
 account is `(default)`, the harness's own. `ameesh progress` and the alerts read
 `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
 

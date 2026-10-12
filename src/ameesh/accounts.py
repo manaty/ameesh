@@ -708,6 +708,11 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
         resets = [g.resets_at for g in depasses if g.resets_at]
         result.until = max(resets) if len(resets) == len(depasses) else None
+        if result.until is not None:
+            # #373 r2 : la pause affichée est celle de la fenêtre qui bloque
+            # le plus longtemps
+            late = max(depasses, key=lambda g: float(g.resets_at))
+            result.held = (late.key, late.used)
         return result
     if profile.hourly_usd > 0 and book.db is not None:
         spent = book.spent("all", 3600, account=profile.name, harnesses=[profile.harness])
@@ -765,9 +770,9 @@ def pause_label(evaluations: dict) -> str:
     if not dated:
         return ""
     first = min(dated, key=lambda ev: ev.until)
+    from .cost import until_label
     return "pause (account %s, %s %.0f %%) until %s; " % (
-        first.profile.name, first.held[0], first.held[1] * 100,
-        time.strftime("%H:%M", time.localtime(first.until)))
+        first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until))
 
 
 def _label(evaluations: dict) -> str:
