@@ -87,7 +87,10 @@ class OfferTest(unittest.TestCase):
                {"calm_seconds": float("inf")}, {"calm_seconds": 10 ** 400},
                {"cpu_max": float("nan")}, {"drain_seconds": True},
                {"reclaim": {"io_pressure_max": "120%"}},
-               {"reclaim": {"disk_paths": "/"}}]
+               {"reclaim": {"disk_paths": "/"}},
+               # L159e4: whole seconds >= 0
+               {"restart_after_seconds": -1}, {"restart_after_seconds": 1.5},
+               {"restart_after_seconds": True}, {"restart_after_seconds": "600"}]
         for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
             with self.assertRaises(guard.GuardError, msg=offer):
                 guard.parse_offer(offer)
@@ -1221,6 +1224,166 @@ class DrainStopTest(unittest.TestCase):
                 mock.patch("sys.stderr"):
             self.assertEqual(guard.main(["drain", "--for", "inf"]), 2)
         self.assertFalse(os.path.exists(path))
+
+
+class RestartTest(unittest.TestCase):
+    """L159e4: the agent units a stop stopped start again, once, after
+    `restart_after_seconds` at level 1 or below."""
+
+    UNITS = ("ameesh-guest-runner@1.service", "ameesh-guest-runner@2.service",
+             "ameesh-guest-runner@3.service")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l159e4-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = guard.GuardConfig(
+            host="vm-test", max_agents=3,
+            offer=guard.parse_offer({**CAPS, "drain_seconds": 100, "calm_seconds": 600,
+                                     "restart_after_seconds": 300,
+                                     "reclaim": {"memory_available_min": "4GiB",
+                                                 "cpu_pressure_max": "20%"}}),
+            state_path=os.path.join(self.tmp, "state.json"),
+            ack_path=os.path.join(self.tmp, "ack.json"),
+            drain_request_path=os.path.join(self.tmp, "drain.json"))
+        self.reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                        "mem_available_bytes": 1 * GIB, "disk_free_bytes": 50 * GIB}
+        self.clock, self.mono, self.boot = [0.0], [5000.0], ["boot-a"]
+        # the fake systemd: ActiveState and InactiveEnterTimestampMonotonic (µs)
+        self.units = {u: ["active", 0] for u in self.UNITS[:2]}
+        self.units[self.UNITS[2]] = ["inactive", 1000 * 10 ** 6]   # the owner's, before
+        self.starts, self.logs = [], []
+        patcher = mock.patch.multiple(guard.resources, lendable=None, measure=None,
+                                      create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def systemd(self, argv, **kw):
+        out = ""
+        if argv[1] == "list-units":
+            running = "--state=active,activating,reloading" in argv
+            out = "".join("%s loaded %s\n" % (u, st) for u, (st, _) in self.units.items()
+                          if not running or st == "active")
+        elif argv[1] == "kill":
+            for unit in self.units.values():
+                if unit[0] == "active":
+                    unit[:] = ["inactive", int(self.mono[0] * 10 ** 6)]
+        elif argv[1] == "show" and argv[-1] not in self.units:
+            out = "FreezerState=frozen\n"          # the slice, frozen at level 2
+        elif argv[1] == "show":
+            st, inactive = self.units[argv[-1]]
+            out = "ActiveState=%s\nInactiveEnterTimestampMonotonic=%d\n" % (st, inactive)
+        elif argv[1] == "start":
+            self.starts.append(argv[-1])
+            self.units[argv[-1]][0] = "active"
+        return mock.Mock(returncode=0, stdout=out, stderr="")
+
+    def guard(self):
+        enforcer = guard.Enforcer(self.cfg, run=self.systemd, log=self.logs.append,
+                                  clock=lambda: self.clock[0], boot_id=lambda: self.boot[0],
+                                  boottime=lambda: self.mono[0], monotonic=lambda: self.mono[0],
+                                  sleep=lambda s: None)
+        return guard.Guard(self.cfg, observe=False, signals=lambda now: dict(self.reading),
+                           clock=lambda: self.clock[0], enforcer=enforcer)
+
+    def at(self, g, t):
+        self.mono[0] += t - self.clock[0]
+        self.clock[0] = t
+        return g.step()
+
+    def stop_then_clear(self, g):
+        self.at(g, 0.0)
+        state = self.at(g, 130.0)
+        self.assertEqual(state["state"], "stopped")
+        self.assertEqual(state["guard"]["stopped"]["units"], list(self.UNITS[:2]))
+        self.reading["mem_available_bytes"] = 12 * GIB
+        self.at(g, 200.0)                                # calm counting from 200
+        self.assertEqual(self.at(g, 800.0)["level"], 0)  # level 0: low from 800
+        return g
+
+    def test_restart_once_after_the_window(self):
+        g = self.stop_then_clear(self.guard())
+        self.at(g, 1099.0)
+        self.assertEqual(self.starts, [])
+        state = self.at(g, 1100.0)
+        # the owner's unit, inactive before the stop, is not the guard's
+        self.assertEqual(self.starts, list(self.UNITS[:2]))
+        self.assertEqual(state["guard"]["restart"],
+                         {"ts": 1100.0, "started": list(self.UNITS[:2]), "skipped": {}})
+        self.assertNotIn("stopped", state["guard"])
+        self.assertTrue(any("restart after the stop" in line for line in self.logs))
+        with open(self.cfg.state_path) as fh:
+            self.assertEqual(json.load(fh)["guard"]["restart"]["started"], list(self.UNITS[:2]))
+        # once: units stopped again by hand stay stopped
+        for unit in self.UNITS[:2]:
+            self.units[unit] = ["inactive", int(self.mono[0] * 10 ** 6)]
+        self.at(g, 5000.0)
+        self.assertEqual(len(self.starts), 2)
+
+    def test_never_a_unit_stopped_since_by_someone_else(self):
+        g = self.stop_then_clear(self.guard())
+        # the owner started @2 and stopped it again; @1 is running again
+        self.units[self.UNITS[1]] = ["inactive", int(self.mono[0] * 10 ** 6)]
+        self.units[self.UNITS[0]][0] = "active"
+        state = self.at(g, 1100.0)
+        self.assertEqual(self.starts, [])
+        self.assertEqual(state["guard"]["restart"]["skipped"],
+                         {self.UNITS[0]: "running", self.UNITS[1]: "stopped_by_owner"})
+
+    def test_window_restarts_when_the_level_rises(self):
+        g = self.stop_then_clear(self.guard())
+        self.reading["mem_available_bytes"] = 1 * GIB
+        self.assertEqual(self.at(g, 1000.0)["level"], 3)
+        self.reading["mem_available_bytes"] = 12 * GIB
+        self.at(g, 1001.0)          # level 3 held, calm counting: not low yet
+        # the new drain is not acknowledged: stopped again, the record kept
+        state = self.at(g, 1130.0)
+        self.assertEqual(state["state"], "stopped")
+        self.assertEqual(state["guard"]["stopped"]["units"], list(self.UNITS[:2]))
+        self.assertEqual(self.at(g, 1601.0)["level"], 0)
+        self.at(g, 1900.0)
+        self.assertEqual(self.starts, [])
+        self.at(g, 1901.0)
+        self.assertEqual(self.starts, list(self.UNITS[:2]))
+
+    def test_a_freeze_restarts_the_window(self):
+        g = self.stop_then_clear(self.guard())
+        self.reading["psi_cpu_10"] = 50.0
+        self.assertEqual(self.at(g, 900.0)["level"], 2)
+        del self.reading["psi_cpu_10"]
+        self.assertEqual(self.at(g, 901.0)["level"], 1)     # thawed: low from 901
+        self.at(g, 1100.0)
+        self.assertEqual(self.starts, [])
+        self.at(g, 1201.0)
+        self.assertEqual(self.starts, list(self.UNITS[:2]))
+
+    def test_kept_across_a_guard_restart(self):
+        g = self.guard()
+        self.at(g, 0.0)
+        self.at(g, 130.0)
+        self.reading["mem_available_bytes"] = 12 * GIB
+        self.at(g, 200.0)
+        self.at(g, 800.0)
+        self.at(self.guard(), 1100.0)               # a new guard, same boot
+        self.assertEqual(self.starts, list(self.UNITS[:2]))
+
+    def test_never_after_a_reboot_nor_a_manual_drain(self):
+        g = self.stop_then_clear(self.guard())
+        self.boot[0] = "boot-b"
+        state = self.at(g, 1100.0)
+        self.assertEqual(self.starts, [])
+        self.assertEqual(set(state["guard"]["restart"]["skipped"].values()), {"reboot"})
+        # a stop of a drain the owner asked
+        self.setUp()
+        self.reading["mem_available_bytes"] = 12 * GIB
+        guard.request_drain(self.cfg.drain_request_path, 0.0, None)
+        g = self.guard()
+        self.at(g, 0.0)
+        self.assertEqual(self.at(g, 130.0)["state"], "stopped")
+        self.assertTrue(guard.cancel_drain(self.cfg.drain_request_path))
+        for t in (131.0, 800.0, 1500.0):
+            state = self.at(g, t)
+        self.assertEqual(self.starts, [])
+        self.assertEqual(set(state["guard"]["restart"]["skipped"].values()), {"manual"})
 
 
 class CliTest(unittest.TestCase):
