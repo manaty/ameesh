@@ -505,10 +505,15 @@ restée 4 h fusionnée sans être déployée :
    `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
    `v<version>` sur ce commit de `main` (le numéro est celui de son
    `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent
-   de `docs/versions/<version>.md` s'il existe, sinon de la description de la
-   PR de ce commit. Seule la plus haute version est marquée « Latest ».
-   `poste.sh rattraper` fait de même pour chaque version de l'historique de
-   `main` à qui il manque son étiquette ou sa release ; une étiquette déjà
-   posée fait foi et n'est pas déplacée. `A_BLANC=1` affiche ce qui serait
-   posé, poussé et publié, notes comprises, sans rien toucher. Ces deux étapes
-   n'ont besoin que du dépôt et de `gh`, ni du serveur ni de la base.
+   de `docs/versions/<version>.md` tel qu'il est dans `main` (une note se
+   relit et se fusionne avant de publier), sinon de la description de la PR
+   qui a fusionné ce commit (vérifié auprès de GitHub) ; une description
+   illisible arrête la publication. Seule la plus haute version est marquée
+   « Latest ». `poste.sh rattraper` fait de même pour chaque version de
+   l'historique de `main` à qui il manque son étiquette ou sa release ; une
+   étiquette déjà posée sur le distant fait foi et n'est pas déplacée, si son
+   commit porte bien cette version (sinon tout s'arrête). Une étiquette posée
+   ici mais pas poussée est poussée à la relance. `A_BLANC=1` affiche ce qui
+   serait posé, poussé et publié, notes comprises, sans rien écrire, pas même
+   un `git fetch`. Ces deux étapes n'ont besoin que du dépôt et de `gh`, ni
+   du serveur ni de la base.
