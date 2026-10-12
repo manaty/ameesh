@@ -281,6 +281,9 @@ command_line="$PYTHON -I $SHELL_BIN --config $ETC/offload.json"
 # choom (util-linux): the global OOM killer picks the guest's jobs first (study 1.6)
 CHOOM=$(command -v choom || true)
 [ -z "$CHOOM" ] || command_line="$CHOOM -n 500 -- $command_line"
+# exec: sshd runs the forced command through the guest's shell (-c); without
+# it, that shell would stay alive holding the session's streams
+command_line="exec $command_line"
 key_opts="restrict"
 [ -z "$FROM" ] || key_opts="$key_opts,from=\"$FROM\""
 key_opts="$key_opts,command=\"$command_line\""

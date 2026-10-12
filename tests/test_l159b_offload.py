@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -713,6 +714,35 @@ class ShellTest(OffloadBase):
         self.assertEqual(res.returncode, 2)
         self.assertIn(b"--nonce is no longer accepted", res.stderr)
 
+    def test_a_foreign_holder_of_the_session_streams_is_an_error(self):
+        # a process of the same UID holding the same ends as the shell's
+        # stdout/stderr (here a sibling started by the parent shell, as with
+        # a forced command run without exec) could write into the session
+        env = dict(self.env(), SSH_ORIGINAL_COMMAND="run acme-widget %s -- true" % ("0" * 40))
+        proc = subprocess.Popen(
+            ["bash", "-c", 'sleep 60 & echo $! > "$0"; exec "$@"',
+             os.path.join(self.tmp, "sibling"), sys.executable, "-m",
+             "ameesh.offload_shell", "--config", self.config_path],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        try:
+            proc.wait(timeout=60)
+        finally:
+            # the sibling holds the pipes open: the output ends with it
+            with open(os.path.join(self.tmp, "sibling")) as fh:
+                os.kill(int(fh.read()), signal.SIGKILL)
+        out, err = proc.communicate(timeout=30)
+        res = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+        self.assertEqual(res.returncode, 70, res.stderr)
+        self.assertIn(b"session streams held by another process", res.stderr)
+        results = [line for line in res.stderr.splitlines() if b" result " in line]
+        self.assertEqual(len(results), 1, res.stderr)
+        result = json.loads(results[0].split(b" result ", 1)[1])
+        self.assertEqual(result["outcome"], "error")  # never refused: no local rerun
+        self.assertIn("mac", result)
+        # the same command, alone on its streams, reaches the job checks
+        self.assertEqual(self.shell("run acme-widget %s -- true" % ("0" * 40)).returncode, 2)
+
     def test_names_and_paths_are_validated(self):
         self.assertIn(b"invalid repository name", self.shell("put ../x --have").stderr)
         self.assertIn(b"invalid commit id", self.shell("put repo zzz").stderr)
@@ -860,7 +890,7 @@ class InstallScriptTest(unittest.TestCase):
                              capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("useradd", res.stdout)
-        self.assertIn('restrict,from="203.0.113.7",command=', res.stdout)
+        self.assertIn('restrict,from="203.0.113.7",command="exec ', res.stdout)
         self.assertIn("MemoryMax=", res.stdout)
         self.assertIn("meta skuid", res.stdout)
         self.assertIn("ForceCommand ", res.stdout)

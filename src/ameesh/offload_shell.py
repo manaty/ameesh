@@ -187,6 +187,55 @@ def _no_dump() -> None:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE, 0)")
 
 
+def _access_mode(pid: str, fd: str) -> int | None:
+    try:
+        with open("/proc/%s/fdinfo/%s" % (pid, fd)) as fh:
+            for line in fh:
+                if line.startswith("flags:"):
+                    return int(line.split()[1], 8) & os.O_ACCMODE
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def foreign_holders() -> list[str]:
+    """Processes, other than this shell, that hold the same end as one of its
+    fds 0-2 (the session's streams), among those whose /proc/<pid>/fd this
+    UID can read: they could read the session's input or write into its
+    output. The other ends belong to sshd (not dumpable, and the reverse
+    access mode anyway). Called after `_no_dump`, before this shell starts
+    anything."""
+    own = set()
+    for fd in (0, 1, 2):
+        try:
+            own.add((os.readlink("/proc/self/fd/%d" % fd),
+                     fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE))
+        except OSError:
+            pass
+    targets = {target for target, _ in own}
+    me = os.getpid()
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            fds = os.listdir("/proc/%s/fd" % name)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink("/proc/%s/fd/%s" % (name, fd))
+            except OSError:
+                continue
+            if target not in targets:
+                continue
+            mode = _access_mode(name, fd)
+            if any(t == target and (m == mode or os.O_RDWR in (m, mode))
+                   for t, m in own):
+                found.append("pid %s fd %s (%s)" % (name, fd, target))
+    return found
+
+
 #: this shell's stderr carries both the protocol and the job's relayed
 #: stderr: one writer at a time, and whether the last byte ended a line
 _ERR_LOCK = threading.Lock()
@@ -1077,6 +1126,16 @@ def main(argv: list[str] | None = None) -> int:
         global NONCE
         NONCE = secrets.token_hex(16)
         emit("session")
+    holders = foreign_holders()
+    if holders:
+        # an error, never `refused`: the client must not rerun locally what
+        # another process may be watching
+        reason = "session streams held by another process: " + ", ".join(holders[:5])
+        if words[0] == "run":
+            emit_result({"job": None, "outcome": "error", "exit": None, "reason": reason})
+        else:
+            emit("error", reason)
+        return 70
     try:
         cfg = load_config(config)
         return VERBS[words[0]](cfg, words[1:])
