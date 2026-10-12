@@ -126,15 +126,33 @@ class Keys(interface.Keys):
     def owner_registrations(self, since) -> list[dict]:
         return self.db.query(
             """
-            SELECT id, name, holder, event, fingerprint, db_user, owner_gesture,
-                   extract(epoch from at)::float8 as at_ts
-              FROM key_events
-             WHERE key_role = 'owner' AND event IN ('registered', 'replaced')
-               AND at >= to_timestamp(%s)
-             ORDER BY id
+            SELECT e.id, e.name, e.holder, e.event, e.fingerprint, e.db_user,
+                   e.owner_gesture, extract(epoch from e.at)::float8 as at_ts
+              FROM key_events e
+             WHERE e.key_role = 'owner' AND e.event IN ('registered', 'replaced')
+               AND CASE WHEN e.owner_gesture THEN e.at >= to_timestamp(%s)
+                        ELSE NOT EXISTS (SELECT 1 FROM key_events c
+                                          WHERE c.name = e.name AND c.event = 'confirmed'
+                                            AND c.id > e.id)
+                   END
+             ORDER BY e.id
             """,
             (since,),
         )
+
+    def confirm(self, name) -> int:
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            rows = tx.query(
+                """
+                INSERT INTO key_events (name, holder, event, key_role, fingerprint)
+                SELECT name, holder, 'confirmed', key_role, public_key_fingerprint
+                  FROM mesh_keys WHERE name = %s
+                RETURNING id
+                """,
+                (name,),
+            )
+        return int(rows[0]["id"]) if rows else 0
 
     def registered(self) -> list[dict]:
         return self.db.query(

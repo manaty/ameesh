@@ -152,18 +152,26 @@ base64 of the 32-byte seed or key). Rules:
     owner's authority delegated) is the same gesture (#326 r2): setting,
     changing, renaming or un-revoking it is refused outside the owner's
     role; an `agent` key stays free;
-  * no agent is created under a key holder's name (trigger on
-    `agent_registry`): a holder's rotation is never blocked by an agent
-    that took its name meanwhile;
-  * dates are the server's: `key_updated_at`, `created_at` and
-    `key_revoked_at` are set by the triggers to `now()`, whatever the
-    writer sends. Every key event (registered, replaced, revoked, removed;
+  * no agent is created under a key holder's name, nor a key holder under
+    an agent's (triggers on both tables, #326 r3): a holder's rotation is
+    never blocked by an agent that took its name meanwhile, and a holder
+    never shadows an agent's key. A first owner key holder also counts the
+    agents' owner keys. Should a name still be both with two different keys
+    (a race), `mesh_keys` gives it no key at all;
+  * dates are the server's clock at the event: `key_updated_at`,
+    `created_at` and `key_revoked_at` are set by the triggers to
+    `clock_timestamp()` (not the transaction's start), whatever the writer
+    sends. Every key event (registered, replaced, revoked, removed;
     holder or agent; the database role; whether it was the owner's gesture)
     goes to `key_events`, append-only and written by the triggers only (no
     update, no delete, no direct insert). `ameesh alerts` raises
-    `owner_key_registered` from it for 7 days, pushed to
-    `notify.default_human` (urgent): a backdated row or a revocation right
-    after use hides nothing.
+    `owner_key_registered` from it, pushed to `notify.default_human`
+    (urgent): for 7 days when it was the owner's gesture; otherwise until
+    the owner confirms it with their database role
+    (`ameesh key confirm <name>`, an event `confirmed`), with no time limit.
+    A backdated row, a revocation right after use or a transaction held open
+    for days hides nothing. Registering your own first owner key with the
+    executor's DSN therefore alerts until you confirm it.
 
   A rotation signed by the current owner key was considered and left out:
   a rotation is rare, and the owner holds the owner database role anyway;

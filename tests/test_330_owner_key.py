@@ -229,11 +229,18 @@ class OwnerKeyGuardTest(_Keys):
         self.assertEqual([(a["type"], a["reason"], a["agent"], a["holder"]) for a in alerts],
                          [("owner_key_registered", "alice#1", None, "human")])
         self.assertIsNone(alerts[0].get("responsible"))
-        self.assertEqual(exploitation._owner_key_registered(self.db, time.time() + 8 * 86400),
-                         [])
+        self.assertIn("ameesh key confirm alice", alerts[0]["detail"])
+        # #326 r3: not the owner's gesture — no time limit, until confirmed
+        self.assertEqual(len(exploitation._owner_key_registered(self.db,
+                                                                time.time() + 30 * 86400)), 1)
         # #326 r2: a revocation right after use does not erase it
         authority.revoke_key(self.db, "alice")
         self.assertEqual(len(exploitation._owner_key_registered(self.db, time.time())), 1)
+        proc = self.mesh("key", "confirm", "alice", env=self.mesh_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(exploitation._owner_key_registered(self.db, time.time()), [])
+        with self.assertRaises(authority.AuthorityError):
+            authority.confirm_key(self.db, "nobody")
         # the CLI writes to the owner's chat, if it exists
         registry.upsert(self.db, "chat-dave", harness="claude", host=self.cfg.host)
         _private, public = self.keypair("dave")
@@ -305,6 +312,48 @@ class OwnerKeyGuardTest(_Keys):
             with self.assertRaises(DbError, msg=sql):
                 self.db.execute(sql)
         self.assertEqual(len(self.db.query("SELECT 1 FROM key_events")), 3)
+
+    def test_a_holder_never_shadows_an_agent(self):
+        # #326 r3: an agent with an owner key, no owner key holder
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("DELETE FROM key_holders")
+        authority.register_key(self.db, "orch", signing.read_public(self.public), role="owner")
+        for sql in ("INSERT INTO key_holders (name, human, public_key, public_key_fingerprint, "
+                    "key_role) VALUES ('orch', 'human:orch', 'k', 'f', 'owner')",
+                    "INSERT INTO key_holders (name, human, public_key, public_key_fingerprint, "
+                    "key_role) VALUES ('orch', 'human:orch', 'k', 'f', 'agent')",
+                    # the agents' owner keys count: no other first owner key
+                    "INSERT INTO key_holders (name, human, public_key, key_role) "
+                    "VALUES ('mallory', 'human:mallory', 'k', 'owner')"):
+            with self.assertRaises(DbError, msg=sql):
+                self.db.execute(sql)
+        info = authority.key_info(self.db, "orch")
+        self.assertEqual((info["holder"], info["public_key_fingerprint"]),
+                         ("agent", signing.fingerprint(signing.read_public(self.public))))
+        # a name both, with two keys (a race, a row past the triggers): no key
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("INSERT INTO key_holders (name, human, public_key, "
+                       "public_key_fingerprint, key_role) "
+                       "VALUES ('orch', 'human:orch', 'k', 'f', 'owner')")
+        self.assertIsNone(authority.key_info(self.db, "orch"))
+
+    def test_event_dates_are_the_events_not_the_transactions(self):
+        # #326 r3: a transaction opened long before the insert
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("DELETE FROM key_holders")
+        with self.db.transaction() as tx:
+            tx.query("SELECT pg_sleep(1.5)")
+            tx.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
+                       "VALUES ('late', 'human:late', 'k', 'owner')")
+            lag = tx.query(
+                "SELECT extract(epoch from (SELECT at FROM key_events WHERE name = 'late') "
+                "- now())::float8 AS e, extract(epoch from (SELECT key_updated_at "
+                "FROM key_holders WHERE name = 'late') - now())::float8 AS k")[0]
+        self.assertGreater(lag["e"], 1.0)
+        self.assertGreater(lag["k"], 1.0)
 
     def test_two_first_owner_keys_at_once(self):
         # #326 r2: two transactions, neither seeing the other's owner key

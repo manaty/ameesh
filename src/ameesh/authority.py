@@ -271,6 +271,24 @@ def revoke_key(db: Db, agent: str) -> bool:
     return storage.of(db).keys.revoke(agent)
 
 
+def confirm_key(db: Db, name: str) -> int:
+    """Le propriétaire confirme les enregistrements de la clé de `name`
+    (#326 r3) : l'alerte `owner_key_registered` d'une clé owner posée sans son
+    geste s'éteint. Geste du propriétaire, refusé par la base hors de son
+    rôle ; rend l'id de l'événement `confirmed`."""
+    try:
+        event = storage.of(db).keys.confirm(name)
+    except DbError as exc:
+        if "key_events is written" not in str(exc):
+            raise
+        raise AuthorityError(
+            "confirming a key is the owner's own gesture: run it with the owner's "
+            "database role") from exc
+    if not event:
+        raise AuthorityError("no key registered for %s" % name)
+    return event
+
+
 def _valid_key(db: Db, agent: str, expected_fingerprint: str | None) -> tuple[dict | None, Verdict]:
     info = key_info(db, agent)
     if not info or not info.get("public_key"):

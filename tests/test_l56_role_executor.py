@@ -165,7 +165,13 @@ class RoleExecutorTest(PgTestCase):
                     "DELETE FROM key_events",
                     "UPDATE key_events SET at = now() - interval '30 days'",
                     "INSERT INTO key_events (name, holder, event) "
-                    "VALUES ('x', 'human', 'revoked')"):
+                    "VALUES ('x', 'human', 'revoked')",
+                    # #326 r3: nor confirm a registration, nor a holder under
+                    # an agent's name
+                    "SET ameesh.owner_gesture = 'on'; INSERT INTO key_events "
+                    "(name, holder, event) VALUES ('l56-owner', 'human', 'confirmed')",
+                    "INSERT INTO key_holders (name, human, public_key, key_role) "
+                    "VALUES ('l56-agent', 'human:l56-agent', 'k6', 'agent')"):
             proc = self.as_host(sql)
             self.assertNotEqual(proc.returncode, 0, sql)
         proc = self.as_host("UPDATE agent_registry SET public_key = 'k5', key_role = 'agent' "

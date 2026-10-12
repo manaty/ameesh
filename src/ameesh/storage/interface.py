@@ -831,9 +831,17 @@ class Keys(Domain):
 
     @abc.abstractmethod
     def owner_registrations(self, since: float) -> list[dict]:
-        """Clés owner enregistrées ou remplacées depuis `since` (#326 r2), lues
-        dans le journal `key_events`, qu'aucune révocation n'efface : id,
-        name, holder, event, fingerprint, db_user, owner_gesture, at_ts."""
+        """Clés owner enregistrées ou remplacées (#326 r2-r3), lues dans le
+        journal `key_events`, qu'aucune révocation n'efface : par le geste du
+        propriétaire, depuis `since` ; sans ce geste, tant que le propriétaire
+        ne les a pas confirmées (`confirm`). id, name, holder, event,
+        fingerprint, db_user, owner_gesture, at_ts."""
+
+    @abc.abstractmethod
+    def confirm(self, name: str) -> int:
+        """Le propriétaire confirme les enregistrements de la clé de `name`
+        (#326 r3) : un événement `confirmed`, que la base refuse hors de son
+        geste (rôle propriétaire) ; rend son id, 0 sans clé de ce nom."""
 
     @abc.abstractmethod
     def registered(self) -> list[dict]:

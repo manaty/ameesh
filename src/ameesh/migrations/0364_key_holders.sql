@@ -26,11 +26,17 @@
 -- The same holds for an owner key on an agent's row (#326 r2: the owner's
 -- authority delegated to an agent, `key register <agent> --role owner`):
 -- set, changed, moved to another name or brought back from a revocation by
--- the owner's gesture only. No agent may be created under a holder's name.
--- Dates are the server's (`now()`), never the writer's; every key event goes
--- to `key_events`, append-only and written by these triggers only, which
--- `ameesh alerts` reads (`owner_key_registered`): a revocation right after
--- use does not erase it.
+-- the owner's gesture only. No agent may be created under a holder's name,
+-- nor a holder under an agent's (#326 r3); a first owner key counts the
+-- agents' owner keys too.
+-- Dates are the server's clock at the event (`clock_timestamp()`, not the
+-- transaction's start), never the writer's; every key event goes to
+-- `key_events`, append-only and written by these triggers only, which
+-- `ameesh alerts` reads (`owner_key_registered`): an owner key registered
+-- WITHOUT the owner's gesture stays in alert, with no time limit, until the
+-- owner confirms it by their gesture (`ameesh key confirm <name>`, an event
+-- `confirmed`) — neither a revocation nor a transaction held open for days
+-- hides it.
 --
 -- `mesh_keys` is what the key lookups read: the key holders, then the
 -- agents' keys for the names no key holder has.
@@ -65,11 +71,12 @@ create unique index if not exists key_holders_one_owner
 -- registration here, and `owner_key_registered` reads it
 create table if not exists key_events (
     id            bigserial primary key,
-    at            timestamptz not null default now(),
+    at            timestamptz not null default clock_timestamp(),
     name          text not null,
     holder        text not null check (holder in ('human', 'agent')),
     event         text not null
-                  check (event in ('registered', 'replaced', 'revoked', 'removed')),
+                  check (event in ('registered', 'replaced', 'revoked', 'removed',
+                                   'confirmed')),
     key_role      text,
     fingerprint   text,
     db_user       text not null default current_user,
@@ -92,11 +99,13 @@ begin
         raise exception 'key_events is append-only: an event is never changed nor removed'
             using errcode = 'insufficient_privilege';
     end if;
-    if pg_trigger_depth() < 2 then
-        raise exception 'key_events is written by the key triggers only'
+    if pg_trigger_depth() < 2
+            and not (new.event = 'confirmed' and key_holders_owner_gesture()) then
+        raise exception 'key_events is written by the key triggers only (and a confirmation by the owner''s own gesture)'
             using errcode = 'insufficient_privilege';
     end if;
-    new.at := now();
+    new.at := clock_timestamp();        -- the event's time, not its transaction's
+    new.owner_gesture := key_holders_owner_gesture();
     new.db_user := current_user;
     return new;
 end
@@ -161,8 +170,14 @@ begin
         return coalesce(new, old);
     end if;
     if tg_op = 'INSERT' then
-        if new.key_role = 'owner' and exists (
-                select 1 from key_holders where key_role = 'owner') then
+        if exists (select 1 from agent_registry where name = new.name) then
+            raise exception 'an agent is named %: a human''s key never sits on an agent''s identity (the owner''s own gesture)', new.name
+                using errcode = 'insufficient_privilege';
+        end if;
+        if new.key_role = 'owner' and (
+                exists (select 1 from key_holders where key_role = 'owner')
+                or exists (select 1 from agent_registry
+                            where key_role = 'owner' and public_key is not null)) then
             raise exception 'an owner key already exists: replacing it is the owner''s own gesture (key register --human % --replace, with the owner''s database role)', new.name
                 using errcode = 'insufficient_privilege';
         end if;
@@ -170,8 +185,8 @@ begin
             raise exception 'a key holder is not created revoked'
                 using errcode = 'insufficient_privilege';
         end if;
-        new.key_updated_at := now();    -- the server's clock, never the writer's
-        new.created_at := now();
+        new.key_updated_at := clock_timestamp();    -- the server's clock, never the writer's
+        new.created_at := clock_timestamp();
         return new;
     end if;
     if tg_op = 'UPDATE' and old.key_revoked_at is null and new.key_revoked_at is not null
@@ -181,7 +196,7 @@ begin
             and new.key_role = old.key_role
             and new.key_updated_at is not distinct from old.key_updated_at
             and new.created_at = old.created_at then
-        new.key_revoked_at := now();
+        new.key_revoked_at := clock_timestamp();
         return new;                     -- a revocation
     end if;
     raise exception 'the key of % is only replaced, rotated or removed by the owner''s own gesture (key register --human % --replace, with the owner''s database role)', old.name, old.name
@@ -241,13 +256,13 @@ begin
             using errcode = 'insufficient_privilege';
     end if;
     if changed then
-        new.key_updated_at := now();
+        new.key_updated_at := clock_timestamp();
     elsif tg_op = 'UPDATE' then
         new.key_updated_at := old.key_updated_at;
     end if;
     if tg_op = 'UPDATE' and new.key_revoked_at is distinct from old.key_revoked_at
             and new.key_revoked_at is not null then
-        new.key_revoked_at := now();
+        new.key_revoked_at := clock_timestamp();
     end if;
     return new;
 end
@@ -265,6 +280,10 @@ create trigger agent_registry_key_events
                                         key_revoked_at, name on agent_registry
     for each row execute function key_events_log();
 
+-- the copy is this migration's own gesture: its role owns the tables, and
+-- the agent row of that name still exists (local to the migration's
+-- transaction)
+select set_config('ameesh.owner_gesture', 'on', true);
 insert into key_holders (name, human, public_key, public_key_fingerprint, key_role,
                          key_updated_at, created_at)
 select r.name, r.responsible, r.public_key, r.public_key_fingerprint, r.key_role,
@@ -277,11 +296,17 @@ select r.name, r.responsible, r.public_key, r.public_key_fingerprint, r.key_role
    and (r.key_role <> 'owner'
         or not exists (select 1 from key_holders where key_role = 'owner'))
 on conflict (name) do nothing;
+select set_config('ameesh.owner_gesture', '', true);
 
+-- a name both a key holder and an agent with ANOTHER key (#326 r3: a race,
+-- or a row slipped past the triggers) has no key at all: fail closed
 create or replace view mesh_keys as
 select h.name, 'human' as holder, h.public_key, h.public_key_fingerprint, h.key_role,
        h.key_updated_at, h.key_revoked_at
   from key_holders h
+ where not exists (select 1 from agent_registry r
+                    where r.name = h.name and r.public_key is not null
+                      and r.public_key_fingerprint is distinct from h.public_key_fingerprint)
 union all
 select r.name, 'agent', r.public_key, r.public_key_fingerprint, r.key_role,
        r.key_updated_at, r.key_revoked_at

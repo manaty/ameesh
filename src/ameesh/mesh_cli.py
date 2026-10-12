@@ -687,6 +687,15 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 if result.get("human"):
                     _note_owner_key(db, result)
             return 0
+        if args.key_command == "confirm":
+            try:
+                event = authority.confirm_key(db, args.agent)
+            except authority.AuthorityError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
+            print("key of %s confirmed by the owner (event %d): its owner_key_registered "
+                  "alerts end" % (args.agent, event))
+            return 0
         if args.key_command == "revoke":
             if not authority.revoke_key(db, args.agent):
                 print(USAGE_HINT % ("no active key for %s" % args.agent), file=sys.stderr)
@@ -1850,6 +1859,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_krev = key_sub.add_parser("revoke")
     p_krev.add_argument("agent")
     p_krev.set_defaults(func=cmd_key)
+    p_kconf = key_sub.add_parser(
+        "confirm", help="the owner confirms the registrations of a key: its "
+        "owner_key_registered alert ends (owner's database role, #326)")
+    p_kconf.add_argument("agent")
+    p_kconf.set_defaults(func=cmd_key)
 
     p_app = sub.add_parser("approve", help="sign an approval")
     p_app.add_argument("--key", required=True, help="owner's private key")
