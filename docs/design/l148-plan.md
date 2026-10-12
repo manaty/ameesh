@@ -456,12 +456,17 @@ Ordering rules used by the plan:
 Each stage is one or more small PRs. "Free" means no open PR touches the file. All PRs carry
 `ameesh-work: 147` (L148); this document's own PR carries `ameesh-work: 469`.
 
-### Stage 0 — hygiene (one PR, ~10 lines, free files)
+### Stage 0 — deprecate the unused French aliases (one PR, free files)
 
-- Delete the unused French-only aliases `--tache` (alias of `--lot`) and `--deploiement`
-  (alias of `--livraison`): 0 references in code, tests, docs and scripts.
-- Keep `--lot` (kept term). No other change.
-- Files: `src/ameesh/roadmap.py`, `src/ameesh/plan_cli.py`. Open PRs: none.
+- `--tache` (alias of `--lot`) and `--deploiement` (alias of `--livraison`) have 0 references
+  in code, tests, docs and scripts, but removing an option string is a breaking change for
+  `scripts/version-level.py`: the next version would have to be 2.0.0. They stay accepted,
+  hidden from `--help`, and print one line on stderr naming the canonical spelling
+  (`--tache is deprecated, use --lot`), through `src/ameesh/deprecated.py` (`DeprecatedAlias`).
+- Keep `--lot` (kept term). No other change. The actual removal moves to stage 7, with the
+  next major version.
+- Files: `src/ameesh/roadmap.py`, `src/ameesh/plan_cli.py`, `src/ameesh/deprecated.py`.
+  Open PRs: none. Implemented by #446 (`ameesh-work: 147`).
 
 ### Stage 1 — production module renames behind shims
 
@@ -501,16 +506,19 @@ stage 4.
 
 **2a — free CLI files.** `plan_cli.py` (`--debut/--fin/--livraison`), `roadmap.py`
 (`--pour`, `--projet`, `--porteur`, `--depend-de`, `--fiche`), `serve.py` (`--organisation`).
-Recipe: English option first in the `add_argument` tuple, `dest=` stays the current attribute
-name during the transition, French spelling kept as an alias with `help=argparse.SUPPRESS`:
+Recipe: English option first, `dest=` stays the current attribute name during the transition,
+the French spelling gets its own hidden `DeprecatedAlias` argument (accepted, absent from
+`--help`, one line on stderr naming the canonical spelling):
 
 ```python
-p.add_argument("--start", "--debut", dest="debut", default=None,
+p.add_argument("--start", dest="debut", default=None,
                help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
+p.add_argument("--debut", dest="debut", action=DeprecatedAlias, canonical="--start",
+               default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 ```
 
 This is conflict-free even where tests still pass `--debut`, and the visible help becomes
-English. A later PR swaps `dest` and the tests.
+English. A later PR swaps `dest` and the tests; the French strings leave in stage 7.
 
 **2b — dev scripts.** `scripts/carte.py`, `scripts/carte_mesure.py`, `scripts/ci-flux.py`,
 `scripts/test-parts.py`: 28 function names, 13 options, 11 subcommands, 6 positionals, 4 file
@@ -594,18 +602,19 @@ must be rebased on the day the last of #194/#394/#417/#420/#421/#422/#423/#424 m
   (`session_policy`, `mode`, orphan/delegation reasons, roadmap milestones, turn kinds) and keep
   the existing `*_LABELS` translation tables as the read-side compatibility layer.
 
-### Stage 7 — cleanup
+### Stage 7 — cleanup at the next major
 
 - Delete the module shims, the `old = new` Python aliases, the CLI aliases and the duplicate
-  JSON keys after one release with no open PR on the files.
+  JSON keys when the next major version (2.0.0) is prepared, with no open PR on the files:
+  this stage holds those removals and nothing else.
 - Re-run this inventory by script; the target is 0 French identifiers outside the kept `lot`
   vocabulary and the 14 applied migration file names.
 
-## 5. Decisions (mesh-design, 2026-10-12 17:52 UTC)
+## 5. Decisions (mesh-design, 2026-10-12)
 
 `#147` is reassigned to `mty-amh-impl-04` (was `ameesh-dev7`); stages 0–2 start now, one small PR
 per stage, each carrying `ameesh-work: 147`. Answers to the six questions this section used to
-ask:
+ask (mesh-design, 2026-10-12 17:52 UTC):
 
 1. **Repositories**: `manaty/ameesh` only — `manaty/nexlink` is not covered by #147, so
    `porte_hote` stays out of scope.
@@ -615,6 +624,13 @@ ask:
 4. **`organisation`**: keep the British spelling; no API change for a spelling.
 5. **Stored values**: out of #147 for now; stage 6's value migration becomes a separate lot.
 6. **Start**: stages 0–2 now; stage 4 keeps waiting for the PRs that touch its files.
+
+Follow-up (mesh-design, 2026-10-12 18:00 UTC): no stage may break anything. A renamed option
+keeps its old spelling accepted, hidden from `--help`, with one line on stderr naming the
+canonical spelling; `scripts/version-level.py` must keep seeing no breaking change (checked
+with `scripts/version-level.py level`); shared-code renames go behind shims (module
+re-exports, `old = new`, JSON keys emitted twice). Every removal is bundled into stage 7, at
+the next major version.
 
 ## 6. Limits
 
