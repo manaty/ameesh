@@ -301,8 +301,8 @@ when an agent of the registry creates the lot** (`work add`, `mail send
 --new-lot`): refused otherwise, nothing is created; a human gets a warning.
 ameesh measures the actual duration itself: start = first move to `build`
 (or `qa`), or the assignee's first turn on the lot (noted by the runner);
-end = the `merged` milestone. `work show` (line « durée », duration), `ameesh projects`
-(short **DURÉE** column, duration: `1h10/2h` elapsed/estimated, `2h` not started,
+end = the `merged` milestone. `work show` (line `estimate`), `ameesh projects`
+(short **DURATION** column: `1h10/2h` elapsed/estimated, `2h` not started,
 `2h40/2h!` overrun), `ameesh progress`, the roadmap and the header of the
 lots' GitHub issues (L126) show the estimate, the actual duration and the
 gap. `work estimates` gives, over delivered lots, the actual/estimated ratio

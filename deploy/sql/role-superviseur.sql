@@ -52,6 +52,10 @@
 --       executor_tokens.token_sha256, executor_invitations.code_sha256,
 --       executor_assertion_jti.jti, executors.public_key, .device_attestation,
 --       exec_idempotency.response
+--   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
+--     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
+--     reconnaîtrait un jeton fuité ; inutile à la supervision :
+--       credential_health.failing_fingerprint
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes
@@ -274,7 +278,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
         'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
         -- #246 (0067): btrfs allocation, numbers only
-        'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes'
+        'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',
+        -- #253 (0359): every filesystem the host writes to, paths and numbers
+        'volumes'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
@@ -360,11 +366,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
     ]),
-    -- credential health (L226a/L226b, 0060): account NAMES and their state
+    -- credential health (L226a/L226b, 0060, 0068): account NAMES and their state
     -- (short cause and fix command), never a credential
     ('credential_health', ARRAY[
         'host', 'harness', 'account', 'state', 'reason', 'source', 'checked_at',
-        'failing_since', 'expires_at'
+        'failing_since', 'expires_at', 'last_failure_at', 'failures'
     ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu

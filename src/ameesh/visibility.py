@@ -207,34 +207,34 @@ class Forge:
         compte est vérifié sur la forge déclarée ; un humain sans compte n'est
         prouvable que par la copie d'essai s'il est seul."""
         if self.mode in ("none", "off", "0"):
-            return False, "vérification de visibilité désactivée (AMEESH_FORGE=%s)" % self.mode
+            return False, "visibility check disabled (AMEESH_FORGE=%s)" % self.mode
         if self.mode == "git":
             if len(humans) == 1 and self.reachable(repo):
-                return True, "copie d'essai réussie (responsable de l'hôte)"
-            return False, ("copie d'essai impossible ou hôte à plusieurs humains "
-                           "(elle ne prouve que le responsable)")
+                return True, "test clone succeeded (host owner)"
+            return False, ("test clone failed or host has several humans "
+                           "(it only proves the owner)")
         if not self.supports(repo):
             if len(humans) == 1 and self.reachable(repo):
-                return True, ("copie d'essai réussie (forge %s non interrogeable par gh)"
+                return True, ("test clone succeeded (forge %s cannot be queried by gh)"
                               % repo.forge)
-            return False, ("forge %s non prise en charge par l'API (AMEESH_FORGE_HOSTS) "
-                           "et hôte à plusieurs humains" % repo.forge)
+            return False, ("forge %s not supported by the API (AMEESH_FORGE_HOSTS) "
+                           "and host has several humans" % repo.forge)
         inconnus = [h for h in humans if not logins.get(h)]
         if inconnus:
             if len(humans) == 1 and self.reachable(repo):
-                return True, "copie d'essai réussie (poste à un seul humain)"
-            return False, ("sans compte de forge pour %s, la copie d'essai ne prouve rien "
-                           "pour les administrateurs" % ", ".join(inconnus))
+                return True, "test clone succeeded (single-human workstation)"
+            return False, ("no forge account for %s, the test clone proves nothing "
+                           "for the administrators" % ", ".join(inconnus))
         for human in humans:
             permission = self.permission(repo, logins[human])
             if permission is None:
                 if len(humans) == 1 and self.reachable(repo):
-                    return True, "copie d'essai réussie (API de la forge indisponible)"
-                return False, "droits de %s illisibles sur %s" % (human, repo.identity)
+                    return True, "test clone succeeded (forge API unavailable)"
+                return False, "permissions of %s on %s unreadable" % (human, repo.identity)
             if permission not in READ_PERMISSIONS:
-                return False, "%s n'a pas accès au dépôt %s (permission %s)" % (
+                return False, "%s has no access to repository %s (permission %s)" % (
                     human, repo.identity, permission)
-        return True, "responsable, administrateurs et occupants de l'hôte ont accès au dépôt"
+        return True, "host owner, administrators and occupants have access to the repository"
 
 
 def decision_context(canon, host: str, repository: str | None, forge: Forge) -> dict:
@@ -273,7 +273,7 @@ def check(canon, persona, host: str, *, db, forge: Forge | None = None,
     repository = getattr(persona, "memory_repository", None)
     name = getattr(persona, "title", None) or str(persona)
     if not repository:
-        return Result(True, "règle de visibilité sans objet (pas de dépôt de mémoire)")
+        return Result(True, "visibility rule not applicable (no memory repository)")
     now = time.time() if now is None else float(now)
     f = forge or Forge.from_config(db.cfg)
     ctx = decision_context(canon, host, repository, f)
@@ -281,9 +281,9 @@ def check(canon, persona, host: str, *, db, forge: Forge | None = None,
     if cached is not None:
         return Result(bool(cached["ok"]), cached["diagnostic"], cached["repository"])
     if ctx["repo"] is None:
-        result = Result(False, "dépôt de mémoire illisible : %s" % repository, repository)
+        result = Result(False, "unreadable memory repository: %s" % repository, repository)
     elif not ctx["humans"]:
-        result = Result(False, "hôte %s sans responsable humain résolu" % host, repository)
+        result = Result(False, "host %s has no resolved human owner" % host, repository)
     else:
         visible, why = f.visible(ctx["repo"], ctx["humans"], ctx["logins"])
         result = Result(visible, why, repository)
@@ -306,5 +306,5 @@ def annotate(canon, persona, host: str, verdict, *, db, forge: Forge | None = No
     result = check(canon, persona, host, db=db, forge=forge)
     if not result.ok:
         verdict.ok = False
-        verdict.diagnostic = "persona-hidden-from-host : %s" % result.diagnostic
+        verdict.diagnostic = "persona-hidden-from-host: %s" % result.diagnostic
     return result.ok, result.diagnostic

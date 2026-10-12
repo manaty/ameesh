@@ -93,8 +93,8 @@ _PATH_SECRET_RE = re.compile(r"/(a|enroll)/[^/?\s]*")
 
 def redact(text: str) -> str:
     """Masque les jetons de lien et toute longue suite base64url."""
-    text = _PATH_SECRET_RE.sub(lambda m: "/%s/<jeton>" % m.group(1), str(text))
-    return _SECRET_RE.sub("<masqué>", text)
+    text = _PATH_SECRET_RE.sub(lambda m: "/%s/<token>" % m.group(1), str(text))
+    return _SECRET_RE.sub("<redacted>", text)
 
 
 class RateLimiter:
@@ -164,7 +164,7 @@ class ApproveHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            log.warning("trop de connexions simultanées : connexion fermée")
+            log.warning("too many simultaneous connections: connection closed")
             self.shutdown_request(request)
             return
         try:
@@ -181,7 +181,7 @@ class ApproveHTTPServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address) -> None:
         # pas de trace complète sur stderr : une ligne, sans donnée de requête
-        log.warning("connexion interrompue : %s", sys.exc_info()[0].__name__)
+        log.warning("connection interrupted: %s", sys.exc_info()[0].__name__)
 
 
 class ApproveHandler(BaseHTTPRequestHandler):
@@ -218,7 +218,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
                  code)
 
     def log_error(self, format, *args) -> None:  # noqa: A002 (signature de http.server)
-        log.warning("%s erreur HTTP : %s", self.client_ip(), redact(format % args)[:200])
+        log.warning("%s HTTP error: %s", self.client_ip(), redact(format % args)[:200])
 
     def log_message(self, format, *args) -> None:  # noqa: A002
         log.info("%s %s", self.client_ip(), redact(format % args)[:200])
@@ -254,10 +254,10 @@ class ApproveHandler(BaseHTTPRequestHandler):
 
     def _error(self, kind: str, exc: ApproveError, extra: tuple = ()) -> None:
         if kind in ("approve", "enroll") and self.command == "GET":
-            titles = {404: "Lien inconnu", 410: "Lien inutilisable", 409: "Demande caduque",
-                      429: "Trop de requêtes", 503: "Service indisponible"}
+            titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
+                      429: "Too many requests", 503: "Service unavailable"}
             self._html(exc.status, render.message_page(
-                titles.get(exc.status, "Erreur"), exc.message))
+                titles.get(exc.status, "Error"), exc.message))
         else:
             self._json(exc.status, {"error": exc.code, "message": exc.message}, extra)
 
@@ -270,7 +270,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
 
     def _not_allowed(self) -> None:
         self.close_connection = True
-        self._json(405, {"error": "method", "message": "méthode non admise"},
+        self._json(405, {"error": "method", "message": "method not allowed"},
                    (("Allow", "GET, POST"),))
 
     do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _not_allowed
@@ -321,26 +321,26 @@ class ApproveHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> bytes:
         if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
-            raise ApproveError(411, "length_required", "Transfer-Encoding refusé : "
-                                                       "Content-Length obligatoire")
+            raise ApproveError(411, "length_required", "Transfer-Encoding refused: "
+                                                       "Content-Length required")
         lengths = self.headers.get_all("Content-Length") or []
         if len(lengths) != 1 or not lengths[0].strip().isdigit():
             self.close_connection = True
-            raise ApproveError(411, "length_required", "Content-Length obligatoire")
+            raise ApproveError(411, "length_required", "Content-Length required")
         length = int(lengths[0].strip())
         if length > self.server.service.cfg.max_body:
             self.close_connection = True
-            raise ApproveError(413, "too_large", "corps trop gros (max %d octets)"
+            raise ApproveError(413, "too_large", "body too large (max %d bytes)"
                                % self.server.service.cfg.max_body)
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             self.close_connection = True
-            raise ApproveError(415, "content_type", "application/json attendu")
+            raise ApproveError(415, "content_type", "application/json expected")
         self._body_consumed = True
         body = self.rfile.read(length)
         if len(body) != length:
             self.close_connection = True
-            raise ApproveError(400, "truncated", "corps tronqué")
+            raise ApproveError(400, "truncated", "truncated body")
         return body
 
     def _browser_origin_ok(self) -> bool:
@@ -358,20 +358,20 @@ class ApproveHandler(BaseHTTPRequestHandler):
                                                                                "not_found")
         try:
             if not self.server.ip_limiter.allow("ip:" + self.client_ip()):
-                raise ApproveError(429, "rate_limited", "trop de requêtes, réessayez plus tard")
+                raise ApproveError(429, "rate_limited", "too many requests, try again later")
             if problem == "method":
                 self._discard_body()
                 return self._not_allowed()
             if kind is None:
-                raise ApproveError(404, "not_found", "introuvable")
+                raise ApproveError(404, "not_found", "not found")
             if not self._host_ok(kind):
                 self.close_connection = True
-                raise ApproveError(421, "host", "en-tête Host non admis")
+                raise ApproveError(421, "host", "Host header not allowed")
             if kind == "static":
                 return self._static(value)
             if kind == "health":
                 if self.headers.get("Origin") is not None:
-                    raise ApproveError(403, "origin", "aucun navigateur admis")
+                    raise ApproveError(403, "origin", "no browser allowed")
                 return self._json(200, self.server.service.health(tls=self.server.tls
                                                                   is not None))
             # corps lu (borné) AVANT les contrôles d'autorisation : la réponse
@@ -387,30 +387,30 @@ class ApproveHandler(BaseHTTPRequestHandler):
         except (ConnectionError, socket.timeout):
             self.close_connection = True       # client parti : rien à répondre
         except Exception as exc:  # pas de trace (ni de donnée) vers le client
-            log.error("erreur interne %s sur %s %s", type(exc).__name__, self.command,
+            log.error("internal error %s on %s %s", type(exc).__name__, self.command,
                       redact(path)[:120])
             self.close_connection = True
-            self._json(500, {"error": "internal", "message": "erreur interne"})
+            self._json(500, {"error": "internal", "message": "internal error"})
 
     def _static(self, name: str) -> None:
         entry = self.server.static.get(name)
         if entry is None:
-            raise ApproveError(404, "not_found", "introuvable")
+            raise ApproveError(404, "not_found", "not found")
         self._send(200, entry[0], entry[1])
 
     def _api(self, request_id: str | None, raw: bytes) -> None:
         if self.headers.get("Origin") is not None:
-            raise ApproveError(403, "origin", "API de service : aucun navigateur admis")
+            raise ApproveError(403, "origin", "service API: no browser allowed")
         authorization = self.headers.get("Authorization") or ""
         scheme, _, presented = authorization.partition(" ")
         if scheme.lower() != "bearer" or not self.server.service.check_service_token(
                 presented.strip()):
-            raise ApproveError(401, "unauthorized", "jeton de service absent ou invalide")
+            raise ApproveError(401, "unauthorized", "service token missing or invalid")
         service = self.server.service
         if self.command == "POST":
             return self._json(201, service.create_request(load_json_body(raw)))
         if not REQUEST_ID_RE.fullmatch(request_id or ""):
-            raise ApproveError(404, "not_found", "introuvable")
+            raise ApproveError(404, "not_found", "not found")
         status, payload = service.receipt(request_id)
         if isinstance(payload, bytes):
             return self._send(status, payload, "application/json; charset=utf-8")
@@ -418,14 +418,14 @@ class ApproveHandler(BaseHTTPRequestHandler):
 
     def _human(self, kind: str, token: str, raw: bytes) -> None:
         if not TOKEN_RE.fullmatch(token or ""):
-            raise ApproveError(404, "unknown_link", "lien inconnu")
+            raise ApproveError(404, "unknown_link", "unknown link")
         token_key = "tok:" + hashlib.sha256(token.encode("ascii")).hexdigest()
         if not self.server.token_limiter.allow(token_key):
-            raise ApproveError(429, "rate_limited", "trop de tentatives sur ce lien")
+            raise ApproveError(429, "rate_limited", "too many attempts on this link")
         service = self.server.service
         if self.command == "POST":
             if not self._browser_origin_ok():
-                raise ApproveError(403, "origin", "origine de la requête non autorisée")
+                raise ApproveError(403, "origin", "request origin not allowed")
             body = load_json_body(raw)
             if kind == "approve":
                 return self._json(200, service.submit(token, body))

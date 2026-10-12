@@ -212,7 +212,7 @@ def is_remote(cfg: Config) -> bool:
 def quote_ident(name: str) -> str:
     """Identifiant SQL sûr (noms de schéma, de canal) : refus sinon."""
     if not _SQL_IDENT.match(name or ""):
-        raise DbError("identifiant SQL invalide : %r" % (name,))
+        raise DbError("invalid SQL identifier: %r" % (name,))
     return '"%s"' % name
 
 
@@ -232,7 +232,7 @@ def sql_literal(value: Any) -> str:
         return "'\\x%s'::bytea" % bytes(value).hex()
     text = value if isinstance(value, str) else str(value)
     if "\x00" in text:
-        raise DbError("caractère NUL interdit dans un paramètre SQL")
+        raise DbError("NUL character not allowed in an SQL parameter")
     return "'" + text.replace("'", "''") + "'"
 
 
@@ -244,7 +244,7 @@ def bind(sql: str, params: Sequence[Any]) -> str:
     """
     chunks = sql.split("%s")
     if len(chunks) - 1 != len(params):
-        raise DbError("SQL : %d marqueurs pour %d paramètres" % (len(chunks) - 1, len(params)))
+        raise DbError("SQL: %d placeholders for %d parameters" % (len(chunks) - 1, len(params)))
     out: list[str] = []
     for chunk, param in zip(chunks, params):
         out.append(chunk)
@@ -269,7 +269,7 @@ def _json_query(sql: str) -> str:
     )
     if modifying:
         if not re.search(r"\breturning\b", sql, re.I):
-            raise DbError("query() sur un DML sans RETURNING : %.60s" % sql)
+            raise DbError("query() on a DML statement without RETURNING: %.60s" % sql)
         return (
             "WITH __dml AS (\n%s\n)\n"
             "SELECT coalesce(json_agg(row_to_json(__dml)), '[]'::json)::text FROM __dml" % sql
@@ -306,7 +306,7 @@ def _parse_json_rows(text: str) -> list[dict]:
     try:
         rows = json.loads(text)
     except ValueError as exc:
-        raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
+        raise DbError("unreadable JSON response from psql: %.120s" % text) from exc
     if isinstance(rows, dict):
         rows = [rows]
     return [_normalize_row(row) for row in rows]
@@ -355,7 +355,7 @@ class PsqlDriver:
     def __init__(self, cfg: Config):
         binary = shutil.which("psql")
         if not binary:
-            raise Unavailable("psql introuvable dans le PATH")
+            raise Unavailable("psql not found in PATH")
         self.binary = binary
         self.cfg = cfg
         #: délai client : si le serveur ne répond plus (réseau coupé, requête
@@ -414,10 +414,10 @@ class PsqlDriver:
             # (statement_timeout, 5 s plus tôt) : un délai CLIENT dépassé dit
             # donc que le serveur ne répond plus — réseau ou base (L72).
             raise Unavailable(
-                "psql : délai client dépassé (%ss) — requête abandonnée"
+                "psql: client timeout exceeded (%ss), query aborted"
                 % self._client_timeout) from exc
         except OSError as exc:
-            raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
+            raise Unavailable("psql could not start: %s" % exc) from exc
 
     def _check(self) -> None:
         # La sonde de connexion dit aussi si le schéma est migré : la
@@ -430,8 +430,8 @@ class PsqlDriver:
             message = detail[-1] if detail else "code %d" % proc.returncode
             low = (proc.stderr or "").lower()
             if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
-                raise Unavailable("psql : %s" % message)
-            raise DbError("psql : %s" % message)
+                raise Unavailable("psql: %s" % message)
+            raise DbError("psql: %s" % message)
 
     def _fail(self, proc: subprocess.CompletedProcess) -> DbError:
         lines = [l for l in (proc.stderr or "").strip().splitlines() if l.strip()]
@@ -442,8 +442,8 @@ class PsqlDriver:
                 break
         low = (proc.stderr or "").lower()
         if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
-            return Unavailable("psql : %s" % message)
-        return DbError("psql : %s" % message)
+            return Unavailable("psql: %s" % message)
+        return DbError("psql: %s" % message)
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
@@ -477,9 +477,9 @@ class PsqlDriver:
             try:
                 results = json.loads(text)
             except ValueError as exc:
-                raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
+                raise DbError("unreadable JSON response from psql: %.120s" % text) from exc
             if not isinstance(results, list) or len(results) != len(chunk):
-                raise DbError("psql : réponse de lot inattendue")
+                raise DbError("psql: unexpected batch response")
             out += [[_normalize_row(row) for row in (rows or [])] for rows in results]
         return out
 
@@ -553,7 +553,7 @@ class _PsqlTransaction:
                 stdout=subprocess.PIPE, stderr=self._err, env=self.driver.env)
         except OSError as exc:
             self._err.close()
-            raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
+            raise Unavailable("psql could not start: %s" % exc) from exc
         try:
             for line in self.driver._bootstrap.splitlines():
                 if line.strip():
@@ -618,7 +618,7 @@ class _PsqlTransaction:
     def _run(self, sql: str) -> str:
         """Envoie une instruction, rend sa sortie (tout ce qui précède le témoin)."""
         if self.proc is None:
-            raise DbError("psql : transaction fermée")
+            raise DbError("psql: transaction closed")
         self._seq += 1
         TRACE.trip(sql)
         marker = ("%s_%d__" % (self._token, self._seq)).encode()
@@ -640,7 +640,7 @@ class _PsqlTransaction:
             ready, _, _ = select.select([fd], [], [], wait)
             if not ready:
                 self._close(abort=True)
-                raise Unavailable("psql : délai client dépassé (%ss) — transaction annulée"
+                raise Unavailable("psql: client timeout exceeded (%ss), transaction rolled back"
                                   % timeout)
             chunk = os.read(fd, 65536)
             if not chunk:
@@ -693,7 +693,7 @@ class _PsqlListener:
         except OSError as exc:
             os.close(self.master)
             os.close(slave)
-            raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
+            raise Unavailable("psql could not start: %s" % exc) from exc
         os.close(slave)
         threading.Thread(target=self._read_pty, daemon=True).start()
         threading.Thread(target=self._heartbeat, daemon=True).start()
@@ -793,7 +793,7 @@ class PsycopgDriver:
             import psycopg  # noqa: F401
             from psycopg.rows import dict_row
         except ImportError as exc:
-            raise Unavailable("psycopg (v3) absent : %s" % exc) from exc
+            raise Unavailable("psycopg (v3) missing: %s" % exc) from exc
         self._psycopg = psycopg
         self._dict_row = dict_row
         self.cfg = cfg
@@ -826,7 +826,7 @@ class PsycopgDriver:
         try:
             return self._psycopg.connect(self.cfg.dsn, **kwargs)
         except Exception as exc:  # psycopg.OperationalError et cie
-            raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
+            raise Unavailable("psycopg: %s" % _one_line(exc)) from exc
 
     def _check(self) -> None:
         TRACE.trip("SELECT 1")
@@ -838,7 +838,7 @@ class PsycopgDriver:
                                   % int(self.cfg.statement_timeout_ms))
             self.conn.execute("SELECT 1").fetchone()
         except Exception as exc:
-            raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
+            raise Unavailable("psycopg: %s" % _one_line(exc)) from exc
 
     def _live(self) -> None:
         """Rouvre la connexion si une coupure l'a cassée (L72).
@@ -854,7 +854,7 @@ class PsycopgDriver:
         if not (getattr(conn, "closed", False) or getattr(conn, "broken", False)):
             return
         if self._tx_depth:
-            raise Unavailable("psycopg : connexion perdue pendant une transaction")
+            raise Unavailable("psycopg: connection lost during a transaction")
         with self._reconnect_lock:
             if self.conn is not conn:
                 return  # un autre fil a déjà rouvert
@@ -1035,7 +1035,7 @@ class PsycopgDriver:
                 TRACE.trip("LISTEN %s" % channel)
                 conn.execute("LISTEN %s" % quote_ident(channel))
         except AttributeError as exc:  # psycopg trop ancien
-            raise Unavailable("psycopg sans support LISTEN : %s" % exc) from exc
+            raise Unavailable("psycopg without LISTEN support: %s" % exc) from exc
         return _PsycopgListener(conn, list(channels))
 
     def close(self) -> None:
@@ -1114,16 +1114,17 @@ def explain(exc: BaseException, limit: int = 160) -> str:
     migration : « ameesh migrate » n'est suggéré que si une table manque."""
     text = _one_line(exc)[:limit]
     low = text.lower()
-    if "timeout expired" in low or "délai client dépassé" in low or "timed out" in low:
-        return ("délai de connexion dépassé, base injoignable (réseau, VPN ou serveur ; "
-                "délai réglable par AMEESH_CONNECT_TIMEOUT) : %s" % text)
+    if ("timeout expired" in low or "client timeout exceeded" in low
+            or "délai client dépassé" in low or "timed out" in low):
+        return ("connection timeout exceeded, database unreachable (network, VPN or server; "
+                "timeout set by AMEESH_CONNECT_TIMEOUT): %s" % text)
     if isinstance(exc, Unavailable):
-        return "base injoignable : %s" % text
+        return "database unreachable: %s" % text
     if isinstance(exc, SchemaMissing) or (
             "does not exist" in low and ("relation" in low or "table" in low
                                          or "column" in low or "colonne" in low)) \
             or "n'existe pas" in low:
-        return "%s : « ameesh migrate » ?" % text
+        return "%s: \"ameesh migrate\"?" % text
     return text
 
 
@@ -1157,11 +1158,11 @@ def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDrive
             return PsqlDriver(cfg)
         except Unavailable as exc:
             errors.append(str(exc))
-    raise Unavailable(" ; ".join(errors) or "aucun pilote Postgres disponible")
+    raise Unavailable("; ".join(errors) or "no Postgres driver available")
 
 
 def _schema_message(db) -> str:
-    return ("schéma agent-mesh absent (base %s, schéma %s) : lancez « agent-mesh migrate »"
+    return ("agent-mesh schema missing (database %s, schema %s): run \"agent-mesh migrate\""
             % (mask_dsn(db.cfg.dsn), db.cfg.schema))
 
 

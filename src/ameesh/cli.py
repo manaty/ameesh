@@ -1,71 +1,71 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
+"""agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
-  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"
+  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
                  [--estimate 2h]] [--queue]
-                                                 dépose un message (dest = nom, ou "all")
-                                                 et l'écrit dans le fil lisible du projet
-                                                 ou du lot (ameesh fil show <projet> [<lot>]) ;
-                                                 d'un orchestrateur, --lot rattache le lot
-                                                 au destinataire et --new-lot le crée (L118),
-                                                 avec sa durée estimée --estimate (L157 :
-                                                 obligatoire quand un agent crée le lot) ;
-                                                 refusé vers un nom absent du registre (noms
-                                                 proches proposés), vers un agent arrêté
-                                                 (sauf --queue) et depuis une identité arrêtée
-                       [--urgent] [--ack] [--cc NOM[,NOM…]]
-                                                 L125 : un agent au repos n'est réveillé
-                                                 qu'après une fenêtre de regroupement
-                                                 (AMEESH_MAIL_BATCH, 90 s) ; --urgent le
-                                                 réveille sans délai ; --ack (accusé de
-                                                 réception) et --cc (copie, en événement)
-                                                 ne réveillent pas : lus au tour suivant ;
-                                                 « all » sans --urgent non plus
-  agent-mail forward <ancien> <nouveau> [--dry-run] [--json]
-                                                 re-livre le courrier en attente d'un agent
-                                                 arrêté (ou absent du registre) à un agent
-                                                 vivant : expéditeur et date gardés
-  agent-mail list                                agents, hôte, bail, non lus
-  agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
-  agent-mail whoami [--session ID --harness H]   identité liée et sa source (runner, explicit,
-                                                 session) ; --cwd DOSSIER = diagnostic
-  agent-mail bind <NOM> --session ID --harness claude|codex|deepseek [--pid N] [--force]
-                                                 lie une session EXTERNE (identifiant de session
-                                                 du harnais) à NOM, sur cet hôte (L41, 0030) ;
-                                                 agent `execute` refusé sans --force (L46)
-  agent-mail bind --import FICHIER               importe les liaisons du pont local
+                                                 drops a message (dest = name, or "all")
+                                                 and writes it to the readable thread of the
+                                                 project or work item (ameesh fil show <project> [<lot>]);
+                                                 from an orchestrator, --lot assigns the work item
+                                                 to the recipient and --new-lot creates it (L118),
+                                                 with its estimated duration --estimate (L157:
+                                                 required when an agent creates the work item);
+                                                 refused to a name not in the registry (close
+                                                 names suggested), to a stopped agent
+                                                 (unless --queue) and from a stopped identity
+                       [--urgent] [--ack] [--cc NAME[,NAME…]]
+                                                 L125: an idle agent is woken only
+                                                 after a batching window
+                                                 (AMEESH_MAIL_BATCH, 90 s); --urgent wakes
+                                                 it at once; --ack (acknowledgement)
+                                                 and --cc (copy, as an event)
+                                                 do not wake: read on the next turn;
+                                                 nor does "all" without --urgent
+  agent-mail forward <old> <new> [--dry-run] [--json]
+                                                 re-delivers the pending mail of a stopped
+                                                 agent (or one missing from the registry) to a
+                                                 live agent: sender and date kept
+  agent-mail list                                agents, host, lease, unread
+  agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
+  agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
+                                                 session); --cwd DIR = diagnostic
+  agent-mail bind <NAME> --session ID --harness claude|codex|deepseek [--pid N] [--force]
+                                                 binds an EXTERNAL session (harness session
+                                                 identifier) to NAME, on this host (L41, 0030);
+                                                 `execute` agent refused without --force (L46)
+  agent-mail bind --import FILE                  imports the bindings of the local bridge
                                                  (external-session-bindings.json)
-  agent-mail unbind --session ID --harness H     révoque la liaison de cette session
-  agent-mail bindings [--all] [--json]           liaisons de session actives (--all : révoquées aussi)
-  agent-mail alias <NOM> <DOSSIER> [CHANTIER]    nomme les sessions dont le dossier commence par DOSSIER
-  agent-mail status "<travail en cours>"         état de l'agent (registre + titre du terminal)
-  agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
-  agent-mail statusline                          barre d'état Claude Code : [chantier/nom] travail · dossier
-  agent-mail migrate [--dry-run | --additive-only]  applique les migrations versionnées
-  agent-mail doctor [--notify-test | --probe | --harness]  diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY ; harnais de l'hôte (L106)
-                                                 (--probe : sonde légère de conteneur)
+  agent-mail unbind --session ID --harness H     revokes the binding of this session
+  agent-mail bindings [--all] [--json]           active session bindings (--all: revoked ones too)
+  agent-mail alias <NAME> <DIR> [WORKSPACE]      names the sessions whose directory starts with DIR
+  agent-mail status "<current work>"             agent status (registry + terminal title)
+  agent-mail hook <claude|codex|deepseek>        hook: reads the JSON on stdin, delivers the unread
+  agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
+  agent-mail migrate [--dry-run | --additive-only]  applies the versioned migrations
+  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY; host harnesses (L106)
+                                                 (--probe: lightweight container probe)
 
-Identité d'une session : $AGENT_MAIL_NAME (le runner la pose pour le harnais
-qu'il lance). Si $AMEESH_RUNNER_ID et $AMEESH_LEASE_EPOCH sont aussi posées, le
-bail doit être vivant et détenu par ce runner — l'identité est liée au bail.
-Sans $AGENT_MAIL_NAME, une session EXTERNE (lancée par un humain) n'a une
-identité que si elle est LIÉE (`bind`, source « session ») : le hook la
-retrouve par l'identifiant de session que le harnais lui passe et, si la
-liaison porte un --pid, exige que ce PID soit un ancêtre du hook ; une commande
-lancée dans la session (whoami, send, inbox) la retrouve par son ascendance.
-Sans identité, le hook ne remet RIEN et n'écrit rien. Une session liée ne
-remplace jamais la session enregistrée d'un agent, et un agent qui détient un
-bail vivant ne se lie pas (il est mené par l'exécuteur).
-Le dossier courant ne donne JAMAIS d'identité : lire dans le worktree d'un
-autre agent ne consomme pas son courrier. Les anciens noms AGENT_MESH_* restent
-acceptés en alias.
+Identity of a session: $AGENT_MAIL_NAME (the runner sets it for the harness
+it launches). If $AMEESH_RUNNER_ID and $AMEESH_LEASE_EPOCH are also set, the
+lease must be live and held by that runner — the identity is bound to the lease.
+Without $AGENT_MAIL_NAME, an EXTERNAL session (launched by a human) has an
+identity only if it is BOUND (`bind`, source "session"): the hook finds it
+by the session identifier the harness passes to it and, if the
+binding carries a --pid, requires that PID to be an ancestor of the hook; a command
+run inside the session (whoami, send, inbox) finds it by its ancestry.
+Without an identity, the hook delivers NOTHING and writes nothing. A bound session
+never replaces an agent's registered session, and an agent holding a
+live lease cannot be bound (it is driven by the runner).
+The current directory NEVER gives an identity: reading in another agent's
+worktree does not consume its mail. The old AGENT_MESH_* names remain
+accepted as aliases.
 
-Backend : Postgres (AMEESH_DSN, schéma AMEESH_SCHEMA). Si la base est
-absente et que AMEESH_BACKEND=auto, repli lisible sur les fichiers v0
-(~/.local/state/agent-mail) : mêmes commandes, mêmes JSON de hook, rien ne casse.
-Les hooks ne font jamais échouer l'agent : toute erreur → sortie 0 sans rien.
-Un message d'agent n'a jamais l'autorité du propriétaire : l'expéditeur est affiché.
+Backend: Postgres (AMEESH_DSN, schema AMEESH_SCHEMA). If the database is
+missing and AMEESH_BACKEND=auto, readable fallback to the v0 files
+(~/.local/state/agent-mail): same commands, same hook JSON, nothing breaks.
+Hooks never make the agent fail: any error → exit 0 with no output.
+An agent's message never has the owner's authority: the sender is shown.
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ MAX_STOP_BLOCKS = 3
 REGISTER_EVERY_S = 60.0
 
 #: verdict neutre pour le comptage : un message non signé n'a aucune autorité
-_NO_PROOF = authority.Verdict(False, "non signé")
+_NO_PROOF = authority.Verdict(False, "unsigned")
 
 
 # --------------------------------------------------------------------------
@@ -107,7 +107,7 @@ def verdicts_for(bk, msgs: list[dict]) -> dict:
         try:
             out[msg.get("id")] = authority.verify_message(bk.db, msg)
         except Exception as exc:  # une vérification impossible n'accorde rien
-            out[msg.get("id")] = authority.Verdict(False, "vérification impossible : %s" % exc)
+            out[msg.get("id")] = authority.Verdict(False, "verification failed: %s" % exc)
     return out
 
 
@@ -127,23 +127,23 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
                         and verdicts[msg.get("id")].role == "agent")
     if prouves:
         lines = [
-            "[agent-mail] %d nouveau(x) message(s) — dont %d avec l'autorité du "
-            "propriétaire PROUVÉE (signature Ed25519)%s ; les autres n'ont pas cette "
-            "autorité :" % (
+            "[agent-mail] %d new message(s) — %d of them with the owner's authority "
+            "PROVEN (Ed25519 signature)%s; the others do not have this "
+            "authority:" % (
                 len(msgs), prouves,
-                " et %d signé(s) par un agent (authentique(s), sans autorité "
-                "propriétaire)" % agents_signes if agents_signes else "")
+                " and %d signed by an agent (authentic, no owner "
+                "authority)" % agents_signes if agents_signes else "")
         ]
     elif agents_signes:
         lines = [
-            "[agent-mail] %d nouveau(x) message(s) — dont %d signé(s) par un agent "
-            "(authentique(s), sans autorité du propriétaire) ; les autres n'ont pas "
-            "cette autorité :" % (len(msgs), agents_signes)
+            "[agent-mail] %d new message(s) — %d of them signed by an agent "
+            "(authentic, without the owner's authority); the others do not have "
+            "this authority:" % (len(msgs), agents_signes)
         ]
     else:
         lines = [
-            "[agent-mail] %d nouveau(x) message(s) — l'expéditeur est indiqué ; "
-            "un message d'agent n'a pas l'autorité du propriétaire :" % len(msgs)
+            "[agent-mail] %d new message(s) — the sender is shown; "
+            "an agent's message does not have the owner's authority:" % len(msgs)
         ]
     for msg in msgs:
         moment = time.strftime("%H:%M", time.localtime(msg.get("ts", 0)))
@@ -153,22 +153,22 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
             expire = time.strftime("%H:%M", time.localtime(verdict.expires_ts)) \
                 if verdict.expires_ts else "?"
             if verdict.authority:
-                suffixe = "  [autorité du propriétaire PROUVÉE, expire %s]" % expire
+                suffixe = "  [owner's authority PROVEN, expires %s]" % expire
             elif verdict.ok:
-                suffixe = ("  [signé par un agent, authentique, sans autorité "
-                           "propriétaire, expire %s]" % expire)
+                suffixe = ("  [signed by an agent, authentic, no owner "
+                           "authority, expires %s]" % expire)
             else:
-                suffixe = "  [⚠ signature NON valide : %s]" % verdict.reason
+                suffixe = "  [⚠ signature NOT valid: %s]" % verdict.reason
         if msg.get("deja_consigne"):
-            suffixe += "  [re-livré après une panne : peut-être déjà traité]"
+            suffixe += "  [re-delivered after an outage: may already have been handled]"
         suffixe += mail.forwarded_note(msg)
         # L125 : un message passif (copie, accusé, diffusion) le dit ; un
-        # message ordinaire garde la ligne de la v0, à l'octet près
+        # message ordinaire garde la ligne de la v0, traduite (L156c)
         passif = mail.passive_label(msg)
-        lines.append("— de %s à %s%s : %s%s" % (
+        lines.append("— from %s at %s%s: %s%s" % (
             msg.get("from", "?"), moment, " (%s)" % passif if passif else "",
             msg.get("text", ""), suffixe))
-    lines.append("(répondre : agent-mail send <nom> \"…\")")
+    lines.append("(to reply: agent-mail send <name> \"…\")")
     return "\n".join(lines)
 
 
@@ -223,7 +223,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         value = args[index + 1] if index + 1 < len(args) else ""
         args = args[:index] + args[index + 2:]
         if not value.strip():
-            print("--cc attend un nom d'agent (ou plusieurs, séparés par des virgules)",
+            print("--cc expects an agent name (or several, comma-separated)",
                   file=sys.stderr)
             return 2
         cc += [name.strip() for name in value.split(",") if name.strip()]
@@ -258,43 +258,43 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--queue"]
     explicit = sender is not None
     if kind not in ("request", "reply", "notify", "event"):
-        print("kind invalide : %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
+        print("invalid kind: %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
         return 2
     # L125 : --urgent vaut pour tout message (réveil sans délai) ; il
     # n'interrompt un tour en cours que d'un expéditeur habilité (0018)
     if ack and urgent:
-        print("--ack et --urgent se contredisent : un accusé ne réveille pas",
+        print("--ack and --urgent contradict each other: an acknowledgement does not wake",
               file=sys.stderr)
         return 2
     if ack and new_lot is not None:
-        print("--ack et --new-lot se contredisent : un accusé ne confie pas de travail",
+        print("--ack and --new-lot contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
     sign = key_path is not None or "--sign" in args
     allow_structured = "--allow-structured" in args
     args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
     if expires and not sign:
-        print("--expires n'a de sens qu'avec --sign/--key", file=sys.stderr)
+        print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID|RÉF] "
-              "[--new-lot \"titre\" [--estimate 2h]] [--kind request|reply|notify|event] "
+        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
+              "[--new-lot \"title\" [--estimate 2h]] [--kind request|reply|notify|event] "
               "[--urgent] "
-              "[--ack] [--cc NOM[,NOM…]] [--sign --key FICHIER] [--expires 24h] [--queue]",
+              "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
-        print("lot invalide : %r (lettres, chiffres, . _ -)" % lot, file=sys.stderr)
+        print("invalid lot: %r (letters, digits, . _ -)" % lot, file=sys.stderr)
         return 2
     if new_lot is not None and lot is not None:
-        print("--lot OU --new-lot, pas les deux", file=sys.stderr)
+        print("--lot OR --new-lot, not both", file=sys.stderr)
         return 2
     if new_lot is not None and not new_lot.strip():
-        print("--new-lot : titre vide", file=sys.stderr)
+        print("--new-lot: empty title", file=sys.stderr)
         return 2
     if estimate is not None and new_lot is None:
-        print("--estimate accompagne --new-lot (la durée estimée du lot créé ; pour un lot "
-              "existant : ameesh work plan <id> --estimate 2h)", file=sys.stderr)
+        print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
+              "existing one: ameesh work plan <id> --estimate 2h)", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
     binding = None
@@ -302,55 +302,55 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
         if not binding.ok:
             # la raison quand une identité est annoncée (ex. « agent arrêté »)
-            print("expéditeur non lié%s : posez AGENT_MAIL_NAME (le runner le fait) "
-                  "ou passez --from NOM" % (
-                      " (%s : %s)" % (binding.name, binding.reason)
+            print("unbound sender%s: set AGENT_MAIL_NAME (the runner does it) "
+                  "or pass --from NAME" % (
+                      " (%s: %s)" % (binding.name, binding.reason)
                       if binding.name and binding.reason else ""), file=sys.stderr)
             return 2
         sender = binding.name
     if not NAME_RE.match(sender) or not text:
-        print("expéditeur ou texte invalide", file=sys.stderr)
+        print("invalid sender or text", file=sys.stderr)
         return 2
     if "," in dest:
         # L125 : un seul destinataire réveillé ; les autres en copie
-        print("un seul destinataire par message : pour mettre les autres en copie, "
-              "sans les réveiller, --cc %s" % ",".join(
+        print("one recipient per message: to copy the others "
+              "without waking them, --cc %s" % ",".join(
                   n.strip() for n in dest.split(",")[1:] if n.strip()), file=sys.stderr)
         return 2
     if dest != "all" and not NAME_RE.match(dest):
-        print("destinataire invalide", file=sys.stderr)
+        print("invalid recipient", file=sys.stderr)
         return 2
     # L125 : les copies — ni au destinataire, ni à soi, sans doublon ; un
     # agent inconnu est refusé avant tout dépôt
     cc = [n for i, n in enumerate(cc) if n not in (dest, sender) and n not in cc[:i]]
     if cc and (dest == "all" or sign):
-        print("--cc vise un message à un destinataire précis, non signé", file=sys.stderr)
+        print("--cc applies to an unsigned message to a single recipient", file=sys.stderr)
         return 2
     for name in cc:
         if not NAME_RE.match(name):
-            print("copie : nom d'agent invalide %r" % name, file=sys.stderr)
+            print("copy: invalid agent name %r" % name, file=sys.stderr)
             return 2
         if bk.kind == "pg":
             from . import undeliverable
             if undeliverable.registry_rows(bk.db, [name])[name] is None:
-                print("copie refusée : agent inconnu : %s (rien n'est déposé)" % name,
+                print("copy refused: unknown agent: %s (nothing dropped)" % name,
                       file=sys.stderr)
                 return 2
     # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
     if not allow_structured:
         reason = fil.unreadable_reason(text)
         if reason:
-            print("message refusé — %s\n(--allow-structured est réservé aux tests et "
-                  "aux outils)" % reason, file=sys.stderr)
+            print("message refused — %s\n(--allow-structured is reserved for tests and "
+                  "tools)" % reason, file=sys.stderr)
             return 2
 
     signed = None
     if sign:
         if not key_path:
-            print("--sign exige --key <clé privée> (acte du propriétaire)", file=sys.stderr)
+            print("--sign requires --key <private key> (owner act)", file=sys.stderr)
             return 2
         if dest == "all":
-            print("un message signé vise un destinataire précis (pas « all »)", file=sys.stderr)
+            print("a signed message targets a single recipient (not \"all\")", file=sys.stderr)
             return 2
         try:
             ttl = authority.parse_ttl(expires)
@@ -358,20 +358,20 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             signed = authority.sign_message(
                 seed, sender=sender, recipient=dest, body=text, ttl=ttl)
         except (ValueError, authority.AuthorityError, OSError) as exc:
-            print("signature impossible : %s" % exc, file=sys.stderr)
+            print("cannot sign: %s" % exc, file=sys.stderr)
             return 2
         if bk.kind == "pg":
             info = authority.key_info(bk.db, sender)
             if not info or not info.get("public_key"):
-                print("attention : aucune clé enregistrée pour %s — le message ne sera "
-                      "pas reconnu comme signé" % sender, file=sys.stderr)
+                print("warning: no key registered for %s — the message will "
+                      "not be recognized as signed" % sender, file=sys.stderr)
             elif info.get("public_key_fingerprint") != signed["signature_key"]:
-                print("attention : l'empreinte %s n'est pas celle enregistrée pour %s (%s) — "
-                      "le message ne sera pas reconnu" % (
+                print("warning: fingerprint %s is not the one registered for %s (%s) — "
+                      "the message will not be recognized" % (
                           signed["signature_key"][:12], sender,
                           (info.get("public_key_fingerprint") or "?")[:12]), file=sys.stderr)
         else:
-            print("attention : en repli fichier, la signature n'est pas conservée",
+            print("warning: in file fallback, the signature is not kept",
                   file=sys.stderr)
 
     # Courrier en souffrance (2026-10-11) : ni agent fantôme, ni boîte morte,
@@ -383,10 +383,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             notes = undeliverable.check_send(cfg, bk.db, sender=sender, dest=dest, queue=queue,
                                              explicit=explicit, binding=binding)
         except undeliverable.Refused as exc:
-            print("message non déposé — %s" % exc, file=sys.stderr)
+            print("message not dropped — %s" % exc, file=sys.stderr)
             return 2
         for note in notes:
-            print("attention : %s" % note, file=sys.stderr)
+            print("warning: %s" % note, file=sys.stderr)
 
     # L125 : ce qui réveille le destinataire. Un humain réveille tout de suite
     # (jamais d'accusé reconnu pour lui) ; un accusé de réception — `--ack`, ou
@@ -407,7 +407,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "the work item on the server before sending mail", file=sys.stderr)
         return 2
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
-        print("--new-lot exige la base et un destinataire précis", file=sys.stderr)
+        print("--new-lot requires the database and a single recipient", file=sys.stderr)
         return 2
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
@@ -419,25 +419,25 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
                 estimate=estimate)
         except assignments.AssignmentError as exc:
-            print("message non déposé — %s" % exc, file=sys.stderr)
+            print("message not dropped — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]
         for warning in linked["warnings"]:
-            print("attention : %s" % warning, file=sys.stderr)
+            print("warning: %s" % warning, file=sys.stderr)
         if linked["warnings"]:
-            thread_meta = {"avertissement": " ; ".join(linked["warnings"])}
+            thread_meta = {"avertissement": "; ".join(linked["warnings"])}
         item = linked["lot"]
         if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
             print("lot #%d %s%s%s" % (
-                int(item["id"]), "créé et assigné à %s" % dest if linked["created"]
-                else "assigné à %s" % dest if linked["assigned"] else "rattaché",
-                " : %s" % item.get("title") if linked["created"] else "",
-                " (branche %s)" % linked["branch"] if linked["branch"] else ""))
+                int(item["id"]), "created and assigned to %s" % dest if linked["created"]
+                else "assigned to %s" % dest if linked["assigned"] else "linked",
+                ": %s" % item.get("title") if linked["created"] else "",
+                " (branch %s)" % linked["branch"] if linked["branch"] else ""))
         if payload.get("ack") and (linked["created"] or linked["assigned"]):
             # L125 : un message qui confie un lot n'est jamais un accusé
             del payload["ack"]
-            print("attention : ce message confie un lot à %s : il le réveille "
-                  "(pas un accusé de réception)" % dest, file=sys.stderr)
+            print("warning: this message hands a work item to %s: it wakes it "
+                  "(not an acknowledgement)" % dest, file=sys.stderr)
 
     skipped: list[str] = []
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
@@ -446,17 +446,17 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
     if skipped:
-        print("attention : non déposé pour %s (%s) — --queue pour déposer quand même" % (
-            ", ".join(sorted(skipped)), "arrêtés : personne ne lit leur boîte"
-            if len(skipped) > 1 else "arrêté : personne ne lit sa boîte"), file=sys.stderr)
+        print("warning: not dropped for %s (%s) — --queue to drop anyway" % (
+            ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
+            if len(skipped) > 1 else "stopped: nobody reads its mailbox"), file=sys.stderr)
     if not targets:
-        print("aucun destinataire")
+        print("no recipient")
     elif signed:
-        print("déposé pour : %s (signé %s, expire %s)" % (
+        print("dropped for: %s (signed %s, expires %s)" % (
             ", ".join(targets), signed["signature_key"][:12],
             time.strftime("%H:%M", time.localtime(signed["expires_us"] / 1_000_000))))
     else:
-        print("déposé pour : " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
+        print("dropped for: " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
     return 0
 
 
@@ -480,12 +480,12 @@ def _send_note(dest: str, urgent: bool, payload: dict, cc: list[str]) -> str:
     """L125 : ce que l'envoi réveille, dit à l'expéditeur ('' : message ordinaire)."""
     note = ""
     if payload.get("ack"):
-        note = " (accusé de réception : lu à son prochain tour, sans le réveiller)"
+        note = " (acknowledgement: read on its next turn, without waking it)"
     elif dest == "all" and not urgent and not payload.get("human"):
-        note = (" (annonce : lue au prochain tour de chacun, sans réveil ; "
-                "--urgent pour réveiller)")
+        note = (" (announcement: read on everyone's next turn, no wake-up; "
+                "--urgent to wake)")
     if cc:
-        note += " ; copie sans réveil pour : " + ", ".join(cc)
+        note += "; copy without wake-up for: " + ", ".join(cc)
     return note
 
 
@@ -495,7 +495,7 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
     else:
         binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
         if not binding.ok:
-            print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+            print("unbound identity: %s" % (binding.reason or "AGENT_MAIL_NAME not set"),
                   file=sys.stderr)
             return 1
         name = binding.name
@@ -506,13 +506,13 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
         marque = ""
         if verdict is not None:
             if verdict.authority:
-                marque = "  [signé par le propriétaire]"
+                marque = "  [signed by the owner]"
             elif verdict.ok:
-                marque = "  [signé par un agent]"
+                marque = "  [signed by an agent]"
             else:
-                marque = "  [⚠ signature NON valide : %s]" % verdict.reason
+                marque = "  [⚠ signature NOT valid: %s]" % verdict.reason
         marque += mail.forwarded_note(msg)
-        print("de %s%s : %s" % (msg.get("from"), marque, msg.get("text")))
+        print("from %s%s: %s" % (msg.get("from"), marque, msg.get("text")))
     return 0
 
 
@@ -523,10 +523,10 @@ def cmd_list(bk) -> int:
         if row.get("host"):
             extra.append("@" + row["host"])
         if row.get("lease_owner"):
-            extra.append("bail:%s" % row["lease_owner"])
+            extra.append("lease:%s" % row["lease_owner"])
         if row.get("status_text"):
             extra.append(row["status_text"])
-        print("%-20s %-9s vu il y a %5ss  non lus:%-3d %s%s" % (
+        print("%-20s %-9s seen %5ss ago  unread:%-3d %s%s" % (
             row["name"], row.get("tool", "?"), age, row.get("unread", 0),
             row.get("cwd") or "", ("  " + " ".join(extra)) if extra else "",
         ))
@@ -536,7 +536,7 @@ def cmd_list(bk) -> int:
 def cmd_status(bk, cfg: Config, rest: list[str]) -> int:
     binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
     if not binding.ok:
-        print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+        print("unbound identity: %s" % (binding.reason or "AGENT_MAIL_NAME not set"),
               file=sys.stderr)
         return 1
     name = binding.name
@@ -552,7 +552,7 @@ def cmd_alias(cfg: Config, rest: list[str]) -> int:
         return 2
     chantier = rest[2] if len(rest) == 3 else ""
     path = identity.write_alias(cfg, rest[0], rest[1], chantier)
-    print("alias %s → %s%s" % (rest[0], path, (" (chantier %s)" % chantier) if chantier else ""))
+    print("alias %s → %s%s" % (rest[0], path, (" (workspace %s)" % chantier) if chantier else ""))
     return 0
 
 
@@ -667,22 +667,22 @@ class _Remise:
 
 def avis_borne(attente: int, borne: int) -> str:
     """Ce que le hook dit à l'agent quand la borne du tour est atteinte."""
-    return ("[ameesh] %d message(s) en attente restent pour ton tour suivant : au plus "
-            "%d message(s) te sont remis pendant un même tour. Conclus ce tour : "
-            "termine l'étape en cours, puis rends la main ; l'exécuteur te remettra "
-            "la suite au tour suivant." % (attente, borne))
+    return ("[ameesh] %d pending message(s) remain for your next turn: at most "
+            "%d message(s) are delivered to you during a single turn. Wrap up this turn: "
+            "finish the current step, then hand back control; the runner will deliver "
+            "the rest on the next turn." % (attente, borne))
 
 
 def avis_borne_travail(attente: int, borne: int, travail: list[str]) -> str:
     """Borne atteinte, mais un travail lancé pendant le tour tourne encore :
     le tour n'est pas coupé pour le courrier (le conclure maintenant
     laisserait ce travail sans personne pour en lire le résultat)."""
-    return ("[ameesh] %d message(s) en attente restent pour ton tour suivant : au plus "
-            "%d message(s) te sont remis pendant un même tour. Un travail lancé pendant "
-            "ce tour tourne encore (%s) : ne conclus pas avant sa fin ; conclus ensuite "
-            "ce tour, l'exécuteur te remettra la suite au tour suivant."
-            % (attente, borne, " ; ".join(travail[:3])
-               + (" ; …" if len(travail) > 3 else "")))
+    return ("[ameesh] %d pending message(s) remain for your next turn: at most "
+            "%d message(s) are delivered to you during a single turn. Work started during "
+            "this turn is still running (%s): do not wrap up before it ends; then wrap up "
+            "this turn, the runner will deliver the rest on the next turn."
+            % (attente, borne, "; ".join(travail[:3])
+               + ("; …" if len(travail) > 3 else "")))
 
 
 #: le travail du tour (processus de fond, conteneurs) est relevé au plus à ce
@@ -800,8 +800,8 @@ def _foreign_hook_refused(cfg: Config, bk, name: str, tool: str, attendu: str,
     """L224 : refus dit sur stderr à chaque fois, journalisé au fil une seule
     fois par (harnais, session) — un PostToolUse par appel d'outil sinon."""
     session = str(session_id or "")
-    print("agent-mail : hook %s refusé pour %s (harnais du tour : %s ; session %s) — "
-          "ni inscription ni courrier" % (tool, name, attendu, session or "?"),
+    print("agent-mail: hook %s refused for %s (harness of the turn: %s; session %s) — "
+          "neither registration nor mail" % (tool, name, attendu, session or "?"),
           file=sys.stderr)
     if bk.kind != "pg":
         return
@@ -821,9 +821,9 @@ def _foreign_hook_refused(cfg: Config, bk, name: str, tool: str, attendu: str,
     except db_mod.DbError:
         row = None
     fil.record(cfg, bk.db, sender="ameesh", recipients=[name],
-               text="Hook %s refusé pour %s : le tour est mené sous %s. La session %s "
-                    "n'est pas celle de l'agent (processus lancé pendant le tour avec "
-                    "son environnement) : ni inscrite, ni servie en courrier."
+               text="Hook %s refused for %s: the turn runs under %s. Session %s "
+                    "is not the agent's (process launched during the turn with "
+                    "its environment): neither registered nor served mail."
                     % (tool, name, attendu, session or "?"),
                project=fil.project_for(cfg, fil.agent_project(row)),
                meta={"action": "hook-refuse", "harness": tool, "attendu": attendu,
@@ -887,7 +887,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         if binding.name:
             # Identité annoncée mais bail invalide : on le dit sur stderr, et
             # on ne touche à rien.
-            print("agent-mail : identité %s non liée (%s) — courrier laissé en place"
+            print("agent-mail: identity %s unbound (%s) — mail left in place"
                   % (binding.name, binding.reason), file=sys.stderr)
         return 0
     name = binding.name
@@ -921,8 +921,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # verrou ; ce contrôle-ci le dit.
             holder = sb.lease_holder(bk.db, name)
             if holder:
-                print("agent-mail : %s est mené par l'exécuteur (bail vivant de %s) — "
-                      "courrier laissé en place" % (name, holder), file=sys.stderr)
+                print("agent-mail: %s is driven by the runner (live lease of %s) — "
+                      "mail left in place" % (name, holder), file=sys.stderr)
                 return 0
         set_title(cfg, bk, name)
         if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
@@ -1027,14 +1027,14 @@ def _options(rest: list[str], valued: tuple[str, ...], flags: tuple[str, ...] = 
         arg = rest[index]
         if arg in valued:
             if index + 1 >= len(rest):
-                raise ValueError("%s attend une valeur" % arg)
+                raise ValueError("%s expects a value" % arg)
             opts[arg] = rest[index + 1]
             index += 2
             continue
         if arg in flags:
             opts[arg] = True
         elif arg.startswith("--"):
-            raise ValueError("option inconnue : %s" % arg)
+            raise ValueError("unknown option: %s" % arg)
         else:
             positional.append(arg)
         index += 1
@@ -1051,7 +1051,7 @@ def _actor() -> str:
 
 
 _BIND_USAGE = ("usage: agent-mail bind <agent> --session ID --harness claude|codex|deepseek "
-               "[--pid N] [--force]\n       agent-mail bind --import FICHIER")
+               "[--pid N] [--force]\n       agent-mail bind --import FILE")
 
 
 def cmd_bind(bk, cfg: Config, rest: list[str]) -> int:
@@ -1066,19 +1066,19 @@ def cmd_bind(bk, cfg: Config, rest: list[str]) -> int:
     if "--import" in opts:
         if positional or any(k in opts for k in ("--session", "--harness", "--pid",
                                                   "--force")):
-            print("--import s'utilise seul\n" + _BIND_USAGE, file=sys.stderr)
+            print("--import must be used alone\n" + _BIND_USAGE, file=sys.stderr)
             return 2
         try:
             report = sb.import_file(cfg, bk.db, opts["--import"], by=by)
         except (OSError, ValueError) as exc:
-            print("import impossible : %s" % exc, file=sys.stderr)
+            print("import failed: %s" % exc, file=sys.stderr)
             return 1
-        print("liaisons importées : %d ; ignorées : %d" % (
+        print("bindings imported: %d; skipped: %d" % (
             len(report.imported), len(report.skipped)))
         for session_id, agent, detail in report.imported:
-            print("  importée : %s → %s (%s)" % (session_id, agent, detail))
+            print("  imported: %s → %s (%s)" % (session_id, agent, detail))
         for session_id, reason in report.skipped:
-            print("  ignorée  : %s — %s" % (session_id, reason))
+            print("  skipped : %s — %s" % (session_id, reason))
         return 0
     if len(positional) != 1 or "--session" not in opts or "--harness" not in opts:
         print(_BIND_USAGE, file=sys.stderr)
@@ -1088,16 +1088,16 @@ def cmd_bind(bk, cfg: Config, rest: list[str]) -> int:
                          harness=opts["--harness"], pid=opts.get("--pid"), by=by,
                          force=bool(opts.get("--force")))
     except sb.BindError as exc:
-        print("liaison refusée : %s" % exc, file=sys.stderr)
+        print("binding refused: %s" % exc, file=sys.stderr)
         return 1
     row = result.row
-    verbe = {"created": "liée", "updated": "re-liée (pid mis à jour)",
-             "unchanged": "déjà liée"}[result.status]
-    print("session %s %s %s à %s sur %s (pid %s)" % (
+    verbe = {"created": "bound", "updated": "re-bound (pid updated)",
+             "unchanged": "already bound"}[result.status]
+    print("session %s %s %s to %s on %s (pid %s)" % (
         row.get("harness"), row.get("session_id"), verbe, row.get("agent"),
-        row.get("host"), row.get("pid") or "non contrôlé"))
+        row.get("host"), row.get("pid") or "not checked"))
     for warning in result.warnings:
-        print("attention : %s" % warning, file=sys.stderr)
+        print("warning: %s" % warning, file=sys.stderr)
     return 0
 
 
@@ -1118,10 +1118,10 @@ def cmd_unbind(bk, cfg: Config, rest: list[str]) -> int:
         print("%s" % exc, file=sys.stderr)
         return 2
     if row is None:
-        print("aucune liaison active pour la session %s %s sur %s"
+        print("no active binding for session %s %s on %s"
               % (opts["--harness"], opts["--session"], cfg.host), file=sys.stderr)
         return 1
-    print("liaison révoquée : session %s %s (était %s)" % (
+    print("binding revoked: session %s %s (was %s)" % (
         row.get("harness"), row.get("session_id"), row.get("agent")))
     return 0
 
@@ -1141,15 +1141,15 @@ def cmd_bindings(bk, rest: list[str]) -> int:
         print(json.dumps(rows, ensure_ascii=False))
         return 0
     if not rows:
-        print("aucune liaison de session")
+        print("no session binding")
         return 0
     print("%-20s %-8s %-38s %-8s %-12s %-16s %s" % (
-        "AGENT", "HARNAIS", "SESSION", "PID", "HÔTE", "LIÉE LE", "PAR"))
+        "AGENT", "HARNESS", "SESSION", "PID", "HOST", "BOUND AT", "BY"))
     for row in rows:
         quand = time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("created_ts") or 0))
         etat = ""
         if row.get("revoked_ts"):
-            etat = "  (révoquée %s)" % time.strftime(
+            etat = "  (revoked %s)" % time.strftime(
                 "%Y-%m-%d %H:%M", time.localtime(row["revoked_ts"]))
         print("%-20s %-8s %-38s %-8s %-12s %-16s %s%s" % (
             row.get("agent"), row.get("harness"), row.get("session_id"),
@@ -1157,7 +1157,7 @@ def cmd_bindings(bk, rest: list[str]) -> int:
     return 0
 
 
-_FORWARD_USAGE = "usage: agent-mail forward <ancien> <nouveau> [--dry-run] [--json]"
+_FORWARD_USAGE = "usage: agent-mail forward <old> <new> [--dry-run] [--json]"
 
 
 def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
@@ -1177,7 +1177,7 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
         result = undeliverable.forward(cfg, bk.db, old, new, actor=_actor(),
                                        dry_run=bool(opts.get("--dry-run")))
     except undeliverable.Refused as exc:
-        print("renvoi refusé — %s" % exc, file=sys.stderr)
+        print("forward refused — %s" % exc, file=sys.stderr)
         return 1
     if opts.get("--json"):
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -1185,27 +1185,27 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     if result["dry_run"]:
         rows = result["messages"]
         if not rows:
-            print("aucun message en attente pour %s : rien à renvoyer" % old)
+            print("no pending message for %s: nothing to forward" % old)
             return 0
-        print("à blanc : %d message(s) en attente pour %s (%s) seraient re-livré(s) à %s :"
-              % (len(rows), old, result["old_state"], new))
+        print("dry run: %d pending message(s) for %s (%s) would be re-delivered to %s:"
+              % (len(rows), old, undeliverable.state_label(result["old_state"]), new))
         for row in rows:
-            print("  n°%s de %s, %s%s" % (
+            print("  #%s from %s, %s%s" % (
                 row["id"], row.get("sender") or "?",
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("created_ts") or 0)),
                 " (%s)" % row["kind"] if row.get("kind") not in (None, "notify") else ""))
         return 0
     moved = result["forwarded"]
     if not moved:
-        print("aucun message en attente pour %s : rien à renvoyer" % old)
+        print("no pending message for %s: nothing to forward" % old)
         return 0
     senders: dict = {}
     for row in moved:
         senders[row.get("sender") or "?"] = senders.get(row.get("sender") or "?", 0) + 1
-    print("%d message(s) re-livré(s) de %s (%s) à %s : %s" % (
-        len(moved), old, result["old_state"], new,
-        ", ".join("n°%s → n°%s" % (r["original_id"], r["new_id"]) for r in moved)))
-    print("expéditeurs : %s ; expéditeur et date d'origine gardés, renvoi noté dans le fil"
+    print("%d message(s) re-delivered from %s (%s) to %s: %s" % (
+        len(moved), old, undeliverable.state_label(result["old_state"]), new,
+        ", ".join("#%s → #%s" % (r["original_id"], r["new_id"]) for r in moved)))
+    print("senders: %s; original sender and date kept, forward noted in the thread"
           % ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
                                                        key=lambda kv: (-kv[1], kv[0]))))
     return 0
@@ -1214,13 +1214,13 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
 def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
     if len(rest) > 1 and rest[0] == "--cwd":
         # Diagnostic : le dossier ne donne aucune identité.
-        print("legacy %s (diagnostic, non autoritaire)"
+        print("legacy %s (diagnostic, not authoritative)"
               % identity.legacy_name(rest[1], cfg))
         return 0
     try:
         opts, _positional = _options(rest, ("--session", "--harness"))
     except ValueError as exc:
-        print("%s\nusage: agent-mail whoami [--session ID --harness H] | --cwd DOSSIER"
+        print("%s\nusage: agent-mail whoami [--session ID --harness H] | --cwd DIR"
               % exc, file=sys.stderr)
         return 2
     db = bk.db if bk.kind == "pg" else None
@@ -1232,7 +1232,7 @@ def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
     else:
         binding = identity.resolve_binding(cfg, db)
     if not binding.ok:
-        print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+        print("unbound identity: %s" % (binding.reason or "AGENT_MAIL_NAME not set"),
               file=sys.stderr)
         if binding.session:
             print("(%s)" % binding.describe_session(), file=sys.stderr)
@@ -1255,13 +1255,13 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
-        print("migration impossible : %s" % exc, file=sys.stderr)
+        print("migration failed: %s" % exc, file=sys.stderr)
         return 1
     try:
         if dry_run or additive_only:
             missing, modified, _unknown = migrations.check(db)
             if modified:
-                print("migration en échec : %s modifiée(s) après application"
+                print("migration failed: %s modified after being applied"
                       % ",".join(m.label for m in modified), file=sys.stderr)
                 return 1
             refused = []
@@ -1270,28 +1270,28 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
                 if reasons:
                     refused.append(migration)
                 if dry_run or reasons:
-                    print("%s : %s" % (migration.label, "NON additive — " + " ; ".join(reasons)
+                    print("%s: %s" % (migration.label, "NOT additive — " + "; ".join(reasons)
                                        if reasons else "additive"))
             if refused:
-                print("%d migration(s) non additive(s) : le code d'avant casserait sur la "
-                      "base migrée" % len(refused), file=sys.stderr)
+                print("%d non-additive migration(s): the previous code would break on the "
+                      "migrated database" % len(refused), file=sys.stderr)
             if dry_run:
                 if not missing:
-                    print("schéma à jour : aucune migration à appliquer")
+                    print("schema up to date: no migration to apply")
                 return 0
             if refused:
-                print("rien n'est appliqué (--additive-only)", file=sys.stderr)
+                print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
         done = migrations.migrate(db, log=lambda line: print(line))
     except db_mod.DbError as exc:
-        print("migration en échec : %s" % exc, file=sys.stderr)
+        print("migration failed: %s" % exc, file=sys.stderr)
         return 1
     finally:
         db.close()
     if not done:
-        print("schéma à jour : aucune migration à appliquer")
+        print("schema up to date: no migration to apply")
     else:
-        print("%d migration(s) appliquée(s)" % len(done))
+        print("%d migration(s) applied" % len(done))
     return 0
 
 
@@ -1303,29 +1303,29 @@ def cmd_probe(cfg: Config) -> int:
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
-        print("sonde : KO — base injoignable (%s)" % exc)
+        print("probe: KO — database unreachable (%s)" % exc)
         return 1
     try:
         db_mod.require_schema(db)
         missing, modified, unknown = migrations.check(db)
     except db_mod.SchemaMissing:
-        print("sonde : KO — schéma absent (%s, schéma %s)"
+        print("probe: KO — schema missing (%s, schema %s)"
               % (config_mod.mask_dsn(cfg.dsn), cfg.schema))
         return 1
     except db_mod.DbError as exc:
-        print("sonde : KO — %s" % exc)
+        print("probe: KO — %s" % exc)
         return 1
     finally:
         db.close()
     if missing or modified:
-        print("sonde : KO — migrations %s%s" % (
-            "manquantes %s" % ",".join(m.label for m in missing) if missing else "",
-            ("%smodifiées %s" % ("; " if missing else "", ",".join(m.label for m in modified))
+        print("probe: KO — migrations %s%s" % (
+            "missing %s" % ",".join(m.label for m in missing) if missing else "",
+            ("%smodified %s" % ("; " if missing else "", ",".join(m.label for m in modified))
              if modified else "")))
         return 1
-    extra = (" ; base plus récente que ce code (versions %s)"
+    extra = ("; database newer than this code (versions %s)"
              % ",".join("%04d" % v for v in unknown)) if unknown else ""
-    print("sonde : OK (pilote %s, schéma %s)%s" % (db.name, cfg.schema, extra))
+    print("probe: OK (driver %s, schema %s)%s" % (db.name, cfg.schema, extra))
     return 0
 
 
@@ -1336,9 +1336,9 @@ def driver_warnings(driver: str, remote: bool) -> list[str]:
     if driver != "psql" or not remote:
         return []
     return [
-        "attention  : pilote psql avec une base DISTANTE — un sous-processus et une "
-        "connexion TLS par requête (~1,5 s chacune à 180 ms d'aller-retour) ;",
-        "             installez psycopg dans l'environnement d'ameesh : %s -m pip install "
+        "warning    : psql driver with a REMOTE database — one subprocess and one "
+        "TLS connection per query (~1.5 s each at 180 ms round trip);",
+        "             install psycopg in ameesh's environment: %s -m pip install "
         "'psycopg[binary]>=3.1'" % sys.executable,
     ]
 
@@ -1353,7 +1353,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         try:
             db = db_mod.connect(cfg)
         except db_mod.Unavailable as exc:
-            print("base       : injoignable (%s) — harnais vérifiés sans les agents" % exc)
+            print("database   : unreachable (%s) — harnesses checked without the agents" % exc)
             return hostcheck.cmd_harness(cfg)
         try:
             return hostcheck.cmd_harness(cfg, db)
@@ -1362,17 +1362,17 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     from . import version
     print("version    : ameesh %s" % version())
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
-    print("schéma     : %s" % cfg.schema)
-    print("hôte       : %s" % cfg.host)
+    print("schema     : %s" % cfg.schema)
+    print("host       : %s" % cfg.host)
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
-        print("pilote     : aucun (%s)" % exc)
-        print("verdict    : KO — la CLI basculerait sur les fichiers %s" % cfg.v0_state)
+        print("driver     : none (%s)" % exc)
+        print("verdict    : KO — the CLI would fall back to the files %s" % cfg.v0_state)
         return 1
     connected = time.monotonic() - started
-    print("pilote     : %s" % db.name)
+    print("driver     : %s" % db.name)
     remote = db_mod.is_remote(cfg)
     if remote:
         # L61 : sur une base distante, chaque aller-retour coûte la latence
@@ -1381,7 +1381,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         try:
             db.ping()
             trip = time.monotonic() - started
-            print("réseau     : base distante ; connexion %d ms, requête simple %d ms"
+            print("network    : remote database; connection %d ms, simple query %d ms"
                   % (connected * 1000, trip * 1000))
         except db_mod.DbError:
             pass
@@ -1395,22 +1395,22 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             info = db.conn.info
             if (psycopg.pq.version() >= 170000 and info.server_version >= 170000
                     and db.conn.pgconn.ssl_in_use):
-                print("conseil    : ajoutez sslnegotiation=direct au DSN (libpq et serveur "
-                      "≥ 17) : un aller-retour de moins par connexion")
+                print("hint       : add sslnegotiation=direct to the DSN (libpq and server "
+                      "≥ 17): one round trip less per connection")
         except Exception:
             pass
     try:
         db_mod.require_schema(db)
     except db_mod.SchemaMissing as exc:
-        print("schéma     : absent (%s)" % exc)
-        print("verdict    : KO — lancez « agent-mesh migrate »")
+        print("schema     : missing (%s)" % exc)
+        print("verdict    : KO — run \"agent-mesh migrate\"")
         return 1
     known, done = migrations.status(db)
-    print("migrations : %d/%d appliquées" % (len(done), len(known)))
+    print("migrations : %d/%d applied" % (len(done), len(known)))
     agents = storage.of(db).agents.count()
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
-    print("non lus    : %d" % unread)
+    print("unread     : %d" % unread)
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
     from . import hostcheck
@@ -1427,7 +1427,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         channel = "ameesh_doctor"
         listener = storage.of(db).wakeups.subscribe([channel])
         if listener is None:
-            print("notify     : pilote sans LISTEN/NOTIFY")
+            print("notify     : driver without LISTEN/NOTIFY")
             verdict = 1
         else:
             time.sleep(0.3)
@@ -1435,7 +1435,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             got = listener.wait(timeout=3.0)
             listener.close()
             if got and got.get("payload") == "ping":
-                print("notify     : OK (LISTEN/NOTIFY de bout en bout)")
+                print("notify     : OK (LISTEN/NOTIFY end to end)")
             else:
                 print("notify     : KO (%r)" % (got,))
                 verdict = 1
@@ -1488,14 +1488,14 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_whoami(bk, cfg, rest)
         if command == "forward":
             if bk.kind != "pg":
-                print("le renvoi exige la base (AMEESH_DSN) : le repli fichier n'a pas de "
-                      "registre", file=sys.stderr)
+                print("forwarding requires the database (AMEESH_DSN): the file fallback has no "
+                      "registry", file=sys.stderr)
                 return 1
             return cmd_forward(bk, cfg, rest)
         if command in ("bind", "unbind", "bindings"):
             if bk.kind != "pg":
-                print("les liaisons de session exigent la base (AMEESH_DSN) : "
-                      "le repli fichier n'en a pas", file=sys.stderr)
+                print("session bindings require the database (AMEESH_DSN): "
+                      "the file fallback has none", file=sys.stderr)
                 return 1
             if command == "bind":
                 return cmd_bind(bk, cfg, rest)
@@ -1507,10 +1507,10 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         return 2
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except (db_mod.DbError, ValueError) as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

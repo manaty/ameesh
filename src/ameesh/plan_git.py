@@ -81,7 +81,7 @@ def _patch_ids(repo: str, *log_args: str) -> dict[str, str]:
     log = _git(repo, "log", "-p", "--no-merges", "--no-color", "--format=commit %H",
                *log_args)
     if log.returncode != 0:
-        raise MergeProbeError("git log %s : %s" % (" ".join(log_args),
+        raise MergeProbeError("git log %s: %s" % (" ".join(log_args),
                                                    log.stderr.decode("utf-8", "replace").strip()))
     if not log.stdout.strip():
         return {}
@@ -113,25 +113,25 @@ def probe(repo: str, sha: str, target: str) -> dict:
     porte le contenu (le gel lui-même s'il est ancêtre)."""
     head = _commit(repo, target)
     if head is None:
-        raise MergeProbeError("cible %r introuvable dans %s" % (target, repo))
+        raise MergeProbeError("target %r not found in %s" % (target, repo))
     if not _SHA_RE.match(sha or ""):
-        return {"merged": False, "how": None, "ref": None, "detail": "commit illisible"}
+        return {"merged": False, "how": None, "ref": None, "detail": "unreadable commit"}
     frozen = _commit(repo, sha)
     if frozen is None:
         return {"merged": False, "how": None, "ref": None,
-                "detail": "commit %s absent du dépôt" % sha[:12]}
+                "detail": "commit %s not in the repository" % sha[:12]}
     if _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0:
         return {"merged": True, "how": "ancestor", "ref": frozen,
-                "detail": "%s ancêtre de %s" % (frozen[:12], target)}
+                "detail": "%s is an ancestor of %s" % (frozen[:12], target)}
     base = _out(repo, "merge-base", frozen, head)
     if not base:
-        return {"merged": False, "how": None, "ref": None, "detail": "aucune base commune"}
+        return {"merged": False, "how": None, "ref": None, "detail": "no common base"}
     try:
         return _by_patch_id(repo, frozen, head, base, target)
     except _NoVerbatim as exc:
         return {"merged": False, "how": None, "ref": None,
-                "detail": "git patch-id --verbatim indisponible (git >= 2.40 requis : %s) : "
-                          "seul l'ancêtre prouve la fusion" % (exc or "refus")}
+                "detail": "git patch-id --verbatim unavailable (git >= 2.40 required: %s): "
+                          "only ancestry proves the merge" % (exc or "refused")}
 
 
 def _by_patch_id(repo: str, frozen: str, head: str, base: str, target: str) -> dict:
@@ -142,15 +142,15 @@ def _by_patch_id(repo: str, frozen: str, head: str, base: str, target: str) -> d
         # patch-id est celui du dernier commit du gel
         last = on_target[next(iter(mine))]
         return {"merged": True, "how": "patch-id", "ref": last,
-                "detail": "%d commit(s) du gel retrouvé(s) par patch-id dans %s"
+                "detail": "%d frozen commit(s) found by patch-id in %s"
                           % (len(mine), target)}
     squash = _diff_patch_id(repo, base, frozen)
     if squash and squash in on_target:
         return {"merged": True, "how": "squash", "ref": on_target[squash],
-                "detail": "diff du gel retrouvé en un commit de %s (squash)" % target}
+                "detail": "frozen diff found as one commit of %s (squash)" % target}
     missing = sum(1 for pid in mine if pid not in on_target)
     return {"merged": False, "how": None, "ref": None,
-            "detail": "%d/%d commit(s) du gel absents de %s" % (missing, len(mine), target)}
+            "detail": "%d/%d frozen commit(s) missing from %s" % (missing, len(mine), target)}
 
 
 def latest_freeze(rows: list[dict]) -> dict | None:
@@ -168,7 +168,7 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
     """Ferme les lots dont le contenu gelé est entré dans `target`."""
     try:
         if _commit(repo_dir, target) is None:
-            raise MergeProbeError("cible %r introuvable dans %s" % (target, repo_dir))
+            raise MergeProbeError("target %r not found in %s" % (target, repo_dir))
     except GitError as exc:
         raise MergeProbeError(str(exc)) from exc
     st = storage.of(db)
@@ -183,8 +183,8 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
         sha = ((freeze or {}).get("sha") or "").strip()
         entry = {"work_item": int(row["id"]), "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
-                 "detail": ("dernier gel sans commit (jalon frozen --sha)" if freeze
-                            else "aucun gel déclaré (jalon frozen --sha)")}
+                 "detail": ("last freeze has no commit (milestone frozen --sha)" if freeze
+                            else "no freeze declared (milestone frozen --sha)")}
         if sha:
             try:
                 found = probe(repo_dir, sha, target)
@@ -198,7 +198,7 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
             else:
                 done = work_mod.close_merged(
                     db, int(row["id"]), sha=entry["ref"] or "", actor="git:%s" % target,
-                    source="contenu (%s)" % entry["how"], frozen_id=int(freeze["id"]))
+                    source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]))
                 entry["result"] = done["result"]
                 entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
@@ -278,12 +278,12 @@ MAX_MERGE_SCAN = 500
 CLOCK_SLACK_S = 120.0
 
 
-def check_ref(name: str, what: str = "branche") -> str:
+def check_ref(name: str, what: str = "branch") -> str:
     """Un nom de branche (ou de cible) admissible, sinon ValueError."""
     text = (name or "").strip()
     if not _REF_RE.match(text) or ".." in text or "//" in text or text.endswith(
             ("/", ".", ".lock")) or "@{" in text:
-        raise ValueError("%s invalide : %r (lettres, chiffres, . _ / -)" % (what, name))
+        raise ValueError("invalid %s: %r (letters, digits, . _ / -)" % (what, name))
     return text
 
 
@@ -306,8 +306,8 @@ def default_target(repo: str) -> str | None:
     if configured:
         if _commit(repo, configured):
             return configured
-        raise MergeProbeError("%s = %s introuvable dans %s (aucun fetch n'est fait : "
-                              "corrigez la valeur ou récupérez la branche)"
+        raise MergeProbeError("%s = %s not found in %s (no fetch is done: "
+                              "fix the value or fetch the branch)"
                               % (TARGET_GIT_KEY, configured, repo))
     head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
     if head and _commit(repo, head):
@@ -370,7 +370,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     (l'appelant la retient comme `branch_head`)."""
     head = _commit(repo, target)
     if head is None:
-        raise MergeProbeError("cible %r introuvable dans %s" % (target, repo))
+        raise MergeProbeError("target %r not found in %s" % (target, repo))
     tip = _tip(repo, branch)
     out = {"merged": False, "how": None, "ref": None, "tip": tip, "ahead": False}
 
@@ -380,7 +380,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
         found = probe(repo, seen_head, target)
         if found["merged"]:
             return dict(out, merged=True, how="vu-" + found["how"], ref=found["ref"],
-                        detail="dernier commit vu en avance (%s) : %s"
+                        detail="last commit seen ahead (%s): %s"
                                % (seen_head[:12], found["detail"]))
         return None
 
@@ -388,25 +388,25 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
         sha = merge_mentioning(repo, branch, head, since_ts)
         if sha:
             return dict(out, merged=True, how="message", ref=sha,
-                        detail="commit de fusion %s de %s qui cite %s" % (sha[:12], target,
+                        detail="merge commit %s of %s that cites %s" % (sha[:12], target,
                                                                           branch))
         return dict(out, detail=why)
 
     if tip is None:
-        return seen() or mention("branche %s introuvable (ni locale ni origin/)" % branch)
+        return seen() or mention("branch %s not found (neither local nor origin/)" % branch)
     if _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0:
         if not _on_first_parent(repo, tip, head):
             return dict(out, merged=True, how="ancestor", ref=tip,
-                        detail="%s (%s) entrée dans %s par un commit de fusion"
+                        detail="%s (%s) entered %s through a merge commit"
                                % (branch, tip[:12], target))
-        return seen() or mention("%s n'a aucun travail propre : sa pointe %s est sur la "
-                                 "ligne de %s" % (branch, tip[:12], target))
+        return seen() or mention("%s has no work of its own: its tip %s is on the "
+                                 "line of %s" % (branch, tip[:12], target))
     out["ahead"] = True
     found = probe(repo, tip, target)
     if found["merged"]:
         return dict(out, merged=True, how=found["how"], ref=found["ref"],
-                    detail="%s : %s" % (branch, found["detail"]))
-    return dict(out, detail="%s en avance sur %s (%s)" % (branch, target, tip[:12]))
+                    detail="%s: %s" % (branch, found["detail"]))
+    return dict(out, detail="%s ahead of %s (%s)" % (branch, target, tip[:12]))
 
 
 def lot_ref_hash(repo: str) -> bool:
@@ -425,7 +425,7 @@ def merge_commits(repo: str, target: str, since_ts: float | None = None,
         args.append("--since=@%d" % int(since_ts))
     proc = _git(repo, *args, target)
     if proc.returncode != 0:
-        raise MergeProbeError("git log %s : %s" % (
+        raise MergeProbeError("git log %s: %s" % (
             target, proc.stderr.decode("utf-8", "replace").strip()))
     rows = []
     for record in proc.stdout.decode("utf-8", "replace").split("\x1e"):
@@ -474,10 +474,10 @@ def _citation(merge: dict, lot: int, target: str, *, sha: bool = True) -> str:
     """Comment la fusion a été constatée, en clair (compte rendu ; sans le
     commit, `sha=False`, pour la note du lot, qui le porte déjà)."""
     title = (merge["message"].splitlines() or [""])[0].strip()
-    return "commit de fusion %sde %s qui %s (« %s »)" % (
+    return "merge commit %sof %s that %s (\"%s\")" % (
         "%s " % merge["sha"][:12] if sha else "", target,
-        "porte « ameesh-work: %d »" % lot if merge["how"] == "ameesh-work"
-        else "cite #%d dans son titre (%s %s)" % (lot, LOT_REF_GIT_KEY, LOT_REF_HASH),
+        "carries \"ameesh-work: %d\"" % lot if merge["how"] == "ameesh-work"
+        else "cites #%d in its title (%s %s)" % (lot, LOT_REF_GIT_KEY, LOT_REF_HASH),
         title[:80] + ("…" if len(title) > 80 else ""))
 
 
@@ -523,15 +523,15 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         reg = regs.get(assignee) if assignee and ":" not in assignee else None
         if reg is None:
             if host is None and branch:
-                entry["detail"] = "aucun agent assigné : dépôt inconnu"
+                entry["detail"] = "no agent assigned: repository unknown"
                 results.append(entry)
             continue
         if host is not None and (reg.get("host") or "") != host:
             continue
         repo = os.path.expanduser(reg.get("cwd") or "")
         if not repo or not os.path.isdir(repo):
-            entry.update(result="no-repo", detail="dossier de travail de %s absent (%s)"
-                         % (assignee, repo or "non déclaré"))
+            entry.update(result="no-repo", detail="working directory of %s missing (%s)"
+                         % (assignee, repo or "not declared"))
             results.append(entry)
             continue
         try:
@@ -547,8 +547,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                     raise targets[repo]
                 target = targets[repo]
             if not target:
-                entry.update(result="no-target", detail="aucune cible : `git config %s "
-                             "<branche>` dans %s, ou --target" % (TARGET_GIT_KEY, repo))
+                entry.update(result="no-target", detail="no target: `git config %s "
+                             "<branch>` in %s, or --target" % (TARGET_GIT_KEY, repo))
                 results.append(entry)
                 continue
             entry["target"] = target
@@ -571,9 +571,9 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 elif found is None:
                     found = {"merged": False, "how": None, "ref": None, "tip": None,
                              "ahead": False,
-                             "detail": "aucun commit de fusion de %s ne désigne le lot "
-                                       "(ligne « ameesh-work: %d »%s)"
-                                       % (target, lot, ", ni « #%d » dans un titre" % lot
+                             "detail": "no merge commit of %s names the lot "
+                                       "(line \"ameesh-work: %d\"%s)"
+                                       % (target, lot, ", nor \"#%d\" in a title" % lot
                                           if hashes[repo] else "")}
         except (MergeProbeError, GitError) as exc:
             entry.update(result="error", detail=str(exc))
@@ -592,18 +592,18 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         if found.get("note"):
-            source = "le relevé des fusions, %s" % found["note"]
+            source = "the merge sweep, %s" % found["note"]
         else:
-            source = "branche %s (%s)" % (branch, found["how"])
+            source = "branch %s (%s)" % (branch, found["how"])
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source)
         entry.update(result=done["result"], detail="%s — %s" % (found["detail"], done["detail"]))
         if done["result"] == "merged":
-            text = ("Lot #%d « %s » livré : %s (%s, commit %s). Fermé par le relevé des "
-                    "fusions de l'exécuteur."
+            text = ("Lot #%d \"%s\" delivered: %s (%s, commit %s). Closed by the runner's "
+                    "merge sweep."
                     % (lot, row.get("title") or "",
-                       "un commit de fusion de %s le désigne" % target if found.get("note")
-                       else "la branche %s est entrée dans %s" % (branch, target),
+                       "a merge commit of %s names it" % target if found.get("note")
+                       else "branch %s entered %s" % (branch, target),
                        found["how"], (found["ref"] or "?")[:12]))
             fil.record(db.cfg, db, sender=work_mod.SYSTEM_SENDER, recipients=[assignee],
                        text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),

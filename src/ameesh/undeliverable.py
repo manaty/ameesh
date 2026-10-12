@@ -60,7 +60,16 @@ class Refused(Exception):
 # --------------------------------------------------------------------------
 
 def _moment(ts) -> str:
-    return time.strftime("%Y-%m-%d à %H:%M", time.localtime(float(ts)))
+    return time.strftime("%Y-%m-%d at %H:%M", time.localtime(float(ts)))
+
+
+#: `old_state` of `forward` (a JSON value, kept as is) → its English label
+_STATE_LABELS = {"arrêté": "stopped", "absent du registre": "not in the registry"}
+
+
+def state_label(state: str) -> str:
+    """The display label of a `forward` `old_state` value."""
+    return _STATE_LABELS.get(state, state)
 
 
 def _span(seconds) -> str:
@@ -155,22 +164,22 @@ def suggestions(dest: str, rows: list, *, role_names=(), team: str = "") -> list
             return
         seen.add(name)
         if (by_name.get(name) or {}).get("status") == "stopped":
-            why += ", arrêté"
+            why += ", stopped"
         out.append((name, why))
 
     for name in role_names:
-        add(name, "orchestrateur de l'équipe %s" % team
-            if team and team_of(by_name.get(name)) == team else "orchestrateur")
+        add(name, "orchestrator of team %s" % team
+            if team and team_of(by_name.get(name)) == team else "orchestrator")
     limit = 2 if len(dest) >= 5 else 1
     for gap, name in sorted((distance(dest, name), name) for name in by_name):
         if gap <= limit:
-            add(name, "%d lettre%s d'écart" % (gap, "s" if gap > 1 else ""))
+            add(name, "%d letter%s apart" % (gap, "s" if gap > 1 else ""))
     low = dest.lower()
     if len(low) >= 3:
         for name in sorted(by_name):
             other = name.lower()
             if other.startswith(low) or (len(other) >= 3 and low.startswith(other)):
-                add(name, "même début")
+                add(name, "same prefix")
     return out[:MAX_SUGGESTIONS]
 
 
@@ -195,11 +204,11 @@ def stop_facts(row: dict, now: float | None = None) -> str:
     parts = []
     since = row.get("status_since_ts")
     if since:
-        parts.append("depuis le %s (%s)" % (_moment(since), _span(now - float(since))))
+        parts.append("since %s (%s)" % (_moment(since), _span(now - float(since))))
     reason = " — ".join(str(p) for p in (row.get("stop_reason"), row.get("status_text")) if p)
-    parts.append("raison : %s" % (reason or "inconnue"))
-    parts.append("responsable : %s" % (row.get("responsible") or "aucun"))
-    return " ; ".join(parts)
+    parts.append("reason: %s" % (reason or "unknown"))
+    parts.append("responsible: %s" % (row.get("responsible") or "none"))
+    return "; ".join(parts)
 
 
 def successor(db, row: dict | None, *, bindings: list | None = None) -> str | None:
@@ -230,11 +239,11 @@ def unknown_text(cfg, db, dest: str, rows: list | None = None, *, sender: str | 
     """Le refus d'un destinataire absent du registre, avec les noms proches."""
     rows = registry.overview(db) if rows is None else rows
     by_name = {row["name"]: row for row in rows}
-    lines = ["« %s » n'est pas dans le registre (agent inconnu) : personne ne lirait ce "
-             "message, et aucun agent n'est créé." % dest]
+    lines = ["\"%s\" is not in the registry (unknown agent): nobody would read this "
+             "message, and no agent is created." % dest]
     human = _known_human(cfg, db, dest)
     if human:
-        lines.append("« %s » désigne un humain (%s) : la boîte aux lettres ne joint que des "
+        lines.append("\"%s\" designates a human (%s): the mailbox only reaches "
                      "agents." % (dest, human))
     team = team_of(by_name.get(sender)) if sender else ""
     role_names: list[str] = []
@@ -244,11 +253,11 @@ def unknown_text(cfg, db, dest: str, rows: list | None = None, *, sender: str | 
                                         exclude=(sender,) if sender else ())
     near = suggestions(dest, rows, role_names=role_names, team=team)
     if near:
-        lines.append("noms proches : " + ", ".join("%s (%s)" % pair for pair in near))
+        lines.append("close names: " + ", ".join("%s (%s)" % pair for pair in near))
     else:
-        lines.append("aucun nom proche dans le registre")
-    lines.append("agents connus : agent-mail list ; un nouvel agent s'inscrit d'abord "
-                 "(agent-runner register <nom> <harnais> …)")
+        lines.append("no close name in the registry")
+    lines.append("known agents: agent-mail list; a new agent registers first "
+                 "(agent-runner register <name> <harness> …)")
     return "\n  ".join(lines)
 
 
@@ -256,12 +265,12 @@ def stopped_recipient_text(db, row: dict, now: float | None = None) -> str:
     """Le refus d'un destinataire arrêté : depuis quand, pourquoi, qui, qui a
     repris, et les deux gestes possibles."""
     name = row["name"]
-    lines = ["%s est arrêté (%s) : personne ne lit sa boîte." % (name, stop_facts(row, now))]
+    lines = ["%s is stopped (%s): nobody reads its mailbox." % (name, stop_facts(row, now))]
     heir = successor(db, row)
     if heir:
-        lines.append("son travail a été repris par %s (sa dernière session lui est liée) : "
+        lines.append("its work was taken over by %s (its last session is bound to it): "
                      "agent-mail send %s \"…\"" % (heir, heir.split(", ")[0]))
-    lines.append("pour le déposer quand même (lu à sa reprise) : --queue ; pour le relancer : "
+    lines.append("to drop it anyway (read when it resumes): --queue; to restart it: "
                  "ameesh resume %s" % name)
     return "\n  ".join(lines)
 
@@ -282,30 +291,30 @@ def stopped_sender_text(cfg, db, row: dict, *, explicit: bool, binding=None,
     from . import identity
 
     name = row["name"]
-    lines = ["l'expéditeur %s est arrêté (%s) : les réponses iraient dans une boîte que "
-             "personne ne lit." % (name, stop_facts(row, now))]
+    lines = ["sender %s is stopped (%s): replies would go to a mailbox that "
+             "nobody reads." % (name, stop_facts(row, now))]
     heir = successor(db, row)
     if heir:
-        lines.append("son travail a été repris par %s" % heir)
+        lines.append("its work was taken over by %s" % heir)
     if binding is None:
         binding = identity.resolve_binding(cfg, db)
     if explicit and binding.ok and binding.name != name:
-        lines.append("identité liée à cette session (agent-mail whoami) : %s — renvoyez "
-                     "sans --from (ou --from %s)" % (_whoami(binding), binding.name))
+        lines.append("identity bound to this session (agent-mail whoami): %s — resend "
+                     "without --from (or --from %s)" % (_whoami(binding), binding.name))
     elif binding.ok and binding.name == name:
         if binding.source == "session":
-            lines.append("cette session est liée à %s (agent-mail whoami : %s) : déliez-la "
-                         "(agent-mail unbind --session %s --harness %s) et liez-la à l'agent "
-                         "qu'elle porte désormais (agent-mail bind <agent> …)"
+            lines.append("this session is bound to %s (agent-mail whoami: %s): unbind it "
+                         "(agent-mail unbind --session %s --harness %s) and bind it to the agent "
+                         "it now carries (agent-mail bind <agent> …)"
                          % (name, _whoami(binding), (binding.session or {}).get("session_id"),
                             (binding.session or {}).get("harness")))
         else:
-            lines.append("cette session parle au nom de %s (agent-mail whoami : %s) : posez "
-                         "AGENT_MAIL_NAME=<agent vivant>, ou passez --from <agent vivant>"
+            lines.append("this session speaks on behalf of %s (agent-mail whoami: %s): set "
+                         "AGENT_MAIL_NAME=<live agent>, or pass --from <live agent>"
                          % (name, _whoami(binding)))
     else:
-        lines.append("identité de cette session (agent-mail whoami) : %s — passez --from "
-                     "<agent vivant>" % binding.describe())
+        lines.append("identity of this session (agent-mail whoami): %s — pass --from "
+                     "<live agent>" % binding.describe())
     return "\n  ".join(lines)
 
 
@@ -351,8 +360,8 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
         return []
     if not queue:
         raise Refused(stopped_recipient_text(db, row, now))
-    return ["%s est arrêté (%s) : message mis en attente jusqu'à sa reprise (ameesh resume %s) "
-            "ou à son renvoi (ameesh mail forward %s <agent>)"
+    return ["%s is stopped (%s): message queued until it resumes (ameesh resume %s) "
+            "or is forwarded (ameesh mail forward %s <agent>)"
             % (dest, stop_facts(row, now), dest, dest)]
 
 
@@ -431,13 +440,13 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
             teams = {team_of(row)}
             reason = "arrete"
             responsible = row.get("responsible") or None
-            detail = ("%d message(s) en attente depuis %s pour %s, arrêté (%s) : personne ne "
-                      "les lira — de %s. Re-livrer : ameesh mail forward %s %s ; ou relancer "
-                      "l'agent : ameesh resume %s"
+            detail = ("%d message(s) pending for %s for %s, stopped (%s): nobody will "
+                      "read them — from %s. Re-deliver: ameesh mail forward %s %s; or restart "
+                      "the agent: ameesh resume %s"
                       % (group["count"], age, name, stop_facts(row, now), _senders(group),
-                         name, heir.split(", ")[0] if heir else "<agent vivant>", name))
+                         name, heir.split(", ")[0] if heir else "<live agent>", name))
             if heir:
-                detail += " (travail repris par %s)" % heir
+                detail += " (work taken over by %s)" % heir
             extra.update(stop_reason=row.get("stop_reason") or None, successor=heir,
                          host=row.get("host") or None)
         else:
@@ -448,11 +457,11 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
                           if role_of(name) else [])
             near = suggestions(name, listing, role_names=role_names,
                                team=next(iter(teams)) if len(teams) == 1 else "")
-            detail = ("%d message(s) en attente depuis %s pour « %s », absent du registre "
-                      "(faute de nom ?) — de %s. %sRe-livrer : ameesh mail forward %s <agent>, "
-                      "et prévenir les expéditeurs du bon nom"
+            detail = ("%d message(s) pending for %s for \"%s\", not in the registry "
+                      "(misspelled name?) — from %s. %sRe-deliver: ameesh mail forward %s <agent>, "
+                      "and tell the senders the right name"
                       % (group["count"], age, name, _senders(group),
-                         "Noms proches : %s. " % ", ".join(n for n, _why in near) if near else "",
+                         "Close names: %s. " % ", ".join(n for n, _why in near) if near else "",
                          name))
             extra.update(suggestions=[n for n, _why in near])
         orchestras = team_orchestrators(listing, known, {t for t in teams if t},
@@ -481,18 +490,18 @@ def orchestrator_briefs(alert: dict) -> dict:
     senders = ", ".join(alert.get("senders") or ()) or "?"
     if alert.get("reason") == "inconnu":
         near = alert.get("suggestions") or []
-        text = ("Courrier en souffrance : %d message(s) adressé(s) à « %s », absent du "
-                "registre (faute de nom ?), attendent depuis plus de %s, de %s ; personne ne "
-                "les lira. %sRe-livre-les : ameesh mail forward %s <agent> (à toi-même s'ils "
-                "t'étaient destinés), puis préviens les expéditeurs du bon nom."
+        text = ("Undeliverable mail: %d message(s) addressed to \"%s\", not in the "
+                "registry (misspelled name?), waiting for more than %s, from %s; nobody will "
+                "read them. %sRe-deliver them: ameesh mail forward %s <agent> (to yourself if they "
+                "were meant for you), then tell the senders the right name."
                 % (count, name, _span(alert.get("threshold") or 0), senders,
-                   "Noms proches : %s. " % ", ".join(near) if near else "", name))
+                   "Close names: %s. " % ", ".join(near) if near else "", name))
     else:
         heir = alert.get("successor")
-        text = ("Courrier en souffrance : %d message(s) adressé(s) à %s, arrêté, attendent "
-                "depuis plus de %s, de %s ; personne ne les lira. Re-livre-les à l'agent qui "
-                "porte son travail : ameesh mail forward %s %s ; ou fais relancer l'agent par "
-                "son responsable (ameesh resume %s)."
+        text = ("Undeliverable mail: %d message(s) addressed to %s, stopped, waiting "
+                "for more than %s, from %s; nobody will read them. Re-deliver them to the agent "
+                "carrying its work: ameesh mail forward %s %s; or have the agent restarted by "
+                "its owner (ameesh resume %s)."
                 % (count, name, _span(alert.get("threshold") or 0), senders, name,
                    heir.split(", ")[0] if heir else "<agent>", name))
     return {orch: text for orch in alert.get("orchestrators") or () if orch != name}
@@ -513,18 +522,18 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     passe remis avec `meta.forwarded` ; le renvoi est écrit dans le fil.
     `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`."""
     if old == new:
-        raise Refused("ancien et nouveau destinataire identiques (%s)" % old)
+        raise Refused("old and new recipient are the same (%s)" % old)
     old_row, new_row = db_mod.batched(db, lambda d: [registry.get(d, old),
                                                      registry.get(d, new)])
     if old_row is not None and old_row.get("status") != "stopped":
-        raise Refused("%s n'est pas arrêté (statut %s) : sa boîte est lue, son courrier lui "
-                      "sera remis. Pour la vider vers un autre agent, arrêtez-le d'abord "
-                      "(agent-runner stop %s), puis renvoyez."
+        raise Refused("%s is not stopped (status %s): its mailbox is read, its mail will "
+                      "be delivered to it. To empty it to another agent, stop it first "
+                      "(agent-runner stop %s), then forward."
                       % (old, old_row.get("status") or "?", old))
     if new_row is None:
         raise Refused(unknown_text(cfg, db, new))
     if new_row.get("status") == "stopped":
-        raise Refused("%s est arrêté (%s) : renvoyez à un agent vivant"
+        raise Refused("%s is stopped (%s): forward to a live agent"
                       % (new, stop_facts(new_row, now)))
     state = "arrêté" if old_row is not None else "absent du registre"
     if dry_run:
@@ -539,9 +548,9 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
         project = fil.project_for(cfg, team_of(new_row), team_of(old_row))
         fil.record(
             cfg, db, sender=actor, recipients=[new],
-            text=("Renvoi de %d message(s) en souffrance : la boîte de %s (%s) n'était plus "
-                  "lue ; re-livrés à %s, expéditeur et date d'origine gardés (n° %s)."
-                  % (len(moved), old, state, new, ", ".join(
+            text=("Forwarded %d undeliverable message(s): the mailbox of %s (%s) was no longer "
+                  "read; re-delivered to %s, original sender and date kept (#%s)."
+                  % (len(moved), old, state_label(state), new, ", ".join(
                       "%d → %d" % (int(r["original_id"]), int(r["new_id"])) for r in moved))),
             project=project,
             meta={"audit": "forward", "from": old, "to": new,

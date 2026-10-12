@@ -1,42 +1,42 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Fil lisible (spec §6, C5, R12) : chaque message passé par ameesh, en clair.
+"""Readable thread (spec §6, C5, R12): every message that goes through ameesh, in plain text.
 
-La boîte Postgres (`agent_mailbox`) n'est que la file de distribution (hooks,
-réveil des exécuteurs) ; le **fil** est la référence lisible et auditable par
-les humains, y compris pour les échanges d'agent à agent (décision 0006).
+The Postgres mailbox (`agent_mailbox`) is only the delivery queue (hooks,
+waking runners); the **thread** is the readable, auditable reference for
+humans, including agent-to-agent exchanges (decision 0006).
 
-* `ThreadRef` = (projet, lot) ; sans lot, c'est le fil du projet.
-* `Entry` = auteur (`human:`/`agent:`), horodatage, destinataire, texte en
-  langage naturel (autosuffisant) et métadonnées structurées **en plus**.
-* `Transport` : `post(thread, entry) -> id externe`, `read(thread, since)`.
-  Transport v1 : `file`, un fichier Markdown par fil sous `AMEESH_THREADS`
-  (défaut `<état>/fils/<projet>/<lot ou _projet>.md`), en ajout seulement,
-  une entrée complète écrite d'un bloc sous verrou `flock`. La racine est de
-  confiance ; sous elle, chaque dossier et chaque fichier est ouvert par un
-  descripteur ancré sur son parent, sans jamais suivre de lien symbolique.
+* `ThreadRef` = (project, lot); without a lot, it is the project thread.
+* `Entry` = author (`human:`/`agent:`), timestamp, recipient, natural
+  language text (self-contained) and structured metadata **on top**.
+* `Transport`: `post(thread, entry) -> external id`, `read(thread, since)`.
+  Transport v1: `file`, one Markdown file per thread under `AMEESH_THREADS`
+  (default `<state>/fils/<project>/<lot or _projet>.md`), append-only, each
+  entry written whole in one block under a `flock` lock. The root is
+  trusted; below it, every directory and file is opened through a
+  descriptor anchored on its parent, never following a symbolic link.
 
-Une écriture de fil qui échoue ne fait JAMAIS perdre le message : `record()`
-ne lève pas, il le dit sur stderr, et le message reste dans la boîte.
+A failed thread write NEVER loses the message: `record()` does not raise,
+it reports on stderr, and the message stays in the mailbox.
 
-Format d'une entrée : le texte du message, tel quel, dans un bloc de code
-clôturé dont la barrière (```) est plus longue que toute suite de ` du texte.
-Aucune ligne du corps ne peut donc fermer le bloc : rien n'y est interprété
-comme du Markdown (titre à toute indentation, setext, HTML, commentaire, autre
-barrière), et la relecture rend le texte exact.
+Entry format: the message text, verbatim, in a fenced code block whose
+fence (```) is longer than any run of ` in the text. No body line can close
+the block: nothing in it is read as Markdown (heading at any indentation,
+setext, HTML, comment, other fence), and reading it back gives the exact
+text.
 
     ### 2026-10-04T10:15:30+02:00 — agent:alpha → agent:beta
 
     ```
-    Le texte du message, tel quel.
+    The message text, verbatim.
     ```
 
     <!-- ameesh {"host": "laptop", "ids": [12]} -->
 
-  ameesh fil list                               les fils connus (index + disque)
-  ameesh fil show <projet> [<lot>] [--last N]   lire un fil
-  ameesh fil tail <projet> [<lot>] [--last N]   suivre un fil (Ctrl-C pour sortir)
+  ameesh fil list                                known threads (index + disk)
+  ameesh fil show <project> [<lot>] [--last N]   read a thread
+  ameesh fil tail <project> [<lot>] [--last N]   follow a thread (Ctrl-C to quit)
 
-L'index des fils (`thread_index`) est écrit et lu par le stockage
+The thread index (`thread_index`) is written and read by storage
 (`storage.of(db).threads`, spec §10).
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{%d,}" % (MAX_BLOB + 1))
 _ALPHABET_RE = re.compile(r"[A-Za-z0-9+/=_-]+")
 _HEX_RUN_RE = re.compile(r"[0-9A-Fa-f]{%d,}" % (MAX_BLOB + 1))
 _WORD_RE = re.compile(r"[A-Z]?[a-z]{2,}")
-_ALLOW_HINT = "(--allow-structured est réservé aux tests et aux outils)"
+_ALLOW_HINT = "(--allow-structured is reserved for tests and tools)"
 
 
 class UnreadableBody(ValueError):
@@ -133,7 +133,7 @@ class ThreadRef:
 
     def describe(self) -> str:
         return ("%s / lot %s" % (self.project, self.lot)) if self.lot \
-            else "%s (fil du projet)" % self.project
+            else "%s (project thread)" % self.project
 
 
 @dataclass
@@ -167,14 +167,14 @@ class Transport(Protocol):
 def unreadable_reason(body) -> str | None:
     """Pourquoi ce corps n'est pas du texte lisible (None s'il l'est)."""
     if body is None or not str(body).strip():
-        return "corps vide : un message doit contenir du texte lisible"
+        return "empty body: a message must contain readable text"
     body = str(body)
     for ch in body:
         if ch in "\n\t\r":
             continue
         if unicodedata.category(ch) in ("Cc", "Cs"):
-            return ("caractère de contrôle ou binaire U+%04X : le fil n'accepte que du "
-                    "texte (retirez les couleurs de terminal et les données binaires)"
+            return ("control or binary character U+%04X: the thread only accepts "
+                    "text (remove terminal colors and binary data)"
                     % ord(ch))
     stripped = body.strip()
     if stripped[0] in "{[":
@@ -183,14 +183,14 @@ def unreadable_reason(body) -> str | None:
         except ValueError:
             value = None
         if isinstance(value, (dict, list)):
-            return ("le corps n'est que du JSON : écrivez en phrases ce que le destinataire "
-                    "doit savoir ; les données structurées accompagnent le texte, elles ne "
-                    "le remplacent pas")
+            return ("the body is only JSON: write in sentences what the recipient "
+                    "needs to know; structured data goes along with the text, it does not "
+                    "replace it")
     for blob, folded in _blobs(body):
         if re.search(r"[A-Za-z0-9]", blob) and not _word_like(blob):
-            return ("bloc encodé de %d caractères %s (base64 ou hexadécimal) : "
-                    "décrivez-le en clair et transmettez la donnée par un autre moyen"
-                    % (len(blob), "replié sur plusieurs lignes" if folded else "sans espace"))
+            return ("encoded block of %d characters %s (base64 or hexadecimal): "
+                    "describe it in plain words and send the data another way"
+                    % (len(blob), "folded over several lines" if folded else "without spaces"))
     # L'hexadécimal, replié ou espacé (« de ad be ef … »), se voit aussi dans le
     # texte sans aucun blanc : aucun texte n'aligne 200 caractères de [0-9a-f]
     # mêlant lettres et chiffres (une liste de nombres n'a pas de lettres).
@@ -198,8 +198,8 @@ def unreadable_reason(body) -> str | None:
         run = match.group(0)
         letters = sum(ch.isalpha() for ch in run)
         if 0.05 * len(run) <= letters <= 0.95 * len(run):
-            return ("bloc encodé de %d caractères (hexadécimal replié ou espacé) : "
-                    "décrivez-le en clair et transmettez la donnée par un autre moyen"
+            return ("encoded block of %d characters (folded or spaced hexadecimal): "
+                    "describe it in plain words and send the data another way"
                     % len(run))
     return None
 
@@ -277,7 +277,7 @@ def ensure_readable(body, allow_structured: bool = False) -> None:
         return
     reason = unreadable_reason(body)
     if reason:
-        raise UnreadableBody("message refusé — %s %s" % (reason, _ALLOW_HINT))
+        raise UnreadableBody("message refused — %s %s" % (reason, _ALLOW_HINT))
 
 
 def clean_text(text) -> str:
@@ -355,10 +355,10 @@ def format_entry(entry: Entry, *, meta: bool = True) -> str:
 
 def header(thread: ThreadRef) -> str:
     return (
-        "# Fil — %s\n\n"
-        "Fil lisible tenu par ameesh : une entrée par message, en ajout seulement.\n"
-        "Le texte de chaque message est reproduit tel quel dans un bloc de code ;\n"
-        "ses métadonnées sont dans un commentaire `ameesh` discret.\n\n"
+        "# Thread — %s\n\n"
+        "Readable thread kept by ameesh: one entry per message, append-only.\n"
+        "Each message text is copied verbatim into a code block;\n"
+        "its metadata is in an unobtrusive `ameesh` comment.\n\n"
         % thread.describe()
     )
 
@@ -529,7 +529,7 @@ def _open_at(parent_fd: int, name: str, flags: int, shown: str) -> int:
         return os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent_fd)
     except OSError as exc:
         if exc.errno in _REFUSED:
-            raise ThreadError("%s : lien symbolique ou type de fichier inattendu, refusé"
+            raise ThreadError("%s: symbolic link or unexpected file type, refused"
                               % shown) from exc
         raise
 
@@ -600,7 +600,7 @@ class FileTransport:
             os.close(dir_fd)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise ThreadError("%s : pas un fichier ordinaire, refusé" % self.location(thread))
+                raise ThreadError("%s: not a regular file, refused" % self.location(thread))
         except BaseException:
             os.close(fd)
             raise
@@ -642,7 +642,7 @@ class FileTransport:
     def _offset(self, thread: ThreadRef, since: str) -> int:
         key, sep, offset = str(since).rpartition("#")
         if not sep or key != thread.key or not offset.isdigit():
-            raise ThreadError("id d'entrée %r étranger au fil %s" % (since, thread.key))
+            raise ThreadError("entry id %r does not belong to thread %s" % (since, thread.key))
         return int(offset)
 
     def read(self, thread: ThreadRef, since: str | None = None) -> list[Entry]:
@@ -712,7 +712,7 @@ def member(cfg: Config, name: str) -> str:
     outil qui n'est ni l'un ni l'autre) reste tel quel : un nom d'agent ne
     contient jamais `:`."""
     if name == "all":
-        return "tous"
+        return "all"
     if ":" in name:
         return name
     return ("human:%s" if name in cfg.human_names else "agent:%s") % name
@@ -741,7 +741,7 @@ def agent_project(row: dict | None) -> str:
 
 def _warn(text: str) -> None:
     try:
-        print("ameesh fil : %s" % text, file=sys.stderr)
+        print("ameesh fil: %s" % text, file=sys.stderr)
     except Exception:
         pass
 
@@ -776,17 +776,17 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
                       text=text, ts=float(ts) if ts else time.time(), meta=entry_meta)
         external_id = transport.post(thread, entry)
     except Exception as exc:
-        _warn("écriture du fil impossible (%s) — message conservé %s" % (
+        _warn("thread write failed (%s) — message kept %s" % (
             " ".join(str(exc).split())[:200],
-            "dans la boîte (id %s)" % ", ".join(map(str, ids)) if ids
-            else "dans la boîte fichier"))
+            "in the mailbox (id %s)" % ", ".join(map(str, ids)) if ids
+            else "in the file mailbox"))
         return None
     if db is not None:
         try:
             index(db, cfg, transport, thread, entry, external_id, ids)
         except Exception as exc:
             from . import db as db_mod
-            _warn("index des fils non mis à jour (%s) — le fil et le message sont intacts"
+            _warn("thread index not updated (%s) — the thread and the message are intact"
                   % db_mod.explain(exc, 200))
     return external_id
 
@@ -846,7 +846,7 @@ def cmd_list(cfg: Config, _args: argparse.Namespace) -> int:
         finally:
             db.close()
     except db_mod.DbError as exc:
-        print("index des fils indisponible (%s) : fils trouvés sur disque seulement"
+        print("thread index unavailable (%s): showing threads found on disk only"
               % " ".join(str(exc).split())[:200], file=sys.stderr)
     # Les fils écrits en repli fichier (base absente) ne sont pas indexés.
     transport = transport_for(cfg)
@@ -862,15 +862,15 @@ def cmd_list(cfg: Config, _args: argparse.Namespace) -> int:
         last = entries[-1] if entries else None
         rows.append({
             "project": thread.project, "lot": thread.lot or "", "transport": transport.name,
-            "host": cfg.host, "location": transport.location(thread) + "  (hors index)",
+            "host": cfg.host, "location": transport.location(thread) + "  (not indexed)",
             "entries": len(entries), "last_ts": last.ts if last else None,
             "last_author": last.author if last else "",
         })
     if not rows:
-        print("aucun fil")
+        print("no threads")
         return 0
     print("%-20s %-12s %7s  %-16s %-20s %s" % (
-        "PROJET", "LOT", "ENTRÉES", "DERNIÈRE", "AUTEUR", "EMPLACEMENT"))
+        "PROJECT", "LOT", "ENTRIES", "LAST", "AUTHOR", "LOCATION"))
     for row in rows:
         location = row.get("location") or ""
         if row.get("transport") != transport.name:
@@ -891,7 +891,7 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     thread = _thread_from(args)
     transport = transport_for(cfg)
     if not transport.exists(thread):
-        print("aucun fil %s (%s)" % (thread.describe(), transport.location(thread)),
+        print("no thread %s (%s)" % (thread.describe(), transport.location(thread)),
               file=sys.stderr)
         return 1
     entries = transport.read(thread)
@@ -910,7 +910,7 @@ def cmd_tail(cfg: Config, args: argparse.Namespace) -> int:
         for entry in (entries[-args.last:] if args.last > 0 else []):
             _write(format_entry(entry, meta=args.meta))
         cursor = entries[-1].id if entries else None
-        print("(suivi de %s — Ctrl-C pour sortir)" % thread.describe(), file=sys.stderr)
+        print("(following %s — Ctrl-C to quit)" % thread.describe(), file=sys.stderr)
         while True:
             time.sleep(args.interval)
             for entry in transport.read(thread, since=cursor):
@@ -924,9 +924,9 @@ def _positive(text: str) -> int:
     try:
         value = int(text)
     except ValueError:
-        raise argparse.ArgumentTypeError("entier attendu : %r" % text)
+        raise argparse.ArgumentTypeError("integer expected: %r" % text)
     if value < 0:
-        raise argparse.ArgumentTypeError("entier positif attendu : %r" % text)
+        raise argparse.ArgumentTypeError("positive integer expected: %r" % text)
     return value
 
 
@@ -935,21 +935,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ameesh fil", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
-    p_list = sub.add_parser("list", help="les fils connus")
+    p_list = sub.add_parser("list", help="known threads")
     p_list.set_defaults(func=cmd_list)
     for name, func, last, aide in (
-            ("show", cmd_show, None, "lire un fil"),
-            ("tail", cmd_tail, 10, "suivre un fil (Ctrl-C pour sortir)")):
+            ("show", cmd_show, None, "read a thread"),
+            ("tail", cmd_tail, 10, "follow a thread (Ctrl-C to quit)")):
         p_cmd = sub.add_parser(name, help=aide)
-        p_cmd.add_argument("project", metavar="projet")
+        p_cmd.add_argument("project", metavar="project")
         p_cmd.add_argument("lot", nargs="?", default=None)
         p_cmd.add_argument("--last", type=_positive, default=last,
-                           help="seulement les N dernières entrées")
+                           help="only the last N entries")
         p_cmd.add_argument("--meta", action="store_true",
-                           help="afficher aussi les métadonnées de chaque entrée")
+                           help="also show each entry's metadata")
         if name == "tail":
             p_cmd.add_argument("--interval", type=float, default=0.5,
-                               help="période de relecture en secondes (défaut 0,5)")
+                               help="polling period in seconds (default 0.5)")
         p_cmd.set_defaults(func=func)
     return parser
 
@@ -969,7 +969,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         return args.func(cfg, args)
     except (ThreadError, OSError) as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

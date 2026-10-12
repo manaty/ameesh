@@ -86,7 +86,7 @@ class HookEtrangerSousBailTest(_Base):
                 proc = self._hook("codex", event, CODEX)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout, "")
-                self.assertIn("hook codex refusé pour md", proc.stderr)
+                self.assertIn("hook codex refused for md", proc.stderr)
                 self.assertEqual(self._non_remis(), 1)
         self.assertEqual(registry.get(self.db, "md")["session_id"], CLAUDE)
         self.assertEqual(self._refus_au_fil(), 1)  # une fois par (harnais, session)
@@ -136,7 +136,7 @@ class RepriseVerifieeTest(_Base):
         with self._env():
             self.assertTrue(self._tour(worker))
         self.assertEqual(self._reprises(), [None])
-        self.assertIn("session %s inconnue du harnais" % CODEX,
+        self.assertIn("session %s unknown to the harness" % CODEX,
                       " ".join(self.turns()[-1]["argv"]))
         self.assertEqual(worker.resume_origin, "ameesh")
         self.assertFalse(worker.fast_failure)

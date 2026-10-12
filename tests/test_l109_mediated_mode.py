@@ -411,7 +411,7 @@ class SessionTest(unittest.TestCase):
         code, out, err = self.ameesh("mail", "hook", "claude",
                                      stdin=json.dumps({"hook_event_name": "Stop"}))
         self.assertEqual((code, out), (0, ""))
-        self.assertIn("non liée", err)
+        self.assertIn("unbound", err)
 
     def test_inbox_par_la_session(self):
         # contrat 1.1 : `mailbox.unread` est ouverte au jeton de session
@@ -463,7 +463,7 @@ class SessionTest(unittest.TestCase):
             "action", "propose", "--connector", "shell-noop", "--operation", "write",
             "--project", "site", "--target", "note.txt", "--args", '{"text":"bonjour"}')
         self.assertEqual(code, 0, err)
-        self.assertIn("proposée", out)
+        self.assertIn("proposed", out)
         self.assertEqual(proposees[0]["proposed_by"], "agent:inge-front")
         self.assertIn("actions.propose", self.server.ops())
         self.assert_session_only()

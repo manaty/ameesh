@@ -203,23 +203,23 @@ def _recorded(group: list[dict], text: str, cited: set[int], recent: list[dict])
 # commande `ameesh work unrecorded`
 # --------------------------------------------------------------------------
 
-CHANNEL_LABELS = {"mail": "courrier", "decision": "décision", "chat": "chat"}
+CHANNEL_LABELS = {"mail": "mail", "decision": "decision", "chat": "chat"}
 #: comment enregistrer, rappelé sous la liste
-HINT = ("Pour chacune : enregistrer le lot, phrase exacte en source — ameesh work add "
-        "--title \"RÉF : titre\" --source \"<qui> : « <phrase exacte> »\" --priority 1|2|3 "
-        "[--assignee <agent>] —, puis citer son numéro dans la réponse à l'humain "
-        "(docs/ORCHESTRATEUR.md, « Toute demande d'un humain devient un lot »).")
+HINT = ("For each one: record the lot, with the exact sentence as source (ameesh work add "
+        "--title \"REF: title\" --source \"<who>: '<exact sentence>'\" --priority 1|2|3 "
+        "[--assignee <agent>]), then cite its number in the reply to the human "
+        "(docs/ORCHESTRATEUR.md, \"Every request from a human becomes a lot\").")
 
 
 def add_parser(work_sub, func) -> None:
     parser = work_sub.add_parser(
         "unrecorded",
-        help="demandes d'humains (courrier, réponses aux décisions, chat) sans lot (L130)")
+        help="human requests (mail, decision answers, chat) without a lot (L130)")
     parser.add_argument("--since", default=DEFAULT_SINCE,
-                        help="période : durée (2h, 24h, 7d) ou date ISO (défaut %s)"
+                        help="period: duration (2h, 24h, 7d) or ISO date (default %s)"
                              % DEFAULT_SINCE)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
-                        help="messages examinés au plus, les plus récents (défaut %d)"
+                        help="maximum messages examined, most recent first (default %d)"
                              % DEFAULT_LIMIT)
     parser.add_argument("--json", action="store_true")
     parser.set_defaults(func=func)
@@ -245,13 +245,13 @@ def _excerpt(text: str, limit: int = 140) -> str:
 def render(report: dict, since_text: str) -> list[str]:
     examined, missing = report["examined"], report["unrecorded"]
     if not missing:
-        return ["Aucune demande d'humain sans lot depuis %s (%d message(s) examiné(s)%s)."
-                % (since_text, examined, ", tous rattachés à un lot" if examined else "")]
-    lines = ["Demandes d'humains sans lot depuis %s : %d sur %d message(s) examiné(s)."
+        return ["No human request without a lot since %s (%d message(s) examined%s)."
+                % (since_text, examined, ", all tied to a lot" if examined else "")]
+    lines = ["Human requests without a lot since %s: %d of %d message(s) examined."
              % (since_text, len(missing), examined)]
     for entry in missing:
         recipients = entry["recipients"]
-        lines.append("  n°%-7d %s  %s → %s  [%s]  « %s »" % (
+        lines.append("  #%-7d  %s  %s → %s  [%s]  \"%s\"" % (
             entry["id"], _moment(entry["created_ts"]), entry["sender"],
             recipients[0] + (" (+%d)" % (len(recipients) - 1) if len(recipients) > 1 else ""),
             CHANNEL_LABELS.get(entry["channel"], entry["channel"]), _excerpt(entry["text"])))
@@ -264,10 +264,10 @@ def run(cfg, db, args: argparse.Namespace) -> int:
     try:
         start = since_ts(args.since, now)
     except UnrecordedError as exc:
-        print("ameesh work unrecorded : %s" % exc, file=sys.stderr)
+        print("ameesh work unrecorded: %s" % exc, file=sys.stderr)
         return 2
     if args.limit < 1:
-        print("ameesh work unrecorded : --limit doit être positif", file=sys.stderr)
+        print("ameesh work unrecorded: --limit must be positive", file=sys.stderr)
         return 2
     report = scan(cfg, db, since_ts=start, now=now, limit=args.limit)
     if args.json:

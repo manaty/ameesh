@@ -65,7 +65,7 @@ def _string(text: str) -> str:
         elif code < 0x20:
             out.append("\\u%04x" % code)
         elif 0xD800 <= code <= 0xDFFF:
-            raise JcsError("surrogate UTF-16 isolé U+%04X : chaîne non I-JSON" % code)
+            raise JcsError("lone UTF-16 surrogate U+%04X: string is not I-JSON" % code)
         else:
             out.append(char)
     out.append('"')
@@ -96,16 +96,16 @@ def _double(value: float) -> str:
 def _number(value, doubles: bool = False) -> str:
     if isinstance(value, int):
         if abs(value) > MAX_SAFE_INTEGER:
-            raise JcsError("entier hors de l'intervalle sûr ±(2^53-1) : %d" % value)
+            raise JcsError("integer outside the safe range ±(2^53-1): %d" % value)
         return str(value)
     if not math.isfinite(value):
-        raise JcsError("nombre non fini refusé : %r" % value)
+        raise JcsError("non-finite number rejected: %r" % value)
     if doubles:
         return "0" if value == 0 else _double(value)
     if not value.is_integer():
-        raise JcsError("nombre non entier refusé : %r (JCS des doubles non pris en charge)" % value)
+        raise JcsError("non-integer number rejected: %r (JCS for doubles not supported)" % value)
     if abs(value) > MAX_SAFE_INTEGER:
-        raise JcsError("nombre hors de l'intervalle sûr ±(2^53-1) : %r" % value)
+        raise JcsError("number outside the safe range ±(2^53-1): %r" % value)
     return str(int(value))  # -0.0 → "0", 1.0 → "1"
 
 
@@ -117,7 +117,7 @@ def _utf16_key(key: str) -> bytes:
 
 def _encode(value, out: list, depth: int, doubles: bool = False) -> None:
     if depth > MAX_DEPTH:
-        raise JcsError("imbrication trop profonde (> %d)" % MAX_DEPTH)
+        raise JcsError("nesting too deep (> %d)" % MAX_DEPTH)
     if value is None:
         out.append("null")
     elif value is True:
@@ -132,7 +132,7 @@ def _encode(value, out: list, depth: int, doubles: bool = False) -> None:
         items = []
         for key, item in value.items():
             if not isinstance(key, str):
-                raise JcsError("clé d'objet non textuelle : %r" % (key,))
+                raise JcsError("non-string object key: %r" % (key,))
             encoded_key = _string(key)  # valide aussi les surrogates isolés
             items.append((_utf16_key(key), encoded_key, item))
         items.sort(key=lambda entry: entry[0])
@@ -152,7 +152,7 @@ def _encode(value, out: list, depth: int, doubles: bool = False) -> None:
             _encode(item, out, depth + 1, doubles)
         out.append("]")
     else:
-        raise JcsError("type non JSON : %s" % type(value).__name__)
+        raise JcsError("non-JSON type: %s" % type(value).__name__)
 
 
 def dumps(value, *, doubles: bool = False) -> str:
@@ -171,13 +171,13 @@ def _no_duplicates(pairs):
     found = {}
     for key, value in pairs:
         if key in found:
-            raise JcsError("clé en double dans un objet JSON : %r" % key)
+            raise JcsError("duplicate key in a JSON object: %r" % key)
         found[key] = value
     return found
 
 
 def _no_constant(name):
-    raise JcsError("constante JSON non standard refusée : %s" % name)
+    raise JcsError("non-standard JSON constant rejected: %s" % name)
 
 
 def loads(text: str | bytes):
@@ -186,10 +186,10 @@ def loads(text: str | bytes):
         try:
             text = bytes(text).decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise JcsError("JSON non UTF-8 : %s" % exc) from exc
+            raise JcsError("JSON is not UTF-8: %s" % exc) from exc
     try:
         return json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
     except JcsError:
         raise
     except (ValueError, RecursionError) as exc:
-        raise JcsError("JSON illisible : %s" % exc) from exc
+        raise JcsError("unreadable JSON: %s" % exc) from exc

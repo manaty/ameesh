@@ -3,13 +3,13 @@
 <!-- Vue de référence d'ameesh progress (L24, décision 0024 ; feuille de route L96) : page statique
      autonome, sans ressource réseau. Les données (schéma ameesh-progress/1)
      sont embarquées plus bas par `ameesh progress --html`. -->
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
 <meta name="referrer" content="no-referrer">
-<title>Avancement ameesh</title>
+<title>ameesh progress</title>
 <style>
 :root {
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #6f6d68;
@@ -149,29 +149,29 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 </head>
 <body>
 <main>
-  <h1 id="title">Avancement</h1>
+  <h1 id="title">Progress</h1>
   <div class="sub" id="when"></div>
 
   <section aria-labelledby="h-projects" id="projects-section">
-    <h2 id="h-projects">Projets</h2>
+    <h2 id="h-projects">Projects</h2>
     <div id="projects"></div>
   </section>
 
   <section aria-labelledby="h-roadmap" id="roadmap-section">
     <div class="rm-head">
-      <h2 id="h-roadmap">Feuille de route</h2>
-      <button type="button" class="rm-toggle" id="roadmap-toggle" aria-expanded="true">masquer</button>
+      <h2 id="h-roadmap">Roadmap</h2>
+      <button type="button" class="rm-toggle" id="roadmap-toggle" aria-expanded="true">hide</button>
     </div>
     <div id="roadmap-body">
       <div class="legend" aria-hidden="true">
-        <span><i style="border:1px dashed var(--phase-build);height:10px"></i>prévu</span>
-        <span><i style="background:var(--phase-build)"></i>réel, en cours</span>
-        <span><i style="background:var(--phase-merge)"></i>réel, livré</span>
-        <span><i style="background:var(--critical)"></i>après la date prévue</span>
-        <span><i style="background:var(--ink);width:9px;height:9px;transform:rotate(45deg)"></i>livraison prévue</span>
-        <span><i style="border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)"></i>échéance d'un engagement</span>
-        <span><i style="background:var(--warning);width:9px;height:9px;border-radius:50%"></i>décision attendue</span>
-        <span><i style="background:var(--critical);width:2px;height:12px"></i>aujourd'hui</span>
+        <span><i style="border:1px dashed var(--phase-build);height:10px"></i>planned</span>
+        <span><i style="background:var(--phase-build)"></i>actual, in progress</span>
+        <span><i style="background:var(--phase-merge)"></i>actual, delivered</span>
+        <span><i style="background:var(--critical)"></i>past the planned date</span>
+        <span><i style="background:var(--ink);width:9px;height:9px;transform:rotate(45deg)"></i>planned delivery</span>
+        <span><i style="border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)"></i>commitment due date</span>
+        <span><i style="background:var(--warning);width:9px;height:9px;border-radius:50%"></i>pending decision</span>
+        <span><i style="background:var(--critical);width:2px;height:12px"></i>today</span>
       </div>
       <div class="axis" id="rm-axis" aria-hidden="true"></div>
       <div id="roadmap"></div>
@@ -179,12 +179,12 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   </section>
 
   <section aria-labelledby="h-lots">
-    <h2 id="h-lots">Lots</h2>
+    <h2 id="h-lots">Work items</h2>
     <div class="legend" aria-hidden="true">
-      <span><i style="background:var(--phase-build)"></i>demande → gel</span>
-      <span><i style="background:var(--phase-review)"></i>gel → verdict (revue)</span>
-      <span><i style="background:var(--phase-merge)"></i>verdict → fusion</span>
-      <span><i style="background:var(--ink);width:2px;height:12px"></i>jalon</span>
+      <span><i style="background:var(--phase-build)"></i>request → freeze</span>
+      <span><i style="background:var(--phase-review)"></i>freeze → verdict (review)</span>
+      <span><i style="background:var(--phase-merge)"></i>verdict → merge</span>
+      <span><i style="background:var(--ink);width:2px;height:12px"></i>milestone</span>
     </div>
     <div class="axis" id="axis" aria-hidden="true"></div>
     <div id="lots"></div>
@@ -201,7 +201,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   </section>
 
   <section aria-labelledby="h-ms">
-    <h2 id="h-ms">Jalons du projet</h2>
+    <h2 id="h-ms">Project milestones</h2>
     <div id="milestones"></div>
   </section>
 
@@ -215,7 +215,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   </section>
 
   <section aria-labelledby="h-missing">
-    <h2 id="h-missing">Données manquantes</h2>
+    <h2 id="h-missing">Missing data</h2>
     <ul class="missing" id="missing"></ul>
   </section>
 
@@ -228,12 +228,12 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 (function () {
   var D = JSON.parse(document.getElementById("data").textContent || "null");
   if (!D || D.schema !== "ameesh-progress/1") {
-    document.getElementById("when").textContent = "données absentes ou schéma inconnu";
+    document.getElementById("when").textContent = "missing data or unknown schema";
     return;
   }
-  var LOT_FR = {active: "actif", review: "en revue", blocked: "bloqué", approved: "approuvé", merged: "fusionné", closed: "fermé"};
+  var LOT_FR = {active: "active", review: "in review", blocked: "blocked", approved: "approved", merged: "merged", closed: "closed"};
   var LOT_ICON = {active: "▶", review: "◐", blocked: "■", approved: "✓", merged: "●", closed: "✕"};
-  var AG_FR = {working: "travaille", idle: "repos", paused: "pause", stopped: "arrêt"};
+  var AG_FR = {working: "working", idle: "idle", paused: "paused", stopped: "stopped"};
   var AG_ICON = {working: "▶", idle: "○", paused: "‖", stopped: "■"};
 
   function el(tag, cls, text) {
@@ -255,19 +255,19 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     if (s < 60) return s + " s";
     if (s < 3600) return Math.floor(s / 60) + " min";
     if (s < 86400) { var mn = Math.floor((s % 3600) / 60); return Math.floor(s / 3600) + " h" + (mn ? " " + pad(mn) : ""); }
-    return Math.floor(s / 86400) + " j " + Math.floor((s % 86400) / 3600) + " h";
+    return Math.floor(s / 86400) + " d " + Math.floor((s % 86400) / 3600) + " h";
   }
-  function usd(v) { return (v || 0).toFixed(2) + " $"; }
+  function usd(v) { return "$" + (v || 0).toFixed(2); }
   function chip(state, fr, icon) { return el("span", "chip st-" + state, (icon[state] || "") + " " + (fr[state] || state)); }
 
   var from = D.window.from_ts, to = D.window.to_ts, span = Math.max(1, to - from);
   function pct(ts) { return Math.min(100, Math.max(0, (ts - from) / span * 100)); }
 
-  document.getElementById("title").textContent = "Avancement" + (D.project ? " — " + D.project : "");
+  document.getElementById("title").textContent = "Progress" + (D.project ? " — " + D.project : "");
   document.getElementById("when").textContent =
-    "instantané " + hm(D.generated_ts) + " · fenêtre " + dur(span) + (D.host ? " · hôte " + D.host : "");
+    "snapshot " + hm(D.generated_ts) + " · window " + dur(span) + (D.host ? " · host " + D.host : "");
   document.getElementById("foot").textContent =
-    D.schema + " · généré " + D.generated_at + " · page statique, aucune ressource réseau";
+    D.schema + " · generated " + D.generated_at + " · static page, no network resource";
 
   // Axe : repères à l'heure locale ronde (ou au jour au-delà de 48 h), assez
   // espacés pour la largeur réelle (téléphone compris) ; une étiquette porte
@@ -298,13 +298,13 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 
   // Lots
   var lotsBox = document.getElementById("lots");
-  var cutLabels = {lots: "lots", actions: "actions"};
+  var cutLabels = {lots: "work items", actions: "actions"};
   Object.keys(D.truncated || {}).forEach(function (k) {
     var c = D.truncated[k];
-    lotsBox.appendChild(el("p", "trunc", "⚠ Tronqué : " + c.shown + " " + (cutLabels[k] || k)
-      + " affichés sur " + c.total + " (borne " + c.limit + ")."));
+    lotsBox.appendChild(el("p", "trunc", "⚠ Truncated: " + c.shown + " " + (cutLabels[k] || k)
+      + " shown out of " + c.total + " (limit " + c.limit + ")."));
   });
-  if (!D.lots.length) lotsBox.appendChild(el("p", "empty", "Aucun lot dans la fenêtre."));
+  if (!D.lots.length) lotsBox.appendChild(el("p", "empty", "No work item in the window."));
   D.lots.forEach(function (lot) {
     var m = lot.milestones, row = el("div", "lot");
     var head = el("button", "lot-head");
@@ -312,16 +312,16 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     head.setAttribute("aria-expanded", "false");
     head.appendChild(el("span", "lot-id", "#" + lot.id));
     head.appendChild(el("span", "lot-title", lot.title + (lot.epic ? " [" + lot.epic + "]" : "")));
-    if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stagnant " + dur(lot.stale.idle_s)));
+    if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stalled " + dur(lot.stale.idle_s)));
     if (lot.closed) head.appendChild(el("span", "chip st-closed", lot.closed.reason === "abandoned"
-      ? "✕ abandonné" : "✕ remplacé par #" + lot.closed.superseded_by));
+      ? "✕ abandoned" : "✕ superseded by #" + lot.closed.superseded_by));
     else head.appendChild(chip(lot.state, LOT_FR, LOT_ICON));
     head.addEventListener("click", function () {
       row.classList.toggle("open");
       head.setAttribute("aria-expanded", row.classList.contains("open") ? "true" : "false");
     });
     row.appendChild(head);
-    if (lot.waiting_for) row.appendChild(el("div", "waiting", "attend : " + lot.waiting_for.label));
+    if (lot.waiting_for) row.appendChild(el("div", "waiting", "waiting for: " + lot.waiting_for.label));
 
     var track = el("div", "track");
     addTicks(track);
@@ -354,25 +354,25 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       if (ts && ts >= from) { var k = el("div", "mark"); k.style.left = "calc(" + pct(ts) + "% - 1px)"; track.appendChild(k); }
     });
     var nl = el("div", "nowline"); nl.style.left = "100%"; track.appendChild(nl);
-    track.setAttribute("aria-label", "demande " + hm(m.requested) + ", gel " + hm(m.frozen)
-      + ", verdict " + hm(m.verdict) + ", fusion " + hm(m.merged));
+    track.setAttribute("aria-label", "request " + hm(m.requested) + ", freeze " + hm(m.frozen)
+      + ", verdict " + hm(m.verdict) + ", merge " + hm(m.merged));
     row.appendChild(track);
 
     var det = el("div", "lot-detail"), dl = el("dl");
     function add(k, v) { if (v === null || v === undefined || v === "") return; dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, v)); }
-    add("demande", hm(m.requested)); add("gel", hm(m.frozen));
+    add("request", hm(m.requested)); add("freeze", hm(m.frozen));
     add("verdict", hm(m.verdict) + (lot.verdict ? " (" + lot.verdict + ")" : ""));
-    add("fusion", hm(m.merged));
-    add("état du lot", lot.work_state);
-    if (lot.waiting_for) add("attend", lot.waiting_for.label);
-    if (lot.delegation) add("délégation", lot.delegation.label);
-    if (lot.estimate && (lot.estimate.minutes || lot.estimate.actual_minutes !== null)) add("durée", lot.estimate.label);
-    if (lot.stale) add("stagnant depuis", hm(lot.stale.since_ts) + " (" + dur(lot.stale.idle_s) + ")");
-    add("epic", lot.epic); add("fiche", lot.package); add("PR", lot.pr_ref);
-    add("auteur", lot.assignee); add("revue", lot.reviewer);
-    add("verdicts bloquants", lot.blocked_verdicts === null ? "inconnu" : lot.blocked_verdicts);
-    add("mises en attente", lot.blocks);
-    add("projet", lot.project); add("ticket", lot.issue_ref);
+    add("merge", hm(m.merged));
+    add("work item state", lot.work_state);
+    if (lot.waiting_for) add("waiting for", lot.waiting_for.label);
+    if (lot.delegation) add("delegation", lot.delegation.label);
+    if (lot.estimate && (lot.estimate.minutes || lot.estimate.actual_minutes !== null)) add("duration", lot.estimate.label);
+    if (lot.stale) add("stalled since", hm(lot.stale.since_ts) + " (" + dur(lot.stale.idle_s) + ")");
+    add("epic", lot.epic); add("package", lot.package); add("PR", lot.pr_ref);
+    add("author", lot.assignee); add("review", lot.reviewer);
+    add("blocking verdicts", lot.blocked_verdicts === null ? "unknown" : lot.blocked_verdicts);
+    add("times put on hold", lot.blocks);
+    add("project", lot.project); add("ticket", lot.issue_ref);
     if (lot.actions && lot.actions.length) add("actions", lot.actions.join(", "));
     det.appendChild(dl); row.appendChild(det);
     lotsBox.appendChild(row);
@@ -381,40 +381,40 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   // Epics (L29)
   var epBox = document.getElementById("epics");
   var epics = D.epics || [];
-  if (!epics.length) epBox.appendChild(el("p", "empty", "Aucun epic déclaré au canon."));
+  if (!epics.length) epBox.appendChild(el("p", "empty", "No epic declared in the canon."));
   epics.forEach(function (e) {
     var row = el("div", "epic"), counted = e.lots_total - e.lots_abandoned;
-    row.appendChild(el("div", null, e.id + " — " + (e.title || "") + " : " + e.lots_merged + "/" + counted
-      + " lots fusionnés" + (e.lots_abandoned ? " (" + e.lots_abandoned + " abandonné(s))" : "")));
+    row.appendChild(el("div", null, e.id + " — " + (e.title || "") + ": " + e.lots_merged + "/" + counted
+      + " work items merged" + (e.lots_abandoned ? " (" + e.lots_abandoned + " abandoned)" : "")));
     var bar = el("div", "bar"), fill = el("div", "fill");
     fill.style.width = (counted ? Math.round(e.lots_merged / counted * 100) : 0) + "%";
     bar.appendChild(fill); row.appendChild(bar);
     bar.setAttribute("role", "img");
-    bar.setAttribute("aria-label", e.lots_merged + " sur " + counted + " lots fusionnés");
+    bar.setAttribute("aria-label", e.lots_merged + " of " + counted + " work items merged");
     epBox.appendChild(row);
   });
 
   // Projets (L62) : qui travaille sur quoi, lots ouverts sans agent
-  var PAY_FR = {plan: "forfait", token: "token"};
+  var PAY_FR = {plan: "plan", token: "token"};
   var pjBox = document.getElementById("projects");
   if (!D.projects) document.getElementById("projects-section").style.display = "none";
-  else if (!D.projects.length) pjBox.appendChild(el("p", "empty", "Aucun projet."));
+  else if (!D.projects.length) pjBox.appendChild(el("p", "empty", "No project."));
   (D.projects || []).forEach(function (p) {
     var box = el("div", "project" + (p.active ? "" : " idle-project"));
     var head = el("div");
-    head.appendChild(el("span", "project-name", p.name || "(sans projet)"));
+    head.appendChild(el("span", "project-name", p.name || "(no project)"));
     var parts = ["working", "paused", "idle", "stopped"].filter(function (k) { return p.counts[k]; })
       .map(function (k) { return p.counts[k] + " " + AG_FR[k]; });
-    var meta = [p.agents.length + " agent(s)" + (parts.length ? " : " + parts.join(", ") : "")];
-    if (p.lots_open) meta.push(p.lots_open + " lot(s) ouvert(s)");
-    if (p.unread) meta.push(p.unread + " non lu(s)");
+    var meta = [p.agents.length + " agent(s)" + (parts.length ? ": " + parts.join(", ") : "")];
+    if (p.lots_open) meta.push(p.lots_open + " open work item(s)");
+    if (p.unread) meta.push(p.unread + " unread");
     if (p.usd_24h) meta.push("24 h " + usd(p.usd_24h) + " (token " + usd(p.usd_24h_token) + ")");
     head.appendChild(el("span", "meta", " — " + meta.join(" · ")));
     box.appendChild(head);
     (p.warnings || []).forEach(function (w) { box.appendChild(el("div", "warn", "⚠ " + w)); });
     if (p.agents.length) {
       var wrap = el("div", "table-wrap"), tb = el("table"), tr = el("tr");
-      ["agent", "état", "paiement", "24 h", "non lus", "lot en cours", "dernière avancée"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+      ["agent", "state", "payment", "24 h", "unread", "current work item", "latest progress"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
       tb.appendChild(tr);
       p.agents.forEach(function (a) {
         var x = el("tr"), st = el("td");
@@ -428,19 +428,19 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
         x.appendChild(el("td", "n", a.unread));
         x.appendChild(el("td", null, (a.lot ? "#" + a.lot.id + " " + a.lot.title
           + (a.open_lots > 1 ? " (+" + (a.open_lots - 1) + ")" : "")
-          : (a.task ? "tour : " + a.task : "—"))
-          + (a.lot && a.on_task_since_ts ? " (depuis " + dur(D.generated_ts - a.on_task_since_ts) + ")" : "")));
+          : (a.task ? "turn: " + a.task : "—"))
+          + (a.lot && a.on_task_since_ts ? " (for " + dur(D.generated_ts - a.on_task_since_ts) + ")" : "")));
         // L96 : la dernière avancée lue dans le fil (une ligne)
-        x.appendChild(el("td", null, a.last_update ? a.last_update.text + " (il y a "
-          + dur(D.generated_ts - a.last_update.ts) + ")" : "—"));
+        x.appendChild(el("td", null, a.last_update ? a.last_update.text + " ("
+          + dur(D.generated_ts - a.last_update.ts) + " ago)" : "—"));
         tb.appendChild(x);
       });
       wrap.appendChild(tb); box.appendChild(wrap);
     }
-    var WHY = {unassigned: "non assigné", stopped: "assigné à {a}, arrêté",
-               unknown: "assigné à {a}, inconnu du registre", external: "assigné à {a}, session externe"};
+    var WHY = {unassigned: "unassigned", stopped: "assigned to {a}, stopped",
+               unknown: "assigned to {a}, not in the registry", external: "assigned to {a}, external session"};
     (p.lots_without_agent || []).forEach(function (l) {
-      box.appendChild(el("div", "waiting", "sans agent : #" + l.id + " " + l.state + " — " + l.title
+      box.appendChild(el("div", "waiting", "no agent: #" + l.id + " " + l.state + " — " + l.title
         + " (" + (WHY[l.why] || l.why).replace("{a}", l.assignee || "") + ")"));
     });
     pjBox.appendChild(box);
@@ -448,53 +448,53 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 
   // Agents
   var agBox = document.getElementById("agents");
-  if (!D.agents.length) agBox.appendChild(el("p", "empty", "Aucun agent."));
+  if (!D.agents.length) agBox.appendChild(el("p", "empty", "No agent."));
   D.agents.forEach(function (a) {
     var c = el("div", "card"), h = el("div", "card-head");
     h.appendChild(el("span", "card-name", a.name));
     h.appendChild(chip(a.state, AG_FR, AG_ICON));
     c.appendChild(h);
-    c.appendChild(el("div", "meta", [a.harness || "?", a.model || "modèle par défaut",
-      "effort " + (a.effort || "défaut")].join(" · ")));
-    if (a.since_ts) c.appendChild(el("div", "meta", (a.state === "working" ? "tour depuis " : "depuis ") + dur(D.generated_ts - a.since_ts)));
-    if (a.turn) c.appendChild(el("div", "task", a.turn.task || a.turn.label || "tour en cours"));
+    c.appendChild(el("div", "meta", [a.harness || "?", a.model || "default model",
+      "effort " + (a.effort || "default")].join(" · ")));
+    if (a.since_ts) c.appendChild(el("div", "meta", (a.state === "working" ? "turn for " : "for ") + dur(D.generated_ts - a.since_ts)));
+    if (a.turn) c.appendChild(el("div", "task", a.turn.task || a.turn.label || "turn in progress"));
     else if ((a.state === "paused" || a.state === "stopped") && a.status_text) c.appendChild(el("div", "task", a.status_text));
-    if (a.unread) c.appendChild(el("div", "meta", a.unread + " message(s) non lu(s)"));
+    if (a.unread) c.appendChild(el("div", "meta", a.unread + " unread message(s)"));
     agBox.appendChild(c);
   });
 
   // Jalons du projet
   var msBox = document.getElementById("milestones");
-  if (!D.milestones.length) msBox.appendChild(el("p", "empty", "Aucun jalon déclaré au canon."));
+  if (!D.milestones.length) msBox.appendChild(el("p", "empty", "No milestone declared in the canon."));
   D.milestones.forEach(function (ms) {
     var counted = (ms.lots_total || 0) - (ms.lots_abandoned || 0);
-    msBox.appendChild(el("div", null, (ms.at_ts ? hm(ms.at_ts) : "sans date") + " — " + (ms.title || "")
-      + (ms.lots_total !== undefined ? " : " + ms.lots_merged + "/" + counted + " lots fusionnés" : "")));
+    msBox.appendChild(el("div", null, (ms.at_ts ? hm(ms.at_ts) : "no date") + " — " + (ms.title || "")
+      + (ms.lots_total !== undefined ? ": " + ms.lots_merged + "/" + counted + " work items merged" : "")));
   });
 
   // Budget (L95) : dépense payée au token et valeur des forfaits, jamais additionnées
   var B = D.budget, sp = document.getElementById("spend");
   function pv(b) { return b.plan_value_usd !== undefined ? b.plan_value_usd : 0; }
-  [["dépensé (payé au token), 1 h", B.spend["1h"].paid_usd],
-   ["dépensé (payé au token), 24 h", B.spend["24h"].paid_usd],
-   ["dépensé (payé au token), fenêtre", B.spend.window.paid_usd],
-   ["plafond horaire", B.hourly_cap_usd],
-   ["valeur consommée sur les forfaits, 24 h", pv(B.spend["24h"])],
-   ["valeur consommée sur les forfaits, fenêtre", pv(B.spend.window)]]
+  [["spent (paid per token), 1 h", B.spend["1h"].paid_usd],
+   ["spent (paid per token), 24 h", B.spend["24h"].paid_usd],
+   ["spent (paid per token), window", B.spend.window.paid_usd],
+   ["hourly cap", B.hourly_cap_usd],
+   ["value consumed on plans, 24 h", pv(B.spend["24h"])],
+   ["value consumed on plans, window", pv(B.spend.window)]]
     .forEach(function (p) { var t = el("div", "tile"); t.appendChild(el("div", "v", usd(p[1]))); t.appendChild(el("div", "l", p[0])); sp.appendChild(t); });
-  sp.parentNode.insertBefore(el("p", "meta", "Les montants payés au token sont estimés tour par tour (barème × jetons) ; "
-    + "la valeur des forfaits est un équivalent au barème, qui ne coûte rien de plus par tour."), sp.nextSibling);
+  sp.parentNode.insertBefore(el("p", "meta", "Amounts paid per token are estimated turn by turn (price list × tokens); "
+    + "plan value is a price-list equivalent, which costs nothing extra per turn."), sp.nextSibling);
 
   // Dépense réelle (soldes des fournisseurs) face à l'estimation
-  var realBox = document.getElementById("real"), PERIOD = {window: "fenêtre", "24h": "24 h"};
+  var realBox = document.getElementById("real"), PERIOD = {window: "window", "24h": "24 h"};
   (B.real || []).forEach(function (r) {
-    var txt = "dépense réelle " + r.provider + " " + (PERIOD[r.period] || "") + " (soldes) : "
+    var txt = "actual spend " + r.provider + " " + (PERIOD[r.period] || "") + " (balances): "
       + r.real_spent.toFixed(2) + " " + r.currency;
-    if (r.estimated_usd !== null && r.estimated_usd !== undefined) txt += " · estimée " + usd(r.estimated_usd);
-    if (r.gap_usd !== null && r.gap_usd !== undefined) txt += " · écart " + (r.gap_usd >= 0 ? "+" : "") + r.gap_usd.toFixed(2) + " $";
-    if (r.topups) txt += " · recharge(s) " + r.topups.toFixed(2);
-    txt += " · relevés " + hm(r.start_ts) + " → " + hm(r.end_ts);
-    realBox.appendChild(el("div", r.alert ? "warn" : "meta", (r.alert ? "⚠ écart au-delà du seuil — " : "") + txt));
+    if (r.estimated_usd !== null && r.estimated_usd !== undefined) txt += " · estimated " + usd(r.estimated_usd);
+    if (r.gap_usd !== null && r.gap_usd !== undefined) txt += " · gap " + (r.gap_usd >= 0 ? "+$" : "-$") + Math.abs(r.gap_usd).toFixed(2);
+    if (r.topups) txt += " · top-up(s) " + r.topups.toFixed(2);
+    txt += " · readings " + hm(r.start_ts) + " → " + hm(r.end_ts);
+    realBox.appendChild(el("div", r.alert ? "warn" : "meta", (r.alert ? "⚠ gap beyond the threshold — " : "") + txt));
   });
 
   function gaugeBar(label, used, capv, over) {
@@ -504,64 +504,64 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     f.style.width = Math.min(100, used * 100) + "%"; bar.appendChild(f);
     var cap = el("div", "cap"); cap.style.left = "calc(" + Math.min(100, capv * 100) + "% - 1px)"; bar.appendChild(cap);
     bar.setAttribute("role", "img");
-    bar.setAttribute("aria-label", Math.round(used * 100) + " % utilisé, rythme " + Math.round(capv * 100) + " %");
+    bar.setAttribute("aria-label", Math.round(used * 100) + "% used, pace " + Math.round(capv * 100) + "%");
     g.appendChild(bar);
     return g;
   }
 
   // Comptes déclarés (L74) : toutes les fenêtres, capacité perdue, prochain choix
   var accBox = document.getElementById("accounts"), covered = {};
-  if ((B.accounts || []).length) accBox.appendChild(el("div", "subhead", "Comptes des forfaits (hôte " + (D.host || "?") + ")"));
+  if ((B.accounts || []).length) accBox.appendChild(el("div", "subhead", "Plan accounts (host " + (D.host || "?") + ")"));
   (B.accounts || []).forEach(function (a) {
     covered[a.harness] = true;
     var box = el("div", "account");
     var head = el("div");
     head.appendChild(el("strong", null, a.harness + " / " + a.account));
     var flags = [];
-    if (a.active) flags.push(a.forced ? "actif (forcé)" : "actif");
-    if (a.next) flags.push("prochain choix");
-    if (!a.ok) flags.push("au seuil");
+    if (a.active) flags.push(a.forced ? "active (forced)" : "active");
+    if (a.next) flags.push("next choice");
+    if (!a.ok) flags.push("at threshold");
     if (flags.length) head.appendChild(el("span", "meta", " — " + flags.join(" · ")));
     box.appendChild(head);
-    if (!a.gauges.length) box.appendChild(el("div", "meta", "aucune jauge lue pour ce compte"));
+    if (!a.gauges.length) box.appendChild(el("div", "meta", "no gauge read for this account"));
     a.gauges.forEach(function (g) {
       var over = g.used >= g.pace_cap;
-      box.appendChild(gaugeBar(g.key + " : " + Math.round(g.used * 100) + " % utilisé, rythme " + Math.round(g.pace_cap * 100) + " %"
-        + (g.reset_passed ? " — remise à zéro passée (dernier relevé " + Math.round(g.last_used * 100) + " %)"
-           : (g.resets_ts ? " · remise à zéro " + hm(g.resets_ts) : "")), g.used, g.pace_cap, over));
+      box.appendChild(gaugeBar(g.key + ": " + Math.round(g.used * 100) + "% used, pace " + Math.round(g.pace_cap * 100) + "%"
+        + (g.reset_passed ? " — reset passed (last reading " + Math.round(g.last_used * 100) + "%)"
+           : (g.resets_ts ? " · reset " + hm(g.resets_ts) : "")), g.used, g.pace_cap, over));
     });
-    if (a.losses.length) box.appendChild(el("div", "meta", "perdu à la remise à zéro si rien ne change : "
-      + a.losses.map(function (l) { return l.key + " " + Math.round(l.lost * 100) + " % dans " + dur(l.in_s); }).join(", ")));
+    if (a.losses.length) box.appendChild(el("div", "meta", "lost at reset if nothing changes: "
+      + a.losses.map(function (l) { return l.key + " " + Math.round(l.lost * 100) + "% in " + dur(l.in_s); }).join(", ")));
     if (a.reason) box.appendChild(el("div", "warn", a.reason));
-    if (a.next && a.why) box.appendChild(el("div", "meta", "prochain choix : " + a.why));
+    if (a.next && a.why) box.appendChild(el("div", "meta", "next choice: " + a.why));
     accBox.appendChild(box);
   });
 
   // Jauges des harnais sans comptes déclarés
   var plans = document.getElementById("plans");
   var rest = B.plans.filter(function (p) { return !covered[p.harness]; });
-  if (!rest.length && !(B.accounts || []).length) plans.appendChild(el("p", "empty", "Aucune jauge de forfait lue sur cet hôte."));
+  if (!rest.length && !(B.accounts || []).length) plans.appendChild(el("p", "empty", "No plan gauge read on this host."));
   rest.forEach(function (p) {
-    plans.appendChild(gaugeBar("forfait " + p.harness + " " + p.key + " : " + Math.round(p.used * 100)
-      + " % utilisé, rythme " + Math.round(p.pace_cap * 100) + " %" + (p.exceeded ? " — dépassé" : "")
-      + (p.resets_ts ? " · remise à zéro " + hm(p.resets_ts) : ""), p.used, p.pace_cap, p.exceeded));
+    plans.appendChild(gaugeBar("plan " + p.harness + " " + p.key + ": " + Math.round(p.used * 100)
+      + "% used, pace " + Math.round(p.pace_cap * 100) + "%" + (p.exceeded ? " — exceeded" : "")
+      + (p.resets_ts ? " · reset " + hm(p.resets_ts) : ""), p.used, p.pace_cap, p.exceeded));
   });
 
   // Par agent : tours (échecs à part) et jetons d'entrée, de cache relu, de sortie
   function tok(n) {
     n = n || 0;
-    if (n >= 1e6) return (n / 1e6).toFixed(2).replace(".", ",") + " M";
-    if (n >= 1e4) return (n / 1e3).toFixed(1).replace(".", ",") + " k";
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + " M";
+    if (n >= 1e4) return (n / 1e3).toFixed(1) + " k";
     return String(n);
   }
   if (B.by_agent.length) {
     var tb = el("table"), tr = el("tr");
-    ["agent", "harnais", "modèle", "tours", "en échec", "USD", "entrée", "cache relu", "sortie"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+    ["agent", "harness", "model", "turns", "failed", "USD", "input", "cache read", "output"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
     tb.appendChild(tr);
     B.by_agent.forEach(function (r) {
       var x = el("tr");
       x.appendChild(el("td", null, r.agent));
-      x.appendChild(el("td", null, r.harness + (r.paid ? " (payé)" : " (forfait)")));
+      x.appendChild(el("td", null, r.harness + (r.paid ? " (paid)" : " (plan)")));
       x.appendChild(el("td", null, r.model || "—")); x.appendChild(el("td", "n", r.turns));
       x.appendChild(el("td", "n", r.failed_turns || 0));
       x.appendChild(el("td", "n", r.usd.toFixed(4)));
@@ -583,7 +583,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     try { hidden = window.localStorage.getItem("ameesh-roadmap-hidden") === "1"; } catch (e) { hidden = false; }
     function apply() {
       body.style.display = hidden ? "none" : "";
-      tg.textContent = hidden ? "afficher" : "masquer";
+      tg.textContent = hidden ? "show" : "hide";
       tg.setAttribute("aria-expanded", hidden ? "false" : "true");
     }
     tg.addEventListener("click", function () {
@@ -601,10 +601,10 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     function dm(iso) { if (!iso) return "—"; var p = String(iso).split("-"); return p[2] + "/" + p[1]; }
     function dmTs(ts) { if (!ts) return "—"; var d = new Date(ts * 1000); return pad(d.getDate()) + "/" + pad(d.getMonth() + 1); }
     var todayTs = dayTs(R.today) + 43200;
-    var LBL = {start: "début", end: "fin", delivery: "livraison", demandee: "demandée", debut: "en cours",
-               soumise: "soumise", verdict: "verdict", livree: "livrée"};
-    var ST = {en_cours: "en cours", a_valider: "à valider", validee: "validée", bloquee: "bloquée",
-              livree: "livrée", abandonnee: "abandonnée"};
+    var LBL = {start: "start", end: "end", delivery: "delivery", demandee: "requested", debut: "in progress",
+               soumise: "submitted", verdict: "verdict", livree: "delivered"};
+    var ST = {en_cours: "in progress", a_valider: "to validate", validee: "validated", bloquee: "blocked",
+              livree: "delivered", abandonnee: "abandoned"};
     var axis = document.getElementById("rm-axis"), days = Math.round(sp / 86400);
     var stepDays = [1, 2, 7, 14, 28].filter(function (k) { return days / k <= Math.max(2, Math.floor((axis.clientWidth || 320) / 56)); })[0] || 28;
     var ticks = [];
@@ -633,18 +633,18 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     function planned(p) {
       var out = ["start", "end", "delivery"].filter(function (k) { return p && p[k]; })
         .map(function (k) { return LBL[k] + " " + dm(p[k]); });
-      return out.length ? "prévu : " + out.join(", ") : "sans date prévue";
+      return out.length ? "planned: " + out.join(", ") : "no planned date";
     }
     function source(det, src) {
       if (!src || !src.label) return;
-      det.appendChild(document.createTextNode(" · source : "));
+      det.appendChild(document.createTextNode(" · source: "));
       if (src.url) { var a = el("a", null, src.label); a.href = src.url; a.rel = "noreferrer noopener"; det.appendChild(a); }
       else det.appendChild(document.createTextNode(src.label));
     }
     function late(head, l) {
       if (!l) return;
-      head.appendChild(el("span", "chip st-late", l.open ? "⚠ en retard de " + l.days + " j"
-        : "livrée avec " + l.days + " j de retard"));
+      head.appendChild(el("span", "chip st-late", l.open ? "⚠ " + l.days + " d late"
+        : "delivered " + l.days + " d late"));
     }
     function planBars(p, real, ended) {
       var ps = dayTs(p.start), pe = dayTs(p.end), pd = dayTs(p.delivery);
@@ -660,8 +660,8 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
           parts.push({a: target + 86400, b: rz, cls: "rm-real late"});
         } else parts.push({a: ra, b: rz, cls: "rm-real" + (done ? " done" : "")});
       }
-      if (pd) parts.push({mark: true, at: pd + 43200, title: "livraison prévue " + dm(p.delivery)});
-      if (real && real.livree) parts.push({mark: true, at: real.livree, cls: "done", title: "livrée " + dmTs(real.livree)});
+      if (pd) parts.push({mark: true, at: pd + 43200, title: "planned delivery " + dm(p.delivery)});
+      if (real && real.livree) parts.push({mark: true, at: real.livree, cls: "done", title: "delivered " + dmTs(real.livree)});
       return parts;
     }
     function group(title, rows, render) {
@@ -673,7 +673,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", p.id));
       head.appendChild(el("span", "t", p.title));
-      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " livrée(s)"));
+      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " delivered"));
       late(head, p.late);
       row.appendChild(head);
       // le réel d'une fiche court jusqu'à aujourd'hui tant que tout n'est pas livré
@@ -683,9 +683,9 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       source(det, p.source);
       row.appendChild(det); box.appendChild(row);
     }
-    group("Jalons", R.milestones, pkgRow);
+    group("Milestones", R.milestones, pkgRow);
     group("Epics", R.epics, pkgRow);
-    group("Tâches", R.tasks, function (x) {
+    group("Tasks", R.tasks, function (x) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", "#" + x.id));
       head.appendChild(el("span", "t", x.title + (x.epic ? " [" + x.epic + "]" : "")));
@@ -695,42 +695,42 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       row.appendChild(track(planBars(x.planned, x.real, x.state === "abandonnee")));
       var reached = ["demandee", "debut", "soumise", "verdict", "livree"].filter(function (k) { return x.real[k]; })
         .map(function (k) { return LBL[k] + " " + dmTs(x.real[k]); });
-      var det = el("div", "rm-detail", [planned(x.planned), reached.length ? "réel : " + reached.join(", ") : "",
+      var det = el("div", "rm-detail", [planned(x.planned), reached.length ? "actual: " + reached.join(", ") : "",
         x.estimate && x.estimate.minutes ? x.estimate.label : "", x.assignee || ""].filter(Boolean).join(" · "));
       source(det, x.source);
-      if (x.commitments.length) det.appendChild(document.createTextNode(" · engagement(s) "
+      if (x.commitments.length) det.appendChild(document.createTextNode(" · commitment(s) "
         + x.commitments.map(function (i) { return "e" + i; }).join(", ")));
       row.appendChild(det); box.appendChild(row);
     });
-    var CST = {proposed: "proposé, à valider", open: "ouvert", done: "tenu", cancelled: "annulé"};
-    group("Engagements", R.commitments, function (c) {
+    var CST = {proposed: "proposed, to validate", open: "open", done: "kept", cancelled: "cancelled"};
+    group("Commitments", R.commitments, function (c) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", "e" + c.id));
       head.appendChild(el("span", "t", c.what));
       head.appendChild(el("span", "chip st-" + (c.fulfilled ? "done" : c.status === "proposed" ? "proposed" : "active"),
-        c.fulfilled ? "tenu" : CST[c.status] || c.status));
+        c.fulfilled ? "kept" : CST[c.status] || c.status));
       late(head, c.late);
       row.appendChild(head);
-      row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "pour " + dm(c.due)}]));
-      var det = el("div", "rm-detail", ["pour " + dm(c.due), c.owner || "", c.project ? "projet " + c.project : "",
-        c.lot ? "tâche #" + c.lot : "", c.depends_on.length ? "dépend de " + c.depends_on.join(", ") : ""]
+      row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "due " + dm(c.due)}]));
+      var det = el("div", "rm-detail", ["due " + dm(c.due), c.owner || "", c.project ? "project " + c.project : "",
+        c.lot ? "task #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
         .filter(Boolean).join(" · "));
       source(det, c.source);
       row.appendChild(det); box.appendChild(row);
     });
-    group("Décisions attendues", R.decisions, function (c) {
+    group("Pending decisions", R.decisions, function (c) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", c.id ? "e" + c.id : "#" + c.lot));
       head.appendChild(el("span", "t", c.what));
-      if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposé, à valider"));
+      if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposed, to validate"));
       row.appendChild(head);
       row.appendChild(track([{mark: true, at: c.due ? dayTs(c.due) + 43200 : todayTs, cls: "decision"}]));
-      var det = el("div", "rm-detail", (c.due ? "pour " + dm(c.due) : "sans date") + (c.owner ? " · " + c.owner : ""));
+      var det = el("div", "rm-detail", (c.due ? "due " + dm(c.due) : "no date") + (c.owner ? " · " + c.owner : ""));
       source(det, c.source);
       row.appendChild(det); box.appendChild(row);
     });
     if (!R.tasks.length && !R.epics.length && !R.milestones.length && !R.commitments.length && !R.decisions.length)
-      box.appendChild(el("p", "empty", "Rien à planifier : aucune tâche ouverte, aucune date prévue, aucun engagement."));
+      box.appendChild(el("p", "empty", "Nothing to plan: no open task, no planned date, no commitment."));
   })();
 
   var miss = document.getElementById("missing");

@@ -112,10 +112,10 @@ class PlafondDeContexteTest(_Base):
         flux = self._evenements(worker)
         self.assertIn('"tool_use_id": "outil-0"', flux)   # l'outil en cours a fini
         self.assertNotIn('"tool_use_id": "outil-1"', flux)  # le suivant, jamais
-        self.assertTrue(worker.last_turn_closed.startswith("plafond de contexte"))
+        self.assertTrue(worker.last_turn_closed.startswith("context cap"))
         agent = registry.get(self.db, "orch-ctx")
         self.assertEqual(agent["status"], "idle")
-        self.assertIn("clos : plafond de contexte", agent["status_text"])
+        self.assertIn("closed: context cap", agent["status_text"])
         # le grand livre relit l'usage par appel d'un tour sans `result`
         self.assertGreaterEqual(worker.last_turn_reread, 1200)
         self.assertTrue(worker.rotation_forcee)
@@ -135,8 +135,8 @@ class PlafondDeContexteTest(_Base):
             self.assertTrue(worker.run_turn(spec))
         argv = self.turns()[-1]["argv"]
         self.assertNotIn("--resume", argv)
-        self.assertIn("Reprise de session après rotation", argv[-1])
-        self.assertIn("Suite : ton tour précédent a été clos", argv[-1])
+        self.assertIn("Session resumed after rotation", argv[-1])
+        self.assertIn("Continuation: your previous turn was closed", argv[-1])
         self.assertIsNone(worker.suite)
 
     def test_politique_jamais_suite_sans_rotation(self):
@@ -173,7 +173,7 @@ class DureeMaximaleTest(_Base):
         flux = self._evenements(worker)
         self.assertIn('"tool_use_id": "outil-0"', flux)   # l'outil en cours a fini
         self.assertNotIn('"tool_use_id": "outil-1"', flux)
-        self.assertTrue(worker.last_turn_closed.startswith("durée maximale du tour"))
+        self.assertTrue(worker.last_turn_closed.startswith("maximum turn duration"))
         self.assertIsNone(worker.rotation_forcee)
         session = worker.current_session()
         self.assertTrue(session)
@@ -184,7 +184,7 @@ class DureeMaximaleTest(_Base):
             self.assertTrue(worker.run_turn(spec))
         argv = self.turns()[-1]["argv"]
         self.assertEqual(argv[argv.index("--resume") + 1], session)
-        self.assertIn("durée maximale du tour", argv[-1])
+        self.assertIn("maximum turn duration", argv[-1])
 
     def test_sans_limite_le_tour_va_au_bout(self):
         _runner, worker = self._worker("orch-libre", turn_max_seconds=0)
@@ -226,8 +226,8 @@ class CourrierBorneTest(_Base):
         sortie = self._hook(worker, "tour-1")
         self.assertIn("message n°4", sortie)
         self.assertNotIn("message n°5", sortie)
-        self.assertIn("2 message(s) en attente", sortie)
-        self.assertIn("Conclus ce tour", sortie)
+        self.assertIn("2 pending message(s)", sortie)
+        self.assertIn("Wrap up this turn", sortie)
         self.assertEqual(self._livres(ids), 5)
         # borne atteinte : plus rien de remis ni de réservé, et le Stop ne
         # relance plus le tour
@@ -241,7 +241,7 @@ class CourrierBorneTest(_Base):
         mail.release(self.db, "orch-mail", jeton, [int(r["id"]) for r in restants])
         # l'exécuteur le note après le tour
         worker._note_courrier_borne("tour-1", 12.0)
-        self.assertEqual(worker.last_turn_closed, "courrier borné")
+        self.assertEqual(worker.last_turn_closed, "mail cap")
         self.assertIsNone(worker.suite)  # le reste du courrier ouvre le tour suivant
 
     def test_un_nouveau_tour_remet_la_suite(self):
@@ -251,7 +251,7 @@ class CourrierBorneTest(_Base):
         sortie = self._hook(worker, "tour-2", borne=5)
         self.assertIn("message n°5", sortie)
         self.assertIn("message n°6", sortie)
-        self.assertNotIn("en attente", sortie)
+        self.assertNotIn("pending message(s)", sortie)
         self.assertEqual(self._livres(ids), 7)
 
     def test_stop_bloque_dans_la_borne(self):
@@ -259,7 +259,7 @@ class CourrierBorneTest(_Base):
         ids = [mail.send(self.db, "pair", "orch-stop", "message n°%d" % i) for i in range(3)]
         sortie = json.loads(self._hook(worker, "tour-1", event="Stop", borne=2))
         self.assertEqual(sortie["decision"], "block")
-        self.assertIn("1 message(s) en attente", sortie["reason"])
+        self.assertIn("1 pending message(s)", sortie["reason"])
         self.assertEqual(self._livres(ids), 2)
 
     def test_borne_zero_ou_hors_tour_mene_sans_borne(self):
@@ -275,15 +275,15 @@ class ReglagesTest(_Base):
         self._worker("orch-set")
         proc = self.mesh("set", "orch-set", "turn_max_seconds=45m", "turn_mail_max=3")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("tour_max_s=2700", proc.stdout)
-        self.assertIn("courrier_par_tour=3", proc.stdout)
+        self.assertIn("turn_max_s=2700", proc.stdout)
+        self.assertIn("mail_per_turn=3", proc.stdout)
         agent = registry.get(self.db, "orch-set")
         self.assertEqual((agent["turn_max_seconds"], agent["turn_mail_max"]), (2700, 3))
         self.assertEqual(self.mesh("set", "orch-set", "turn_max_seconds=bientot").returncode, 2)
         self.assertEqual(self.mesh("set", "orch-set", "turn_mail_max=-1").returncode, 2)
         proc = self.mesh("set", "orch-set", "turn_max_seconds=", "turn_mail_max=")
-        self.assertIn("tour_max_s=1800 (défaut)", proc.stdout)
-        self.assertIn("courrier_par_tour=20 (défaut)", proc.stdout)
+        self.assertIn("turn_max_s=1800 (default)", proc.stdout)
+        self.assertIn("mail_per_turn=20 (default)", proc.stdout)
 
     def test_borne_du_courrier_passee_au_harnais(self):
         _runner, worker = self._worker("orch-env", turn_mail_max=2)

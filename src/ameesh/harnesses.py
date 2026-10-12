@@ -106,7 +106,7 @@ class Finding:
 
     def __str__(self) -> str:
         return "%s %-32s %s" % (
-            "ERREUR " if self.severity == ERROR else "avert. ", self.code, self.message)
+            "ERROR  " if self.severity == ERROR else "warn.  ", self.code, self.message)
 
 
 @dataclass(frozen=True)
@@ -225,19 +225,19 @@ def _euid() -> int | None:
 def _component_problem(info: os.stat_result, path: str, *, directory: bool) -> str:
     """Pourquoi un composant du dossier de l'hôte est refusé, ou ''."""
     if stat.S_ISLNK(info.st_mode):
-        return "lien symbolique refusé dans le dossier de descripteurs : %s" % path
+        return "symlink refused in the descriptor directory: %s" % path
     if directory and not stat.S_ISDIR(info.st_mode):
-        return "composant non dossier : %s" % path
+        return "component is not a directory: %s" % path
     if not directory and not stat.S_ISREG(info.st_mode):
-        return "fichier ordinaire attendu : %s" % path
+        return "regular file expected: %s" % path
     euid = _euid()
     if euid is not None and info.st_uid != euid:
-        return "composant d'un autre utilisateur (%s) : ignoré" % path
+        return "component owned by another user (%s): ignored" % path
     if directory and info.st_mode & 0o077:
-        return ("dossier de descripteurs non privé (%s, mode %o, attendu 700) : ignoré"
+        return ("descriptor directory not private (%s, mode %o, expected 700): ignored"
                 % (path, info.st_mode & 0o777))
     if not directory and info.st_mode & 0o022:
-        return ("descripteur modifiable par le groupe ou les autres (%s, mode %o) : ignoré"
+        return ("descriptor writable by group or others (%s, mode %o): ignored"
                 % (path, info.st_mode & 0o777))
     return ""
 
@@ -256,7 +256,7 @@ def host_dir_problem(directory: str) -> str:
     try:
         info = os.lstat(directory)
     except OSError as exc:
-        return "dossier de descripteurs illisible (%s) : %s" % (directory, exc.strerror or exc)
+        return "descriptor directory unreadable (%s): %s" % (directory, exc.strerror or exc)
     problem = _component_problem(info, directory, directory=True)
     if problem:
         return problem
@@ -268,7 +268,7 @@ def host_file_problem(path: str) -> str:
     try:
         info = os.lstat(path)
     except OSError as exc:
-        return "descripteur illisible (%s) : %s" % (path, exc.strerror or exc)
+        return "descriptor unreadable (%s): %s" % (path, exc.strerror or exc)
     return _component_problem(info, path, directory=False)
 
 
@@ -290,7 +290,7 @@ def _sources(directory: str, findings: list[Finding] | None = None) -> list[str]
                 if findings is not None:
                     findings.append(Finding(
                         "harness-host-insecure", WARNING,
-                        "lien symbolique ignoré dans le dossier de descripteurs : %s"
+                        "symlink ignored in the descriptor directory: %s"
                         % entry.path, entry.path))
                 continue
             if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
@@ -305,7 +305,7 @@ def _sources(directory: str, findings: list[Finding] | None = None) -> list[str]
                     if findings is not None:
                         findings.append(Finding(
                             "harness-host-insecure", WARNING,
-                            "descripteur atteint par un lien symbolique : %s" % agent, agent))
+                            "descriptor reached through a symlink: %s" % agent, agent))
                     continue
                 if stat.S_ISREG(info.st_mode):
                     out.append(agent)
@@ -354,16 +354,16 @@ def _secure_read(path: str, root: str) -> bytes:
     cible = os.path.abspath(path)
     rel = os.path.relpath(cible, racine)
     if rel == os.pardir or rel.startswith(os.pardir + os.sep):
-        pb = "descripteur hors du dossier de l'hôte : %s" % cible
+        pb = "descriptor outside the host directory: %s" % cible
         raise DescriptorError(pb, [Finding("harness-host-insecure", WARNING, pb, cible)])
     composants = [c for c in rel.split(os.sep) if c not in ("", os.curdir)]
     if not composants:
-        pb = "descripteur sans chemin de fichier : %s" % cible
+        pb = "descriptor without a file path: %s" % cible
         raise DescriptorError(pb, [Finding("harness-host-insecure", WARNING, pb, cible)])
     try:
         fd = _open_root_dir(racine)
     except OSError as exc:
-        pb = ("dossier de descripteurs atteint par un lien ou illisible (%s) : %s"
+        pb = ("descriptor directory reached through a link or unreadable (%s): %s"
               % (racine, exc))
         raise DescriptorError(pb, [Finding("harness-host-insecure", WARNING, pb, racine)])
     ouvert: int | None = None
@@ -401,7 +401,7 @@ def _secure_read(path: str, root: str) -> bytes:
     except OSError as exc:
         if ouvert is not None:
             os.close(ouvert)
-        pb = "descripteur atteint par un lien ou un composant interdit (%s) : %s" % (cible, exc)
+        pb = "descriptor reached through a link or a forbidden component (%s): %s" % (cible, exc)
         raise DescriptorError(pb, [Finding("harness-host-insecure", WARNING, pb, cible)])
     finally:
         # Le dossier parent est toujours refermé : sans ce `finally` il fuitait
@@ -481,78 +481,78 @@ def _normalize_authentication(value: Any) -> dict | None:
 def _check_distribution(value: Any, findings: list[Finding]) -> None:
     if not isinstance(value, dict):
         findings.append(Finding("harness-distribution-invalid", ERROR,
-                                "`distribution` : objet attendu"))
+                                "`distribution`: object expected"))
         return
     if not value:
         findings.append(Finding("harness-distribution-empty", WARNING,
-                                "`distribution` vide : l'installation du harnais n'est pas décrite"))
+                                "`distribution` empty: the harness install is not described"))
         return
     for kind, entry in value.items():
         if kind not in DISTRIBUTION_TYPES:
             findings.append(Finding("harness-distribution-invalid", ERROR,
-                                    "`distribution.%s` : type inconnu (%s)"
+                                    "`distribution.%s`: unknown type (%s)"
                                     % (kind, " | ".join(DISTRIBUTION_TYPES))))
             continue
         if not isinstance(entry, dict):
             findings.append(Finding("harness-distribution-invalid", ERROR,
-                                    "`distribution.%s` : objet attendu" % kind))
+                                    "`distribution.%s`: object expected" % kind))
             continue
         if kind == "binary":
             for target, item in entry.items():
                 if target not in BINARY_TARGETS:
                     findings.append(Finding("harness-distribution-invalid", ERROR,
-                                            "`distribution.binary.%s` : cible inconnue" % target))
+                                            "`distribution.binary.%s`: unknown target" % target))
                 elif not isinstance(item, dict) or not _text(item.get("archive")) \
                         or not _text(item.get("cmd")):
                     findings.append(Finding(
                         "harness-distribution-invalid", ERROR,
-                        "`distribution.binary.%s` : `archive` et `cmd` attendus" % target))
+                        "`distribution.binary.%s`: `archive` and `cmd` expected" % target))
                 else:
                     _check_args_env(item, "distribution.binary.%s" % target, findings)
         else:
             if not _text(entry.get("package")):
                 findings.append(Finding("harness-distribution-invalid", ERROR,
-                                        "`distribution.%s.package` attendu" % kind))
+                                        "`distribution.%s.package` expected" % kind))
             _check_args_env(entry, "distribution.%s" % kind, findings)
 
 
 def _check_args_env(entry: dict, where: str, findings: list[Finding]) -> None:
     if "args" in entry and _strings(entry.get("args")) is None:
         findings.append(Finding("harness-distribution-invalid", ERROR,
-                                "`%s.args` : liste de textes attendue" % where))
+                                "`%s.args`: list of strings expected" % where))
     if "env" in entry and not isinstance(entry.get("env"), dict):
         findings.append(Finding("harness-distribution-invalid", ERROR,
-                                "`%s.env` : objet attendu" % where))
+                                "`%s.env`: object expected" % where))
 
 
 def _check_setting(key: str, value: Any, findings: list[Finding]) -> None:
     if not isinstance(value, dict):
         findings.append(Finding("harness-option-invalid", ERROR,
-                                "`ameesh.%s` : objet attendu" % key))
+                                "`ameesh.%s`: object expected" % key))
         return
     unknown = [k for k in value if k not in ("flag", "file", "default")]
     for name in unknown:
         findings.append(Finding("harness-key-unknown", WARNING,
-                                "`ameesh.%s.%s` : clé inconnue (ignorée)" % (key, name)))
+                                "`ameesh.%s.%s`: unknown key (ignored)" % (key, name)))
     flag = value.get("flag")
     if flag is not None and _strings(flag) is None:
         findings.append(Finding("harness-option-invalid", ERROR,
-                                "`ameesh.%s.flag` : liste de textes attendue" % key))
+                                "`ameesh.%s.flag`: list of strings expected" % key))
     default = value.get("default")
     if default is not None and not isinstance(default, (str, int, float)):
         findings.append(Finding("harness-option-invalid", ERROR,
-                                "`ameesh.%s.default` : texte attendu" % key))
+                                "`ameesh.%s.default`: text expected" % key))
     delivery = value.get("file")
     if delivery is None:
         return
     if not isinstance(delivery, dict):
         findings.append(Finding("harness-option-invalid", ERROR,
-                                "`ameesh.%s.file` : objet attendu" % key))
+                                "`ameesh.%s.file`: object expected" % key))
         return
     template = delivery.get("template")
     if not isinstance(template, str) or not template:
         findings.append(Finding("harness-option-invalid", ERROR,
-                                "`ameesh.%s.file.template` : texte non vide attendu" % key))
+                                "`ameesh.%s.file.template`: non-empty text expected" % key))
         return
     # les placeholders du gabarit sont limités aux valeurs connues : {model},
     # {effort}, {tier}, {path} — une faute de frappe laisserait un patch vide.
@@ -560,165 +560,165 @@ def _check_setting(key: str, value: Any, findings: list[Finding]) -> None:
     for _literal, name, _spec, _conv in Formatter().parse(template):
         if name is not None and name not in known:
             findings.append(Finding("harness-option-invalid", ERROR,
-                                    "`ameesh.%s.file.template` : placeholder {%s} inconnu (%s)"
+                                    "`ameesh.%s.file.template`: unknown placeholder {%s} (%s)"
                                     % (key, name, ", ".join(sorted(known)))))
     for name in delivery:
         if name not in ("template",):
             findings.append(Finding("harness-key-unknown", WARNING,
-                                    "`ameesh.%s.file.%s` : clé inconnue (ignorée)" % (key, name)))
+                                    "`ameesh.%s.file.%s`: unknown key (ignored)" % (key, name)))
 
 
 def validate(document: Any, *, path: str = "") -> list[Finding]:
     """Les constats d'un document de descripteur (erreurs bloquantes + avertissements)."""
     findings: list[Finding] = []
     if not isinstance(document, dict):
-        return [Finding("harness-not-object", ERROR, "objet JSON attendu", path)]
+        return [Finding("harness-not-object", ERROR, "JSON object expected", path)]
     for key in document:
         if key not in MANIFEST_KEYS:
             findings.append(Finding("harness-key-unknown", WARNING,
-                                    "clé inconnue au premier niveau : `%s` (ignorée)" % key,
+                                    "unknown top-level key: `%s` (ignored)" % key,
                                     path))
     ident = _text(document.get("id"))
     if ident is None:
-        findings.append(Finding("harness-id-missing", ERROR, "`id` requis (texte)", path))
+        findings.append(Finding("harness-id-missing", ERROR, "`id` required (text)", path))
     elif not ID_RE.match(ident):
         findings.append(Finding("harness-id-invalid", ERROR,
-                                "`id` %r invalide (minuscules, chiffres, tirets, "
-                                "commence par une lettre)" % ident, path))
+                                "`id` %r invalid (lowercase, digits, hyphens, "
+                                "starts with a letter)" % ident, path))
     for key in ("name", "version", "schema_version", "description"):
         value = document.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             value = str(value)
         if _text(value) is None:
             findings.append(Finding("harness-field-missing", ERROR,
-                                    "`%s` requis (texte non vide)" % key, path))
+                                    "`%s` required (non-empty text)" % key, path))
     version = document.get("schema_version")
     version = str(version) if isinstance(version, (int, float)) else version
     if _text(version) and str(version).split(".")[0] not in ("", SCHEMA_VERSION):
         findings.append(Finding("harness-schema-version", WARNING,
-                                "`schema_version` %s : ce code comprend la version %s "
-                                "(clés inconnues ignorées)" % (version, SCHEMA_VERSION), path))
+                                "`schema_version` %s: this code understands version %s "
+                                "(unknown keys ignored)" % (version, SCHEMA_VERSION), path))
     if "repository" in document and _text(document.get("repository")) is None:
         findings.append(Finding("harness-field-invalid", ERROR,
-                                "`repository` : texte attendu", path))
+                                "`repository`: text expected", path))
     if "license" in document and _text(document.get("license")) is None:
-        findings.append(Finding("harness-field-invalid", ERROR, "`license` : texte attendu", path))
+        findings.append(Finding("harness-field-invalid", ERROR, "`license`: text expected", path))
     if "authors" in document and _strings(document.get("authors")) is None:
         findings.append(Finding("harness-field-invalid", ERROR,
-                                "`authors` : liste de textes attendue", path))
+                                "`authors`: list of strings expected", path))
     if "capabilities" in document:
         caps = _normalize_capabilities(document.get("capabilities"))
         if caps is None:
             findings.append(Finding("harness-capabilities-invalid", ERROR,
-                                    "`capabilities` : objet méthode → booléen, ou liste de "
-                                    "méthodes", path))
+                                    "`capabilities`: object method → boolean, or list of "
+                                    "methods", path))
         else:
             for method in caps:
                 if method not in ACP_METHODS:
                     findings.append(Finding("harness-capabilities-invalid", WARNING,
-                                            "méthode ACP inconnue : `%s`" % method, path))
+                                            "unknown ACP method: `%s`" % method, path))
     if "authentication" in document:
         auth = _normalize_authentication(document.get("authentication"))
         if auth is None:
             findings.append(Finding("harness-authentication-invalid", ERROR,
-                                    "`authentication` : objet ou liste attendue", path))
+                                    "`authentication`: object or list expected", path))
         else:
             methods = auth.get("methods")
             if methods is not None:
                 if not isinstance(methods, list):
                     findings.append(Finding("harness-authentication-invalid", ERROR,
-                                            "`authentication.methods` : liste attendue", path))
+                                            "`authentication.methods`: list expected", path))
                 else:
                     for item in methods:
                         if not isinstance(item, dict) or not _text(item.get("id")):
                             findings.append(Finding(
                                 "harness-authentication-invalid", ERROR,
-                                "`authentication.methods` : chaque méthode porte un `id` "
-                                "texte", path))
+                                "`authentication.methods`: each method needs a text "
+                                "`id`", path))
                         elif item.get("type") not in AUTH_TYPES:
                             findings.append(Finding(
                                 "harness-authentication-invalid", ERROR,
-                                "méthode d'authentification %r : `type` attendu %s"
+                                "authentication method %r: `type` expected %s"
                                 % (item.get("id"), " | ".join(AUTH_TYPES)), path))
     if "distribution" in document:
         _check_distribution(document.get("distribution"), findings)
     if "icon" in document and _text(document.get("icon")) is None:
-        findings.append(Finding("harness-field-invalid", ERROR, "`icon` : texte attendu", path))
+        findings.append(Finding("harness-field-invalid", ERROR, "`icon`: text expected", path))
 
     ameesh = document.get("ameesh")
     if ameesh is None:
         findings.append(Finding("harness-ameesh-missing", ERROR,
-                                "espace `ameesh` requis (pilotage sans interface)", path))
+                                "`ameesh` namespace required (headless driving)", path))
         return findings
     if not isinstance(ameesh, dict):
-        findings.append(Finding("harness-ameesh-invalid", ERROR, "`ameesh` : objet attendu", path))
+        findings.append(Finding("harness-ameesh-invalid", ERROR, "`ameesh`: object expected", path))
         return findings
     for key in ameesh:
         if key not in AMEESH_KEYS:
             findings.append(Finding("harness-key-unknown", WARNING,
-                                    "`ameesh.%s` : clé inconnue (ignorée)" % key, path))
+                                    "`ameesh.%s`: unknown key (ignored)" % key, path))
     protocol = ameesh.get("protocol")
     if protocol not in PROTOCOLS:
         findings.append(Finding("harness-protocol-invalid", ERROR,
-                                "`ameesh.protocol` : %s attendu"
+                                "`ameesh.protocol`: %s expected"
                                 % " | ".join(PROTOCOLS), path))
     binary = _text(ameesh.get("binary"))
     if binary is None:
         findings.append(Finding("harness-binary-missing", ERROR,
-                                "`ameesh.binary` requis (nom ou chemin du binaire)", path))
+                                "`ameesh.binary` required (binary name or path)", path))
     env_names = ameesh.get("binary_env")
     if env_names is not None:
         names = _strings(env_names)
         if names is None or not all(ENV_RE.match(n) for n in names):
             findings.append(Finding("harness-binary-env-invalid", ERROR,
-                                    "`ameesh.binary_env` : noms de variables attendus", path))
+                                    "`ameesh.binary_env`: variable names expected", path))
     for key in ("launcher", "command"):
         value = ameesh.get(key)
         if value is not None and _strings(value) is None:
             findings.append(Finding("harness-command-invalid", ERROR,
-                                    "`ameesh.%s` : liste de textes attendue" % key, path))
+                                    "`ameesh.%s`: list of strings expected" % key, path))
     interactive = ameesh.get("interactive", "absent")
     if interactive != "absent" and interactive is not None and _strings(interactive) is None:
         findings.append(Finding("harness-command-invalid", ERROR,
-                                "`ameesh.interactive` : liste de textes ou null attendu", path))
+                                "`ameesh.interactive`: list of strings or null expected", path))
     session = ameesh.get("session")
     if session is not None:
         if not isinstance(session, dict):
             findings.append(Finding("harness-session-invalid", ERROR,
-                                    "`ameesh.session` : objet attendu", path))
+                                    "`ameesh.session`: object expected", path))
         else:
             for key in session:
                 if key != "flag":
                     findings.append(Finding("harness-key-unknown", WARNING,
-                                            "`ameesh.session.%s` : clé inconnue (ignorée)" % key,
+                                            "`ameesh.session.%s`: unknown key (ignored)" % key,
                                             path))
             if _strings(session.get("flag")) is None:
                 findings.append(Finding("harness-session-invalid", ERROR,
-                                        "`ameesh.session.flag` : liste de textes attendue", path))
+                                        "`ameesh.session.flag`: list of strings expected", path))
             if protocol == "acp":
                 findings.append(Finding("harness-session-invalid", WARNING,
-                                        "`ameesh.session` n'a pas de sens en ACP (session JSON-RPC)",
+                                        "`ameesh.session` makes no sense in ACP (JSON-RPC session)",
                                         path))
     stream = ameesh.get("stream")
     if protocol == "cli":
         if stream is None:
             findings.append(Finding("harness-stream-unknown", ERROR,
-                                    "`ameesh.stream` requis pour un harnais en ligne de commande "
+                                    "`ameesh.stream` required for a command-line harness "
                                     "(%s)" % " | ".join(STREAM_FORMATS), path))
         elif stream not in STREAM_FORMATS:
             findings.append(Finding("harness-stream-unknown", ERROR,
-                                    "`ameesh.stream` %r inconnu (%s)"
+                                    "`ameesh.stream` %r unknown (%s)"
                                     % (stream, " | ".join(STREAM_FORMATS)), path))
     elif stream is not None and stream != "acp-json":
         findings.append(Finding("harness-stream-unknown", ERROR,
-                                "`ameesh.stream` doit valoir `acp-json` en ACP", path))
+                                "`ameesh.stream` must be `acp-json` in ACP", path))
     env = ameesh.get("env")
     if env is not None:
         if not isinstance(env, dict) or not all(
                 isinstance(k, str) and ENV_RE.match(k) and isinstance(v, str)
                 for k, v in env.items()):
             findings.append(Finding("harness-env-invalid", ERROR,
-                                    "`ameesh.env` : objet nom → texte attendu", path))
+                                    "`ameesh.env`: object name → text expected", path))
     files = 0
     for key in ("model", "effort", "tier"):
         if key in ameesh:
@@ -727,43 +727,43 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                 files += 1
     if files > 1:
         findings.append(Finding("harness-option-invalid", ERROR,
-                                "un seul réglage peut être livré par fichier "
-                                "(model, effort ou tier)", path))
+                                "only one setting can be delivered by file "
+                                "(model, effort or tier)", path))
     _check_shape(ameesh.get("hooks"), "hooks", findings, path)
     cost = ameesh.get("cost")
     if cost is not None:
         if not isinstance(cost, dict):
             findings.append(Finding("harness-cost-invalid", ERROR,
-                                    "`ameesh.cost` : objet attendu", path))
+                                    "`ameesh.cost`: object expected", path))
         else:
             for key in cost:
                 if key not in ("source", "gauges", "paid_per_token"):
                     findings.append(Finding("harness-key-unknown", WARNING,
-                                            "`ameesh.cost.%s` : clé inconnue (ignorée)" % key,
+                                            "`ameesh.cost.%s`: unknown key (ignored)" % key,
                                             path))
             if cost.get("source") is not None and cost.get("source") not in (
                     "stream", "api", "none", "transcript", "sessions"):
                 findings.append(Finding("harness-cost-invalid", WARNING,
-                                        "`ameesh.cost.source` %r inconnu" % cost.get("source"),
+                                        "`ameesh.cost.source` %r unknown" % cost.get("source"),
                                         path))
             if "paid_per_token" in cost and not isinstance(cost["paid_per_token"], bool):
                 findings.append(Finding("harness-cost-invalid", ERROR,
-                                        "`ameesh.cost.paid_per_token` : booléen attendu", path))
+                                        "`ameesh.cost.paid_per_token`: boolean expected", path))
     findings.extend(_check_interactive_permission(ameesh.get("interactive_permission"), path))
     permissions = ameesh.get("permissions")
     if permissions is not None:
         if not isinstance(permissions, dict):
             findings.append(Finding("harness-permissions-invalid", ERROR,
-                                    "`ameesh.permissions` : objet attendu", path))
+                                    "`ameesh.permissions`: object expected", path))
         else:
             for key in permissions:
                 if key not in ("default", "allow_kinds", "deny_kinds"):
                     findings.append(Finding("harness-key-unknown", WARNING,
-                                            "`ameesh.permissions.%s` : clé inconnue (ignorée)"
+                                            "`ameesh.permissions.%s`: unknown key (ignored)"
                                             % key, path))
             if permissions.get("default") not in (None, "deny", "allow"):
                 findings.append(Finding("harness-permissions-invalid", ERROR,
-                                        "`ameesh.permissions.default` : deny | allow attendu", path))
+                                        "`ameesh.permissions.default`: deny | allow expected", path))
             for key in ("allow_kinds", "deny_kinds"):
                 kinds = permissions.get(key)
                 if kinds is None:
@@ -771,45 +771,45 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                 if not isinstance(kinds, list) or not all(
                         isinstance(k, str) and k in TOOL_KINDS for k in kinds):
                     findings.append(Finding("harness-permissions-invalid", ERROR,
-                                            "`ameesh.permissions.%s` : kinds ACP attendus (%s)"
+                                            "`ameesh.permissions.%s`: ACP kinds expected (%s)"
                                             % (key, " | ".join(TOOL_KINDS)), path))
     acp = ameesh.get("acp")
     if acp is not None:
         if not isinstance(acp, dict):
             findings.append(Finding("harness-acp-invalid", ERROR,
-                                    "`ameesh.acp` : objet attendu", path))
+                                    "`ameesh.acp`: object expected", path))
         else:
             for key in acp:
                 if key not in ("auth_method", "config"):
                     findings.append(Finding("harness-key-unknown", WARNING,
-                                            "`ameesh.acp.%s` : clé inconnue (ignorée)" % key,
+                                            "`ameesh.acp.%s`: unknown key (ignored)" % key,
                                             path))
             if acp.get("auth_method") is not None and _text(acp.get("auth_method")) is None:
                 findings.append(Finding("harness-acp-invalid", ERROR,
-                                        "`ameesh.acp.auth_method` : texte attendu", path))
+                                        "`ameesh.acp.auth_method`: text expected", path))
             config = acp.get("config")
             if config is not None and (not isinstance(config, dict) or not all(
                     isinstance(k, str) and k in ("model", "effort", "tier")
                     and isinstance(v, str) for k, v in config.items())):
                 findings.append(Finding("harness-acp-invalid", ERROR,
-                                        "`ameesh.acp.config` : objet model|effort|tier → "
-                                        "identifiant d'option attendu", path))
+                                        "`ameesh.acp.config`: object model|effort|tier → "
+                                        "option id expected", path))
     if "install" in ameesh:
         _check_shape(ameesh.get("install"), "install", findings, path)
     accounts = ameesh.get("accounts")
     if accounts is not None:
         if not isinstance(accounts, dict):
             findings.append(Finding("harness-accounts-invalid", ERROR,
-                                    "`ameesh.accounts` : objet attendu", path))
+                                    "`ameesh.accounts`: object expected", path))
         else:
             for key, value in accounts.items():
                 if key not in ACCOUNT_KEYS:
                     findings.append(Finding("harness-key-unknown", WARNING,
-                                            "`ameesh.accounts.%s` : clé inconnue (%s)"
+                                            "`ameesh.accounts.%s`: unknown key (%s)"
                                             % (key, " | ".join(ACCOUNT_KEYS)), path))
                 elif not isinstance(value, str) or not value:
                     findings.append(Finding("harness-accounts-invalid", ERROR,
-                                            "`ameesh.accounts.%s` : texte non vide attendu" % key,
+                                            "`ameesh.accounts.%s`: non-empty text expected" % key,
                                             path))
     return findings
 
@@ -820,7 +820,7 @@ def _check_shape(value: Any, key: str, findings: list[Finding], path: str) -> No
         return
     if not isinstance(value, dict):
         findings.append(Finding("harness-%s-invalid" % key, ERROR,
-                                "`ameesh.%s` : objet attendu" % key, path))
+                                "`ameesh.%s`: object expected" % key, path))
 
 
 def errors(findings: Iterable[Finding]) -> list[Finding]:
@@ -1014,12 +1014,12 @@ def load(path: str, *, source: str = "",
     except DescriptorError:
         raise
     except (OSError, ValueError, UnicodeDecodeError) as exc:
-        raise DescriptorError("descripteur illisible %s : %s" % (path, exc),
+        raise DescriptorError("descriptor unreadable %s: %s" % (path, exc),
                               [Finding("harness-unreadable", ERROR, str(exc), path)])
     findings = validate(document, path=path)
     blocking = errors(findings)
     if blocking:
-        raise DescriptorError("descripteur invalide %s : %s"
+        raise DescriptorError("descriptor invalid %s: %s"
                               % (path, "; ".join(f.message for f in blocking)), findings)
     descriptor = _build(document, path, tag or "paquet")
     return dataclass_replace_sha(descriptor, hashlib.sha256(brut).hexdigest())
@@ -1063,13 +1063,13 @@ def scan(host: str | None = None) -> tuple[dict[str, HarnessDescriptor], list[Fi
             if previous is not None and previous.source == source:
                 findings.append(Finding(
                     "harness-id-duplicate", ERROR,
-                    "descripteur %s déclaré deux fois dans la source %s (%s et %s)"
+                    "descriptor %s declared twice in source %s (%s and %s)"
                     % (descriptor.id, source, previous.path, path), path))
                 continue
             if previous is not None and previous.source == "paquet" and source == "hôte":
                 findings.append(Finding(
                     "harness-host-overrides", WARNING,
-                    "le descripteur de l'hôte %s masque celui du paquet %s pour l'id %s"
+                    "host descriptor %s shadows package descriptor %s for id %s"
                     % (path, previous.path, descriptor.id), path))
             out[descriptor.id] = descriptor  # l'hôte écrase le paquet
     return out, findings

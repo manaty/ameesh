@@ -50,23 +50,23 @@ def check_client_data(client_json: bytes, *, kind: str, challenge: bytes, origin
     try:
         client = jcs.loads(client_json)
     except jcs.JcsError as exc:
-        raise EnrollError("client_data", "clientDataJSON illisible : %s" % exc) from exc
+        raise EnrollError("client_data", "unreadable clientDataJSON: %s" % exc) from exc
     if not isinstance(client, dict):
-        raise EnrollError("client_data", "clientDataJSON : objet attendu")
+        raise EnrollError("client_data", "clientDataJSON: object expected")
     if client.get("type") != kind:
-        raise EnrollError("client_data_type", "clientDataJSON.type : %s attendu" % kind)
+        raise EnrollError("client_data_type", "clientDataJSON.type: %s expected" % kind)
     try:
         signed = b64u_decode(client.get("challenge"), "clientDataJSON.challenge")
     except receipts.ReceiptError as exc:
         raise EnrollError("challenge_mismatch", str(exc)) from exc
     if not hmac.compare_digest(signed, challenge):
-        raise EnrollError("challenge_mismatch", "le challenge n'est pas celui de ce lien")
+        raise EnrollError("challenge_mismatch", "the challenge is not the one for this link")
     if client.get("origin") not in origins:
-        raise EnrollError("origin", "origine non autorisée")
+        raise EnrollError("origin", "origin not allowed")
     if "crossOrigin" in client and client["crossOrigin"] is not False:
-        raise EnrollError("cross_origin", "contexte inter-origines refusé")
+        raise EnrollError("cross_origin", "cross-origin context refused")
     if "topOrigin" in client:
-        raise EnrollError("cross_origin", "contexte inter-origines refusé (topOrigin)")
+        raise EnrollError("cross_origin", "cross-origin context refused (topOrigin)")
     return client
 
 
@@ -78,34 +78,34 @@ def parse_registration(*, attestation_object: bytes, client_data_json: bytes, ra
     try:
         attestation, _end = cose.decode(attestation_object)
     except cose.CborError as exc:
-        raise EnrollError("attestation", "attestationObject illisible : %s" % exc) from exc
+        raise EnrollError("attestation", "unreadable attestationObject: %s" % exc) from exc
     if not isinstance(attestation, dict) or set(attestation) != {"fmt", "attStmt", "authData"}:
-        raise EnrollError("attestation", "attestationObject : fmt, attStmt, authData attendus")
+        raise EnrollError("attestation", "attestationObject: fmt, attStmt, authData expected")
     fmt, statement, auth = attestation["fmt"], attestation["attStmt"], attestation["authData"]
     if not isinstance(fmt, str) or not re.fullmatch(r"[a-z0-9-]{1,32}", fmt):
-        raise EnrollError("attestation", "format d'attestation illisible")
+        raise EnrollError("attestation", "unreadable attestation format")
     if not isinstance(statement, dict) or (fmt == "none" and statement):
-        raise EnrollError("attestation", "attStmt incohérent avec le format %s" % fmt)
+        raise EnrollError("attestation", "attStmt inconsistent with format %s" % fmt)
     if not isinstance(auth, bytes) or len(auth) < 55:
-        raise EnrollError("authenticator_data", "authData trop court")
+        raise EnrollError("authenticator_data", "authData too short")
     if not hmac.compare_digest(auth[:32], hashlib.sha256(rp_id.encode("utf-8")).digest()):
-        raise EnrollError("rp_id_mismatch", "rpIdHash différent du RP ID du service")
+        raise EnrollError("rp_id_mismatch", "rpIdHash differs from the service RP ID")
     flags = auth[32]
     if not flags & FLAG_UP:
-        raise EnrollError("user_presence", "présence de l'utilisateur non attestée (UP=0)")
+        raise EnrollError("user_presence", "user presence not attested (UP=0)")
     if not flags & FLAG_UV:
-        raise EnrollError("user_verification", "utilisateur non vérifié (UV=0)")
+        raise EnrollError("user_verification", "user not verified (UV=0)")
     if not flags & FLAG_AT:
-        raise EnrollError("authenticator_data", "pas de credential attesté (AT=0)")
+        raise EnrollError("authenticator_data", "no attested credential (AT=0)")
     if flags & FLAG_BS and not flags & FLAG_BE:
-        raise EnrollError("authenticator_data", "drapeaux incohérents : BS=1 sans BE")
+        raise EnrollError("authenticator_data", "inconsistent flags: BS=1 without BE")
     aaguid = auth[37:53]
     length = int.from_bytes(auth[53:55], "big")
     if not 16 <= length <= MAX_CREDENTIAL_ID or 55 + length > len(auth):
-        raise EnrollError("authenticator_data", "identifiant de credential de longueur invalide")
+        raise EnrollError("authenticator_data", "credential id of invalid length")
     credential = auth[55:55 + length]
     if not hmac.compare_digest(credential, raw_id):
-        raise EnrollError("credential_id", "rawId différent du credential attesté")
+        raise EnrollError("credential_id", "rawId differs from the attested credential")
     start = 55 + length
     try:
         _key, end = cose.decode(auth, start, allow_trailing=True)
@@ -114,11 +114,11 @@ def parse_registration(*, attestation_object: bytes, client_data_json: bytes, ra
         if flags & FLAG_ED:
             extensions, _done = cose.decode(auth, end)
             if not isinstance(extensions, dict):
-                raise EnrollError("authenticator_data", "extensions : table CBOR attendue")
+                raise EnrollError("authenticator_data", "extensions: CBOR map expected")
         elif end != len(auth):
-            raise EnrollError("authenticator_data", "authData : octets en trop")
+            raise EnrollError("authenticator_data", "authData: trailing bytes")
     except cose.CborError as exc:
-        raise EnrollError("key", "clé publique refusée : %s" % exc) from exc
+        raise EnrollError("key", "public key refused: %s" % exc) from exc
     return {
         "facade": "webauthn",
         "credential_id": b64u_encode(credential),
@@ -150,7 +150,7 @@ def write_proposal(directory: str, *, approver: str, entry: dict, rp_id: str, or
     """Écrit la proposition (0600) ; rend le nom du fichier créé."""
     match = _APPROVER_RE.fullmatch(approver)
     if not match:
-        raise EnrollError("approver", "approbateur « human:<id> » attendu")
+        raise EnrollError("approver", "approver \"human:<id>\" expected")
     directory = ensure_private_dir(directory)
     moment = time.time() if now is None else now
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(moment))
@@ -161,7 +161,7 @@ def write_proposal(directory: str, *, approver: str, entry: dict, rp_id: str, or
     lines = [
         "---",
         "type: AuthenticatorProposal",
-        "title: %s" % _q("Passkey proposée pour %s" % approver),
+        "title: %s" % _q("Proposed passkey for %s" % approver),
         "status: proposed",
         "member: %s" % _q(approver),
         "created: %s" % _q(created),
@@ -180,23 +180,23 @@ def write_proposal(directory: str, *, approver: str, entry: dict, rp_id: str, or
     lines += [
         "---",
         "",
-        "# Passkey proposée pour `%s`" % approver,
+        "# Proposed passkey for `%s`" % approver,
         "",
-        "Produite par ameesh-approve lors d'une cérémonie d'enrôlement (lien à usage",
-        "unique créé par `ameesh-approve enroll-link`). **Rien n'est actif** : ameesh ne",
-        "fait confiance qu'au registre du canon, à la révision fusionnée.",
+        "Produced by ameesh-approve during an enrollment ceremony (single-use link",
+        "created by `ameesh-approve enroll-link`). **Nothing is active**: ameesh only",
+        "trusts the canon registry, at the merged revision.",
         "",
-        "Avant de fusionner :",
+        "Before merging:",
         "",
-        "1. confirmer **hors bande** avec %s que cette passkey a bien été créée par" % approver,
-        "   cette personne le %s (appareil, heure) : c'est la parade contre un faux" % created,
-        "   enrôlement (lien intercepté, authentificateur virtuel) ;",
-        "2. comparer l'empreinte de clé `%s` ;" % entry["key_fingerprint"][:16],
-        "3. ajouter l'entrée ci-dessous à `authenticators` de la fiche du membre, par PR revue.",
+        "1. confirm **out of band** with %s that this passkey was really created by" % approver,
+        "   this person on %s (device, time): this is the defense against a fake" % created,
+        "   enrollment (intercepted link, virtual authenticator);",
+        "2. compare the key fingerprint `%s`;" % entry["key_fingerprint"][:16],
+        "3. add the entry below to `authenticators` in the member's sheet, via a reviewed PR.",
         "",
-        "Niveau proposé : `standard` (attestation non vérifiée%s). Le niveau `eleve` exige une"
-        % (", passkey synchronisable BE=1" if entry["backup_eligible"] else ""),
-        "clé matérielle (BE=0) dont l'attestation a été vérifiée par le relecteur.",
+        "Proposed level: `standard` (attestation not verified%s). The `eleve` level requires a"
+        % (", syncable passkey BE=1" if entry["backup_eligible"] else ""),
+        "hardware key (BE=0) whose attestation was verified by the reviewer.",
         "",
         "```yaml",
         "authenticators:",

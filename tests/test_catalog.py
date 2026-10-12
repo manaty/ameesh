@@ -43,7 +43,7 @@ class RetraitTest(unittest.TestCase):
         decision = reconcile(active("a", "b", "c"), seen())
         self.assertEqual(decision.to_retire, ())
         self.assertEqual(decision.refused_reason, "empty")
-        self.assertIn("rien n'est retiré", decision.detail)
+        self.assertIn("nothing is retired", decision.detail)
 
     def test_un_retrait_massif_est_refuse_et_un_humain_tranche(self):
         # 4 modèles actifs, la source n'en voit plus qu'un : 3 retraits sur 4 > moitié.
@@ -51,7 +51,7 @@ class RetraitTest(unittest.TestCase):
         self.assertEqual(decision.to_retire, ())
         self.assertEqual(decision.refused_reason, "mass-withdrawal")
         self.assertEqual(len(decision.mass_withdrawal_refused), 3)
-        self.assertIn("un humain tranche", decision.detail)
+        self.assertIn("a human decides", decision.detail)
 
     def test_exactement_la_moitie_passe(self):
         # La garde est « plus de la moitié », pas « la moitié » : 2 sur 4 est permis.

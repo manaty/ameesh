@@ -59,7 +59,16 @@ from . import canon_sync, db as db_mod, identity, registry
 from . import placement as placement_mod
 from .config import Config
 
-UNTRUSTED_TAG = "[NON APPROUVÉ] "
+UNTRUSTED_TAG = "[NOT APPROVED] "
+
+#: L156d : libellés anglais des actions de `canon_sync` à l'affichage ; le
+#: JSON (`--json`, `SyncAction.to_dict`) garde les valeurs stockées
+ACTION_LABELS = {
+    "créé": "created", "mis à jour": "updated", "inchangé": "unchanged",
+    "conflit": "conflict", "laissé": "left", "déplacé": "moved",
+    "réintégré": "revived", "arrêté": "stopped", "arrêt demandé": "stop requested",
+    "hors canon": "off canon",
+}
 
 
 def _load(cfg: Config, args: argparse.Namespace) -> canon_mod.Canon:
@@ -110,17 +119,17 @@ def _print_findings(findings: list[canon_mod.Finding]) -> None:
     for f in findings:
         print("%s%-8s %-30s %s — %s" % (
             UNTRUSTED_TAG if f.untrusted else "",
-            "ERREUR" if f.severity == canon_mod.ERROR
-            else "info." if f.severity == canon_mod.INFO else "avert.",
+            "ERROR" if f.severity == canon_mod.ERROR
+            else "info." if f.severity == canon_mod.INFO else "warn.",
             f.code, f.where(), f.message))
 
 
 def _summary(findings: list[canon_mod.Finding]) -> str:
     errors = len(canon_mod.errors(findings))
     infos = sum(1 for f in findings if f.severity == canon_mod.INFO)
-    return "%d erreur(s), %d avertissement(s)%s" % (
+    return "%d error(s), %d warning(s)%s" % (
         errors, len(findings) - errors - infos,
-        ", %d information(s)" % infos if infos else "")
+        ", %d info(s)" % infos if infos else "")
 
 
 def _moment(ts) -> str:
@@ -130,11 +139,11 @@ def _moment(ts) -> str:
 def _status_line(host: str, status: str, diagnostic: str, *, recorded: bool) -> str:
     """Le statut du canon pour un hôte, et ce qu'il implique pour la réclamation."""
     if status == canon_sync.CANON_OK:
-        return "état du canon pour %s : ok%s" % (host, " — %s" % diagnostic if diagnostic else "")
-    return ("état du canon pour %s : %s — %s\n  → %sagents du canon (et leurs éphémères) "
-            "NON réclamables sur %s ; baux, sessions et tours en cours intacts"
+        return "canon state for %s: ok%s" % (host, " — %s" % diagnostic if diagnostic else "")
+    return ("canon state for %s: %s — %s\n  → %scanon agents (and their ephemerals) "
+            "NOT claimable on %s; leases, sessions and running turns left intact"
             % (host, status, diagnostic or "?",
-               "" if recorded else "après ameesh canon sync : ", host))
+               "" if recorded else "after ameesh canon sync: ", host))
 
 
 def _recorded(cfg: Config, host: str, canon: canon_mod.Canon | None = None) -> dict | None:
@@ -168,26 +177,26 @@ def _print_recorded_placements(recorded: dict | None) -> None:
     rows = (recorded or {}).get("placements") or {}
     for name in sorted(rows):
         if rows[name].get("placement_profile_ok") is False:
-            print("registre  : %-16s %s" % (name, rows[name]["placement_diagnostic"]))
+            print("registry  : %-16s %s" % (name, rows[name]["placement_diagnostic"]))
 
 
 def _recorded_line(host: str, recorded: dict | None) -> str:
     if recorded is None:
-        return "registre  : état enregistré inconnu (base injoignable ou non migrée)"
+        return "registry  : recorded state unknown (database unreachable or not migrated)"
     st = recorded["state"]
     if st is None:
-        return ("registre  : aucun état du canon pour %s (ameesh canon sync) : agents du "
-                "canon non réclamables" % host)
-    line = "registre  : %s pour %s (contrôle du %s), dernier commit valide %s (%s)" % (
+        return ("registry  : no canon state for %s (ameesh canon sync): canon agents "
+                "not claimable" % host)
+    line = "registry  : %s for %s (checked %s), last valid commit %s (%s)" % (
         st["status"], host, _moment(st.get("checked_ts")),
         (st.get("last_good_commit") or "—")[:12], _moment(st.get("last_good_ts")))
     if st["status"] != canon_sync.CANON_OK:
-        line += (" — %s\n  → agents du canon non réclamables sur %s jusqu'à un "
-                 "« ameesh canon sync » qui lit un canon valide" % (st.get("diagnostic") or "?",
+        line += (" — %s\n  → canon agents not claimable on %s until an "
+                 "\"ameesh canon sync\" reads a valid canon" % (st.get("diagnostic") or "?",
                                                                     host))
     if st.get("auth_status"):
-        line += "\nauthentificateurs : %s%s (contrôle du %s)%s" % (
-            "EN ERREUR — " if st["auth_status"] == canon_sync.AUTH_STATE_ERROR else "",
+        line += "\nauthenticators : %s%s (checked %s)%s" % (
+            "IN ERROR — " if st["auth_status"] == canon_sync.AUTH_STATE_ERROR else "",
             st["auth_status"], _moment(st.get("auth_checked_ts")),
             " — %s" % st["auth_diagnostic"] if st.get("auth_diagnostic") else "")
     return line
@@ -245,9 +254,9 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     print("canon : %s" % canon.root)
     print("source : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
     _print_findings(findings)
-    print(("canon valide — " if not errors
-           else "canon ILLISIBLE — " if not canon.readable
-           else "canon INVALIDE — ") + _summary(findings))
+    print(("canon valid — " if not errors
+           else "canon UNREADABLE — " if not canon.readable
+           else "canon INVALID — ") + _summary(findings))
     print(_status_line(host, status, diagnostic, recorded=False))
     print(_recorded_line(host, recorded))
     if canon.readable:
@@ -259,12 +268,12 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
 def _print_placements(host: str, verdicts: list[placement_mod.Verdict]) -> None:
     """Placements de l'hôte (C4) : admis, ou refusés et pourquoi."""
     if not verdicts:
-        print("placements sur %s : aucun" % host)
+        print("placements on %s: none" % host)
         return
     refused = [v for v in verdicts if not v.ok]
-    print("placements sur %s : %d admis, %d refusé(s)%s" % (
+    print("placements on %s: %d admitted, %d refused%s" % (
         host, len(verdicts) - len(refused), len(refused),
-        " (non réclamables ; ameesh placement check --agent A pour les hôtes admissibles)"
+        " (not claimable; ameesh placement check --agent A for admissible hosts)"
         if refused else ""))
     for verdict in verdicts:
         print("  %-16s %s" % (verdict.agent, verdict.describe()))
@@ -301,42 +310,42 @@ def _show_one(canon: canon_mod.Canon, args: argparse.Namespace) -> int:
     print("source     : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
     if canon.scopes or canon.scope_unread:
         # L43 (0031) : périmètre ameesh d'un canon partagé
-        print("périmètre  : %s" % " ; ".join(
+        print("scope      : %s" % "; ".join(
             ["%s → %s%s" % (member, ", ".join(s or "." for s in dirs),
-                            " (%d fiche(s) typée(s) hors périmètre ignorée(s))"
+                            " (%d typed card(s) outside the scope ignored)"
                             % canon.out_of_scope[member]
                             if canon.out_of_scope.get(member) else "")
              for member, dirs in sorted(canon.scopes.items())]
-            + ["%s → NON LU (périmètre invalide ou absent)" % member
+            + ["%s → NOT READ (scope invalid or missing)" % member
                for member in sorted(canon.scope_unread)]))
-    print("membres    : %s" % (", ".join(
+    print("members    : %s" % (", ".join(
         "%s (%s)" % (m.title, _join(m.roles)) for m in canon.members) or "—"))
-    print("hôtes      :")
+    print("hosts      :")
     for h in canon.hosts:
         p = h.policy
-        print("  %-14s %-18s harnais %s ; fournisseurs %s ; modes %s ; max %s%s" % (
-            h.title, h.responsible or "SANS RESPONSABLE",
-            "tous" if p.harnesses is None else _join(p.harnesses),
-            "tous" if p.providers is None else _join(p.providers),
-            "tous" if p.credential_modes is None else _join(p.credential_modes),
+        print("  %-14s %-18s harnesses %s; providers %s; modes %s; max %s%s" % (
+            h.title, h.responsible or "NO RESPONSIBLE",
+            "all" if p.harnesses is None else _join(p.harnesses),
+            "all" if p.providers is None else _join(p.providers),
+            "all" if p.credential_modes is None else _join(p.credential_modes),
             "—" if p.max_agents is None else p.max_agents,
-            " ; étiquettes %s" % _join(h.tags) if h.tags else ""))
+            "; tags %s" % _join(h.tags) if h.tags else ""))
     print("agents     :")
     for a in canon.agents:
         hosts = placement_mod.admitted_hosts(canon, placement_mod.admission_of(canon, a.title))
         print("  %-14s %-18s %-12s %s/%s/%s [%s] → %s" % (
-            a.title, a.responsible or "SANS RESPONSABLE", a.team or "—",
+            a.title, a.responsible or "NO RESPONSIBLE", a.team or "—",
             a.harness or "?", a.provider or "?", a.credential_mode or "?",
             _join(a.capabilities), _join(hosts)))
     print("admissions :")
     for pl in canon.placements:
         cibles = "%s%s" % (
             _join(pl.host_names()),
-            " +étiquettes %s" % _join(pl.tags()) if pl.tags() else "")
+            " +tags %s" % _join(pl.tags()) if pl.tags() else "")
         print("  %-14s → %-24s %-13s%s" % (
             pl.agent or "?", cibles or "—", pl.credential_mode or "—",
-            " (cwd ignoré : %s)" % pl.cwd if pl.cwd else ""))
-    print("constats   : %s (détail : ameesh canon check)" % _summary(findings))
+            " (cwd ignored: %s)" % pl.cwd if pl.cwd else ""))
+    print("findings   : %s (details: ameesh canon check)" % _summary(findings))
     return 0
 
 
@@ -354,7 +363,7 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
             except canon_sync.DefaultCanonError as exc:
                 # L46 : aucun canon n'est synchronisé — le nouveau canon par
                 # défaut prendrait les lignes de l'ancien pour les siennes
-                print("canon sync refusé : %s" % exc, file=sys.stderr)
+                print("canon sync refused: %s" % exc, file=sys.stderr)
                 return 1
         for canon in canons:
             if not args.json:
@@ -391,24 +400,28 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
             print(json.dumps(data, ensure_ascii=False, indent=2))
         return 1 if report.errors or auth_errors else 0
     tag = UNTRUSTED_TAG if report.untrusted else ""
-    print("%scanon sync sur %s — %s" % (tag, host, report.source))
+    print("%scanon sync on %s — %s" % (tag, host, report.source))
     if not report.actions:
-        print("  aucun agent placé sur %s" % host)
+        print("  no agent placed on %s" % host)
     for action in report.actions:
-        print("%s  %-16s %-14s %s" % (tag, action.agent, action.action, action.detail))
+        print("%s  %-16s %-14s %s" % (tag, action.agent,
+                                      ACTION_LABELS.get(action.action, action.action),
+                                      action.detail))
+
         for reason in action.blocked:
-            print("%s  %-16s   bloqué par %s" % (tag, "", reason))
+            print("%s  %-16s   blocked by %s" % (tag, "", reason))
     refused = [a.agent for a in report.actions
-               if a.action in ("créé", "mis à jour", "inchangé")
+               if a.action in ("created", "updated", "unchanged",
+                               "créé", "mis à jour", "inchangé")  # canon_sync, either language
                and a.placement is not None and not a.placement.ok]
     if refused:
-        print("%splacement refusé sur %s : %s — non réclamable(s) ; hôtes admissibles : "
+        print("%splacement refused on %s: %s — not claimable; admissible hosts: "
               "ameesh placement check --agent A" % (tag, host, ", ".join(refused)))
     print(_status_line(host, report.status, report.diagnostic, recorded=True))
     _print_packages(report.packages)
     _print_authenticators(report.authenticators)
     if report.errors:
-        print("canon INVALIDE — %s : les agents concernés ne sont pas réclamables "
+        print("canon INVALID — %s: the affected agents are not claimable "
               "(ameesh canon check)" % _summary(report.findings))
         return 1
     return 1 if auth_errors else 0
@@ -419,19 +432,19 @@ def _print_packages(done) -> None:
     if done is None:
         return
     parts = ["%d %s" % (len(ids), label) for ids, label in (
-        (done.created, "créée(s)"), (done.updated, "mise(s) à jour"),
-        (done.unchanged, "inchangée(s)"), (done.retired, "retirée(s)"),
-        (done.skipped, "en erreur, non écrite(s)"),
-        (getattr(done, "conflicts", []), "déclarée(s) par un autre canon, non écrite(s)"))
+        (done.created, "created"), (done.updated, "updated"),
+        (done.unchanged, "unchanged"), (done.retired, "retired"),
+        (done.skipped, "in error, not written"),
+        (getattr(done, "conflicts", []), "declared by another canon, not written"))
         if ids]
     if not parts:
         return
     print("plan (WorkPackage) : %s%s" % (
         ", ".join(parts),
-        " ; %d lot(s) suivent le nouveau parent de leur fiche" % done.relinked
+        "; %d lot(s) follow the new parent of their card" % done.relinked
         if done.relinked else ""))
     if done.skipped:
-        print("  en erreur : %s (ameesh canon check)" % ", ".join(done.skipped))
+        print("  in error: %s (ameesh canon check)" % ", ".join(done.skipped))
 
 
 def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:
@@ -439,27 +452,27 @@ def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:
     if done is None:
         return
     if done.branch:
-        print("authentificateurs : branche canonique de confiance %s (%s)" % (
+        print("authenticators : trusted canonical branch %s (%s)" % (
             done.branch, canon_sync.TRUST_LABELS.get(done.trust, done.trust)))
     for note in done.notes:
-        print("authentificateurs : %s" % note)
+        print("authenticators : %s" % note)
     if done.status != canon_sync.AUTH_SYNCED:
-        print("authentificateurs : %s%s" % (
-            "REFUSÉ — " if done.status == canon_sync.AUTH_REFUSED else "", done.reason))
+        print("authenticators : %s%s" % (
+            "REFUSED — " if done.status == canon_sync.AUTH_REFUSED else "", done.reason))
         return
     data = done.to_dict()
-    print("authentificateurs : ajoutés %s ; mis à jour %s ; révoqués %s ; inchangés %d%s" % (
+    print("authenticators : added %s; updated %s; revoked %s; unchanged %d%s" % (
         _join(data["added"]), _join(data["updated"]), _join(data["revoked"]),
-        data["unchanged"], " ; GELÉS %s" % _join(data["frozen"]) if data["frozen"] else ""))
+        data["unchanged"], "; FROZEN %s" % _join(data["frozen"]) if data["frozen"] else ""))
     if done.partial:
-        print("authentificateurs : canon lu en partie (%s) : aucune révocation pour absence"
+        print("authenticators : canon partly read (%s): no revocation for absence"
               % "; ".join(done.partial))
     for error in done.errors:
-        print("authentificateurs : ERREUR %s" % error)
+        print("authenticators : ERROR %s" % error)
 
 
 def _modes(modes) -> str:
-    return "tous" if modes is None else (_join(modes) if modes else "aucun")
+    return "all" if modes is None else (_join(modes) if modes else "none")
 
 
 def cmd_placement_check(cfg: Config, args: argparse.Namespace) -> int:
@@ -510,7 +523,7 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
                   "untrusted": canon.untrusted, "agents": [],
                   "findings": [f.to_dict() for f in findings]})
             return 1
-        print("canon ILLISIBLE (%s) : aucun placement évaluable" % canon.root)
+        print("canon UNREADABLE (%s): no placement can be evaluated" % canon.root)
         _print_findings(findings)
         return 1
     entries = placement_mod.report(canon, args.agent, findings)
@@ -529,18 +542,18 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
     print("canon : %s" % canon.root)
     print("source : %s%s" % (tag, canon.source_label()))
     if errors:
-        print("canon INVALIDE — %s : les agents concernés ne sont pas réclamables "
+        print("canon INVALID — %s: the affected agents are not claimable "
               "(ameesh canon check)" % _summary(findings))
     for entry in entries:
         name = entry["agent"]
         if not entry["known"]:
-            print("%sagent %s : aucune fiche Agent dans le canon" % (tag, name))
+            print("%sagent %s: no Agent card in the canon" % (tag, name))
             continue
-        print("%sagent %s — harnais %s, fournisseur %s, modèle %s, mode %s" % (
+        print("%sagent %s — harness %s, provider %s, model %s, mode %s" % (
             tag, name, entry["harness"] or "?", entry["provider"] or "?",
             entry["model"] or "—", entry["credential_mode"] or "?"))
         if not entry["placements"]:
-            print("  placement : aucun — non réclamable (agent sans placement)")
+            print("  placement: none — not claimable (agent without placement)")
         for current in entry["placements"]:
             verdict = placement_mod.Verdict(
                 name, current["host"], current["placement_ok"],
@@ -548,21 +561,21 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
                 current["credential_mode"])
             print("  placement %-12s %s%s" % (
                 current["host"], verdict.describe(),
-                "" if verdict.ok else " → non réclamable sur %s" % current["host"]))
+                "" if verdict.ok else " → not claimable on %s" % current["host"]))
         admissible = entry["admissible"]
-        print("  admissibles :%s" % ("" if admissible else " aucun hôte du canon"))
+        print("  admissible:%s" % ("" if admissible else " no canon host"))
         for choice in admissible:
-            print("    %-14s mode %s (admis : %s)%s" % (
-                choice["host"], choice["credential_mode"] or "à fixer",
+            print("    %-14s mode %s (admitted: %s)%s" % (
+                choice["host"], choice["credential_mode"] or "to be set",
                 _modes(choice["credential_modes"]),
-                " — placement actuel" if choice["current"] else ""))
+                " — current placement" if choice["current"] else ""))
         if entry["refused"]:
-            print("  refusés :")
+            print("  refused:")
         for choice in entry["refused"]:
-            print("    %-14s %s" % (choice["host"], " ; ".join(choice["reasons"])))
+            print("    %-14s %s" % (choice["host"], "; ".join(choice["reasons"])))
     if refused:
-        print("%d placement(s) refusé(s) : ameesh ne déplace aucun agent — changez la "
-              "fiche Placement (ou la politique de l'hôte) par PR sur le canon, puis "
+        print("%d placement(s) refused: ameesh moves no agent — change the "
+              "Placement card (or the host policy) by PR on the canon, then "
               "ameesh canon sync" % len(refused))
     return code
 
@@ -577,7 +590,7 @@ def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
             "actions": [], "errors": len(canon_mod.errors(exc.findings)),
             "findings": [f.to_dict() for f in exc.findings],
             "authenticators": canon_sync.AuthenticatorSync(
-                canon_sync.AUTH_SKIPPED, "canon illisible : registre inchangé").to_dict(),
+                canon_sync.AUTH_SKIPPED, "canon unreadable: registry unchanged").to_dict(),
         }
         if sink is not None:
             data.update(canon_id=canon.id, default=canon.is_default)
@@ -585,8 +598,8 @@ def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
         else:
             print(json.dumps(data, ensure_ascii=False, indent=2))
         return 1
-    print("canon sync sur %s — canon ILLISIBLE (%s) : registre inchangé (agents et "
-          "authentificateurs)" % (exc.host, canon.root))
+    print("canon sync on %s — canon UNREADABLE (%s): registry unchanged (agents and "
+          "authenticators)" % (exc.host, canon.root))
     _print_findings(exc.findings)
     print(_status_line(exc.host, canon_sync.CANON_UNREADABLE, exc.diagnostic, recorded=True))
     return 1
@@ -602,7 +615,7 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
         finally:
             db.close()
         if not binding.ok or binding.name != args.by:
-            print("refus : cette session est %s ; --by %s n'est pas son identité"
+            print("refused: this session is %s; --by %s is not its identity"
                   % (binding.describe(), args.by), file=sys.stderr)
             return 1
     ttl = canon_sync.parse_ttl(args.ttl)
@@ -625,68 +638,68 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(row, ensure_ascii=False, indent=2))
         return 0
-    print("agent éphémère %s créé par %s : responsable %s, capacités %s, hôte %s, "
-          "échéance %s" % (
+    print("ephemeral agent %s created by %s: responsible %s, capabilities %s, host %s, "
+          "expires %s" % (
               row["name"], row["created_by"], row["responsible"],
               _join(row.get("capabilities")), row.get("host") or "—",
               time.strftime("%Y-%m-%d %H:%M", time.localtime(row["ephemeral_expires_ts"]))))
     if row.get("placement_ok") is False:
-        print("placement refusé (non réclamable) : %s"
+        print("placement refused (not claimable): %s"
               % (row.get("placement_diagnostic") or "?"))
     return 0
 
 
 def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--canon", default=None,
-                        help="identifiant d'un canon configuré (L42 ; sinon tous pour "
-                             "check/show/sync, le canon par défaut ailleurs), ou racine "
-                             "d'un canon (sinon AMEESH_CANON)")
+                        help="id of a configured canon (L42; otherwise all for "
+                             "check/show/sync, the default canon elsewhere), or root "
+                             "of a canon (otherwise AMEESH_CANON)")
     parser.add_argument("--ref", default=None,
-                        help="révision canonique (sinon AMEESH_CANON_REF, le ref du "
-                             "manifeste, origin/main)")
-    parser.add_argument("--fetch", action="store_true", help="git fetch avant la lecture")
+                        help="canonical revision (otherwise AMEESH_CANON_REF, the manifest "
+                             "ref, origin/main)")
+    parser.add_argument("--fetch", action="store_true", help="git fetch before reading")
     parser.add_argument("--json", action="store_true")
 
 
 def add_parsers(sub) -> None:
     """Branche `canon …`, `placement …` et `agent …` sur le parseur de mesh_cli."""
-    p_canon = sub.add_parser("canon", help="canon OKF : check, show, sync")
+    p_canon = sub.add_parser("canon", help="OKF canon: check, show, sync")
     canon_sub = p_canon.add_subparsers(dest="canon_command")
-    p_check = canon_sub.add_parser("check", help="valider le canon (§4.3)")
+    p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
     _canon_options(p_check)
     p_check.add_argument("--host", default=None,
-                         help="hôte dont l'état est diagnostiqué (sinon AMEESH_HOST / cette "
+                         help="host whose state is diagnosed (otherwise AMEESH_HOST / this "
                               "machine)")
     p_check.set_defaults(func=cmd_check)
-    p_cshow = canon_sub.add_parser("show", help="fiches lues et leur source")
+    p_cshow = canon_sub.add_parser("show", help="cards read and their source")
     _canon_options(p_cshow)
     p_cshow.set_defaults(func=cmd_show)
-    p_sync = canon_sub.add_parser("sync", help="canon → registre de l'hôte (§4.4)")
+    p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
     _canon_options(p_sync)
-    p_sync.add_argument("--host", default=None, help="hôte (sinon AMEESH_HOST / cette machine)")
-    p_sync.add_argument("--bootstrap-ref", default=None, metavar="BRANCHE",
-                        help="premier amorçage du registre des authentificateurs seulement "
-                             "(ni AMEESH_CANON_REF, ni commit déjà appliqué) : branche "
-                             "canonique de confiance (origin/<BRANCHE>), journalisée ; "
-                             "ignorée ensuite")
+    p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")
+    p_sync.add_argument("--bootstrap-ref", default=None, metavar="BRANCH",
+                        help="first bootstrap of the authenticator registry only "
+                             "(no AMEESH_CANON_REF, no commit applied yet): trusted "
+                             "canonical branch (origin/<BRANCH>), logged; "
+                             "ignored afterwards")
     p_sync.set_defaults(func=cmd_sync)
 
-    p_place = sub.add_parser("placement", help="placement gouverné (C4) : check")
+    p_place = sub.add_parser("placement", help="governed placement (C4): check")
     place_sub = p_place.add_subparsers(dest="placement_command")
     p_pcheck = place_sub.add_parser(
-        "check", help="placements admis ou refusés, et placements admissibles (lecture seule)")
+        "check", help="admitted or refused placements, and admissible placements (read-only)")
     _canon_options(p_pcheck)
-    p_pcheck.add_argument("--agent", default=None, help="un seul agent (sinon tous)")
+    p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
     p_pcheck.set_defaults(func=cmd_placement_check)
 
-    p_agent = sub.add_parser("agent", help="agents éphémères")
+    p_agent = sub.add_parser("agent", help="ephemeral agents")
     agent_sub = p_agent.add_subparsers(dest="agent_command")
     p_spawn = agent_sub.add_parser(
-        "spawn", help="créer un éphémère (responsable hérité du créateur, read/propose)")
+        "spawn", help="create an ephemeral (responsible inherited from the creator, read/propose)")
     p_spawn.add_argument("name")
-    p_spawn.add_argument("--by", required=True, help="agent créateur")
-    p_spawn.add_argument("--ttl", required=True, help="échéance : 30m, 2h, 1d (max 7d)")
-    p_spawn.add_argument("--cwd", default=None, help="dossier (sinon celui du créateur)")
-    p_spawn.add_argument("--prompt", default=None, help="première consigne")
+    p_spawn.add_argument("--by", required=True, help="creating agent")
+    p_spawn.add_argument("--ttl", required=True, help="expiry: 30m, 2h, 1d (max 7d)")
+    p_spawn.add_argument("--cwd", default=None, help="directory (otherwise the creator's)")
+    p_spawn.add_argument("--prompt", default=None, help="first prompt")
     p_spawn.add_argument("--json", action="store_true")
     p_spawn.set_defaults(func=cmd_spawn)

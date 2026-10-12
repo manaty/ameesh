@@ -67,7 +67,7 @@ def parse(text) -> int:
     """Une durée estimée en minutes (entier > 0) : `90` (minutes), `90m`,
     `2h`, `1h30`, `1,5h`, `2d`/`2j` (jours de 24 h écoulées)."""
     if isinstance(text, bool):
-        raise EstimateError("estimation illisible : %r" % (text,))
+        raise EstimateError("unreadable estimate: %r" % (text,))
     if isinstance(text, (int, float)):
         raw = str(text)
     else:
@@ -78,14 +78,14 @@ def parse(text) -> int:
     else:
         match = _RE_SIMPLE.match(raw)
         if not match:
-            raise EstimateError("estimation illisible : %r (90m, 2h, 1h30, 1,5h, 2d — ou des "
+            raise EstimateError("unreadable estimate: %r (90m, 2h, 1h30, 1.5h, 2d — or "
                                 "minutes)" % (text,))
         minutes = float(match.group(1).replace(",", ".")) * _UNITS[match.group(2) or "m"]
         minutes = int(round(minutes))
     if minutes <= 0:
-        raise EstimateError("estimation nulle : %r (une durée positive)" % (text,))
+        raise EstimateError("zero estimate: %r (give a positive duration)" % (text,))
     if minutes > MAX_MINUTES:
-        raise EstimateError("estimation de %s : au-delà de 60 jours, découpez le lot"
+        raise EstimateError("estimate of %s: over 60 days, split the lot"
                             % work_mod.span(minutes * 60))
     return minutes
 
@@ -104,12 +104,12 @@ def compact(minutes) -> str:
         hours, rest = divmod(minutes, 60)
         return "%dh%02d" % (hours, rest) if rest else "%dh" % hours
     days, rest = divmod(minutes, 1440)
-    return "%dj%dh" % (days, rest // 60) if rest >= 60 else "%dj" % days
+    return "%dd%dh" % (days, rest // 60) if rest >= 60 else "%dd" % days
 
 
 def ratio_text(ratio) -> str:
     """« ×1,33 »."""
-    return "×%s" % ("%.2f" % ratio).rstrip("0").rstrip(".").replace(".", ",")
+    return "×%s" % ("%.2f" % ratio).rstrip("0").rstrip(".")
 
 
 # --------------------------------------------------------------------------
@@ -130,10 +130,10 @@ def is_agent(db, actor: str | None) -> bool:
         return False
 
 
-REQUIRED = ("estimation obligatoire : un lot créé par un agent (%s) porte sa durée estimée "
-            "dès sa création — %s (90m, 2h, 1h30, 1,5h, 2d)")
-MISSING = ("lot sans durée estimée : posez-la (ameesh work plan %s --estimate 2h) — tout lot "
-           "porte une durée estimée dès sa création")
+REQUIRED = ("estimate required: a lot created by an agent (%s) carries its estimated duration "
+            "from creation — %s (90m, 2h, 1h30, 1.5h, 2d)")
+MISSING = ("lot without an estimated duration: set one (ameesh work plan %s --estimate 2h) — "
+           "every lot carries an estimated duration from creation")
 
 
 def check(db, actor: str | None, minutes, *, option: str = "--estimate 2h") -> bool:
@@ -144,7 +144,7 @@ def check(db, actor: str | None, minutes, *, option: str = "--estimate 2h") -> b
     if minutes:
         return False
     if is_agent(db, actor):
-        raise EstimateError(REQUIRED % (actor, "ajoutez %s" % option))
+        raise EstimateError(REQUIRED % (actor, "add %s" % option))
     return True
 
 
@@ -165,14 +165,14 @@ def set_estimate(db, item_id: int, estimate, *, source: str | None = None,
     minutes = parse(estimate)
     item = work_mod.get(db, item_id)
     if item is None:
-        raise EstimateError("lot %s introuvable" % item_id)
+        raise EstimateError("lot %s not found" % item_id)
     if item["state"] in work_mod.MERGED_STATES or item["state"] == "closed":
-        raise EstimateError("lot %s déjà %s : son estimation est figée (l'écart se mesure "
-                            "avec l'estimation du début)" % (item_id, item["state"]))
+        raise EstimateError("lot %s already %s: its estimate is frozen (the gap is measured "
+                            "against the estimate at start)" % (item_id, item["state"]))
     source = " ".join(str(source or "").split()) or None
     row = storage.of(db).work.set_estimate(item_id, minutes, source=source, actor=actor)
     if row is None:
-        raise EstimateError("lot %s terminé entre-temps : estimation non posée" % item_id)
+        raise EstimateError("lot %s finished in the meantime: estimate not set" % item_id)
     return row
 
 
@@ -184,7 +184,7 @@ def mark_started(db, agent: str, lots) -> list[int]:
     if not ids:
         return []
     return storage.of(db).work.mark_started(
-        agent, ids, "début mesuré : premier tour de %s sur le lot" % agent)
+        agent, ids, "start measured: first turn of %s on the lot" % agent)
 
 
 # --------------------------------------------------------------------------
@@ -234,21 +234,21 @@ def view(item: dict, *, merged_ts=None, now: float | None = None) -> dict:
 def describe(v: dict) -> str:
     """« estimé 2 h · réel 2 h 40 (+40 min, ×1,33) », « estimé 2 h · en cours
     depuis 1 h 10 », « sans estimation · réel 3 h »."""
-    parts = ["estimé %s" % label(v["minutes"]) if v.get("minutes") else "sans estimation"]
+    parts = ["estimated %s" % label(v["minutes"]) if v.get("minutes") else "no estimate"]
     if v.get("actual_minutes") is not None:
-        text = "réel %s" % label(v["actual_minutes"])
+        text = "actual %s" % label(v["actual_minutes"])
         if v.get("gap_minutes") is not None:
             gap = v["gap_minutes"]
             text += " (%s%s, %s)" % ("+" if gap >= 0 else "−", label(abs(gap)),
                                     ratio_text(v["ratio"]))
         parts.append(text)
     elif v.get("elapsed_minutes") is not None:
-        text = "en cours depuis %s" % label(v["elapsed_minutes"])
+        text = "in progress for %s" % label(v["elapsed_minutes"])
         if v.get("overrun"):
-            text += " (DÉPASSÉ, %s)" % ratio_text(v["ratio"])
+            text += " (OVERRUN, %s)" % ratio_text(v["ratio"])
         parts.append(text)
     elif v.get("finished_ts") is not None:
-        parts.append("réel inconnu (début non mesuré)")
+        parts.append("actual unknown (start not measured)")
     return " · ".join(parts)
 
 
@@ -355,20 +355,20 @@ def _ratio_cell(value) -> str:
 def format_report(rep: dict) -> str:
     out = []
     o = rep["overall"]
-    out.append("écarts réel/estimé%s — %d lot(s) livré(s), %d estimé(s) dès le début" % (
-        " (projet %s)" % rep["app"] if rep.get("app") else "", rep["delivered"], o["lots"]))
+    out.append("actual/estimated gaps%s — %d lot(s) delivered, %d estimated from the start" % (
+        " (project %s)" % rep["app"] if rep.get("app") else "", rep["delivered"], o["lots"]))
     if o["lots"]:
-        out.append("ensemble : médiane %s · p80 %s · estimé %s, réel %s" % (
+        out.append("overall: median %s · p80 %s · estimated %s, actual %s" % (
             _ratio_cell(o["median"]), _ratio_cell(o["p80"]), label(o["estimated_minutes"]),
             label(o["actual_minutes"])))
-    for title, rows in (("PAR TYPE DE LOT", rep["by_type"]),
-                        ("PAR AUTEUR D'ESTIMATION", rep["by_author"])):
+    for title, rows in (("BY LOT TYPE", rep["by_type"]),
+                        ("BY ESTIMATE AUTHOR", rep["by_author"])):
         if not rows:
             continue
         out.append("")
         out.append(title)
-        out.append("  %-24s %5s %9s %7s %11s %11s" % ("", "LOTS", "MÉDIANE", "P80", "ESTIMÉ",
-                                                       "RÉEL"))
+        out.append("  %-24s %5s %9s %7s %11s %11s" % ("", "LOTS", "MEDIAN", "P80", "ESTIMATED",
+                                                       "ACTUAL"))
         for g in rows:
             out.append("  %-24s %5d %9s %7s %11s %11s" % (
                 str(g["key"])[:24], g["lots"], _ratio_cell(g["median"]),
@@ -378,21 +378,21 @@ def format_report(rep: dict) -> str:
     ex = rep["excluded"]
     notes = []
     if late:
-        notes.append("%d estimé(s) après le début (médiane %s), hors calcul" % (
+        notes.append("%d estimated after the start (median %s), excluded" % (
             late["lots"], _ratio_cell(late["median"])))
     if rep["revised"]:
-        notes.append("%d lot(s) ré-estimé(s)" % rep["revised"])
+        notes.append("%d lot(s) re-estimated" % rep["revised"])
     if ex["no_estimate"]:
-        notes.append("%d livré(s) sans estimation" % ex["no_estimate"])
+        notes.append("%d delivered without an estimate" % ex["no_estimate"])
     if ex["no_start"]:
-        notes.append("%d sans début mesuré" % ex["no_start"])
+        notes.append("%d without a measured start" % ex["no_start"])
     if notes:
         out.append("")
-        out.append("à part : " + " · ".join(notes))
+        out.append("set aside: " + " · ".join(notes))
     if not o["lots"]:
         out.append("")
-        out.append("aucun lot livré avec une estimation posée avant le début : rien à "
-                   "comparer encore")
+        out.append("no delivered lot with an estimate set before the start: nothing to "
+                   "compare yet")
     return "\n".join(out)
 
 
@@ -415,7 +415,7 @@ BIAS_LOW, BIAS_HIGH = 0.5, 2.0
 #: premier groupe d'au moins MIN_LOTS lots
 LEVELS = (("type", "size", "host", "harness"), ("type", "size"), ("type",), ())
 UNKNOWN = "?"
-SIZE_LABELS = {"s": "petit", "m": "moyen", "l": "gros"}
+SIZE_LABELS = {"s": "small", "m": "medium", "l": "large"}
 
 
 def _level_name(level) -> str:
@@ -559,13 +559,13 @@ def proposal_label(p: dict | None) -> str:
     """« médiane 25 min · p80 40 min (evolution, moyen, 12 lots ; table du
     2026-10-11 par auditeur) », ou « aucune (…) »."""
     if not p:
-        return "aucune (pas de table publiée, ou moins de %d lots semblables)" % MIN_LOTS
+        return "none (no published table, or fewer than %d similar lots)" % MIN_LOTS
     keys = [p.get("type"), SIZE_LABELS.get(p.get("size"), p.get("size")), p.get("host"),
             p.get("harness")]
-    where = ", ".join(str(k) for k in keys if k) or "tous les lots"
+    where = ", ".join(str(k) for k in keys if k) or "all lots"
     when = (time.strftime("%Y-%m-%d", time.gmtime(float(p["published_ts"])))
             if p.get("published_ts") else "?")
-    return "médiane %s · p80 %s (%s, %d lots ; table du %s par %s)" % (
+    return "median %s · p80 %s (%s, %d lots; table of %s by %s)" % (
         label(p["median_minutes"]), label(p["p80_minutes"]), where, int(p["lots"]), when,
         p.get("published_by") or "?")
 
@@ -573,12 +573,12 @@ def proposal_label(p: dict | None) -> str:
 def format_published(row: dict) -> str:
     """Le compte rendu de `work estimates --publish`."""
     body = row["body"]
-    out = ["table de référence n°%s publiée : %d lot(s) livré(s), %d mesuré(s), %d groupe(s)"
+    out = ["reference table #%s published: %d lot(s) delivered, %d measured, %d group(s)"
            % (row.get("id"), body["delivered"], body["measured"], len(body["groups"]))]
     for e in body["estimators"]:
-        out.append("  %-24s %4d lot(s)  médiane %s  p80 %s%s" % (
+        out.append("  %-24s %4d lot(s)  median %s  p80 %s%s" % (
             str(e["estimator"])[:24], e["lots"], _ratio_cell(e["median_ratio"]),
-            _ratio_cell(e["p80_ratio"]), "  BIAIS (estimate_bias)" if e["biased"] else ""))
+            _ratio_cell(e["p80_ratio"]), "  BIAS (estimate_bias)" if e["biased"] else ""))
     if not body["estimators"]:
-        out.append("  aucun estimateur mesuré (lots livrés estimés avant le début)")
+        out.append("  no estimator measured (delivered lots estimated before the start)")
     return "\n".join(out)

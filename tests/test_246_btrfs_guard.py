@@ -358,7 +358,11 @@ class AlertTest(unittest.TestCase):
         warning = self.alerts({"btrfs_unallocated_bytes": 8 * GIB})
         self.assertEqual([a["type"] for a in warning], ["host_disk_low"])
         self.assertFalse(warning[0]["urgent"])
-        self.assertIn("btrfs non alloué 8.0 GiB (seuil 10.0 GiB)", warning[0]["detail"])
+        self.assertIn("btrfs unallocated 8.0 GiB (threshold 10.0 GiB)", warning[0]["detail"])
+        # L156d: the alert text is in English
+        self.assertIn("btrfs almost fully allocated", warning[0]["detail"])
+        self.assertIn("no new turn except an orchestrator's", warning[0]["detail"])
+
         # one episode, one key, whatever the level (codex r1 (4))
         again = self.alerts({"btrfs_unallocated_bytes": 7 * GIB})
         self.assertEqual(exploitation.alert_key(warning[0]), exploitation.alert_key(again[0]))
@@ -367,6 +371,8 @@ class AlertTest(unittest.TestCase):
         self.assertEqual([a["type"] for a in critical], ["host_disk_low"])
         self.assertTrue(critical[0]["urgent"])
         self.assertEqual(critical[0]["reason"], "critique")
+        self.assertIn("no new turn at all", critical[0]["detail"])
+
         self.assertEqual(exploitation.alert_key(warning[0]),
                          exploitation.alert_key(critical[0]))
         self.assertEqual(sorted(critical[0]["breaches"]),
@@ -403,7 +409,7 @@ class AlertTest(unittest.TestCase):
         self.assertEqual(events, [["raised"], ["raised"], [], [], ["resolved"]])
         # the warning, the escalation (urgent), then the resolution
         self.assertEqual([m.urgent for m in sent], [False, True, False])
-        self.assertIn("plus aucun nouveau tour", sent[1].body)
+        self.assertIn("no new turn at all", sent[1].body)
 
     def test_raised_critical_is_not_escalated_again(self):
         sent: list = []

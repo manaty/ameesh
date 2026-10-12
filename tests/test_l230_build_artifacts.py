@@ -570,7 +570,7 @@ class MergedKeptTest(_Repo):
                 "status": "kept", "created_ts": time.time() - 3 * DAY,
                 "checked_ts": time.time() - checked_ago,
                 "detail": detail if detail is not None else
-                "lot #%s merged : gardé — %s" % (lot, st["reason"])}
+                "lot #%s merged: kept — %s" % (lot, st["reason"])}
 
     def run_pass(self, rows, lots, *, dry_run=False, allow=()):
         store = _Store(rows, lots)
@@ -596,7 +596,7 @@ class MergedKeptTest(_Repo):
         store, entries, _plan = self.run_pass([self.row(wt, checked_ago=DAY + 60)], {7: "merged"})
         self.assertFalse(os.path.exists(wt))
         self.assertEqual(store.statuses[0][1], "removed")
-        self.assertIn("propre et poussé", entries[0]["detail"])
+        self.assertIn("clean and pushed", entries[0]["detail"])
         self.assertIn("lot-7", _git("branch", "--list", "lot-7", cwd=self.main))
 
     def test_ignored_files_or_process_keep_it(self):
@@ -654,7 +654,7 @@ class MergedKeptTest(_Repo):
         plan = self.run_pass(rows(), {12: "merged"})[2]
         held.close()
         self.assertEqual(plan[0]["action"], "attend")
-        self.assertIn("un autre passage", plan[0]["detail"])
+        self.assertIn("another pass", plan[0]["detail"])
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
         real = platform.user_paths
         calls = []
@@ -701,11 +701,11 @@ class MergedKeptTest(_Repo):
         wt = self.add_worktree("lot-13")
         gitdir = _git("rev-parse", "--absolute-git-dir", cwd=wt).strip()
         _write(os.path.join(gitdir, "modules", "sub", "HEAD"), text="ref: refs/heads/local\n")
-        old = "lot #13 merged : gardé — HEAD non intégré (poussé mais non fusionné)"
+        old = "lot #13 merged: kept — HEAD not integrated (pushed but not merged)"
         store, entries, plan = self.run_pass(
             [self.row(wt, checked_ago=2 * DAY, lot="13", detail=old)], {13: "merged"})
         self.assertEqual(plan[0]["action"], "garde")
-        self.assertIn("sous-modules", plan[0]["detail"])
+        self.assertIn("submodules", plan[0]["detail"])
         self.assertEqual(store.statuses[0][1], "kept")   # reported: worktree_kept
         self.assertIn("modules", store.statuses[0][2])
         self.assertEqual(entries[0]["action"], "kept")
@@ -739,7 +739,7 @@ class MergedKeptTest(_Repo):
             store, _e, plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="14")],
                                             {14: "merged"})
         self.assertEqual(plan[0]["action"], "garde")
-        self.assertIn("verrouillé", plan[0]["detail"])
+        self.assertIn("locked", plan[0]["detail"])
         self.assertEqual(store.statuses, [])
         self.assertTrue(os.path.isfile(os.path.join(wt, "f.txt")))
         self.assertEqual(self.journal(), [])
@@ -749,7 +749,7 @@ class MergedKeptTest(_Repo):
         self.assertEqual(self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="8")],
                                        {8: "closed"})[2][0]["action"], "garde")
         self.assertEqual(self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="8",
-                                                 detail="lot #8 merged : gardé — autre")],
+                                                 detail="lot #8 merged: kept — other")],
                                        {8: "merged"})[2][0]["action"], "garde")
         _write(os.path.join(wt, "g.txt"))
         _git("add", "g.txt", cwd=wt)

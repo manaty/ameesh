@@ -1,29 +1,29 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh chat — l'agent de conversation du propriétaire (lot L123).
+"""ameesh chat — the owner's conversation agent (work item L123).
 
-  ameesh chat [--harness claude|codex|…] [--name chat-<humain>] [--cwd DOSSIER]
-        ouvre une session INTERACTIVE du harnais (Claude par défaut) pour
-        l'agent de conversation de l'humain qui la lance : les demandes de
-        décision de tous les projets, ses réponses (`ameesh decide`), ses
-        autres demandes transmises aux orchestrateurs ;
-  ameesh chat --consigne     affiche la consigne du chat (texte versionné du dépôt) ;
-  ameesh chat --dry-run      dit ce qui serait lancé, sans rien lancer ni écrire.
+  ameesh chat [--harness claude|codex|…] [--name chat-<human>] [--cwd DIR]
+        opens an INTERACTIVE harness session (Claude by default) for the
+        conversation agent of the human who launches it: decision requests
+        from every project, their answers (`ameesh decide`), their other
+        requests forwarded to the orchestrators;
+  ameesh chat --consigne     prints the chat instructions (text versioned in the repository);
+  ameesh chat --dry-run      says what would be launched, without launching or writing anything.
 
-À la différence d'`ameesh attach`, le chat ne prend JAMAIS la session ni le
-bail d'un autre agent : il a sa propre identité (`chat-<humain>`), une
-session neuve à chaque lancement, et pas d'exécuteur de fond. Il est inscrit
-au registre en mode `externe` (aucun exécuteur ne le réclame), avec l'humain
-pour responsable, sans lot : il n'entre ni dans les alertes de
-sous-utilisation, ni dans « au repos sans lot », ni dans `ameesh projects`.
+Unlike `ameesh attach`, the chat NEVER takes another agent's session or
+lease: it has its own identity (`chat-<human>`), a fresh session on every
+launch, and no background runner. It is registered in `externe` mode (no
+runner claims it), with the human as owner and no work item: it appears
+neither in under-use alerts, nor in "idle without a work item", nor in
+`ameesh projects`.
 
-Identité : la session du harnais porte `AGENT_MAIL_NAME=chat-<humain>` — son
-courrier lui est remis par le hook, il écrit aux orchestrateurs sous ce nom —
-et `AMEESH_CHAT` / `AMEESH_CHAT_PID`. L'état `<état>/.chat/<nom>.<pid>.json`
-enregistre le processus `ameesh chat` (PID, heure de démarrage, humain).
-`ameesh decide`, lancé dans la session, vérifie que ce processus est bien son
-ANCÊTRE : la réponse est alors celle de l'humain, canal `chat`
-(`decisions.chat_session`). Le chat se lance depuis le terminal de l'humain,
-jamais depuis la session d'un agent (refus).
+Identity: the harness session carries `AGENT_MAIL_NAME=chat-<human>` — its
+mail is delivered by the hook, it writes to the orchestrators under that
+name — and `AMEESH_CHAT` / `AMEESH_CHAT_PID`. The state file
+`<state>/.chat/<name>.<pid>.json` records the `ameesh chat` process (PID,
+start time, human). `ameesh decide`, run inside the session, checks that this
+process is indeed its ANCESTOR: the answer is then the human's, channel `chat`
+(`decisions.chat_session`). The chat is launched from the human's terminal,
+never from an agent's session (refused).
 
 L233: the chat also shows decisions that agents wrote in prose in mail to
 bureau or to the human (`decisions.prose_decisions`, listed by `ameesh
@@ -119,30 +119,30 @@ def verify_session(cfg: Config, name: str, pid_text, *, chain=None) -> dict:
     try:
         pid = int(str(pid_text or "").strip())
     except ValueError:
-        raise DecisionError("refus : session de chat sans processus (AMEESH_CHAT_PID) — "
-                            "relance `ameesh chat`") from None
+        raise DecisionError("refused: chat session without a process (AMEESH_CHAT_PID) — "
+                            "relaunch `ameesh chat`") from None
     try:
         with open(session_path(cfg, name, pid), encoding="utf-8") as fh:
             record = json.load(fh)
     except (OSError, ValueError):
-        raise DecisionError("refus : session de chat inconnue (%s, processus %d) — relance "
-                            "`ameesh chat` depuis ton terminal" % (name, pid)) from None
+        raise DecisionError("refused: unknown chat session (%s, process %d) — relaunch "
+                            "`ameesh chat` from your terminal" % (name, pid)) from None
     if not isinstance(record, dict) or record.get("name") != name \
             or int(record.get("pid") or 0) != pid:
-        raise DecisionError("refus : état de la session de chat %s incohérent" % name)
+        raise DecisionError("refused: inconsistent state for chat session %s" % name)
     try:
         pids = list(platform.ancestry() if chain is None else chain)
         started = platform.start_time(pid)
     except platform.NotAvailable as exc:
-        raise DecisionError("refus : session de chat invérifiable sur cet hôte (%s)"
+        raise DecisionError("refused: chat session cannot be verified on this host (%s)"
                             % exc) from None
     if pid not in pids:
-        raise DecisionError("refus : cette commande ne descend pas de la session de chat %s "
-                            "(processus %d)" % (name, pid))
+        raise DecisionError("refused: this command does not descend from chat session %s "
+                            "(process %d)" % (name, pid))
     if record.get("started_at") is None or not platform.same_start(
             float(record["started_at"]), started):
-        raise DecisionError("refus : le processus %d n'est plus la session de chat %s "
-                            "(PID réutilisé)" % (pid, name))
+        raise DecisionError("refused: process %d is no longer chat session %s "
+                            "(PID reused)" % (pid, name))
     return record
 
 
@@ -175,15 +175,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh chat", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--harness", default=DEFAULT_HARNESS,
-                        help="harnais de la session (défaut %s)" % DEFAULT_HARNESS)
+                        help="session harness (default %s)" % DEFAULT_HARNESS)
     parser.add_argument("--name", default=None,
-                        help="nom de l'agent de conversation (défaut chat-<utilisateur>)")
+                        help="conversation agent name (default chat-<user>)")
     parser.add_argument("--cwd", default=None,
-                        help="dossier de la session (défaut : un dossier neutre de l'état)")
+                        help="session directory (default: a neutral directory under the state dir)")
     parser.add_argument("--consigne", action="store_true",
-                        help="affiche la consigne du chat et sort")
+                        help="print the chat instructions and exit")
     parser.add_argument("--dry-run", action="store_true",
-                        help="dit ce qui serait lancé ; ne lance rien, n'écrit rien")
+                        help="say what would be launched; launch nothing, write nothing")
     return parser
 
 
@@ -192,13 +192,13 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
     from . import account_turn, adapters, decisions, storage
     from . import db as db_mod
     if os.environ.get(decisions.CHAT_ENV):
-        print("ameesh chat : tu es déjà dans une session de chat (%s)"
+        print("ameesh chat: you are already in a chat session (%s)"
               % os.environ[decisions.CHAT_ENV], file=sys.stderr)
         return 1
     user = decisions.unix_user()
     name = args.name or default_name(user)
     if not NAME_RE.match(name) or not name.startswith(CHAT_PREFIX):
-        print("ameesh chat : nom invalide %r (chat-<nom>, lettres, chiffres, . _ -)" % name,
+        print("ameesh chat: invalid name %r (chat-<name>, letters, digits, . _ -)" % name,
               file=sys.stderr)
         return 2
     adapters.configure(cfg)
@@ -206,15 +206,15 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
         adapter = adapters.adapter_for(args.harness)
         argv = adapter.interactive_command(None)
     except adapters.HarnessMissing as exc:
-        print("ameesh chat : %s" % exc, file=sys.stderr)
+        print("ameesh chat: %s" % exc, file=sys.stderr)
         return 1
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
         reason = decisions.agent_session_reason(cfg, db, chain=chain, environ_of=environ_of)
         if reason:
-            print("ameesh chat : refus — %s ; le chat se lance depuis le terminal d'un humain, "
-                  "jamais depuis la session d'un agent (et ne prend jamais sa session)"
+            print("ameesh chat: refused — %s; the chat is launched from a human's terminal, "
+                  "never from an agent's session (and never takes its session)"
                   % reason, file=sys.stderr)
             return 1
         human = decisions.current_human()
@@ -235,20 +235,20 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
             return 1
         command = argv + [prompt]
         if args.dry_run:
-            print("ameesh chat (essai) : %s pour %s, harnais %s, dossier %s"
+            print("ameesh chat (dry run): %s for %s, harness %s, directory %s"
                   % (name, human, args.harness, cwd))
-            print("commande : %s <consigne, %d caractères>" % (" ".join(argv), len(prompt)))
-            print("identité : AGENT_MAIL_NAME=%s, %s=%s, %s=%d ; aucune variable d'exécuteur"
+            print("command: %s <instructions, %d characters>" % (" ".join(argv), len(prompt)))
+            print("identity: AGENT_MAIL_NAME=%s, %s=%s, %s=%d; no runner variable"
                   % (name, decisions.CHAT_ENV, name, decisions.CHAT_PID_ENV, pid))
-            print("décisions en attente pour %s : %d" % (human, len(waiting)))
+            print("pending decisions for %s: %d" % (human, len(waiting)))
             print("decisions written in prose in mail (not requests): %d" % len(prose))
             return 0
         row = storage.of(db).decisions.register_chat(
             name, human=human, host=cfg.host, harness=args.harness, cwd=cwd,
-            status_text="conversation de %s" % human)
+            status_text="conversation of %s" % human)
         if row is None:
-            print("ameesh chat : %s est un agent mené par un exécuteur (ou tient un bail) : "
-                  "choisissez un autre nom (--name chat-…)" % name, file=sys.stderr)
+            print("ameesh chat: %s is an agent driven by a runner (or holds a lease): "
+                  "choose another name (--name chat-…)" % name, file=sys.stderr)
             return 1
     finally:
         db.close()
@@ -257,8 +257,8 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
               "started_at": platform.start_time(pid), "harness": args.harness,
               "host": cfg.host, "cwd": cwd, "ts": round(time.time(), 3)}
     path = write_session(cfg, record)
-    print("ameesh chat : %s, conversation de %s (%d décision(s) en attente%s) — quitter le "
-          "harnais ferme la conversation" % (
+    print("ameesh chat: %s, conversation of %s (%d pending decision(s)%s) — quitting the "
+          "harness ends the conversation" % (
               name, human, len(waiting),
               "; %d decision(s) written in prose in mail, to convert" % len(prose)
               if prose else ""), flush=True)
@@ -272,7 +272,7 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
         finally:
             signal.signal(signal.SIGINT, previous)
     except OSError as exc:
-        print("ameesh chat : lancement impossible : %s" % exc, file=sys.stderr)
+        print("ameesh chat: cannot launch: %s" % exc, file=sys.stderr)
     finally:
         remove_session(path)
     return code
@@ -291,13 +291,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run(cfg, args)
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

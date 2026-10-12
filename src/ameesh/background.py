@@ -56,7 +56,7 @@ def _shell(name: str) -> bool:
 
 def _minutes(seconds: float) -> str:
     minutes = max(0, int(round(seconds / 60.0)))
-    return "moins d'une minute" if minutes == 0 else "%d min" % minutes
+    return "less than a minute" if minutes == 0 else "%d min" % minutes
 
 
 # --------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def jobs_in_turn(table: list[dict], pgid: int, *, exclude=()) -> list[dict]:
 
 
 def describe_process(p: dict) -> str:
-    return "pid %d « %s »" % (p["pid"], _short(platform.command_line(p["pid"])
+    return "pid %d \"%s\"" % (p["pid"], _short(platform.command_line(p["pid"])
                                                or p.get("name") or "?"))
 
 
@@ -138,7 +138,7 @@ def hook_jobs(cfg, db, turn_id: str, *, table: list[dict] | None = None,
         found = runtime.turn_containers(turn_id) if runtime is not None else None
     except Exception:
         found = None
-    out += ["conteneur %s" % (c["name"] or c["id"][:12]) for c in found or ()
+    out += ["container %s" % (c["name"] or c["id"][:12]) for c in found or ()
             if not c.get("lot")]
     return out
 
@@ -303,10 +303,10 @@ class Tracker:
                 storage.of(self.runner.db).turn_resources.begin_grace(
                     turn_id, [c["id"] for c in containers] or None)
             except Exception as exc:  # la grâce ne casse jamais la fin d'un tour
-                self.log("[%s] ressource du tour %s non marquée en grâce (%s)"
+                self.log("[%s] resource of turn %s not marked as in grace (%s)"
                          % (agent, turn_id[:8], exc))
-        self.log("[%s] travail de fond du tour %s : %s — délai de grâce de %s, puis "
-                 "nettoyage s'il tourne encore"
+        self.log("[%s] background work of turn %s: %s — grace period of %s, then "
+                 "cleanup if still running"
                  % (agent, turn_id[:8], self._what(entry, running_only=True),
                     _minutes(entry.grace_s)))
         return entry
@@ -333,7 +333,7 @@ class Tracker:
             try:
                 self._refresh(entry, table, now)
             except Exception as exc:  # jamais fatal au fil de suivi
-                self.log("[%s] suivi du travail de fond du tour %s en échec (%s)"
+                self.log("[%s] tracking background work of turn %s failed (%s)"
                          % (entry.agent, entry.turn_id[:8], exc))
         if strays and table is not None:
             self._strays_at = now
@@ -420,7 +420,7 @@ class Tracker:
             if job.ended is None:
                 job.code, job.ended = platform.reap(job.pid), now
         self._release_resource(entry)
-        self.log("[%s] travail de fond du tour %s : %s" % (
+        self.log("[%s] background work of turn %s: %s" % (
             entry.agent, entry.turn_id[:8], self._outcome(entry, now, state)))
         with self.lock:
             entry.state = state
@@ -446,7 +446,7 @@ class Tracker:
                     storage.of(db).housekeeping.log(
                         self.runner.host, lignes, actor="runner:%s" % self.runner.runner_id)
         except Exception as exc:  # jamais fatal au fil de suivi
-            self.log("[%s] fermeture de la ressource du tour %s impossible (%s)"
+            self.log("[%s] cannot close the resource of turn %s (%s)"
                      % (entry.agent, entry.turn_id[:8], exc))
 
     def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
@@ -497,11 +497,11 @@ class Tracker:
                              key=lambda e: e.ended)
         if not entries:
             return "", []
-        tete = ("[ameesh] Travail de fond de tes tours précédents (laissé à finir après "
-                "la fin du tour, puis arrêté à l'échéance) :")
+        tete = ("[ameesh] Background work from your previous turns (left to finish after "
+                "the turn ended, then stopped at the deadline):")
         lignes, dites = [], []
         for entry in entries:
-            ligne = "- tour %s : %s." % (entry.turn_id[:8], self._outcome(entry, now))
+            ligne = "- turn %s: %s." % (entry.turn_id[:8], self._outcome(entry, now))
             if len((tete + "\n".join(lignes + [ligne])).encode("utf-8")) > NOTE_MAX_BYTES:
                 lignes.append("- …")  # la suite au tour d'après
                 break
@@ -532,10 +532,10 @@ class Tracker:
                 self._kill(entry)
                 self._close(entry, "stopped", time.time())
             except Exception as exc:
-                self.log("[%s] arrêt du travail de fond du tour %s impossible (%s)"
+                self.log("[%s] cannot stop the background work of turn %s (%s)"
                          % (entry.agent, entry.turn_id[:8], exc))
         if suivis:
-            self.log("%s : travail de fond de %d tour(s) arrêté" % (reason, len(suivis)))
+            self.log("%s: background work of %d turn(s) stopped" % (reason, len(suivis)))
         return len(suivis)
 
     # -- textes ---------------------------------------------------------------
@@ -545,41 +545,41 @@ class Tracker:
         jobs = [j for j in entry.jobs.values() if not running_only or j.ended is None]
         for job in jobs[:CITED_MAX]:
             if job.ended is None:
-                etat = "en cours"
+                etat = "running"
             elif job.code is None:
-                etat = "fini (code de sortie inconnu)"
+                etat = "finished (exit code unknown)"
             elif job.code < 0:
-                etat = "tué par le signal %d" % -job.code
+                etat = "killed by signal %d" % -job.code
             else:
-                etat = "code de sortie %d" % job.code
-            parts.append("%s : %s" % (job.cmd, etat))
+                etat = "exit code %d" % job.code
+            parts.append("%s: %s" % (job.cmd, etat))
         if len(jobs) > CITED_MAX:
-            parts.append("%d autre(s) processus" % (len(jobs) - CITED_MAX))
+            parts.append("%d other process(es)" % (len(jobs) - CITED_MAX))
         if entry.others and (running_only or (state or entry.state) == "running"):
-            parts.append("%d processus descendant(s)" % entry.others)
+            parts.append("%d descendant process(es)" % entry.others)
         en_cours = {c["id"] for c in entry.containers}
         vus = list(entry.containers_seen.values())
         for c in vus[:CITED_MAX]:
             if running_only and c["id"] not in en_cours:
                 continue
-            parts.append("conteneur %s (%s) %s" % (
+            parts.append("container %s (%s) %s" % (
                 c.get("name") or c["id"][:12], c.get("image") or "?",
-                "en cours" if c["id"] in en_cours else "arrêté"))
-        return " ; ".join(parts) or "processus du groupe du tour"
+                "running" if c["id"] in en_cours else "stopped"))
+        return "; ".join(parts) or "processes of the turn's group"
 
     def _outcome(self, entry: Entry, now: float, state: str | None = None) -> str:
         state = state or entry.state
-        fini = "fini il y a %s" % _minutes(now - entry.ended)
+        fini = "turn ended %s ago" % _minutes(now - entry.ended)
         if state == "running":
-            return "%s, en cours — %s ; arrêté dans %s s'il tourne encore" % (
+            return "%s, running — %s; stopped in %s if still running" % (
                 fini, self._what(entry, state=state), _minutes(entry.deadline - now))
         if state == "done":
-            return "terminé %s après la fin du tour — %s" % (
+            return "finished %s after the turn ended — %s" % (
                 _minutes((entry.closed or now) - entry.ended), self._what(entry, state=state))
         if state == "expired":
-            return "arrêté à l'échéance du délai de grâce (%s) — %s" % (
+            return "stopped when the grace period (%s) ran out — %s" % (
                 _minutes(entry.grace_s), self._what(entry, state=state))
-        return "arrêté avec l'exécuteur — %s" % self._what(entry, state=state)
+        return "stopped with the runner — %s" % self._what(entry, state=state)
 
 
 def _group_alive(pgid: int | None) -> bool:

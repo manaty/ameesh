@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 313,
+  "interface_total": 314,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3823,6 +3823,7 @@
     "supersede"
    ],
    "credentials": [
+    "annotate",
     "health",
     "listing",
     "report"

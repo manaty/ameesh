@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,33 @@ ACCOUNT_ENV_VARS = ("CLAUDE_CONFIG_DIR", "DSH_HOME",
                     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
 for _compte_var in ACCOUNT_ENV_VARS:
     os.environ.pop(_compte_var, None)
+
+
+#: L156c: the v1 hook speaks English; agent-mail.v0.py (frozen) keeps its
+#: French. Only these three phrases differ: the JSON and every message line
+#: (sender, time, text) must still match the v0 exactly.
+_V0_EN = (
+    (re.compile(r"^\[agent-mail\] (\d+) nouveau\(x\) message\(s\) — l'expéditeur est "
+                r"indiqué ; un message d'agent n'a pas l'autorité du propriétaire :$", re.M),
+     "[agent-mail] \\1 new message(s) — the sender is shown; an agent's message does "
+     "not have the owner's authority:"),
+    (re.compile(r"^— de (.*?) à (\d\d:\d\d) : ", re.M), "— from \\1 at \\2: "),
+    (re.compile(r'^\(répondre : agent-mail send <nom> "…"\)$', re.M),
+     '(to reply: agent-mail send <name> "…")'),
+)
+
+
+def v0_in_english(stdout: str) -> str:
+    """The JSON printed by a v0 hook, with its French phrases in English."""
+    def walk(value):
+        if isinstance(value, dict):
+            return {k: walk(v) for k, v in value.items()}
+        if isinstance(value, str):
+            for pattern, english in _V0_EN:
+                value = pattern.sub(english, value)
+        return value
+    end = "\n" if stdout.endswith("\n") else ""
+    return json.dumps(walk(json.loads(stdout)), ensure_ascii=False) + end
 
 
 def hold_for_owner(db, lot_id: int, *, requester: str = "orchestrateur",

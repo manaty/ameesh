@@ -479,7 +479,7 @@ def open_backend(cfg: Config) -> tuple[FileBackend | PgBackend, str | None]:
         if mode == "pg":
             raise
         warning = (
-            "agent-mail : base injoignable (%s) — repli sur les fichiers %s ; détail : %s"
+            "agent-mail: database unreachable (%s), falling back to files %s; detail: %s"
             % (config_mod.mask_dsn(cfg.dsn), cfg.v0_state, exc)
         )
         return FileBackend(cfg), warning

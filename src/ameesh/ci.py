@@ -146,7 +146,7 @@ def _clean(text: str) -> str:
 def _excerpt(text: str) -> str:
     lines = _clean(text).splitlines()
     if len(lines) > EXCERPT_LINES:
-        lines = lines[:EXCERPT_LINES] + ["… (%d ligne(s) de plus)" % (len(lines) - EXCERPT_LINES)]
+        lines = lines[:EXCERPT_LINES] + ["… (%d more line(s))" % (len(lines) - EXCERPT_LINES)]
     return "\n".join(lines)
 
 
@@ -155,24 +155,24 @@ def _short(sha: str) -> str:
 
 
 def _head(run: dict, lot: dict | None) -> str:
-    where = "lot #%d « %s »" % (lot["id"], lot.get("title") or "") if lot else "sans lot"
-    return "CI de %s, tête %s sur %s (%s)" % (where, _short(run["head_sha"]), run["branch"],
-                                              run.get("url") or "exécution %s" % run["run_id"])
+    where = "lot #%d \"%s\"" % (lot["id"], lot.get("title") or "") if lot else "no lot"
+    return "CI of %s, head %s on %s (%s)" % (where, _short(run["head_sha"]), run["branch"],
+                                          run.get("url") or "run %s" % run["run_id"])
 
 
 def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
     out = []
     for i, f in enumerate(failures):
-        out.append("• %s%s (%s, %s)" % (f["test"], " — hérité" if f.get("inherited") else "",
+        out.append("• %s%s (%s, %s)" % (f["test"], " — inherited" if f.get("inherited") else "",
                                         f.get("part") or "?", f.get("status") or "echec"))
         if f.get("replay"):
-            out.append("  rejouer : %s" % f["replay"])
+            out.append("  replay: %s" % f["replay"])
         if detail and i < DETAILED and f.get("excerpt"):
             out.append("")
             out.extend("    " + line for line in _excerpt(f["excerpt"]).splitlines())
             out.append("")
     if detail and len(failures) > DETAILED:
-        out.append("(extraits des %d premiers seulement)" % DETAILED)
+        out.append("(excerpts of the first %d only)" % DETAILED)
     return out
 
 
@@ -180,18 +180,18 @@ def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bo
                  detail: bool = True, unknown_base: bool = False) -> str:
     """Le message d'un ou plusieurs échecs nouveaux d'une exécution."""
     head = _head(run, lot)
-    what = ("premier échec" if len(failures) == 1 else "%d premiers échecs" % len(failures)) \
-        if first else ("échec suivant" if len(failures) == 1
-                       else "%d échecs suivants" % len(failures))
-    lines = ["%s : %s." % (head, what), ""]
+    what = ("first failure" if len(failures) == 1 else "first %d failures" % len(failures)) \
+        if first else ("next failure" if len(failures) == 1
+                       else "next %d failures" % len(failures))
+    lines = ["%s: %s." % (head, what), ""]
     if unknown_base:
-        lines += ["Aucune exécution conclue de %s n'a encore été relevée : ces échecs sont "
-                  "peut-être hérités, d'où ce message sans réveil." % (run.get("base") or "main"),
+        lines += ["No finished run of %s has been seen yet: these failures may be "
+                  "inherited, hence this message without a wake-up." % (run.get("base") or "main"),
                   ""]
     lines += _failure_lines(failures, detail=detail)
-    lines += ["", "La suite continue, verdict à la fin. Une nouvelle poussée remplace ce "
-                  "passage : les messages que tu n'as pas encore lus seront retirés. Inutile "
-                  "d'attendre la CI dans ton tour (gh pr checks --watch) : ameesh te prévient."]
+    lines += ["", "The suite goes on, verdict at the end. A new push replaces this "
+                  "run: the messages you have not read yet will be withdrawn. No need "
+                  "to wait for the CI in your turn (gh pr checks --watch): ameesh tells you."]
     return "\n".join(lines)
 
 
@@ -201,21 +201,21 @@ def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict])
     own = [f for f in failures if not f.get("inherited")]
     inherited = [f for f in failures if f.get("inherited")]
     if status == "success" and not failures:
-        return "%s : verte." % head
+        return "%s: green." % head
     lines = []
     if status == "success":
-        lines.append("%s : verte, malgré des échecs relevés en cours de route "
-                     "(réessayés ou tolérés)." % head)
+        lines.append("%s: green, despite failures seen along the way "
+                     "(retried or tolerated)." % head)
     elif not own and inherited:
-        lines.append("%s : rouge, mais seulement des échecs hérités de %s (déjà rouges "
-                     "avant ta poussée) : rien ne t'est imputé."
+        lines.append("%s: red, but only failures inherited from %s (already red "
+                     "before your push): nothing is charged to you."
                      % (head, run.get("base") or "main"))
     elif not failures:
-        lines.append("%s : rouge, sans test en échec relevé dans le flux (part interrompue, "
-                     "délai dépassé ou autre job) : voir l'exécution." % head)
+        lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
+                     "timeout or another job): see the run." % head)
     else:
-        lines.append("%s : rouge, %d échec(s)%s." % (
-            head, len(own), ", et %d hérité(s) de la base" % len(inherited) if inherited else ""))
+        lines.append("%s: red, %d failure(s)%s." % (
+            head, len(own), ", and %d inherited from the base" % len(inherited) if inherited else ""))
     lines.append("")
     lines += _failure_lines(own + inherited, detail=False)
     return "\n".join(lines).rstrip()
@@ -296,7 +296,7 @@ class Watcher:
             try:
                 out += self.watch(db, repo)
             except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
-                self.log("CI %s : relevé en échec (%s)" % (repo, " ".join(str(exc).split())[:200]))
+                self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
         return out
 
     # -- un dépôt --------------------------------------------------------------
@@ -433,15 +433,15 @@ class Watcher:
 
 def describe(record: dict) -> str:
     """Une ligne de journal de `ameesh notify` pour un envoi ou un retrait."""
-    where = "CI %s exécution %s" % (record.get("repo"), record.get("run_id"))
+    where = "CI %s run %s" % (record.get("repo"), record.get("run_id"))
     if record["action"] == "superseded":
-        return "%s remplacée par %s ; %d message(s) non lu(s) retiré(s)" % (
+        return "%s superseded by %s; %d unread message(s) withdrawn" % (
             where, _short(record.get("by") or ""), len(record.get("withdrawn") or ()))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
-        if record.get("to") else "(sans destinataire)"
+        if record.get("to") else "(no recipient)"
     if record["action"] == "failures":
-        return "%s : %d échec(s) %s" % (where, len(record.get("tests") or ()), to)
-    return "%s : verdict %s %s" % (where, record.get("status"), to)
+        return "%s: %d failure(s) %s" % (where, len(record.get("tests") or ()), to)
+    return "%s: verdict %s %s" % (where, record.get("status"), to)
 
 
 # --------------------------------------------------------------------------
@@ -469,7 +469,7 @@ def status_of(db, item_id: int, limit: int = 5) -> dict:
     from . import work
     item = work.get(db, int(item_id))
     if item is None:
-        raise CiError("lot #%s inconnu" % item_id)
+        raise CiError("lot #%s unknown" % item_id)
     st = storage.of(db)
     runs = []
     for row in st.ci.for_lot(int(item_id), limit):
@@ -480,32 +480,32 @@ def status_of(db, item_id: int, limit: int = 5) -> dict:
             "branch": item.get("branch"), "runs": runs}
 
 
-_STATUS_FR = {"running": "en cours", "success": "verte", "failure": "rouge",
-              "cancelled": "annulée", "superseded": "remplacée"}
+_STATUS_FR = {"running": "running", "success": "green", "failure": "red",
+              "cancelled": "cancelled", "superseded": "superseded"}
 
 
 def render_status(report: dict) -> list[str]:
     from .notify import local_time
-    lines = ["lot #%d « %s » (branche %s)" % (report["work_item"], report.get("title") or "",
-                                             report.get("branch") or "—")]
+    lines = ["lot #%d \"%s\" (branch %s)" % (report["work_item"], report.get("title") or "",
+                                          report.get("branch") or "—")]
     if not report["runs"]:
-        lines.append("  aucune exécution de CI relevée (relevé de `ameesh notify` sur l'hôte "
-                     "désigné par github.host)")
+        lines.append("  no CI run seen (seen by `ameesh notify` on the host "
+                     "named by github.host)")
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
         if run["status"] == "superseded" and run.get("superseded_by"):
-            state += " par %s" % _short(run["superseded_by"])
+            state += " by %s" % _short(run["superseded_by"])
         own = [f for f in run["failures"] if not f.get("inherited")]
         inherited = len(run["failures"]) - len(own)
         lines.append("  %s  %s  %s  %s%s%s" % (
             local_time(run["first_seen_ts"]), _short(run["head_sha"]), state,
-            "%d échec(s)" % len(own), ", %d hérité(s)" % inherited if inherited else "",
+            "%d failure(s)" % len(own), ", %d inherited" % inherited if inherited else "",
             "  %s" % run["url"] if run.get("url") else ""))
         for f in own[:10]:
             lines.append("      %s (%s)%s" % (f["test"], f.get("part") or "?",
                                               "  → %s" % f["replay"] if f.get("replay") else ""))
         if len(own) > 10:
-            lines.append("      … et %d autre(s)" % (len(own) - 10))
+            lines.append("      … and %d more" % (len(own) - 10))
     return lines
 
 
@@ -515,7 +515,7 @@ def cmd_ci(cfg, args) -> int:
     try:
         report = status_of(db, args.id, limit=args.limit)
     except CiError as exc:
-        print("ameesh ci : %s" % exc)
+        print("ameesh ci: %s" % exc)
         return 1
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
