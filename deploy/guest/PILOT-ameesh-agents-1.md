@@ -185,6 +185,10 @@ What lands in the guest's home or work is written by the guest
 (`runuser -u ameesh-guest`), never by root. `--check` reports each of them
 (with `--canon`, the folders the canon gives; without, `work/<agent>`).
 
+The commands below are this host's (its guests, its project and forge, as
+of the pilot): an example of `--repo`, never a default. ameesh names no
+project; `--repo` is given on each run of `--enable` and is stored nowhere.
+
 ```sh
 sudo deploy/guest/install-pilot.sh --dry-run --enable deepseek6 deepseek1 \
   --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \

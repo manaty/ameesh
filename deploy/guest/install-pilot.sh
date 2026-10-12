@@ -109,6 +109,8 @@ declare -A REPOS=()
 DSH_FROM=""
 HELPER=/opt/ameesh/git-credential-guest
 CREDENTIAL_KEY=credential.https://github.com.helper
+# the same answer as $HELPER, inline, for the check made before it exists
+LS_HELPER='!f() { [ "$1" = get ] && [ -n "$GH_TOKEN" ] && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
 
 die() { echo "install-pilot.sh: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -439,15 +441,27 @@ if bad:
 EOF
 }
 
+# quiet / unquiet: xtrace off around a secret, then as it was (under
+# bash -x, an assignment or an argument would go to stderr: codex #457 r1)
+quiet() { XTRACE=${-//[^x]/}; set +x; }
+unquiet() { [ -z "${XTRACE:-}" ] || set -x; }
 # the GH_TOKEN of AGENT, from its secrets file (into a variable only: never
-# printed, never in a command line)
+# printed, never in a command line, never traced)
 token_of() {
+  { quiet; } 2>/dev/null
   local v
   v=$(sed -n 's/^[[:space:]]*GH_TOKEN=//p' "$(at "$ETC/guest-$1.env")" 2>/dev/null | tail -n 1)
   v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
   printf '%s' "$v"
+  unquiet
 }
-has_token() { [ -n "$(token_of "$1")" ]; }
+has_token() {
+  { quiet; } 2>/dev/null
+  local rc=0
+  [ -n "$(token_of "$1")" ] || rc=1
+  unquiet
+  return $rc
+}
 
 # origin_of DIR: the origin of the clone in DIR, read in its .git/config
 # (by root, a file the guest owns: read, never run; includes not followed)
@@ -491,6 +505,8 @@ EOF
 dsh_files() {
   local src=$1 f p
   [ -f "$src/hooks.json" ] && [ ! -L "$src/hooks.json" ] && echo hooks.json
+  # profiles/ itself a link: nothing under it (codex #457 r1)
+  [ -d "$src/profiles" ] && [ ! -L "$src/profiles" ] || return 0
   for p in "$src"/profiles/*/; do
     [ -d "$p" ] && [ ! -L "${p%/}" ] || continue
     valid_name "$(basename "$p")" || continue
@@ -503,9 +519,18 @@ dsh_files() {
 }
 # looks_secret FILE…: the files that look like they hold a secret (a key,
 # a token, a password); their names only
+# (binary files read too; a private key, PEM or OpenSSH, by its content or
+# its usual name: codex #457 r1)
 looks_secret() {
-  grep -l -I -i -E \
+  local f
+  for f in "$@"; do
+    case "${f##*/}" in
+      id_rsa|id_dsa|id_ecdsa|id_ed25519|id_*_sk|*.pem|*.key|*.p12|*.pfx|*.jks|*.keystore) echo "$f" ;;
+    esac
+  done
+  grep -l -a -i -E \
     -e 'sk-[A-Za-z0-9_-]{16,}' -e 'gh[pousr]_[A-Za-z0-9]{20,}' -e 'github_pat_[A-Za-z0-9_]{20,}' \
+    -e '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY' -e 'PuTTY-User-Key-File' \
     -e '(api[_-]?key|token|secret|passw(or)?d)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[^"'"'"'[:space:],}]{8,}' \
     -- "$@" 2>/dev/null || true
 }
@@ -564,10 +589,11 @@ EOF
      && [ "$(stat -c '%u %a' "$h")" = "$root_uid 755" ]; then
     ok "$HELPER (git credential helper, root 755)"
   else ko "$HELPER missing, changed, or not root 755 (--enable writes it)"; fi
-  if git -C / config --file "$(at "$GHOME/.gitconfig")" --no-includes --get-all "$CREDENTIAL_KEY" \
-       2>/dev/null | grep -qxF "$HELPER"; then
-    ok "$GHOME/.gitconfig: $CREDENTIAL_KEY $HELPER"
-  else ko "$GHOME/.gitconfig: no $CREDENTIAL_KEY $HELPER (--enable sets it)"; fi
+  # the helpers before reset (an empty one), then ours alone
+  if [ "$(git -C / config --file "$(at "$GHOME/.gitconfig")" --no-includes --get-all "$CREDENTIAL_KEY" \
+          2>/dev/null)" = "$(printf '\n%s' "$HELPER")" ]; then
+    ok "$GHOME/.gitconfig: $CREDENTIAL_KEY reset, then $HELPER alone"
+  else ko "$GHOME/.gitconfig: not $CREDENTIAL_KEY '' then $HELPER alone (--enable sets it)"; fi
   d=$(at "$GHOME/.dsh")
   if [ -f "$d/hooks.json" ] && [ -d "$d/profiles" ] && [ ! -L "$d" ] \
      && [ "$(stat -c %u "$d")" = "$guid" ]; then
@@ -628,6 +654,12 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
     # everything checked before anything is done: the canon, each project's
     # forge, the work folders, the tokens, the dsh profile
     ws=$(canon_workspaces "${TARGETS[@]}") || die "the canon refuses (above): nothing done"
+    # the work folders and the guest's home on the volume: no link on the
+    # way, no mount on them (codex #457 r1)
+    for d in "$ROOT/work" "$GHOME"; do
+      resolved "$d" || die "$d goes through a symbolic link: refused, nothing done"
+      ! mounts_under "$(at "$d")" || die "a mount point at or beneath $d: refused, nothing done"
+    done
     clones=()
     while IFS=$'\t' read -r a project dir; do
       [ -n "${REPOS[$project]:-}" ] \
@@ -635,6 +667,9 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
       if origin=$(origin_of "$dir"); then
         same_repo "$origin" "${REPOS[$project]%%#*}" \
           || die "$dir is a clone of $origin, not of ${REPOS[$project]%%#*}: move it away first"
+        # a clone never checked out (a branch that failed): not kept
+        [ -f "$(at "$dir/.git/index")" ] && [ ! -L "$(at "$dir/.git/index")" ] \
+          || die "$dir is a clone of $origin never checked out: move it away first"
         echo "kept $dir: a clone of $origin (never fetched nor reset here)"
         continue
       fi
@@ -654,6 +689,7 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
     if [ -f "$(at "$dsh_dst/hooks.json")" ] && [ -d "$(at "$dsh_dst/profiles")" ]; then
       echo "kept $dsh_dst: hooks.json and profiles there already"
     else
+      [ ! -L "$(at "$dsh_dst")" ] || die "$dsh_dst is a symbolic link: refused"
       if [ -z "$DSH_FROM" ] && [ -z "$HOSTDIR" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
         DSH_FROM=$(getent passwd "$SUDO_USER" | cut -d: -f6)/.dsh
       fi
@@ -663,11 +699,35 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
         || die "$DSH_FROM: no hooks.json, or no profile in profiles/"
       secrets=$(cd "$DSH_FROM" && looks_secret "${copy[@]}")
       [ -z "$secrets" ] || die "not copied, they look like they hold a secret: $(echo $secrets)"
+      # what the guest has already is kept, never overwritten (codex #457 r1)
+      keep=()
+      for f in "${copy[@]}"; do
+        if [ -e "$(at "$dsh_dst/$f")" ] || [ -L "$(at "$dsh_dst/$f")" ]; then
+          echo "kept $dsh_dst/$f: there already"
+        else keep+=("$f"); fi
+      done
+      copy=("${keep[@]}")
     fi
+    # each branch to clone exists, asked of the forge by the guest before
+    # anything is written (codex #457 r1); the token in git's environment
+    # only, handed by a helper that names it, never its value
+    for c in "${clones[@]}"; do
+      read -r a dir spec <<<"$c"
+      { quiet; } 2>/dev/null
+      rc=0
+      GH_TOKEN=$(token_of "$a") GIT_TERMINAL_PROMPT=0 \
+        as_guest git -c credential.helper= -c "$CREDENTIAL_KEY=$LS_HELPER" \
+          ls-remote --exit-code --heads -- "${spec%%#*}" "refs/heads/${spec#*#}" || rc=$?
+      unquiet
+      [ "$rc" = 0 ] || die "${spec%%#*}: no branch ${spec#*#} (or the forge refused): nothing done"
+    done
 
     say "the guest's git credential: $HELPER, for https://github.com"
     helper_text | put "$HELPER" 0755 root:root
-    as_guest git config --file "$GHOME/.gitconfig" --replace-all "$CREDENTIAL_KEY" "$HELPER"
+    # the helpers before it reset (an empty one), ours alone for github.com:
+    # a credential.helper=store set elsewhere never gets the token (codex #457 r1)
+    as_guest git config --file "$GHOME/.gitconfig" --replace-all "$CREDENTIAL_KEY" ""
+    as_guest git config --file "$GHOME/.gitconfig" --add "$CREDENTIAL_KEY" "$HELPER"
     if [ ${#copy[@]} -gt 0 ]; then
       say "the guest's dsh profile: ${copy[*]}, from $DSH_FROM"
       as_guest install -d -m 0700 "$dsh_dst"
@@ -683,20 +743,18 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
     for c in "${clones[@]}"; do
       read -r a dir spec <<<"$c"
       say "$a: $dir, a clone of ${spec%%#*} detached on origin/${spec#*#}"
-      # the token from its secrets file, in the environment of git only
-      if [ "$DRY" = 1 ]; then
-        echo "+ (GH_TOKEN of $ETC/guest-$a.env in the environment, never on a command line)"
-        token=
-      else
-        token=$(token_of "$a")
-      fi
-      GH_TOKEN=$token GIT_TERMINAL_PROMPT=0 \
-        as_guest git -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" \
-        || die "the clone of ${spec%%#*} failed"
+      # the token from its secrets file, in the environment of git only,
+      # never traced
+      [ "$DRY" = 0 ] || echo "+ (GH_TOKEN of $ETC/guest-$a.env in the environment, never on a command line)"
+      { quiet; } 2>/dev/null
+      rc=0
+      GH_TOKEN=$(token_of "$a") GIT_TERMINAL_PROMPT=0 \
+        as_guest git -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" || rc=$?
+      unquiet
+      [ "$rc" = 0 ] || die "the clone of ${spec%%#*} failed"
       as_guest git -C "$dir" checkout --quiet --detach "origin/${spec#*#}" \
-        || die "origin/${spec#*#}: no such branch in ${spec%%#*} ($dir kept, without checkout)"
+        || die "origin/${spec#*#} not checked out in $dir: a rerun refuses it, move it away"
     done
-    unset token
 
     for a in "${TARGETS[@]}"; do
       run systemctl enable --now "ameesh-guest-runner@$a.service"
