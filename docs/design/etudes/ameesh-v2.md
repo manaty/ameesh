@@ -247,7 +247,7 @@ the remaining lots (owner's instruction).
 | **L58** | 2 | **Roles** (C1–C5): `Role` card, `role:` addressing, deputies, absences, escalation |
 | **L59** | 2 | **Activity log** (G1–G5): `ameesh activity`, responsibility-based access, retention |
 
-## Lot status as of 2026-10-11
+## Lot status as of 2026-10-12
 
 This replaces the source study's 2026-10-09 readiness snapshot. “Open” means
 awaiting rebase and review on current main, not current CI approval. The
@@ -263,14 +263,14 @@ triage is recorded on lot #139.
 | L54 persona memory | [#21](https://github.com/manaty/ameesh/pull/21) | Open; rebase after L53 (shared runner changes) | L53 integration |
 | L52 session history (first part) | [#24](https://github.com/manaty/ameesh/pull/24) | Open; rebase after L51; parallel sessions remain separate | L51 integration |
 | L59 activity log | [#19](https://github.com/manaty/ameesh/pull/19) | Open; rebase after L54; responsibility filtering remains | L54 integration |
-| L56 runner Postgres role | [#23](https://github.com/manaty/ameesh/pull/23) | Open; separate lot #140, in parallel after L51 | Current main |
+| L56 runner Postgres role | [#23](https://github.com/manaty/ameesh/pull/23) | Merged into main on 2026-10-12 (lot #140) | — |
 | D1 OIDC identity | [#25](https://github.com/manaty/ameesh/pull/25) | Closed; deferred | — |
 | D2 relationship-based activity access | [#27](https://github.com/manaty/ameesh/pull/27) | Closed; deferred | L59, L51, D1 |
 | E1 Unix user per persona | [#26](https://github.com/manaty/ameesh/pull/26) | Closed; not merged; container trial is not delivery | L57 |
 | E2 MCP proxy | [#28](https://github.com/manaty/ameesh/pull/28) | Closed; deferred | — |
 
 Review/merge order from lot #139: decisions 0032/0033 (#135), L51 #17, L56
-#23 in parallel (#140), then L52 #24, L53 #18, L54 #21 and L59 #19.
+#23 in parallel (#140, merged), then L52 #24, L53 #18, L54 #21 and L59 #19.
 Mesh-design reviews and merges. Old PR #14 is closed; its work is being
 redone under lot #138. PRs #29–#33 are closed because parallel-session option
 B was dropped. Historical readiness and test counts from 2026-10-09 do not
