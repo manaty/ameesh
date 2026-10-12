@@ -101,12 +101,12 @@ for pilote in "${PILOTES[@]}"; do
     port=$(docker port "${CONTENEURS[$i]}" 5432/tcp | head -1)
     port=${port##*:}
     durees=()
-    [ "$MAJ" = 1 ] && durees=(--durees-sortie "$SORTIE/$pilote-$k.json")
+    [ "$MAJ" = 1 ] && durees=(--output-durations "$SORTIE/$pilote-$k.json")
     (
       t0=$(date +%s)
       rc=0
       AMEESH_DRIVER=$pilote AMEESH_TEST_DSN="postgresql://ameesh@127.0.0.1:$port/ameesh" \
-        "${!py_var}" scripts/test-parts.py lancer --parts "$N" --part "$k" --pilote "$pilote" \
+        "${!py_var}" scripts/test-parts.py run --parts "$N" --part "$k" --driver "$pilote" \
         "${LISTE[@]}" "${durees[@]}" >"$SORTIE/$pilote-$k.log" 2>&1 || rc=$?
       echo $(( $(date +%s) - t0 )) >"$SORTIE/$pilote-$k.duree"
       exit "$rc"
@@ -131,7 +131,7 @@ echo "durée totale : $(( $(date +%s) - debut )) s"
 
 if [ "$MAJ" = 1 ]; then
   for pilote in "${PILOTES[@]}"; do
-    python3 scripts/test-parts.py durees --pilote "$pilote" "$SORTIE/$pilote"-*.json
+    python3 scripts/test-parts.py durations --driver "$pilote" "$SORTIE/$pilote"-*.json
   done
 fi
 if [ "$echec" = 1 ]; then

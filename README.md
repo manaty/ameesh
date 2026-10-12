@@ -356,9 +356,9 @@ on the measured durations of `tests/parts/durees.json`): on a pull request,
 `psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
 `tests/parts/pilote-psql.txt`; the full `psql` suite (6 parts) runs on pushes
 to `main` and `release/*`. The `tests` job aggregates the parts. Each part
-streams its results, one JSON line per test (`--flux`, schema
+streams its results, one JSON line per test (`--flow`, schema
 `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
-the job summary (`scripts/ci-flux.py resume`). A `plan` job reads the measured
+the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
 test → code map once per run (`scripts/test-plan.py`, L161f) and every part
 runs from that plan: the test modules impacted by the change (changed code
 blocks, data files, directories, tables) run first, nothing is skipped; map
