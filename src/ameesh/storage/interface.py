@@ -1717,8 +1717,8 @@ class Progress(Domain):
     @abc.abstractmethod
     def package_items(self) -> list[dict]:
         """TOUS les lots rattachés à une fiche (id, package_id, state,
-        close_reason, updated_ts) : la progression d'un epic ne dépend pas de
-        la fenêtre."""
+        close_reason, app, updated_ts) : la progression d'un epic ne dépend
+        pas de la fenêtre ; `app` (L304) rattache un jalon à ses projets."""
 
     @abc.abstractmethod
     def lot_actions(self, item_ids: Sequence[int]) -> list[dict]:
@@ -2234,6 +2234,13 @@ class TurnResources(Domain):
         """L147 : les lignes `orphan` de l'hôte ouvertes avant `before_ts`
         (epoch), d'`id` supérieur à `after_id`, par `id` croissant : une page
         de `limit` lignes au plus (pagination par `id`)."""
+
+    @abc.abstractmethod
+    def running_started_before(self, host: str, before_ts: float, after_id: int = 0,
+                               limit: int = 500) -> list[dict]:
+        """L147b : les lignes `running` de `host` dont le tour a commencé (ou
+        fini, délai de grâce) avant `before_ts`, par id croissant au-delà de
+        `after_id` — la revue d'après démarrage les lit page par page."""
 
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:

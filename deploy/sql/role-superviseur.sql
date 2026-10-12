@@ -280,7 +280,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #246 (0067): btrfs allocation, numbers only
         'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',
         -- #253 (0359): every filesystem the host writes to, paths and numbers
-        'volumes'
+        'volumes',
+        -- L159e6 (0361): the guard's last restart (unit names and reasons)
+        'guard_restart'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',

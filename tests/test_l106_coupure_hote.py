@@ -32,7 +32,7 @@ import uuid
 from unittest import mock
 
 from ameesh import adapters, exploitation, harnesses, hostcheck, mail, notify, registry
-from ameesh import resources, storage
+from ameesh import db as db_mod, resources, storage
 from ameesh import runner as runner_mod
 from ameesh.runner import AgentWorker, Runner
 
@@ -826,6 +826,41 @@ class CoupureTest(PgTestCase):
         for turn in mortes:
             self.assertEqual(turns.get(turn)["status"], "done", turn)
 
+    def test_la_limite_par_passage_vaut_aussi_pour_les_lignes_running(self):
+        # L147b (codex r4 de #220) : des lignes `running` d'avant le démarrage
+        # (et une page plus grande que la limite) — chaque passage en revoit
+        # au plus BOOT_REVIEW_MAX_ROWS, running et orphan comprises
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        actives = ["tour-actif-%s-%d" % (jeton, i) for i in range(5)]
+        orphelines = ["tour-orph-%s-%d" % (jeton, i) for i in range(3)]
+        for turn in actives + orphelines:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+        for turn in orphelines:
+            turns.mark_orphan(turn)
+        self._avant_le_demarrage(*actives, *orphelines)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+        runner = Runner(self.cfg, self.db, once=True)
+        lots = []
+        reel = type(turns).settle_many
+
+        def compte(self_, ids):
+            lots.append(len(ids))
+            return reel(self_, ids)
+
+        with mock.patch.object(runner_mod, "BOOT_ORPHAN_PAGE", 10), \
+                mock.patch.object(runner_mod, "BOOT_REVIEW_MAX_ROWS", 2), \
+                mock.patch.object(type(turns), "settle_many", compte):
+            for _ in range(20):
+                self._revue(runner, 3600, moteur)
+                if runner.boot_review_at is None:
+                    break
+        self.assertIsNone(runner.boot_review_at)
+        self.assertTrue(lots and max(lots) <= 2, lots)
+        for turn in actives + orphelines:
+            self.assertEqual(turns.get(turn)["status"], "done", turn)
+
     def test_le_solde_attend_le_gestionnaire_utilisateur(self):
         runner = Runner(self.cfg, self.db, once=True)
         for uptime, etat, pret in ((runner_mod.BOOT_SETTLE_S - 1, "running", False),
@@ -885,6 +920,111 @@ class CoupureTest(PgTestCase):
         with mock.patch.object(runner_mod, "log"):
             worker.run()
         self.assertIsNone(registry.get(self.db, "migrant").get("lease_owner"))
+
+    def test_place_ailleurs_pendant_une_rotation_aucun_tour_de_travail(self):
+        # L147b (codex r4 de #220) : le tour de résumé d'une rotation passe
+        # après le contrôle de placement ; le canon déplace l'agent pendant ce
+        # tour — aucun tour de travail ne part de l'ancien hôte, la consigne
+        # reste en attente, le bail est rendu
+        self.register("tournant", "claude", cwd=self._cwd("tournant"))
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "tournant", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "tournant"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        registry.set_pending_prompt(self.db, "tournant", "travail")
+
+        def rotation():
+            # le tour de résumé a eu lieu…
+            self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
+                            " WHERE name = 'tournant'")   # …et le canon a déplacé l'agent
+            return True
+
+        with mock.patch.object(worker, "maybe_rotate", side_effect=rotation), \
+                mock.patch.object(worker, "run_turn") as tour, \
+                mock.patch.object(runner_mod, "log"):
+            worker.run()
+        tour.assert_not_called()
+        ligne = registry.get(self.db, "tournant")
+        self.assertEqual(ligne["pending_prompt"], "travail")
+        self.assertIsNone(ligne.get("lease_owner"))
+
+    def _worker(self, name):
+        self.register(name, "claude", cwd=self._cwd(name))
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        return worker
+
+    def test_place_ailleurs_pendant_une_bascule_de_compte_dans_pick(self):
+        # #283 r1 : la bascule de compte fait son résumé DANS pick()
+        # (account_turn.rotate) ; le canon déplace l'agent pendant ce résumé
+        worker = self._worker("bascule")
+        registry.set_pending_prompt(self.db, "bascule", "travail")
+        pick = worker.pick
+
+        def pick_avec_bascule():
+            spec = pick()
+            self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
+                            " WHERE name = 'bascule'")
+            return spec
+
+        with mock.patch.object(worker, "pick", side_effect=pick_avec_bascule), \
+                mock.patch.object(worker, "run_turn") as tour, \
+                mock.patch.object(runner_mod, "log"):
+            worker.run()
+        tour.assert_not_called()
+        ligne = registry.get(self.db, "bascule")
+        self.assertEqual(ligne["pending_prompt"], "travail")
+        self.assertIsNone(ligne.get("lease_owner"))
+
+    def test_place_ailleurs_pendant_une_rotation_en_mode_once(self):
+        # #283 r2 : process_once (--once) passe par la même garde que run()
+        worker = self._worker("unefois")
+        registry.set_pending_prompt(self.db, "unefois", "travail")
+
+        def rotation():
+            self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
+                            " WHERE name = 'unefois'")
+            return True
+
+        with mock.patch.object(worker, "maybe_rotate", side_effect=rotation), \
+                mock.patch.object(worker, "run_turn") as tour, \
+                mock.patch.object(runner_mod, "log"):
+            self.assertFalse(worker.process_once(0))
+        tour.assert_not_called()
+        self.assertEqual(registry.get(self.db, "unefois")["pending_prompt"], "travail")
+
+    def test_base_perdue_au_controle_de_placement_la_consigne_survit(self):
+        # #283 r1 : pick() a pris A, le contrôle de placement lève Unavailable ;
+        # B arrive avant la reprise — A n'est pas perdue, les deux partent
+        worker = self._worker("panne")
+        registry.set_pending_prompt(self.db, "panne", "consigne A")
+        controles = []
+        reel = worker.placed_elsewhere
+
+        def placement():
+            controles.append(1)
+            if len(controles) == 2:          # celui d'après pick()
+                registry.set_pending_prompt(self.db, "panne", "consigne B")
+                raise db_mod.Unavailable("base coupée")
+            return reel()
+
+        tours = []
+
+        def tour(spec):
+            tours.append(spec.get("prompt"))
+            worker.stopping.set()
+            return True
+
+        with mock.patch.object(worker, "placed_elsewhere", side_effect=placement), \
+                mock.patch.object(worker, "_panne_de_base"), \
+                mock.patch.object(worker, "run_turn", side_effect=tour), \
+                mock.patch.object(runner_mod, "log"):
+            worker.run()
+        self.assertEqual(len(tours), 1)
+        self.assertIn("consigne A", tours[0])
+        self.assertIn("consigne B", tours[0])
 
     def test_doctor_signale_un_agent_mene_sans_unite(self):
         self.register("sansunite", "claude", cwd=self._cwd("sansunite"))

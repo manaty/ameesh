@@ -3,6 +3,7 @@
 
   ameesh progress [--json] [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
   ameesh progress --html FILE [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
+  ameesh progress --serve [--port 8765] [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
 
 The project's current state and timeline, **fed by what ameesh records
 itself** (lot transitions in `work_items`, gated actions, registry turns and
@@ -33,7 +34,9 @@ leases, accounting marker, `turn_costs` ledger) — never by git or the board:
 
 The JSON follows the versioned schema `ameesh-progress/1`
 (`docs/PROGRESS.md`). `--html` writes a self-contained static page (no
-network resource, no server) that renders this JSON as a timeline.
+network resource, no server) that renders this JSON as a timeline; `--serve`
+(L304) serves that page and `/api/progress.json` locally, read-only, with a
+Refresh button (`progress_serve`).
 
 This module only reads: every database read goes through
 `storage.of(db).progress`; plan gauges come from `cost.CostBook` (local
@@ -548,6 +551,48 @@ def _truncation(rows: list[dict], limit: int) -> dict | None:
     return {"shown": len(rows), "total": total, "limit": int(limit)}
 
 
+def milestone_projects(packages: Iterable[dict], items: Iterable[dict]) -> dict:
+    """L304 : les projets (`app`) des lots rattachés sous chaque jalon du plan,
+    tous lots confondus (la fenêtre n'y change rien)."""
+    by_id = {p["id"]: p for p in packages}
+    out: dict = {}
+    for item in items:
+        ms = plan_mod.milestone_of(item.get("package_id"), by_id)
+        if ms is not None and item.get("app"):
+            out.setdefault(ms, set()).add(item["app"])
+    return out
+
+
+def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict],
+                   ms_projects: dict, decisions: list[dict]) -> list[dict]:
+    """L304 : la carte de chaque projet, dans l'ordre de `projects` (actifs
+    d'abord). Son jalon est le prochain jalon non atteint qui porte un de ses
+    lots (le plus tôt daté, les non datés après) ; aucun : null."""
+    cards = []
+    for p in projects:
+        name = p.get("name")
+        open_ms = [m for m in milestones if name in ms_projects.get(m["id"], ())
+                   and m.get("progress") != 1]
+        open_ms.sort(key=lambda m: (m.get("date") is None, m.get("date") or "", m["id"]))
+        ms = open_ms[0] if open_ms else None
+        cards.append({
+            "project": name,
+            "active": bool(p.get("active")),
+            "lots_open": int(p.get("lots_open") or 0),
+            "lots_merged_in_window": sum(1 for l in lots if l.get("project") == name
+                                         and l.get("state") == "merged"),
+            "agents_active": int(p.get("agents_active") or 0),
+            "agents_working": int((p.get("counts") or {}).get("working") or 0),
+            "spend_24h_usd": round(float(p.get("usd_24h") or 0.0), 2),
+            "decisions_pending": sum(1 for d in decisions if d.get("project") == name),
+            "milestone": ({k: ms.get(k) for k in ("id", "title", "date", "progress",
+                                                  "lots_merged", "lots_total")}
+                          if ms else None),
+            "warnings": list(p.get("warnings") or []),
+        })
+    return cards
+
+
 def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
              book: cost_mod.CostBook | None = None, now: float | None = None,
              max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
@@ -583,7 +628,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                       messages_ts=messages.get(int(item["id"])), agent_states=states,
                       agent_externals=externals)
             for item in items]
-    plan = plan_mod.summarize(package_rows, st.package_items())
+    package_items = st.package_items()
+    plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
     truncated = {}
     for key, rows, limit in (("lots", items, max_lots), ("actions", action_rows, max_actions)):
@@ -630,6 +676,13 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     if gantt:
         from . import roadmap as roadmap_mod
         roadmap = roadmap_mod.build(db, now=now, project=project)
+    # L304 : les demandes de décision en attente, et la carte de chaque projet
+    from . import decisions as decisions_mod
+    pending = decisions_mod.pending(db, now)
+    if project:
+        pending = [d for d in pending if d.get("project") == project]
+    overview = build_overview(by_project["projects"], lots, plan["milestones"],
+                              milestone_projects(package_rows, package_items), pending)
 
     return {
         "schema": SCHEMA,
@@ -644,6 +697,9 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         # L96 (champ ajouté) : feuille de route, schéma ameesh-roadmap/1 ; null
         # avec --no-gantt
         "roadmap": roadmap,
+        # L304 (champs ajoutés) : une carte par projet, décisions en attente
+        "overview": overview,
+        "decisions": pending,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -879,10 +935,17 @@ def _gauge_text(g: dict) -> str:
 
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_page.html")
 _DATA_MARK = "/*__AMEESH_PROGRESS_DATA__*/null"
+_MODE_MARK = '/*__AMEESH_PROGRESS_MODE__*/"static"'
+_CSP_MARK = "default-src 'none';"
 
 
-def render_html(snap: dict) -> str:
+def render_html(snap: dict | None, *, served: bool = False) -> str:
     """La page de référence avec l'instantané embarqué (aucune ressource externe).
+
+    `served` (L304) : page de `ameesh progress --serve`, rendue sans données
+    (`snap` None) : elle lit `/api/progress.json` avec le jeton, la politique
+    de sécurité ajoute donc `connect-src 'self'` (rien d'autre). Statique, le
+    bouton Refresh est désactivé et la page ne peut rien demander au réseau.
 
     Le JSON est inséré dans un `<script type="application/json">` : `<`, `>`
     et `&` y sont échappés en `\\u003c`… pour qu'aucun texte (titre de lot,
@@ -893,8 +956,11 @@ def render_html(snap: dict) -> str:
     data = (json.dumps(snap, ensure_ascii=False, sort_keys=True)
             .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
-    if _DATA_MARK not in page:
+    if _DATA_MARK not in page or _MODE_MARK not in page or _CSP_MARK not in page:
         raise ProgressError("page template has no data placeholder")
+    page = page.replace(_MODE_MARK, '"served"' if served else '"static"', 1)
+    if served:
+        page = page.replace(_CSP_MARK, _CSP_MARK + " connect-src 'self';", 1)
     return page.replace(_DATA_MARK, data, 1)
 
 
@@ -924,6 +990,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="ameesh-progress/1 schema")
     parser.add_argument("--html", metavar="FILE", default=None,
                         help="write the static timeline page (self-contained, offline)")
+    parser.add_argument("--serve", action="store_true",
+                        help="serve the page locally (127.0.0.1, read-only, token), L304")
+    parser.add_argument("--port", type=int, default=None,
+                        help="port for --serve (default 8765)")
     parser.add_argument("--project", default=None, help="project (app, workstream, team)")
     parser.add_argument("--since", default=DEFAULT_SINCE,
                         help="window start: duration (16h, 2d) or ISO date (default 24h)")
@@ -944,6 +1014,18 @@ def main(argv: list[str] | None = None) -> int:
             threshold = stagnation.stale_after(args.stale_after)
         except stagnation.StaleError as exc:
             raise ProgressError("--stale-after : %s" % exc)
+        if args.port is not None and not args.serve:
+            raise ProgressError("--port only goes with --serve")
+        if args.serve:
+            if args.html or args.json:
+                raise ProgressError("--serve combines with neither --html nor --json")
+            from . import progress_serve
+            port = progress_serve.DEFAULT_PORT if args.port is None else args.port
+            if not 0 <= port <= 65535:
+                raise ProgressError("--port out of range: %s" % port)
+            return progress_serve.serve(cfg, port=port, since=args.since,
+                                        stale_after=threshold, gantt=not args.no_gantt,
+                                        project=args.project)
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db, defer=True)

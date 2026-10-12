@@ -177,6 +177,9 @@ def startup_options(cfg: Config, existing: str = "") -> str:
         # Sans lui, une requête qui pend (réseau, verrou) bloquerait le
         # battement de bail et laisserait un harnais tourner sans bail.
         parts.append("-c statement_timeout=%d" % int(cfg.statement_timeout_ms))
+    if getattr(cfg, "read_only", False):
+        # L304 : toute écriture est refusée par le serveur lui-même
+        parts.append("-c default_transaction_read_only=on")
     return " ".join(parts)
 
 
@@ -394,6 +397,10 @@ class PsqlDriver:
                 timeout = "SET statement_timeout = %d;" % int(cfg.statement_timeout_ms)
                 self._args += ["-c", timeout[:-1]]
                 self._bootstrap = timeout + "\n" + self._bootstrap
+            if getattr(cfg, "read_only", False):
+                ro = "SET default_transaction_read_only = on;"
+                self._args += ["-c", ro[:-1]]
+                self._bootstrap = ro + "\n" + self._bootstrap
         #: résultat de la vérification de schéma, faite avec la sonde de
         #: connexion (L61 : un seul sous-processus pour les deux)
         self._schema_ok: bool | None = None
@@ -836,6 +843,8 @@ class PsycopgDriver:
             if self.cfg.statement_timeout_ms and self.cfg.statement_timeout_ms > 0:
                 self.conn.execute("SET statement_timeout = %d"
                                   % int(self.cfg.statement_timeout_ms))
+            if getattr(self.cfg, "read_only", False):
+                self.conn.execute("SET default_transaction_read_only = on")
             self.conn.execute("SELECT 1").fetchone()
         except Exception as exc:
             raise Unavailable("psycopg: %s" % _one_line(exc)) from exc

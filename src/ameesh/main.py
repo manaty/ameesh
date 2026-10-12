@@ -47,8 +47,9 @@
         restarts a stopped, dead or idle agent: same session if the next
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh interrupt <agent> <message…>   direct interruption (authorized senders);
-  ameesh progress [--json] [--html FILE] [--project P] [--since 24h]
+  ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
+        --serve: the page served locally, read-only, with a Refresh button (L304);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -92,7 +93,7 @@
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
-  ameesh deps link|local|status|entries node_modules shared per lockfile (#248);
+  ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
