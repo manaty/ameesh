@@ -244,6 +244,21 @@ class Config:
     #: cours est arrêté, sa consigne remise en attente). Un second signal
     #: arrête tout de suite. L'unité systemd garde TimeoutStopSec au-dessus.
     drain_seconds: float = 1800.0
+    #: L159f: host gate, the state a capacity guard writes for this host
+    #: (docs/GARDE-DE-CAPACITE.md). `host_gate`: empty (no gate on a classic
+    #: host; a `file` gate on a lending host, one whose Host fiche has
+    #: `policy.lend`), `file`, or `none` (no gate, even on a lending host).
+    #: `host_gate_path`, `host_gate_ack`: the state and the acknowledgement
+    #: (defaults `/run/ameesh-gate/state/state.json`, `…/ack/ack.json`).
+    host_gate: str = ""
+    host_gate_path: str = ""
+    host_gate_ack: str = ""
+    #: what an unreadable, absent or stale state counts as: empty = `stopped`
+    #: on a lending host, `available` on a classic one
+    host_gate_fallback: str = ""
+    #: withdrawal deadline when a `draining` state gives none (seconds); 0 =
+    #: the offer's `drain_seconds` on a lending host, 90 otherwise
+    host_gate_drain: float = 0.0
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -341,21 +356,8 @@ class Config:
     #: VM, la session du harnais reçoit AMEESH_EXEC_URL et AMEESH_EXEC_TOKEN.
     exec_url: str = ""
     exec_token_file: str = ""
-    #: porte d'hôte (L112) : état d'inactivité écrit par le runner Compute.
-    #: `host_gate` : vide (aucune porte, hôte classique inchangé), `file` ou
-    #: `socket` ; `host_gate_path` : le fichier d'état ou la socket (défauts
-    #: `/run/ameesh-gate/state.json`, `/run/ameesh-gate/gate.sock`) ;
-    #: `host_gate_ack` : fichier d'acquittement (défaut : `ack.json` à côté).
-    host_gate: str = ""
-    host_gate_path: str = ""
-    host_gate_ack: str = ""
-    #: état retenu quand la porte est illisible ou absente : vide = `stopped`
-    #: pour un hôte médié, `available` pour un hôte classique
-    host_gate_fallback: str = ""
-    #: hôte médié (exécuteur sans accès à la base, VM d'un appareil prêté)
+    #: L109: mediated host, provider/DB credentials remain on the server.
     host_mediated: bool = False
-    #: délai de retrait quand l'état `draining` ne donne pas d'échéance (s)
-    host_gate_drain: float = 90.0
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
@@ -606,7 +608,7 @@ def load(env: dict | None = None) -> Config:
         approve_tls_name=str(pick("AMEESH_APPROVE_TLS_NAME", default=cfg.approve_tls_name)
                              or "").strip().lower(),
     )
-    # L112 : porte d'hôte
+    # L159f: host gate
     gate_path = pick("AMEESH_HOST_GATE_PATH", default=cfg.host_gate_path) or ""
     gate_ack = pick("AMEESH_HOST_GATE_ACK", default=cfg.host_gate_ack) or ""
     cfg = replace(
@@ -618,11 +620,13 @@ def load(env: dict | None = None) -> Config:
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
         host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
                                     False, "AMEESH_HOST_MEDIATED")),
-        host_gate_drain=max(0.0, _as_float(pick("AMEESH_HOST_GATE_DRAIN"),
-                                           cfg.host_gate_drain)),
+        host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
+                                        int(cfg.host_gate_drain))),
     )
-    if cfg.host_gate not in ("", "none", "file", "socket"):
-        raise SystemExit("AMEESH_HOST_GATE invalide : %r (file | socket)" % cfg.host_gate)
+    if cfg.host_gate not in (("", "none", "file", "socket")
+                             if cfg.backend == "mediated" or cfg.host_mediated
+                             else ("", "none", "file")):
+        raise SystemExit("AMEESH_HOST_GATE invalide : %r (file | none)" % cfg.host_gate)
     if cfg.host_gate_fallback not in ("", "available", "draining", "stopped"):
         raise SystemExit("AMEESH_HOST_GATE_FALLBACK invalide : %r "
                          "(available | draining | stopped)" % cfg.host_gate_fallback)

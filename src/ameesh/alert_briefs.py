@@ -20,7 +20,7 @@ from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
-                 "waiting_without_question")
+                 "waiting_without_question", "module_deviation")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -29,12 +29,14 @@ AUDITOR_ROLES = ("auditeur", "auditor")
 AUDITOR_NAME = "auditeur"
 
 
-def auditors(listing: list, canons=None) -> list:
+def auditors(listing: list, canons=None, *, explicit_only=False) -> list:
     """Les auditeurs du registre : l'agent `auditeur`, et ceux dont la fiche
-    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`)."""
+    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`).
+    `explicit_only` exige ce rôle, sans autorisation implicite par le nom."""
     names = {row["name"] for row in listing}
     found = sous_utilisation.role_orchestrators(canons or [], AUDITOR_ROLES)
-    found.add(AUDITOR_NAME)
+    if not explicit_only:
+        found.add(AUDITOR_NAME)
     return sorted(n for n in found if n in names)
 
 
@@ -122,20 +124,33 @@ def _for_auditor(alert: dict) -> str:
 
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
-           auditor_names=()) -> dict:
+           auditor_names=(), *, orchestrator_names=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
     l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
-    l'estimateur lui-même s'il est un agent du registre. Auditeurs : toujours. Un agent à la fois orchestrateur et auditeur
-    reçoit le texte d'orchestrateur."""
+    l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
+    rôle explicite et projet, sans repli. Auditeurs : toujours pour les autres
+    types. Un agent à la fois orchestrateur et auditeur reçoit un seul texte."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
     by_name = {row["name"]: row for row in listing}
     orchestras = list(alert.get("orchestrators") or ())
-    if kind == "idle_capacity":
+    if kind == "module_deviation":
+        text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
+        project = alert.get("project")
+        if not project:
+            return {}
+        out = {o: text for o in orchestras
+               if o in orchestrator_names and o in by_name
+               and by_name[o].get("chantier") == project}
+        for name in auditor_names or ():
+            if name in by_name and by_name[name].get("chantier") in (None, "", project):
+                out.setdefault(name, text)
+        return out
+    elif kind == "idle_capacity":
         out = sous_utilisation.orchestrator_briefs(alert, listing, lot_titles)
         audit_text = _for_auditor(alert)
     else:

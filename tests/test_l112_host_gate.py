@@ -269,6 +269,19 @@ class ControleurTest(unittest.TestCase):
                                     log=self.log.append, clock=lambda: self.now)
         self.ctl.apply(self.gate.st)
 
+    def test_refresh_observes_withdrawal_before_the_common_runner_claims(self):
+        self.gate.st = P.GateState("draining", 2, reason="guard")
+        self.assertFalse(self.ctl.refresh().may_claim)
+        self.assertTrue(self.ctl.holds_turns())
+
+    def test_foreground_once_worker_is_held_until_lease_release(self):
+        worker = _FauxWorker("foreground")
+        self.runner.gate_foreground = worker
+        ack = self.ctl.tick()
+        self.assertIn("foreground", ack.held)
+        self.runner.gate_foreground = None
+        self.assertNotIn("foreground", self.ctl.tick().held)
+
     def test_transitions_et_acquittements(self):
         a = _FauxWorker("a")
         self.runner.workers["a"] = a

@@ -17,7 +17,9 @@ A lot is stale when it is open and inactive beyond the configured threshold
   and its descendants. An exact WorkPackage ID in `depends_on` resolves to
   its open execution lots (including descendant packages); `lot <id>`,
   `package <id>` and `WorkPackage <id>` also identify a plan package. These are the
-  existing plan dependency sources; no lot-to-lot link table is added.
+  existing plan dependency sources.
+- A direct prerequisite declared with `ameesh work dependencies <id> --add <blocker>`
+  names another open execution lot ([L385](WORK-DEPENDENCIES.md)).
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
@@ -49,5 +51,5 @@ blockers outside the current project or progress window.
 
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
-by a planned date or an existing commitment/plan dependency. This preserves
+by a planned date, commitment/plan dependency or direct prerequisite link. This preserves
 alerts for unexplained waits.

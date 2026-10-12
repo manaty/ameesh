@@ -23,7 +23,7 @@ def ancestors(package_id, packages):
         package_id = package.get("parent")
 
 
-def resolve(rows, dates, commitments, packages, open_items, *, now):
+def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=()):
     """Pure resolver. Only an open execution lot can block another lot.
 
     Commitments apply to their explicit work item or to their plan package
@@ -40,6 +40,9 @@ def resolve(rows, dates, commitments, packages, open_items, *, now):
         for package_id in ancestors(row.get("package_id"), packages):
             package_lots.setdefault(package_id, set()).add(int(row["id"]))
     direct, by_package = {}, {}
+    for edge in dependencies:
+        if edge.get("blocking"):
+            direct.setdefault(int(edge["work_item_id"]), set()).add(int(edge["blocker_id"]))
     for commitment in commitments:
         if commitment.get("status") != "open":
             continue
@@ -86,12 +89,14 @@ def resolve(rows, dates, commitments, packages, open_items, *, now):
     return waits
 
 
-def read(db, rows, *, now=None, packages=None, open_items=None):
+def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None):
     """Grouped, unbounded truth reads; no query per candidate or dependency."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    if dependencies is None:
+        dependencies = st.work_dependencies.for_items([int(r["id"]) for r in rows])
     dates = {int(r["id"]): r for r in st.roadmap.item_plans([int(r["id"]) for r in rows])}
     commitments = st.roadmap.commitments(statuses=["open"])
     packages = (packages if packages is not None else
@@ -99,4 +104,5 @@ def read(db, rows, *, now=None, packages=None, open_items=None):
     if open_items is None:
         open_items = st.operations.open_lots_activity(None) if any(
             c.get("depends_on") for c in commitments) else []
-    return resolve(rows, dates, commitments, packages, open_items, now=now)
+    return resolve(rows, dates, commitments, packages, open_items, now=now,
+                   dependencies=dependencies)

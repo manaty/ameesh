@@ -241,6 +241,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'action_class', 'currency', 'reserved_by', 'reserved_at',
         'released_at', 'released_reason'
     ]),
+    -- L385 (0373): explicit prerequisites and their audit attribution.
+    ('work_item_dependencies', ARRAY[
+        'work_item_id', 'blocker_id', 'created_by', 'created_at'
+    ]),
     -- L78 (0368): conversation cursors and state, without message content.
     ('conversation_heads', ARRAY['agent', 'seq']),
     ('conversation_log', ARRAY[
@@ -290,7 +294,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #253 (0359): every filesystem the host writes to, paths and numbers
         'volumes',
         -- L159e6 (0361): the guard's last restart (unit names and reasons)
-        'guard_restart'
+        'guard_restart',
+        -- L159f (0069): host gate state, seq and the guard's short reason
+        'gate_state', 'gate_seq', 'gate_reason'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',

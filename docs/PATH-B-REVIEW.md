@@ -54,7 +54,7 @@ The final main merge retains the optional `held=false` parameter of
 or sends false; the storage UPDATE atomically requires and locks an open
 request. Decision-source/prose reads,
 waiting-episode reads and host-history reads stay refused remotely; the
-325-operation interface is fully classified without increasing the 62
+326-operation interface is fully classified without increasing the 62
 admitted operations. Credential health operations from L226b also stay
 server-only: devices skip local provider health guards and do not report
 relay errors as global provider credential failures.
@@ -148,6 +148,14 @@ already been written, reconcile spending before reopening ordinary turns:
 older code counts those diagnostic rows. Check the restored commits, normal
 turns and `doctor`; record the failure and retained evidence. Never delete
 the database or reuse an enrollment code as a rollback shortcut.
+
+The 12 October integration retains main's extracted `ameesh.host_gate` for
+ordinary runners, including guard heartbeat validation, lending defaults,
+shared acknowledgments/slots and freeze accounting. The mediated controller
+keeps its remote availability sink, socket support and session-token source;
+it implements synchronous refresh before claim and counts the foreground
+worker. The common `host_gate_drain=0` configuration means the normal 90 s
+fallback for mediated devices. Mail recipient locking remains server-only.
 
 ## Validation of the branch
 

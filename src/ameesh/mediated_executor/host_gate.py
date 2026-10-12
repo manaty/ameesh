@@ -446,7 +446,8 @@ def lease_ttl_for(canons, host: str, default: float) -> float:
     declared: list[float] = []
     volatile = False
     for canon in canons or ():
-        fiche = canon.host(host) if hasattr(canon, "host") else None
+        lookup = getattr(canon, "host", None)
+        fiche = lookup(host) if callable(lookup) else None
         policy = getattr(fiche, "policy", None)
         if policy is None:
             continue
@@ -591,6 +592,11 @@ class GateController:
         st = self.current
         return "%s (%s, seq %d)" % (st.state, st.reason, st.seq)
 
+    def refresh(self) -> GateState:
+        """Refresh before claiming, as required by the common runner."""
+        self.apply(self.gate.state())
+        return self.current
+
     # -- boucle ------------------------------------------------------------
     def start(self) -> None:
         if self._thread is not None:
@@ -650,9 +656,14 @@ class GateController:
         lock = getattr(self.runner, "lock", None)
         workers = getattr(self.runner, "workers", {}) or {}
         if lock is None:
-            return list(workers.values())
-        with lock:
-            return list(workers.values())
+            result = list(workers.values())
+        else:
+            with lock:
+                result = list(workers.values())
+        foreground = getattr(self.runner, "gate_foreground", None)
+        if foreground is not None and foreground not in result:
+            result.append(foreground)
+        return result
 
     # -- transitions -------------------------------------------------------
     def apply(self, state: GateState) -> bool:
@@ -764,5 +775,5 @@ def controller_from_config(runner, *, log: Callable[[str], None] | None = None,
         from . import availability
         sink = RegistrySink(availability.FileRegistry(availability.default_path(cfg)),
                             cfg.host, runner.runner_id, log=log)
-    return GateController(runner, gate, drain_s=getattr(cfg, "host_gate_drain", DEFAULT_DRAIN_S),
+    return GateController(runner, gate, drain_s=getattr(cfg, "host_gate_drain", 0) or DEFAULT_DRAIN_S,
                           sink=sink, log=log)

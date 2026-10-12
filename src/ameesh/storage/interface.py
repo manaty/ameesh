@@ -153,6 +153,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .work_dependencies import WorkDependencies
 
 import abc
 from typing import Any, Callable, Protocol, Sequence
@@ -695,6 +696,14 @@ class Credentials(Domain):
 
 class Mailbox(Domain):
     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
+
+    @abc.abstractmethod
+    def lock_recipient(self, recipient: str) -> dict | None:
+        """Lock the registry recipient against reassignment/deletion until commit.
+
+        Call within a transaction, recheck authorization, then deposit there.
+        Returns name and chantier; missing recipients are not authorized.
+        """
 
     @abc.abstractmethod
     def send(self, sender: str, recipient: str, body: str, *, host: str | None,
@@ -2547,6 +2556,7 @@ class Storage(abc.ABC):
     approvals: Approvals
     nonces: Nonces
     work: WorkItems
+    work_dependencies: WorkDependencies
     packages: WorkPackages
     actions: Actions
     action_source: ActionSource
