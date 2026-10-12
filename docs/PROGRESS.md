@@ -43,7 +43,8 @@ lots merged in the window, pending decisions, 24 h spend, next milestone
 with its progress bar, two warnings at most; then "Watch": overdue or
 urgent decisions, blocked and stale lots), **Gantt** (the roadmap: tasks
 grouped by epic, or by project when they have none, an epic without any
-task keeping its own group, groups folded by default unless they hold a
+task keeping its own group, as does a planned epic whose tasks are all
+finished and hidden, groups folded by default unless they hold a
 late task (in progress alone is not enough), with a summary bar and their open, delivered, blocked and late
 counts; delivered and abandoned tasks hidden unless ticked; week zoom fits
 the window on screen, day zoom gives each day a column and scrolls to

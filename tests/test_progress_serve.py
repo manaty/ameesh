@@ -246,7 +246,12 @@ class PageBuilderTest(unittest.TestCase):
         # r1 : une epic sans tâche garde son groupe ; fenêtre de jalon du min au
         # max de ses dates, en jours calendaires (changement d'heure)
         self.assertIn("if (hasTask[e.id]) return;", html)
-        self.assertIn("if (!shown.length && g.rows.length) return;", html)
+        # r2 : une epic planifiée garde son groupe quand ses tâches finies sont
+        # masquées ; pas de prototype (epic « constructor ») ; pas de « livré »
+        # vert pour un groupe sans tâche
+        self.assertIn("if (!shown.length && g.rows.length && !(g.epic && g.epic.planned)) return;", html)
+        self.assertIn("var hasTask = Object.create(null);", html)
+        self.assertIn('open.length || !g.rows.length ? "" : " done"', html)
         self.assertIn("f = addDays(midnight(Math.min.apply(null, mts)), -1);", html)
         self.assertIn("t = addDays(midnight(Math.max.apply(null, mts)), 2);", html)
         self.assertNotIn('x.state === "en_cours"; });', html)

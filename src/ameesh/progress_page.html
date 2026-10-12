@@ -1242,12 +1242,13 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       R.milestones.forEach(function (p) { pkgRow(gm, p); });
     }
     // tâches par epic, à défaut par projet ; les groupes les plus chargés d'abord
-    var EPIC = {};
+    var EPIC = Object.create(null);
     (R.epics || []).forEach(function (e) { EPIC[e.id] = e; });
-    var byKey = {}, order = [];
+    var byKey = Object.create(null), order = [];
     // une epic sans aucune tâche a son groupe quand même (sa barre prévue) ;
-    // celle dont les tâches sont toutes hors du projet choisi n'en a pas
-    var hasTask = {};
+    // celle dont les tâches sont toutes hors du projet choisi n'en a pas ;
+    // sans prototype, un identifiant « constructor » ou « toString » compte aussi
+    var hasTask = Object.create(null);
     (R.tasks || []).forEach(function (x) { if (x.epic) hasTask[x.epic] = true; });
     (R.epics || []).forEach(function (e) {
       if (hasTask[e.id]) return;
@@ -1265,7 +1266,8 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     }).forEach(function (g) {
       var open = g.rows.filter(function (x) { return !ENDED[x.state]; });
       var shown = G.done ? g.rows : open;
-      if (!shown.length && g.rows.length) return;
+      // une epic planifiée garde son groupe (ses dates) même si ses tâches finies sont masquées
+      if (!shown.length && g.rows.length && !(g.epic && g.epic.planned)) return;
       var nLate = g.rows.filter(function (x) { return x.late && x.late.open; }).length;
       var nBlocked = g.rows.filter(function (x) { return x.state === "bloquee"; }).length;
       var nDone = g.rows.filter(function (x) { return x.state === "livree"; }).length;
@@ -1282,7 +1284,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
           if (hi && (z === null || hi > z)) z = hi;
         });
       });
-      var sum = track(a !== null ? [{a: a, b: Math.max(z, a + 3600), cls: "rm-real" + (nLate ? " late" : open.length ? "" : " done")}] : []);
+      var sum = track(a !== null ? [{a: a, b: Math.max(z, a + 3600), cls: "rm-real" + (nLate ? " late" : open.length || !g.rows.length ? "" : " done")}] : []);
       var title = g.epic ? "epic " + g.epic.id + " " + (g.epic.title || "") : g.title;
       // déplié d'office seulement s'il porte une tâche en retard, ou si l'epic
       // l'est (mesh-design, n°9311) : « en cours » ne suffit pas
