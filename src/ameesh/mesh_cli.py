@@ -333,8 +333,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             if latest.get("btrfs_unallocated_bytes") is not None \
                     or latest.get("btrfs_metadata_headroom_bytes") is not None:
                 # #246: btrfs allocation, which `disque` (statvfs) does not show
-                print("  btrfs      non alloué %s (seuil %s%s) ; marge des métadonnées %s "
-                      "(seuil %s%s)" % (
+                print("  btrfs      unallocated %s (threshold %s%s); metadata headroom %s "
+                      "(threshold %s%s)" % (
                           _fmt_bytes(latest.get("btrfs_unallocated_bytes")),
                           _fmt_bytes(limits.get("min_btrfs_unallocated")),
                           tag("min_btrfs_unallocated"),
