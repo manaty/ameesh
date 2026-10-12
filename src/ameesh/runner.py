@@ -1111,6 +1111,8 @@ class AgentWorker(threading.Thread):
             if self._held_by_pressure(self.runner.host_pressure()):
                 self.runner.pressure_delayed(self.name, rotation=True)
                 return False
+            if not self._rotation_allowed():
+                return False
         if self.rotation_forcee and self.proc is None:
             raison, self.rotation_forcee = self.rotation_forcee, None
             if self.session_policy() != "jamais" and self.current_session():
@@ -1123,6 +1125,19 @@ class AgentWorker(threading.Thread):
             return False
         return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
+
+    def _rotation_allowed(self) -> bool:
+        """L226b : le tour de résumé d'une rotation est un appel de modèle. Il
+        passe les gardes d'un tour (budget et plafonds du compte, santé de
+        l'authentification) et tourne sous le compte de la session ; sinon la
+        rotation attend : la bascule du prochain tour (`continuity`) résume
+        sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
+        if not self.budget_ok() or not self.auth_ready():
+            return False
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return False
+        return account_turn.session_on(self, compte)
 
     def turn_summary(self) -> str:
         """Le résumé rendu par le dernier tour de résumé (L218) : sa réponse
@@ -2294,9 +2309,11 @@ class AgentWorker(threading.Thread):
         """Pose (fencé) le blocage `auth_blocked` d'un agent qui n'a pas de tour
         en cours ; journal et fil une fois par blocage."""
         texte = auth_failure.status_text(harness, account)
-        if texte == self._auth_status:
+        agent = self.agent or {}
+        if texte == self._auth_status and agent.get("status") == "blocked" \
+                and agent.get("status_text") == texte:
             return
-        if self._auth_status:
+        if self._auth_status and self._auth_status != texte:
             # autre compte en échec (bascule vers un compte lui aussi en panne) :
             # l'ancienne marque est levée pour poser la nouvelle
             registry.clear_marked_block(self.db, self.name, self.runner.runner_id,

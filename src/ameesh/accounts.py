@@ -640,7 +640,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # eligible again once the windows that ran out have reset
         spent = result.gauges.spent()
         resets = [g.resets_at for g in spent if g.resets_at]
-        result.until = max(resets) if len(resets) == len(spent) else None
+        # (none dated, or a reading without windows: no date, never a guess)
+        result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
     result.limits = limits(profile, result.gauges, now)
     depasses = []

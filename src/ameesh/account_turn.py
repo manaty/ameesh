@@ -241,6 +241,19 @@ def _session_account(worker) -> str | None:
     return worker._compte_session
 
 
+def session_on(worker, compte) -> bool:
+    """La session courante tourne-t-elle sous `compte` (règle de `continuity`) ?
+    Vrai sans comptes déclarés (`compte` None) ou sans session."""
+    if compte is None or not worker.current_session():
+        return True
+    previous = _session_account(worker)
+    if previous is None:
+        # session d'avant L30 : ouverte avec le dossier par défaut du harnais
+        return accounts.Profile(harness=_harness(worker), name="(défaut)").home() \
+            == compte.home()
+    return previous == compte.name
+
+
 def continuity(worker) -> None:
     """Session ouverte sous un autre compte : reprise, ou rotation avec résumé.
 
@@ -322,8 +335,9 @@ def summary_possible(old, book, items, now: float | None = None, *,
     now = time.time() if now is None else now
     try:
         gauges = accounts.gauges_of(book, old, items) if book is not None else []
-    except Exception:
-        gauges = []
+    except Exception as exc:
+        # L226b : jauges illisibles — pas d'appel de modèle dans le doute
+        return False, "jauges %s illisibles (%s)" % (old.harness, exc)
     if accounts.in_overage(gauges, now):
         return False, "forfait %s en overage (facturé au-delà du forfait)" % old.harness
     fixed = accounts.fixed_caps(old, gauges)

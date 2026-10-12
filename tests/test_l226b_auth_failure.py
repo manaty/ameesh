@@ -610,5 +610,86 @@ class TurnStderrTest(_AuthBase):
             worker.watchdog_stop.set()
 
 
+class ReviewR2Test(_CapsBase):
+    """Codex review r2: unreadable gauges and a reading without windows."""
+
+    def test_unreadable_gauges_allow_no_summary(self):
+        class Broken(_Book):
+            def claude_gauges(self, account=None, primary=None):
+                raise ValueError("window_minutes: 'bad'")
+
+        items = self._items()
+        ok, why = account_turn.summary_possible(items[1], Broken({}), items,
+                                                now=1_800_000_000.0)
+        self.assertFalse(ok)
+        self.assertIn("illisibles", why)
+
+    def test_overage_reading_without_windows(self):
+        now = 1_800_000_000.0
+        items = self._items()
+        bare = cost.Gauges([], cost.Overage(capable=True, in_use=True))
+        evs = self._ev(items, {"secondaire": bare}, now)  # no ValueError
+        self.assertFalse(evs["secondaire"].ok)
+        self.assertIn("in overage", evs["secondaire"].reason)
+        self.assertIsNone(evs["secondaire"].until)
+
+
+class RunnerReviewR2Test(_AuthBase):
+    """Codex review r2: ordinary rotation behind the turn guards, and the
+    auth_blocked mark set again after another status replaced it."""
+
+    def test_ordinary_rotation_waits_for_a_healthy_account(self):
+        runner, worker = self._worker("rot", "claude", {})
+        try:
+            worker.rotation_forcee = "test"
+            self._report("claude", "", "failing")
+            with mock.patch.object(worker, "current_session", return_value="sess-1"), \
+                    mock.patch.object(worker, "run_turn", return_value=False) as tour:
+                self.assertFalse(worker.maybe_rotate())
+                tour.assert_not_called()
+                self.assertEqual(worker.rotation_forcee, "test")  # kept for later
+                self.assertTrue(registry.get(self.db, "rot")["status_text"]
+                                .startswith("auth_blocked"))
+                self._report("claude", "", "healthy")
+                worker.maybe_rotate()
+                tour.assert_called_once()
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_ordinary_rotation_only_on_the_session_account(self):
+        comptes = self._claude_comptes(partage=True)
+        runner, worker = self._worker("rot2", "claude", {"claude": comptes})
+        try:
+            worker.rotation_forcee = "test"
+            registry.set_session_account(self.db, "rot2", "primaire")
+            worker.agent = registry.get(self.db, "rot2")
+            # the guard chose the other account: the switch of the next turn rotates
+            self._report("claude", "primaire", "failing")
+            with mock.patch.object(worker, "current_session", return_value="sess-1"), \
+                    mock.patch.object(worker, "run_turn", return_value=False) as tour:
+                self.assertFalse(worker.maybe_rotate())
+                tour.assert_not_called()
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_auth_mark_set_again_after_a_budget_pause(self):
+        runner, worker = self._worker("ab", "claude", {})
+        try:
+            self._report("claude", "", "failing")
+            self.assertIsNone(self._tour(worker))
+            texte = "auth_blocked: claude/(défaut)"
+            self.assertEqual(registry.get(self.db, "ab")["status_text"], texte)
+            # a budget pause replaced the mark, then lifted itself: idle
+            registry.set_status(self.db, "ab", "blocked", status_text="budget : test")
+            registry.set_status(self.db, "ab", "idle", status_text="")
+            self.assertIsNone(worker.pick())
+            ligne = registry.get(self.db, "ab")
+            self.assertEqual((ligne["status"], ligne["status_text"]), ("blocked", texte))
+            self.assertEqual([a["agent"] for a in exploitation.alerts(self.cfg, self.db)
+                              if a["type"] == "auth_blocked"], ["ab"])
+        finally:
+            worker.watchdog_stop.set()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -221,8 +221,11 @@ evaluated the same way: a forced account past its caps is not launched.
 
 The summary of a rotation (§ 3) runs on the **old** account only if that
 account could still be chosen apart from its pace: not `failing` (§ 5), under
-`cap` and `overage_cap`, not in overage. Otherwise no model call: the session
-resumes from the deterministic brief (L39).
+`cap` and `overage_cap`, not in overage, its gauges readable. Otherwise no
+model call: the session resumes from the deterministic brief (L39). An
+ordinary rotation (size, context cap, L11) passes the guards of a turn first
+(budget and caps, authentication) and runs only on the session's own account;
+otherwise it waits, and the account switch of the next turn rotates.
 
 For the order "Claude tertiary > secondary > primary, Codex secondary >
 primary" on a host that declared `primaire, secondaire, tertiaire`:
@@ -284,7 +287,8 @@ its own as soon as its account, or another, is healthy again. A forced account
 until `ameesh accounts auto` or the reconnection. If the healthy accounts are
 at their cap but a failing one is not, it is `auth_blocked`: reconnecting
 unblocks. If every account is at its cap, failing or not, it is the usual
-budget pause.
+budget pause; once it lifts, an account still failing puts the
+`auth_blocked` mark (and its alert) back.
 
 **Recovery.** After the reconnection (`claude /login` in the account's
 folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
