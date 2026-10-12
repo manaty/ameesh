@@ -632,6 +632,34 @@ class RetryReservationTest(PgTestCase):
         self.assertIs(got, exc, got)
         self.assertEqual(attempts, [0.0], "aucune deuxième transaction")
 
+    def test_psql_verbose_ignore_les_notices_avant_l_erreur(self):
+        # codex #478 r3 : psql imprime les NOTICE et WARNING traversés avant
+        # l'erreur ; leur classe (00, 01, 02) n'est pas une erreur et ne doit
+        # pas donner le code qui classe l'échec. Le libellé de sévérité peut
+        # être traduit : c'est la classe du code qui tranche.
+        for severity, state in (("NOTICE", "00000"), ("AVERTISSEMENT", "01000"),
+                                ("INFO", "02000")):
+            with self.subTest(severity=severity, state=state):
+                stderr = ("%s:  %s: table \"work_items\" does not exist, skipping\n"
+                          % (severity, state)) + _psql_verbose()
+                exc = db_mod.PsqlDriver._fail(None, _failed(stderr))
+                self.assertEqual(exc.sqlstate, "23505")
+                self.assertEqual(exc.constraint, _INDEX)
+                got, _, _, _ = self._reserve(exc, budget=0.0)
+                self.assertIsInstance(got, work.WorkError, got)
+
+    def test_psql_verbose_le_message_ne_pretend_pas_le_champ_contrainte(self):
+        # codex #478 r3 : un message multiligne qui recopie « CONSTRAINT
+        # NAME: » ne doit pas se faire passer pour le champ ; psql écrit ses
+        # champs structurés APRÈS le message — le dernier est le vrai
+        exc = db_mod.PsqlDriver._fail(None, _failed(_psql_verbose(
+            constraint=_INDEX,
+            message='duplicate key value violates unique constraint "%s"\n'
+                    "CONSTRAINT NAME:  %s" % (_INDEX, _INDEX + "_other"))))
+        self.assertEqual(exc.constraint, _INDEX)
+        got, _, _, _ = self._reserve(exc, budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+
     def test_le_code_et_la_contrainte_du_pilote_survivent_a_la_dberror(self):
         # codex #478 r1/r2 : le code SQLSTATE et le nom de contrainte du
         # pilote (psycopg) survivent à la traduction en DbError — seuls eux

@@ -86,14 +86,46 @@ _CONNECT_HINTS = (
 
 #: code SQLSTATE de PostgreSQL pour une violation d'unicité
 UNIQUE_VIOLATION = "23505"
-#: une ligne d'erreur psql en verbosité `verbose` : « ERROR:  23505: … ».
-#: Le libellé de sévérité est traduit par le serveur (`ERREUR` en français),
-#: le code et le nom de contrainte, non : ils viennent des champs structurés
-#: du rapport d'erreur, que psql imprime aussi (`VERBOSITY=verbose`).
+#: une ligne de sévérité psql en verbosité `verbose` : « ERROR:  23505: … ».
+#: Le libellé de sévérité est traduit par le client (`ERREUR` en français) :
+#: on ne le reconnaît pas à son nom, mais à la forme « <mot>: <code>: » — le
+#: code, lui, ne dépend pas de la locale.
 _ERROR_LINE_RE = re.compile(r"^\w+:\s+([0-9A-Z]{5}):", re.MULTILINE)
+#: classes SQLSTATE qui ne sont pas des erreurs : succès (00), avertissement
+#: (01), absence de données (02). psql peut imprimer un NOTICE 00000 avant
+#: l'erreur qui fait échouer le script : ce n'est pas lui qui classe l'échec
+#: (codex #478 r3).
+_NON_ERROR_CLASSES = frozenset(("00", "01", "02"))
 #: le champ structuré « CONSTRAINT NAME: x » (psql, client en locale C) ; il
 #: porte le nom de l'index même quand celui-ci n'est pas une contrainte.
 _CONSTRAINT_LINE_RE = re.compile(r"^CONSTRAINT NAME:[ \t]+(\S.*?)[ \t]*$", re.MULTILINE)
+
+
+def _error_state(stderr: str) -> tuple[str, int] | None:
+    """(code SQLSTATE, position) de la PREMIÈRE ligne de sévérité du rapport
+    dont la classe n'est ni 00 (succès), ni 01 (avertissement), ni 02
+    (absence de données) ; `None` si le rapport n'en porte aucune.
+
+    La sévérité peut être traduite (`ERREUR` en français) : seule la forme de
+    la ligne tranche, jamais son libellé (codex #478 r3)."""
+    for match in _ERROR_LINE_RE.finditer(stderr):
+        if match.group(1)[:2] not in _NON_ERROR_CLASSES:
+            return match.group(1), match.start()
+    return None
+
+
+def _constraint_name(stderr: str, start: int) -> str | None:
+    """Le nom de contrainte du rapport d'erreur, ou `None` : le DERNIER champ
+    « CONSTRAINT NAME: » placé après la ligne de sévérité qui commence en
+    `start` (codex #478 r3).
+
+    psql écrit ses champs structurés après le message, DETAIL, HINT et
+    CONTEXT : un message multiligne qui recopie ce libellé reste avant le
+    vrai champ, seul retenu."""
+    name = None
+    for match in _CONSTRAINT_LINE_RE.finditer(stderr, start):
+        name = match.group(1)
+    return name
 
 
 class DbError(RuntimeError):
@@ -499,14 +531,17 @@ class PsqlDriver:
         low = stderr.lower()
         if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
             return Unavailable("psql: %s" % message)
-        # `VERBOSITY=verbose` : le code SQLSTATE est sur la ligne d'erreur et
-        # le nom exact de la contrainte dans son champ structuré — ni l'un ni
-        # l'autre ne dépend de `lc_messages` (codex #478 r2)
-        state = _ERROR_LINE_RE.search(stderr)
-        name = _CONSTRAINT_LINE_RE.search(stderr)
+        # `VERBOSITY=verbose` : le code SQLSTATE est sur la ligne de sévérité
+        # et le nom exact de la contrainte dans son champ structuré — ni l'un
+        # ni l'autre ne dépend de `lc_messages` (codex #478 r2). La première
+        # sévérité qui n'est ni une notice ni un avertissement classe l'échec,
+        # et seul le dernier champ CONSTRAINT NAME après elle compte : un
+        # message multiligne peut recopier ce libellé (codex #478 r3).
+        state = _error_state(stderr)
+        name = _constraint_name(stderr, state[1]) if state else None
         return DbError("psql: %s" % message,
-                       sqlstate=state.group(1) if state else None,
-                       constraint=name.group(1) if name else None)
+                       sqlstate=state[0] if state else None,
+                       constraint=name)
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
