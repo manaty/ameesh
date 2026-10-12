@@ -52,6 +52,7 @@ from . import plan as plan_mod
 from . import roadmap_dev as dev
 from . import storage
 from . import work as work_mod
+from .deprecated import DeprecatedAlias
 
 SCHEMA = "ameesh-roadmap/1"
 #: borne de lecture des tâches de la frise
@@ -910,6 +911,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="who owns it (agent or human:<id>)")
     p_add.add_argument("--lot", dest="lot", default=None,
                        help="existing task it is attached to")
+    p_add.add_argument("--tache", dest="lot", action=DeprecatedAlias, canonical="--lot",
+                       default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p_add.add_argument("--fiche", dest="package", default=None, help="WorkPackage")
     p_add.add_argument("--source-type", dest="source_kind", default="conversation",
                        choices=SOURCE_KINDS)
