@@ -976,7 +976,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   }
 
   // Comptes déclarés (L74) : toutes les fenêtres, capacité perdue, prochain choix
-  var accBox = document.getElementById("accounts"), covered = {};
+  var accBox = document.getElementById("accounts"), covered = Object.create(null);
   if ((B.accounts || []).length) accBox.appendChild(el("div", "subhead", "Plan accounts (host " + (D.host || "?") + ")"));
   (B.accounts || []).forEach(function (a) {
     covered[a.harness] = true;
