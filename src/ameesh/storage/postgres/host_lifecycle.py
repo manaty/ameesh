@@ -91,3 +91,19 @@ class HostLifecycle(interface.HostLifecycle):
                     (row["host"], row["generation"]))
                 changed.extend(updated)
         return changed
+
+    def complete_return(self, host, generation):
+        with self.db.transaction() as tx:
+            Hosts._lock_gate(tx, host)
+            tx.query("SELECT r.name FROM agent_registry r JOIN host_lifecycle_agents a "
+                     "ON a.agent=r.name WHERE a.host=%s AND a.generation=%s ORDER BY r.name "
+                     "FOR UPDATE OF r", (host, generation))
+            rows = tx.query(
+                "UPDATE host_lifecycle c SET mode='available',updated_at=clock_timestamp() "
+                "WHERE c.host=%s AND c.generation=%s AND c.mode='returning' "
+                "AND NOT EXISTS (SELECT 1 FROM host_lifecycle_agents a "
+                "JOIN agent_registry r ON r.name=a.agent WHERE a.host=c.host AND a.generation=c.generation "
+                "AND (r.host<>c.host OR r.handoff_fenced OR EXISTS "
+                "(SELECT 1 FROM host_handoffs h WHERE h.agent=r.name AND h.state NOT IN ('verified','cancelled')))) "
+                "RETURNING c.host", (host, generation))
+            return bool(rows)

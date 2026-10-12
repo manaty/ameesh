@@ -2248,6 +2248,10 @@ class HostLifecycle(Domain):
     def expire_returns(self) -> list[dict]:
         """Convert elapsed planned withdrawals to durable return requests."""
 
+    @abc.abstractmethod
+    def complete_return(self, host: str, generation: int) -> bool:
+        """Finish a return only when all remaining origins are home and unfenced."""
+
 
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).

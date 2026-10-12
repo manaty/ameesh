@@ -170,10 +170,12 @@ class Handoffs(interface.Handoffs):
                 return api.active(plan["agent"])
             if plan.get("reason") in ("host_drain", "host_return"):
                 mode = "draining" if plan["reason"] == "host_drain" else "returning"
-                controls = tx.query("SELECT host FROM host_lifecycle WHERE host=%s "
-                                    "AND generation=%s AND mode=%s",
-                                    (plan["lifecycle_host"], plan["lifecycle_generation"], mode))
-                if not controls:
+                controls = tx.query("SELECT c.host FROM host_lifecycle c "
+                                    "JOIN host_lifecycle_agents a ON a.host=c.host AND a.generation=c.generation "
+                                    "WHERE c.host=%s AND c.generation=%s AND c.mode=%s AND a.agent=%s",
+                                    (plan.get("lifecycle_host"), plan.get("lifecycle_generation"), mode, plan["agent"]))
+                direction = plan["source"] if mode == "draining" else plan["target"]
+                if not controls or direction != plan.get("lifecycle_host"):
                     return None
             if (not agent["live"] or (agent["canon"] or "") != plan["canon"]
                     or agent["host"] != plan["source"] or plan["target"] not in (agent["admitted_hosts"] or [])

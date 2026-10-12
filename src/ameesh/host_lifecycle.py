@@ -14,7 +14,21 @@ def drain(cfg, db, host, *, duration=None, critical=()):
                                  or not 30 <= duration <= 7 * 86400):
         raise ValueError("drain duration outside 30 seconds..7 days")
     actor = work.corrector(cfg, db)
+    critical = set(critical) | critical_names(cfg, db)
     return storage.of(db).host_lifecycle.drain(host, actor=actor, duration=duration, critical=critical)
+
+
+def critical_names(cfg, db):
+    """Declared critical agents and their own canon's coordination/review roles."""
+    from . import sous_utilisation
+    names = set(getattr(cfg, "critical_agents", ()) or ())
+    canons = work.configured_canons(cfg)
+    roles = ("orchestrateur", "orchestrator", "conception", "design", "auditeur", "auditor", "reviewer")
+    for agent in registry.overview(db):
+        own = [canon for canon in canons if canon.owns(agent.get("canon"))]
+        if agent["name"] in sous_utilisation.role_orchestrators(own, roles):
+            names.add(agent["name"])
+    return names
 
 
 def readiness(db, agent, target, *, adapter=None, requirements_for=None):
@@ -56,7 +70,8 @@ class _ReadyAdapter:
             return False
         # A return request supersedes a move still on the source. Once the
         # target may have work, complete reconciliation there before return.
-        if op["state"] not in ("switched", "activated", "verified"):
+        checkpoint = op["evidence"].get("held_at", op["state"]) if op["state"] == "held" else op["state"]
+        if checkpoint not in ("switched", "activated", "verified"):
             plan = op["plan"]
             control = storage.of(self.db).host_lifecycle.get(plan["lifecycle_host"])
             expected = "draining" if plan["reason"] == "host_drain" else "returning"
@@ -84,7 +99,7 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
             missing = ["helper:L232b"]
         elif op:
             wrapped = _ReadyAdapter(db, adapter, requirements_for)
-            if demand and demand["reason"] == "host_return" and op["plan"].get("reason") == "host_drain":
+            if control["mode"] == "returning" and op["plan"].get("reason") == "host_drain":
                 checkpoint = op["evidence"].get("held_at", op["state"])
                 if checkpoint not in ("switched", "activated", "verified"):
                     op = handoffs.cancel(db, op["id"], wrapped)
@@ -107,9 +122,15 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
                     missing.append("source_lease_or_repository:" + agent["name"])
             elif not missing:
                 missing = ["fresh_admitted_capacity"]
+        if op and op["state"] == "held":
+            missing.append("handoff_requires_reconciliation")
+        if not op and origin.get("operation"):
+            op = api.handoffs.get(origin["operation"])
         api.host_lifecycle.progress(host, control["generation"], agent["name"],
                                     operation=op["id"] if op else None, missing=sorted(set(missing)))
         outcomes.append({"agent": agent["name"], "operation": op, "missing": sorted(set(missing))})
+    if control["mode"] == "returning":
+        api.host_lifecycle.complete_return(host, control["generation"])
     return outcomes
 
 
