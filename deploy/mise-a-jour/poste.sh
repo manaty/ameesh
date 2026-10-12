@@ -20,6 +20,19 @@
 #   controler    doctor, budget, accounts list, projects, alerts
 #   retour       réinstalle la version précédente et redémarre (sans toucher
 #                aux bases : 0041 à 0047 sont additives)
+#   publier      étiquette annotée v<version> sur REF (un commit de main, la
+#                version de son pyproject.toml), poussée, puis release GitHub
+#                (notes : docs/versions/<version>.md de main, sinon la PR qui a
+#                fusionné ce commit) ;
+#                idempotent, jamais une étiquette déplacée (L138)
+#   rattraper    « publier » pour chaque version de l'historique de main
+#                (premier parent) qui n'a pas encore d'étiquette ou de release ;
+#                une étiquette déjà posée sur le distant fait foi (son commit est
+#                publié, s'il porte cette version)
+#
+#   A_BLANC=1 (publier, rattraper) : affiche ce qui serait fait, sans rien
+#   écrire, pas même un fetch (le distant est lu par ls-remote, main est
+#   $DISTANT/main local). Ces deux étapes ne lisent pas $BASCULE_ENV.
 #
 # REF (migrer, installer) : commit, branche ou étiquette du dépôt qui contient
 # ce script ; défaut : HEAD de ce dépôt. MIGRER_APRES=1 (installer) : ancien
@@ -38,10 +51,15 @@ set -euo pipefail
 unset AMEESH_DSN AGENT_MESH_DSN
 
 BASCULE_ENV=${BASCULE_ENV:-$HOME/.config/ameesh/bascule.env}
-[ -r "$BASCULE_ENV" ] || { echo "paramètres absents : $BASCULE_ENV" >&2; exit 2; }
-# shellcheck disable=SC1090
-. "$BASCULE_ENV"
-: "${VM:?VM manquant dans $BASCULE_ENV}"
+case "${1:-}" in
+  publier|rattraper) ;;   # le dépôt et GitHub seuls : ni serveur ni base
+  *)
+    [ -r "$BASCULE_ENV" ] || { echo "paramètres absents : $BASCULE_ENV" >&2; exit 2; }
+    # shellcheck disable=SC1090
+    . "$BASCULE_ENV"
+    : "${VM:?VM manquant dans $BASCULE_ENV}"
+    ;;
+esac
 UNITES_RESTE=${UNITES_RESTE:-}
 
 ICI="$(cd "$(dirname "$0")" && pwd)"
@@ -58,7 +76,10 @@ TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 SAUVEGARDES="$HOME/backups/ameesh"
 #: une persona reste en tour au plus ce temps avant qu'on renonce (secondes)
 ATTENTE_MAX=${ATTENTE_MAX:-7200}
-mkdir -p "$TRAVAIL" "$SAUVEGARDES"; chmod 700 "$TRAVAIL"
+case "${1:-}" in
+  publier|rattraper) ;;
+  *) mkdir -p "$TRAVAIL" "$SAUVEGARDES"; chmod 700 "$TRAVAIL" ;;
+esac
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
@@ -331,7 +352,162 @@ retour() {
   redemarrer
 }
 
+# --- publication (L138) ----------------------------------------------------
+# Une version est le commit de main où pyproject.toml prend son numéro. Son
+# étiquette annotée v<version> est posée sur ce commit et poussée ; la release
+# GitHub reprend les notes de docs/versions/<version>.md lues dans main (jamais
+# dans l'arbre de travail), sinon la description de la PR qui a fusionné ce
+# commit. Rien n'est jamais déplacé ni remplacé : une étiquette posée ailleurs
+# arrête tout (ORCHESTRATEUR.md, livraison, 6). Les étiquettes qui font foi
+# sont celles du distant (ls-remote). À blanc, rien n'est écrit, pas même dans
+# le dépôt local : ni fetch, ni étiquette ; main est alors $DISTANT/main tel
+# qu'il est ici.
+DISTANT=${DISTANT:-origin}
+a_blanc() { [ "${A_BLANC:-0}" = 1 ]; }
+fait() {  # la commande, ou son affichage à blanc
+  if a_blanc; then printf '  à blanc :'; printf ' %q' "$@"; echo; else "$@"; fi
+}
+version_de() {
+  git -C "$DEPOT" show "$1:pyproject.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1
+}
+depot_github() {
+  git -C "$DEPOT" remote get-url "$DISTANT" \
+    | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##'
+}
+# « <commit> <étiquette> » des étiquettes v* du distant (une étiquette annotée
+# donne son commit, `^{}`)
+etiquettes_distantes() {
+  git -C "$DEPOT" ls-remote --tags "$DISTANT" 'refs/tags/v*' | awk '
+    { sub("^refs/tags/", "", $2) }
+    $2 ~ /\^\{\}$/ { sub(/\^\{\}$/, "", $2); pele[$2] = $1; next }
+    { brut[$2] = $1 }
+    END { for (t in brut) print ((t in pele) ? pele[t] : brut[t]), t }'
+}
+# le distant, lu une fois : main et les étiquettes (fetch, sauf à blanc)
+lire_distant() {
+  [ -z "${DISTANTES+x}" ] || return 0
+  a_blanc || git -C "$DEPOT" fetch -q --tags "$DISTANT"
+  DISTANTES=$(etiquettes_distantes)
+}
+commit_distant() { awk -v t="$1" '$2 == t { print $1 }' <<<"$DISTANTES"; }
+# la PR qui a fusionné le commit $1 : fusionnée, et son commit de fusion est
+# $1 ; candidates : « (#N) » du sujet (squash), « Merge pull request #N »
+# (fusion), puis l'API de GitHub
+pr_verifiee() {
+  [ "$(gh pr view "$1" -R "$(depot_github)" --json state,mergeCommit \
+        --jq '.state + " " + (.mergeCommit.oid // "")' 2>/dev/null)" = "MERGED $2" ]
+}
+pr_de() {
+  local sujet n
+  sujet=$(git -C "$DEPOT" log -1 --format=%s "$1")
+  for n in $(sed -nE 's/^Merge pull request #([0-9]+) .*/\1/p; s/.*\(#([0-9]+)\)$/\1/p' <<<"$sujet"); do
+    if pr_verifiee "$n" "$1"; then echo "$n"; return 0; fi
+  done
+  for n in $(gh api "repos/$(depot_github)/commits/$1/pulls" --jq '.[].number' 2>/dev/null || true); do
+    if pr_verifiee "$n" "$1"; then echo "$n"; return 0; fi
+  done
+  return 1
+}
+notes_de() {  # notes de la version $1 (commit $2), sur la sortie standard
+  local main n corps
+  main=$(git -C "$DEPOT" rev-parse --verify "$DISTANT/main^{commit}")
+  if git -C "$DEPOT" cat-file -e "$main:docs/versions/$1.md" 2>/dev/null; then
+    git -C "$DEPOT" show "$main:docs/versions/$1.md"
+    return
+  fi
+  n=$(pr_de "$2") || { echo "notes introuvables pour $1 : ni docs/versions/$1.md dans $DISTANT/main, ni PR qui a fusionné ${2:0:7}" >&2; return 1; }
+  corps=$(gh pr view "$n" -R "$(depot_github)" --json body --jq .body) \
+    || { echo "description de la PR #$n illisible : pas de release $1" >&2; return 1; }
+  [ -n "$corps" ] || { echo "PR #$n sans description : pas de release $1" >&2; return 1; }
+  # la ligne d'outil en pied de description n'est pas une note de version
+  tr -d '\r' <<<"$corps" | { grep -v '^🤖 Generated with' || true; } \
+    | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+  printf '\nPR : #%s\n' "$n"
+}
+derniere_version() {  # la plus haute version étiquetée sur le distant (v1.2.3 → 1.2.3)
+  awk '{ print $2 }' <<<"$DISTANTES" | sed -n 's/^v\([0-9].*\)$/\1/p' | sort -V | tail -1
+}
+
+# publier REF [VERSION] : VERSION, la version attendue (rattraper) ; un écart
+# avec pyproject.toml de REF arrête tout
+publier() {
+  local ref=${1:-HEAD} attendue=${2:-} sha version tag distant ici notes plus_haute
+  lire_distant
+  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
+  version=$(version_de "$sha")
+  [ -n "$version" ] || { echo "pas de version dans pyproject.toml de ${sha:0:7}" >&2; exit 1; }
+  if [ -n "$attendue" ] && [ "$version" != "$attendue" ]; then
+    echo "${sha:0:7} porte la version $version, pas $attendue : rien n'est publié" >&2
+    exit 1
+  fi
+  tag="v$version"
+  etape "$tag : ${sha:0:7} $(git -C "$DEPOT" log -1 --format=%s "$sha")"
+  git -C "$DEPOT" merge-base --is-ancestor "$sha" "$DISTANT/main" \
+    || { echo "${sha:0:7} n'est pas sur $DISTANT/main : rien n'est publié" >&2; exit 1; }
+  distant=$(commit_distant "$tag")
+  if [ -n "$distant" ]; then
+    [ "$distant" = "$sha" ] || { echo "$tag est déjà posée sur ${distant:0:7}, pas ${sha:0:7} : une étiquette publiée ne se déplace pas (une nouvelle version passe par un nouveau numéro dans pyproject.toml)" >&2; exit 1; }
+    echo "étiquette : déjà posée"
+  else
+    if ici=$(git -C "$DEPOT" rev-parse -q --verify "refs/tags/$tag^{commit}"); then
+      # posée ici par une publication dont la poussée a échoué : poussée maintenant
+      [ "$ici" = "$sha" ] || { echo "$tag est posée ici sur ${ici:0:7}, pas ${sha:0:7}, et absente du distant : à examiner (git tag -d $tag si elle est fausse)" >&2; exit 1; }
+      echo "étiquette : posée ici, absente du distant"
+    else
+      fait git -C "$DEPOT" tag -a "$tag" -m "ameesh $version" "$sha"
+    fi
+    fait git -C "$DEPOT" push "$DISTANT" "refs/tags/$tag"
+  fi
+  if gh release view "$tag" -R "$(depot_github)" >/dev/null 2>&1; then
+    echo "release : déjà publiée"
+    return 0
+  fi
+  notes=$(notes_de "$version" "$sha") || exit 1
+  # « Latest » ne va qu'à la plus haute version : un rattrapage ne la vole pas,
+  # ni ne la donne en passant à une version que la suite dépasse
+  plus_haute=$( (derniere_version; echo "$version"; echo "${PREVUE:-}") | sort -V | tail -1)
+  if a_blanc; then
+    echo "release $tag (latest : $([ "$plus_haute" = "$version" ] && echo oui || echo non)), notes :"
+    sed 's/^/  | /' <<<"$notes"
+  else
+    gh release create "$tag" -R "$(depot_github)" --verify-tag --title "ameesh $tag" \
+      --notes "$notes" --latest="$([ "$plus_haute" = "$version" ] && echo true || echo false)"
+  fi
+}
+
+# Les commits de main (premier parent) où pyproject.toml change de version,
+# du plus ancien au plus récent : « <sha> <version> »
+versions_de_main() {
+  local sha avant=""
+  git -C "$DEPOT" log --reverse --first-parent --format=%H -G'^version = ' \
+      "$DISTANT/main" -- pyproject.toml \
+    | while read -r sha; do
+        v=$(version_de "$sha")
+        [ -n "$v" ] && [ "$v" != "$avant" ] && echo "$sha $v"
+        avant=$v
+      done
+}
+
+rattraper() {
+  local sha version distant versions
+  lire_distant
+  versions=$(versions_de_main)
+  # la plus haute version de main, publiée à la fin de ce rattrapage
+  PREVUE=$(awk '{ print $2 }' <<<"$versions" | sort -V | tail -1)
+  while read -r sha version; do
+    [ -n "$sha" ] || continue           # aucune version dans main
+    # une étiquette déjà posée sur le distant fait foi, même sur un commit plus
+    # tardif (v1.0.0 : un correctif fusionné après le numéro), si ce commit
+    # porte bien cette version (publier le vérifie) ; elle n'est pas déplacée
+    distant=$(commit_distant "v$version")
+    [ -z "$distant" ] || sha=$distant
+    ( publier "$sha" "$version" ) || exit 1
+  done <<<"$versions"
+}
+
 case "${1:-}" in
+  publier) publier "${2:-HEAD}" ;;
+  rattraper) rattraper ;;
   verifier) verifier ;;
   sauvegarder) sauvegarder ;;
   installer) installer "${2:-HEAD}" ;;
@@ -340,5 +516,5 @@ case "${1:-}" in
   redemarrer) redemarrer ;;
   controler) controler ;;
   retour) retour ;;
-  *) sed -n '4,26p' "$0" >&2; exit 2 ;;
+  *) sed -n '4,35p' "$0" >&2; exit 2 ;;
 esac
