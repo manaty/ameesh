@@ -59,6 +59,7 @@ DECLARE
     parent record;
     item record;
     privilege text;
+    missing text[];
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r AND rolcanlogin) THEN
         violations := array_append(violations, 'executor group must be NOLOGIN');
@@ -158,6 +159,18 @@ BEGIN
     END LOOP;
     IF cardinality(violations) > 0 THEN
         RAISE EXCEPTION 'ROLE CONTRACT FAILED for %: %', r, array_to_string(violations, '; ');
+    END IF;
+    -- Not a violation: the event stream's cluster identity (0396). Executable
+    -- by PUBLIC unless the server revoked them; then every resume is a reset.
+    SELECT array_agg(f ORDER BY f) INTO missing FROM unnest(ARRAY[
+        'pg_control_system()', 'pg_control_checkpoint()', 'pg_current_wal_lsn()',
+        'pg_walfile_name(pg_lsn)']) f
+     WHERE NOT has_function_privilege(r, f::regprocedure, 'EXECUTE');
+    IF missing IS NOT NULL THEN
+        RAISE WARNING 'role % may not execute %: event stream resumes will all reset; '
+                      'as a superuser: GRANT EXECUTE ON FUNCTION % TO %',
+                      r, array_to_string(missing, ', '), array_to_string(missing, ', '),
+                      quote_ident(r);
     END IF;
 END
 $audit$;

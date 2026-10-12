@@ -71,6 +71,9 @@ create trigger ameesh_events_guard
 create or replace function ameesh_events_dated() returns trigger
 language plpgsql as $$
 begin
+    if not isfinite(new.created_at) then         -- infinity or -infinity
+        raise exception 'ameesh_events: created_at not finite (%)', new.created_at;
+    end if;
     if new.created_at > now() + interval '1 day' then
         raise exception 'ameesh_events: created_at in the future (%)', new.created_at;
     end if;

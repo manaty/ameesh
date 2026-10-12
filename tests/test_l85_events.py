@@ -302,8 +302,9 @@ class EventLogPgTest(PgTestCase):
         self.assertEqual(store.bounds()["pruned"], rows["alert:pz"])
 
     def test_created_at_is_finite_and_not_in_the_future(self):
-        for value in ("infinity", "now() + interval '2 days'"):
-            with self.assertRaises(db_mod.DbError, msg=value):
+        for value, why in (("'infinity'", "not finite"), ("'-infinity'", "not finite"),
+                           ("now() + interval '2 days'", "in the future")):
+            with self.assertRaisesRegex(db_mod.DbError, why, msg=value):
                 self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
                                 " VALUES ('alert.resolved', 'alert:f', %s)" % value)
         self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
@@ -527,6 +528,26 @@ class StreamPgTest(ServerMixin, PgTestCase):
             got = self.read_messages(resp, 2, kind="alert.raised")
             self.assertEqual([json.loads(m["data"])["object"] for m in got],
                              ["alert:held", "alert:behind"])
+
+    def test_restore_warning_is_logged_at_once(self):
+        """Codex P3 r6: rows above the counter hold the stream for long; the
+        warning comes at the first read, not after a heartbeat of silence,
+        and names both tables to empty."""
+        self.addCleanup(self.db.execute, "TRUNCATE ameesh_events, ameesh_events_pruned")
+        with mock.patch.object(serve, "HEARTBEAT_S", 60.0), \
+                self.assertLogs("ameesh.serve", "WARNING") as logs:
+            self.serve()
+            resp = self.open_stream()
+            self.read_messages(resp, 1, timeout=5)              # retry
+            self.db.execute(
+                "INSERT INTO ameesh_events (type, object, tx) VALUES ('alert.raised',"
+                " 'alert:r', ((pg_current_xact_id()::text::bigint + 1000000)::text)::xid8)")
+            events.record(self.db, "alert.raised", "alert:wake")
+            deadline = time.monotonic() + 5
+            while not logs.records and time.monotonic() < deadline:
+                time.sleep(0.05)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("TRUNCATE ameesh_events, ameesh_events_pruned", logs.output[0])
 
     def test_without_last_event_id_only_new_events(self):
         events.record(self.db, "alert.raised", "alert:before")

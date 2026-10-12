@@ -821,6 +821,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     waiting_since = None
                 elif waiting_since is None:
                     waiting_since = time.monotonic()
+                if waiting == "restore" and not restore_logged:
+                    # at once: they hold the stream until the counter passes them
+                    log.warning("event stream: events of another cluster above the"
+                                " transaction counter (logical restore): empty the log,"
+                                " see EXPLOITATION (TRUNCATE ameesh_events,"
+                                " ameesh_events_pruned)")
+                    restore_logged = True
             idle = time.monotonic() - written
             if idle >= HEARTBEAT_S:
                 if waiting_since is not None:
@@ -830,11 +837,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._write("event: delayed\ndata: %s\n\n" % json.dumps(
                         {"reason": DELAY_REASONS.get(waiting, DELAY_REASONS["xmin"]),
                          "waiting_s": round(time.monotonic() - waiting_since, 1)}))
-                    if waiting == "restore" and not restore_logged:
-                        log.warning("event stream: events of another cluster above the"
-                                    " transaction counter (logical restore): empty the log,"
-                                    " see EXPLOITATION (TRUNCATE ameesh_events)")
-                        restore_logged = True
                 else:
                     self._write(": heartbeat\n\n")
                 written = time.monotonic()

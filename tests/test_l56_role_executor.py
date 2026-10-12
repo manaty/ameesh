@@ -115,6 +115,42 @@ class RoleExecutorTest(PgTestCase):
         finally:
             db.close()
 
+    def test_host_reads_a_real_cluster_identity(self):
+        """Codex r6: the event stream's position carries the cluster; a host
+        login, read-only like `ameesh serve`, must get a real one, not
+        `none` (every resume a reset). Revoked from PUBLIC (hardened
+        server): the script warns, and the superuser's grant restores it."""
+        from ameesh import storage
+
+        def cluster():
+            cfg = dataclasses.replace(self.cfg, dsn=self.host_dsn(), read_only=True)
+            db = db_mod.connect(cfg)
+            try:
+                return storage.of(db).events.bounds()["cluster"]
+            finally:
+                db.close()
+
+        own = storage.of(self.db).events.bounds()["cluster"]
+        self.assertRegex(own, "^[0-9a-f]{1,16}t[0-9a-f]{8}$")
+        self.assertEqual(cluster(), own)
+        functions = ("pg_control_system(), pg_control_checkpoint(),"
+                     " pg_current_wal_lsn(), pg_walfile_name(pg_lsn)")
+        # pg_catalog is per database: this test's own database only
+        self.addCleanup(self.db.execute,
+                        "GRANT EXECUTE ON FUNCTION %s TO PUBLIC" % functions)
+        self.addCleanup(self.db.execute, "REVOKE EXECUTE ON FUNCTION %s FROM %s" % (
+            functions, db_mod.quote_ident(self.role)))
+        self.db.execute("REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC")
+        self.assertIsNone(cluster())
+        proc = self.run_script(self.role)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("may not execute pg_control_system()", proc.stderr)
+        self.db.execute("GRANT EXECUTE ON FUNCTION %s TO %s" % (
+            functions, db_mod.quote_ident(self.role)))
+        self.assertEqual(cluster(), own)
+        proc = self.run_script(self.role)
+        self.assertNotIn("may not execute", proc.stderr)
+
     def test_executor_cannot_forge_execution_proof_or_rewrite_policy(self):
         import json
         ModuleStore(self.db).replace("", modules.declarations(federation()))
