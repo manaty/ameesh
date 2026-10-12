@@ -28,7 +28,11 @@ point worktrees to it.
   `package.json`'s lifecycle scripts (`preinstall`, `install`,
   `postinstall`, `prepare`), the package files these scripts name
   (`node scripts/patch-ios-webrtc.cjs`), `patches/**`, `.npmrc`, the label,
-  the install mode, the node and npm versions, the OS and the CPU. A source
+  the install mode, the node and npm versions, the OS and the CPU. Node and
+  npm are asked from the package's directory, where a version manager (mise,
+  asdf) picks them, and the fill runs with that node first on `PATH`: a
+  checkout that pins node 22 gets a tree built by node 22, not by the
+  machine default. A source
   change doesn't change the key. A lockfile, patch, node or npm change gives
   a new entry. The link target depends only on the key.
 * **One install mode**: a fill is always a full development install,
@@ -36,7 +40,9 @@ point worktrees to it.
   --ignore-scripts=false`. Its environment is a whitelist: `PATH`, `HOME`,
   `LANG`, `LANGUAGE`, `LC_*`, `TMPDIR`/`TMP`/`TEMP` and the npm download
   cache (`npm_config_cache`); no `NODE_ENV`, no other `npm_config_*`, nothing
-  an install script could read, so the key needs no environment. The
+  an install script could read, so the key needs no environment. Every fill
+  also gets `SHARP_IGNORE_GLOBAL_LIBVIPS=1`: with a libvips installed on the
+  host, sharp otherwise builds from source and the fill fails. The
   explicit flags win over an npmrc. A turn that asks
   for another tree (`NODE_ENV=production`, `npm ci --omit=dev`) gets a local
   install from the real npm, never the shared tree.
@@ -137,17 +143,21 @@ resolve their own dependencies inside the entry. The real path keeps a
 `/node_modules/` segment, so patterns such as Jest's `transformIgnorePatterns`
 still match.
 
-| Tool | Expected | Verified |
-|---|---|---|
-| jest, ts-jest (mobile, assist, desktop, backend) | works; cache in `$TMPDIR` | pending (real install blocked while loop0 holds the volume) |
-| vitest (website) | works; writes `node_modules/.vite/vitest`, kept writable | pending |
-| next build / dev (website) | webpack follows symlinks; Turbopack may refuse files outside the project root | pending; fallback `ameesh deps local` |
-| expo / Metro bundling (mobile, assist) | Metro must watch the entry (`watchFolders` with the real path of `node_modules`) | pending; fallback `ameesh deps local` |
-| electron-builder packaging (desktop) | copies production `node_modules`; may need a real directory | pending; fallback `ameesh deps local` before `npm run dist` |
-| postinstall scripts that patch `node_modules` (mobile, assist) | run once, during the fill, before the tree is sealed | covered by the key (`patches/**`, script files) |
+Verified on nexlink (pc-smichea, 2026-10-12, #249), one worktree linked to
+the cache, node 26.8.1:
+
+| Tool | Result through the link |
+|---|---|
+| jest, ts-jest (backend, mobile, desktop) | works: backend 3381/3383 (the 2 failures are an order-dependent flake, they pass alone), mobile 1781/1781, desktop 639/639 plus `node --test` 39/39 |
+| vitest (website) | works: 902/902 |
+| next build (website, Next 16, Turbopack) | **refused** as is: "Symlink [project]/node_modules is invalid, it points out of the filesystem root". Works once `turbopack.root` and `outputFileTracingRoot` are the nearest directory holding both the project and the link's target. The `output: 'standalone'` tree then nests the project under that root and links back to the cache: fine locally, not portable; Docker images install their own tree and are unaffected |
+| expo export / Metro (mobile, Expo 54) | works without a config change (1827 modules). The asset URLs carry the cache path (`/assets/____.local/state/ameesh/.menage/cache/nm/<key>/…`): fine for development, not for a release or OTA bundle |
+| electron-builder 26 (desktop) | **packages a broken app without an error**: its module walk checks `lstat(node_modules).isDirectory()`, false for a link, so only the direct dependencies reach `app.asar` (10 modules, 3.7 MB, against 54 modules, 12 MB from a real directory); only a "cannot find path for dependency" warning shows. Run `ameesh deps local` before `npm run dist` |
+| postinstall scripts that patch `node_modules` (mobile, assist) | run once, during the fill, before the tree is sealed; covered by the key (`patches/**`, script files) |
 
 The fallback is always available: `ameesh deps local` in the package, then
-the tool as before.
+the tool as before. Use it for anything that ships: an electron-builder
+package, a release or OTA bundle, a portable Next standalone tree.
 
 ### Garbage collection
 

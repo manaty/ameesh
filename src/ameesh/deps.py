@@ -725,13 +725,17 @@ def link_tree(top: str, cache_root: str, *, fill_missing: bool = True,
 
 def link_ready(top: str, cache_root: str) -> list[dict]:
     """The runner's hook at the start of a turn (cheap, never installs): link
-    the packages under `top` that have NO `node_modules` and whose entry is
-    already complete. Never in a review worktree."""
-    if is_review_worktree(top):
+    the packages of the git worktree holding `top` that have NO
+    `node_modules` and whose entry is already complete. Nothing outside git:
+    a turn started in a parent directory (`~/development/manaty`) would reach
+    every worktree under it, review worktrees included (#249: 262 links from
+    one turn). Never in a review worktree."""
+    root = worktree_root(top) if os.path.isdir(top) else None
+    if not root or is_review_worktree(top):
         return []
     out = []
-    for pkg in find_packages(top):
-        if os.path.lexists(os.path.join(pkg, NODE_MODULES)):
+    for pkg in find_packages(root):
+        if os.path.lexists(os.path.join(pkg, NODE_MODULES)) or is_review_worktree(pkg):
             continue
         done = link_package(pkg, cache_root, fill_missing=False)
         if done["status"] == "linked":

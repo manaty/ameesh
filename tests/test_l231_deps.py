@@ -196,6 +196,8 @@ class LinkTests(_Base):
         installer = FakeInstaller()
         first = _package(os.path.join(self.base, "w1"))
         second = _package(os.path.join(self.base, "w2"))
+        for top in ("w1", "w2"):
+            _git(os.path.join(self.base, top), "init", "-q", "-b", "main")
         self.assertEqual(deps.link_package(first, self.cache, fill_missing=False)["status"],
                          "not-cached")
         self.assertEqual(deps.link_ready(os.path.join(self.base, "w1"), self.cache), [])
@@ -204,6 +206,7 @@ class LinkTests(_Base):
         self.assertEqual([r["package"] for r in ready], [second])
         self.assertEqual(len(installer.calls), 1)
         review = _package(os.path.join(self.base, "nexlink-codex2-review-ime"))
+        _git(os.path.dirname(review), "init", "-q", "-b", "main")
         self.assertEqual(deps.link_ready(os.path.dirname(review), self.cache), [])
 
     def test_find_packages_skips_node_modules_hidden_and_symlinks(self):
@@ -765,6 +768,22 @@ class NexlinkVerificationTests(_Base):
         self.assertEqual(marker["node"], "v22")
 
 
+    def test_3_link_ready_stays_in_the_git_worktree_of_the_turn(self):
+        # a turn started in the parent of every worktree (an orchestrator's
+        # ~/development/manaty) linked 262 packages, review worktrees included
+        first = _package(os.path.join(self.base, "nexlink-a"), "backend")
+        deps.link_package(first, self.cache, installer=FakeInstaller())
+        sibling = _package(os.path.join(self.base, "nexlink-b"), "backend")
+        review = _package(os.path.join(self.base, "nexlink-c-review-1"), "backend")
+        for pkg in (first, sibling, review):
+            _git(os.path.dirname(pkg), "init", "-q", "-b", "main")
+        self.assertEqual(deps.link_ready(self.base, self.cache), [])
+        self.assertEqual(deps.link_ready(os.path.dirname(review), self.cache), [])
+        self.assertEqual(deps.link_ready(os.path.join(sibling, "src"), self.cache)[0]["package"],
+                         sibling)
+        self.assertFalse(os.path.lexists(os.path.join(review, "node_modules")))
+
+
 class _Cfg:
     def __init__(self, state_dir: str):
         self.state_dir = state_dir
@@ -801,6 +820,7 @@ class MenageWiringTests(_Base):
         first = _package(os.path.join(self.base, "w1"))
         second = _package(os.path.join(self.base, "w2"))
         deps.link_package(first, croot, installer=FakeInstaller())
+        _git(os.path.dirname(second), "init", "-q", "-b", "main")
         turn = menage.Turn.begin(cfg, policy, "dev7", os.path.dirname(second),
                                  new_session=False, base_env={"PATH": ""})
         try:
