@@ -134,8 +134,11 @@ directories removed; the host's own agents (`ameesh-agents.slice`) are not
 touched. `--purge` also removes the secrets, the offer, and the user, the
 venv and the guest's directories, only those the script created: it
 records each one, by its absolute path, before creating it
-(`/etc/ameesh/pilot-install.state`); a directory that was there before, a
-mount point, or anything outside them stays. Then, outside the host: a canon PR puts
+(`/etc/ameesh/pilot-install.state`); a directory or a secrets file that
+was there before, a tree with a mount point in it, or anything outside them
+stays. What stays keeps its record, so a later `--purge` can still remove
+it. The install refuses a volume bigger than `disk_max` (nothing else
+holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
 deepseek5 and deepseek6 back on manaty-mesh-1 and removes `policy.lend`, and
 the host's login role (L56) is dropped. A mounted volume is unmounted and
 detached by hand.

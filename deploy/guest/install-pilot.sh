@@ -27,6 +27,8 @@
 #                        the runner's unit is installed with it
 #   --path DIR           extra PATH of the runners, first (repeatable;
 #                        default: the directory of `dsh` if outside /usr)
+#   --accept-larger-volume  install on a volume bigger than the offer's
+#                        disk_max (refused otherwise: nothing else holds it)
 #   --guard-mode M       mode of the guard: observe or enforce (default: the
 #                        installed one, observe on a first install)
 #   --set-guard-mode M   switch the installed guard (restarts it; observe
@@ -49,12 +51,14 @@
 #     ameesh-guard.service;
 #   * /etc/tmpfiles.d/ameesh-gate.conf: /run/ameesh-gate/{state,ack};
 #   * /etc/ameesh/guard.json (offer), guard.env (mode), guest.env and
-#     guest-<agent>.env (secrets, 0640 root:ameesh-guest, never overwritten).
+#     guest-<agent>.env (secrets, 0640 root:ameesh-guest, never overwritten;
+#     --purge removes only those this script created).
 # Not done here (study §4.2, §4.3): the canon PR (Host `policy.lend`, the
 # guest agents' placements), the host's Postgres login role (L56), the
 # agents' clones under $ROOT/work.
-# `disk_max` is enforced by nothing but the volume's size: a volume of that
-# size holds it, the root filesystem (--allow-rootfs) does not.
+# `disk_max` is enforced by nothing but the volume's size: a volume bigger
+# than it is refused (--accept-larger-volume overrides), the root filesystem
+# (--allow-rootfs) does not hold it.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -76,6 +80,7 @@ GUARD_MODE=""
 TARGETS=()
 DRY=0
 ALLOW_ROOTFS=0
+ACCEPT_LARGER=0
 MODE=install
 PURGE=0
 
@@ -97,6 +102,7 @@ while [ $# -gt 0 ]; do
     --guard-mode) GUARD_MODE=$2; shift 2 ;;
     --set-guard-mode) MODE=guard-mode; GUARD_MODE=$2; shift 2 ;;
     --allow-rootfs) ALLOW_ROOTFS=1; shift ;;
+    --accept-larger-volume) ACCEPT_LARGER=1; shift ;;
     --dry-run) DRY=1; shift ;;
     --check) MODE=check; shift ;;
     --enable|--disable) MODE=${1#--}; shift; TARGETS=("$@"); break ;;
@@ -156,6 +162,15 @@ remember() {
   grep -qxF "$1" "$STATE" 2>/dev/null || echo "$1" >> "$STATE"
 }
 created() { grep -qxF "$1" "$STATE" 2>/dev/null; }
+# absent PATH: nothing there, not even a dangling link
+absent() { [ ! -e "$1" ] && [ ! -L "$1" ]; }
+
+# mounts_under PATH: a mount point at PATH or beneath it (a bind mount of
+# the same filesystem included, which rm --one-file-system would cross)
+mounts_under() {
+  awk -v p="$1" '{ if ($5 == p || index($5, p "/") == 1) found = 1 } END { exit !found }' \
+    /proc/self/mountinfo
+}
 
 # purgeable PATH: a directory of its own, two levels deep at least, never
 # a top directory (/home, /tmp, /work…), a user's home nor a system tree
@@ -342,37 +357,59 @@ if [ "$MODE" = uninstall ]; then
   say "4. (yours) drop the host's Postgres login role (L56)"
   if [ "$PURGE" = 1 ]; then
     say "5. purge: secrets, offer, and what this script created"
-    run rm -f "$ETC/guard.json" "$ETC/guest.env" "$ETC"/guest-*.env
+    run rm -f "$ETC/guard.json"
     offload=0
     if [ -f /etc/ameesh-guest/offload.json ]; then
       offload=1
       echo "kept user $GUEST and the guest's directories: the offload (install.sh, L159b) uses them"
     fi
     # only the paths recorded (absolute, as created), the last created first;
-    # never the --root of this command line
+    # never the --root of this command line. What stays (a mount, the
+    # offload, a non-empty directory) keeps its record: a later purge can
+    # still remove it.
+    kept=()
     if [ -f "$STATE" ]; then
       while read -r kind path; do
-        case "$kind" in guest-*) [ "$offload" = 0 ] || continue ;; esac
         case "$kind" in
+          secret)
+            case "$path" in
+              "$ETC/guest.env"|"$ETC"/guest-*.env) run rm -f "$path" ;;
+              *) echo "not removed: $path (recorded, but not a secrets file of this script)" ;;
+            esac
+            continue ;;
           guest-tree|venv-tree|guest-dir|venv-dir) ;;
           *) continue ;;
         esac
-        if ! purgeable "$path"; then
-          echo "not removed: $path (recorded, but not a path of its own)"
-        elif [ ! -e "$path" ]; then
+        if absent "$path"; then
           continue
-        elif mountpoint -q "$path"; then
-          echo "kept $path: a mount point (unmount and detach it by hand)"
+        elif [ "${kind%%-*}" = guest ] && [ "$offload" = 1 ]; then
+          kept+=("$kind $path")
+        elif ! purgeable "$path"; then
+          echo "not removed: $path (recorded, but not a path of its own)"
+        elif mounts_under "$path"; then
+          echo "kept $path: a mount point is there or beneath (unmount it, then --purge again)"
+          kept+=("$kind $path")
         elif [ "${kind#*-}" = tree ]; then
           run rm -rf --one-file-system "$path"
         else
           run rmdir --ignore-fail-on-non-empty "$path"
+          # a directory left non-empty keeps its record
+          [ "$DRY" = 1 ] || absent "$path" || kept+=("$kind $path")
         fi
       done < <(tac "$STATE")
     fi
-    if [ "$offload" = 0 ] && created user; then run userdel "$GUEST" || true; fi
-    run rm -f "$STATE"
-    run rmdir --ignore-fail-on-non-empty "$ETC" || true
+    if created user; then
+      if [ "$offload" = 0 ]; then run userdel "$GUEST" || true; else kept+=("user"); fi
+    fi
+    if [ ${#kept[@]} -gt 0 ]; then
+      echo "kept in $STATE: ${kept[*]}"
+      if [ "$DRY" = 0 ]; then
+        printf '%s\n' "${kept[@]}" | tac > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+      fi
+    else
+      run rm -f "$STATE"
+      run rmdir --ignore-fail-on-non-empty "$ETC" || true
+    fi
   else
     echo "kept: secrets and offer under $ETC, $VENV, user $GUEST, $ROOT (--purge removes what this script created)"
   fi
@@ -416,19 +453,29 @@ lend = json.loads(sys.argv[1])
 offer, problems, unknown = capacity_guard.parse_lend(lend)
 if problems:
     sys.exit("invalid offer: " + "; ".join(problems))
-# disk_max: only the size of the guest volume holds it (no quota)
+# disk_max: only the size of the guest volume holds it (no quota); a bigger
+# volume is refused, unless accepted (argv[6]); a dry run says so (argv[7])
 root, disk_max = sys.argv[5], offer["disk_max"]
 if os.path.ismount(root):
     st = os.statvfs(root)
-    if st.f_blocks * st.f_frsize > disk_max * 1.05:
-        print("warning: %s holds %.0f GiB, above disk_max %.0f GiB: disk_max is not enforced"
-              % (root, st.f_blocks * st.f_frsize / 2 ** 30, disk_max / 2 ** 30), file=sys.stderr)
+    size = st.f_blocks * st.f_frsize
+    if size > disk_max * 1.05 and sys.argv[6] != "1":
+        msg = ("%s holds %.0f GiB, above disk_max %.0f GiB: nothing would hold disk_max "
+               "(a volume of that size, a bigger disk_max, or --accept-larger-volume)"
+               % (root, size / 2 ** 30, disk_max / 2 ** 30))
+        if sys.argv[7] != "1":
+            sys.exit("refused: " + msg)
+        print("warning: refused for real: " + msg, file=sys.stderr)
+    elif size > disk_max * 1.05:
+        print("warning: %s is bigger than disk_max (accepted): disk_max is not enforced" % root,
+              file=sys.stderr)
 else:
     print("warning: %s is not a volume of its own: disk_max is indicative only" % root,
           file=sys.stderr)
 print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
                   "work_path": sys.argv[5], "lend": lend}, indent=2))
-' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT") || die "offer refused"
+' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY") \
+  || die "offer or volume refused"
 
 # PATH of the runners: the directory of the DeepSeek harness (`dsh`)
 if [ ${#EXTRA_PATH[@]} -eq 0 ] && dsh=$(command -v dsh 2>/dev/null); then
@@ -450,14 +497,26 @@ else
 fi
 # each directory recorded on its own, only if this script creates it: a
 # directory that was there (and its content) is never purged
-[ -d "$ROOT" ] || remember "guest-dir $ROOT"
+# (anything already there that is not a plain directory: refused, before
+# any record, never taken for absent)
+for d in "$ROOT" "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; do
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+    die "$d exists and is not a directory: move it away first"
+  fi
+done
+absent "$ROOT" && remember "guest-dir $ROOT"
 run install -d -m 0755 "$ROOT"
 for d in home tmp work; do
-  [ -d "$ROOT/$d" ] || remember "guest-tree $ROOT/$d"
+  absent "$ROOT/$d" && remember "guest-tree $ROOT/$d"
   run install -d -m 0700 -o "$GUEST" -g "$GUEST" "$ROOT/$d"
 done
 
 say "2. ameesh in $VENV (root-owned; the guest can run it, not change it)"
+for d in "$(dirname "$VENV")" "$VENV"; do
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+    die "$d exists and is not a directory: move it away first"
+  fi
+done
 if [ -x "$VENV/bin/ameesh" ] && ! created "venv-tree $VENV"; then
   echo "$VENV exists and was not made by this script: upgraded in place"
 else
@@ -466,8 +525,8 @@ else
     created "venv-tree $VENV" || die "$VENV exists without bin/pip and is not this script's"
     run rm -rf "$VENV"
   fi
-  if [ ! -d "$VENV" ]; then
-    [ -d "$(dirname "$VENV")" ] || remember "venv-dir $(dirname "$VENV")"
+  if absent "$VENV"; then
+    absent "$(dirname "$VENV")" && remember "venv-dir $(dirname "$VENV")"
     remember "venv-tree $VENV"
     run python3 -m venv "$VENV" || {
       run rm -rf "$VENV"
@@ -500,7 +559,8 @@ set_guard_mode "$GUARD_MODE"
 say "4. secrets files (created empty, never overwritten)"
 secret() {
   local path=$1
-  if [ -e "$path" ]; then echo "kept $path"; return; fi
+  if ! absent "$path"; then echo "kept $path"; return; fi
+  remember "secret $path"
   put "$path" 0640 "root:$GUEST"
 }
 secret "$ETC/guest.env" <<'EOF'

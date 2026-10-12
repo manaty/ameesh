@@ -161,7 +161,9 @@ class InstallPilotTest(unittest.TestCase):
         self.assertLess(out.index("disable --now ameesh-guard.service"),
                         out.index("rm -f /etc/systemd/system/ameesh-guest-runner@.service"))
         self.assertIn("rm -f /etc/tmpfiles.d/ameesh-gate.conf", out)
-        self.assertIn("rm -f /etc/ameesh/guard.json /etc/ameesh/guest.env", out)
+        self.assertIn("+ rm -f /etc/ameesh/guard.json\n", out)
+        # secrets the script did not record as its own stay (codex #383 r2)
+        self.assertNotIn("guest.env", out)
         # only what the script recorded as its own goes (none here)
         self.assertNotIn("userdel", out)
         self.assertNotIn("rm -rf /opt/ameesh/venv", out)
@@ -210,7 +212,9 @@ class InstallPilotTest(unittest.TestCase):
             state = os.path.join(tmp, "pilot-install.state")
             with open(state, "w", encoding="utf-8") as fh:
                 fh.write("user\nguest-dir %s\nguest-tree %s/work\nguest-tree /home\n"
-                         "guest-tree /tmp\nguest-tree %s/gone\nroot-content\n" % (made, made, made))
+                         "guest-tree /tmp\nguest-tree %s/gone\nroot-content\n"
+                         "secret /etc/ameesh/guest-deepseek5.env\nsecret /etc/passwd\n"
+                         % (made, made, made))
             res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge",
                                   "--root", "/srv/elsewhere"],
                                  capture_output=True, text=True,
@@ -225,6 +229,51 @@ class InstallPilotTest(unittest.TestCase):
             for path in ("/home", "/tmp", "/srv/elsewhere", made + "/tmp", made + "/home"):
                 self.assertNotIn("rm -rf --one-file-system %s\n" % path, out)
             self.assertIn("+ userdel ameesh-guest", out)
+            # secrets: only those recorded, only the script's own files
+            self.assertIn("+ rm -f /etc/ameesh/guest-deepseek5.env\n", out)
+            self.assertNotIn("rm -f /etc/passwd", out)
+            self.assertNotIn("guest-deepseek6", out)
+
+    def test_an_existing_file_is_never_taken_for_a_directory(self):
+        # codex #383 r2 P1: a file where a directory goes is refused before
+        # any record (a purge would delete it)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "guest")
+            os.makedirs(root)
+            with open(os.path.join(root, "work"), "w") as fh:
+                fh.write("not ours")
+            res = self.dry("--allow-rootfs", "--root", root)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("%s/work exists and is not a directory" % root, res.stderr)
+            self.assertNotIn("record 'guest-tree", res.stdout)
+
+    def test_mounts_beneath_a_tree_are_seen(self):
+        # codex #383 r2 P1: a bind mount under a recorded tree stops its purge
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            text = fh.read()
+        func = text[text.index("mounts_under() {"):]
+        func = func[:func.index("\n}\n") + 3]
+        def under(path):
+            return subprocess.run(["bash", "-c", func + 'mounts_under "$1"', "-", path]).returncode
+        self.assertEqual(under("/proc"), 0)          # /proc itself
+        if os.path.ismount("/dev/shm"):
+            self.assertEqual(under("/dev"), 0)       # /dev/shm beneath
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(under(tmp), 1)
+        self.assertEqual(under("/pro"), 1)           # a prefix is not a parent
+
+    def test_a_volume_bigger_than_disk_max_is_refused(self):
+        # codex #383 r2 P2: nothing but the volume's size holds disk_max
+        if not os.path.ismount("/dev/shm"):
+            self.skipTest("no /dev/shm mount")
+        lend = json.dumps({"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB"})
+        res = self.dry("--root", "/dev/shm", "--lend", "/dev/stdin", stdin=lend)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("refused for real", res.stderr)
+        res = self.dry("--root", "/dev/shm", "--accept-larger-volume", "--lend", "/dev/stdin",
+                       stdin=lend)
+        self.assertNotIn("refused", res.stderr)
+        self.assertIn("(accepted)", res.stderr)
 
     def test_observe_takes_the_caps_off(self):
         # codex #383 r1 P2: a stopped guard leaves its caps; observe removes them
