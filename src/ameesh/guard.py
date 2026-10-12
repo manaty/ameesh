@@ -67,7 +67,7 @@ import sys
 import time
 from typing import Any, Callable
 
-from . import resources
+from . import capacity_guard, resources
 from .platform import host
 
 SCHEMA_HOST_STATE = "ameesh-host-state/1"
@@ -114,12 +114,19 @@ class GuardError(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Window:
-    """A lending window: days, and optionally a time range in UTC (an end
-    before the start runs past midnight, into the next day)."""
+    """A lending window: days, and optionally a time range in its zone (an
+    end before the start runs past midnight, into the next day)."""
 
     days: frozenset
     start_min: int | None = None
     end_min: int | None = None
+    tz: str = "UTC"
+
+    def _zone(self) -> dt.tzinfo:
+        if self.tz == "UTC":
+            return dt.timezone.utc
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(self.tz)
 
     def _span(self, day_start: dt.datetime) -> tuple[dt.datetime, dt.datetime] | None:
         if DAYS[day_start.weekday()] not in self.days:
@@ -134,7 +141,7 @@ class Window:
 
     def end_if_open(self, now: float) -> float | None:
         """The end of the window if it is open at `now` (epoch), else None."""
-        at = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+        at = dt.datetime.fromtimestamp(now, self._zone())
         today = at.replace(hour=0, minute=0, second=0, microsecond=0)
         for day in (today - dt.timedelta(days=1), today):
             span = self._span(day)
@@ -149,35 +156,14 @@ class Window:
         return None
 
 
-_WINDOW_RE = re.compile(r"^\s*(?P<days>[a-z]{3}(?:-[a-z]{3})?|daily)"
-                        r"(?:\s+(?P<start>\d{2}:\d{2})-(?P<end>\d{2}:\d{2}))?"
-                        r"(?:\s+(?P<tz>UTC))?\s*$")
-
-
 def parse_window(text: Any) -> Window:
-    """"mon-fri 18:00-14:00 UTC", "sat-sun", "daily 20:00-06:00" (UTC only)."""
-    match = _WINDOW_RE.match(str(text).lower().replace("utc", "UTC")) \
-        if isinstance(text, str) else None
-    if not match:
-        raise GuardError("window %r: expected 'mon-fri 18:00-14:00 UTC', 'sat-sun'" % (text,))
-    spec = match.group("days")
-    if spec == "daily":
-        days = frozenset(DAYS)
-    else:
-        first, _, last = spec.partition("-")
-        if first not in DAYS or (last and last not in DAYS):
-            raise GuardError("window %r: unknown day" % text)
-        i, j = DAYS.index(first), DAYS.index(last or first)
-        days = frozenset(DAYS[(i + k) % 7] for k in range((j - i) % 7 + 1))
-
-    def minutes(hhmm: str | None) -> int | None:
-        if hhmm is None:
-            return None
-        hours, mins = int(hhmm[:2]), int(hhmm[3:])
-        if hours > 24 or mins > 59 or (hours == 24 and mins):
-            raise GuardError("window %r: invalid time %s" % (text, hhmm))
-        return hours * 60 + mins
-    return Window(days, minutes(match.group("start")), minutes(match.group("end")))
+    """A window as the contract reads it (`capacity_guard.parse_window`):
+    "mon-fri 18:00-14:00 UTC", "sat-sun", "mon,wed 18:00-14:00 Europe/Paris"."""
+    found = capacity_guard.parse_window(text)
+    if found is None:
+        raise GuardError("window %r: expected '<days> [HH:MM-HH:MM] [zone]', e.g. "
+                         "'mon-fri 18:00-14:00 UTC', 'sat-sun'" % (text,))
+    return Window(frozenset(found["days"]), found["start"], found["end"], found["tz"])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,7 +186,8 @@ class Offer:
     disk_paths: tuple = ("/",)
     drain_seconds: float = DEFAULT_DRAIN_S
     calm_seconds: float = DEFAULT_CALM_S
-    raw: dict = dataclasses.field(default_factory=dict, compare=False)
+    #: the offer as published in the state (`offer`): sizes in bytes
+    published: dict = dataclasses.field(default_factory=dict, compare=False)
 
 
 def _percent(value: Any, key: str) -> float | None:
@@ -221,59 +208,47 @@ def _bytes(value: Any, key: str) -> int | None:
     return number
 
 
-def _positive(value: Any, key: str, default: float | None = None) -> float | None:
-    if value is None:
-        return default
-    # finite: drain_seconds of 1e309 (inf) or nan kept the guard draining
-    # forever (codex #211 r5)
-    number = resources.finite_float(value) if isinstance(value, (int, float)) else None
-    if number is None or number <= 0:
-        raise GuardError("lend.%s: positive finite number expected, got %r" % (key, value))
-    return number
+#: reclaim keys only the guard reads; the contract's reader reports them as
+#: unknown and ignores them
+GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
 
 
 def parse_offer(lend: Any) -> Offer:
-    """`Offer` from the `lend` object; `GuardError` on any unreadable key."""
-    if not isinstance(lend, dict) or not lend:
-        raise GuardError("lend: object expected (no offer: the host lends nothing)")
-    reclaim = lend.get("reclaim") or {}
-    if not isinstance(reclaim, dict):
-        raise GuardError("lend.reclaim: object expected")
-    weight = lend.get("cpu_weight", 10)
-    if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 10000:
-        raise GuardError("lend.cpu_weight: integer from 1 to 10000 expected")
-    units = reclaim.get("busy_units") or []
-    if not isinstance(units, list) or not all(isinstance(u, str) and u for u in units):
-        raise GuardError("lend.reclaim.busy_units: list of unit patterns expected")
-    busy_max = reclaim.get("busy_max")
-    if busy_max is not None and (isinstance(busy_max, bool) or not isinstance(busy_max, int)
-                                 or busy_max < 0):
-        raise GuardError("lend.reclaim.busy_max: integer >= 0 expected")
-    paths = reclaim.get("disk_paths") or ["/"]
+    """`Offer` from the `lend` object, read by the contract's own reader
+    (`capacity_guard.parse_lend`): the guard accepts exactly the offers the
+    canon accepts (codex #211 r6), plus the reclaim keys of
+    `GUARD_RECLAIM_KEYS`. `GuardError` on any problem."""
+    parsed, problems, _unknown = capacity_guard.parse_lend(lend)
+    if problems or parsed is None:
+        raise GuardError("lend: %s" % "; ".join(problems or ["unreadable"]))
+    reclaim = parsed.get("reclaim") or {}
+    extra = lend.get("reclaim") or {}
+    paths = extra.get("disk_paths") or ["/"]
     if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
         raise GuardError("lend.reclaim.disk_paths: list of paths expected")
-    windows = lend.get("windows") or []
-    if not isinstance(windows, list):
-        raise GuardError("lend.windows: list expected")
-    disk_min = _bytes(reclaim.get("disk_free_min"), "reclaim.disk_free_min")
+    io = _percent(extra.get("io_pressure_max"), "io_pressure_max")
+    disk_min = _bytes(extra.get("disk_free_min"), "reclaim.disk_free_min")
+    published = dict(parsed)
+    guard_keys = {"io_pressure_max": io, "disk_free_min": disk_min,
+                  "disk_paths": paths if "disk_paths" in extra else None}
+    guard_keys = {k: v for k, v in guard_keys.items() if v is not None}
+    if guard_keys:
+        published["reclaim"] = dict(reclaim, **guard_keys)
     return Offer(
-        cpu_max=_positive(lend.get("cpu_max"), "cpu_max"), cpu_weight=weight,
-        memory_max=_bytes(lend.get("memory_max"), "memory_max"),
-        agent_memory_max=_bytes(lend.get("agent_memory_max"), "agent_memory_max"),
-        disk_max=_bytes(lend.get("disk_max"), "disk_max"),
-        windows=tuple(parse_window(w) for w in windows),
-        memory_available_min=_bytes(reclaim.get("memory_available_min"),
-                                    "reclaim.memory_available_min"),
-        cpu_pressure_max=_percent(reclaim.get("cpu_pressure_max"), "cpu_pressure_max"),
-        memory_pressure_max=_percent(reclaim.get("memory_pressure_max"),
-                                     "memory_pressure_max"),
-        io_pressure_max=_percent(reclaim.get("io_pressure_max"), "io_pressure_max"),
-        busy_units=tuple(units), busy_max=busy_max,
+        cpu_max=parsed["cpu_max"], cpu_weight=parsed.get("cpu_weight", 10),
+        memory_max=parsed["memory_max"], agent_memory_max=parsed.get("agent_memory_max"),
+        disk_max=parsed["disk_max"],
+        windows=tuple(parse_window(w) for w in parsed.get("windows", ())),
+        memory_available_min=reclaim.get("memory_available_min"),
+        cpu_pressure_max=reclaim.get("cpu_pressure_max"),
+        memory_pressure_max=reclaim.get("memory_pressure_max"),
+        io_pressure_max=io,
+        busy_units=tuple(reclaim.get("busy_units", ())), busy_max=reclaim.get("busy_max"),
         disk_free_min=DEFAULT_DISK_FREE_MIN if disk_min is None else disk_min,
         disk_paths=tuple(paths),
-        drain_seconds=_positive(lend.get("drain_seconds"), "drain_seconds", DEFAULT_DRAIN_S),
-        calm_seconds=_positive(lend.get("calm_seconds"), "calm_seconds", DEFAULT_CALM_S),
-        raw=dict(lend))
+        drain_seconds=float(parsed["drain_seconds"]),
+        calm_seconds=float(parsed["calm_seconds"]),
+        published=published)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -505,6 +480,17 @@ def lendable(offer: Offer, reading: dict) -> dict:
     return out
 
 
+#: the smallest CPU share published (4 decimals): the schema wants > 0
+CPU_SHARE_MIN = 0.0001
+
+
+def cpu_share(share: float) -> float:
+    """A share of the host's CPUs as published: rounded up to 4 decimals,
+    at least `CPU_SHARE_MIN`, at most 1 (0.001 CPU of 64 is not 0.0, which
+    the schema refuses and a reader could take for no cap; codex #211 r6)."""
+    return min(1.0, max(CPU_SHARE_MIN, math.ceil(round(share * 10000, 6)) / 10000))
+
+
 def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,
              in_turn: int | None) -> dict:
     """The `caps` of the state for a level (§1.5, §1.6)."""
@@ -514,7 +500,7 @@ def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,
     caps: dict = {"max_concurrent": cfg.max_agents, "cpu_weight": offer.cpu_weight,
                   "io_weight": offer.cpu_weight, "enforced": []}
     if cpu is not None and count:
-        caps["cpu_share"] = round(cpu / count, 4)
+        caps["cpu_share"] = cpu_share(cpu / count)
     if lend.get("memory_bytes") is not None:
         caps["memory_mb"] = int(lend["memory_bytes"] // 2 ** 20)
         caps["memory_high_mb"] = caps["memory_mb"]
@@ -527,13 +513,21 @@ def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,
         # memory brought back to its use (the kernel reclaims its cache)
         caps["max_concurrent"] = min(cfg.max_agents, in_turn or 0)
         if "cpu_share" in caps:
-            caps["cpu_share"] = round(caps["cpu_share"] / 2, 4)
+            caps["cpu_share"] = cpu_share(caps["cpu_share"] / 2)
         guest = reading.get("guest_mem_bytes")
         if guest is not None and "memory_high_mb" in caps:
             caps["memory_high_mb"] = min(caps["memory_high_mb"], int(guest // 2 ** 20))
     if level >= 3:
         caps["max_concurrent"] = 0
     return caps
+
+
+#: the keys of `measure` (contract §4): all present, null when unknown
+MEASURE_KEYS = ("ts", "window_s", "cpu_count", "app_cpu", "guest_cpu", "mem_total_bytes",
+                "mem_available_bytes", "swap_used_bytes", "guest_mem_bytes", "psi", "app_psi",
+                "disk_free_bytes", "app_disk_free_bytes", "tmp_path", "tmp_fstype",
+                "tmp_size_bytes", "tmp_used_bytes", "on_ac", "battery_percent", "metered",
+                "user_idle_s", "busy")
 
 
 def measure_of(reading: dict) -> dict:
@@ -558,7 +552,9 @@ def measure_of(reading: dict) -> dict:
     out = {"ts": reading.get("ts"), "window_s": 60}
     out.update({k: reading.get(k) for k in keys if k in reading})
     out["psi"] = {"cpu_some": reading.get("psi_cpu_60"), "mem_some": reading.get("psi_mem_60"),
-                  "io_some": reading.get("psi_io_60")}
+                  "mem_full": None, "io_some": reading.get("psi_io_60")}
+    # every key the schema requires, null when not measured
+    out.update({k: None for k in MEASURE_KEYS if k not in out})
     return out
 
 
@@ -574,7 +570,7 @@ def build_state(cfg: GuardConfig, decision: Decision, seq: int, now: float, *,
         "caps": caps_for(cfg, decision.level, lend, reading, in_turn),
         "reason": decision.reason, "expires_ts": now + ttl,
         "level": decision.level,
-        "offer": cfg.offer.raw, "measure": dict(measure_of(reading), lendable=lend),
+        "offer": cfg.offer.published, "measure": dict(measure_of(reading), lendable=lend),
         "guard": {"kind": GUARD_KIND, "version": version(), "host_kind": "vm",
                   "mode": "observe" if observe else "enforce"},
     }

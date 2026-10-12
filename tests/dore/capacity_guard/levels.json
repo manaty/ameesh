@@ -1,7 +1,7 @@
 {
   "description": "L159e golden cases: a sequence of signals (t in seconds) and the level the guard decides at each step. Signals: mem_available_bytes, psi_* in %, busy, app_disk_free_bytes. Offer as in study L159 section 1.3.",
   "offer": {
-    "cpu_max": 3, "memory_max": "14GiB", "agent_memory_max": "4.5GiB",
+    "cpu_max": 3, "memory_max": "14GiB", "agent_memory_max": "4.5GiB", "disk_max": "80GiB",
     "reclaim": {"memory_available_min": "6GiB", "cpu_pressure_max": "20%",
                 "memory_pressure_max": "2%", "io_pressure_max": "20%",
                 "busy_units": ["actions.runner.*"], "busy_max": 4},
