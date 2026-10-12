@@ -23,6 +23,10 @@ with open(os.environ["FAKE_DOCKER_LOG"], "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\n")
 args = sys.argv[1:]
 cmd = args[0]
+fail = os.environ.get("FAKE_DOCKER_FAIL", "")
+if (cmd == "ps" and "ps" in fail) or (
+        cmd == "inspect" and "inspect-mounts" in fail and ".Mounts" in " ".join(args)):
+    sys.exit(1)
 
 def save():
     with open(state_path, "w") as f:
@@ -41,13 +45,18 @@ if cmd == "inspect":
     elif ".State.Running" in fmt:
         print("true" if c["running"] else "false")
     elif ".Mounts" in fmt:
-        print(" ".join(c["volumes"]))
+        for src in c["volumes"]:
+            print(src)
     elif ".State.Health.Status" in fmt:
         print("healthy")
 elif cmd == "ps":
-    vol = (opt("--filter") or "volume=").split("=", 1)[1]
+    # comme le démon : `volume=` compare le nom d'un volume nommé (ou la
+    # destination), jamais la source d'un bind mount (un chemin absolu ici)
+    vol = opt("--filter").split("=", 1)[1] if opt("--filter") else None
     for name, c in state.items():
-        if vol in c["volumes"] and (c["running"] or "-a" in args):
+        if not (c["running"] or "-a" in args):
+            continue
+        if vol is None or (vol in c["volumes"] and not vol.startswith("/")):
             print(name)
 elif cmd == "start":
     state[args[1]]["running"] = True
@@ -132,6 +141,28 @@ class PgUpVolumeTest(unittest.TestCase):
         proc, after, _ = self.run_script(alone, AMEESH_PG_NAME="B")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(after["B"]["running"])
+
+    def test_starting_on_a_bind_mount_already_running_is_refused(self):
+        # AMEESH_PG_VOLUME=/srv/pg-data pour A et B : un bind mount, que le
+        # filtre `volume=` de docker ne voit pas ; comparé par sa source
+        shared = {"A": {"running": True, "volumes": ["/srv/pg-data"]},
+                  "B": {"running": False, "volumes": ["/srv/pg-data"]}}
+        proc, after, calls = self.run_script(shared, AMEESH_PG_NAME="B")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("/srv/pg-data", proc.stderr)
+        self.assertFalse(after["B"]["running"])
+        self.assertFalse([c for c in calls if c[0] == "start"])
+
+    def test_a_failed_docker_inspect_or_ps_refuses_the_start(self):
+        for fail in ("inspect-mounts", "ps"):
+            with self.subTest(fail=fail):
+                alone = {"B": {"running": False, "volumes": ["b-data"]}}
+                proc, after, calls = self.run_script(
+                    alone, AMEESH_PG_NAME="B", FAKE_DOCKER_FAIL=fail)
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn("échec", proc.stderr)
+                self.assertFalse(after["B"]["running"])
+                self.assertFalse([c for c in calls if c[0] == "start"])
 
 
 if __name__ == "__main__":

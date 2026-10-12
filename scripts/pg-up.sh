@@ -27,16 +27,24 @@ fi
 
 if docker inspect "$NAME" >/dev/null 2>&1; then
   if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
-    # un conteneur créé avant ce garde peut partager son volume avec un autre :
-    # refus de le démarrer tant qu'un autre conteneur en marche monte un de
-    # ses volumes réels
-    for vol in $(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "$NAME"); do
-      autres=$(docker ps --filter "volume=$vol" --format '{{.Names}}' | grep -vxF "$NAME" | tr '\n' ' ' || true)
-      if [ -n "${autres// /}" ]; then
-        echo "le volume $vol de $NAME est monté par un conteneur en marche : $autres— refus de démarrer $NAME" >&2
-        exit 1
-      fi
-    done
+    # un conteneur créé avant ce garde peut partager ses données avec un
+    # autre : refus de le démarrer si un autre conteneur en marche monte une
+    # même source (volume nommé ou bind mount, comparés par leur .Source sur
+    # l'hôte) ; toute inspection en échec refuse aussi
+    refus() { echo "$1 — refus de démarrer $NAME" >&2; exit 1; }
+    sources() { docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$1"; }
+    miennes=$(sources "$NAME") || refus "inspection des montages de $NAME en échec"
+    en_marche=$(docker ps --format '{{.Names}}') || refus "docker ps en échec"
+    while IFS= read -r autre; do
+      [ -n "$autre" ] && [ "$autre" != "$NAME" ] || continue
+      leurs=$(sources "$autre") || refus "inspection des montages de $autre en échec"
+      while IFS= read -r src; do
+        [ -n "$src" ] || continue
+        if grep -qxF -- "$src" <<<"$leurs"; then
+          refus "$src (données de $NAME) est monté par le conteneur en marche $autre"
+        fi
+      done <<<"$miennes"
+    done <<<"$en_marche"
     echo "démarrage du conteneur $NAME"
     docker start "$NAME" >/dev/null
   fi
