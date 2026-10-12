@@ -39,7 +39,7 @@ ITEM_COLUMNS = """
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
     q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
-    q.queued_by, q.source,
+    q.queued_by, q.source, q.generation, q.frozen_id,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -541,11 +541,11 @@ class WorkItems(interface.WorkItems):
         pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         return self.db.query(
             """
-            SELECT id, work_item_id, state, note, actor,
-                   extract(epoch from created_at)::float8 as created_ts
-              FROM work_item_events
-             WHERE note LIKE %s AND created_at >= to_timestamp(%s)
-             ORDER BY id
+            SELECT e.id, e.work_item_id, e.state, e.note, e.actor, w.assignee,
+                   extract(epoch from e.created_at)::float8 as created_ts
+              FROM work_item_events e JOIN work_items w ON w.id = e.work_item_id
+             WHERE e.note LIKE %s AND e.created_at >= to_timestamp(%s)
+             ORDER BY e.id
             """,
             (pattern, float(since_ts)),
         )
@@ -735,37 +735,69 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="") -> dict | None:
+                  source="", frozen_id=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state FROM work_items WHERE id = %s"
-                           " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
+                           " AND state NOT IN ('merged', 'promoted', 'closed')"
+                           " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
+            latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+                              " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+            latest_id = latest[0]["id"] if latest else None
+            if frozen_id is not None and frozen_id != latest_id:
+                return None
             tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source)"
-                " VALUES (%s, %s, %s, %s, %s)"
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
-                "   source = excluded.source,"
-                "   landing_sha = NULL,"
+                "   source = excluded.source, frozen_id = excluded.frozen_id,"
+                "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
                 "   updated_at = now()",
-                (int(item_id), target, frozen_sha, actor or "", source or ""))
+                (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return self._queue_row(tx, item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False) -> dict | None:
+                     note="", actor="", clear_rank=False, lease=None,
+                     freeze=None, entry=None) -> dict | None:
+        key, owner, epoch = lease if lease is not None else (None, None, None)
+        frozen, landing = freeze if freeze is not None else (None, None)
+        generation, target, frozen_id, entry_sha = entry if entry is not None else (None,) * 4
         with self.db.transaction() as tx:
+            if entry is not None:
+                # Same lock as add_milestone/queue_add: read the latest freeze
+                # after waiting for any concurrent refreeze to finish.
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
+            # #194 r6: the lease row is locked by the same statement (an
+            # acquisition waits for this write, or this write sees its new
+            # epoch), its expiry read on the wall clock, not the transaction's
             rows = tx.query(
-                "UPDATE merge_queue SET state = coalesce(%s, state),"
+                "WITH lease AS (SELECT 1 FROM merge_locks l"
+                "    WHERE l.target = %s AND l.owner = %s AND l.epoch = %s"
+                "      AND l.expires_at > clock_timestamp() FOR UPDATE)"
+                " UPDATE merge_queue SET state = coalesce(%s, state),"
                 "   rank = CASE WHEN %s THEN NULL ELSE coalesce(%s, rank) END,"
                 "   landing_sha = CASE WHEN %s IN ('queued', 'ejected') THEN NULL"
                 "                      ELSE coalesce(%s, landing_sha) END,"
                 "   reason = coalesce(%s, reason), updated_at = now()"
-                " WHERE work_item_id = %s RETURNING work_item_id",
-                (state, state == "ejected" or bool(clear_rank), rank, state or "", landing_sha, reason,
-                 int(item_id)))
+                " WHERE work_item_id = %s"
+                "   AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM lease))"
+                # #194 r8: or under the freeze — still `landing`, same freeze
+                # and same landing commit (a new freeze is never overwritten)
+                "   AND (%s::text IS NULL OR (state = 'landing' AND frozen_sha = %s"
+                "        AND landing_sha IS NOT DISTINCT FROM %s))"
+                "   AND (NOT %s OR (generation = %s AND target = %s"
+                "        AND frozen_id IS NOT DISTINCT FROM %s AND frozen_sha = %s"
+                "        AND frozen_id IS NOT DISTINCT FROM (SELECT id FROM work_item_milestones"
+                "          WHERE work_item_id = %s AND kind = 'frozen'"
+                "          ORDER BY at DESC, id DESC LIMIT 1)))"
+                " RETURNING work_item_id",
+                (key, owner, epoch, state, state == "ejected" or bool(clear_rank), rank,
+                 state or "", landing_sha, reason, int(item_id), key, frozen, frozen,
+                 landing, entry is not None, generation, target, frozen_id, entry_sha, int(item_id)))
             if not rows:
                 return None
             if note:
@@ -782,6 +814,31 @@ class WorkItems(interface.WorkItems):
             lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return True
+
+    def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
+        if epoch is not None:  # renewal: only the holder, at its epoch
+            rows = self.db.query(
+                "UPDATE merge_locks SET expires_at = clock_timestamp()"
+                " + %s * interval '1 second'"
+                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                (float(ttl_s), key, owner, int(epoch)))
+            return int(rows[0]["epoch"]) if rows else None
+        rows = self.db.query(
+            "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
+            " VALUES (%s, %s, 1, clock_timestamp() + %s * interval '1 second')"
+            " ON CONFLICT (target) DO UPDATE SET owner = excluded.owner,"
+            "   epoch = merge_locks.epoch + 1, expires_at = excluded.expires_at"
+            " WHERE merge_locks.owner IS NULL OR merge_locks.expires_at < clock_timestamp()"
+            "    OR merge_locks.owner = excluded.owner"
+            " RETURNING epoch", (key, owner, float(ttl_s)))
+        return int(rows[0]["epoch"]) if rows else None
+
+    def land_unlock(self, key, owner, epoch) -> bool:
+        rows = self.db.query(
+            "UPDATE merge_locks SET owner = NULL, expires_at = NULL"
+            " WHERE target = %s AND owner = %s AND epoch = %s RETURNING target",
+            (key, owner, int(epoch)))
+        return bool(rows)
 
     def queue(self, target=None) -> list[dict]:
         return self.db.query(

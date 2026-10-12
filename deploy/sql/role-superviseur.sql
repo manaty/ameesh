@@ -540,7 +540,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- STATE, no content) and the per-target merge lease
     ('merge_queue', ARRAY[
         'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
-        'queued_by', 'queued_at', 'updated_at', 'source'
+        'queued_by', 'queued_at', 'updated_at', 'source',
+        -- L160e2 (0412): admission generation and frozen milestone identity
+        'generation', 'frozen_id'
     ]),
     ('merge_locks', ARRAY[
         'target', 'owner', 'epoch', 'expires_at'
