@@ -686,8 +686,28 @@ def _taken_agent_names(canons: list, db) -> set:
     return names
 
 
+def _require_readable(canons: list) -> None:
+    """Toutes les réservations sont-elles lisibles ? (codex r3, #452)
+
+    Un canon configuré mais ILLISIBLE (révision jamais récupérée, dépôt cassé)
+    ne dit pas ses noms : proposer un nom supposerait qu'il est libre. On
+    refuse, en nommant le canon et sa ref — que le canon illisible soit celui
+    qui nomme ou un autre, ses réservations manqueraient dans les deux cas."""
+    for canon in canons:
+        if canon.readable:
+            continue
+        reasons = [f.message for f in canon.load_findings
+                   if f.severity == canon_mod.ERROR]
+        raise canon_mod.NamingError(
+            "unreadable canon %s (%s) at ref %s: %s — its agent names are unknown, "
+            "so no free name can be guaranteed (fetch or repair it first)"
+            % (canon.id or "?", canon.root, canon.rev or "?",
+               reasons[0] if reasons else "no source read"))
+
+
 def _generated_name(naming, role: str | None, projects, canons: list, db) -> str:
     """Nom par défaut engendré par le nommage, ou refus explicite (L243, #468)."""
+    _require_readable(canons)
     if naming is None:
         raise canon_mod.NamingError(
             "no `extensions.ameesh.naming` in the canon: declare org, projects and "

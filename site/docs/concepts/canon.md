@@ -146,9 +146,14 @@ working: it is a list of one. See
   agent. `ameesh agent name --role R --project P …` prints the next free one
   (cards of every canon and every registry row, stopped agents included, are
   reserved); `ameesh agent spawn` without a name uses the same generator.
-  `canon check` warns (`agent-name-convention`) on a card whose title starts
-  with the org prefix but does not follow the convention, only when the canon
-  declares `naming:` (existing names are left to #423).
+  Two repos never share a segment (declared or truncated) and one repo keeps
+  the same segment in every canon: a mesh that disagrees is refused. A
+  configured canon that cannot be read (revision never fetched, broken repo)
+  also refuses generation — its reservations are unknown, and the error names
+  the canon and its ref. `canon check` warns (`agent-name-convention`) on a
+  card whose title starts with the org prefix but does not follow the
+  convention, only when the canon declares `naming:` (existing names are left
+  to #423).
 
 Constraints: every host that shares a database must have the **same default
 canon**; do not reorder the canons and upgrade in the same step; removing a

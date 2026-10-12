@@ -1054,6 +1054,11 @@ class Canon:
     #: L243 (#468) : nommage par défaut des nouveaux agents
     #: (`extensions.ameesh.naming`) ; None = aucune convention déclarée.
     naming: "Naming | None" = None
+    #: L243 (#468) : révision DEMANDÉE au chargement (`--ref`, `ref` de
+    #: l'entrée `canons`, branche du manifeste). Renseignée même quand le canon
+    #: n'a pas pu être lu : le refus d'un canon illisible doit nommer la ref à
+    #: récupérer (codex r3, #452).
+    rev: str = ""
 
     # -- accès ---------------------------------------------------------------
     @property
@@ -1625,33 +1630,44 @@ class Naming:
                         known: Mapping[str, str] | None = None) -> str:
         """Segment d'un projet : le nom court déclaré, sinon le nom tronqué à 6.
 
-        Une troncature qui rejoindrait le segment d'un AUTRE dépôt connu est
-        refusée (deux dépôts ne partagent jamais un segment), avec la clé
-        `naming.projects.<dépôt>` à déclarer. `known` : les dépôts connus du
-        mesh (fiches, demande, `naming.projects` des autres canons) et le
-        segment que LEUR nommage leur donne — un mapping dépôt → segment. On
-        compare les segments engendrés, jamais les noms de dépôts (codex r2,
-        #452) : le canon B peut déclarer `otherrepo: catalo` (même segment que
+        Un segment déjà porté par un AUTRE dépôt connu est refusé (deux dépôts
+        ne partagent jamais un segment) — que ce segment soit DÉCLARÉ ou
+        tronqué (codex r3, #452) : `catalogue: catalo` ici et `otherrepo: catalo`
+        ailleurs ne peuvent pas coexister. `known` : les dépôts connus du mesh
+        (fiches, demande, `naming.projects` des autres canons) et le segment que
+        LEUR nommage leur donne — un mapping dépôt → segment. On compare les
+        segments engendrés, jamais les noms de dépôts (codex r2, #452) : le
+        canon B peut déclarer `otherrepo: catalo` (même segment que
         `catalogue`, refusé) ou `catalogapi: capi` (aucun rapport)."""
         declared = self.projects.get(project)
-        if declared:
-            return declared
-        short = str(project)[:6]
-        if not NAMING_SEGMENT_RE.match(short):
+        segment = declared or str(project)[:6]
+        if not NAMING_SEGMENT_RE.match(segment):
             raise NamingError(
                 "project %r has no usable short name (%r): declare "
-                "naming.projects.%s in the federation" % (project, short, project))
+                "naming.projects.%s in the federation" % (project, segment, project))
+        existing = (known or {}).get(project)
+        if existing is not None and existing != segment:
+            raise NamingError(
+                "project %r has several short names in the mesh (%r here, %r "
+                "elsewhere): one repo keeps the same segment in every canon"
+                % (project, segment, existing))
         others = dict(known or {})
-        for key, segment in self.projects.items():
-            others.setdefault(str(key), segment)
+        for key, value in self.projects.items():
+            others.setdefault(str(key), value)
         others.pop(project, None)
-        clash = sorted(key for key, segment in others.items() if segment == short)
+        clash = sorted(key for key, value in others.items() if value == segment)
         if clash:
+            if declared:
+                raise NamingError(
+                    "project %r: the short name %r is already the segment of %s: "
+                    "two repos never share a segment, declare another "
+                    "naming.projects.%s"
+                    % (project, segment, ", ".join(clash), project))
             raise NamingError(
                 "project %r: the 6-character name %r is already the segment of %s: "
                 "declare naming.projects.%s in the federation"
-                % (project, short, ", ".join(clash), project))
-        return short
+                % (project, segment, ", ".join(clash), project))
+        return segment
 
     def role_segment(self, role: str) -> str:
         declared = self.roles.get(role)
@@ -1776,27 +1792,49 @@ def known_projects(canons: Iterable, requested: Iterable[str] = (),
     ses fiches (`team` sinon). `Naming.project_segment` compare ces segments —
     jamais les noms de dépôts, qui peuvent se ressembler sans collision
     (`catalogue` / `catalogapi`) ou se distinguer avec le même segment
-    (`catalogue` / `otherrepo: catalo`) : codex r2, #452."""
-    known: dict[str, str] = {}
+    (`catalogue` / `otherrepo: catalo`) : codex r2, #452.
+
+    TOUS les segments d'un dépôt sont collectés : si deux canons lui donnent
+    deux noms courts (`otherrepo: other` chez B, `otherrepo: catalo` chez C),
+    garder le premier ferait dépendre le verdict de l'ordre des canons et
+    masquerait le conflit de C — on refuse, en parcourant les dépôts et les
+    segments TRIÉS pour que le verdict ne dépende pas de l'ordre (codex r3,
+    #452)."""
+    #: dépôt → {segment : {sources}} : tous les segments vus, pour refuser une
+    #: divergence au lieu de garder le premier (`setdefault`).
+    collected: dict[str, dict[str, set]] = {}
+
+    def note(project, segment, source: str) -> None:
+        if not isinstance(project, str) or not segment:
+            return
+        collected.setdefault(project, {}).setdefault(segment, set()).add(source)
+
     for project in requested:
-        if not isinstance(project, str) or project in known:
-            continue
-        segment = _segment_of(naming, project)
-        if segment:
-            known[project] = segment
+        note(project, _segment_of(naming, project), "the request")
     for canon in canons:
         canon_naming = getattr(canon, "naming", None)
+        label = "canon %s" % (canon.id or canon.root)
         if canon_naming is not None:
             for key, segment in canon_naming.projects.items():
-                if isinstance(key, str):
-                    known.setdefault(key, segment)
+                note(key, segment, label)
         for agent in getattr(canon, "agents", ()) or ():
             for project in agent.effective_projects:
-                if not isinstance(project, str) or project in known:
-                    continue
-                segment = _segment_of(canon_naming, project)
-                if segment:
-                    known[project] = segment
+                note(project, _segment_of(canon_naming, project),
+                     "%s (card %s)" % (label, agent.title))
+    known: dict[str, str] = {}
+    for project in sorted(collected):
+        segments = collected[project]
+        if len(segments) > 1:
+            raise NamingError(
+                "project %r has several short names in the mesh: %s — one repo keeps "
+                "the same segment in every canon (otherwise a collision depends on "
+                "the canon order): align `naming.projects.%s`"
+                % (project,
+                   ", ".join("%r (from %s)" % (segment,
+                                               ", ".join(sorted(segments[segment])))
+                             for segment in sorted(segments)),
+                   project))
+        known[project] = next(iter(segments))
     return known
 
 
@@ -1829,7 +1867,7 @@ class _Loader:
         self.allow_untrusted = untrusted
         self.fetch = fetch
         self.use_pyyaml = use_pyyaml
-        self.canon = Canon(root=self.root, is_default=default)
+        self.canon = Canon(root=self.root, is_default=default, rev=ref)
         _identify(self.canon, None)     # repli tant que le manifeste n'est pas lu
         self.fetched: set[str] = set()
         self.findings = self.canon.load_findings
@@ -1972,6 +2010,7 @@ class _Loader:
             return self.canon
         explicit = bool(self.ref)
         rev = self.ref or self._bootstrap_rev()
+        self.canon.rev = rev
         root = self._source("canon", self.root, rev, explicit)
         if root is None:
             return self.canon
@@ -1989,6 +2028,7 @@ class _Loader:
                     and "%s/%s" % (DEFAULT_REMOTE, branch) != root.rev):
                 # la branche canonique est celle du manifeste
                 rev = "%s/%s" % (DEFAULT_REMOTE, branch)
+                self.canon.rev = rev
                 self.findings[:] = [f for f in self.findings
                                     if f.code not in ("canon-local-divergence",
                                                       "canon-worktree-dirty")]

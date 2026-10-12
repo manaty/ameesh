@@ -389,7 +389,7 @@ ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] 
 | `--host` | host whose state is diagnosed or synced (else `AMEESH_HOST` / this machine) |
 | `--bootstrap-ref` | first bootstrap of the passkey registry only: trusted canonical branch (`origin/<BRANCH>`), logged, ignored afterwards |
 | `--ttl` (spawn) | expiry: `30m`, `2h`, `1d` (max `7d`) |
-| `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused |
+| `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused. Two repos never share a segment and one repo keeps the same segment in every canon (a divergent mesh is refused); a configured canon that cannot be read also refuses generation, naming the canon and its ref |
 | `--diff` (review-class) | files changed since REF (`REF..HEAD` + working tree) |
 
 ## Actions: `ameesh action`

@@ -472,3 +472,98 @@ class NamingCliTest(_CanonDbCase):
                          "--project", "catalogue", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.strip(), "mty-catalo-impl-01")
+
+    def test_unreadable_canon_refuses_a_generated_name(self):
+        """Codex r3 (#452, P2) : un canon configuré mais ILLISIBLE (révision
+        jamais récupérée) passait en silence — ses réservations étaient
+        ignorées et un nom déjà pris pouvait être proposé."""
+        self.naming()
+        workspace = self.make_tmp()
+        _bare_b, clone_b = publish(workspace, "b", None)
+        write(clone_b, "federation.yaml",
+              "id: acme-other\nroot: acme\nmembers: []\n" + NAMING)
+        write(clone_b, "agents/mty-amh-impl-01.md", card("mty-amh-impl-01"))
+        commit_all(clone_b)                     # origin/main : + la réservation
+        config = os.path.join(workspace, "config.json")
+        with open(config, "w", encoding="utf-8") as fh:
+            json.dump({"canons": [
+                {"path": self.root, "untrusted": True},
+                {"path": clone_b, "ref": "origin/stable", "untrusted": True}]}, fh)
+        # `origin/stable` n'a jamais été poussé : B est illisible, ses
+        # réservations sont inconnues -> refus, jamais un nom « libre » supposé
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "acme-web", env=self.env(AMEESH_CONFIG=config))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIn(clone_b, proc.stderr)
+        self.assertIn("origin/stable", proc.stderr)
+        # `spawn` sans nom construit sa propre liste de canons : même refus,
+        # et rien n'est écrit au registre
+        proc = self.mesh("agent", "spawn", "--by", "orchestre", "--ttl", "30m",
+                         "--role", "implementer", "--project", "acme-web",
+                         env=self.env(AMEESH_CONFIG=config))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("origin/stable", proc.stderr)
+        self.assertIsNone(registry.get(self.db, "mty-amh-impl-01"))
+        # le canon CHOISI peut être l'illisible : même refus nommé, et non un
+        # « pas de bloc naming » qui enverrait déclarer une convention déjà là
+        config_b_first = os.path.join(workspace, "config-b-first.json")
+        with open(config_b_first, "w", encoding="utf-8") as fh:
+            json.dump({"canons": [
+                {"path": clone_b, "ref": "origin/stable", "untrusted": True},
+                {"path": self.root, "untrusted": True}]}, fh)
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "acme-web",
+                         env=self.env(AMEESH_CONFIG=config_b_first))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(clone_b, proc.stderr)
+        self.assertIn("origin/stable", proc.stderr)
+        self.assertNotIn("no `extensions.ameesh.naming`", proc.stderr)
+
+    def test_declared_segments_never_collide_across_canons(self):
+        """Codex r3 (#452, P2) : les projets DÉCLARÉS échappaient au contrôle de
+        collision — `catalogue: catalo` ici, `otherrepo: catalo` ailleurs."""
+        self.naming()
+        write(self.root, "federation.yaml",
+              FEDERATION + NAMING.replace(
+                  "      projects:\n", "      projects:\n        catalogue: catalo\n"))
+        other = self.example_copy()
+        write(other, "federation.yaml",
+              "id: acme-other\nroot: acme\nmembers: []\n"
+              "extensions:\n  ameesh:\n    naming:\n      org: oth\n"
+              "      projects:\n        otherrepo: catalo\n")
+        env = self.cli_env(AMEESH_CANONS="%s:%s" % (self.root, other))
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "catalogue", env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIn("otherrepo", proc.stderr)
+        self.assertIn("catalo", proc.stderr)
+
+    def test_a_repo_with_two_declared_segments_is_refused_in_any_order(self):
+        """Codex r3 (#452, P2) : `setdefault` gardait le premier segment d'un
+        dépôt (`otherrepo: other` chez B, `otherrepo: catalo` chez C) ; le
+        verdict dépendait donc de l'ordre des canons."""
+        self.naming()
+        second = self.example_copy()
+        write(second, "federation.yaml",
+              "id: acme-second\nroot: acme\nmembers: []\n"
+              "extensions:\n  ameesh:\n    naming:\n      org: two\n"
+              "      projects:\n        otherrepo: other\n")
+        third = self.example_copy()
+        write(third, "federation.yaml",
+              "id: acme-third\nroot: acme\nmembers: []\n"
+              "extensions:\n  ameesh:\n    naming:\n      org: tre\n"
+              "      projects:\n        otherrepo: catalo\n")
+        errors = []
+        for order in ((second, third), (third, second)):
+            env = self.cli_env(AMEESH_CANONS=":".join([self.root, *order]))
+            proc = self.mesh("agent", "name", "--role", "implementer",
+                             "--project", "catalogue", env=env)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "")
+            self.assertIn("otherrepo", proc.stderr)
+            self.assertIn("'other'", proc.stderr)
+            self.assertIn("'catalo'", proc.stderr)
+            errors.append(proc.stderr.strip())
+        self.assertEqual(errors[0], errors[1])

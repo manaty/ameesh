@@ -266,6 +266,9 @@ creator's). Without a name it takes `--role`/`--project` and generates one from
 `extensions.ameesh.naming` (`org`, `projects`, `roles` in `federation.yaml`),
 the same generator as `ameesh agent name`; the harness never appears in a name,
 and a number already attributed to a card or a registry row is never reused.
+Two repos never share a segment and one repo keeps the same segment in every
+canon; an unreadable configured canon refuses generation (its reservations are
+unknown) rather than propose a name that may be taken.
 A fictitious example canon lives in [`examples/canon/`](examples/canon/).
 
 **Canon state, fail closed (§4.1).** Every `canon sync` records the canon's
