@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import glob
+import gzip
 import hashlib
 import io
 import json
@@ -21,6 +22,7 @@ import tempfile
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass
 
 DEFAULT_MIN_INTERVAL_S = 300.0
@@ -72,6 +74,16 @@ def parse(raw) -> BackupConfig | None:
     return BackupConfig(target=target.rstrip("/") or "/", recipients=tuple(recipients),
                         encrypt=encrypt, min_interval_s=max(0.0, interval))
 
+def _has_symlink(home: str, path: str) -> bool:
+    relative = os.path.relpath(path, home)
+    current = home
+    for part in relative.split(os.sep):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return True
+    return False
+
+
 def session_paths(home: str, patterns, session: str) -> list[str]:
     """Find session files under the account home; reject unsafe session identifiers."""
     if not session or not _SAFE.match(session) or any(c in session for c in "*?[]"):
@@ -80,6 +92,10 @@ def session_paths(home: str, patterns, session: str) -> list[str]:
     found: list[str] = []
     for pattern in patterns:
         for path in sorted(glob.glob(os.path.join(home, pattern.replace("{session}", session)))):
+            # Keep the matched path: resolving a rollout symlink would turn
+            # an unrelated credential file into an apparently valid session.
+            if _has_symlink(home, path):
+                continue
             real = os.path.realpath(path)
             if real != home and real.startswith(home + os.sep) and real not in found:
                 found.append(real)
@@ -106,10 +122,23 @@ def archive(home: str, paths: list[str]) -> bytes:
     """Archive paths relative to the account home, excluding harness lock files."""
     home = os.path.realpath(home)
     buf = io.BytesIO()
+    def safe_member(member):
+        path = os.path.join(home, member.name)
+        if member.issym() or member.islnk() or _has_symlink(home, path):
+            return None
+        if not (member.isfile() or member.isdir()):
+            return None
+        if not os.path.realpath(path).startswith(home + os.sep):
+            raise BackupError("session archive path escapes account home")
+        return None if fnmatch.fnmatch(member.name, "*.lock") else member
+
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in paths:
+            if (_has_symlink(home, path)
+                    or not os.path.realpath(path).startswith(home + os.sep)):
+                raise BackupError("unsafe session archive path")
             tar.add(path, arcname=os.path.relpath(path, home),
-                    filter=lambda ti: None if fnmatch.fnmatch(ti.name, "*.lock") else ti)
+                    filter=safe_member)
     return buf.getvalue()
 
 
@@ -152,12 +181,31 @@ def _s3(cfg: BackupConfig, env) -> tuple[str, str, str, str]:
     return endpoint + "/" + m.group(1), prefix, "%s:%s" % (access, secret), region
 
 
-def _curl(args: list[str], data: bytes | None = None, timeout: float = 600) -> bytes:
-    proc = subprocess.run(["curl", "-fsS", "--retry", "3", *args], input=data,
-                          capture_output=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise BackupError("S3 storage failed: %s" % proc.stderr.decode("utf-8", "replace").strip()[-300:])
-    return proc.stdout
+def _curl(args: list[str], data: bytes | None = None, timeout: float = 600,
+          *, user: str) -> bytes:
+    # Uploads already use stdin. Keep authentication in a private curl config
+    # file, removed even on timeout; neither argv nor exceptions contain it.
+    if any(ord(c) < 32 or ord(c) == 127 for c in user):
+        raise BackupError("invalid S3 credentials")
+    quoted = user.replace("\\", "\\\\").replace('"', '\\"')
+    fd, path = tempfile.mkstemp(prefix="ameesh-s3-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write('user = "' + quoted + '"\n')
+        try:
+            proc = subprocess.run(["curl", "-q", "--config", path, "-fsS", "--retry", "3", *args],
+                                  input=data, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise BackupError("S3 storage timed out") from None
+        if proc.returncode != 0:
+            message = proc.stderr.decode("utf-8", "replace").strip()
+            for credential in (user, *user.split(":", 1)):
+                if credential:
+                    message = message.replace(credential, "[redacted]")
+            raise BackupError("S3 storage failed: %s" % message[-300:])
+        return proc.stdout
+    finally:
+        os.unlink(path)
 
 
 def _local_path(cfg: BackupConfig, key: str) -> str:
@@ -181,8 +229,8 @@ def put(cfg: BackupConfig, key: str, data: bytes, env=None) -> str:
         return path
     base, prefix, user, region = _s3(cfg, env)
     url = "%s/%s" % (base, urllib.parse.quote("/".join(p for p in (prefix, key) if p), safe="/"))
-    _curl(["-X", "PUT", "--data-binary", "@-", "--user", user,
-           "--aws-sigv4", "aws:amz:%s:s3" % region, url], data=data)
+    _curl(["-X", "PUT", "--data-binary", "@-",
+           "--aws-sigv4", "aws:amz:%s:s3" % region, url], data=data, user=user)
     return url
 
 
@@ -205,8 +253,8 @@ def list_keys(cfg: BackupConfig, prefix: str, env=None) -> list[str]:
         if token:
             params["continuation-token"] = token
         query = urllib.parse.urlencode(params)
-        body = _curl(["--user", user, "--aws-sigv4", "aws:amz:%s:s3" % region,
-                      "%s?%s" % (base, query)]).decode("utf-8", "replace")
+        body = _curl(["--aws-sigv4", "aws:amz:%s:s3" % region,
+                      "%s?%s" % (base, query)], user=user).decode("utf-8", "replace")
         try:
             document = ET.fromstring(body)
         except ET.ParseError as exc:
@@ -227,8 +275,9 @@ def get(cfg: BackupConfig, key: str, env=None) -> bytes:
         with open(_local_path(cfg, key), "rb") as fh:
             return fh.read()
     base, prefix, user, region = _s3(cfg, env)
-    return _curl(["--user", user, "--aws-sigv4", "aws:amz:%s:s3" % region,
-                  "%s/%s" % (base, urllib.parse.quote("/".join(p for p in (prefix, key) if p), safe="/"))])
+    return _curl(["--aws-sigv4", "aws:amz:%s:s3" % region,
+                  "%s/%s" % (base, urllib.parse.quote("/".join(p for p in (prefix, key) if p), safe="/"))],
+                 user=user)
 
 def _state_path(state_dir: str, agent: str) -> str:
     return os.path.join(state_dir, "session-backup", "%s.json" % agent)
@@ -286,9 +335,15 @@ def restore(cfg: BackupConfig, key: str, home: str, *, env=None, overwrite: bool
     data = get(cfg, key, env)
     if key.endswith(".gpg"):
         data = decrypt(data)
+    # Tar readers may stop at the tar end marker before consuming the gzip
+    # trailer. Verify the entire stream (CRC and length) before any extraction.
+    try:
+        data = gzip.decompress(data)
+    except (OSError, EOFError, zlib.error) as exc:
+        raise BackupError("backup rejected: invalid or incomplete gzip stream") from exc
     home = os.path.realpath(home)
     restored = []
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
         members = tar.getmembers()
         for m in members:
             target = os.path.realpath(os.path.join(home, m.name))
@@ -330,6 +385,27 @@ def _agent_home(cfg, row: dict) -> tuple[str, tuple[str, ...]]:
         patterns
 
 
+def restore_agent(db, cfg, conf, args) -> tuple[str, str, list[str]]:
+    """Exclude active turns and keep runner claims blocked through extraction."""
+    with db.transaction() as tx:
+        rows = tx.query(
+            "SELECT harness, session_id, session_account, status, "
+            "(lease_owner IS NOT NULL AND (lease_expires_at IS NULL "
+            "OR lease_expires_at > clock_timestamp())) AS leased "
+            "FROM agent_registry WHERE name = %s FOR UPDATE", (args.agent,))
+        if not rows:
+            raise BackupError("unknown agent %s" % args.agent)
+        row = rows[0]
+        if row["status"] == "running" or row["leased"]:
+            raise BackupError("cannot restore an active agent: stop %s first" % args.agent)
+        home = args.home or _agent_home(cfg, row)[0]
+        session = args.session or row.get("session_id")
+        key = args.key or latest(conf, agent=args.agent, session=session or "")
+        if not key:
+            raise BackupError("no backup for %s (session %s)" % (args.agent, session))
+        return key, home, restore(conf, key, home, overwrite=args.overwrite)
+
+
 def main(argv) -> int:
     import argparse
     import sys
@@ -369,6 +445,10 @@ def main(argv) -> int:
             return 0
         db = db_mod.connect(cfg)
         try:
+            if sub == "restore":
+                key, home, files = restore_agent(db, cfg, conf, args)
+                print("restored %s: %d file(s) under %s" % (key, len(files), home))
+                return 0
             rows = db.query("SELECT harness, session_id, session_account FROM agent_registry "
                             "WHERE name = %s", (args.agent,))
             row = rows[0] if rows else None
@@ -386,16 +466,6 @@ def main(argv) -> int:
                        session=row["session_id"], state_dir=cfg.state_dir, force=args.force)
             print(json.dumps(r, ensure_ascii=False))
             return 0 if r["status"] in ("copied", "unchanged", "too_soon") else 1
-        if sub == "restore":
-            session = args.session or row.get("session_id")
-            key = args.key or latest(conf, agent=args.agent, session=session or "")
-            if not key:
-                print("ameesh session: no backup for %s (session %s)" % (args.agent, session),
-                      file=sys.stderr)
-                return 1
-            files = restore(conf, key, args.home or home, overwrite=args.overwrite)
-            print("restored %s: %d file(s) under %s" % (key, len(files), args.home or home))
-            return 0
     except BackupError as exc:
         print("ameesh session: %s" % exc, file=sys.stderr)
         return 1

@@ -9,7 +9,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import cli, persona_sessions as ps, registry
+from ameesh import cli, db as db_mod, persona_sessions as ps, registry, storage
 
 from .support import PgTestCase
 
@@ -80,6 +80,137 @@ class SessionHistoryTest(PgTestCase):
         self.assertEqual([r["session_id"] for r in rows], ["s1"])
         self.assertIsNone(rows[0]["ended_at"])
 
+    def test_injected_history_query_canceled_preserves_registry_transitions(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        self.db.execute(
+            "CREATE FUNCTION cancel_history_write() RETURNS trigger LANGUAGE plpgsql AS "
+            "$$ BEGIN RAISE EXCEPTION 'injected history cancellation' "
+            "USING ERRCODE = '57014'; END $$")
+        self.db.execute(
+            "CREATE TRIGGER cancel_history_write BEFORE INSERT OR UPDATE ON persona_sessions "
+            "FOR EACH ROW EXECUTE FUNCTION cancel_history_write()")
+        try:
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                registry.set_session(self.db, "checker-a", "s2")
+            self.assertIn("injected history cancellation", err.getvalue())
+            self.assertEqual(registry.get(self.db, "checker-a")["session_id"], "s2")
+            self.assertEqual([r["session_id"] for r in ps.sessions(self.db, "checker-a")], ["s1"])
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+            # Close an existing history row as well as replacing it.
+            with mock.patch.object(sys, "stderr", io.StringIO()):
+                registry.set_session(self.db, "checker-a", "s1")
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                storage.of(self.db).operations.resume(
+                    "checker-a", prompt=None, forget=True, status_text="resume")
+            self.assertIn("injected history cancellation", err.getvalue())
+            self.assertIsNone(registry.get(self.db, "checker-a")["session_id"])
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+        finally:
+            self.db.execute("DROP TRIGGER cancel_history_write ON persona_sessions")
+            self.db.execute("DROP FUNCTION cancel_history_write()")
+
+    def test_locked_history_statement_timeout_preserves_registry_transition(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        blocker = db_mod.connect(self.cfg)
+        try:
+            with blocker.transaction() as locked:
+                locked.query("SELECT id FROM persona_sessions WHERE persona = 'checker-a' FOR UPDATE")
+                with self.db.transaction() as tx:
+                    tx.execute("SET LOCAL statement_timeout = '100ms'")
+                    with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                        registry.set_session(tx, "checker-a", "s2")
+                    self.assertIn("statement timeout", err.getvalue())
+                    self.assertEqual(registry.get(tx, "checker-a")["session_id"], "s2")
+            self.assertEqual(registry.get(self.db, "checker-a")["session_id"], "s2")
+            self.assertEqual([r["session_id"] for r in ps.sessions(self.db, "checker-a")], ["s1"])
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+        finally:
+            blocker.close()
+
+    def test_session_id_is_data_in_best_effort_history_sql(self):
+        session_id = "s' ; $history$ \\ quoted"
+        registry.set_session(self.db, "checker-a", session_id)
+        self.assertEqual(registry.get(self.db, "checker-a")["session_id"], session_id)
+        self.assertEqual(ps.sessions(self.db, "checker-a")[0]["session_id"], session_id)
+
+    def test_adopt_tracks_replacement_without_runner_turn(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        result = storage.of(self.db).operations.adopt(
+            "checker-a", harness="codex", host="other", cwd=None,
+            session_id="s2", session_account="adopted", prompt=None, status_text="adopt")
+        self.assertIsNotNone(result)
+        rows = {r["session_id"]: r for r in ps.sessions(self.db, "checker-a")}
+        self.assertEqual(rows["s1"]["end_reason"], "replaced by s2")
+        self.assertIsNone(rows["s2"]["ended_at"])
+        self.assertEqual((rows["s2"]["harness"], rows["s2"]["host"], rows["s2"]["account"]),
+                         ("codex", "other", "adopted"))
+
+    def test_restart_closes_history_without_runner_turn(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        ops = storage.of(self.db).operations
+        ops.request_restart("checker-a", "new brief")
+        self.assertIsNotNone(ops.apply_restart("checker-a"))
+        self.assertIsNone(registry.get(self.db, "checker-a")["session_id"])
+        self.assertEqual(ps.sessions(self.db, "checker-a")[0]["end_reason"], "restart")
+
+    def test_fresh_resume_closes_history_without_runner_turn(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        self.assertIsNotNone(storage.of(self.db).operations.resume(
+            "checker-a", prompt="fresh", forget=True, status_text="resume"))
+        self.assertIsNone(registry.get(self.db, "checker-a")["session_id"])
+        self.assertEqual(ps.sessions(self.db, "checker-a")[0]["end_reason"], "fresh resume")
+
+    def test_refused_operations_preserve_history(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'r', lease_epoch = 7, "
+                        "lease_expires_at = now() + interval '5 minutes', "
+                        "status = 'running' WHERE name = 'checker-a'")
+        ops = storage.of(self.db).operations
+        self.assertIsNone(ops.adopt("checker-a", harness="codex", host="other", cwd=None,
+                                   session_id="s2", session_account=None, prompt=None,
+                                   status_text="adopt"))
+        self.assertIsNone(ops.resume("checker-a", prompt=None, forget=True, status_text="resume"))
+        ops.request_restart("checker-a", "new brief")
+        self.assertIsNone(ops.apply_restart("checker-a", "other", 7))
+        self.assertEqual([r["session_id"] for r in ps.sessions(self.db, "checker-a")], ["s1"])
+        self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+
+    def test_history_close_holds_registry_lock_until_commit(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'r', lease_epoch = 7, "
+                        "lease_expires_at = now() + interval '5 minutes' WHERE name = 'checker-a'")
+        replacement = db_mod.connect(self.cfg)
+        original = ps.record_end
+        def delayed_end(*args, **kwargs):
+            # A replacement trying to resume s1 at the old race boundary must
+            # wait for the clear AND history close, on either SQL driver.
+            with self.assertRaises(db_mod.DbError):
+                with replacement.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '100ms'")
+                    registry.set_session(tx, "checker-a", "s1")
+            original(*args, **kwargs)
+        try:
+            with mock.patch.object(ps, "record_end", side_effect=delayed_end):
+                self.assertTrue(registry.clear_session(self.db, "checker-a", "r", 7))
+            registry.set_session(replacement, "checker-a", "s1")
+            self.assertEqual(registry.get(self.db, "checker-a")["session_id"], "s1")
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+        finally:
+            replacement.close()
+
+    def test_missing_history_table_does_not_block_atomic_clear(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'r', lease_epoch = 7, "
+                        "lease_expires_at = now() + interval '5 minutes' WHERE name = 'checker-a'")
+        self.db.execute("ALTER TABLE persona_sessions RENAME TO history_unavailable")
+        try:
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                self.assertTrue(registry.clear_session(self.db, "checker-a", "r", 7))
+            self.assertIn("session history could not be recorded", err.getvalue())
+            self.assertIsNone(registry.get(self.db, "checker-a")["session_id"])
+        finally:
+            self.db.execute("ALTER TABLE history_unavailable RENAME TO persona_sessions")
+
     def test_external_hook_records_only_accepted_session(self):
         registry.upsert(self.db, "external", harness="deepseek", host="pc", mode="externe")
         for session_id in ("main", "ignored"):
@@ -128,15 +259,13 @@ class HookHistoryFilterTest(unittest.TestCase):
 
 
 class NonBlockingHistoryTest(unittest.TestCase):
-    def test_recording_failure_does_not_block_session_update(self):
-        with mock.patch.object(registry.storage, "of") as store, \
-                mock.patch.object(ps, "record_start", side_effect=RuntimeError("history unavailable")), \
+    def test_hook_history_failure_is_logged(self):
+        with mock.patch.object(ps, "record_start", side_effect=RuntimeError("history unavailable")), \
                 mock.patch.object(sys, "stderr", io.StringIO()) as err:
-            registry.set_session(mock.sentinel.db, "checker", "s1")
-        store.return_value.agents.set_session.assert_called_once_with("checker", "s1", None)
+            registry.record_session_history(mock.sentinel.db, "checker", "s1")
         self.assertIn("session history could not be recorded", err.getvalue())
 
-    def test_history_snapshot_failure_does_not_block_rotation(self):
+    def test_clear_does_not_read_history_outside_fenced_storage(self):
         db = mock.Mock()
         db.query.side_effect = RuntimeError("snapshot unavailable")
         with mock.patch.object(registry.storage, "of") as store, \
@@ -144,3 +273,4 @@ class NonBlockingHistoryTest(unittest.TestCase):
             store.return_value.leases.clear_session.return_value = True
             self.assertTrue(registry.clear_session(db, "checker", "r", 1))
         store.return_value.leases.clear_session.assert_called_once_with("checker", "r", 1)
+        db.query.assert_not_called()

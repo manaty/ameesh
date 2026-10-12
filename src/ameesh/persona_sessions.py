@@ -11,14 +11,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
+from functools import wraps
+
+from .db import bind, sql_literal
 
 
-def record_start(db, persona: str, session_id: str, *, account: str | None = None) -> None:
+def record_start(db, persona: str, session_id: str, *, account: str | None = None,
+                 best_effort: bool = False) -> None:
     # One statement keeps replacement and insertion atomic on both drivers.
     # Lock and read only the accepted registry session: an external hook may
     # supply an ID that L36/L46 deliberately refuses to install.
-    db.execute(
+    _write(db, best_effort,
         "WITH current_session AS ("
         "SELECT name AS persona, session_id, harness, host, session_account, session_work_item "
         "FROM agent_registry WHERE name = %s AND session_id = %s FOR UPDATE"
@@ -37,13 +42,61 @@ def record_start(db, persona: str, session_id: str, *, account: str | None = Non
         (persona, session_id, account))
 
 
-def record_end(db, persona: str, session_id: str | None, reason: str) -> None:
+def record_end(db, persona: str, session_id: str | None, reason: str,
+               *, best_effort: bool = False) -> None:
     if not session_id:
         return
-    db.execute(
+    _write(db, best_effort,
         "UPDATE persona_sessions SET ended_at = now(), end_reason = %s "
         "WHERE persona = %s AND session_id = %s AND ended_at IS NULL",
         (reason, persona, session_id))
+
+
+def _write(db, best_effort, sql, params):
+    if not best_effort:
+        db.execute(sql, params)
+        return
+    # A PL/pgSQL exception block is a server-side savepoint on both drivers.
+    # psql exits on an SQL error, so client-side SAVEPOINT recovery cannot
+    # preserve the primary registry write. Bind then quote the whole statement
+    # as data for EXECUTE; session IDs never become PL/pgSQL source.
+    # OTHERS excludes query_canceled: history timeouts must also stay inside
+    # this subtransaction so the accepted registry transition can commit.
+    body = (
+        "BEGIN PERFORM set_config('ameesh.session_history_error', '', true); "
+        "BEGIN EXECUTE " + sql_literal(bind(sql, params)) + "; "
+        "EXCEPTION WHEN query_canceled OR OTHERS THEN "
+        "PERFORM set_config('ameesh.session_history_error', SQLERRM, true); "
+        "END; END")
+    db.execute("DO " + sql_literal(body))
+    rows = db.query("SELECT current_setting('ameesh.session_history_error') AS error")
+    if rows and rows[0]["error"]:
+        print("ameesh: session history could not be recorded: " + rows[0]["error"],
+              file=sys.stderr)
+
+
+def track_change(reason: str, *, returns_none: bool = False):
+    """Keep accepted registry/session-history writes under the same row lock."""
+    def decorate(method):
+        @wraps(method)
+        def tracked(store, name, *args, **kwargs):
+            with store.db.transaction() as tx:
+                before = tx.query(
+                    "SELECT session_id FROM agent_registry WHERE name = %s FOR UPDATE",
+                    (name,))
+                result = method(type(store)(tx), name, *args, **kwargs)
+                if not before or (not returns_none and not result):
+                    return result
+                after = tx.query("SELECT session_id FROM agent_registry WHERE name = %s",
+                                 (name,))
+                current = after[0]["session_id"] if after else None
+                if current:
+                    record_start(tx, name, current, best_effort=True)
+                elif before[0]["session_id"]:
+                    record_end(tx, name, before[0]["session_id"], reason, best_effort=True)
+                return result
+        return tracked
+    return decorate
 
 
 def sessions(db, persona: str, limit: int = 50) -> list[dict]:
