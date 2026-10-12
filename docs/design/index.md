@@ -1,11 +1,11 @@
-# Conception d'ameesh
+# ameesh design
 
-* [Historique : les PR fusionnées](https://github.com/manaty/ameesh/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc) - Ce qui a changé et pourquoi, une description par PR ; le détail est dans `git log`. Aucun journal tenu à la main (L160a).
-* [Spécification d'ameesh v1](specification.md) - Périmètre, architecture, canon, actions, reçus, plan de lots.
-* [Descripteurs de harnais](descripteurs-de-harnais.md) - Manifeste ACP + clés `ameesh`, adaptateur ACP générique, fin de la liste fermée (L16, R22).
-* [Bascule vers ameesh v1 (brouillon)](bascule-v1.md) - Plan réversible : canon d'amorçage, ameesh-approve, orchestrateurs à tours.
-* [Exigences (R1–R23)](exigences.md) - Les exigences d'origine généralisées et celles ajoutées le 2026-10-03.
-* [Questions ouvertes](questions-ouvertes.md) - Ce qui attend une décision du propriétaire ou une étude.
-* [Décisions du propriétaire](decisions/) - Une décision par fichier, rapportée par mesh-design.
-* [Études](etudes/) - Messagerie, catalogue du travail, autorité humaine, métiers, standards des harnais.
-* [ameesh-approve : trois hébergements](ameesh-approve-hebergement-equipes.md) - Une identité WebAuthn par équipe, trois modes d'hébergement, bascule sans réenrôlement.
+* [History: merged PRs](https://github.com/manaty/ameesh/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc) - What changed and why, one description per PR; the details are in `git log`. No hand-kept log (L160a).
+* [ameesh v1 specification](specification.md) - Scope, architecture, canon, actions, receipts, lot plan.
+* [Harness descriptors](descripteurs-de-harnais.md) - ACP manifest + `ameesh` keys, generic ACP adapter, end of the closed list (L16, R22).
+* [Cutover to ameesh v1 (draft)](bascule-v1.md) - Reversible plan: bootstrap canon, ameesh-approve, turn-based orchestrators.
+* [Requirements (R1–R23)](exigences.md) - The original requirements, generalized, and those added on 2026-10-03.
+* [Open questions](questions-ouvertes.md) - What awaits an owner decision or a study.
+* [Owner decisions](decisions/) - One decision per file, reported by mesh-design.
+* [Studies](etudes/) - Messaging, work catalog, human authority, business domains, harness standards.
+* [ameesh-approve: three hosting options](ameesh-approve-hebergement-equipes.md) - One WebAuthn identity per team, three hosting modes, switchover without re-enrollment.

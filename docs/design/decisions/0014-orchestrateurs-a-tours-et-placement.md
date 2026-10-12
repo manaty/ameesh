@@ -1,51 +1,51 @@
 ---
 type: Decision
-title: "Orchestrateurs à tours ; placement des agents décidé par les humains responsables"
-description: "Les orchestrateurs deviennent des agents à tours avec attachement interactif ; le responsable ameesh du projet, ou l'infra à qui il délègue, décide quel agent tourne où et avec quels identifiants, dans les limites posées par le responsable de chaque serveur."
+title: "Turn-based orchestrators; agent placement decided by the responsible humans"
+description: "Orchestrators become turn-based agents with interactive attachment; the project's ameesh lead, or the infra people they delegate to, decides which agent runs where and with which credentials, within the limits set by the lead of each server."
 status: stable
 tags: [orchestrateur, placement, infrastructure, identifiants, supervision]
 decided_by: human:smichea
 decision_date: 2026-10-04
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T01:10:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Les orchestrateurs (Nexlink, ameesh) sont des sessions interactives collées au
-PC : sans bail, sans relance fiable, leur surveillance meurt avec la session.
-Les déplacer sur un serveur pose la question des identifiants (abonnement ou
-clé d'API) et de qui décide où tourne quoi.
+The orchestrators (Nexlink, ameesh) are interactive sessions tied to the
+PC: no lease, no reliable restart, their monitoring dies with the session.
+Moving them to a server raises the question of credentials (subscription or
+API key) and of who decides what runs where.
 
-# Décision
+# Decision
 
-- **Les orchestrateurs deviennent des agents à tours** à la bascule vers
-  ameesh : surveillance en service séparé qui dépose ses événements dans leur
-  boîte, réveil par l'exécuteur, échanges dans le fil du projet, et
-  **attachement interactif** à la demande (`ameesh attach`) qui prend le bail
-  et rend la main à l'exécuteur à la sortie. D'abord sur le PC, puis sur un
-  serveur.
-- **Le placement est une décision humaine** : c'est **le responsable ameesh du
-  projet** — qui **peut déléguer à des responsables d'infrastructure** — qui
-  décide **quel type d'agent tourne sur quel serveur**, et **avec une clé
-  d'API ou un forfait**.
-- **Le responsable d'un serveur peut imposer ses règles**, par exemple
-  n'accepter que des agents DeepSeek ou Codex sur sa machine.
-- **ameesh doit faciliter cette gestion et sa supervision.**
+- **Orchestrators become turn-based agents** at the switchover to
+  ameesh: monitoring as a separate service that drops its events into their
+  mailbox, wake-up by the runner, exchanges in the project thread, and
+  **interactive attachment** on demand (`ameesh attach`) which takes the lease
+  and hands control back to the runner on exit. First on the PC, then on a
+  server.
+- **Placement is a human decision**: it is **the project's ameesh
+  lead** — who **may delegate to infrastructure leads** — who
+  decides **which type of agent runs on which server**, and **with an API
+  key or a plan**.
+- **The lead of a server may impose their rules**, for example
+  accepting only DeepSeek or Codex agents on their machine.
+- **ameesh must make this management and its supervision easy.**
 
-# Conséquences
+# Consequences
 
-- Nouveaux concepts du canon : **Hôte** (machine ou cluster, avec son humain
-  responsable et sa **politique** : harnais, fournisseurs et modèles admis,
-  modes d'identifiants admis — clé d'API, forfait —, quotas, contraintes de
-  données) et **Placement** (agent → hôte, mode d'identifiants), modifiés par PR
-  revue selon les rôles de la fédération (responsable du projet, responsables
-  d'infra délégués, responsable de l'hôte).
-- ameesh **refuse un placement qui viole la politique de l'hôte** et propose
-  les placements admissibles ; il ne déplace jamais un agent de lui-même.
-- Les **secrets** (clés d'API, jetons de forfait) ne sont jamais dans le canon :
-  le canon dit quel mode est utilisé, ameesh aide à installer le secret sur
-  l'hôte (trousseau, gestionnaire de secrets) et vérifie sa présence.
-- **Supervision** : par hôte et par projet — agents placés, baux, santé, coûts
-  par fournisseur et par mode, consommation des forfaits au regard de leurs
-  limites (R7), alertes à l'humain responsable concerné.
+- New canon concepts: **Host** (machine or cluster, with its responsible
+  human and its **policy**: allowed harnesses, providers and models, allowed
+  credential modes — API key, plan —, quotas, data
+  constraints) and **Placement** (agent → host, credential mode), modified by PR
+  reviewed according to the federation roles (project lead, delegated
+  infra leads, host lead).
+- ameesh **refuses a placement that violates the host policy** and proposes
+  the admissible placements; it never moves an agent on its own.
+- **Secrets** (API keys, plan tokens) are never in the canon:
+  the canon says which mode is used, ameesh helps install the secret on
+  the host (keyring, secret manager) and checks that it is present.
+- **Supervision**: per host and per project — placed agents, leases, health, costs
+  per provider and per mode, plan consumption against their
+  limits (R7), alerts to the responsible human concerned.

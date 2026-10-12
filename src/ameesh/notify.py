@@ -86,7 +86,11 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
-                 "ci_main_red")
+                 "ci_main_red",
+                 # #246 : btrfs presque plein côté allocation (df ne le voit pas)
+                 "host_disk_low",
+                 # L225 : des tours sans tarif au barème échappent à la dépense
+                 "turn_unpriced")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -142,6 +146,11 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "biais d'estimation",
     "ci_main_red": "CI rouge sur main",
+    "host_disk_low": "disque btrfs presque plein",
+    "turn_unpriced": "tour sans tarif au barème",
+    # L233: briefed to the assignee and the orchestrators (alert_briefs); not
+    # pushed to humans by default (add it to `notify.types` to receive it)
+    "waiting_without_question": "lot waiting for the owner with no question asked",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
@@ -437,6 +446,12 @@ def _readable(title: str, body: str, detail_line: str | None) -> tuple:
 def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     """Le message d'une alerte levée (`raised`) ou résolue (`resolved`)."""
     kind = str(alert.get("type") or "?")
+    if kind == "orphan_lot" and alert.get("grouped"):
+        subject = "agent %s" % _clean(alert.get("agent") or "unknown", 64)
+        title = "ameesh: %sorphan lots (%s)" % (
+            "resolved — " if event == "resolved" else "", subject)
+        text = "[orphan_lot] %s\n%s" % (subject, _clean(alert.get("detail"), GROUPED_DETAIL_LIMIT))
+        return Message(title, text, low=event == "resolved", urgent=event != "resolved")
     label = TYPE_LABELS.get(kind, kind.replace("_", " "))
     subject = _subject(alert)
     since = alert.get("since")
@@ -850,7 +865,44 @@ def save_state(path: str, state: dict) -> None:
 
 def key_of(alert: dict) -> str:
     """Clé de dédoublonnage : celle d'`ameesh alerts --follow`, en texte."""
-    return json.dumps(list(exploitation.alert_key(alert)), ensure_ascii=False)
+    key = list(exploitation.alert_key(alert))
+    if alert.get("type") == "orphan_lot" and alert.get("grouped"):
+        key.append(alert.get("responsible"))
+    return json.dumps(key, ensure_ascii=False)
+
+
+GROUPED_LOTS_SHOWN = 5
+GROUPED_DETAIL_LIMIT = 600
+
+
+def group_orphan_lots(alerts: list, resolve) -> list:
+    """Group orphan notifications by agent, reason and resolved human.
+
+    Resolve each lot before grouping so different humans keep separate alerts.
+    Omit lot, host and since from the group identity: changing its membership
+    must not resend a notification while the orphaned-agent situation persists.
+    The original alerts remain available to automatic assignment and briefs.
+    """
+    out, groups = [], {}
+    for alert in alerts:
+        if alert.get("type") != "orphan_lot":
+            out.append(alert)
+            continue
+        human, _ = resolve(alert)
+        groups.setdefault((alert.get("agent"), alert.get("reason"), human), []).append(alert)
+    for (agent, reason, human), lots in groups.items():
+        ordered = sorted(lots, key=lambda alert: int(alert["lot"]))
+        names = ", ".join("#%s%s" % (
+            alert["lot"], ' "%s"' % _clean(alert.get("title"), 60) if alert.get("title") else "")
+            for alert in ordered[:GROUPED_LOTS_SHOWN])
+        more = (" and %d more" % (len(lots) - GROUPED_LOTS_SHOWN)
+                if len(lots) > GROUPED_LOTS_SHOWN else "")
+        grouped = {"type": "orphan_lot", "agent": agent, "reason": reason,
+                   "responsible": human, "grouped": True, "value": len(lots),
+                   "detail": "%d orphan lot(s) (%s): %s%s" % (
+                       len(lots), _clean(reason or "unknown", 64), names, more)}
+        out.append(grouped)
+    return out
 
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
@@ -860,7 +912,7 @@ _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
-         "decision")
+         "decision", "grouped")
 
 
 # --------------------------------------------------------------------------
@@ -901,8 +953,10 @@ class Notifier:
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
-        wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
+        notifications = group_orphan_lots(current, router.resolve)
+        wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
         active = self.state["active"]
+        self._reconcile_orphan_groups(active, wanted, router)
         for key in list(active):
             if key in wanted:
                 continue
@@ -919,14 +973,27 @@ class Notifier:
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
+                if alert.get("type") in exploitation.ESCALATING:
+                    entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
-            elif entry["status"] in ("sans_destinataire", "sans_canal"):
-                # un responsable (ou une route) a pu apparaître depuis
+            elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
+                  and not entry.get("escalated")):
+                # #246 : même épisode, niveau critique atteint — poussée une
+                # seconde fois, sur place (une seule fois par épisode ; le
+                # retour au seuil puis au critique ne la relève pas)
+                entry.update(alert={k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                             escalated=True, status="nouvelle", channels={})
                 self._raise(entry, router, now)
             else:
-                self._retry(entry, "raised", now)
+                if alert.get("type") == "orphan_lot" and alert.get("grouped"):
+                    entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
+                if entry["status"] in ("sans_destinataire", "sans_canal"):
+                    # un responsable (ou une route) a pu apparaître depuis
+                    self._raise(entry, router, now)
+                else:
+                    self._retry(entry, "raised", now)
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
@@ -945,6 +1012,45 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
+        """Adopt persisted per-lot deliveries before checking for resolutions.
+
+        Keep recipient identity and successful channels: upgrading must not
+        resolve/re-raise an unchanged orphan situation or resend delivered alerts.
+        Multiple old alerts share the earliest raise and a single retry budget.
+        """
+        ranks = {"nouvelle": 0, "sans_destinataire": 1, "sans_canal": 2,
+                 "resumee": 3, "envoi": 4}
+        for old_key in list(active):
+            entry = active[old_key]
+            alert = entry["alert"]
+            if alert.get("type") != "orphan_lot" or alert.get("grouped"):
+                continue
+            human = entry.get("human")
+            if human is None:
+                human, _ = router.resolve(alert)
+            identity = {"type": "orphan_lot", "agent": alert.get("agent"),
+                        "reason": alert.get("reason"), "responsible": human, "grouped": True}
+            key = key_of(identity)
+            if key not in wanted:
+                continue
+            active.pop(old_key)
+            target = active.get(key)
+            if target is None:
+                target = active[key] = entry
+            else:
+                target["raised_ts"] = min(target["raised_ts"], entry["raised_ts"])
+                if ranks.get(entry["status"], 0) > ranks.get(target["status"], 0):
+                    target.update(status=entry["status"], human=entry.get("human"),
+                                  source=entry.get("source"))
+                for channel, state in entry.get("channels", {}).items():
+                    previous = target["channels"].get(channel)
+                    if previous is None or (not previous.get("ok") and
+                            (state.get("ok") or state.get("attempts", 0) < previous.get("attempts", 0))):
+                        target["channels"][channel] = dict(state)
+            target["alert"] = {k: wanted[key].get(k) for k in _KEPT
+                               if wanted[key].get(k) is not None}
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def _github_issues(self, db, now: float) -> None:

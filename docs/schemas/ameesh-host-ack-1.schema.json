@@ -1,0 +1,55 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/manaty/ameesh/blob/main/docs/schemas/ameesh-host-ack-1.schema.json",
+ "title": "ameesh-host-ack/1",
+ "description": "What the guest did with the state `seq` (docs/GARDE-DE-CAPACITE.md). Closed: a reader admits exactly these keys; a change opens version 2.",
+ "type": "object",
+ "required": [
+  "schema",
+  "seq",
+  "state",
+  "in_turn",
+  "held",
+  "drained",
+  "ts"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "schema": {
+   "const": "ameesh-host-ack/1"
+  },
+  "seq": {
+   "type": "integer",
+   "minimum": 0,
+   "description": "the seq of the state acknowledged"
+  },
+  "state": {
+   "enum": [
+    "available",
+    "draining",
+    "stopped"
+   ]
+  },
+  "in_turn": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   },
+   "description": "agents still in a turn"
+  },
+  "held": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   },
+   "description": "agents still holding a lease"
+  },
+  "drained": {
+   "type": "boolean",
+   "description": "no turn and no lease left"
+  },
+  "ts": {
+   "type": "number"
+  }
+ }
+}

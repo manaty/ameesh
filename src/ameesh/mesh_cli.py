@@ -231,6 +231,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         # L42 (0031) : les fiches Host de tous les canons configurés (le canon
         # par défaut d'abord)
         canons = canon_mod.load_configured(cfg)
+        if getattr(args, "report", False):
+            return _host_report(cfg, db, canons, args)
         latest_by_host = {row["host"]: row for row in res.current(db)}
         # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
         # worktrees suivis)
@@ -277,6 +279,11 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                                 "admissions": admissions.get(canon.id, 0)}
                                for canon, fiche in fiches],
                     "latest": latest,
+                    # L159d: the offer, and the common measure (study §1.4)
+                    # whose lendable capacity it caps
+                    "offer": limits.get("lend"),
+                    "measure": (res.measure(latest, limits.get("lend"))
+                                if latest is not None else None),
                     "pressure": verdict,
                     "history": history,
                     "housekeeping": menage,
@@ -304,6 +311,10 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            if limits.get("max_cpu_pressure") is not None:
+                print("  thresholds CPU pressure ≤ %s%s"
+                      % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
+                         tag("max_cpu_pressure")))
             print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
                   % (_fmt_bytes(latest.get("mem_available_bytes")),
                      _fmt_bytes(latest.get("swap_used_bytes")),
@@ -321,6 +332,20 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                           if latest.get("battery_percent") is not None else "",
                           limits.get("min_battery_percent"),
                           limits.get("stop_battery_percent")))
+            if latest.get("btrfs_unallocated_bytes") is not None \
+                    or latest.get("btrfs_metadata_headroom_bytes") is not None:
+                # #246: btrfs allocation, which `disque` (statvfs) does not show
+                print("  btrfs      non alloué %s (seuil %s%s) ; marge des métadonnées %s "
+                      "(seuil %s%s)" % (
+                          _fmt_bytes(latest.get("btrfs_unallocated_bytes")),
+                          _fmt_bytes(limits.get("min_btrfs_unallocated")),
+                          tag("min_btrfs_unallocated"),
+                          _fmt_bytes(latest.get("btrfs_metadata_headroom_bytes")),
+                          _fmt_bytes(limits.get("min_btrfs_metadata_headroom")),
+                          tag("min_btrfs_metadata_headroom")))
+
+            for line in _host_measure_lines(latest, limits.get("lend")):
+                print(line)
 
             if verdict and verdict["breaches"]:
                 tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
@@ -341,6 +366,61 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _host_report(cfg: Config, db, canons, args: argparse.Namespace) -> int:
+    """`ameesh hosts HOST --report [--days N]` (L159g): the pilot report of
+    a host over its last N days of readings (study L159 §4.4)."""
+    from . import pilot
+    from . import resources as res
+
+    if not args.host:
+        print("ameesh hosts --report: name the host", file=sys.stderr)
+        return 2
+    days = float(args.days)
+    if not 0 < days <= res.HISTORY_RETENTION_S / 86400.0:
+        print("ameesh hosts --report: --days between 0 and %g (readings are kept "
+              "%g days)" % ((res.HISTORY_RETENTION_S / 86400.0,) * 2), file=sys.stderr)
+        return 2
+    readings = storage.of(db).hosts.since(args.host, days * 86400.0)
+    limits = res.host_limits(canons, args.host)["limits"]
+    rep = pilot.report(args.host, readings, limits, days=days)
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False, sort_keys=True))
+    else:
+        for line in pilot.format_report(rep):
+            print(line)
+    return 0
+
+
+def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
+    """`ameesh hosts` (L159d): PSI, application and guest shares, lendable
+    capacity; nothing for a reading without these measures."""
+    from . import resources as res
+
+    def pct(value) -> str:
+        return "—" if value is None else "%.1f %%" % float(value)
+
+    def cpus(value) -> str:
+        return "—" if value is None else "%.2f" % float(value)
+
+    out = []
+    if any(latest.get(column) is not None for column, _r, _l in res.PSI_FIELDS):
+        out.append("  PSI        cpu %s ; memory %s (full %s) ; io %s  (some, 60 s)" % (
+            pct(latest.get("psi_cpu_some")), pct(latest.get("psi_mem_some")),
+            pct(latest.get("psi_mem_full")), pct(latest.get("psi_io_some"))))
+    if latest.get("app_cpu") is not None or latest.get("guest_mem_bytes") is not None:
+        out.append("  shares     CPU application %s, guest %s of %s ; guest memory %s" % (
+            cpus(latest.get("app_cpu")), cpus(latest.get("guest_cpu")),
+            latest.get("cpu_count") or "—", _fmt_bytes(latest.get("guest_mem_bytes"))))
+    # without an offer the host lends nothing: show what it could lend
+    lent = res.offered(latest, offer if offer is not None else {})
+    if lent is not None:
+        out.append("  lendable   CPU %s ; memory %s ; disk %s  (%s)" % (
+            cpus(lent["cpu"]), _fmt_bytes(lent["memory_bytes"]),
+            _fmt_bytes(lent["disk_bytes"]),
+            "capped by the offer" if offer is not None else "no offer: lends nothing"))
+    return out
 
 
 def _host_menage(hk, host: str, policy, measure_row: dict | None,
@@ -1281,9 +1361,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
-#: `effort` et `tier` avant L26)
+#: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
+#: interactive sessions (`ameesh attach`), also local
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
-            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch")
+            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
+            "permission_mode")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1353,7 +1435,7 @@ def cmd_set(cfg: Config, args) -> int:
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
     """
-    from . import adapters
+    from . import adapters, harnesses
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
@@ -1371,7 +1453,8 @@ def cmd_set(cfg: Config, args) -> int:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
-                      "turn_grace_seconds=20m|0 mail_batch=90s|2m|0"
+                      "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
+                      "permission_mode=auto|acceptEdits|…"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1421,9 +1504,25 @@ def cmd_set(cfg: Config, args) -> int:
                     print("mail_batch invalide : %r (ex. 90s, 2m, 0 = réveil immédiat)"
                           % valeur, file=sys.stderr)
                     return 2
+            if cle == "permission_mode" and valeur:
+                # codex r3 (#182): checked against the agent harness's allowlist
+                harness = agent.get("harness") or ""
+                descriptor = harnesses.get(harness)
+                rule = descriptor.interactive_permission if descriptor else {}
+                if not rule:
+                    print("permission_mode: harness %r declares no interactive "
+                          "permission mode" % harness, file=sys.stderr)
+                    return 2
+                allowed = rule.get("choices") or ()
+                if not harnesses.PERMISSION_MODE_RE.match(valeur) \
+                        or (allowed and valeur not in allowed):
+                    print("invalid permission_mode: %r (%s)"
+                          % (valeur, " | ".join(allowed) or "e.g. auto, acceptEdits"),
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier", "mail_batch"):
+            if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
@@ -1432,7 +1531,8 @@ def cmd_set(cfg: Config, args) -> int:
                     storage.of(db).agents.clear_model(args.agent)
         if "mode" in valeurs:
             registry.set_mode(db, args.agent, valeurs["mode"] or "execute")
-        reglages = {k: v for k, v in valeurs.items() if k not in ("model", "mode")}
+        reglages = {k: v for k, v in valeurs.items()
+                    if k not in ("model", "mode", "permission_mode")}
         if reglages:
             storage.of(db).operations.set_settings(args.agent, reglages)
         agent = registry.get(db, args.agent) or {}
@@ -1468,10 +1568,14 @@ def cmd_set(cfg: Config, args) -> int:
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
                  grace_txt, regroupement_txt))
-        if "mail_batch" in valeurs and (agent.get("host") or "") not in ("", cfg.host):
-            print("attention : mail_batch est lu dans l'état local de l'hôte de l'agent "
-                  "(%s), pas dans la base : lancez ce réglage sur %s"
-                  % (agent.get("host"), agent.get("host")), file=sys.stderr)
+        for local in ("mail_batch", "permission_mode"):
+            if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
+                print("warning: %s is read from the local state of the agent's host "
+                      "(%s), not from the database: run this setting on %s"
+                      % (local, agent.get("host"), agent.get("host")), file=sys.stderr)
+        if valeurs.get("permission_mode"):
+            print("interactive permission mode (attach): %s"
+                  % valeurs["permission_mode"])
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1604,6 +1708,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hosts.add_argument("--history", type=int, default=10,
                          help="nombre de relevés de l'historique court (défaut 10)")
     p_hosts.add_argument("--json", action="store_true", help="un objet JSON par hôte")
+    p_hosts.add_argument("--report", action="store_true",
+                         help="pilot report of HOST: pressure, load, tmpfs, PSI, hosted "
+                              "turns, lendable capacity, per day (L159g)")
+    p_hosts.add_argument("--days", type=float, default=7.0,
+                         help="window of --report, in days (default 7)")
     p_hosts.set_defaults(func=cmd_hosts)
 
     p_menage = sub.add_parser(
@@ -1913,6 +2022,9 @@ def build_parser() -> argparse.ArgumentParser:
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     from . import budget as budget_mod
     budget_mod.add_parsers(sub)
+    # L131 : suites lourdes plafonnées par hôte
+    from . import heavy as heavy_mod
+    heavy_mod.add_parser(sub)
 
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")

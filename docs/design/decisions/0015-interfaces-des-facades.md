@@ -1,51 +1,51 @@
 ---
 type: Decision
-title: "ameesh ne nomme aucun client ; il publie les interfaces qui permettent de bâtir ses façades"
-description: "Pas de nom de client dans le projet ameesh ; des interfaces publiques pour développer des applications (dont mobiles natives) sans imposer Nexlink."
+title: "ameesh names no client; it publishes the interfaces that allow building its front ends"
+description: "No client name in the ameesh project; public interfaces to develop applications (including native mobile ones) without imposing Nexlink."
 status: stable
 tags: [confidentialite, interfaces, mobile, nexlink]
 decided_by: human:smichea
 decision_date: 2026-10-04
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T01:20:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-La question Q6 portait sur une application mobile native pour une organisation
-cliente : application ameesh générique ou intégration aux applications de
-cette organisation.
+Question Q6 was about a native mobile application for a client
+organisation: a generic ameesh application or integration into the applications of
+that organisation.
 
-# Décision
+# Decision
 
-- **Le projet ameesh ne mentionne aucun client** : ni nom, ni système interne,
-  ni dépôt d'une organisation cliente, dans le code, la documentation ou les
-  exemples.
-- **Nexlink**, produit de Manaty, n'est pas un client : ameesh le nomme et
-  l'intègre nativement ([0003](0003-ameesh-et-nexlink.md)).
-- ameesh **ne développe pas d'application pour un client** : il **prévoit les
-  interfaces** qui permettront à une organisation de développer la sienne
-  (notamment une application mobile native), **pour ne pas avoir à imposer
+- **The ameesh project mentions no client**: no name, no internal system,
+  no repository of a client organisation, in the code, the documentation or the
+  examples.
+- **Nexlink**, a Manaty product, is not a client: ameesh names it and
+  integrates it natively ([0003](0003-ameesh-et-nexlink.md)).
+- ameesh **does not develop an application for a client**: it **provides the
+  interfaces** that will allow an organisation to develop its own
+  (notably a native mobile application), **so as not to have to impose
   Nexlink**.
 
-# Conséquences
+# Consequences
 
-- Interfaces publiques et documentées, au même niveau que le connecteur Nexlink :
-  - **approbation** : format de demande et de reçu, vérification par façade
-    (WebAuthn, clé d'appareil ES256…), enrôlement d'un authentificateur dans le
-    registre du canon ;
-  - **fil et notifications** : lire et poster dans le fil d'un lot, recevoir les
-    demandes qui attendent un humain (R17) ;
-  - **identité** : liaison d'un membre `human:<id>` à ses authentificateurs.
-- Nexlink est une façade parmi d'autres, intégrée nativement ; une application
-  tierce sur ces interfaces a les mêmes possibilités.
-- Les exemples et tests utilisent des organisations fictives.
-- **Passage public par un instantané** (décision du propriétaire, ex-Q8) :
-  l'historique git du dépôt privé, qui contient des mentions antérieures d'un
-  client, reste privé ; le dépôt public démarre d'un instantané propre à la
-  première release. Aucune réécriture de l'historique partagé par les agents.
-- **Migrations SQL** : leurs commentaires sont couverts par une empreinte
-  stockée en base et ne peuvent pas être modifiés sans casser les schémas
-  existants. Exception temporaire à cette règle : comme aucune base de
-  production n'existe, les migrations seront **consolidées en une base propre**
-  au moment de l'instantané public.
+- Public, documented interfaces, at the same level as the Nexlink connector:
+  - **approval**: request and receipt format, verification by front end
+    (WebAuthn, ES256 device key…), enrolment of an authenticator in the
+    canon registry;
+  - **thread and notifications**: read and post in a lot's thread, receive the
+    requests waiting for a human (R17);
+  - **identity**: binding of a `human:<id>` member to their authenticators.
+- Nexlink is one front end among others, integrated natively; a third-party
+  application on these interfaces has the same capabilities.
+- Examples and tests use fictitious organisations.
+- **Going public through a snapshot** (owner decision, formerly Q8):
+  the git history of the private repository, which contains earlier mentions of a
+  client, stays private; the public repository starts from a clean snapshot at the
+  first release. No rewriting of the history shared by the agents.
+- **SQL migrations**: their comments are covered by a checksum
+  stored in the database and cannot be modified without breaking existing
+  schemas. Temporary exception to this rule: since no production
+  database exists, the migrations will be **consolidated into a clean base**
+  at the time of the public snapshot.
