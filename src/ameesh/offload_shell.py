@@ -66,7 +66,7 @@ ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 RESERVED_ENV = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP",
                 "LD_PRELOAD", "LD_LIBRARY_PATH", "XDG_RUNTIME_DIR",
                 "DBUS_SESSION_BUS_ADDRESS", "OFFLOAD_JOB", "OFFLOAD_WORK",
-                "OFFLOAD_CACHE")
+                "OFFLOAD_CACHE", "OFFLOAD_SLICE")
 POLL_S = 1.0
 #: snapshots offered to the client as thin-pack bases
 HAVE_DEPTH = 32

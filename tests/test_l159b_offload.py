@@ -230,6 +230,12 @@ class RunTest(OffloadBase):
         res = self.offload("run", "--env", "PATH=/evil", "--fallback", "none", "--", "true")
         self.assertEqual(res.returncode, offload.EX_TEMPFAIL)
         self.assertIn("PATH is set by the host", res.stderr)
+        # an empty slice name would drop --cgroup-parent from the Postgres
+        # hook: its container would escape MemoryMax and the cleanup
+        for env in ("OFFLOAD_SLICE=", "OFFLOAD_SLICE=other.slice"):
+            res = self.offload("run", "--env", env, "--fallback", "none", "--", "true")
+            self.assertEqual(res.returncode, offload.EX_TEMPFAIL)
+            self.assertIn("OFFLOAD_SLICE is set by the host", res.stderr)
         ok = self.offload("run", "--env", "FOO=bar baz", "--", "sh", "-c", 'echo "$FOO"')
         self.assertEqual(ok.stdout, "bar baz\n")
 
