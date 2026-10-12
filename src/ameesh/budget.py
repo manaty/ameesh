@@ -70,6 +70,9 @@ def source_label(source: str) -> str:
 DEFAULT_TTL = 15.0
 #: préfixe du statut d'un agent en pause budget (`runner.budget_ok`)
 PAUSE_PREFIX = "budget : "
+#: L242b (5) : après `PAUSE_PREFIX`, la pause d'un agent critique (posée par
+#: l'exécuteur, seul à savoir qui l'est) — alerte urgente `critical_budget_pause`
+CRITICAL_MARK = "critical agent: "
 
 
 class BudgetError(RuntimeError):

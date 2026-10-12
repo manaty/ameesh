@@ -2106,8 +2106,12 @@ class AgentWorker(threading.Thread):
             self._budget_next_check = maintenant + self.runner.budget_check_interval
             # `paused` n'est pas dans la contrainte de statut (L13 n'a pas de
             # migration) : la pause se lit `blocked` + raison dans `status_text`.
+            # L242b (5) : la pause d'un agent critique est marquée — alerte
+            # urgente `critical_budget_pause`
+            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text="budget : %s" % raison)
+                                status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
+                                                        raison))
             if raison != self._budget_reason:
                 self._budget_reason = raison
                 self._fil_note("Budget pause: %s. No turn until the gauge goes back "
