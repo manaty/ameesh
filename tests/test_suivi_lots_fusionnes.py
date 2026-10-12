@@ -90,7 +90,7 @@ class MergedCommandTest(_Base):
             self.assertEqual((jalon["sha"], jalon["actor"]), (SHA, "claude1"))
             note = work.events(self.db, lot["id"])[0]
             self.assertEqual(note["actor"], "claude1")
-            self.assertEqual(note["note"], "fusion déclarée par claude1 (commit %s) — fusion "
+            self.assertEqual(note["note"], "merge declared by claude1 (commit %s) — fusion "
                                            "locale sur develop" % SHA[:12])
 
     def test_idempotent_et_jamais_de_reouverture(self):
@@ -103,7 +103,7 @@ class MergedCommandTest(_Base):
         work.close(self.db, ferme["id"], abandoned=True)
         with self.assertRaises(work.WorkError) as ctx:
             work.merged(self.db, ferme["id"], sha=SHA, actor="claude1")
-        self.assertIn("aucune réouverture", str(ctx.exception))
+        self.assertIn("not reopened", str(ctx.exception))
         for bad in ("", "xyz1234", "abc12", "g" * 40):
             with self.assertRaises(work.WorkError):
                 work.merged(self.db, lot["id"], sha=bad, actor="claude1")
@@ -113,13 +113,13 @@ class MergedCommandTest(_Base):
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA, "--note", "à la main",
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d → merged (commit %s, déclaré par claude1)"
+        self.assertIn("lot #%d → merged (commit %s, declared by claude1)"
                       % (lot["id"], SHA[:12]), proc.stdout)
         self.assertEqual(self.merged_milestone(lot["id"])["actor"], "claude1")
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA,
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("déjà merged", proc.stdout)
+        self.assertIn("already merged", proc.stdout)
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
 
@@ -146,13 +146,13 @@ class CorrectionTest(_Base):
     def test_orchestrateur(self):
         proc = self.correct(AGENT_MAIL_NAME="orch", AMEESH_ALERT_ORCHESTRATORS="orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("correction tracée au journal, par orch", proc.stdout)
+        self.assertIn("correction recorded in the log, by orch", proc.stdout)
         item = work.get(self.db, self.lot["id"])
         self.assertEqual(item["state"], "merged")
         self.assertIsNone(item["closed_ts"])
         event = work.events(self.db, self.lot["id"])[0]
         self.assertEqual((event["state"], event["actor"]), ("merged", "orch"))
-        self.assertEqual(event["note"], "correction : promoted → merged — promu par erreur : "
+        self.assertEqual(event["note"], "correction: promoted → merged — promu par erreur : "
                                         "pas encore en production")
         # un seul jalon de fusion : la correction n'en invente pas un second
         self.assertEqual(sum(1 for m in work.milestones(self.db, self.lot["id"])
@@ -167,11 +167,11 @@ class CorrectionTest(_Base):
 
     def test_refus(self):
         cas = [
-            ((), {}, "dites qui corrige"),                                 # humain anonyme
-            ((), {"AGENT_MAIL_NAME": "dev1"}, "correction refusée : dev1"),  # agent ordinaire
+            ((), {}, "say who corrects"),                                  # humain anonyme
+            ((), {"AGENT_MAIL_NAME": "dev1"}, "correction refused: dev1"),   # agent ordinaire
             (("--actor", "human:proprio"), {"AGENT_MAIL_NAME": "dev1"},
-             "cette session est celle de dev1"),                         # au nom d'un autre
-            (("--actor", "dev1"), {}, "correction refusée : dev1"),
+             "this session belongs to dev1"),                            # au nom d'un autre
+            (("--actor", "dev1"), {}, "correction refused: dev1"),
         ]
         for extra, env, attendu in cas:
             proc = self.correct(*extra, **env)
@@ -182,7 +182,7 @@ class CorrectionTest(_Base):
         autre = work.add(self.db, title="autre")
         with self.assertRaises(work.WorkError) as ctx:
             work.move(self.db, autre["id"], "merged", actor="orch", correct="raison")
-        self.assertIn("correction refusée : intake → merged", str(ctx.exception))
+        self.assertIn("correction refused: intake → merged", str(ctx.exception))
         with self.assertRaises(work.WorkError):
             work.move(self.db, self.lot["id"], "merged", actor="orch", correct="  ")
 
@@ -225,7 +225,7 @@ class ActorTest(_Base):
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
         proc = self.mesh("work", "note", str(lot["id"]), "une note sans identité")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("acteur inconnu", proc.stderr)
+        self.assertIn("unknown actor", proc.stderr)
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], work.UNKNOWN_ACTOR)
         proc = self.mesh("work", "move", str(lot["id"]), "build", "--actor", "human:proprio",
                          env=self.env(AGENT_MAIL_NAME="orch"))
@@ -238,7 +238,7 @@ class ActorTest(_Base):
         proc = self.mesh("work", "close", str(lot["id"]), "--abandoned",
                          env=self.env(AGENT_MAIL_NAME="orch"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("avertissement", proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
         self.assertFalse([e for e in work.events(self.db, lot["id"]) if not e["actor"]])
 
@@ -300,8 +300,8 @@ class MergeSweepTest(_Base):
         self.assertEqual(item["state"], "merged")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual(jalon["sha"], sha)
-        self.assertIn("relevé des fusions, commit de fusion de develop qui porte "
-                      "« ameesh-work: %d »" % lot["id"], jalon["note"])
+        self.assertIn("merge sweep, merge commit of develop that carries "
+                      "\"ameesh-work: %d\"" % lot["id"], jalon["note"])
         self.assertEqual(work.get(self.db, autre["id"])["state"], "intake")
         self.assertEqual([r["work_item"] for r in self.sync()["results"]], [autre["id"]])
 
@@ -314,7 +314,7 @@ class MergeSweepTest(_Base):
         report = self.sync()
         self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "#id"))
         self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
-        self.assertIn("cite #%d dans son titre (ameesh.lotRef hash)" % lot["id"],
+        self.assertIn("cites #%d in its title (ameesh.lotRef hash)" % lot["id"],
                       self.merged_milestone(lot["id"])["note"])
 
     def test_formes_voisines_et_corps_ignores(self):
@@ -355,7 +355,7 @@ class MergeSweepTest(_Base):
         _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "origin/develop")
         entry = self.sync()["results"][0]
         self.assertEqual((entry["work_item"], entry["result"]), (lot["id"], "error"))
-        self.assertIn("ameesh.target = origin/develop introuvable", entry["detail"])
+        self.assertIn("ameesh.target = origin/develop not found", entry["detail"])
 
     def test_stale_lot_dit_l_action_puis_se_tait_apres_le_releve(self):
         lot = self.lot()
@@ -366,8 +366,8 @@ class MergeSweepTest(_Base):
             self.db.execute(sql)
         stale = [a for a in exploitation.alerts(self.cfg, self.db) if a["type"] == "stale_lot"]
         self.assertEqual([a["lot"] for a in stale], [lot["id"]])
-        self.assertIn("fusionné ? fermez-le : ameesh work merged %d --sha <commit de fusion> ; "
-                      "sinon relancez claude1" % lot["id"], stale[0]["detail"])
+        self.assertIn("merged? close it: ameesh work merged %d --sha <merge commit>; "
+                      "otherwise nudge claude1" % lot["id"], stale[0]["detail"])
         self.assertEqual(stale[0]["action"], exploitation.stale_action(stale[0] | {
             "id": lot["id"], "assignee": "claude1"}))
         self.merge("feature/z", "Merge #%d\n\nameesh-work: %d" % (lot["id"], lot["id"]))
@@ -380,8 +380,8 @@ class MergeSweepTest(_Base):
         self.merge("feature/cli", "Merge\n\nameesh-work: %d" % lot["id"])
         proc = self.mesh("work", "sync-branches")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("(sans branche)", proc.stdout)
-        self.assertIn("FERMÉ", proc.stdout)
+        self.assertIn("(no branch)", proc.stdout)
+        self.assertIn("CLOSED", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
 

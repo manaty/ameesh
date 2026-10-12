@@ -177,7 +177,7 @@ class Operations(interface.Operations):
                                               r.current_prompt, r.pending_prompt),
                    current_prompt = NULL,
                    status = CASE WHEN r.status = 'stopped' THEN r.status ELSE 'queued' END,
-                   status_text = 'redémarrage : session neuve sur brief',
+                   status_text = 'restart: fresh session from brief',
                    restart_brief = NULL,
                    restart_requested_at = NULL,
                    updated_at = now()
@@ -398,12 +398,12 @@ class Operations(interface.Operations):
                 SELECT e.actor FROM work_item_events e
                   JOIN work_items w ON w.id = e.work_item_id
                  WHERE e.created_at >= now() - make_interval(secs => %s)
-                   AND e.note LIKE %s
+                   AND (e.note LIKE %s OR e.note LIKE %s)
                    AND e.actor <> ''
                    AND e.actor IS DISTINCT FROM w.assignee
             ) a WHERE coalesce(who, '') <> '' ORDER BY who
             """,
-            (float(since_s), float(since_s), "assigné à %"))
+            (float(since_s), float(since_s), "assigné à %", "assigned to %"))
         return [row["who"] for row in rows]
 
     # -- soldes --------------------------------------------------------------

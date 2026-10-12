@@ -108,7 +108,7 @@ class PriseTest(_Base):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["sender"], rows[0]["recipient"], rows[0]["work_item_id"]),
                          ("ameesh", "claude1", str(haut["id"])))
-        self.assertIn("geste irréversible ou de production", rows[0]["body"])
+        self.assertIn("any irreversible or production action", rows[0]["body"])
         notes = [e["note"] for e in work.events(self.db, haut["id"])]
         self.assertTrue(any(n.startswith(backlog.AUTO_TAKE_NOTE) for n in notes))
         # l'agent a maintenant un lot (et du courrier) : il ne prend plus rien
@@ -245,7 +245,7 @@ class AlerteEtNotifyTest(_Base):
         notifier.run_pass(self.db, thresholds=_seuils())
         prises = [r for r in records if r["event"] == "auto_take"]
         self.assertEqual([(r["agent"], r["lot"]) for r in prises], [("claude1", item["id"])])
-        self.assertIn("prise automatique", notify._format(prises[0]))
+        self.assertIn("auto-take", notify._format(prises[0]))
         self.assertEqual(work.get(self.db, item["id"])["assignee"], "claude1")
         args = notify.build_parser().parse_args(["--take-idle", "0", "--take-lot-idle", "0"])
         self.assertIsNone(notify.take_settings(args))

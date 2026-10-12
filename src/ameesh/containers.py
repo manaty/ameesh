@@ -175,7 +175,7 @@ class Runtime:
         except (OSError, subprocess.SubprocessError) as exc:
             return False, str(exc)
         if getattr(proc, "returncode", 1) != 0:
-            return False, (getattr(proc, "stderr", "") or "refusé").strip()[:300]
+            return False, (getattr(proc, "stderr", "") or "refused").strip()[:300]
         return True, ""
 
     def running_for_agent(self, agent: str) -> list[str]:
@@ -209,7 +209,7 @@ case "${0##*/}" in
   *) real="" ;;
 esac
 if [ -z "$real" ] || [ ! -x "$real" ]; then
-  echo "ameesh : moteur de conteneurs introuvable (${0##*/})" >&2
+  echo "ameesh: container engine not found (${0##*/})" >&2
   exit 127
 fi
 if [ "$1" = run ] || [ "$1" = create ]; then

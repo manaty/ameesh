@@ -211,7 +211,7 @@ class PlafondDeContexteTest(_Base):
             self.assertLess(worker.session_turns, self.cfg.session_min_turns)
             with mock.patch.object(worker, "_fil_note") as note:
                 self.assertTrue(worker.maybe_rotate())
-        self.assertTrue(any("plafond de contexte" in str(appel) for appel in note.call_args_list),
+        self.assertTrue(any("context cap" in str(appel) for appel in note.call_args_list),
                         "la rotation est tracée dans le fil avec sa raison")
         self.assertIsNone(registry.get(self.db, "ds-cap")["session_id"])
         self.assertTrue(worker.resume_summary)
@@ -228,7 +228,7 @@ class PlafondDeContexteTest(_Base):
             self.assertTrue(self._tour(worker, "tour suivant"))
         argv = self.turns()[-1]["argv"]
         self.assertNotIn("--session-id", argv, "session neuve")
-        self.assertIn("Reprise de session après rotation", " ".join(argv))
+        self.assertIn("Session resumed after rotation", " ".join(argv))
 
     def test_sous_le_plafond_rien_ne_tourne(self):
         runner, worker = self._worker("ds-sous")
@@ -246,7 +246,7 @@ class PlafondDeContexteTest(_Base):
         # plafond abaissé pour cet agent : 2 M relus suffisent
         proc = self.mesh("set", "ds-reg", "context_max_tokens=1.5M")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("contexte=1500000", proc.stdout)
+        self.assertIn("context=1500000", proc.stdout)
         worker.agent = registry.get(self.db, "ds-reg")
         self.assertEqual(worker.context_max_tokens(), 1_500_000)
         self.assertTrue(worker.context_rotation_due())

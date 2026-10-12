@@ -413,8 +413,8 @@ class VolumesDbTest(PgTestCase):
         self.assertEqual([v["path"] for v in objet["volumes"]], ["/ssd", "/state"])
         texte = self.mesh("hosts", "pc-253")
         self.assertEqual(texte.returncode, 0, texte.stderr)
-        self.assertIn("volume     /state : libre 70.0 GiB", texte.stdout)
-        self.assertIn("(aussi /)", texte.stdout)
+        self.assertIn("volume     /state: free 70.0 GiB", texte.stdout)
+        self.assertIn("(also /)", texte.stdout)
 
     def test_supervisor_reads_volumes(self):
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

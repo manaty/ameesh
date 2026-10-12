@@ -358,7 +358,7 @@ class AlertTest(unittest.TestCase):
         warning = self.alerts({"btrfs_unallocated_bytes": 8 * GIB})
         self.assertEqual([a["type"] for a in warning], ["host_disk_low"])
         self.assertFalse(warning[0]["urgent"])
-        self.assertIn("btrfs non alloué 8.0 GiB (seuil 10.0 GiB)", warning[0]["detail"])
+        self.assertIn("btrfs unallocated 8.0 GiB (threshold 10.0 GiB)", warning[0]["detail"])
         # one episode, one key, whatever the level (codex r1 (4))
         again = self.alerts({"btrfs_unallocated_bytes": 7 * GIB})
         self.assertEqual(exploitation.alert_key(warning[0]), exploitation.alert_key(again[0]))

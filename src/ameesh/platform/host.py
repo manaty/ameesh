@@ -44,11 +44,11 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
         except Exception:
             pass
         if not out:
-            raise NotAvailable("mémoire de l'hôte", "psutil ne la donne pas")
+            raise NotAvailable("host memory", "psutil does not report it")
         return out
     if meminfo is None:
         if not _proc_ok():
-            raise NotAvailable("mémoire de l'hôte", "ni psutil ni /proc")
+            raise NotAvailable("host memory", "neither psutil nor /proc")
         meminfo = os.path.join(PROC, "meminfo")
     values: dict[str, int] = {}
     try:
@@ -59,7 +59,7 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
                     continue
                 values[key.strip()] = int(rest.strip().split()[0]) * 1024
     except (OSError, ValueError, IndexError) as exc:
-        raise NotAvailable("mémoire de l'hôte", "%s illisible : %s" % (meminfo, exc)) from None
+        raise NotAvailable("host memory", "%s unreadable: %s" % (meminfo, exc)) from None
     out = {}
     if "MemAvailable" in values:
         out["mem_available_bytes"] = values["MemAvailable"]
@@ -486,6 +486,9 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
 
 #: identifier of the current boot, new at every boot
 BOOT_ID = os.path.join(PROC, "sys", "kernel", "random", "boot_id")
+#: the boot clock as a shell reads it: seconds since the boot, suspend
+#: included (CLOCK_BOOTTIME), first field
+UPTIME = os.path.join(PROC, "uptime")
 
 
 def own_cgroup(path: str | None = None) -> str | None:

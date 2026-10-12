@@ -127,7 +127,7 @@ class FenetreEchueTest(ComptesBase):
         self.assertEqual(jauge["used"], 0.0)
         self.assertAlmostEqual(jauge["last_used"], 0.93)
         texte = accounts.format_rows(list(rows.values()))
-        self.assertIn("codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%)",
+        self.assertIn("codex-300min 0% (pace 90%, reset passed, last reading 93%)",
                       texte)
         # la règle de choix existante peut donc basculer sur le secondaire
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)

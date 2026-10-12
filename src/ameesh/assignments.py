@@ -73,12 +73,12 @@ def resolve_lot(db, ref: str) -> dict | None:
         if item is None:
             return None
         if item["state"] in work_mod.MERGED_STATES or item["state"] == "closed":
-            raise AssignmentError("lot #%s déjà %s : rien à rattacher (nouveau lot : "
-                                  "--new-lot \"titre\")" % (number, item["state"]))
+            raise AssignmentError("lot #%s already %s: nothing to link (new lot: "
+                                  "--new-lot \"title\")" % (number, item["state"]))
         return item
     rows = storage.of(db).work.open_by_ref(text)
     if len(rows) > 1:
-        raise AssignmentError("référence %r ambiguë : lots %s — précisez le numéro"
+        raise AssignmentError("ambiguous reference %r: lots %s — give the number"
                               % (text, ", ".join("#%d" % int(r["id"]) for r in rows)))
     return rows[0] if rows else None
 
@@ -130,10 +130,10 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             from . import estimates
             title = new_lot.strip()
             if not title:
-                raise AssignmentError("--new-lot : titre vide")
+                raise AssignmentError("--new-lot: empty title")
             minutes = estimates.parse(estimate) if estimate not in (None, "") else None
             warn = estimates.check(db, sender, minutes,
-                                   option="--estimate 2h à côté de --new-lot")
+                                   option="--estimate 2h alongside --new-lot")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
                                 source="mail", cfg=cfg, branch=branch, estimate=minutes)
             out.update(created=True, assigned=True, branch=item.get("branch"))
@@ -143,16 +143,16 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             item = resolve_lot(db, lot)
             if item is None:
                 out["warnings"].append(
-                    "--lot %s ne désigne aucun lot ouvert : simple étiquette du fil "
-                    "(lot à créer : --new-lot \"titre\", ou ameesh work add)" % lot)
+                    "--lot %s matches no open lot: kept as a plain thread label "
+                    "(to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
             else:
                 current = (item.get("assignee") or "").strip()
                 if current != recipient:
                     if current and current != sender \
                             and not current.startswith(work_mod.HUMAN_PREFIX):
                         out["warnings"].append(
-                            "lot #%d appartient à %s : non réassigné à %s (pour le "
-                            "reprendre : ameesh work assign %d %s)"
+                            "lot #%d belongs to %s: not reassigned to %s (to "
+                            "take it over: ameesh work assign %d %s)"
                             % (int(item["id"]), current, recipient, int(item["id"]),
                                recipient))
                     else:
@@ -165,7 +165,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                 if branch and not item.get("branch") \
                         and (item.get("assignee") or "") == recipient:
                     item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
-                                               source="citée par le courrier")
+                                               source="cited by the mail")
                     out["branch"] = item.get("branch")
     except work_mod.WorkError as exc:
         raise AssignmentError(str(exc)) from exc
@@ -173,9 +173,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         out.update(lot=item, work_item_id=str(item["id"]))
     if not has_open and not out["assigned"] and not _is_chat(db, recipient):
         out["warnings"].append(
-            "%s n'a aucun lot ouvert : ce travail n'apparaîtra ni dans ameesh projects "
-            "ni dans les alertes — rattachez-le (--lot <id|réf>) ou créez-le "
-            "(--new-lot \"titre\")" % recipient)
+            "%s has no open lot: this work will show up neither in ameesh projects "
+            "nor in alerts — link it (--lot <id|ref>) or create it "
+            "(--new-lot \"title\")" % recipient)
     return out
 
 

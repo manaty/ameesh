@@ -71,7 +71,7 @@
 
   function supported() {
     if (!window.PublicKeyCredential || !navigator.credentials) {
-      say("Ce navigateur ne gère pas les passkeys (WebAuthn).", "error");
+      say("This browser does not support passkeys (WebAuthn).", "error");
       return false;
     }
     return true;
@@ -86,7 +86,7 @@
         return;
       }
       setBusy(true);
-      say("Signature en cours : suivez les instructions de votre appareil…");
+      say("Signing: follow your device's instructions…");
       var challenge = decision === "approve" ? data.challengeApprove : data.challengeDeny;
       navigator.credentials.get({
         publicKey: {
@@ -111,21 +111,21 @@
       }).then(function (result) {
         if (result.ok) {
           var approved = data.kind === "assume-duplicate"
-            ? "Décision signée : vous assumez le risque d'un doublon. Vous pouvez fermer cette page."
-            : "Approbation signée et enregistrée. Vous pouvez fermer cette page.";
+            ? "Decision signed: you assume the risk of a duplicate. You can close this page."
+            : "Approval signed and recorded. You can close this page.";
           say(decision === "approve"
             ? approved
-            : "Refus signé et enregistré. Vous pouvez fermer cette page.", "done");
+            : "Denial signed and recorded. You can close this page.", "done");
         } else {
           setBusy(false);
-          say("Refusé par le service (" + (result.data.error || result.status) + ") : " +
+          say("Refused by the service (" + (result.data.error || result.status) + "): " +
             (result.data.message || ""), "error");
         }
       }).catch(function (error) {
         setBusy(false);
         say(error && error.message === "cancelled"
-          ? "Signature annulée ou refusée par l'appareil."
-          : "Erreur réseau : réessayez.", "error");
+          ? "Signing cancelled or refused by the device."
+          : "Network error: try again.", "error");
       });
     }
 
@@ -145,7 +145,7 @@
         return;
       }
       setBusy(true);
-      say("Création de la passkey : suivez les instructions de votre appareil…");
+      say("Creating the passkey: follow your device's instructions…");
       navigator.credentials.create({
         publicKey: {
           rp: { id: data.rpId, name: data.rpName },
@@ -172,18 +172,18 @@
         throw new Error("cancelled");
       }).then(function (result) {
         if (result.ok) {
-          say("Passkey créée. Empreinte de clé : " + String(result.data.key_fingerprint || "").slice(0, 16) +
-            ". Elle sera active après revue et fusion de la PR du canon.", "done");
+          say("Passkey created. Key fingerprint: " + String(result.data.key_fingerprint || "").slice(0, 16) +
+            ". It will be active after the canon PR is reviewed and merged.", "done");
         } else {
           setBusy(false);
-          say("Refusé par le service (" + (result.data.error || result.status) + ") : " +
+          say("Refused by the service (" + (result.data.error || result.status) + "): " +
             (result.data.message || ""), "error");
         }
       }).catch(function (error) {
         setBusy(false);
         say(error && error.message === "cancelled"
-          ? "Création annulée ou refusée par l'appareil."
-          : "Erreur réseau : réessayez.", "error");
+          ? "Creation cancelled or refused by the device."
+          : "Network error: try again.", "error");
       });
     });
   }

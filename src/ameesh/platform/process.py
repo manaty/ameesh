@@ -57,8 +57,8 @@ def ancestry(pid: int | None = None) -> list[int]:
     permet pas de remonter du tout."""
     ps = _psutil()
     if ps is None and not _proc_ok():
-        raise NotAvailable("ascendance des processus",
-                           "ni psutil ni /proc pour lire le parent d'un processus")
+        raise NotAvailable("process ancestry",
+                           "neither psutil nor /proc to read a process's parent")
     out: list[int] = []
     current = os.getpid() if pid is None else int(pid)
     for _ in range(MAX_DEPTH):
@@ -88,18 +88,18 @@ def boot_time(stat_path: str | None = None) -> float:
         try:
             return float(ps.boot_time())
         except Exception as exc:
-            raise NotAvailable("démarrage de l'hôte", "psutil : %s" % exc) from None
+            raise NotAvailable("host boot time", "psutil: %s" % exc) from None
     path = stat_path or os.path.join(PROC, "stat")
     if stat_path is None and not _proc_ok():
-        raise NotAvailable("démarrage de l'hôte", "ni psutil ni /proc")
+        raise NotAvailable("host boot time", "neither psutil nor /proc")
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 if line.startswith("btime "):
                     return float(line.split()[1])
     except (OSError, ValueError, IndexError) as exc:
-        raise NotAvailable("démarrage de l'hôte", "%s illisible : %s" % (path, exc)) from None
-    raise NotAvailable("démarrage de l'hôte", "pas de ligne btime dans %s" % path)
+        raise NotAvailable("host boot time", "%s unreadable: %s" % (path, exc)) from None
+    raise NotAvailable("host boot time", "no btime line in %s" % path)
 
 
 def ticks_to_epoch(ticks: int) -> float:
@@ -108,8 +108,8 @@ def ticks_to_epoch(ticks: int) -> float:
     que sous Linux, sur l'hôte qui l'a mesurée : `NotAvailable` ailleurs."""
     from . import is_linux
     if not is_linux():
-        raise NotAvailable("conversion des tops d'horloge",
-                           "une heure en tops d'horloge n'a de sens que sous Linux")
+        raise NotAvailable("clock tick conversion",
+                           "a time in clock ticks only makes sense on Linux")
     try:
         hertz = os.sysconf("SC_CLK_TCK")
     except (AttributeError, ValueError, OSError):
@@ -130,10 +130,10 @@ def start_time(pid: int | None) -> float | None:
         except ps.NoSuchProcess:
             return None
         except Exception as exc:
-            raise NotAvailable("heure de démarrage d'un processus",
-                               "pid %s : %s" % (pid, type(exc).__name__)) from None
+            raise NotAvailable("process start time",
+                               "pid %s: %s" % (pid, type(exc).__name__)) from None
     if not _proc_ok():
-        raise NotAvailable("heure de démarrage d'un processus", "ni psutil ni /proc")
+        raise NotAvailable("process start time", "neither psutil nor /proc")
     try:
         ticks = int(_stat_fields(int(pid))[22 - 3])
     except FileNotFoundError:
@@ -141,8 +141,8 @@ def start_time(pid: int | None) -> float | None:
     except (OSError, ValueError, IndexError) as exc:
         if not os.path.exists(os.path.join(PROC, str(int(pid)))):
             return None
-        raise NotAvailable("heure de démarrage d'un processus",
-                           "pid %s : %s" % (pid, exc)) from None
+        raise NotAvailable("process start time",
+                           "pid %s: %s" % (pid, exc)) from None
     return ticks_to_epoch(ticks)
 
 
@@ -176,7 +176,7 @@ def alive(pid: int) -> bool:
             return os.path.exists(os.path.join(PROC, str(int(pid))))
     from . import is_windows
     if is_windows():
-        raise NotAvailable("vie d'un processus", "psutil absent")
+        raise NotAvailable("process liveness", "psutil missing")
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -203,8 +203,8 @@ def environ(pid: int | None = None) -> dict | None:
         except Exception:  # disparu, refusé, zombie : inconnu, jamais inventé
             return None
     if not _proc_ok():
-        raise NotAvailable("environnement d'un processus",
-                           "ni psutil ni /proc pour lire l'environnement d'un processus")
+        raise NotAvailable("process environment",
+                           "neither psutil nor /proc to read a process's environment")
     try:
         with open(os.path.join(PROC, str(current), "environ"), "rb") as fh:
             data = fh.read()
@@ -225,7 +225,7 @@ def open_fd_count() -> int:
         return int(ps.Process().num_fds())
     if _proc_ok():
         return len(os.listdir(os.path.join(PROC, "self", "fd")))
-    raise NotAvailable("descripteurs ouverts", "ni psutil (POSIX) ni /proc")
+    raise NotAvailable("open descriptors", "neither psutil (POSIX) nor /proc")
 
 
 #: descriptors of this process, always the real `/proc` (not `PROC`, which
@@ -248,7 +248,7 @@ def fd_path(fd: int) -> str:
     else:
         raise NotAvailable("chemin d'un descripteur", "ni /proc ni F_GETPATH")
     if not target.startswith("/") or target.endswith(" (deleted)"):
-        raise NotAvailable("chemin d'un descripteur", "fichier supprimé ou hors arborescence")
+        raise NotAvailable("path of a descriptor", "file deleted or outside the tree")
     return target
 
 
@@ -265,7 +265,7 @@ def process_table() -> list[dict]:
     omis. `NotAvailable` si l'OS ne permet pas de lister les processus ou
     leurs groupes : une liste vide voudrait dire « plus rien ne tourne »."""
     if not hasattr(os, "getpgid"):
-        raise NotAvailable("table des processus", "pas de groupes de processus (POSIX)")
+        raise NotAvailable("process table", "no process groups (POSIX)")
     ps = _psutil()
     if ps is not None:
         out = []
@@ -281,7 +281,7 @@ def process_table() -> list[dict]:
                         "zombie": info.get("status") == ps.STATUS_ZOMBIE})
         return out
     if not _proc_ok():
-        raise NotAvailable("table des processus", "ni psutil ni /proc")
+        raise NotAvailable("process table", "neither psutil nor /proc")
     try:
         demarrage = boot_time()
     except NotAvailable:
@@ -339,6 +339,49 @@ def become_subreaper() -> bool:
         return False
 
 
+def children(pid: int | None = None) -> list[dict]:
+    """Les enfants DIRECTS de `pid` (défaut : ce processus), zombies compris :
+    `pid`, `zombie`. Sous Linux, la liste du noyau
+    (`/proc/<pid>/task/<tid>/children`, lue d'un coup, sans balayer tous les
+    processus) ; sinon psutil ; sinon `NotAvailable` (L131c : un sous-
+    moissonneur sait ainsi exactement s'il lui reste des descendants)."""
+    pid = os.getpid() if pid is None else int(pid)
+    if _proc_ok():
+        tasks = os.path.join(PROC, str(pid), "task")
+        try:
+            tids = os.listdir(tasks)
+        except OSError as exc:
+            raise NotAvailable("enfants d'un processus", str(exc))
+        pids: list[int] = []
+        found = False
+        for tid in tids:
+            try:
+                with open(os.path.join(tasks, tid, "children"), encoding="ascii") as fh:
+                    pids += [int(x) for x in fh.read().split()]
+                found = True
+            except FileNotFoundError:
+                continue            # fil terminé, ou noyau sans CONFIG_PROC_CHILDREN
+            except (OSError, ValueError):
+                continue
+        if found:
+            out = []
+            for child in sorted(set(pids)):
+                try:
+                    zombie = _stat_fields(child)[0] in ("Z", "X")
+                except (OSError, ValueError, IndexError):
+                    continue        # moissonné entre-temps
+                out.append({"pid": child, "zombie": zombie})
+            return out
+    ps = _psutil()
+    if ps is not None:
+        try:
+            return [{"pid": c.pid, "zombie": c.status() == ps.STATUS_ZOMBIE}
+                    for c in ps.Process(pid).children()]
+        except (ps.NoSuchProcess, ps.AccessDenied) as exc:
+            raise NotAvailable("enfants d'un processus", str(exc))
+    raise NotAvailable("enfants d'un processus", "ni liste du noyau ni psutil")
+
+
 def reap(pid: int) -> int | None:
     """Moissonne `pid` s'il est un enfant TERMINÉ de ce processus : rend son
     code de sortie (négatif : tué par ce signal). None s'il tourne encore,
@@ -384,13 +427,13 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
         return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
     if _proc_ok():
         return _holders_proc(real, is_dir, needle, exclude, mapped)
-    raise NotAvailable("détenteurs d'un fichier",
-                       "ni psutil ni /proc pour lister les fichiers ouverts")
+    raise NotAvailable("file holders",
+                       "neither psutil nor /proc to list open files")
 
 
 def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | None:
     if not hit and needle and pid not in exclude and any(needle in a for a in argv[1:]):
-        hit = "id de session sur la ligne de commande"
+        hit = "session id on the command line"
     if hit:
         return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160]}
     return None
@@ -401,8 +444,8 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
     try:
         ps.Process(me).open_files()
     except Exception as exc:
-        raise NotAvailable("détenteurs d'un fichier",
-                           "fichiers ouverts illisibles même pour ce processus (%s)"
+        raise NotAvailable("file holders",
+                           "open files unreadable even for this process (%s)"
                            % type(exc).__name__) from None
     found = []
     for proc in ps.process_iter():
@@ -413,14 +456,14 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
                 try:
                     for item in proc.open_files():
                         if _inside(os.path.realpath(item.path), real, is_dir):
-                            hit = "fichier ouvert"
+                            hit = "open file"
                             break
                 except (ps.AccessDenied, ps.ZombieProcess, OSError):
                     pass
                 if not hit and is_dir:
                     try:
                         if _inside(os.path.realpath(proc.cwd()), real, True):
-                            hit = "dossier courant"
+                            hit = "working directory"
                     except (ps.AccessDenied, ps.ZombieProcess, OSError):
                         pass
                 if not hit and mapped:
@@ -429,7 +472,7 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
                     except (ps.AccessDenied, ps.ZombieProcess, OSError, AttributeError):
                         paths = []
                     if any(p and _inside(os.path.realpath(p), real, is_dir) for p in paths):
-                        hit = "fichier projeté"
+                        hit = "mapped file"
                 try:
                     argv = [str(a) for a in proc.cmdline()]
                 except (ps.AccessDenied, ps.ZombieProcess, OSError):
@@ -447,7 +490,7 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     `real` ; "" sinon ou si illisible."""
     try:
         if _inside(os.readlink(os.path.join(PROC, pid, "exe")), real, is_dir):
-            return "fichier projeté"
+            return "mapped file"
     except OSError:
         pass
     try:
@@ -457,7 +500,7 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
                 parts = line.split(None, 5)
                 if len(parts) == 6 and parts[5].startswith("/") and \
                         _inside(parts[5].rstrip("\n"), real, is_dir):
-                    return "fichier projeté"
+                    return "mapped file"
     except OSError:
         pass
     return ""
@@ -467,12 +510,12 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
-        raise NotAvailable("détenteurs d'un fichier", "%s illisible : %s" % (PROC, exc)) from None
+        raise NotAvailable("file holders", "%s unreadable: %s" % (PROC, exc)) from None
     try:
         os.listdir(os.path.join(PROC, str(os.getpid()), "fd"))
     except OSError as exc:
-        raise NotAvailable("détenteurs d'un fichier",
-                           "fichiers ouverts illisibles même pour ce processus (%s)"
+        raise NotAvailable("file holders",
+                           "open files unreadable even for this process (%s)"
                            % exc) from None
     found = []
     for pid in pids:
@@ -488,12 +531,12 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
             except OSError:
                 continue
             if _inside(target, real, is_dir):
-                hit = "fichier ouvert"
+                hit = "open file"
                 break
         if not hit and is_dir:
             try:
                 if _inside(os.readlink(os.path.join(PROC, pid, "cwd")), real, True):
-                    hit = "dossier courant"
+                    hit = "working directory"
             except OSError:
                 pass
         if not hit and mapped:

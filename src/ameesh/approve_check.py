@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh approve-check — concordance de la politique WebAuthn (lot L27).
+"""ameesh approve-check: WebAuthn policy agreement (lot L27).
 
   ameesh approve-check [--url U] [--json]
 
-Le service ameesh-approve signe sous SA politique (RP ID, origines : son
-JSON) ; ameesh vérifie et consomme les reçus sous celle des vérificateurs
-(`actions.policy_from_env` : AMEESH_APPROVE_RP_ID, AMEESH_APPROVE_ORIGINS),
-lue indépendamment. Si elles divergent, des reçus valides sont refusés — ou,
-pire, la confiance d'un poste est plus large que celle du service. Cette
-commande lit la politique publiée par le service (`GET /health`, sans jeton
-ni secret) à `approve_url` (ou `--url`) et la compare à celle de ce poste.
+The ameesh-approve service signs under ITS policy (RP ID, origins: its
+JSON); ameesh verifies and consumes receipts under the verifiers' policy
+(`actions.policy_from_env`: AMEESH_APPROVE_RP_ID, AMEESH_APPROVE_ORIGINS),
+read independently. If they diverge, valid receipts are refused, or worse,
+a machine trusts more than the service does. This command reads the policy
+published by the service (`GET /health`, no token or secret) at
+`approve_url` (or `--url`) and compares it with this machine's.
 
-Codes : 0 concordance ; 1 écart (liste sur la sortie) ; 2 configuration
-absente ou service injoignable. Rien n'est écrit.
+Exit codes: 0 agreement; 1 mismatch (listed on output); 2 configuration
+missing or service unreachable. Nothing is written.
 
-Modifier `approve_url` ne modifie pas la confiance : seule la politique des
-vérificateurs le fait, et cette commande vérifie qu'elle reste celle du
-service.
+Changing `approve_url` does not change trust: only the verifiers' policy
+does, and this command checks that it still matches the service's.
 """
 from __future__ import annotations
 
@@ -34,24 +33,24 @@ def compare(service: dict, policy) -> list[str]:
     vérificateur (receipts.Policy) ; liste vide = concordance."""
     ecarts = []
     if not policy.rp_id:
-        ecarts.append("vérificateur : AMEESH_APPROVE_RP_ID absent (aucun reçu WebAuthn ne "
-                      "sera accepté)")
+        ecarts.append("verifier: AMEESH_APPROVE_RP_ID missing (no WebAuthn receipt will "
+                      "be accepted)")
     elif policy.rp_id != service.get("rp_id"):
-        ecarts.append("RP ID : service %r, vérificateur %r" % (service.get("rp_id"),
+        ecarts.append("RP ID: service %r, verifier %r" % (service.get("rp_id"),
                                                                policy.rp_id))
     theirs = set(service.get("origins") or ())
     ours = set(policy.origins)
     if not ours:
-        ecarts.append("vérificateur : AMEESH_APPROVE_ORIGINS absent")
+        ecarts.append("verifier: AMEESH_APPROVE_ORIGINS missing")
     else:
         for origin in sorted(ours - theirs):
-            ecarts.append("origine admise par le vérificateur mais pas par le service : %s"
+            ecarts.append("origin allowed by the verifier but not by the service: %s"
                           % origin)
         for origin in sorted(theirs - ours):
-            ecarts.append("origine du service refusée par le vérificateur : %s" % origin)
+            ecarts.append("service origin refused by the verifier: %s" % origin)
     if service.get("profile") == "strict" and len(ours) > 1:
-        ecarts.append("vérificateur : plusieurs origines alors que le service est en profil "
-                      "strict (une seule, https://<RP ID>)")
+        ecarts.append("verifier: several origins while the service uses the strict "
+                      "profile (only one, https://<RP ID>)")
     return ecarts
 
 
@@ -60,10 +59,10 @@ def _route(url: str, service: dict) -> str:
     host = (urlsplit(url).hostname or "").lower()
     public = (urlsplit(service.get("public_url") or "").hostname or "").lower()
     if public and host == public:
-        return "hôte public (api_via_public)"
+        return "public host (api_via_public)"
     if approve_client._loopback(host):
-        return "boucle locale"
-    return "accès privé (%s)" % host
+        return "loopback"
+    return "private access (%s)" % host
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,8 +70,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="ameesh approve-check", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default=None,
-                        help="URL de l'API du service (défaut : AMEESH_APPROVE_URL)")
-    parser.add_argument("--json", action="store_true", help="sortie JSON")
+                        help="service API URL (default: AMEESH_APPROVE_URL)")
+    parser.add_argument("--json", action="store_true", help="JSON output")
     args = parser.parse_args(argv)
 
     cfg = config_mod.load()
@@ -85,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": exc.code, "message": exc.message},
                              ensure_ascii=False, sort_keys=True))
         else:
-            print("approve-check : %s" % exc.message, file=sys.stderr)
+            print("approve-check: %s" % exc.message, file=sys.stderr)
         return 2
     ecarts = compare(service, policy)
     base = approve_client.endpoint(url)
@@ -95,21 +94,21 @@ def main(argv: list[str] | None = None) -> int:
             "verificateur": {"rp_id": policy.rp_id, "origins": list(policy.origins)},
             "api": _route(base, service)}, ensure_ascii=False, sort_keys=True))
         return 1 if ecarts else 0
-    print("service      : RP ID %s, origines %s, profil %s, niveau %s%s"
+    print("service  : RP ID %s, origins %s, profile %s, level %s%s"
           % (service.get("rp_id"), ", ".join(service.get("origins") or ()),
              service.get("profile"), service.get("level"),
-             ", TLS local" if service.get("tls") else ""))
-    print("vérificateur : RP ID %s, origines %s"
-          % (policy.rp_id or "(absent)", ", ".join(policy.origins) or "(absentes)"))
-    print("API          : %s par %s" % (base, _route(base, service)))
+             ", local TLS" if service.get("tls") else ""))
+    print("verifier : RP ID %s, origins %s"
+          % (policy.rp_id or "(missing)", ", ".join(policy.origins) or "(missing)"))
+    print("API      : %s via %s" % (base, _route(base, service)))
     if ecarts:
-        print("ÉCART de politique (%d) :" % len(ecarts))
+        print("Policy MISMATCH (%d):" % len(ecarts))
         for ecart in ecarts:
             print("  - %s" % ecart)
-        print("Corriger la configuration du service OU des vérificateurs (le provisionneur "
-              "pose les deux) ; rien n'a été modifié.")
+        print("Fix the configuration of the service OR of the verifiers (the provisioner "
+              "sets both); nothing was changed.")
         return 1
-    print("politique concordante")
+    print("policies match")
     return 0
 
 

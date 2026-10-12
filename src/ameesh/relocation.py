@@ -19,9 +19,9 @@ from . import resources, storage
 
 #: message de reprise quand la session native n'est pas portable entre hôtes
 FALLBACK_SUMMARY = (
-    "Reprise après déplacement de l'hôte %s vers %s : la session précédente "
-    "n'est pas reprise (stockage des sessions local à chaque hôte). Relis le "
-    "fil de ton projet et l'état de ton lot avant de continuer."
+    "Resuming after a move from host %s to %s: the previous session "
+    "is not resumed (session storage is local to each host). Re-read your "
+    "project thread and the state of your lot before continuing."
 )
 
 
@@ -79,7 +79,7 @@ def plan(admitted_hosts, current_host: str, *, db, current_limits=None,
     return {
         "target": meilleur["host"],
         "keep_session": bool(shared_sessions),
-        "reason": "hôte %s sous pression (%s) ; %s disponible" % (
+        "reason": "host %s under pressure (%s); %s available" % (
             current_host, ", ".join(b["key"] for b in current["breaches"]),
             meilleur["host"]),
         "current": current,
@@ -105,7 +105,7 @@ def move(db, row: dict, plan_dict: dict, *, current_host: str,
     moved = storage.of(db).canon.relocate(
         name, current_host, target=plan_dict["target"],
         canon_ref=row.get("canon_ref") or "",
-        diagnostic="déplacé de %s : placement à réévaluer sur %s (pression de l'hôte)"
+        diagnostic="moved from %s: placement to re-evaluate on %s (host pressure)"
                    % (current_host, plan_dict["target"]),
         ref=row.get("placement_ref"),
         keep_session=keep, owner=owner, epoch=epoch, summary=summary)

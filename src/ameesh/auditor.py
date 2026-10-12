@@ -14,7 +14,8 @@ def load_all(cfg):
         if (not loaded.readable or loaded.scope_unread
                 or canon_mod.errors(loaded.load_findings)
                 or any(f.code == "frontmatter-invalid" for f in loaded.load_findings)):
-            raise canon_mod.CanonError("canon illisible ou périmètre incomplet : %s" % entry.path)
+            raise canon_mod.CanonError("canon unreadable or scope incomplete: %s"
+ % entry.path)
         out.append(loaded)
     canon_mod.check_identities(out)
     return out

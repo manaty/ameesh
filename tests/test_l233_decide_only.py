@@ -150,7 +150,7 @@ class WaitingHumanTest(_Base):
                         (self.lot["id"],))
         proc = self.mesh("decisions", env=self.mesh_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("aucune décision en attente", proc.stdout)
+        self.assertIn("no pending decision", proc.stdout)
         self.assertIn("lots in waiting_human with no question asked", proc.stdout)
         self.assertIn("RT-9 : cercle de confiance", proc.stdout)
 
@@ -254,7 +254,7 @@ class ProseTest(_Base):
         self.assertEqual([p["id"] for p in queue["prose"]], [report])
         self.assertEqual(queue["requests"], [])
         texte = self.mesh("decisions", env=self.mesh_env()).stdout
-        for expected in ("aucune décision en attente",
+        for expected in ("no pending decision",
                          "decisions written in prose in mail — not requests",
                          "mail #%d orch → bureau" % report,
                          "ameesh decide ask --from-mail %d" % report):

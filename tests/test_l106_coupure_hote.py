@@ -81,7 +81,7 @@ class ResolutionTest(unittest.TestCase):
         with mock.patch.object(adapters, "systemd_manager_path", return_value=""):
             res = adapters.resolve_harness(self.claude, env=self.env(), bins={})
         self.assertEqual(res.path, os.path.join(self.connu, "claude"))
-        self.assertEqual(res.source, "emplacement connu")
+        self.assertEqual(res.source, "known location")
         self.assertEqual(res.path_prepend, (self.connu,))
 
     def test_path_du_gestionnaire_systemd_relu(self):
@@ -91,7 +91,7 @@ class ResolutionTest(unittest.TestCase):
         _script(os.path.join(session, "claude"), "#!/bin/sh\nexit 0\n")
         with mock.patch.object(adapters, "systemd_manager_path", return_value=session):
             res = adapters.resolve_harness(self.claude, env=self.env(), bins={})
-        self.assertEqual(res.source, "PATH du gestionnaire systemd")
+        self.assertEqual(res.source, "systemd manager PATH")
         self.assertEqual(res.path, os.path.join(session, "claude"))
 
     def test_ordre_variable_puis_configuration_puis_path(self):
@@ -128,7 +128,7 @@ class ResolutionTest(unittest.TestCase):
         self.assertEqual(res.interpreter, "node")
         self.assertEqual(res.interpreter_path, os.path.join(node_dir, "node"))
         self.assertEqual(res.path_prepend, (node_dir,))
-        self.assertIn("interpréteur node", res.describe())
+        self.assertIn("interpreter node", res.describe())
         # l'adaptateur passe ce PATH complété au harnais
         with mock.patch.dict(os.environ, env), \
                 mock.patch.object(adapters, "systemd_manager_path", return_value=""):
@@ -141,7 +141,7 @@ class ResolutionTest(unittest.TestCase):
                 self.assertRaises(adapters.HarnessMissing) as ctx:
             adapters.resolve_harness(self.deepseek, env=self.env(AMEESH_DSH_BIN=dsh),
                                      bins={})
-        self.assertIn("interpréteur node introuvable", str(ctx.exception))
+        self.assertIn("interpreter node not found", str(ctx.exception))
 
     def test_replis_coupes_par_une_recherche_vide(self):
         _script(os.path.join(self.connu, "claude"), "#!/bin/sh\n")
@@ -337,7 +337,7 @@ class HoteNonPretTest(PgTestCase):
         self.assertNotEqual(row["status"], "stopped")
         self.assertEqual(row["status"], "blocked")
         self.assertEqual(row["status_text"], "hôte non prêt")
-        self.assertIn("introuvable", row["last_error"])
+        self.assertIn("not found", row["last_error"])
         self.assertTrue(row["last_error"].startswith("hôte non prêt : "))
         self.assertEqual(row["pending_prompt"], "tour")
 
@@ -441,7 +441,7 @@ class HoteNonPretTest(PgTestCase):
         self.assertEqual(alertes[0]["agent"], "alerte")
         self.assertEqual(alertes[0]["reason"], "hote")
         self.assertEqual(alertes[0]["responsible"], "human:resp")
-        self.assertIn("introuvable", alertes[0]["detail"])
+        self.assertIn("not found", alertes[0]["detail"])
         self.assertIn("host_not_ready", notify.DEFAULT_TYPES)
 
     def test_alerte_host_power_low_urgente_au_seuil_d_arret(self):
@@ -520,7 +520,7 @@ class AlimentationExecuteurTest(PgTestCase):
             row = registry.get(self.db, "nomade")
             self.assertIsNone(row["lease_owner"])
             self.assertEqual((row["status"], row["status_text"]), ("blocked", "hôte non prêt"))
-            self.assertIn("batterie 7.0 %", row["last_error"])
+            self.assertIn("battery 7.0 %", row["last_error"])
             self.assertNotEqual(row["status"], "stopped")
             # en attente du secteur : aucun bail repris
             runner.sweep()
@@ -582,7 +582,7 @@ class CoupureTest(PgTestCase):
         self.assertTrue(runner.did_turn)
         tour = self.turns()[-1]["argv"]
         self.assertEqual(tour[tour.index("--resume") + 1], "sess-interactive")
-        self.assertIn("session interactive (ameesh attach) s'est interrompue", tour[-1])
+        self.assertIn("interactive session (ameesh attach) was interrupted", tour[-1])
 
     def test_attach_rendu_proprement_pas_de_reprise(self):
         self.register("humain", "claude", cwd=self._cwd("humain"), session="sess-h")
@@ -618,7 +618,7 @@ class CoupureTest(PgTestCase):
         self.assertTrue(runner2.did_turn)
         consigne = self.turns()[-1]["argv"][-1]
         self.assertIn("message en vol", consigne)
-        self.assertIn("re-livré", consigne)
+        self.assertIn("re-delivered", consigne)
         self.assertIsNotNone(mail.get(self.db, mid)["delivered_ts"])
 
     def test_ressources_d_avant_le_redemarrage_signalees(self):
@@ -914,9 +914,9 @@ class CoupureTest(PgTestCase):
         self.register("dsh1", "deepseek", cwd=self._cwd("dsh1"))
         proc = self.cli("doctor", "--harness", env=self.env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("harnais    : deepseek [dsh1] → %s" % os.path.join(FAKEBIN, "dsh"),
+        self.assertIn("harness    : deepseek [dsh1] → %s" % os.path.join(FAKEBIN, "dsh"),
                       proc.stdout)
-        self.assertIn("interpréteur python3", proc.stdout)
+        self.assertIn("interpreter python3", proc.stdout)
         self.assertIn("version 9.9.9", proc.stdout)  # L120
         proc = self.cli("doctor", "--harness",
                         env=self.env(AMEESH_DSH_BIN=os.path.join(self.tmp, "absent")))

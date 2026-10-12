@@ -245,7 +245,7 @@ class AuditorTest(unittest.TestCase):
         worker = types.SimpleNamespace(stop_group_now=stop)
         AgentWorker._audit_deadline_monitor(worker, threading.Event(), time.monotonic() + 0.05)
         self.assertNotEqual(proc.wait(timeout=3), 0)
-        self.assertIn("plafond dur", worker._audit_guard_error)
+        self.assertIn("hard cap", worker._audit_guard_error)
 
     def test_no_exemption_without_scope_and_timer_cancellation(self):
         with mock.patch.object(audit_guard, "available", return_value=False):

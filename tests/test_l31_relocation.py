@@ -80,7 +80,7 @@ class PlanTest(_TwoHosts):
         self.assertIsNotNone(plan)
         self.assertEqual(plan["target"], "banc")
         self.assertFalse(plan["keep_session"])
-        self.assertIn("sous pression", plan["reason"])
+        self.assertIn("under pressure", plan["reason"])
 
     def test_aucun_candidat_disponible(self):
         self.releve("atelier", 0)
@@ -130,7 +130,7 @@ class MoveTest(_MoveCase):
         row = registry.get(self.db, "ouvrier")
         self.assertEqual(row["host"], "banc")
         self.assertIsNone(row["session_id"])                 # session non portable
-        self.assertIn("Reprise après déplacement", row["pending_prompt"])
+        self.assertIn("Resuming after a move", row["pending_prompt"])
         self.assertIn("consigne en attente", row["pending_prompt"])
         verdict = self.db.query("SELECT placement_ok FROM agent_registry "
                                 "WHERE name = 'ouvrier'")[0]
@@ -234,7 +234,7 @@ class RunnerRelocationTest(_MoveCase):
         self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
         row = registry.get(self.db, "ouvrier")
         self.assertEqual(row["host"], "banc")
-        self.assertIn("Reprise après déplacement", row["pending_prompt"])
+        self.assertIn("Resuming after a move", row["pending_prompt"])
         # l'exécuteur de l'hôte d'arrivée réclame et fait le tour
         env_b = self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
                          AMEESH_HOST="banc")
