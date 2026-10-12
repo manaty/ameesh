@@ -41,12 +41,22 @@ it or executes an artifact.
      "schema": "ameesh",
      "driver": "psycopg",
      "execution_user": "ameesh-it-run",
+     "snapshot_root": "/var/lib/ameesh-it-proof",
      "runners": ["/usr/bin/python3"]
    }
    ```
 
    Root's pgpass can hold the password. Approved runners and their dependencies
    must be trusted; a caller cannot choose `/bin/true` as a fake interpreter.
+   Create the root-owned `snapshot_root` on disk, mode 0755, with all parent
+   directories root-owned and unmodifiable by agents. Never place it in an
+   executor-owned TMPDIR. Each request streams the artifact from an O_NOFOLLOW
+   descriptor into a helper-owned copy, makes that copy mode 0555, hashes it,
+   checks the declared digest and executes only the copy. The helper never
+   rereads the original path after copying. It deletes the snapshot at exit;
+   proof keeps its digest and actual command. Source substitution cannot change
+   the executed bytes. Artifact-relative dependencies must be bundled or passed
+   explicitly; a sibling directory of the original artifact is not copied.
    Direct executable artifacts need no runner. The worker account's environment
    contains only PATH, HOME and LANG, and it runs from `/`; provide any needed
    test inputs as explicit artifact arguments.
@@ -65,7 +75,7 @@ An agent declares its delivery with `ameesh module it delivery <lot> --artifact
 /path/to/artifact [--runner /usr/bin/python3] [--timeout 60] -- <artifact args>`.
 The CLI passes execution inputs through stdin to the fixed helper. The project
 selects a private configuration; the helper rechecks that this project owns the
-lot and is active, obtains the current declaration, executes, checks SHA-256
+lot and is active, obtains the current declaration, executes its protected snapshot, checks the snapshot SHA-256
 before/after and records evidence under its isolated role. Client-supplied
 command/output/exit/digest/binding fields are rejected. Database guards recheck
 the declaration under the lot lock before accepting evidence.

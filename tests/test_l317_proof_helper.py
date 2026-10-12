@@ -46,7 +46,7 @@ class ProofHelperTest(unittest.TestCase):
             result = proof_service.produce(mock.Mock(), self.payload(), actor="uid:1000", execution_user="worker")
         self.assertEqual(result, {"id": 17})
         prove.assert_called_once_with(mock.ANY, 1, "/artifact", actor="uid:1000", runner=None,
-                                      arguments=[], timeout=60., execution_user="worker")
+                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None)
 
     def test_cli_uses_fixed_privileged_entry_without_evidence_or_config_arguments(self):
         process = mock.Mock(returncode=0, stdout=json.dumps({"milestone": {"id": 17}}))
@@ -69,8 +69,9 @@ class ProofHelperTest(unittest.TestCase):
         process.stdout.read.side_effect = [b"smoke", b""]
         with mock.patch("pwd.getpwnam", return_value=account), \
                 mock.patch("os.geteuid", return_value=0), \
-                mock.patch("subprocess.Popen", return_value=process) as popen:
-            execute(artifact, execution_user="worker")
+                mock.patch("subprocess.Popen", return_value=process) as popen, \
+                mock.patch.object(proof_service, "private_path", return_value=folder.name):
+            execute(artifact, execution_user="worker", snapshot_root=folder.name)
         _, options = popen.call_args
         self.assertEqual(options["user"], 65534)
         self.assertEqual(options["group"], 65534)
@@ -93,18 +94,21 @@ class ProofHelperTest(unittest.TestCase):
             if any(parent.stat().st_mode & 0o001 == 0 for parent in Path(folder).parents):
                 self.skipTest("worker cannot traverse this runner's private temporary directory")
             artifact = Path(folder, "artifact.py")
-            artifact.write_text("import os\nprint(os.geteuid(), os.environ.get('PGPASSWORD', 'absent'))\n")
+            artifact.write_text("import os\nprint(os.geteuid(), os.environ.get('PGPASSWORD', 'absent'), os.access(__file__, os.W_OK))\n")
             artifact.chmod(0o644)
-            code = ("import sys, os, json; sys.path.insert(0, sys.argv[1]); "
+            code = ("import sys, os, json, tempfile; sys.path.insert(0, sys.argv[1]); "
                     "from ameesh.modules.it.execution import execute; "
                     "os.environ['PGPASSWORD'] = 'service-secret'; "
-                    "print(json.dumps(execute(sys.argv[2], runner=sys.executable, execution_user='nobody'))) ")
+                    "root = tempfile.TemporaryDirectory(dir='/var/lib'); os.chmod(root.name, 0o755); "
+                    "print(json.dumps(execute(sys.argv[2], runner=sys.argv[3], execution_user='nobody', "
+                    "snapshot_root=root.name))); root.cleanup()")
             result = subprocess.run(["sudo", "-n", sys.executable, "-I", "-c", code,
-                                     str(Path(__file__).resolve().parents[1] / "src"), str(artifact)],
+                                     str(Path(__file__).resolve().parents[1] / "src"), str(artifact),
+                                     "/usr/bin/python3"],
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
             observed = json.loads(result.stdout)
-            self.assertEqual(observed["output"], "%s absent" % account.pw_uid)
+            self.assertEqual(observed["output"], "%s absent False" % account.pw_uid)
             self.assertEqual(observed["exit_code"], 0)
 
     def test_helper_rejects_unprivileged_start_and_writable_configuration(self):

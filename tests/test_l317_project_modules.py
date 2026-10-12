@@ -104,7 +104,10 @@ class ExecutionTest(unittest.TestCase):
         self.write("import sys\nprint('started:', sys.argv[1])\n")
         evidence = execute(self.artifact, runner=sys.executable, arguments=["smoke"])
         self.assertEqual(evidence["sha256"], digest(self.artifact)[1])
-        self.assertEqual(evidence["command"], [sys.executable, str(self.artifact), "smoke"])
+        self.assertEqual(evidence["command"], [sys.executable, evidence["executed_artifact"], "smoke"])
+        self.assertNotEqual(evidence["executed_artifact"], str(self.artifact))
+        self.assertEqual(evidence["artifact"], str(self.artifact))
+        self.assertFalse(Path(evidence["executed_artifact"]).exists())
         self.assertEqual(evidence["output"], "started: smoke")
         self.assertEqual(evidence["exit_code"], 0)
 
@@ -118,9 +121,49 @@ class ExecutionTest(unittest.TestCase):
                             timeout=.1 if error == "timed out" else 5)
 
     def test_changed_artifact_is_not_proof(self):
-        self.write("from pathlib import Path\nPath(__file__).write_text('changed')\nprint('ok')\n")
+        self.write("from pathlib import Path\np=Path(__file__); p.chmod(0o755); p.write_text('changed')\nprint('ok')\n")
         with self.assertRaisesRegex(ValueError, "changed during"):
             execute(self.artifact, runner=sys.executable)
+
+    def test_source_A_B_A_substitution_executes_only_the_hashed_snapshot(self):
+        original = "print('real artifact A')"
+        replacement = "print('trivial artifact B')"
+        self.write(original)
+        sha = digest(self.artifact)[1]
+        import subprocess
+        launch = subprocess.Popen
+
+        def swap_source(command, **options):
+            self.artifact.write_text(replacement)
+            try:
+                self.assertNotEqual(command[1], str(self.artifact))
+                self.assertEqual(Path(command[1]).read_text(), original)
+                return launch(command, **options)
+            finally:
+                self.artifact.write_text(original)
+
+        with mock.patch("ameesh.modules.it.execution.subprocess.Popen", side_effect=swap_source):
+            evidence = execute(self.artifact, runner=sys.executable, expected_sha=sha)
+        self.assertEqual(evidence["output"], "real artifact A")
+        self.assertEqual(evidence["sha256"], sha)
+        self.assertEqual(self.artifact.read_text(), original)
+
+    def test_changed_source_during_run_does_not_rebind_the_snapshot(self):
+        self.write("from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('changed source')\nprint('snapshot ran')")
+        sha = digest(self.artifact)[1]
+        evidence = execute(self.artifact, runner=sys.executable, arguments=[str(self.artifact)], expected_sha=sha)
+        self.assertEqual(evidence["sha256"], sha)
+        self.assertEqual(evidence["output"], "snapshot ran")
+        self.assertEqual(self.artifact.read_text(), "changed source")
+
+    def test_symlink_artifact_is_refused_without_execution(self):
+        self.write("print('real')")
+        link = Path(self.folder.name, "symlink.py")
+        link.symlink_to(self.artifact)
+        with mock.patch("ameesh.modules.it.execution.subprocess.Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                execute(link, runner=sys.executable)
+        launch.assert_not_called()
 
     def test_output_is_drained_with_bounded_memory(self):
         self.write("print('x' * 2000000)\n")
@@ -146,7 +189,7 @@ class ExecutionTest(unittest.TestCase):
         self.write("print('ok')")
         with mock.patch.object(it, "item"), \
                 mock.patch.object(ModuleStore, "latest", return_value={"id": 1, "subject": "0" * 64}), \
-                mock.patch("ameesh.modules.it.execution.execute") as run:
+                mock.patch("ameesh.modules.it.execution.subprocess.Popen") as run:
             with self.assertRaisesRegex(ValueError, "nothing executed"):
                 it.prove(mock.Mock(), 1, self.artifact, actor="test")
         run.assert_not_called()

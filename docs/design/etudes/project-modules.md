@@ -63,3 +63,16 @@ writes take its exclusive counterpart. Projects without active modules take
 no project lock, and independent lots no longer serialize or deadlock merely
 because they share a project. Declaration/evidence ordering remains protected
 by the lot row lock.
+
+# Review r2 correction (12 October 2026, mesh-design at 11:03)
+
+Hashing the caller's path before and after execution permits A/B/A substitution.
+The helper now opens the source with O_NOFOLLOW, streams it into a helper-owned
+snapshot under a protected root-owned parent, marks the copy read/execute-only,
+and hashes those exact copied bytes. It checks the delivery digest before
+launching and executes only the snapshot. No subsequent read of the source
+path participates in proof. The unprivileged artifact UID and executor cannot
+modify or replace the snapshot. Evidence retains the source path, executed
+snapshot path and argv; the copy is removed when execution finishes. Tests
+replace A by B at Popen then restore A, assert A output, refuse symlinks and
+check that a source mutation cannot alter the snapshot binding.

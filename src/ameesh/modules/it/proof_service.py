@@ -19,7 +19,7 @@ def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
     runner_path = shutil.which(runner) if runner else None
     if runner and runner_path is None:
         raise ValueError("runner executable not found")
-    payload = dict(project=project, lot=int(lot), artifact=str(Path(artifact).resolve()),
+    payload = dict(project=project, lot=int(lot), artifact=str(Path(artifact).absolute()),
                    runner=runner_path, arguments=list(arguments), timeout=timeout)
     try:
         result = subprocess.run(["sudo", "-n", HELPER],
@@ -37,7 +37,7 @@ def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
     return response["milestone"]
 
 
-def produce(db, payload, *, actor, execution_user, allowed_runners=()):
+def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_root=None):
     from . import item, prove
     if not isinstance(payload, dict) or set(payload) != {
             "project", "lot", "artifact", "runner", "arguments", "timeout"}:
@@ -59,7 +59,7 @@ def produce(db, payload, *, actor, execution_user, allowed_runners=()):
         raise ValueError("proof helper project does not own this lot")
     return prove(db, payload["lot"], payload["artifact"], actor=actor,
                  runner=payload["runner"], arguments=payload["arguments"],
-                 timeout=float(payload["timeout"]), execution_user=execution_user)
+                 timeout=float(payload["timeout"]), execution_user=execution_user, snapshot_root=snapshot_root)
 
 
 def private_path(path, *, directory=False):
@@ -95,6 +95,7 @@ def main():
     execution_user = settings["execution_user"]
     if pwd.getpwnam(execution_user).pw_uid == 0:
         raise ValueError("execution user must be unprivileged")
+    snapshot_root = private_path(settings.get("snapshot_root", "/var/lib/ameesh-it-proof"), directory=True)
     cfg = config.load(env={"AMEESH_CONFIG": config_path})
     db = db_mod.connect(cfg)
     try:
@@ -107,7 +108,8 @@ def main():
         if not rows or rows[0]["unsafe"] or not rows[0]["writer"]:
             raise ValueError("helper requires the isolated nonadministrative IT proof database role")
         result = produce(db, payload, actor="uid:%s" % os.environ.get("SUDO_UID", "0"),
-                         execution_user=execution_user, allowed_runners=settings.get("runners", []))
+                         execution_user=execution_user, allowed_runners=settings.get("runners", []),
+                         snapshot_root=snapshot_root)
         print(json.dumps({"milestone": result}, default=str))
     finally:
         db.close()
