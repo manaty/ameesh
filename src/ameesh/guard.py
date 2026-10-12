@@ -451,27 +451,30 @@ def decide(offer: Offer, signals: dict, previous: Decision, now: float, *,
 # --------------------------------------------------------------------------
 
 def lendable(offer: Offer, reading: dict) -> dict:
-    """{cpu, memory_bytes, disk_bytes}: `resources.lendable` (L159d) when
-    there, else the warm-up values of §1.4 (25 % of the memory, 1 CPU)."""
+    """{cpu, memory_bytes, disk_bytes}, capped by the offer: `resources.lendable`
+    (L159d) when there, else the warm-up values of §1.4 (25 % of the memory,
+    1 CPU)."""
+    out = None
     found = getattr(resources, "lendable", None)
     if found is not None:
         try:
-            out = found(reading, None)
-            return {"cpu": out.get("lendable_cpu"),
-                    "memory_bytes": out.get("lendable_memory_bytes"),
-                    "disk_bytes": out.get("lendable_disk_bytes")}
+            got = found(reading, None)
+            out = {"cpu": got.get("lendable_cpu"),
+                   "memory_bytes": got.get("lendable_memory_bytes"),
+                   "disk_bytes": got.get("lendable_disk_bytes")}
         except Exception:  # noqa: BLE001 — the measure never stops the guard
             pass
-    total = reading.get("mem_total_bytes")
-    memory = int(total * WARMUP_MEMORY_SHARE) if total else None
-    if memory is not None and offer.memory_max is not None:
-        memory = min(memory, offer.memory_max)
-    cpu = WARMUP_CPU if offer.cpu_max is None else min(WARMUP_CPU, offer.cpu_max)
-    free = reading.get("disk_free_bytes")
-    disk = None if free is None else max(0, free - DEFAULT_DISK_FREE_MIN)
-    if disk is not None and offer.disk_max is not None:
-        disk = min(disk, offer.disk_max)
-    return {"cpu": cpu, "memory_bytes": memory, "disk_bytes": disk}
+    if out is None:
+        total = reading.get("mem_total_bytes")
+        free = reading.get("disk_free_bytes")
+        out = {"cpu": WARMUP_CPU,
+               "memory_bytes": int(total * WARMUP_MEMORY_SHARE) if total else None,
+               "disk_bytes": None if free is None else max(0, free - DEFAULT_DISK_FREE_MIN)}
+    for key, limit in (("cpu", offer.cpu_max), ("memory_bytes", offer.memory_max),
+                       ("disk_bytes", offer.disk_max)):
+        if out[key] is not None and limit is not None:
+            out[key] = min(out[key], limit)
+    return out
 
 
 def caps_for(cfg: GuardConfig, level: int, lend: dict, reading: dict,

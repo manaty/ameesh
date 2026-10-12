@@ -146,6 +146,16 @@ class StateTest(unittest.TestCase):
                                      100.0, reading=self.reading)
             self.assertEqual((stop["state"], stop["drain_deadline_ts"]), ("stopped", None))
 
+    def test_lendable_capped_by_the_offer(self):
+        # the measure (L159d, or the warm-up) never lends more than the offer
+        offer = guard.parse_offer({"cpu_max": 0.5, "memory_max": "4GiB", "disk_max": "10GiB"})
+        reading = dict(self.reading, mem_total_bytes=64 * GIB, mem_available_bytes=40 * GIB,
+                       app_cpu=1.0, disk_free_bytes=100 * GIB)
+        capped = {"cpu": 0.5, "memory_bytes": 4 * GIB, "disk_bytes": 10 * GIB}
+        self.assertEqual(guard.lendable(offer, reading), capped)
+        with mock.patch.object(guard.resources, "lendable", None, create=True):
+            self.assertEqual(guard.lendable(offer, reading), capped)
+
     def test_loop_seq_expiry_and_ack(self):
         clock = [1000.0]
         readings = [dict(self.reading)]
