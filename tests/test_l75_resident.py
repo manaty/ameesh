@@ -279,6 +279,16 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertTrue(driver.alive)
         self.assertEqual(self.wait(driver.send("next")).final, "ECHO:next")
 
+    def test_late_interrupt_never_reaches_the_next_turn(self):
+        driver = self.driver()
+        driver.start()
+        old = driver.send("quick")
+        self.wait(old)
+        new = driver.send("SLOW next")
+        self.assertFalse(driver._interrupt(old))
+        self.assertEqual(self.wait(new).status, resident.COMPLETED)
+        self.assertNotIn({"control": "interrupt"}, self.trace())
+
     def test_failed_turn(self):
         driver = self.driver()
         driver.start()
@@ -394,6 +404,50 @@ class CodexAppServerTest(DriverCase):
                          ["SLOW first", "follow"])
         self.assertEqual(result.usage["output_tokens"], 18)
 
+    def steer_racing_the_end(self, driver) -> None:
+        """`turn/steer` reaches the server only once the turn has ended."""
+        request = driver.peer.request
+
+        def late(method, params=None, **kwargs):
+            if method == "turn/steer":
+                self.wait(driver_turns[0])
+            return request(method, params, **kwargs)
+        driver_turns: list = []
+        driver.peer.request = late
+        return driver_turns
+
+    def test_steer_refused_after_the_end_opens_a_new_turn(self):
+        driver = self.driver()
+        driver.start()
+        turns = self.steer_racing_the_end(driver)
+        turns.append(driver.send("SLOW first", input_id="a"))
+        second = driver.steer("late", input_id="b")
+        first = self.wait(turns[0])
+        self.assertEqual(first.inputs, ("a",))  # not served by it
+        self.assertIsNot(second, turns[0])
+        self.assertEqual(self.wait(second).inputs, ("b",))
+        self.assertEqual([p["input"][0]["text"] for p in self.methods("turn/start")],
+                         ["SLOW first", "late"])
+
+    def test_steer_accepted_just_before_the_end_is_served_by_it(self):
+        driver = self.driver()
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        request = driver.peer.request
+        accepted = []
+
+        def slow_answer(method, params=None, **kwargs):
+            result = request(method, params, **kwargs)
+            if method == "turn/steer":
+                accepted.append(True)
+                self.wait(turn)  # the turn ends before the answer is handled
+            return result
+        driver.peer.request = slow_answer
+        driver.steer("steered", input_id="b")
+        self.assertTrue(accepted)
+        self.assertEqual(turn.result.inputs, ("a", "b"))
+        self.assertIn("ECHO:steered", turn.result.final)
+
     def test_interrupt(self):
         driver = self.driver()
         driver.start()
@@ -480,6 +534,15 @@ class AcpResidentTest(DriverCase):
         result = self.wait(turn)
         self.assertEqual(result.status, resident.INTERRUPTED)
         self.assertTrue(driver.alive)
+
+    def test_late_interrupt_never_reaches_the_next_turn(self):
+        driver = self.driver(env={"FAKE_ACP_MODE": "normal"})
+        driver.start()
+        old = driver.send("one")
+        self.wait(old)
+        self.assertFalse(driver._interrupt(old))
+        self.assertEqual(self.wait(driver.send("two")).status, resident.COMPLETED)
+        self.assertEqual(self.methods("session/cancel"), [])
 
     def test_exit_fails_the_turn(self):
         driver = self.driver(env={"FAKE_ACP_MODE": "exit"})

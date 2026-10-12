@@ -218,6 +218,9 @@ class ResidentDriver:
     """Common part of the drivers: turn state, results, process group."""
 
     protocol = ""
+    #: `_steer` does not wait for the harness: it runs under the lock, so
+    #: that a steered input never reaches the harness after its turn ended
+    _steer_locked = True
 
     def __init__(self, adapter: HarnessAdapter, *, cwd: str, session: str | None = None,
                  model: str | None = None, effort: str | None = None,
@@ -247,6 +250,8 @@ class ResidentDriver:
         self._lock = threading.RLock()
         self._turn: Turn | None = None
         self._followups: list[tuple[str, str]] = []
+        #: steered inputs not yet accepted by the harness
+        self._unconfirmed: set[str] = set()
         self._interrupting = False
         self._closed = False
         self._dead: str | None = None
@@ -318,20 +323,32 @@ class ResidentDriver:
         with self._lock:
             self._usable()
             turn = self._turn
-            if turn is None:
-                return self.send(text, input_id)
-            turn.inputs.append(input_id)
-        self._steer(turn, text, input_id)
-        return turn
+            if turn is not None:
+                turn.inputs.append(input_id)
+                if self._steer_locked:
+                    # written before the turn can end: never into the next one
+                    try:
+                        self._steer(turn, text, input_id)
+                    except BaseException:
+                        turn.inputs.remove(input_id)
+                        raise
+                    return turn
+                # served only once the harness accepts it (`_finish` leaves
+                # it out until then: retried rather than lost)
+                self._unconfirmed.add(input_id)
+        if turn is None:
+            return self.send(text, input_id)
+        return self._steer(turn, text, input_id) or turn
 
     def interrupt(self) -> bool:
         """End the running turn without killing the harness (False: no turn)."""
         with self._lock:
-            if self._turn is None:
+            turn = self._turn
+            if turn is None:
                 return False
             self._followups.clear()
             self._interrupting = True
-        return self._interrupt()
+        return self._interrupt(turn)
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
         """Does the harness answer? (process alive at least)"""
@@ -399,11 +416,13 @@ class ResidentDriver:
             result = TurnResult(
                 status=status, final=self._final[-FINAL_MAX_CHARS:],
                 error=error if error is not None else self._error,
-                session=self.session_id, inputs=tuple(current.inputs), usage=usage,
+                session=self.session_id, usage=usage,
+                inputs=tuple(i for i in current.inputs if i not in self._unconfirmed),
                 cost=self._cost, cost_total=self._cost_total,
                 duration_s=round(time.monotonic() - current.started, 3))
             self._turn = None
             self._followups.clear()
+            self._unconfirmed.clear()
             self._interrupting = False
         current._set(result)
 
@@ -424,10 +443,12 @@ class ResidentDriver:
     def _begin(self, text: str, input_id: str) -> None:
         raise NotImplementedError
 
-    def _steer(self, turn: Turn, text: str, input_id: str) -> None:
+    def _steer(self, turn: Turn, text: str, input_id: str) -> Turn | None:
+        """Serve the input in `turn`; another turn if it serves it instead."""
         raise NotImplementedError
 
-    def _interrupt(self) -> bool:
+    def _interrupt(self, turn: Turn) -> bool:
+        """Interrupt `turn`, never the turn after it."""
         raise NotImplementedError
 
 
@@ -500,15 +521,24 @@ class ClaudeStreamJson(ResidentDriver):
             except (BrokenPipeError, OSError, ValueError) as exc:
                 raise ResidentError("cannot write to the harness: %s" % exc)
 
-    def _control(self, request: dict, timeout: float) -> dict:
+    def _control(self, request: dict, timeout: float, *,
+                 turn: Turn | None = None) -> dict | None:
+        """Send a control request and wait for its answer; with `turn`, only
+        if it is still the running turn (None otherwise)."""
         with self._lock:
+            if turn is not None and self._turn is not turn:
+                return None
             self._control_seq += 1
             request_id = "ameesh-%d" % self._control_seq
             slot = {"event": threading.Event(), "response": None}
             self._controls[request_id] = slot
+            try:
+                self._write({"type": "control_request", "request_id": request_id,
+                             "request": request})
+            except ResidentError:
+                self._controls.pop(request_id, None)
+                raise
         try:
-            self._write({"type": "control_request", "request_id": request_id,
-                         "request": request})
             deadline = time.monotonic() + timeout
             while not slot["event"].wait(0.1):
                 if self._dead is not None or (self._proc and self._proc.poll() is not None):
@@ -543,13 +573,13 @@ class ClaudeStreamJson(ResidentDriver):
         # written at once: the harness reads it at the next safe point
         self._user(text, new_id())
 
-    def _interrupt(self) -> bool:
+    def _interrupt(self, turn: Turn) -> bool:
         try:
-            self._control({"subtype": "interrupt"}, CONTROL_TIMEOUT)
+            return self._control({"subtype": "interrupt"}, CONTROL_TIMEOUT,
+                                 turn=turn) is not None
         except ResidentError as exc:
             log("interrupt: %s" % exc)
             return False
-        return True
 
     # -- reading -----------------------------------------------------------
     def _read_loop(self) -> None:
@@ -652,7 +682,9 @@ class ClaudeStreamJson(ResidentDriver):
                 status = FAILED
                 error = "; ".join(str(e) for e in errors) if isinstance(errors, list) \
                     and errors else str(event.get("subtype") or "harness error")
-        self._finish(status, error)
+            # under the lock: a steer either was written before (and read) or
+            # finds no turn and opens the next one
+            self._finish(status, error)
 
 
 # --------------------------------------------------------------------------
@@ -663,6 +695,8 @@ class CodexAppServer(ResidentDriver):
     """`codex app-server`: one thread, one `turn/start` per turn."""
 
     protocol = "codex-app-server"
+    #: `turn/steer` waits for the server's answer
+    _steer_locked = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -759,7 +793,7 @@ class CodexAppServer(ResidentDriver):
             self._turn_id = None
         self._turn_start(text)
 
-    def _steer(self, turn: Turn, text: str, input_id: str) -> None:
+    def _steer(self, turn: Turn, text: str, input_id: str) -> Turn | None:
         assert self.peer is not None
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
@@ -775,23 +809,32 @@ class CodexAppServer(ResidentDriver):
                                                  "expectedTurnId": turn_id,
                                                  "input": self._input(text)},
                                   timeout=CONTROL_TIMEOUT)
-                return
             except acp.AcpError as exc:
                 log("turn/steer refused (%s): the input follows in the same turn" % exc)
+            else:
+                with self._lock:
+                    self._unconfirmed.discard(input_id)
+                    result = turn.result
+                    if result is not None and input_id not in result.inputs:
+                        # accepted just before the end of the turn: served by it
+                        result.inputs = (*result.inputs, input_id)
+                return
         with self._lock:
+            self._unconfirmed.discard(input_id)
             if self._turn is turn:
                 # served by a new harness turn when the current one completes
                 self._followups.append((input_id, text))
                 return
-        self.send(text, input_id)
+        # the turn ended without it (left out of its inputs): a new turn
+        return self.send(text, input_id)
 
-    def _interrupt(self) -> bool:
+    def _interrupt(self, turn: Turn) -> bool:
         assert self.peer is not None
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
             with self._lock:
                 turn_id = self._turn_id
-                running = self._turn is not None
+                running = self._turn is turn
             if turn_id or not running or time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
@@ -888,6 +931,8 @@ class CodexAppServer(ResidentDriver):
         status = turn.get("status")
         error = (turn.get("error") or {}).get("message") if isinstance(turn.get("error"), dict) \
             else None
+        # decided and ended under the lock: a steer either joins as a
+        # follow-up or finds no turn
         with self._lock:
             if self._turn is None:
                 return
@@ -895,18 +940,16 @@ class CodexAppServer(ResidentDriver):
                 return  # end of a turn that is not ours
             followup = self._take_followup()
             self._turn_id = None
-            interrupting = self._interrupting
-        if followup is not None:
-            # not from the reader thread: it must stay free to read the answer
-            threading.Thread(target=self._serve_followup, args=(followup,), daemon=True,
-                             name="resident-codex-followup").start()
-            return
-        if status == "completed":
-            self._finish(COMPLETED)
-        elif status == "interrupted" or interrupting:
-            self._finish(INTERRUPTED, error)
-        else:
-            self._finish(FAILED, error or "turn %s" % (status or "ended without status"))
+            if followup is not None:
+                # not from the reader thread: it must stay free to read the answer
+                threading.Thread(target=self._serve_followup, args=(followup,),
+                                 daemon=True, name="resident-codex-followup").start()
+            elif status == "completed":
+                self._finish(COMPLETED)
+            elif status == "interrupted" or self._interrupting:
+                self._finish(INTERRUPTED, error)
+            else:
+                self._finish(FAILED, error or "turn %s" % (status or "ended without status"))
 
     def _serve_followup(self, followup: tuple[str, str]) -> None:
         with self._lock:
@@ -1068,24 +1111,27 @@ class AcpResident(ResidentDriver):
                     client._last_cost - (client._first_cost or 0.0), 0.0)
                 self._cost = (self._cost or 0.0) + cost
                 self._cost_total = client._last_cost
-            followup = self._take_followup()
-            interrupting = self._interrupting
         parsed = {"display": ["%s (%s)" % (adapters.END_OF_TURN_MARK, stop)]}
         if error:
             parsed["error"] = error
         self._emit({"type": "prompt_end", "stopReason": stop}, parsed)
-        if followup is not None:
-            try:
-                self._prompt(followup[1])
-            except ResidentError as exc:
-                self._finish(FAILED, str(exc), turn=turn)
-            return
-        if stop == "end_turn":
-            self._finish(COMPLETED, turn=turn)
-        elif stop == "cancelled" or interrupting:
-            self._finish(INTERRUPTED, turn=turn)
-        else:
-            self._finish(FAILED, error or "ACP turn ended: %s" % stop, turn=turn)
+        # decided and ended under the lock: a steer either joins as a
+        # follow-up (its `session/cancel` already written) or finds no turn
+        with self._lock:
+            if self._turn is not turn:
+                return
+            followup = self._take_followup()
+            if followup is not None:
+                try:
+                    self._prompt(followup[1])
+                except ResidentError as exc:
+                    self._finish(FAILED, str(exc), turn=turn)
+            elif stop == "end_turn":
+                self._finish(COMPLETED, turn=turn)
+            elif stop == "cancelled" or self._interrupting:
+                self._finish(INTERRUPTED, turn=turn)
+            else:
+                self._finish(FAILED, error or "ACP turn ended: %s" % stop, turn=turn)
 
     def _cancel(self) -> bool:
         client = self.client
@@ -1100,20 +1146,16 @@ class AcpResident(ResidentDriver):
         return True
 
     def _steer(self, turn: Turn, text: str, input_id: str) -> None:
-        with self._lock:
-            if self._turn is not turn:
-                running = False
-            else:
-                running = True
-                self._followups.append((input_id, text))
-        if not running:
-            self.send(text, input_id)
-            return
-        # ACP has no steer: the prompt in flight is cancelled, the input follows
+        # under the lock, turn running: ACP has no steer, so the prompt in
+        # flight is cancelled and the input follows in a new prompt
+        self._followups.append((input_id, text))
         self._cancel()
 
-    def _interrupt(self) -> bool:
-        return self._cancel()
+    def _interrupt(self, turn: Turn) -> bool:
+        with self._lock:
+            if self._turn is not turn:
+                return False  # ended meanwhile: the next turn is not touched
+            return self._cancel()
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
         client = self.client
