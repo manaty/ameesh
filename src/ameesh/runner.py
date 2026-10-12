@@ -4916,6 +4916,21 @@ class Runner:
                 except Exception:
                     pass
 
+    def lot_sessions_purge(self, db) -> list[dict]:
+        """#408 : les sessions mises de côté (et les réveils) des lots
+        fusionnés, livrés, fermés ou réassignés sont oubliées ; les
+        transcripts du harnais restent au ménage. Ne lève jamais."""
+        try:
+            purges = storage.of(db).lot_sessions.purge()
+        except db_mod.DbError as exc:
+            log_async("lot sessions not purged (%s)" % exc)
+            return []
+        for row in purges:
+            if row.get("session_id"):
+                log_async("[%s] session %s of lot #%s forgotten (lot finished or reassigned)"
+                          % (row["agent"], row["session_id"], row["work_item_id"]))
+        return purges
+
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
@@ -4935,6 +4950,7 @@ class Runner:
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
             if not self.dry_run:
                 self.measure_once(db)
+                self.lot_sessions_purge(db)
             self.radar_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur

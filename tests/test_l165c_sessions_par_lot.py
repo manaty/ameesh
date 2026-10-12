@@ -297,3 +297,16 @@ class ReveilTest(_Base):
         b = work.add(self.db, title="à faire", assignee="r6")["id"]
         work.note(self.db, b, "hold: attend l'hôte de test", actor="r6")
         self.assertIsNone(self.pick(worker))
+
+
+class PurgeTest(_Base):
+    def test_le_releve_des_branches_purge_les_lots_finis(self):
+        runner, lease = self.bail("p1")
+        a = work.add(self.db, title="A", assignee="p1")["id"]
+        b = work.add(self.db, title="B", assignee="p1")["id"]
+        for lot in (a, b):
+            self.st.note_wake("p1", lot, time.time())
+        work.close(self.db, a, abandoned=True, actor="test")
+        purges = runner.lot_sessions_purge(self.db)
+        self.assertEqual([r["work_item_id"] for r in purges], [a])
+        self.assertEqual([r["work_item_id"] for r in self.st.listing("p1")], [b])
