@@ -40,10 +40,10 @@
 #                        read at its merged branch by ameesh's own reader, as
 #                        the checkout's owner: each agent's project and work
 #                        folder on --host (under $ROOT/work, refused elsewhere)
-#   --repo P=URL#BRANCH  with --enable: the forge of project P, which the
-#                        canon does not hold (repeatable), https without
+#   --repo P=URL#BRANCH  with --enable: the forge of project P, never from the
+#                        canon (repeatable): https without
 #                        user or token in it, e.g.
-#                        nexlink=https://github.com/manaty/nexlink.git#develop
+#                        P=https://github.com/ORG/REPO.git#BRANCH
 #   --dsh-from DIR       with --enable: the ~/.dsh whose hooks.json and
 #                        profiles/ the guest gets (default: the sudo user's)
 #   --check              report the state of everything installed

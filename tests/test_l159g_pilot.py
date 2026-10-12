@@ -212,13 +212,13 @@ class InstallPilotTest(unittest.TestCase):
 
     # --- the guests' workspace (#483): clone, git credential, dsh profile ---
 
-    REPO_ARG = "nexlink=https://github.com/manaty/nexlink.git#develop"
+    REPO_ARG = "proj-a=https://github.com/example-org/proj-a.git#develop"
     TOKEN = "ghp_" + "T0k3n" * 6
 
     def canon(self, work="/srv/ameesh-guest/work/{agent}", agents=("deepseek5", "deepseek6"),
-              placed=("deepseek5", "deepseek6")):
+              placed=("deepseek5", "deepseek6"), team="proj-a"):
         """A canon of the test's own, a git checkout read at origin/main: the
-        agents on project nexlink, their work folders on host vm-test."""
+        agents on project TEAM, their work folders on host vm-test."""
         root = os.path.join(self.host, "canon")
         if os.path.isdir(root):
             subprocess.run(["rm", "-rf", root], check=True)
@@ -228,8 +228,8 @@ class InstallPilotTest(unittest.TestCase):
                 fh.write("---\n%s---\n" % text)
         for a in agents:
             fiche("agents/%s.md" % a, "type: Agent\ntitle: %s\nresponsible: human:alice\n"
-                  "team: nexlink\nharness: deepseek\nprovider: deepseek\n"
-                  "credential_mode: api-key\n" % a)
+                  "team: %s\nharness: deepseek\nprovider: deepseek\n"
+                  "credential_mode: api-key\n" % (a, team))
         for a in placed:
             fiche("placements/%s-vm-test.md" % a, "type: Placement\ntitle: %s@vm-test\n"
                   "agent: %s\nhost: vm-test\ncredential_mode: api-key\n" % (a, a))
@@ -298,7 +298,7 @@ class InstallPilotTest(unittest.TestCase):
         self.assertIn("| runuser -u ameesh-guest -- tar -C /srv/ameesh-guest/home/.dsh -xf -", tar)
         # the clone, from the canon's project and folder, by the guest, detached
         self.assertIn("+ runuser -u ameesh-guest -- git -C /srv/ameesh-guest/work clone --quiet "
-                      "--no-checkout -- https://github.com/manaty/nexlink.git "
+                      "--no-checkout -- https://github.com/example-org/proj-a.git "
                       "/srv/ameesh-guest/work/deepseek6", out)
         self.assertIn("+ runuser -u ameesh-guest -- git -C /srv/ameesh-guest/work/deepseek6 "
                       "checkout --quiet --detach origin/develop", out)
@@ -324,7 +324,7 @@ class InstallPilotTest(unittest.TestCase):
             res = subprocess.run(
                 ["git", "-c", "credential.helper=",
                  "-c", "credential.https://github.com.helper=" + helper, "credential", "fill"],
-                input="protocol=https\nhost=%s\npath=manaty/nexlink.git\n\n" % host,
+                input="protocol=https\nhost=%s\npath=example-org/proj-a.git\n\n" % host,
                 capture_output=True, text=True, env=env)
             return res.stdout
         self.assertIn("username=x-access-token\npassword=%s\n" % self.TOKEN, fill("github.com"))
@@ -343,16 +343,16 @@ class InstallPilotTest(unittest.TestCase):
             self.assertNotIn("+ ", res.stdout, args)     # nothing done, not even printed
             self.canon()
         refused(why="--enable needs --canon DIR")
-        refused(*self.workspace_args(repo=False), why="--repo nexlink=https://")
-        for url in ("https://x:tok@github.com/manaty/nexlink.git", "http://github.com/m/n",
+        refused(*self.workspace_args(repo=False), why="--repo proj-a=https://")
+        for url in ("https://x:tok@github.com/example-org/proj-a.git", "http://github.com/m/n",
                     "https://github.com/m/n?x=1", "git@github.com:m/n.git"):
             res = self.dry("--enable", "deepseek6", "--canon", self.canon(),
-                           "--repo", "nexlink=%s#develop" % url)
+                           "--repo", "proj-a=%s#develop" % url)
             self.assertNotEqual(res.returncode, 0, url)
             self.assertNotIn("tok@", res.stdout)
         for branch in ("-x", "a..b", "a b"):
             res = self.dry("--enable", "deepseek6", "--canon", self.canon(),
-                           "--repo", "nexlink=https://github.com/m/n#%s" % branch)
+                           "--repo", "proj-a=https://github.com/m/n#%s" % branch)
             self.assertNotEqual(res.returncode, 0, branch)
         args = self.workspace_args()
         refused(*args, why="deepseek6: not placed on vm-test", placed=("deepseek5",))
@@ -369,14 +369,14 @@ class InstallPilotTest(unittest.TestCase):
     def test_enable_keeps_what_is_there(self):
         # bureau's activation: a clone (its URL without .git) and a profile
         self.on_host("/srv/ameesh-guest/work/deepseek6/.git/config",
-                     '[remote "origin"]\n\turl = https://github.com/manaty/nexlink\n')
+                     '[remote "origin"]\n\turl = https://github.com/example-org/proj-a\n')
         self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
         self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent")
         res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False))
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout
         self.assertIn("kept /srv/ameesh-guest/work/deepseek6: a clone of "
-                      "https://github.com/manaty/nexlink (never fetched nor reset here)", out)
+                      "https://github.com/example-org/proj-a (never fetched nor reset here)", out)
         self.assertIn("kept /srv/ameesh-guest/home/.dsh: hooks.json and profiles there", out)
         self.assertNotIn("git -C /srv/ameesh-guest/work clone", out)
         self.assertNotIn("+ tar", out)
@@ -440,14 +440,14 @@ class InstallPilotTest(unittest.TestCase):
         self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
         self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml", "[]\n")
         self.on_host("/srv/ameesh-guest/work/deepseek6/.git/config",
-                     '[remote "origin"]\n\turl = https://github.com/manaty/nexlink.git\n')
+                     '[remote "origin"]\n\turl = https://github.com/example-org/proj-a.git\n')
         self.on_host("/srv/ameesh-guest/work/deepseek6/.git/HEAD", "0123456789abcdef0123\n")
         out = self.run_script("--check", "--host", "vm-test", "--canon", self.canon()).stdout
         self.assertIn("ok   /opt/ameesh/git-credential-guest (git credential helper, root 755)", out)
         self.assertIn("ok   /srv/ameesh-guest/home/.gitconfig: credential.https://github.com.helper", out)
         self.assertIn("ok   /srv/ameesh-guest/home/.dsh: hooks.json, profiles agent", out)
         self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: a clone of "
-                      "https://github.com/manaty/nexlink.git, detached at 0123456789ab", out)
+                      "https://github.com/example-org/proj-a.git, detached at 0123456789ab", out)
         # without --canon: the folder taken for $ROOT/work/<agent>
         out = self.run_script("--check", "--host", "vm-test").stdout
         self.assertIn("no --canon: each work folder taken for /srv/ameesh-guest/work/<agent>", out)
@@ -742,10 +742,13 @@ class InstallPilotTest(unittest.TestCase):
             if m:
                 commands.append(shlex.split(m.group(1)))
         self.assertGreaterEqual(len(commands), 8)
-        canon = self.canon(agents=("deepseek6", "deepseek1"), placed=("deepseek6", "deepseek1"))
-        dsh = self.dsh()
         enable = [a for a in commands if "--enable" in a]
         self.assertTrue(enable and all("--canon" in a and "--repo" in a for a in enable), enable)
+        # the project is the runbook's own (--repo P=…): ameesh names none
+        team = enable[0][enable[0].index("--repo") + 1].split("=", 1)[0]
+        canon = self.canon(agents=("deepseek6", "deepseek1"), placed=("deepseek6", "deepseek1"),
+                           team=team)
+        dsh = self.dsh()
         for args in commands:
             args = [a for a in args if a != "--dry-run"]
             if "--host" not in args:
