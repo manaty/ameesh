@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 333,
+  "interface_total": 354,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3711,7 +3711,8 @@
    "visibility": "visibilité 0029 : serveur seulement",
    "wakeups": "hors du sous-ensemble de l'exécuteur médié",
    "work": "hors du sous-ensemble de l'exécuteur médié",
-   "watches": "CI watches: mesh server only"
+   "watches": "CI watches: mesh server only",
+   "handoffs": "host handoff controller: mesh server only"
   },
   "operations": {
    "accounts": [
@@ -3785,6 +3786,7 @@
     "key_for_root",
     "lineage_rows",
     "lock_default_state",
+    "lot_projects",
     "move_host",
     "rebase_default",
     "record_auth_state",
@@ -3855,6 +3857,7 @@
     "revoke"
    ],
    "hosts": [
+    "gate_guard",
     "harness_versions",
     "history",
     "lend_basis",
@@ -3994,6 +3997,7 @@
     "add",
     "add_milestone",
     "assign",
+    "assignment_events",
     "auto_takes_since",
     "backlog",
     "backlog_add",
@@ -4009,6 +4013,8 @@
     "estimates",
     "events",
     "events_noted",
+    "handoff",
+    "handoff_lots",
     "issue_feed",
     "items",
     "link_package",
@@ -4052,6 +4058,24 @@
     "deliver",
     "list",
     "put"
+   ],
+   "handoffs": [
+    "active",
+    "begin_effect",
+    "controller",
+    "cooling",
+    "drain",
+    "events",
+    "finish_effect",
+    "get",
+    "hold",
+    "occupancy",
+    "prepare_reconcile",
+    "renew",
+    "reserve",
+    "switch",
+    "transition",
+    "unfence"
    ]
   }
  },
