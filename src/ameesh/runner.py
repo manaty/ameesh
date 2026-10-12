@@ -2153,6 +2153,26 @@ class AgentWorker(threading.Thread):
             self.agent = dict(agent, status="idle", status_text="")
             log_async("[%s] budget pause lifted (%s)" % (self.name, texte))
 
+    def turn_harness(self) -> str:
+        """L242b (3) : le harnais de ce tour (`account_turn._harness`) — le
+        sien, ou celui qu'un agent critique emprunte, ou celui d'un résumé de
+        rotation."""
+        return account_turn._harness(self) or "other"
+
+    def _ledger_harness(self) -> str:
+        """Le harnais du dernier tour lancé (noté avant le lancement) : celui
+        de sa ligne de grand livre, même rejouée après une panne."""
+        return self._state_read("turn_harness") or (self.agent or {}).get("harness") or ""
+
+    def _state_note(self, key: str, value: str) -> None:
+        """Écrit une valeur d'état locale ; jamais fatal."""
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(os.path.join(self.state_dir, key), "w", encoding="utf-8") as fh:
+                fh.write(value)
+        except OSError as exc:
+            log_async("[%s] state %s not written (%s)" % (self.name, key, exc))
+
     def _state_read(self, key: str) -> str:
         """Lit une valeur d'état locale (`model`, `effort`) ; '' si absente."""
         try:
@@ -2216,7 +2236,7 @@ class AgentWorker(threading.Thread):
             from . import accounts as accounts_mod
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir, db=self.db,
-                tools={self.name: self.agent.get("harness") or ""},
+                tools={self.name: self._ledger_harness()},
                 # L95 : le journal d'un fil Codex vit dans le dossier du compte
                 codex_homes=accounts_mod.homes(self.cfg, "codex"))
             # Le modèle **du tour** se relit dans les événements du tour, qui sont
@@ -2281,7 +2301,7 @@ class AgentWorker(threading.Thread):
         """
         modele = ""
         try:
-            adapter = adapters.adapter_for(self.agent.get("harness") or "other",
+            adapter = adapters.adapter_for(self._ledger_harness() or "other",
                                            resolve=False)
             with open(self._path("events.jsonl"), encoding="utf-8") as flux:
                 for numero, ligne in enumerate(flux):
@@ -2498,7 +2518,7 @@ class AgentWorker(threading.Thread):
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
             return True  # `account_turn.apply` refusera le tour, avec sa raison
-        harness = self.agent.get("harness") or ""
+        harness = self.turn_harness()
         account = auth_failure.account_name(compte)
         sick = auth_failure.failing(self.db, self.cfg.host, harness).get(account)
         if sick is None:
@@ -2786,7 +2806,7 @@ class AgentWorker(threading.Thread):
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
-        harness = self.agent.get("harness") or "other"
+        harness = self.turn_harness()
         adapter = adapters.adapter_for(harness)
         # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
         # descripteur utilisé est journalisé avec sa provenance et son empreinte,
@@ -3044,7 +3064,10 @@ class AgentWorker(threading.Thread):
     def _run_turn(self, spec: dict) -> bool:
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
-        harness = self.agent.get("harness") or "other"
+        harness = self.turn_harness()
+        # L242b (3) : un harnais emprunté ne prend ni le modèle, ni l'effort,
+        # ni le tier de l'agent (ceux de son harnais) : les défauts du sien
+        emprunte = harness != ((self.agent or {}).get("harness") or "other")
         try:
             adapter = self._adapter()
         except adapters.HarnessMissing as exc:
@@ -3070,17 +3093,18 @@ class AgentWorker(threading.Thread):
             resume = self._resume_prompt()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
-        model = self.agent.get("model") or self._state_read("model")
+        model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
         if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
             # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
             # du descripteur est passé explicitement. Le modèle du tour est
             # alors connu (grand livre au bon tarif, jamais « inconnu ») au
             # lieu de dépendre du profil local du harnais.
             model = adapter.spec.defaults["model"]
-        effort = self._state_read("effort") or self.agent.get("effort") or ""
+        effort = "" if emprunte else (self._state_read("effort")
+                                      or self.agent.get("effort") or "")
         # Tier (L26) : passé par le descripteur du harnais (Codex :
         # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
-        tier = self._state_read("tier") or self.agent.get("tier") or ""
+        tier = "" if emprunte else (self._state_read("tier") or self.agent.get("tier") or "")
         patch = self._path("model.patch.yml") if (model or effort) else None
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
@@ -3230,6 +3254,8 @@ class AgentWorker(threading.Thread):
         # une trace, on ne dépense pas (fail-closed, L13 B5). Le marqueur est
         # écrit atomiquement et lu au redémarrage ; la session sera résolue par
         # `record` au moment de l'écriture.
+        # L242b (3) : le harnais de la ligne de grand livre de ce tour
+        self._state_note("turn_harness", harness)
         if not self._compta_marque(events_start, label, model):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
@@ -3262,7 +3288,7 @@ class AgentWorker(threading.Thread):
                              daemon=True).start()
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
-        empreinte = sentinel.launch_fingerprint(self.agent.get("harness") or "", compte, env)
+        empreinte = sentinel.launch_fingerprint(harness, compte, env)
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
@@ -3345,6 +3371,9 @@ class AgentWorker(threading.Thread):
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
+                        # L242b (3) : le harnais de la session (rotation au
+                        # changement de harnais, `account_turn.continuity`)
+                        self._state_note("session_harness", harness)
                         # L39 (0030) : le compte d'origine de la session, en
                         # registre avec son id (le marqueur du flux reste la
                         # source des relevés du tour)
@@ -3594,7 +3623,7 @@ class AgentWorker(threading.Thread):
                 # suivant bascule vers un compte sain, sinon l'agent reste
                 # `auth_blocked` jusqu'au retour d'un compte sain.
                 self.fast_failure = False
-                nom_harnais = self.agent.get("harness") or ""
+                nom_harnais = harness
                 account = auth_failure.account_name(compte)
                 # #210 : l'empreinte du jeton du tour (lue au lancement, pas
                 # maintenant) — la sentinelle ne lève l'échec que pour un autre
