@@ -2726,6 +2726,10 @@ class Handoffs(Domain):
         """Fence the expired source epoch after scoped quiescence and publication proof."""
 
     @abc.abstractmethod
+    def promote_loss(self, operation: str) -> dict | None:
+        """Convert a pre-switch handoff after loss, preserving its capacity reservation."""
+
+    @abc.abstractmethod
     def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
 
     @abc.abstractmethod

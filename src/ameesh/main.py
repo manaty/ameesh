@@ -247,7 +247,7 @@ def _dispatch(argv: list[str] | None) -> int:
         # L84: read API, local mode
         from . import serve
         return serve.main(rest)
-    if command == "host":
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "plan":

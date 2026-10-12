@@ -450,6 +450,12 @@ def advance(db, operation, adapter, *, enable_slot=None):
 
 
 @_serialized
+def promote_loss(db, operation, adapter):
+    """Replan a fenced pre-switch checkpoint when its source becomes lost."""
+    return storage.of(db).handoffs.promote_loss(operation)
+
+
+@_serialized
 def cancel(db, operation, adapter):
     """Only before switching hosts: reconcile stopped source, then release its fence."""
     api = storage.of(db).handoffs
@@ -463,9 +469,15 @@ def cancel(db, operation, adapter):
         raise HandoffError("lost source cannot be restored by ordinary cancellation")
     if state in ("switched", "activated", "verified"):
         raise HandoffError("destination may have new work; recovery requires reconciliation")
-    if _effect(api, adapter, "restore_source", op) is not True:
-        raise HandoffError("source recovery not verified")
-    return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
+    # Loss publication uses this same gate lock. Keep the current lifecycle
+    # check, restoration and fence release within one boundary.
+    with storage.of(db).hosts.gate_guard(op["source"]) as hosts:
+        control = storage.of(hosts.db).host_lifecycle.get(op["source"])
+        if control and control["mode"] == "lost":
+            raise HandoffError("lost source cannot be restored by ordinary cancellation")
+        if _effect(api, adapter, "restore_source", op) is not True:
+            raise HandoffError("source recovery not verified")
+        return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
 
 
 @_serialized
@@ -497,8 +509,10 @@ def retry(db, operation, adapter, *, renew_ttl=None):
         op = api.finish_effect(operation, pending["epoch"])
         if op["state"] != "held":
             op = api.hold(operation, op["state"])
-        if op["evidence"].get("cancel_requested"):
+        control = storage.of(db).host_lifecycle.get(op["source"])
+        if op["evidence"].get("cancel_requested") and (not control or control["mode"] != "lost"):
             return op  # explicit cancellation may now restore the source
+    op = api.promote_loss(operation) or op
     if _effect(api, adapter, "revalidate", op) is not True:
         raise HandoffError("host reconciliation or prerequisites changed")
     if renew_ttl is not None:

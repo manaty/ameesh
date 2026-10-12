@@ -166,6 +166,14 @@ source returns. A helper timeout leaves a pending effect requiring explicit
 reconciliation; ordinary cancellation cannot restore a lost source.
 Heartbeat absence alone never enables a second executor.
 
+If a source is lost during an existing pre-switch drain, the controller
+converts that same operation to loss recovery while preserving its destination
+reservation. It keeps the source fenced, discards stale publication/session
+proofs and obtains the scoped recovery proof before proceeding. An unknown
+effect must first be explicitly reconciled. Restoration checks the source's
+current lifecycle under its gate lock, so a planned drain cannot restore a
+source that has since become lost.
+
 All L232e host effects are currently tested with simulated adapters. The
 runner records `helper:L232b` when no enrolled implementation is supplied;
 real SSH, secret delivery and provider login integration depend on L232b/c/d.

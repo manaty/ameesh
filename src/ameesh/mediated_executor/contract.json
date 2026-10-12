@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 365,
+  "interface_total": 366,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4072,6 +4072,7 @@
     "hold",
     "occupancy",
     "prepare_reconcile",
+    "promote_loss",
     "recover_source",
     "renew",
     "reserve",

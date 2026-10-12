@@ -20,6 +20,64 @@ class RecoveryAdapter(drain_fixtures.Adapter):
 
 
 class LossRecoveryTest(drain_fixtures.DrainHandoffTest):
+    def lose_prepared_drain(self):
+        self.adapter = RecoveryAdapter()
+        self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
+        self.step()
+        op = self.step()[0]["operation"]
+        self.assertEqual(op["state"], "prepared")
+        self.db.execute("UPDATE agent_registry SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE name='dev'")
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()-interval '20 minutes' WHERE host='source'")
+        self.api.host_lifecycle.detect_losses(actor="remote", older_than=180, critical=("dev",))
+        return op
+
+    def test_cancel_planned_drain_refuses_source_that_is_now_lost(self):
+        op = self.lose_prepared_drain()
+        with self.assertRaisesRegex(handoffs.HandoffError, "lost source"):
+            handoffs.cancel(self.db, op["id"], self.adapter)
+        self.assertNotIn("restore_source", self.adapter.calls)
+        self.assertNotEqual(self.api.handoffs.get(op["id"])["state"], "cancelled")
+
+    def test_prepared_drain_enters_loss_recovery_and_reaches_verified(self):
+        op = self.lose_prepared_drain()
+        for _ in range(6):
+            result = self.step()[0]
+        self.assertEqual(result["operation"]["id"], op["id"])
+        self.assertEqual(result["operation"]["state"], "verified")
+        self.assertEqual(result["operation"]["plan"]["reason"], "host_loss")
+        self.assertIn("recover_source", self.adapter.calls)
+        self.assertNotIn("restore_source", self.adapter.calls)
+
+    def test_held_drain_retry_converts_current_lost_source_before_revalidation(self):
+        op = self.lose_prepared_drain()
+        self.api.handoffs.hold(op["id"], "prepared")
+        wrapped = host_lifecycle._ReadyAdapter(self.db, self.adapter, self.requirements)
+        retried = handoffs.retry(self.db, op["id"], wrapped)
+        self.assertEqual(retried["state"], "prepared")
+        self.assertEqual(retried["plan"]["reason"], "host_loss")
+        self.assertTrue(retried["fenced"])
+        for _ in range(6):
+            result = self.step()[0]
+        self.assertEqual(result["operation"]["state"], "verified")
+
+    def test_uncertain_old_drain_effect_must_be_reconciled_before_loss_conversion(self):
+        op = self.lose_prepared_drain()
+        with self.api.handoffs.controller(op["id"]) as journal:
+            from ameesh import storage
+            storage.of(journal).handoffs.begin_effect(op["id"], "prepared", "restore_source")
+        result = self.step()[0]
+        self.assertEqual(result["missing"], ["handoff_requires_reconciliation"])
+        self.assertEqual(result["operation"]["plan"]["reason"], "host_drain")
+        self.assertNotIn("recover_source", self.adapter.calls)
+        wrapped = host_lifecycle._ReadyAdapter(self.db, self.adapter, self.requirements)
+        retried = handoffs.retry(self.db, op["id"], wrapped)
+        self.assertEqual(retried["plan"]["reason"], "host_loss")
+        self.assertNotIn("pending_effect", retried["evidence"])
+        self.assertNotIn("cancel_requested", retried["evidence"])
+        for _ in range(6):
+            result = self.step()[0]
+        self.assertEqual(result["operation"]["state"], "verified")
+
     def lose_source(self, *, critical=True, minutes=20):
         self.adapter = RecoveryAdapter()
         self.assertTrue(registry.begin_turn(self.db, "dev", "runner", self.lease["lease_epoch"], "running"))

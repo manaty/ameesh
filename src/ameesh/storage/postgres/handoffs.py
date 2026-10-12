@@ -229,6 +229,52 @@ class Handoffs(interface.Handoffs):
                 tx.execute("UPDATE host_handoffs SET fenced=true WHERE id=%s", (operation,))
             return api.get(operation)
 
+    def promote_loss(self, operation):
+        if not isinstance(self.db, ControllerDb):
+            raise ControllerLost("loss conversion requires a controller epoch")
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["plan"].get("reason") == "host_loss" or op["state"] in TERMINAL:
+                return op
+            checkpoint = op["evidence"].get("held_at") if op["state"] == "held" else op["state"]
+            if checkpoint in ("switched", "activated", "verified"):
+                return op
+            if op["evidence"].get("pending_effect"):
+                return None
+            from .hosts import Hosts
+            Hosts._lock_gate(tx, op["source"])
+            controls = tx.query("SELECT host,generation FROM host_lifecycle WHERE host=%s AND mode='lost'",
+                                (op["source"],))
+            if not controls:
+                return op
+            rows = tx.query("SELECT *, (lease_expires_at>clock_timestamp()) AS live "
+                            "FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            if not rows:
+                return None
+            agent, plan = rows[0], op["plan"]
+            if (agent["live"] or agent["host"] != op["source"] or agent["mode"] != "execute"
+                    or agent["status"] in ("paused", "stopped") or agent["harness"] != plan["harness"]
+                    or (agent["canon"] or "") != plan["canon"] or (agent["cwd"] or "") != plan["source_cwd"]
+                    or op["target"] not in (agent["admitted_hosts"] or [])):
+                return None
+            prepared = "prepared" if op["evidence"].get("release_revision") else "planned"
+            fields = {"reason": "host_loss", "lifecycle_host": op["source"],
+                      "lifecycle_generation": controls[0]["generation"],
+                      "owner": agent["lease_owner"], "epoch": agent["lease_epoch"],
+                      "previous_reason": plan["reason"]}
+            evidence = dict(op["evidence"])
+            for key in ("branch", "commit", "repository", "cwd", "session_mode", "source_recovered", "cancel_requested", "held_at"):
+                evidence.pop(key, None)
+            if op["state"] == "held":
+                evidence["held_at"] = prepared
+            state = "held" if op["state"] == "held" else prepared
+            tx.execute("UPDATE agent_registry SET handoff_fenced=true,updated_at=now() WHERE name=%s", (op["agent"],))
+            tx.execute("UPDATE host_handoffs SET plan=plan || %s::jsonb,evidence=%s::jsonb, "
+                       "state=%s,fenced=true,updated_at=clock_timestamp() WHERE id=%s",
+                       (json.dumps(fields), json.dumps(evidence), state, operation))
+            Handoffs(tx)._event(operation, state, "source lost; reservation retained for scoped recovery")
+            return Handoffs(tx).get(operation)
+
     def recover_source(self, operation, *, proof):
         if not isinstance(self.db, ControllerDb):
             raise ControllerLost("source recovery requires a controller epoch")

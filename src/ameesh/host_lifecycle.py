@@ -101,6 +101,16 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
         if adapter is None:
             missing = ["helper:L232b"]
         elif op:
+            if (control["mode"] == "lost" and op["source"] == host
+                    and op["plan"].get("reason") != "host_loss"):
+                try:
+                    op = handoffs.promote_loss(db, op["id"], adapter) or op
+                except handoffs.HandoffError:
+                    missing.append("handoff_requires_reconciliation")
+                    api.host_lifecycle.progress(host, control["generation"], agent["name"],
+                                                operation=op["id"], missing=missing)
+                    outcomes.append({"agent": agent["name"], "operation": op, "missing": missing})
+                    continue
             wrapped = _ReadyAdapter(db, adapter, requirements_for)
             if control["mode"] == "returning" and op["plan"].get("reason") == "host_drain":
                 checkpoint = op["evidence"].get("held_at", op["state"])
