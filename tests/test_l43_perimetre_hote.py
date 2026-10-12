@@ -323,6 +323,9 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             # L159d: CPU pressure not watched, no lending offer
             "max_cpu_pressure": None,
             "lend": None,
+            # #246: btrfs floors, nobody declares them
+            "min_btrfs_unallocated": resources.DEFAULT_MIN_BTRFS_UNALLOCATED,
+            "min_btrfs_metadata_headroom": resources.DEFAULT_MIN_BTRFS_METADATA_HEADROOM,
         })
         self.assertEqual(got["max_agents"], 3)
         self.assertEqual(got["origin"], {
@@ -332,6 +335,8 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "min_battery_percent": resources.DEFAULT_ORIGIN,
             "stop_battery_percent": resources.DEFAULT_ORIGIN,
             "max_cpu_pressure": resources.DEFAULT_ORIGIN,
+            "min_btrfs_unallocated": resources.DEFAULT_ORIGIN,
+            "min_btrfs_metadata_headroom": resources.DEFAULT_ORIGIN,
             "max_agents": ID_T})
         self.assertEqual(got["fiches"], [ID_A, ID_T])
         # une fiche qui se tait n'impose pas le défaut à celle qui déclare

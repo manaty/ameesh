@@ -784,7 +784,8 @@ class HostPolicy:
     max_agents: int | None = None
     #: seuils de ressources de l'hôte (L31, 0028) : mapping
     #: `{min_mem_available, max_swap_used, max_load, min_disk_free}`, plus
-    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` ; None =
+    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` et
+    #: btrfs (#246) `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None =
     #: valeurs par défaut prudentes (`ameesh.resources`).
     resources: dict | None = None
     #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
