@@ -264,6 +264,18 @@ DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
 #: fusion, ou corps d'une PR : `plan_github`)
 WORK_TRAILER_RE = re.compile(
     r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})[ \t]*$")
+#: L118b : une ligne `ameesh-work-partial: <id>` (corps d'une PR, message d'un
+#: commit de fusion) : la PR ne livre qu'une partie du lot, qui reste ouvert
+#: (lots parapluie, #139)
+PARTIAL_TRAILER_RE = re.compile(
+    r"(?im)^[ \t>*-]*ameesh-work-partial[ \t]*:[ \t]*#?([1-9][0-9]{0,17})[ \t]*$")
+#: L118b : le titre d'un commit de fusion d'une branche `lot/<id>-…` : celui de
+#: GitHub (« Merge pull request #N from owner/lot/<id>-… », groupe 1 : N) ou
+#: d'une fusion locale (« Merge branch 'lot/<id>-…' [into …] »)
+LOT_BRANCH_MERGE_RE = re.compile(
+    r"^Merge (?:pull request #([1-9][0-9]{0,17}) from [A-Za-z0-9_.-]+/"
+    r"|(?:remote-tracking )?branch '(?:origin/)?)"
+    r"lot/([1-9][0-9]{0,17})(?:-[A-Za-z0-9._/-]*)?'?(?: into [^\s]+)?[ \t]*$")
 #: `#<id>` dans le titre d'un commit de fusion (« Merge #93 … », « … (#91) ») ;
 #: ni `PR#9`, ni `depot#9`, ni `##9`, ni `#9a`
 HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
@@ -442,17 +454,38 @@ def merge_commits(repo: str, target: str, since_ts: float | None = None,
 
 def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     """`{lot: forme}` des lots que désigne le message d'un commit de fusion :
-    une ligne `ameesh-work: <id>` (forme `ameesh-work`), et, avec `hash_refs`,
-    `#<id>` dans le titre (forme `#id`) — pas dans le corps, qui peut recopier
-    les titres des commits fusionnés."""
+    une ligne `ameesh-work: <id>` (forme `ameesh-work`), le titre de la fusion
+    d'une branche `lot/<id>-…` (forme `lot-branch`, L118b), et, avec
+    `hash_refs`, `#<id>` dans le titre (forme `#id`) — pas dans le corps, qui
+    peut recopier les titres des commits fusionnés. Un lot déclaré partiel
+    (`ameesh-work-partial: <id>`) n'est pas désigné."""
     found: dict[int, str] = {}
+    lines = (message or "").strip().splitlines()
+    title = lines[0].strip() if lines else ""
     for match in WORK_TRAILER_RE.finditer(message or ""):
         found.setdefault(int(match.group(1)), "ameesh-work")
+    branch = LOT_BRANCH_MERGE_RE.match(title)
+    if branch:
+        found.setdefault(int(branch.group(2)), "lot-branch")
     if hash_refs:
-        lines = (message or "").strip().splitlines()
-        for match in HASH_REF_RE.finditer(lines[0] if lines else ""):
+        for match in HASH_REF_RE.finditer(title):
             found.setdefault(int(match.group(1)), "#id")
+    for match in PARTIAL_TRAILER_RE.finditer(message or ""):
+        found.pop(int(match.group(1)), None)
     return found
+
+
+def merge_pr_number(message: str) -> int | None:
+    """Le numéro de la PR d'un commit de fusion GitHub d'une branche
+    `lot/<id>-…` (son corps n'est pas dans le message : `partial_of_pr`)."""
+    lines = (message or "").strip().splitlines()
+    match = LOT_BRANCH_MERGE_RE.match(lines[0].strip() if lines else "")
+    return int(match.group(1)) if match and match.group(1) else None
+
+
+def partial_lots(body: str | None) -> set[int]:
+    """Les lots qu'une PR déclare ne livrer qu'en partie (L118b)."""
+    return {int(m.group(1)) for m in PARTIAL_TRAILER_RE.finditer(body or "")}
 
 
 def merge_citing(merges: list[dict], lot: int, *, since_ts: float | None = None,
@@ -470,6 +503,21 @@ def merge_citing(merges: list[dict], lot: int, *, since_ts: float | None = None,
     return found
 
 
+def merges_citing(merges: list[dict], lot: int, *, since_ts: float | None = None,
+                  hash_refs: bool = False) -> list[dict]:
+    """Les commits de fusion postérieurs à `since_ts` (à `CLOCK_SLACK_S` près)
+    qui désignent le lot (`cited_lots`), du plus ancien au plus récent, avec
+    `how` (L118b : le premier dont la PR n'est pas partielle ferme le lot)."""
+    out = []
+    for merge in reversed(merges):           # du plus ancien au plus récent
+        if since_ts and merge["ts"] < float(since_ts) - CLOCK_SLACK_S:
+            continue
+        how = cited_lots(merge["message"], hash_refs=hash_refs).get(int(lot))
+        if how:
+            out.append(dict(merge, how=how))
+    return out
+
+
 def _citation(merge: dict, lot: int, target: str, *, sha: bool = True) -> str:
     """Comment la fusion a été constatée, en clair (compte rendu ; sans le
     commit, `sha=False`, pour la note du lot, qui le porte déjà)."""
@@ -477,12 +525,51 @@ def _citation(merge: dict, lot: int, target: str, *, sha: bool = True) -> str:
     return "merge commit %sof %s that %s (\"%s\")" % (
         "%s " % merge["sha"][:12] if sha else "", target,
         "carries \"ameesh-work: %d\"" % lot if merge["how"] == "ameesh-work"
+        else "merges the branch lot/%d-…" % lot if merge["how"] == "lot-branch"
         else "cites #%d in its title (%s %s)" % (lot, LOT_REF_GIT_KEY, LOT_REF_HASH),
         title[:80] + ("…" if len(title) > 80 else ""))
 
 
+def implicit_branch(repo: str, lot: int) -> str | None:
+    """L118b : la branche `lot/<id>` ou `lot/<id>-…` d'un lot qui n'en porte
+    pas, locale ou `origin/`, si elle est UNIQUE (deux candidates : on ne
+    devine pas)."""
+    out = _out(repo, "for-each-ref", "--format=%(refname)",
+               "refs/heads/lot/%d" % lot, "refs/heads/lot/%d-*" % lot,
+               "refs/remotes/origin/lot/%d" % lot, "refs/remotes/origin/lot/%d-*" % lot)
+    names = set()
+    for ref in (out or "").split():
+        for prefix in ("refs/heads/", "refs/remotes/origin/"):
+            if ref.startswith(prefix):
+                names.add(ref[len(prefix):])
+    return next(iter(names)) if len(names) == 1 else None
+
+
+def github_slug(repo: str) -> str | None:
+    """`owner/repo` du dépôt `origin` s'il est sur GitHub, sinon None."""
+    url = (_out(repo, "remote", "get-url", "origin") or "").strip()
+    match = re.match(r"^(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
+                     r"([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)
+    return match.group(1) if match else None
+
+
+def gh_pr_body(repo: str, number: int) -> str:
+    """Le corps de la PR `number` du dépôt GitHub de `repo` (`gh`) ; lève
+    GitError s'il est illisible."""
+    from . import plan_github
+    slug = github_slug(repo)
+    if not slug:
+        raise GitError("origin of %s is not a GitHub repository" % repo)
+    try:
+        data = plan_github._json(plan_github.Gh(), ["pr", "view", str(int(number)),
+                                                    "--repo", slug, "--json", "body"])
+    except plan_github.GithubError as exc:
+        raise GitError(str(exc)) from exc
+    return (data or {}).get("body") or ""
+
+
 def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = False,
-                  actor: str = "", limit: int = MAX_BRANCH_LOTS) -> dict:
+                  actor: str = "", limit: int = MAX_BRANCH_LOTS, pr_body=None) -> dict:
     """L118 : ferme les lots ouverts dont la fusion dans leur cible est constatée.
 
     Examinés : les lots ouverts qui portent une branche ou ont un assigné.
@@ -493,7 +580,15 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     qui désigne le lot (`ameesh-work: <id>`, ou `#<id>` si le dépôt l'active :
     `merge_citing`). La fermeture passe par `work.close_merged` (idempotente,
     jamais de réouverture) avec le commit de fusion et une note qui dit comment
-    elle a été constatée, et s'écrit dans le fil du lot. Rend le compte rendu."""
+    elle a été constatée, et s'écrit dans le fil du lot. Rend le compte rendu.
+
+    L118b : un lot sans branche prend pour branche implicite son unique
+    `lot/<id>[-…]` (`implicit_branch`), et la fusion GitHub d'une branche
+    `lot/<id>-…` le désigne (« Merge pull request #N from owner/lot/<id>-… »).
+    Le corps de cette PR (`pr_body(repo, N)`, défaut : `gh`) est lu : une PR
+    qui se déclare partielle (`ameesh-work-partial: <id>`) ne ferme pas le
+    lot, et un corps illisible le laisse ouvert (un lot fermé n'est jamais
+    rouvert : on ne ferme pas sans savoir)."""
     import os
 
     from . import fil, registry
@@ -508,6 +603,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     hashes: dict = {}
     merges: dict = {}
     regs: dict = {}                          # une lecture du registre par assigné
+    bodies: dict = {}                        # (dépôt, PR) → corps, ou l'erreur
+    pr_body = pr_body or gh_pr_body
     results: list[dict] = []
     for row in rows:
         lot = int(row["id"])
@@ -553,16 +650,56 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 continue
             entry["target"] = target
             found = None
+            implicit = False
+            if not branch:
+                branch = implicit_branch(repo, lot)
+                implicit = bool(branch)
+                entry["branch"] = branch
             if branch:
                 found = branch_probe(repo, branch, target, seen_head=row.get("branch_head"),
                                      since_ts=row.get("created_ts"))
-            if found is None or not found["merged"]:
-                if repo not in hashes:
-                    hashes[repo] = lot_ref_hash(repo)
-                if (repo, target) not in merges:
-                    merges[(repo, target)] = merge_commits(repo, target, since_all)
-                cited = merge_citing(merges[(repo, target)], lot,
-                                     since_ts=row.get("created_ts"), hash_refs=hashes[repo])
+            if repo not in hashes:
+                hashes[repo] = lot_ref_hash(repo)
+            if (repo, target) not in merges:
+                merges[(repo, target)] = merge_commits(repo, target, since_all)
+            citing = merges_citing(merges[(repo, target)], lot,
+                                   since_ts=row.get("created_ts"), hash_refs=hashes[repo])
+            # L118b : une fusion GitHub de `lot/<id>-…` ne ferme le lot que si
+            # sa PR ne se déclare pas partielle ; la première qui livre tout
+            held = None
+            unreadable = False
+            cited = None
+            for merge in citing:
+                number = merge_pr_number(merge["message"])
+                if not number:
+                    cited = merge
+                    break
+                if (repo, number) not in bodies:
+                    try:
+                        bodies[(repo, number)] = pr_body(repo, number)
+                    except GitError as exc:
+                        bodies[(repo, number)] = exc
+                body = bodies[(repo, number)]
+                if isinstance(body, GitError):
+                    unreadable = True
+                    held = held or ("PR #%d merged, but its body is unreadable (%s): not "
+                                    "closed until it says whether it is partial"
+                                    % (number, body))
+                    break
+                if lot in partial_lots(body):
+                    held = ("PR #%d declares itself partial (\"ameesh-work-partial: %d\"): "
+                            "lot kept open" % (number, lot))
+                    continue
+                cited = merge
+                break
+            # une branche enregistrée déjà prouvée fusionnée ferme comme avant
+            # quand le corps est illisible (hôte sans gh) : seule la preuve
+            # implicite attend de savoir
+            proven = bool(found and found["merged"] and row.get("branch"))
+            if held and cited is None and not (unreadable and proven):
+                found = dict(found or {"tip": None, "ahead": False, "ref": None},
+                             merged=False, how="partial", detail=held)
+            elif found is None or not found["merged"]:
                 if cited:
                     found = dict(found or {"tip": None, "ahead": False}, merged=True,
                                  how=cited["how"], ref=cited["sha"],
@@ -572,8 +709,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                     found = {"merged": False, "how": None, "ref": None, "tip": None,
                              "ahead": False,
                              "detail": "no merge commit of %s names the lot "
-                                       "(line \"ameesh-work: %d\"%s)"
-                                       % (target, lot, ", nor \"#%d\" in a title" % lot
+                                       "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
+                                       % (target, lot, lot, ", nor \"#%d\" in a title" % lot
                                           if hashes[repo] else "")}
         except (MergeProbeError, GitError) as exc:
             entry.update(result="error", detail=str(exc))
@@ -584,6 +721,13 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         if not found["merged"]:
             if branch and found["ahead"] and found["tip"] \
                     and found["tip"] != row.get("branch_head") and not dry_run:
+                if implicit:
+                    # L118b : la branche implicite devient celle du lot (journal)
+                    try:
+                        work_mod.set_branch(db, lot, branch, actor=actor or "git:%s" % target,
+                                            source="the merge sweep: lot/%d branch" % lot)
+                    except work_mod.WorkError:
+                        pass
                 st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue

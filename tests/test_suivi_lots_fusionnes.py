@@ -327,6 +327,82 @@ class MergeSweepTest(_Base):
         self.sync()
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
 
+    # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
+
+    def test_fusion_github_d_une_branche_lot_ferme_le_lot(self):
+        lot = self.lot()
+        n = lot["id"]
+        sha = self.merge("lot/%d-garde" % n,
+                         "Merge pull request #7 from manaty/lot/%d-garde\n\nL1: garde" % n)
+        _git(self.repo, "branch", "-q", "-D", "lot/%d-garde" % n)   # supprimée après la PR
+        lus = []
+        report = self.sync(pr_body=lambda repo, num: lus.append(num) or "Lot #%d." % n)
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "lot-branch"))
+        self.assertEqual(lus, [7])
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+        self.assertIn("merges the branch lot/%d-…" % n, self.merged_milestone(n)["note"])
+
+    def test_pr_partielle_le_lot_reste_ouvert_jusqu_a_la_derniere(self):
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        corps = {7: "Part one.\n\nameesh-work-partial: %d" % n, 8: "The rest."}
+        self.merge("lot/%d-un" % n, "Merge pull request #7 from manaty/lot/%d-un" % n)
+        report = self.sync(pr_body=lambda repo, num: corps[num])
+        self.assertEqual(report["results"][0]["how"], "partial")
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        sha = self.merge("lot/%d-deux" % n, "Merge pull request #8 from manaty/lot/%d-deux" % n)
+        report = self.sync(pr_body=lambda repo, num: corps[num])
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(self.merged_milestone(n)["sha"], sha)
+
+    def test_corps_illisible_aucune_fermeture(self):
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-x" % n, "Merge pull request #9 from manaty/lot/%d-x" % n)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        report = self.sync(pr_body=illisible)
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertIn("unreadable", report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_fusion_locale_d_une_branche_lot(self):
+        lot = self.lot()
+        n = lot["id"]
+
+        def jamais(repo, num):
+            raise AssertionError("no PR to read")
+
+        self.merge("lot/%d-local" % n, "Merge branch 'lot/%d-local' into develop" % n)
+        self.assertEqual(self.sync(pr_body=jamais)["merged"], 1)
+
+    def test_branche_implicite_en_avance_rapide(self):
+        lot = self.lot()
+        n = lot["id"]
+        _git(self.repo, "checkout", "-q", "-b", "lot/%d-ff" % n, "develop")
+        self.commit("ff")
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()                       # la pointe en avance est retenue
+        self.assertEqual(report["results"][0]["branch"], "lot/%d-ff" % n)
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        _git(self.repo, "merge", "-q", "--ff-only", "lot/%d-ff" % n)
+        self.assertEqual(work.get(self.db, n)["branch"], "lot/%d-ff" % n)
+        self.assertEqual(self.sync()["merged"], 1)
+
+    def test_formes_lot_branch(self):
+        cite = plan_git.cited_lots
+        self.assertEqual(cite("Merge pull request #3 from o/lot/42-x"), {42: "lot-branch"})
+        self.assertEqual(cite("Merge pull request #3 from o/lot/42"), {42: "lot-branch"})
+        self.assertEqual(cite("Merge branch 'lot/42-x'"), {42: "lot-branch"})
+        self.assertEqual(cite("Merge remote-tracking branch 'origin/main' into lot/42-x"), {})
+        self.assertEqual(cite("Merge pull request #3 from o/lot/42x"), {})
+        self.assertEqual(cite("Merge pull request #3 from o/agent/lot/42-x"), {})
+        self.assertEqual(cite("Merge branch 'lot/42-x'\n\nameesh-work-partial: 42"), {})
+        self.assertEqual(plan_git.merge_pr_number("Merge pull request #3 from o/lot/42-x"), 3)
+        self.assertIsNone(plan_git.merge_pr_number("Merge branch 'lot/42-x'"))
+
     def test_cited_lots(self):
         cas = {
             "merge(desktop): DESKTOP-MAC-UNIVERSAL (#91) …": {91: "#id"},
