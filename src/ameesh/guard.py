@@ -695,9 +695,14 @@ def slice_properties(caps: dict, cpu_count: int | None) -> dict:
     return props
 
 
-#: the transient timer that thaws the slice at the freeze bound, so that a
-#: guard killed during a freeze never leaves the guest frozen
+#: prefix of the transient timers that thaw the slice at the freeze bound, so
+#: that a guard killed during a freeze never leaves the guest frozen: a new
+#: one, uniquely named, before every freeze attempt
 THAW_UNIT = "ameesh-guard-thaw"
+#: the thawing service retries a failed thaw by itself: every 2 s, 10 min at most
+THAW_RETRY_S, THAW_RETRIES = 2, 300
+THAW_SCRIPT = ('i=0; until systemctl thaw "$0"; do i=$((i+1)); '
+               '[ "$i" -ge %d ] && exit 1; sleep %d; done' % (THAW_RETRIES, THAW_RETRY_S))
 
 #: which `caps` key each property enforces
 PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
@@ -711,11 +716,13 @@ class Enforcer:
     failed command is reported on stderr, and its caps are left out of
     `caps.enforced`.
 
-    A freeze holds without the guard: before it, a transient systemd timer
-    (`THAW_UNIT`) is armed to thaw the slice at the freeze bound; no timer,
-    no freeze. A freeze attempted counts as possibly in force until a thaw
-    succeeds: every evaluation below level 2, and the guard's exit, thaw
-    again until it does."""
+    A freeze holds without the guard: before every freeze attempt, a new
+    transient systemd timer (`THAW_UNIT-…`) is armed to thaw the slice at
+    the freeze bound, its service retrying a failed thaw by itself; only
+    then are the older timers stopped, so there is never a moment without
+    one. No timer, no freeze. A freeze attempted counts as possibly in force
+    until a thaw succeeds: every evaluation below level 2, and the guard's
+    exit, thaw again until it does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
                  log: Callable | None = None):
@@ -725,7 +732,7 @@ class Enforcer:
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
         self.freeze_done = False         # the freeze command succeeded
-        self.armed_until: float | None = None   # bound of the armed thaw timer
+        self.thaw_count = 0              # thaw timers armed by this guard
 
     def _command(self, argv: list[str]) -> bool:
         try:
@@ -774,48 +781,64 @@ class Enforcer:
             last.update(changed)
         return set(props)
 
+    def _thaw_units(self) -> list[str]:
+        """The thaw timers and services loaded (by any guard, this one or a
+        previous one)."""
+        try:
+            proc = self.run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+                             "--no-pager", THAW_UNIT + "-*"],
+                            capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode != 0:
+            return []
+        return [w for line in proc.stdout.splitlines() for w in line.split()[:2]
+                if w.startswith(THAW_UNIT + "-")][:64]
+
+    def _stop_thaw_units(self, keep: str | None = None) -> None:
+        # stopped but `keep`; absent or failing: harmless, not reported
+        for unit in self._thaw_units():
+            if keep is None or unit.rsplit(".", 1)[0] != keep:
+                try:
+                    self.run(["systemctl", "stop", unit], capture_output=True, text=True,
+                             timeout=10)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+
     def _arm_thaw(self, until: float, now: float) -> bool:
-        """(Re)arms the thaw timer at `until`; True if armed."""
-        if self.armed_until == until:
-            return True
-        self._disarm_thaw()
+        """Arms a new thaw timer at `until`, then stops the older ones; True
+        if armed (never trusts a timer armed before: it may have fired)."""
+        self.thaw_count += 1
+        unit = "%s-%d-%d-%d" % (THAW_UNIT, int(now), os.getpid(), self.thaw_count)
         seconds = max(1, int(math.ceil(until - now)))
-        if not self._command(["systemd-run", "--unit=%s" % THAW_UNIT, "--collect", "--quiet",
+        if not self._command(["systemd-run", "--unit=%s" % unit, "--collect", "--quiet",
                               "--on-active=%ds" % seconds, "--timer-property=AccuracySec=1s",
-                              "systemctl", "thaw", self.cfg.slice]):
+                              "/bin/sh", "-c", THAW_SCRIPT, self.cfg.slice]):
             return False
-        self.armed_until = until
+        self._stop_thaw_units(keep=unit)
         return True
 
-    def _disarm_thaw(self) -> None:
-        # absent (never armed, or fired): harmless, not reported
-        try:
-            self.run(["systemctl", "stop", THAW_UNIT + ".timer"], capture_output=True,
-                     text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            pass
-        self.armed_until = None
-
     def freeze(self, on: bool, until: float | None = None, now: float | None = None) -> bool:
-        """Freezes the guest's slice until `until` (the thaw timer armed
+        """Freezes the guest's slice until `until` (a new thaw timer armed
         first), or thaws it; True if the slice is as asked."""
         if not on:
             if not self.frozen:
                 return True
             if not self._systemctl("thaw", self.cfg.slice):
-                return False          # owed: retried, and the timer still runs
+                return False          # owed: retried, and the timers still run
             self.frozen = self.freeze_done = False
-            self._disarm_thaw()
+            self._stop_thaw_units()
+            return True
+        if self.freeze_done:
             return True
         now = time.time() if now is None else now
-        if until is None or not self._arm_thaw(until, now):
+        if until is None or now >= until or not self._arm_thaw(until, now):
             self.log("freeze refused: no thaw timer to bound it")
             self.freeze(False)
             return False
-        if not self.freeze_done:
-            # attempted: possibly in force even if the command does not return
-            self.frozen = True
-            self.freeze_done = self._systemctl("freeze", self.cfg.slice)
+        # attempted: possibly in force even if the command does not return
+        self.frozen = True
+        self.freeze_done = self._systemctl("freeze", self.cfg.slice)
         return self.freeze_done
 
     def thaw_at_start(self) -> None:

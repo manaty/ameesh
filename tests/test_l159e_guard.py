@@ -415,12 +415,22 @@ class EnforcerTest(unittest.TestCase):
         self.units = "ameesh-guest-runner@a.service loaded active running a\n" \
                      "\u25cf ameesh-guest-runner@b.service loaded failed failed b\n"
         self.logged = []
+        self.armed = []      # thaw timers armed, in order (none ever stopped here)
         self.enforcer = guard.Enforcer(self.cfg, run=self.fake, log=self.logged.append)
+
+    def thaw_units(self):
+        stopped = {c[2] for c in self.calls if c[:2] == ["systemctl", "stop"]}
+        return "".join("%s.timer loaded active waiting thaw\n" % u for u in self.armed
+                       if u + ".timer" not in stopped)
 
     def fake(self, argv, **kw):
         self.calls.append(argv)
         failed = self.verb(argv) in self.failing
-        out = self.units if argv[1] == "list-units" else ""
+        out = ""
+        if argv[1] == "list-units":
+            out = self.thaw_units() if argv[-1].startswith(guard.THAW_UNIT) else self.units
+        elif argv[0] == "systemd-run" and not failed:
+            self.armed.append(argv[1].split("=", 1)[1])
         return mock.Mock(returncode=1 if failed else 0, stdout=out,
                          stderr="denied" if failed else "")
 
@@ -458,19 +468,19 @@ class EnforcerTest(unittest.TestCase):
         # level 1: only the changed properties are sent
         self.calls.clear()
         reduced = dict(caps, cpu_share=0.125, memory_high_mb=1024)
-        self.enforcer.apply({"caps": reduced}, 4)
+        self.enforcer.apply({"caps": reduced}, 4, 10.0)
         self.assertEqual(self.sets(), [["ameesh-guest.slice", "CPUQuota=50%",
                                         "MemoryHigh=1024M"]])
         # level 2: freeze, once
         self.calls.clear()
         frozen = {"caps": reduced, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
-        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
-        self.enforcer.apply(frozen, 4)
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4, 10.0))
+        self.enforcer.apply(frozen, 4, 10.0)
         self.assertEqual([c for c in self.calls if c[1] in ("freeze", "thaw")],
                          [["systemctl", "freeze", "ameesh-guest.slice"]])
         # the level drops: thawed
         self.calls.clear()
-        self.assertNotIn("freeze", self.enforcer.apply({"caps": reduced}, 4))
+        self.assertNotIn("freeze", self.enforcer.apply({"caps": reduced}, 4, 10.0))
         self.assertEqual([c for c in self.calls if c[1] in ("freeze", "thaw")],
                          [["systemctl", "thaw", "ameesh-guest.slice"]])
 
@@ -478,58 +488,94 @@ class EnforcerTest(unittest.TestCase):
         self.failing = {"set-property", "freeze"}
         caps = {"cpu_weight": 10, "agent_memory_mb": 1024}
         state = {"caps": caps, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
-        self.assertEqual(self.enforcer.apply(state, 4), [])
+        self.assertEqual(self.enforcer.apply(state, 4, 10.0), [])
         self.assertTrue(any("denied" in line for line in self.logged))
         # retried at the next evaluation, and in force once it works
         self.failing = set()
         self.calls.clear()
-        self.assertEqual(self.enforcer.apply(state, 4),
+        self.assertEqual(self.enforcer.apply(state, 4, 10.0),
                          ["agent_memory_mb", "cpu_weight", "freeze"])
         self.assertIn(["ameesh-guest.slice", "CPUWeight=10"], self.sets())
         # no agent unit loaded: the per-agent cap is not in force
         self.units = ""
-        self.assertNotIn("agent_memory_mb", self.enforcer.apply({"caps": caps}, 4))
+        self.assertNotIn("agent_memory_mb", self.enforcer.apply({"caps": caps}, 4, 10.0))
         # systemctl missing: nothing in force, nothing raised
         broken = guard.Enforcer(self.cfg, log=self.logged.append,
                                 run=lambda *a, **k: (_ for _ in ()).throw(OSError("none")))
-        self.assertEqual(broken.apply(state, 4), [])
+        self.assertEqual(broken.apply(state, 4, 10.0), [])
 
     def test_freeze_bounded_without_the_guard(self):
-        # codex #237 r1: a thaw timer is armed before the freeze, at its
-        # bound; no timer, no freeze; a thaw disarms it
+        # codex #237 r1/r2: a new thaw timer before every freeze attempt, its
+        # service retrying the thaw; the older ones stopped only after it
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
         self.assertIn("freeze", self.enforcer.apply(frozen, 4, 1010.0))
-        armed = [c for c in self.calls if c[0] == "systemd-run"]
-        self.assertEqual(armed, [["systemd-run", "--unit=ameesh-guard-thaw", "--collect",
-                                  "--quiet", "--on-active=50s",
-                                  "--timer-property=AccuracySec=1s",
-                                  "systemctl", "thaw", "ameesh-guest.slice"]])
-        self.assertLess(self.calls.index(armed[0]),
+        run = [c for c in self.calls if c[0] == "systemd-run"]
+        self.assertEqual(len(run), 1)
+        self.assertTrue(run[0][1].startswith("--unit=ameesh-guard-thaw-1010-"))
+        self.assertEqual(run[0][2:7], ["--collect", "--quiet", "--on-active=50s",
+                                       "--timer-property=AccuracySec=1s", "/bin/sh"])
+        self.assertEqual(run[0][-1], "ameesh-guest.slice")
+        self.assertIn('until systemctl thaw "$0"', run[0][-2])
+        self.assertLess(self.calls.index(run[0]),
                         self.calls.index(["systemctl", "freeze", "ameesh-guest.slice"]))
         self.calls.clear()
-        self.enforcer.apply(frozen, 4, 1015.0)              # same bound: not re-armed
+        self.enforcer.apply(frozen, 4, 1015.0)              # frozen: nothing more
         self.assertEqual([c for c in self.calls if c[0] == "systemd-run"], [])
         self.enforcer.apply({"caps": {}}, 4, 1020.0)
-        self.assertEqual(self.calls[-2:], [["systemctl", "thaw", "ameesh-guest.slice"],
-                                           ["systemctl", "stop", "ameesh-guard-thaw.timer"]])
+        self.assertEqual(self.freezes(), [["systemctl", "thaw", "ameesh-guest.slice"]])
+        self.assertIn(["systemctl", "stop", self.armed[0] + ".timer"], self.calls)
         # the timer cannot be armed: no freeze
         self.calls.clear()
         self.failing = {"systemd-run"}
         self.assertNotIn("freeze", self.enforcer.apply(frozen, 4, 1030.0))
         self.assertEqual(self.freezes(), [])
+        # past the bound: no freeze either
+        self.failing = set()
+        self.assertNotIn("freeze", self.enforcer.apply(frozen, 4, 1060.0))
+        self.assertEqual(self.freezes(), [])
+
+    def test_every_freeze_attempt_arms_a_new_timer_first(self):
+        # codex #237 r2: the first freeze fails, its timer fires; the retry
+        # arms a new timer before freezing, and the old one is stopped after
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.failing = {"freeze"}
+        self.enforcer.apply(frozen, 4, 1000.0)
+        self.failing = set()
+        self.enforcer.apply(frozen, 4, 1055.0)
+        self.assertEqual(len(self.armed), 2)
+        second = self.calls.index([c for c in self.calls if c[0] == "systemd-run"][1])
+        stop_old = self.calls.index(["systemctl", "stop", self.armed[0] + ".timer"])
+        freeze = len(self.calls) - 1 - self.calls[::-1].index(
+            ["systemctl", "freeze", "ameesh-guest.slice"])
+        self.assertLess(second, stop_old)
+        self.assertLess(second, freeze)
+        self.assertNotIn(["systemctl", "stop", self.armed[1] + ".timer"], self.calls)
+
+    def test_restart_keeps_the_old_timer_until_a_new_one(self):
+        # codex #237 r2: thaw fails at start; the old guard's timer is kept
+        # until the next freeze has armed its own
+        self.armed.append("ameesh-guard-thaw-900-1-1")
+        self.failing = {"thaw"}
+        self.enforcer.thaw_at_start()
+        self.assertEqual([c for c in self.calls if c[1] == "stop"], [])
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.enforcer.apply(frozen, 4, 1000.0)
+        arm = self.calls.index([c for c in self.calls if c[0] == "systemd-run"][0])
+        stop = self.calls.index(["systemctl", "stop", "ameesh-guard-thaw-900-1-1.timer"])
+        self.assertLess(arm, stop)
 
     def test_freeze_attempted_is_thawed(self):
         # codex #237 r1: the freeze command fails (timeout, SIGTERM) after
         # systemd froze the slice: the drop of the level and stop() thaw
         self.failing = {"freeze"}
         frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
-        self.assertNotIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertNotIn("freeze", self.enforcer.apply(frozen, 4, 1000.0))
         self.failing = set()
         self.calls.clear()
-        self.enforcer.apply({"caps": {}}, 4)
+        self.enforcer.apply({"caps": {}}, 4, 1000.0)
         self.assertEqual(self.freezes(), [["systemctl", "thaw", "ameesh-guest.slice"]])
         self.failing = {"freeze"}
-        self.enforcer.apply(frozen, 4)
+        self.enforcer.apply(frozen, 4, 1000.0)
         self.calls.clear()
         self.failing = set()
         self.enforcer.freeze(False)                          # Guard.stop
