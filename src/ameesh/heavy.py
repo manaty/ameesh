@@ -167,24 +167,29 @@ def _killpg(pgid: int, signum: int) -> bool:
     return True
 
 
+def _can_scan() -> bool:
+    """The platform layer can list processes with their group and state
+    (psutil, or Linux /proc); otherwise only kill(0) tells a group apart."""
+    from . import platform
+    try:
+        platform.process_table()
+    except platform.NotAvailable:
+        return False
+    return True
+
+
 def _group_alive(pgid: int) -> bool:
     """A process of the group `pgid` still runs. A zombie does not count: its
-    reaper (init, a subreaper) may take its time, the process is gone."""
+    reaper (init, a subreaper) may take its time, the process is gone.
+    Without a process table (`platform.NotAvailable`), kill(0) decides."""
+    from . import platform
     if not _killpg(pgid, 0):
         return False
     try:
-        pids = [name for name in os.listdir("/proc") if name.isdigit()]
-    except OSError:
-        return True                 # no /proc: kill(0) is all there is
-    for pid in pids:
-        try:
-            with open("/proc/%s/stat" % pid, encoding="utf-8") as fh:
-                fields = fh.read().rsplit(") ", 1)[-1].split()
-        except OSError:
-            continue
-        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] not in ("Z", "X"):
-            return True
-    return False
+        table = platform.process_table()
+    except platform.NotAvailable:
+        return True
+    return any(row["pgid"] == pgid and not row["zombie"] for row in table)
 
 
 def _group_gone(pgid: int) -> bool:
@@ -274,7 +279,9 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         _note_child(fh, child.pid)
         for signum in pending:
             relay(signum, None)
-        code = _wait_unreaped(child)
+        # without a process table the leader's zombie would look alive for
+        # ever: it is reaped at once, as before codex review r3
+        code = _wait_unreaped(child) if _can_scan() else child.wait()
         if not _drain_group(child.pid):
             print("ameesh heavy: processes of the command (group %d) survive SIGKILL; "
                   "slot released" % child.pid, file=sys.stderr)

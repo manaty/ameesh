@@ -282,6 +282,26 @@ class DrainTest(unittest.TestCase):
             self.assertTrue(heavy._drain_group(4242, grace=5, sleep=lambda s: None))
         self.assertEqual(sent, [signal.SIGTERM])
 
+    def test_without_a_process_table_kill_zero_decides(self):
+        # mesh-design r4 (CI L63): the scan lives in the platform layer; an OS
+        # where it cannot list processes refuses (NotAvailable), and heavy
+        # falls back on kill(0) and reaps the command at once
+        from ameesh import platform
+        refuse = mock.patch.object(platform, "process_table",
+                                   side_effect=platform.NotAvailable("table", "test"))
+        with refuse, mock.patch.object(heavy, "_killpg", return_value=True):
+            self.assertTrue(heavy._group_alive(4242))
+            self.assertFalse(heavy._can_scan())
+        with refuse, mock.patch.object(heavy, "_killpg", return_value=False):
+            self.assertFalse(heavy._group_alive(4242))
+        table = [{"pid": 1, "pgid": 4242, "zombie": True},
+                 {"pid": 2, "pgid": 4243, "zombie": False}]
+        with mock.patch.object(platform, "process_table", return_value=table), \
+                mock.patch.object(heavy, "_killpg", return_value=True):
+            self.assertFalse(heavy._group_alive(4242))      # only a zombie left
+            table.append({"pid": 3, "pgid": 4242, "zombie": False})
+            self.assertTrue(heavy._group_alive(4242))
+
 
 class NoteTest(unittest.TestCase):
     def test_mail_turns_tell_agents_to_use_ameesh_heavy(self):
