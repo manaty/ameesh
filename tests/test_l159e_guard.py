@@ -1031,11 +1031,13 @@ class EnforcerTest(unittest.TestCase):
             self.assertTrue(g.step()["freeze"]["enforced"])
             self.assertEqual(self.runs()[-1][-1], "55")
 
-    def freeze_script(self, uptime_s: str | None, suspend_at: int = 0) -> list[str]:
+    def freeze_script(self, uptime_s: str | None, suspend_at: int = 0,
+                      whole_sleep: bool = False) -> list[str]:
         """FREEZE_SCRIPT run by sh on fake systemctl and sleep, bound 60.000:
         each `sleep` moves the boot clock by its seconds, the `suspend_at`-th
-        one spans a 300 s suspend; `uptime_s` None: no clock to read. The
-        calls, in order."""
+        one spans a 300 s suspend; `uptime_s` None: no clock to read;
+        `whole_sleep`: `sleep` refuses a fraction at once (BusyBox without
+        FEATURE_FLOAT_SLEEP). The calls, in order."""
         with tempfile.TemporaryDirectory() as tmp:
             uptime, log = os.path.join(tmp, "uptime"), os.path.join(tmp, "log")
             if uptime_s is not None:
@@ -1043,11 +1045,13 @@ class EnforcerTest(unittest.TestCase):
                     fh.write("%s 5.00\n" % uptime_s)
             for name, body in (
                     ("systemctl", 'echo "systemctl $*" >> "%s"' % log),
-                    ("sleep", 'echo "sleep $*" >> "%s"; n=$(grep -c sleep "%s"); '
+                    ("sleep", 'echo "sleep $*" >> "%s"; %sn=$(grep -c sleep "%s"); '
                               'awk -v s="$1" -v n="$n" -v z=%d '
                               '\'{print $1 + s + (n == z ? 300 : 0), $2}\' '
                               '"%s" > "%s.new" && mv "%s.new" "%s"'
-                              % (log, log, suspend_at, uptime, uptime, uptime, uptime))):
+                              % (log, 'case "$1" in *.*) exit 1;; esac; '
+                                 if whole_sleep else "", log, suspend_at, uptime, uptime,
+                                 uptime, uptime))):
                 path = os.path.join(tmp, name)
                 with open(path, "w") as fh:
                     fh.write("#!/bin/sh\n" + body + "\n")
@@ -1071,6 +1075,11 @@ class EnforcerTest(unittest.TestCase):
         # codex #276 r2: the last wait is what is left, not a whole second
         # (58.90 + 1 + 1 thawed at 60.90)
         self.assertEqual(self.freeze_script("58.90"), [
+            "systemctl freeze ameesh-guest.slice", "sleep 1", "sleep 0.1",
+            "systemctl thaw ameesh-guest.slice"])
+        # codex #308 r1: a `sleep` that refuses the fraction (BusyBox) ends
+        # the wait at once, never a busy loop up to the bound
+        self.assertEqual(self.freeze_script("58.90", whole_sleep=True), [
             "systemctl freeze ameesh-guest.slice", "sleep 1", "sleep 0.1",
             "systemctl thaw ameesh-guest.slice"])
         # an unreadable clock ends the wait

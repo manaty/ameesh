@@ -805,7 +805,7 @@ FREEZE_BACKSTOP_S = 30
 FREEZE_SCRIPT = ('systemctl freeze "$0" && { if [ -n "$1" ]; then '
                  'while s="$(awk -v d="$1" \'{l = d - $1; if (l <= 0) exit 1; '
                  'print (l < 1 ? l : 1)}\' ' + host.UPTIME + ')"; '
-                 'do sleep "$s"; done; '
+                 'do sleep "$s" || break; done; '
                  'else sleep "$2"; fi; }; '
                  'until systemctl thaw "$0"; do sleep 2; done')
 
