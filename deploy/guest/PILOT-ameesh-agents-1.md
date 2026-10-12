@@ -28,14 +28,44 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   cd /root/ameesh && git log -1 --oneline                        # the reviewed commit of main
   ```
 
-* **The guest's volume.** `/srv/ameesh-guest` is not a mount point today
-  (one 135 GB root disk, 109 GB free). Either:
-  - (study §4.1) attach a Scaleway volume, about 100 GB, and mount it on
-    `/srv/ameesh-guest` (`/etc/fstab`); a guest that fills it never reaches
-    the system; or
-  - add `--allow-rootfs` to the two install commands below. The guest then
-    shares `/` with the host's agents: `disk_max` is not a filesystem quota,
-    and only the guard's reclaim (under 10 GiB free on `/`) holds it back.
+* **The guest's volume: the owner's decision** (it costs money and changes
+  the infrastructure). `/srv/ameesh-guest` is not a mount point today: one
+  local 150 GB disk (`l_ssd`), 109 GB free; the VM is a GP1-S in `fr-par-1`.
+  - **Recommended** (study §4.1): a 100 GB Block Storage volume, 5K IOPS,
+    mounted on `/srv/ameesh-guest`. A guest that fills it never reaches the
+    system nor the host's own agents. Cost: €0.000130/GB/hour excluding VAT
+    (scaleway.com/en/pricing/storage, read on 2026-10-12), so about
+    **€9.50 per month** for 100 GB (730 h), snapshots not included. From a
+    workstation with the `scw` CLI configured for the ameesh project:
+
+    ```sh
+    scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=100GB zone=fr-par-1
+    scw block volume wait <volume-id> zone=fr-par-1          # until "available"
+    scw instance server list name=ameesh-agents-1 zone=fr-par-1
+    scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
+      volume-type=sbs_volume zone=fr-par-1
+    ```
+
+    Then on the host (the new disk is the one `lsblk` did not list before,
+    without partitions; check its size):
+
+    ```sh
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+    sudo mkfs.ext4 -L ameesh-guest /dev/<new disk>
+    sudo mkdir -p /srv/ameesh-guest
+    echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
+      | sudo tee -a /etc/fstab
+    sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
+    findmnt /srv/ameesh-guest                                # the volume, 100 GB
+    ```
+
+    `nofail`: the host boots even without the volume. The guest's runners
+    do not start then (`RequiresMountsFor=/srv/ameesh-guest`): they never
+    write on the root disk instead; the host's agents are not affected.
+  - **Without a volume**: `--allow-rootfs` on the two install commands below.
+    The guest then shares `/` with the host's agents: `disk_max` is not a
+    filesystem quota, and only the guard's reclaim (under 10 GiB free on `/`)
+    holds it back. Not to be used while the owner has not chosen.
 
 ## Install (guard in observation, no guest runner started)
 
@@ -64,8 +94,9 @@ sudo deploy/guest/install-pilot.sh --check # every line "ok"
 
 Only once the canon PR is merged: the Host fiche gets `policy.lend` (the
 offer above, the one in `/etc/ameesh/guard.json`) and keeps `max_agents: 6`
-for its own agents; the placements of deepseek5 and deepseek6 move from
-manaty-mesh-1 to ameesh-agents-1 (work under `/srv/ameesh-guest/work`). Their runners on manaty-mesh-1 are
+for its own agents, without `volatile`; `policy.work_dirs` puts the guests'
+work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek5 and
+deepseek6 move from manaty-mesh-1 to ameesh-agents-1. Their runners on manaty-mesh-1 are
 stopped first: an agent runs on one host at a time.
 
 ```sh

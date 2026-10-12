@@ -38,6 +38,8 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(u["Slice"], ["ameesh-guest.slice"])
         self.assertEqual(u["OOMScoreAdjust"], ["500"])
         self.assertEqual(u["TimeoutStopSec"], ["180"])
+        # a volume in /etc/fstab that did not mount: no start on the root disk
+        self.assertEqual(u["RequiresMountsFor"], ["/srv/ameesh-guest"])
         self.assertTrue(u["MemoryHigh"] and u["MemoryMax"])
         self.assertLess(resources.parse_bytes(u["MemoryHigh"][0]),
                         resources.parse_bytes(u["MemoryMax"][0]))
