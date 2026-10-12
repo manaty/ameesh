@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "L460 — launch-time cgroup isolation for tool freezing"
-description: "Feasibility by harness, recovery requirements, and a recommendation to drop arbitrary tool freezing."
+description: "Prefer admission control and existing cgroup weights over arbitrary tool freezing; assess harness isolation and recovery limits."
 status: draft
 tags: [pression, harnais, cgroup, reprise]
 generated: { by: "ameesh-cx1", at: "2026-10-12" }
@@ -9,13 +9,14 @@ generated: { by: "ameesh-cx1", at: "2026-10-12" }
 
 # Recommendation
 
-**Drop automatic freezing of arbitrary tools.** Launch-time cgroup isolation
-is technically plausible for selected shell commands, particularly through
-DeepSeek's replaceable executor, but it does not make suspension safe for
-commands holding database transactions or shared locks. Keep pressure
-admission control and the duration caps proposed in [PR #423](https://github.com/manaty/ameesh/pull/423).
-A future experiment should isolate explicitly eligible jobs and prove
-recovery before enabling any freeze.
+**Drop automatic freezing of arbitrary tools; prefer admission control plus
+low CPU/I/O weights on existing runner/guest cgroups.** The guest already
+has this cheaper mechanism. It keeps commands schedulable without tool
+hooks or a thaw guardian. Keep the duration caps proposed in
+[PR #423](https://github.com/manaty/ameesh/pull/423). Verify effective
+hierarchy and controller support before extending weights to other runner
+units. Launch-time tool isolation remains plausible, particularly through
+DeepSeek's executor, but does not make transaction/lock suspension safe.
 
 This study replaces the implementation deliverable of lot #460, following
 mesh-design's agent-mail of 2026-10-12 at 19:29. The `revue-460-design`
@@ -26,12 +27,27 @@ does not authorize host changes.
 
 # Baseline and evidence
 
-Inspected ameesh `origin/main` at `4a056a9`. Normal turns use
-`AgentWorker.run_turn` with `Popen(start_new_session=True)`; background work
-is tracked by process group. Only pressure-exempt audit turns use the
-special systemd scope. The user, server and guest runner unit templates
-lack `Delegate=yes`; the guest also sets `ProtectControlGroups=yes`.
-There is no existing normal-turn or tools cgroup to freeze.
+Inspected ameesh `origin/main` at `4a056a9`; these file/line links pin that
+baseline:
+
+- Normal launch uses `Popen(start_new_session=True)`
+  ([src/ameesh/runner.py:3419](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/runner.py#L3419));
+  background survivors are selected by process group
+  ([src/ameesh/background.py:238](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/background.py#L238)).
+- The audit-only scope route
+  ([src/ameesh/runner.py:5352](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/runner.py#L5352))
+  sets `KillMode=control-group`
+  ([src/ameesh/platform/audit_guard.py:28](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/platform/audit_guard.py#L28)).
+- Runner templates use `KillMode=mixed` and contain no delegation setting:
+  [deploy/systemd/ameesh-runner-agent@.service:55](https://github.com/manaty/ameesh/blob/4a056a9/deploy/systemd/ameesh-runner-agent%40.service#L55),
+  [deploy/serveur/ameesh-runner@.service:30](https://github.com/manaty/ameesh/blob/4a056a9/deploy/serveur/ameesh-runner%40.service#L30),
+  [deploy/guest/ameesh-guest-runner@.service:55](https://github.com/manaty/ameesh/blob/4a056a9/deploy/guest/ameesh-guest-runner%40.service#L55).
+  The guest additionally sets `ProtectControlGroups=yes`
+  ([deploy/guest/ameesh-guest-runner@.service:69](https://github.com/manaty/ameesh/blob/4a056a9/deploy/guest/ameesh-guest-runner%40.service#L69)).
+
+There is no existing normal-turn or tools cgroup to freeze. New sibling
+scopes would have their own lifecycle: runner `KillMode=mixed` cleanup and
+process-group tracking cannot automatically manage them.
 
 Read-only local checks found Claude Code **2.1.286**, Codex CLI **0.159.3**
 and DSH **0.1.5-rc.2**. DSH's shim had no selected Node version in this
@@ -40,6 +56,59 @@ reported the version without changing the environment. Upstream documents
 were checked on 2026-10-12. No provider call, live tool interception,
 cgroup creation, freeze or unit change was performed. The conclusions
 below distinguish a documented integration point from a tested guarantee.
+Claude/Codex hook coverage was not exercised on the installed versions;
+the r1 reviewer could not independently verify upstream contracts under
+its no-network constraint. Their routes remain documentation-based
+feasibility claims, not installed-version coverage results.
+
+# Cheaper alternative: admission control and existing cgroup weights
+
+The guest slice already sets `CPUWeight=10` and `IOWeight=10`
+([deploy/guest/ameesh-guest.slice:24](https://github.com/manaty/ameesh/blob/4a056a9/deploy/guest/ameesh-guest.slice#L24)).
+Its parent drop-in sets both as well, so the hierarchy competes at the
+application's level, rather than merely between guest children
+([deploy/guest/ameesh.slice.d/guest-weight.conf:3](https://github.com/manaty/ameesh/blob/4a056a9/deploy/guest/ameesh.slice.d/guest-weight.conf#L3)).
+The offload installer also sets them on the dedicated user's slice
+([deploy/guest/install.sh:326](https://github.com/manaty/ameesh/blob/4a056a9/deploy/guest/install.sh#L326)).
+`guard.py` translates both weights to systemd properties and applies them
+through `set-property --runtime`
+([src/ameesh/guard.py:771](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/guard.py#L771),
+[src/ameesh/guard.py:949](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/guard.py#L949),
+[src/ameesh/guard.py:1203](https://github.com/manaty/ameesh/blob/4a056a9/src/ameesh/guard.py#L1203)).
+Reuse that weight-application mechanism; the guard's separate guest-freeze
+policy is not the proposed alternative.
+
+Combine pressure admission control with these existing low shares. For
+other runner cgroups, an authorized manager can apply suitable weights
+without delegation into tool subgroups. Forked descendants remaining in
+that hierarchy share the policy; separate audit scopes and containers
+need their placement checked. Lowering an entire runner also affects its
+heartbeat, mail and psql children, so validate lease latency. Do not lower
+the database service's weight along with agent work.
+
+Limits matter:
+
+- Weights distribute **relative contention shares**, not a CPU quota or
+  guaranteed I/O rate. Idle resources remain usable; parent/sibling placement
+  determines which workloads compete. See the
+  [kernel weight model](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#weights).
+- CPU/I/O controllers must be enabled in the relevant hierarchy. I/O
+  weighting additionally requires a supported device/backend, such as
+  enabled iocost or BFQ's cgroup support; a successful property write alone
+  does not demonstrate effective prioritization. Verify kernel interfaces
+  and behavior on the actual storage path. See the
+  [kernel I/O controller](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#io)
+  and [BFQ documentation](https://docs.kernel.org/block/bfq-iosched.html).
+- CPU/I/O weights do not reclaim memory. Keep existing memory protection,
+  admission control and bounded termination for memory pressure.
+- Commands continue running and can release locks, avoiding a deadlock
+  caused by suspension. Slower progress can still lengthen transaction or
+  lock holding; weights neither eliminate application deadlocks nor bound
+  completion time.
+
+This is the preferred incremental alternative where support is verified.
+No host effectiveness benchmark or weight change was performed in this
+study; unsupported hosts retain admission control and duration caps.
 
 # Harness launch points
 
@@ -105,7 +174,10 @@ applies; `SIGCONT` does not thaw a cgroup. Thaw before graceful TERM, then
 use the isolated cgroup for bounded descendant cleanup. Reconcile stale
 generations and competing runners without reusing scope names. Retain
 existing agent/guest memory limits and background grace across new scope
-boundaries; creating sibling scopes must not bypass those limits.
+boundaries; creating sibling scopes must not bypass those limits. Define
+scope-specific stop ownership and background expiry explicitly: the
+existing runner's mixed kill mode does not propagate to sibling scopes,
+and the audit scope's control-group kill mode is a different contract.
 
 User-manager delegation needs validation on desktop hosts. System-service
 creation needs the host's authorized broker or service manager; the guest's
@@ -127,5 +199,6 @@ Reconsider only after a separate prototype proves launch placement for
 every enabled shell path, foreground/background and subagents; preservation
 of sandboxing and resource limits; runner/recovery-service SIGKILL and OOM
 recovery at every freeze boundary; deadline racing late requests; two-runner
-fencing; and DB/lock safety. On current evidence, **drop the freeze and
-retain admission control and bounded termination**.
+fencing; and DB/lock safety. On current evidence, **drop the freeze; prefer
+admission control plus verified low CPU/I/O weights on existing cgroups,
+with memory protection and bounded termination retained**.
