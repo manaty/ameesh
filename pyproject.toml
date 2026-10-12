@@ -54,4 +54,5 @@ where = ["src"]
 [tool.setuptools.package-data]
 ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json",
           "consignes/*.md"]
+"ameesh.mediated_executor" = ["contract.json"]
 "ameesh.approve" = ["static/*.js", "static/*.css"]

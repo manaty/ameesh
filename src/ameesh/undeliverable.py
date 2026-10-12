@@ -318,6 +318,23 @@ def stopped_sender_text(cfg, db, row: dict, *, explicit: bool, binding=None,
     return "\n  ".join(lines)
 
 
+def registry_rows(db, names: list[str]) -> dict:
+    """`{name: registry row or None}` for the send checks.
+
+    Path B: a mediated harness session has no `agents.get` (contract 1.1),
+    only the reduced directory (`agents.overview`: name, team, status). The
+    same checks then run on it, with fewer facts in the refusal texts (no
+    stop date, reason or responsible)."""
+    from .mediated_executor.contract import NotSupportedRemotely
+
+    try:
+        return dict(zip(names, db_mod.batched(db, lambda d: [registry.get(d, n)
+                                                               for n in names])))
+    except NotSupportedRemotely:
+        directory = {row["name"]: row for row in registry.overview(db)}
+        return {name: directory.get(name) for name in names}
+
+
 def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
                explicit: bool = False, binding=None, now: float | None = None) -> list[str]:
     """Contrôle d'un envoi `agent-mail send`, AVANT tout dépôt (base seulement).
@@ -329,7 +346,7 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     l'identité déjà résolue de la session, s'il y en a une. « all » ne
     contrôle que l'expéditeur (la diffusion écarte elle-même les arrêtés)."""
     names = [sender] if dest in ("all", sender) else [sender, dest]
-    rows = dict(zip(names, db_mod.batched(db, lambda d: [registry.get(d, n) for n in names])))
+    rows = registry_rows(db, names)
     row = rows.get(sender)
     if row is not None and row.get("status") == "stopped":
         raise Refused(stopped_sender_text(cfg, db, row, explicit=explicit, binding=binding,

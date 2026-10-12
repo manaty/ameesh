@@ -37,8 +37,12 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   et leurs alias `AGENT_MESH_*`), et pointe `AMEESH_CONFIG` et
   `AGENT_MESH_CONFIG` vers un fichier absent : ni
   `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus.
-  `HOME` reste celui du poste (le banc lit `~/.pgpass`). Un test qui a besoin
-  d'une config, d'un canon ou d'une variable la pose lui-même ;
+  `HOME` reste celui du poste (le banc lit `~/.pgpass`). Les caches de
+  gestionnaires de paquets du poste (`npm_config_*`, `pnpm_config_*`,
+  `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`) sont retirés de même (L73) : le
+  ménage les redirige et respecte un choix déjà posé, donc la suite ne doit
+  pas les hériter. Un test qui a besoin d'une config, d'un canon ou d'une
+  variable la pose lui-même ;
   `tests/test_l142_env_isole.py` vérifie qu'un poste « pollué » voit la même
   chose qu'un poste propre. Tout module de test qui touche à l'environnement
   importe donc `tests.support`.

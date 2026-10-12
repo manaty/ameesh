@@ -471,7 +471,9 @@ class TurnCosts(Domain):
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
                cum_output_tokens: int | None, account: str | None = None,
-               spend_key: str | None = None, void_reason: str | None = None,
+               spend_key: str | None = None, source: str | None = None,
+               executor: str | None = None, lease_owner: str | None = None,
+               lease_epoch: int | None = None, void_reason: str | None = None,
                price_fallback: str | None = None,
                cache_write_tokens: int | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
@@ -482,14 +484,20 @@ class TurnCosts(Domain):
         migration 0043) : la ligne naît écartée des sommes ; `price_fallback`
         (L225, migration 0059) : tour facturé au repli prudent ;
         `cache_write_tokens` (L225, 0059) : écritures de cache Claude du tour ;
-        None = colonne non écrite. Vrai si la ligne est écrite."""
+        None = colonne non écrite. Vrai si la ligne est écrite.
+        `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
+        0064) : `relay` pour la mesure du relais de modèle, `device` pour la
+        déclaration d'un appareil médié (hors plafond) ; None = colonnes non
+        écrites (`source` vaut alors `harness`)."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
               harnesses: Sequence[str] | None, account: str | None = None) -> float:
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
-        ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+        ces harnais seulement si donnés, de ce compte seulement si donné (L30).
+        Les lignes `source = 'device'` (L111) ne comptent jamais : la dépense
+        d'un appareil médié est celle que le relais a mesurée."""
 
     @abc.abstractmethod
     def spent_between(self, from_ts: float, to_ts: float, *,
