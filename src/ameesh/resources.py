@@ -314,17 +314,24 @@ def docker_root(now: float | None = None) -> str | None:
 def disk_paths(cfg, policy=None) -> list[str]:
     """The paths whose filesystems the guard watches (#253): every work root
     that exists (the current directory without any), the state dir, the deps
-    cache root, docker's root dir (best effort) and `/`."""
+    cache root, the turns' tmp root and the system tmp (both unless in memory:
+    a tmpfs has its own measure, `tmpfs_fraction`), docker's root dir (best
+    effort) and `/`."""
+    from . import menage as menage_mod
     paths = [os.path.expanduser(root) for root in getattr(cfg, "worktree_roots", ()) or ()]
     paths = [p for p in paths if os.path.isdir(p)] or [os.getcwd()]
+    tmps = []
     state_dir = getattr(cfg, "state_dir", None)
     if state_dir:
         paths.append(state_dir)
-        try:
-            from . import menage as menage_mod
-            paths.append(menage_mod.cache_root(cfg, policy or menage_mod.Policy()))
-        except Exception:  # a reading never fails on the cache root
+        policy = policy or menage_mod.Policy()
+        try:  # a reading never fails on a managed root
+            paths.append(menage_mod.cache_root(cfg, policy))
+            tmps.append(menage_mod.tmp_root(cfg, policy))
+        except Exception:
             pass
+    tmps.append(system_tmp())
+    paths += [p for p in tmps if not menage_mod.in_memory(p)]
     docker = docker_root()
     if docker:
         paths.append(docker)
@@ -332,10 +339,27 @@ def disk_paths(cfg, policy=None) -> list[str]:
     return paths
 
 
+def _anchor(path: str) -> str:
+    """`path`, or its nearest ancestor that can be stat'ed: a missing dir (a
+    cache not created yet) or one behind a dir that denies traversal
+    (/data/private/docker) is read on the filesystem of that ancestor."""
+    current = path
+    while True:
+        try:
+            os.stat(current)
+            return current
+        except OSError:
+            parent = os.path.dirname(current.rstrip(os.sep)) or os.sep
+            if parent == current:
+                return path
+            current = parent
+
+
 def _probe(path: str) -> str:
-    """`path`, or its nearest parent ON THE SAME FILESYSTEM that can be opened:
-    the btrfs ioctls open the path (docker's root is not readable by the
-    executor); never a parent across a mount point."""
+    """`path` (or its `_anchor`), or its nearest parent ON THE SAME FILESYSTEM
+    that can be opened: the btrfs ioctls open the path (docker's root is not
+    readable by the executor); never a parent across a mount point."""
+    path = _anchor(path)
     try:
         dev = os.stat(path).st_dev
     except OSError:
@@ -357,12 +381,13 @@ def _probe(path: str) -> str:
 def volume_key(path: str) -> str:
     """The identity of the filesystem holding `path`: its btrfs fsid (two
     subvolumes of one btrfs are one volume, their st_dev differ), else its
-    st_dev, else the path itself (unreadable: sampled on its own)."""
+    st_dev, else the path itself (unreadable: sampled on its own); read on
+    the path's `_anchor`."""
     found = platform.btrfs_fs_info(_probe(path)) if platform.is_linux() else None
     if found is not None and found[0]:
         return "btrfs:%s" % found[0]
     try:
-        return "dev:%d" % os.stat(path).st_dev
+        return "dev:%d" % os.stat(_anchor(path)).st_dev
     except OSError:
         return "path:%s" % path
 
@@ -383,8 +408,9 @@ def volumes(paths) -> list[dict]:
             if path not in seen[key]["paths"]:
                 seen[key]["paths"].append(path)
             continue
-        volume = {"path": path, "paths": [path], "disk_free_bytes": disk_free(path)}
-        volume.update(btrfs_usage(_probe(path)))
+        probe = _probe(path)
+        volume = {"path": path, "paths": [path], "disk_free_bytes": disk_free(probe)}
+        volume.update(btrfs_usage(probe))
         seen[key] = volume
         out.append(volume)
     return out

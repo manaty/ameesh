@@ -69,6 +69,23 @@ class DiskPathsTest(_Tmp):
         paths = self.paths(self.cfg(state_dir=state), menage.Policy(cache_root=cache))
         self.assertIn(cache, paths)
 
+    def test_tmp_roots_unless_in_memory(self):
+        """r1 (1): the turns' tmp root and the system tmp on their own disk
+        filesystem are watched; a tmpfs keeps its own measure."""
+        state, scratch, system = self.dir("state"), self.dir("scratch"), self.dir("tmp")
+        cfg, policy = self.cfg(state_dir=state), menage.Policy(tmp_root=scratch)
+        with mock.patch.dict(os.environ, {"AMEESH_SYSTEM_TMP": system}), \
+                mock.patch.object(menage, "in_memory", return_value=False):
+            paths = self.paths(cfg, policy)
+            self.assertIn(os.path.join(state, menage.MANAGED_DIR, "tmp"), self.paths(cfg))
+        self.assertIn(scratch, paths)
+        self.assertIn(system, paths)
+        with mock.patch.dict(os.environ, {"AMEESH_SYSTEM_TMP": system}), \
+                mock.patch.object(menage, "in_memory", side_effect=lambda p: p == system):
+            paths = self.paths(cfg, policy)
+        self.assertIn(scratch, paths)
+        self.assertNotIn(system, paths)
+
     def test_docker_root_best_effort(self):
         self.assertIn("/var/lib/docker", self.paths(self.cfg(), docker="/var/lib/docker"))
         self.assertNotIn(None, self.paths(self.cfg(), docker=None))
@@ -168,6 +185,38 @@ class VolumesTest(_Tmp):
             self.skipTest("running as root")
         self.assertEqual(resources._probe(locked), parent)
         self.assertEqual(resources._probe(parent), parent)
+
+    def test_untraversable_or_missing_path_read_on_its_ancestor(self):
+        """r1 (2): /data/private/docker with `private` denying traversal (stat
+        fails) and a cache dir not created yet are read on the filesystem of
+        their nearest accessible ancestor, so an exhausted one breaches."""
+        data = self.dir("data")
+        docker = os.path.join(self.dir("data", "private", "docker"))
+        private = os.path.dirname(docker)
+        os.chmod(private, 0)
+        self.addCleanup(os.chmod, private, 0o700)
+        try:
+            os.stat(docker)
+            self.skipTest("running as root")
+        except OSError:
+            pass
+        missing = os.path.join(self.tmp, "nocache", "deps")
+        self.assertEqual(resources._probe(docker), data)
+        self.assertEqual(resources._probe(missing), self.tmp)
+        patches = self.fake({data: FSID_SYSTEM}, {data: 70 * GIB, self.tmp: 50 * GIB},
+                            {data: (0, 5 * GIB)})
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        reading = resources.sample("pc", paths=[docker], now=100.0)
+        self.assertEqual(reading["volumes"][0]["disk_free_bytes"], 70 * GIB)
+        self.assertEqual(reading["btrfs_unallocated_bytes"], 0)
+        limits = resources.thresholds({"resources": {"min_btrfs_unallocated": "10GiB"}})
+        found = {b["key"]: b for b in resources.breaches(reading, limits)}
+        self.assertEqual(found["min_btrfs_unallocated"]["path"], docker)
+        vol = resources.volumes([missing])[0]
+        self.assertEqual(vol["path"], missing)
+        self.assertEqual(vol["disk_free_bytes"], 50 * GIB)
 
     def test_sample_takes_the_worst_reading_per_floor(self):
         ssd, state = self.dir("ssd"), self.dir("system", "state")
