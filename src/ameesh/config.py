@@ -69,6 +69,12 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _as_share(value, default: float) -> float:
+    """Part entre 0 et 1 ; illisible ou hors bornes : défaut."""
+    part = _as_float(value, default)
+    return part if 0.0 <= part <= 1.0 else default
+
+
 def _as_count(value, default: int) -> int:
     """Entier ≥ 0 (L105) ; une valeur illisible, négative ou infinie : défaut."""
     nombre = _as_float(value, float(default))
@@ -198,6 +204,15 @@ class Config:
     #: conception et auditeur du canon) : jamais en pause budget tant qu'un
     #: compte a de la marge (voir docs/COMPTES.md § 7)
     critical_agents: tuple[str, ...] = ()
+    #: L242b : part du plafond horaire payé au token du mesh au-delà de
+    #: laquelle un agent NON critique s'arrête (décision de mesh-design du
+    #: 2026-10-12 : 0.75, soit 15 $ sur 20) ; un critique va jusqu'au plafond
+    #: plein. Entre 0 et 1 ; une valeur hors bornes : le défaut.
+    noncritical_hourly_share: float = 0.75
+    #: L242b (3) : les harnais vers lesquels un agent critique au seuil sur
+    #: tous les comptes du sien tourne, dans l'ordre (un harnais au forfait,
+    #: puis un harnais à clé d'API), par rotation avec résumé. Vide : aucun.
+    critical_fallback_harnesses: tuple[str, ...] = ("codex", "deepseek")
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
@@ -350,6 +365,8 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: Off-device session backup; storage credentials come from the environment.
+    session_backup: dict = field(default_factory=dict)
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
@@ -366,6 +383,8 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: Neutral memory transport settings; ssh_key names a host-managed key file.
+    persona_memory: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
@@ -501,6 +520,14 @@ def load(env: dict | None = None) -> Config:
             n.strip() for n in (cfg.critical_agents.split(",")
                                 if isinstance(cfg.critical_agents, str)
                                 else cfg.critical_agents or ()) if str(n).strip()),
+        critical_fallback_harnesses=_as_names(pick("AMEESH_CRITICAL_FALLBACK_HARNESSES"))
+        or tuple(n.strip() for n in (cfg.critical_fallback_harnesses.split(",")
+                                     if isinstance(cfg.critical_fallback_harnesses, str)
+                                     else cfg.critical_fallback_harnesses or ())
+                 if str(n).strip()),
+        noncritical_hourly_share=_as_share(
+            pick("AMEESH_NONCRITICAL_HOURLY_SHARE"),
+            _as_share(cfg.noncritical_hourly_share, Config.noncritical_hourly_share)),
         session_max_tokens=_as_float(
             pick("AMEESH_SESSION_MAX_TOKENS", "AGENT_MESH_SESSION_MAX_TOKENS"),
             cfg.session_max_tokens),

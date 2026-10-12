@@ -78,7 +78,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, mail, migrations, platform, signing, storage
+from . import fil, identity, mail, migrations, platform, registry, signing, storage
 from . import session_bindings as sb
 from .config import NAME_RE, Config
 
@@ -915,6 +915,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             bk.register(name, tool, data.get("cwd"), session_id,
                         leased=binding.bound_to_lease)
             if bk.kind == "pg":
+                # L52: record only after L133/L166 have filtered child IDs.
+                # Under a runner lease, session_id is None; stream parsing
+                # and registry.set_session own the authoritative session.
+                if session_id:
+                    registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
         if binding.source == "explicit" and bk.kind == "pg":
             # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
@@ -1398,6 +1403,20 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schema     : %s" % cfg.schema)
     print("host       : %s" % cfg.host)
+    from . import persona_memory
+    from . import canon as canon_mod
+    memory_note = ""
+    try:
+        policies = [(canon.id, persona_memory.isolation_policy(cfg, canon.registry_canon))
+                    for canon in canon_mod.load_configured(cfg)]
+    except Exception:  # an unreadable policy never breaks the diagnostic
+        policies = []
+        memory_note = " [approved canon unreadable; exception not verified]"
+    exceptions = [ident for ident, policy in policies if policy == "shared-uid-accepted"]
+    print("memory     : %s%s" % ("shared-uid-accepted (approved canon: %s; no UID isolation)"
+                                 % ", ".join(exceptions) if exceptions else
+                                 "UID isolation required; active host peers disable transport",
+                                 memory_note))
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)

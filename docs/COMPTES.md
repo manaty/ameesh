@@ -487,8 +487,7 @@ the turn and before any pause. The runner journal and the team thread say
 change. No `account_switches` row is written, since the shared choice did not
 change.
 
-**Fallback order for a critical agent at its threshold** (this PR covers the
-first two steps):
+**Fallback order for a critical agent at its threshold**:
 
 1. another plan account of the same harness with headroom (§ 4 order);
 2. the harness's default account (`~/.claude`) beyond its implicit 50 % cap.
@@ -502,6 +501,100 @@ first two steps):
    As soon as another account has headroom again (for example after its
    window resets), the agent leaves the default account: continuity only keeps
    a session on an account that is under its ordinary threshold;
-3. another plan harness (Codex), then an API-key harness (DeepSeek), via a
-   rotation with summary. This step is not done yet (lot #340, next PR);
+3. another harness, in the order of `critical_fallback_harnesses` (host
+   configuration, `AMEESH_CRITICAL_FALLBACK_HARNESSES`; default `codex`, then
+   `deepseek`: a plan harness, then an API-key one). The first one that has
+   headroom is used:
+   * it must be installed on the host;
+   * it must have an account under its threshold. With declared accounts,
+     this is a choice for the agent alone, as in steps 1–2; without, its
+     default plan must be under its pace;
+   * if it is paid per token, the mesh hourly cap must still hold. A critical
+     agent has it in full, since non-critical agents stop at
+     `noncritical_hourly_share`.
+
+   The switch goes through a rotation with summary. The summary is made
+   under the old harness and the session's account, the only ones that can
+   resume it; when that is impossible, a deterministic brief is used (L39).
+   A paid-per-token old harness must still hold the mesh caps for the
+   summary, like a turn; otherwise the brief is used. The summary (or
+   brief) is kept in the agent's state (`resume-pending.json`) before the
+   old session is forgotten: a runner restarted before the new session
+   starts still opens it with the summary. It is dropped only once the new
+   session has reported its id (or its turn completed): a harness that dies
+   at launch leaves it for the next turn. If it cannot be written (disk
+   full), the rotation does not happen: the old session is kept and the
+   turn waits. An ordinary rotation (L11) never
+   runs while the next turn would go to another harness than the session's:
+   the switch does it.
+   A fresh session then starts under the new harness. The agent's model,
+   effort and tier do not follow it: the borrowed harness uses its own
+   defaults. Each turn is counted under the harness it ran on (ledger,
+   mesh cap): that harness is written to the agent's state before the
+   accounting marker, and the turn does not start if it cannot be. The
+   thread says "its turns run under codex/<account> until its
+   own account has headroom again" and "Harness switch: …".
+
+   **Coming back.** Before every turn the agent's own harness is evaluated
+   first. While the agent runs under a borrowed harness, it comes back only
+   when one of its accounts has the headroom of a non-critical agent: the
+   reserve of 10 points under the pace (`accounts.RESERVE`) and
+   `noncritical_hourly_share` of the hourly cap, including on the default
+   account taken beyond its 50 % cap (step 2). Without that margin, each
+   crossing of a rising pace cap would cost a summary and a rotation. If no
+   borrowed harness has headroom left, its own account is used without the
+   margin rather than a pause. The return is the same rotation, with the
+   summary made under the borrowed harness;
 4. pause, once all of the above are exhausted.
+
+**Reserve for the critical agents** (L242b (2)). The other agents stop
+earlier, so that the margin left is for the critical ones:
+
+* on a plan, a non-critical agent stops 10 points below the pace cap
+  (`accounts.RESERVE`). With a 90 % pace cap it stops at 80 %: min(80 %,
+  elapsed), no head start above the linear pace (mesh-design, 2026-10-12).
+  The short window cap, when set, is lowered the same way, and never exceeds
+  min(80 %, elapsed) for a non-critical agent. The fixed caps (50 % of the
+  primary, `cap`, `overage_cap`) are not: they hold for everyone. The reason
+  then says "10 points kept for critical agents". This holds with or without
+  declared accounts. It also holds on a host with no critical agent: the
+  reserve is then simply not used;
+* on pay-per-token, a non-critical agent stops at `noncritical_hourly_share`
+  of the mesh hourly cap. The setting is in the host configuration
+  (`AMEESH_NONCRITICAL_HOURLY_SHARE`; between 0 and 1; default 0.75, a
+  mesh-design decision of 2026-10-12): 15 $ of 20 $. A critical agent goes up
+  to the full cap.
+
+**The mesh hourly cap counts the real spend** (mesh-design decision,
+2026-10-12). The pay-per-token spend of the last 60 minutes is the real drop
+of the provider balances, **account by account** (each API key has its own
+balance series):
+
+* a drop between two readings counts only for its part inside the hour. It
+  is split like the ledger estimate of that account over the interval, or in
+  proportion to time when the interval carries less than 0.50 $ of estimate;
+* outside the interval covered by an account's readings, its ledger estimate
+  counts, corrected by its real/estimated ratio. The ratio is used only when
+  the covered interval carries at least 0.50 $ of estimate, and it never goes
+  below 0.1 (`cost.PAID_RATIO_FLOOR`);
+* an account without readings counts its estimate as is: an account with
+  readings never covers the others. A balance series with no account name
+  covers the ledger lines that no named series covers.
+
+Unreadable balances fall back to the estimate. `ameesh budget` shows the
+counted amount next to the estimate.
+
+**A budget pause is shown as one.** The pause reason starts with the account
+that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
+all claude accounts at threshold — …". It is the agent's `status_text`
+("budget : pause (…) until 14:20; …"). An account held by several windows
+frees when the last of them resets: the label names that window, and the
+date when it is not today ("until 14/10 09:00"). Without declared accounts the
+account is `(default)`, the harness's own. `ameesh progress` and the alerts read
+`paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
+
+**Urgent alert** (L242b (5)). When a critical agent is paused on budget
+anyway, the runner marks its status text ("budget : critical agent: …").
+`ameesh alerts` then raises `critical_budget_pause`. The alert is pushed by
+default and urgent, and is mailed (urgent) to the orchestrators of the
+agent's team and to the auditors.

@@ -136,6 +136,74 @@ def _lease(row: dict) -> str:
 # mesh list / show  (spec §5 point 5)
 # --------------------------------------------------------------------------
 
+def _annotate_agents(cfg: Config, db, rows: list) -> list:
+    """The fields of `list --json` added to `registry.overview` rows."""
+    # C4 : verdict de placement de chaque agent (0022)
+    placement.annotate(db, rows)
+    # L26 : champs d'exploitation (schéma `ameesh-agent/1`,
+    # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
+    from . import exploitation
+    exploitation.annotate(cfg, db, rows)
+    return rows
+
+
+def agent_rows(cfg: Config, db) -> list:
+    """The rows of `ameesh list --json` (also `GET /api/v1/agents`, L84)."""
+    from .projects import agent_project
+    rows = registry.overview(db)
+    for row in rows:
+        row["project"] = agent_project(row)
+    return _annotate_agents(cfg, db, rows)
+
+
+def agent_detail(db, name: str) -> dict | None:
+    """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
+    # L61 : la ligne et la clé en un seul aller-retour (db.batched)
+    row, info = db_mod.batched(db, lambda db: (
+        registry.get(db, name), authority.key_info(db, name)))
+    if row is None:
+        return None
+    row = dict(row)
+    row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
+    row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
+    row["key_updated_ts"] = (info or {}).get("key_updated_ts")
+    row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
+    return row
+
+
+def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
+    """L232a planner/journal; activation is supplied by the L232b controller."""
+    from . import canon, handoffs, identity, resources, storage
+    db = _open(cfg)
+    try:
+        if args.handoff_command == "show":
+            row = storage.of(db).handoffs.get(args.operation)
+            if row is None:
+                raise ValueError("unknown handoff")
+            print(json.dumps({"operation": row,
+                              "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
+            return 0
+        binding = identity.resolve_binding(cfg, db)
+        if not binding.ok or binding.name != args.agent:
+            work.corrector(cfg, db)
+        agent = registry.get(db, args.agent)
+        if agent is None:
+            raise ValueError("unknown agent")
+        canons = canon.load_configured(cfg)
+        def limits(host):
+            effective = resources.host_limits(canons, host)
+            return dict(effective["limits"], max_agents=effective["max_agents"])
+        candidate = handoffs.plan(db, agent, limits_for=limits)
+        if candidate is None:
+            print("no fresh admitted destination with capacity")
+            return 0
+        result = candidate if args.dry_run else handoffs.request(db, candidate, repository=args.repository)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    finally:
+        db.close()
+
+
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
@@ -149,13 +217,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         for row in rows:
             row["project"] = agent_project(row)
         if args.json:
-            # C4 : verdict de placement de chaque agent (0022)
-            placement.annotate(db, rows)
-            # L26 : champs d'exploitation (schéma `ameesh-agent/1`,
-            # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
-            from . import exploitation
-            exploitation.annotate(cfg, db, rows)
-            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            print(json.dumps(_annotate_agents(cfg, db, rows), ensure_ascii=False, indent=2))
             return 0
         if not rows:
             print("no known agent")
@@ -210,6 +272,86 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         db.close()
 
 
+def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list[dict]:
+    """What `ameesh hosts` shows of each host (all, or `only`), by name."""
+    from . import canon as canon_mod
+    from . import menage as menage_mod
+    from . import placement as placement_mod
+    from . import resources as res
+
+    latest_by_host = {row["host"]: row for row in res.current(db)}
+    # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
+    # worktrees suivis)
+    hk = storage.of(db).housekeeping
+    measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
+    names = set(latest_by_host) | set(measure_by_host)
+    for canon in canons:
+        names |= {h.title for h in canon.hosts}
+    if only:
+        names = {only}
+    parts = []
+    for name in sorted(names):
+        # L43 (0031) : chaque canon décrit l'hôte par sa fiche Host ; les
+        # limites physiques sont les plus strictes, avec leur provenance
+        fiches = canon_mod.host_fiches(canons, name)
+        physical = res.host_limits(canons, name)
+        latest = latest_by_host.get(name)
+        parts.append({
+            "name": name, "fiches": fiches, "physical": physical, "latest": latest,
+            "host": fiches[0][1] if fiches else None,
+            "admissions": {
+                canon.id: sum(1 for p in canon.placements if p.agent and name in
+                              placement_mod.admitted_hosts(canon, p))
+                for canon, _fiche in fiches},
+            "verdict": (res.pressure(latest, limits=physical["limits"])
+                        if latest is not None else None),
+            "history": res.history(db, name, history),
+            "menage": _host_menage(hk, name, menage_mod.effective(canons, name),
+                                   measure_by_host.get(name), latest),
+        })
+    return parts
+
+
+def _host_json(part: dict) -> dict:
+    """One `ameesh-host/1` object (`hosts --json`, `GET /api/v1/hosts`)."""
+    from . import resources as res
+    host, physical, latest = part["host"], part["physical"], part["latest"]
+    limits = physical["limits"]
+    return {
+        "schema": "ameesh-host/1",
+        "host": part["name"],
+        "responsible": host.responsible if host is not None else None,
+        "limits": limits,
+        "max_agents": physical["max_agents"],
+        "limits_origin": physical["origin"],
+        "fiches": [{"canon": canon.id, "default": canon.is_default,
+                    "responsible": fiche.responsible,
+                    "max_agents": fiche.policy.max_agents,
+                    "admissions": part["admissions"].get(canon.id, 0)}
+                   for canon, fiche in part["fiches"]],
+        "latest": latest,
+        # #253: every filesystem the host writes to, its own reading
+        "volumes": (latest or {}).get("volumes") or [],
+        # L159d: the offer, and the common measure (study §1.4)
+        # whose lendable capacity it caps
+        "offer": limits.get("lend"),
+        "measure": (res.measure(latest, limits.get("lend"))
+                    if latest is not None else None),
+        "pressure": part["verdict"],
+        # L64: what the last reading could not measure
+        "unmeasured": res.unmeasured(latest),
+        "history": part["history"],
+        "housekeeping": part["menage"],
+    }
+
+
+def host_views(cfg: Config, db, host: str | None = None, history: int = 10) -> list[dict]:
+    """The `ameesh-host/1` objects of `ameesh hosts --json` (L84)."""
+    from . import canon as canon_mod
+    canons = canon_mod.load_configured(cfg)
+    return [_host_json(part) for part in _host_parts(cfg, db, canons, host, history)]
+
+
 def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh hosts [--json] [HOST]` : ressources des hôtes (L31, 0028).
 
@@ -223,8 +365,6 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     chacune (`limits_origin`) et les fiches de chaque canon (`fiches`).
     """
     from . import canon as canon_mod
-    from . import menage as menage_mod
-    from . import placement as placement_mod
     from . import resources as res
 
     db = _open(cfg)
@@ -234,66 +374,22 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         canons = canon_mod.load_configured(cfg)
         if getattr(args, "report", False):
             return _host_report(cfg, db, canons, args)
-        latest_by_host = {row["host"]: row for row in res.current(db)}
-        # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
-        # worktrees suivis)
-        hk = storage.of(db).housekeeping
-        measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
-        names_hk = set(measure_by_host)
-        names = set(latest_by_host) | names_hk
-        for canon in canons:
-            names |= {h.title for h in canon.hosts}
-        if args.host:
-            names = {args.host}
-        if not names:
+        parts = _host_parts(cfg, db, canons, args.host, args.history)
+        if not parts:
             print("no known host: no published measurement, no Host card in the canon")
             return 0
         now = time.time()
         many = len(canons) > 1
-        for name in sorted(names):
-            # L43 (0031) : chaque canon décrit l'hôte par sa fiche Host ; les
-            # limites physiques sont les plus strictes, avec leur provenance
-            fiches = canon_mod.host_fiches(canons, name)
-            host = fiches[0][1] if fiches else None
-            physical = res.host_limits(canons, name)
-            limits, origin = physical["limits"], physical["origin"]
-            admissions = {
-                canon.id: sum(1 for p in canon.placements if p.agent and name in
-                              placement_mod.admitted_hosts(canon, p))
-                for canon, _fiche in fiches}
-            latest = latest_by_host.get(name)
-            verdict = res.pressure(latest, limits=limits) if latest is not None else None
-            history = res.history(db, name, args.history)
-            menage = _host_menage(hk, name, menage_mod.effective(canons, name),
-                                  measure_by_host.get(name), latest)
+        for part in parts:
             if args.json:
-                print(json.dumps({
-                    "schema": "ameesh-host/1",
-                    "host": name,
-                    "responsible": host.responsible if host is not None else None,
-                    "limits": limits,
-                    "max_agents": physical["max_agents"],
-                    "limits_origin": origin,
-                    "fiches": [{"canon": canon.id, "default": canon.is_default,
-                                "responsible": fiche.responsible,
-                                "max_agents": fiche.policy.max_agents,
-                                "admissions": admissions.get(canon.id, 0)}
-                               for canon, fiche in fiches],
-                    "latest": latest,
-                    # #253: every filesystem the host writes to, its own reading
-                    "volumes": (latest or {}).get("volumes") or [],
-                    # L159d: the offer, and the common measure (study §1.4)
-                    # whose lendable capacity it caps
-                    "offer": limits.get("lend"),
-                    "measure": (res.measure(latest, limits.get("lend"))
-                                if latest is not None else None),
-                    "pressure": verdict,
-                    # L64: what the last reading could not measure
-                    "unmeasured": res.unmeasured(latest),
-                    "history": history,
-                    "housekeeping": menage,
-                }, ensure_ascii=False, sort_keys=True), flush=True)
+                print(json.dumps(_host_json(part), ensure_ascii=False, sort_keys=True),
+                      flush=True)
                 continue
+            name, fiches, host, physical = (part["name"], part["fiches"], part["host"],
+                                            part["physical"])
+            admissions, latest, verdict = part["admissions"], part["latest"], part["verdict"]
+            history, menage = part["history"], part["menage"]
+            limits, origin = physical["limits"], physical["origin"]
             resp = ("responsible %s" % host.responsible) if host is not None and host.responsible \
                 else "host without a Host card" if host is None else "responsible unknown"
             if latest is None:
@@ -576,17 +672,10 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
-        # L61 : la ligne et la clé en un seul aller-retour (db.batched)
-        row, info = db_mod.batched(db, lambda db: (
-            registry.get(db, args.agent), authority.key_info(db, args.agent)))
+        row = agent_detail(db, args.agent)
         if row is None:
             print(USAGE_HINT % ("unknown agent: %s" % args.agent), file=sys.stderr)
             return 1
-        row = dict(row)
-        row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
-        row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
-        row["key_updated_ts"] = (info or {}).get("key_updated_ts")
-        row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
@@ -956,6 +1045,76 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         print("warning: %s" % warning, file=sys.stderr)
 
 
+def work_rows(db, *, state: str | None = None, assignee: str | None = None,
+              limit: int | None = None, threshold: float | None = None) -> list:
+    """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84)."""
+    from . import plan, stagnation
+    if threshold is None:
+        threshold = stagnation.DEFAULT_THRESHOLD_S
+
+    def lire(db):
+        rows = work.list_items(db, state=state, assignee=assignee, limit=limit)
+        plan.annotate(db, rows, threshold=threshold)
+        # Les délais viennent d'un seul balayage, restreint aux lots
+        # affichés (jamais une requête par ligne) ; le JSON les porte
+        # aussi, pour la frise (L24). Le filtre porte sur les lignes
+        # rendues, pas sur une fenêtre globale : un lot ancien garde sa
+        # frise (B3).
+        delays = {row["work_item_id"]: row for row in
+                  work.delays(db, ids=[row["id"] for row in rows])}
+        for row in rows:
+            row["delays"] = delays.get(row["id"])
+        return rows
+
+    # L61 : lectures regroupées — deux allers-retours en tout
+    return db_mod.batched(db, lire)
+
+
+def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
+    """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
+    from . import plan
+    item = work.get(db, lot_id)
+    if item is None:
+        return None
+    item["events"] = work.events(db, lot_id)
+    item["milestones"] = work.milestones(db, lot_id)
+    from .modules.storage import ModuleStore
+    item["module_milestones"] = ModuleStore(db).milestones(lot_id)
+    item["delays"] = work.timeline(db, lot_id)
+    plan.annotate(db, [item])
+    # L96 : dates prévues (feuille de route)
+    planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
+    item["planned"] = {k: planned.get("planned_" + k)
+                       for k in ("start", "end", "delivery", "source", "by")}
+    # L157 : durée estimée, réel mesuré, écart ; historique des estimations
+    from . import estimates
+    item["estimate"] = estimates.view(
+        item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+    item["estimates"] = storage.of(db).work.estimates(lot_id)
+    # L157b : estimation de référence (lecture de la table publiée)
+    item["estimate_reference"] = estimates.proposal(
+        db, type=item.get("type"), size=item.get("change_size"),
+        assignee=item.get("assignee"))
+    # L160d : résolutions préparées où le lot est l'un des deux côtés
+    from . import resolutions
+    item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
+    if error:  # e.g. a database without migration 0057
+        item["resolutions_error"] = error
+    # L160e : place du lot dans la file de fusion de sa cible
+    try:
+        item["queue"] = next((r for r in storage.of(db).work.queue()
+                              if int(r["work_item_id"]) == lot_id), None)
+    except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
+        item["queue"] = None
+    # L157c: actual time by phase and merged diff size, once delivered
+    from . import lot_measures
+    item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
+    # L317c: the auditor's automatic deep analysis and its measured delay
+    from . import deep_analysis
+    item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
+    return item
+
+
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     from . import plan, plan_cli, stagnation  # plan de travail (L29)
     db = _open(cfg)
@@ -1071,25 +1230,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           row["work_item_id"], issue))
             return 0
         if args.work_command == "list":
-            threshold = stagnation.stale_after(args.stale_after)
-
-            def lire(db):
-                rows = work.list_items(db, state=args.state, assignee=args.assignee,
-                                       limit=args.limit)
-                plan.annotate(db, rows, threshold=threshold)
-                # Les délais viennent d'un seul balayage, restreint aux lots
-                # affichés (jamais une requête par ligne) ; le JSON les porte
-                # aussi, pour la frise (L24). Le filtre porte sur les lignes
-                # rendues, pas sur une fenêtre globale : un lot ancien garde sa
-                # frise (B3).
-                delays = {row["work_item_id"]: row for row in
-                          work.delays(db, ids=[row["id"] for row in rows])}
-                for row in rows:
-                    row["delays"] = delays.get(row["id"])
-                return rows
-
-            # L61 : lectures regroupées — deux allers-retours en tout
-            rows = db_mod.batched(db, lire)
+            rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
+                             threshold=stagnation.stale_after(args.stale_after))
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -1119,46 +1261,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("      %s" % " · ".join(notes))
             return 0
         if args.work_command == "show":
-            item = work.get(db, args.id)
+            from . import estimates, lot_measures, resolutions
+            item = work_detail(cfg, db, args.id)
             if item is None:
                 print(USAGE_HINT % ("lot %s not found" % args.id), file=sys.stderr)
                 return 1
-            item["events"] = work.events(db, args.id)
-            item["milestones"] = work.milestones(db, args.id)
-            from .modules.storage import ModuleStore
-            item["module_milestones"] = ModuleStore(db).milestones(args.id)
-            item["delays"] = work.timeline(db, args.id)
-            plan.annotate(db, [item])
-            # L96 : dates prévues (feuille de route)
-            planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
-            item["planned"] = {k: planned.get("planned_" + k)
-                               for k in ("start", "end", "delivery", "source", "by")}
-            # L157 : durée estimée, réel mesuré, écart ; historique des estimations
-            from . import estimates
-            item["estimate"] = estimates.view(
-                item, merged_ts=(item["delays"] or {}).get("merged_ts"))
-            item["estimates"] = storage.of(db).work.estimates(args.id)
-            # L157b : estimation de référence (lecture de la table publiée)
-            item["estimate_reference"] = estimates.proposal(
-                db, type=item.get("type"), size=item.get("change_size"),
-                assignee=item.get("assignee"))
-            # L160d : résolutions préparées où le lot est l'un des deux côtés
-            from . import resolutions
-            item["resolutions"], error = resolutions.of_lot_or_error(db, args.id)
-            if error:  # e.g. a database without migration 0057
-                item["resolutions_error"] = error
-            # L160e : place du lot dans la file de fusion de sa cible
-            try:
-                item["queue"] = next((r for r in storage.of(db).work.queue()
-                                      if int(r["work_item_id"]) == args.id), None)
-            except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
-                item["queue"] = None
-            # L157c: actual time by phase and merged diff size, once delivered
-            from . import lot_measures
-            item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
-            # L317c: the auditor's automatic deep analysis and its measured delay
-            from . import deep_analysis
-            item["deep_analysis"] = deep_analysis.status(db, args.id, cfg=cfg)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -1898,6 +2005,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_models_discover.add_argument("--notify", help="agent to wake with an event")
     p_models_discover.add_argument("--sender", default=os.environ.get("AMEESH_AGENT") or "catalogue")
     p_models_discover.set_defaults(func=cmd_models_discover)
+
+    p_handoff = sub.add_parser("handoff", help="plan a reserved lot-boundary host move or inspect its journal")
+    handoff_sub = p_handoff.add_subparsers(dest="handoff_command")
+    p_handoff_plan = handoff_sub.add_parser("plan")
+    p_handoff_plan.add_argument("agent")
+    p_handoff_plan.add_argument("--repository", required=True,
+                                help="enrolled Git remote identity, never inferred from a directory name")
+    p_handoff_plan.add_argument("--dry-run", action="store_true")
+    p_handoff_plan.set_defaults(func=cmd_handoff)
+    p_handoff_show = handoff_sub.add_parser("show")
+    p_handoff_show.add_argument("operation")
+    p_handoff_show.set_defaults(func=cmd_handoff)
 
     p_key = sub.add_parser("key", help="owner public keys")
     key_sub = p_key.add_subparsers(dest="key_command")

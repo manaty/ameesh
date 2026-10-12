@@ -639,6 +639,59 @@ class _CanonDbCase(_TmpMixin, PgTestCase):
 
 
 class SyncTest(_CanonDbCase):
+    def test_claim_during_capability_revocation_reports_incomplete_then_recovers(self):
+        self.sync()
+        path = os.path.join(self.root, "agents", "orchestre.md")
+        with open(path, encoding="utf-8") as source:
+            declared = source.read()
+        write(self.root, "agents/orchestre.md", declared.replace(
+            "capabilities: [read, report-drift, propose]", "capabilities: [read]"))
+        original = canon_sync._write_declared
+        raced = []
+        def claim_before_write(db, name, values):
+            if name == "orchestre":
+                lease = registry.claim(db, name, "racing-runner", 600)
+                self.assertIsNotNone(lease)
+                self.assertGreater(lease["lease_epoch"], values["_expected_lease_epoch"])
+                raced.append(name)
+            return original(db, name, values)
+        with mock.patch.object(canon_sync, "_write_declared", side_effect=claim_before_write):
+            report = self.sync()
+        self.assertEqual(raced, ["orchestre"])
+        self.assertEqual(self.actions(report)["orchestre"], "différé")
+        self.assertEqual(report.status, canon_sync.CANON_INVALID)
+        self.assertIn(canon_sync.SYNC_INCOMPLETE, codes(report.findings, canon.ERROR))
+        self.assertIn("orchestre", report.diagnostic)
+        action = next(a for a in report.actions if a.agent == "orchestre")
+        self.assertIsNone(action.placement)  # no written placement to report
+        self.assertEqual(self.row("orchestre")["capabilities"], ["read", "report-drift", "propose"])
+        self.assertEqual(canon_sync.state(self.db, "atelier")["status"], "invalid")
+        self.assertEqual(registry.claimable(self.db, "atelier", require_responsible=True), [])
+        # The next pass reads the current epoch and applies the revocation
+        # without changing or terminating the claimed lease.
+        before = self.row("orchestre")
+        recovered = self.sync()
+        self.assertEqual(self.actions(recovered)["orchestre"], "mis à jour")
+        self.assertEqual(recovered.status, canon_sync.CANON_OK)
+        after = self.row("orchestre")
+        self.assertEqual(after["capabilities"], ["read"])
+        self.assertEqual((after["lease_owner"], after["lease_epoch"]),
+                         (before["lease_owner"], before["lease_epoch"]))
+        self.assertEqual(canon_sync.state(self.db, "atelier")["status"], "ok")
+
+    def test_concurrent_insert_is_not_reported_as_created(self):
+        original = canon_sync._write_declared
+        def insert_before_write(db, name, values):
+            if name == "orchestre":
+                registry.upsert(db, name, harness="codex", host="atelier", cwd="/concurrent/work")
+            return original(db, name, values)
+        with mock.patch.object(canon_sync, "_write_declared", side_effect=insert_before_write):
+            report = self.sync()
+        self.assertEqual(self.actions(report)["orchestre"], "différé")
+        self.assertEqual(report.status, canon_sync.CANON_INVALID)
+        self.assertEqual(self.row("orchestre")["cwd"], "/concurrent/work")
+        self.assertEqual(self.row("orchestre")["harness"], "codex")
+
     def test_cree_les_agents_places_sur_l_hote(self):
         report = self.sync()
         self.assertEqual(self.actions(report), {"orchestre": "créé", "relecteur": "créé"})

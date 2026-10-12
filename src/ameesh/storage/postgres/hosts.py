@@ -14,9 +14,11 @@ la base (`now()`) sauf quand un test la fournit.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any
 
 from .. import interface
+from ... import db as db_mod
 
 #: une liste de textes passée en paramètre : `NULL` si vide/None, sinon un
 #: JSON que l'instruction convertit en `text[]`
@@ -88,7 +90,29 @@ TURN_COLUMNS = (
 
 class Hosts(interface.HostResources):
 
+    @contextmanager
+    def gate_guard(self, host):
+        # Independent connection: the durable effect intent must stay
+        # committed while the gate lock spans the synchronous host call.
+        gate_db = db_mod.connect(self.db.cfg)
+        try:
+            with gate_db.transaction() as tx:
+                self._lock_gate(tx, host)
+                yield Hosts(tx)
+        finally:
+            gate_db.close()
+
+    @staticmethod
+    def _lock_gate(tx, host):
+        tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                 ("host-gate:" + host,))
+
     def record(self, reading) -> dict:
+        with self.db.transaction() as tx:
+            self._lock_gate(tx, reading.get("host") or "")
+            return Hosts(tx)._record(reading)
+
+    def _record(self, reading) -> dict:
         rows = self.db.query(
             """
             INSERT INTO host_resources
@@ -271,6 +295,23 @@ class TurnResources(interface.TurnResources):
             " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status <> 'done' RETURNING id",
             (_array(turn_ids),)))
 
+    def settle_unchanged(self, rows) -> list[str]:
+        if not rows:
+            return []
+        import json
+        seen = json.dumps([{"turn_id": r["turn_id"], "status": r.get("status"),
+                            "ended_ts": r.get("ended_ts"), "pgid": r.get("pgid"),
+                            "containers": r.get("containers")} for r in rows])
+        return [row["turn_id"] for row in self.db.query(
+            "UPDATE turn_resources t SET status = 'done', ended_at = coalesce(t.ended_at, now())"
+            " FROM jsonb_to_recordset(%s::jsonb) AS v(turn_id text, status text,"
+            "   ended_ts float8, pgid integer, containers jsonb)"
+            " WHERE t.turn_id = v.turn_id AND t.status <> 'done' AND t.status = v.status"
+            "   AND extract(epoch from t.ended_at)::float8 IS NOT DISTINCT FROM v.ended_ts"
+            "   AND t.pgid IS NOT DISTINCT FROM v.pgid"
+            "   AND coalesce(to_jsonb(t.containers), 'null') = coalesce(v.containers, 'null')"
+            " RETURNING t.turn_id", (seen,))]
+
     def mark_orphan_many(self, turn_ids) -> int:
         if not turn_ids:
             return 0
@@ -301,6 +342,16 @@ class TurnResources(interface.TurnResources):
             "SELECT " + TURN_COLUMNS + " FROM turn_resources" + where +
             (" AND" if where else " WHERE") + " status = 'orphan'"
             " ORDER BY started_at DESC, id DESC LIMIT %s", tuple(params))
+
+    def to_review(self, host, idle_s, after_id=0, limit=500) -> list[dict]:
+        # comme `stale_running` : une ligne en délai de grâce se juge sur la
+        # fin de son tour
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND id > %s AND (status = 'orphan' OR (status = 'running'"
+            "   AND coalesce(ended_at, started_at) < now() - make_interval(secs => %s)))"
+            " ORDER BY id LIMIT %s",
+            (host, int(after_id), float(idle_s), int(limit)))
 
     def orphans_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
         return self.db.query(
