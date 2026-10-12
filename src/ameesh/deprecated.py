@@ -22,14 +22,21 @@ class HiddenAliasParser(argparse.ArgumentParser):
     prefix that matches at least one visible option resolves on the visible
     one (``--dep`` -> ``--depends-on``), and when several visible options
     remain the ambiguity message names those only: a hidden alias never shows
-    up in an error suggestion. A prefix that matches hidden aliases only keeps
-    argparse's behaviour, so the old spelling stays usable.
+    up in an error suggestion.
+
+    A prefix that matches hidden aliases only keeps the old spelling usable
+    when it designates exactly one of them (``--pou`` -> ``--pour``). When it
+    designates several, argparse's ambiguity message would name them
+    (``--po could match --pour, --porteur``): the match is dropped instead, so
+    no hidden alias leaks into a suggestion.
     """
 
     def _get_option_tuples(self, option_string):  # type: ignore[override]
         tuples = super()._get_option_tuples(option_string)
         visible = [t for t in tuples if t[0].help is not argparse.SUPPRESS]
-        return visible or tuples
+        if visible:
+            return visible
+        return tuples if len(tuples) == 1 else []
 
 
 def _append_unique(namespace, dest: str, value) -> None:

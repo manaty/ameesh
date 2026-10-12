@@ -100,6 +100,23 @@ class RoadmapAliasesTest(unittest.TestCase):
         self.assertIn("--decision", err.getvalue())
         self.assertNotIn("--depend-de", err.getvalue())
 
+    def test_hidden_only_ambiguity_names_no_french_alias(self):
+        """P3 : `--po` ne désigne que des alias cachés : aucun n'est suggéré."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as case:
+            self.parser.parse_args(["add", "x", "--po", "2026-10-20"])
+        self.assertEqual(case.exception.code, 2)
+        message = err.getvalue()
+        self.assertIn("--po", message)
+        for _, french in self.ADD:
+            self.assertNotIn(french, message)
+
+    def test_hidden_only_prefix_still_resolves_when_unique(self):
+        """L'ancienne abréviation d'un seul alias caché reste acceptée."""
+        namespace, err = parse(self.parser, "add", "x", "--pou", "2026-10-20")
+        self.assertEqual(namespace.due, "2026-10-20")
+        self.assertIn("--pour is deprecated, use --due", err)
+
     def test_depends_on_and_depend_de_do_not_duplicate(self):
         """P2 : la même dépendance, dans les deux graphies, n'est gardée qu'une fois."""
         for argv in (("--depend-de", "L1", "--depends-on", "L1"),
