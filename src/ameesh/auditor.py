@@ -4,21 +4,34 @@ from . import canon as canon_mod
 from .alert_briefs import AUDITOR_NAME, AUDITOR_ROLES
 
 
-def load_all(cfg):
-    """La prise automatique exige tous les canons, sans omission silencieuse."""
+def _readable(loaded):
+    # Un frontmatter invalide peut masquer le rôle de l'auditeur, même
+    # classé warning quand son type est indéterminable.
+    return (loaded.readable and not loaded.scope_unread
+            and not canon_mod.errors(loaded.load_findings)
+            and not any(f.code == "frontmatter-invalid" for f in loaded.load_findings))
+
+
+def load_all(cfg, *, strict=True):
+    """Charge tous les canons sans omission ; vérifie leurs identités.
+
+    En mode non strict, la prise vérifie ensuite le canon de chaque candidat.
+    """
     out = []
     for entry in canon_mod.configured(cfg):
         loaded = canon_mod.from_config(cfg, entry=entry)
-        # Un frontmatter invalide peut masquer le rôle de l'auditeur, même
-        # classé warning quand son type est indéterminable.
-        if (not loaded.readable or loaded.scope_unread
-                or canon_mod.errors(loaded.load_findings)
-                or any(f.code == "frontmatter-invalid" for f in loaded.load_findings)):
-            raise canon_mod.CanonError("canon unreadable or scope incomplete: %s"
- % entry.path)
+        if strict and not _readable(loaded):
+            raise canon_mod.CanonError("canon unreadable or scope incomplete: %s" % entry.path)
         out.append(loaded)
     canon_mod.check_identities(out)
     return out
+
+
+def may_take(row, canons):
+    """Refuse une prise si le canon propriétaire est absent ou incomplet."""
+    if not canons:  # installations historiques sans canon configuré
+        return True
+    return any(c.owns(row.get("canon")) and _readable(c) for c in canons)
 
 
 def cards(listing, canons):
