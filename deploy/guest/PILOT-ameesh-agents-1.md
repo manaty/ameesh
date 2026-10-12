@@ -186,7 +186,10 @@ runners. Everything is checked before anything is done:
   read, as its runner does), on each request, for `https://github.com`
   only: root hands git no token (no file, argument, environment or open
   descriptor), and nothing is printed. A clone without `GH_TOKEN` in the
-  agent's file is refused;
+  agent's file is refused. **The guests of one host share a UID
+  (`ameesh-guest`), so their tokens**: any guest agent, or a git hook it
+  runs, can read every `guest-<agent>.env`. Use one GitHub token per guest
+  host, with the fewest rights possible (`--check` says it too);
 * **the dsh profile**: `hooks.json` and the plain files of
   `~/.dsh/profiles/*/` from `--dsh-from` (by default the `sudo` user's
   `~/.dsh`), never its sessions, keys, logs or modules; refused if a file

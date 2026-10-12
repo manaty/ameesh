@@ -502,7 +502,8 @@ class InstallPilotTest(unittest.TestCase):
         for cmd in ("ls-remote --exit-code", "clone --quiet"):
             line = next(l for l in fresh.splitlines() if cmd in l)
             self.assertIn("-- env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN "
-                          "GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=!f()",
+                          "-u GIT_TRACE_REDACT GIT_TERMINAL_PROMPT=0 git -c credential.helper= "
+                          "-c credential.helper=!f()",
                           line)
         # that inline helper, run: the store set by the environment unset
         inline = self.inline_helper(fresh)
@@ -813,6 +814,9 @@ class InstallPilotTest(unittest.TestCase):
         self.assertIn("FAIL /opt/ameesh/git-credential-guest missing", out)
         self.assertIn("FAIL /srv/ameesh-guest/home/.dsh: no hooks.json", out)
         self.assertIn("ok   GH_TOKEN set in guest-deepseek6.env", out)
+        # mesh-design #457 r5: one UID, so one token, for every guest
+        self.assertIn("note: the guests of one host share a UID, so their tokens: one GitHub "
+                      "token per guest host, with the fewest rights possible", out)
         self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: not a clone", out)
         self.assertNotIn(self.TOKEN, out + res.stderr)
         # what --enable makes, made by hand in the test's host

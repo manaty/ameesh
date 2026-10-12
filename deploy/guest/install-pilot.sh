@@ -661,7 +661,9 @@ git_cred() {
   shift
   helper=$(printf '!f() { [ "$1" = get ] || return 0; p= h=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in protocol=*) p=${l#protocol=} ;; host=*) h=${l#host=} ;; esac; done; [ "$p" = https ] && [ "$h" = github.com ] || return 0; t=$(sed -n "s/^[[:space:]]*GH_TOKEN=//p" %s | tail -n 1 | sed "s/^[\\"\\x27]//; s/[\\"\\x27]\\$//"); [ -n "$t" ] && printf "username=x-access-token\\npassword=%%s\\n" "$t"; }; f' \
     "$ETC/guest-$a.env")
-  as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN GIT_TERMINAL_PROMPT=0 \
+  # (GIT_TRACE_REDACT unset: a trace, if any, keeps its redaction: mesh-design #457 r5)
+  as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN -u GIT_TRACE_REDACT \
+    GIT_TERMINAL_PROMPT=0 \
     git -c credential.helper= -c "credential.helper=$helper" "$@"
 }
 # cred_audit DIR before|after: what in the clone in DIR's config, as git
@@ -789,6 +791,9 @@ EOF
     echo "     (no --canon: each work folder taken for $ROOT/work/<agent>)"
     for a in "${guests[@]}"; do folder[$a]=$ROOT/work/$a; done
   fi
+  # one UID for every guest: no token is kept from the others (mesh-design #457 r5)
+  [ ${#guests[@]} -eq 0 ] || echo "     note: the guests of one host share a UID, so their tokens:" \
+    "one GitHub token per guest host, with the fewest rights possible"
   for a in "${guests[@]}"; do
     has_token "$a" && ok "GH_TOKEN set in guest-$a.env" || ko "GH_TOKEN not set in $ETC/guest-$a.env"
     dir=${folder[$a]:-}
