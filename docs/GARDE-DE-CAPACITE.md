@@ -12,8 +12,8 @@ behind each choice are in the study
 | this document | `docs/GARDE-DE-CAPACITE.md` |
 | schema of the state | [`docs/schemas/ameesh-host-state-1.schema.json`](schemas/ameesh-host-state-1.schema.json) |
 | schema of the acknowledgement | [`docs/schemas/ameesh-host-ack-1.schema.json`](schemas/ameesh-host-ack-1.schema.json) |
-| golden sets | `tests/dore/capacity_guard/` (`state.json`, `ack.json`, `offer.json`, `lendable.json`) |
-| offer parser, paths, names | `src/ameesh/capacity_guard.py` |
+| golden sets | `tests/dore/capacity_guard/` (`state.json`, `ack.json`, `offer.json`, `lendable.json`, `freshness.json`) |
+| offer parser, paths, names, freshness of the state | `src/ameesh/capacity_guard.py` |
 | common measure | `resources.measure` (L159d) |
 | VM guard | `ameesh guard` (L159e) |
 
@@ -98,7 +98,9 @@ device's `Host` fiche keeps `policy.volatile` and `max_agents`.
 ## 4. The common measure
 
 The guard publishes a `measure` object in the state. Every key is always
-present. A value that is not measured is `null`, never a guess.
+present: the schema requires each of them, and those of `psi`, `app_psi`
+and `lendable` when these are objects. A value that is not measured is
+`null`, never a guess, and a missing key makes the state invalid.
 
 | Key | Definition |
 |---|---|
@@ -146,10 +148,12 @@ expected `lendable`.
 
 ## 5. The state: `ameesh-host-state/1`
 
-The guard writes the state, and the guest reads it. Only `schema`, `state`
+The guard writes the state, and the guest reads it. `schema`, `state`
 (`available`, `draining` or `stopped`) and `seq` (an integer that grows at
-each write) are required. Every field below is optional, and a reader
-ignores those it does not know.
+each write) are required. A capacity guard (a state with `guard`) also
+always writes `expires_ts` (section 5.3). Every other field below is
+optional, and a reader ignores those it does not know. The sizes in `caps`
+(`*_mb`) are in MiB (section 5.4).
 
 | Field | Meaning | An older reader |
 |---|---|---|
@@ -159,7 +163,7 @@ ignores those it does not know.
 | `caps.max_concurrent` | the guest claims within `min(max_concurrent, max_agents)` | unchanged |
 | `caps.cpu_share` | share of the **host's** CPUs (0 < x ≤ 1): quota `cpu_share × cpu_count` | unchanged |
 | `caps.memory_mb` | hard cap of the **whole** guest: the actual envelope, not the offer | unchanged |
-| `expires_ts` | the state is no longer valid after this instant. The guard rewrites it every third of its life (30 s by default). An expired state is unreadable, so it counts as `stopped` | ignores it; the kernel caps stay in place |
+| `expires_ts` | the state is no longer valid from this instant. Required from a capacity guard, at most 300 s ahead; the guard rewrites it every third of its life (30 s by default). On a lending host, an expired, missing or null `expires_ts` counts as `stopped` (section 5.3) | ignores it; the kernel caps stay in place |
 | `caps.cpu_weight`, `caps.io_weight` | weight against the application (1 to 10 000) | ignored |
 | `caps.memory_high_mb` | soft cap: above it, the kernel reclaims the guest's memory first | ignored |
 | `caps.agent_memory_mb` | hard cap per agent or per offloaded job | ignored |
@@ -192,6 +196,37 @@ Free text is admitted. The following values have a fixed meaning:
   writable by the guest.
 
 Both files are written to a temporary file, then renamed.
+
+### 5.3 Freshness
+
+A guard that dies must not leave behind a state the guest keeps obeying.
+On a **lending host** (`host_gate_fallback: stopped`), the guest obeys the
+state it read at `now` only if all of these hold, and counts it as
+`stopped` otherwise:
+
+- the document is readable, of schema `ameesh-host-state/1`, with a known
+  `state` and an integer `seq`;
+- `expires_ts` is a finite number: **missing or `null` is stale**;
+- `now < expires_ts`: a state expiring at `now` is expired;
+- `expires_ts ≤ now + 300 s`: further ahead, a dead guard's `available`
+  would outlive it. A guard writes `now + 90 s` by default.
+
+On a **classic host** (no capacity guard), an absent or `null`
+`expires_ts` is admitted, because the gate predates it; a state that is
+otherwise unreadable or stale falls back to `available`, as before.
+`capacity_guard.gate_state` implements this rule, and
+`tests/dore/capacity_guard/freshness.json` gives its cases. The rule
+compares the guard's instants with the guest's clock: on a device, the
+agent VM's clock must follow the host's, since a skew of more than a few
+seconds misjudges freshness.
+
+### 5.4 Units of the caps
+
+`memory_mb`, `memory_high_mb`, `agent_memory_mb`, `disk_mb` and `tmp_mb`
+are **MiB** (2^20 bytes): `memory_mb: 4096` is 4 294 967 296 bytes. A guard
+converts bytes to these caps rounding **down** (`bytes // 2^20`), so a cap
+never exceeds the capacity it stands for. systemd reads them with the
+suffix `M`, which is also 2^20 bytes (`MemoryMax=4096M`).
 
 ## 6. Giving way: the tiers
 
@@ -261,10 +296,13 @@ Each file of `tests/dore/capacity_guard/` carries `"schema":
 - `offer.json`: an offer as written in a fiche (`lend`), and the offer read
   from it, or the problems that drop it;
 - `lendable.json`: the constants of section 4, then the inputs and the
-  expected `lendable` of each case.
+  expected `lendable` of each case;
+- `freshness.json`: `max_state_ttl_s`, then a state document (or `null`),
+  the instant it is read, whether the host lends, and the state the guest
+  obeys (section 5.3).
 
 `tests/test_l159a_capacity_guard.py` checks them in ameesh against the
-schemas, the offer parser and the formula of section 4, which it computes
+schemas, the offer parser, the freshness rule and the formula of section 4, which it computes
 independently of `resources`. Its JSON Schema validator implements only
 the keywords the schemas use, so a new keyword fails the test until the
 validator learns it. Nexlink Compute runs the same files in its tests.

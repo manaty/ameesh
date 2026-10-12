@@ -182,6 +182,7 @@
     "schema": "ameesh-host-state/1",
     "state": "draining",
     "seq": 12,
+    "expires_ts": 1791640030.0,
     "drain_deadline_ts": 1791640090.0,
     "reason": "the owner closed the lid",
     "guard": {
@@ -378,6 +379,462 @@
     "seq": 5,
     "guard": {
      "kind": "other"
+    }
+   }
+  },
+  {
+   "why": "a capacity guard always writes expires_ts (section 5.3)",
+   "doc": {
+    "schema": "ameesh-host-state/1",
+    "state": "available",
+    "seq": 1791640000,
+    "until_ts": 1791676800.0,
+    "drain_deadline_ts": null,
+    "reason": "idle",
+    "caps": {
+     "max_concurrent": 2,
+     "cpu_share": 0.375,
+     "memory_mb": 10240,
+     "cpu_weight": 10,
+     "io_weight": 10,
+     "memory_high_mb": 9216,
+     "agent_memory_mb": 4608,
+     "disk_mb": 81920,
+     "tmp_mb": 2048,
+     "max_job_s": 14400,
+     "enforced": [
+      "cpu_share",
+      "memory_mb",
+      "cpu_weight",
+      "io_weight",
+      "memory_high_mb",
+      "agent_memory_mb"
+     ]
+    },
+    "freeze": null,
+    "windows": [
+     {
+      "start_ts": 1791652800.0,
+      "end_ts": 1791720000.0
+     }
+    ],
+    "offer": {
+     "cpu_max": 3.0,
+     "memory_max": 15032385536,
+     "disk_max": 85899345920
+    },
+    "measure": {
+     "ts": 1791640000.0,
+     "window_s": 60.0,
+     "cpu_count": 8,
+     "app_cpu": 1.6,
+     "guest_cpu": 2.1,
+     "mem_total_bytes": 34359738368,
+     "mem_available_bytes": 19327352832,
+     "swap_used_bytes": 0,
+     "guest_mem_bytes": 6442450944,
+     "psi": {
+      "cpu_some": 3.2,
+      "mem_some": 0.0,
+      "mem_full": 0.0,
+      "io_some": 0.4
+     },
+     "app_psi": null,
+     "disk_free_bytes": 107374182400,
+     "app_disk_free_bytes": null,
+     "tmp_path": "/tmp",
+     "tmp_fstype": "tmpfs",
+     "tmp_size_bytes": 17179869184,
+     "tmp_used_bytes": 536870912,
+     "on_ac": null,
+     "battery_percent": null,
+     "metered": null,
+     "user_idle_s": null,
+     "busy": null,
+     "lendable": {
+      "cpu": 3.0,
+      "memory_bytes": 10737418240,
+      "disk_bytes": 85899345920
+     }
+    },
+    "guard": {
+     "kind": "ameesh-guard",
+     "version": "1.10.0",
+     "host_kind": "vm"
+    }
+   }
+  },
+  {
+   "why": "measure: every key present, null when not measured",
+   "doc": {
+    "schema": "ameesh-host-state/1",
+    "state": "available",
+    "seq": 1791640000,
+    "until_ts": 1791676800.0,
+    "drain_deadline_ts": null,
+    "expires_ts": 1791640030.0,
+    "reason": "idle",
+    "caps": {
+     "max_concurrent": 2,
+     "cpu_share": 0.375,
+     "memory_mb": 10240,
+     "cpu_weight": 10,
+     "io_weight": 10,
+     "memory_high_mb": 9216,
+     "agent_memory_mb": 4608,
+     "disk_mb": 81920,
+     "tmp_mb": 2048,
+     "max_job_s": 14400,
+     "enforced": [
+      "cpu_share",
+      "memory_mb",
+      "cpu_weight",
+      "io_weight",
+      "memory_high_mb",
+      "agent_memory_mb"
+     ]
+    },
+    "freeze": null,
+    "windows": [
+     {
+      "start_ts": 1791652800.0,
+      "end_ts": 1791720000.0
+     }
+    ],
+    "offer": {
+     "cpu_max": 3.0,
+     "memory_max": 15032385536,
+     "disk_max": 85899345920
+    },
+    "measure": {},
+    "guard": {
+     "kind": "ameesh-guard",
+     "version": "1.10.0",
+     "host_kind": "vm"
+    }
+   }
+  },
+  {
+   "why": "measure: a missing key is not a null one",
+   "doc": {
+    "schema": "ameesh-host-state/1",
+    "state": "available",
+    "seq": 1791640000,
+    "until_ts": 1791676800.0,
+    "drain_deadline_ts": null,
+    "expires_ts": 1791640030.0,
+    "reason": "idle",
+    "caps": {
+     "max_concurrent": 2,
+     "cpu_share": 0.375,
+     "memory_mb": 10240,
+     "cpu_weight": 10,
+     "io_weight": 10,
+     "memory_high_mb": 9216,
+     "agent_memory_mb": 4608,
+     "disk_mb": 81920,
+     "tmp_mb": 2048,
+     "max_job_s": 14400,
+     "enforced": [
+      "cpu_share",
+      "memory_mb",
+      "cpu_weight",
+      "io_weight",
+      "memory_high_mb",
+      "agent_memory_mb"
+     ]
+    },
+    "freeze": null,
+    "windows": [
+     {
+      "start_ts": 1791652800.0,
+      "end_ts": 1791720000.0
+     }
+    ],
+    "offer": {
+     "cpu_max": 3.0,
+     "memory_max": 15032385536,
+     "disk_max": 85899345920
+    },
+    "measure": {
+     "ts": 1791640000.0,
+     "window_s": 60.0,
+     "cpu_count": 8,
+     "app_cpu": 1.6,
+     "guest_cpu": 2.1,
+     "mem_total_bytes": 34359738368,
+     "mem_available_bytes": 19327352832,
+     "swap_used_bytes": 0,
+     "guest_mem_bytes": 6442450944,
+     "psi": {
+      "cpu_some": 3.2,
+      "mem_some": 0.0,
+      "mem_full": 0.0,
+      "io_some": 0.4
+     },
+     "app_psi": null,
+     "disk_free_bytes": 107374182400,
+     "app_disk_free_bytes": null,
+     "tmp_path": "/tmp",
+     "tmp_fstype": "tmpfs",
+     "tmp_size_bytes": 17179869184,
+     "tmp_used_bytes": 536870912,
+     "on_ac": null,
+     "battery_percent": null,
+     "metered": null,
+     "user_idle_s": null,
+     "lendable": {
+      "cpu": 3.0,
+      "memory_bytes": 10737418240,
+      "disk_bytes": 85899345920
+     }
+    },
+    "guard": {
+     "kind": "ameesh-guard",
+     "version": "1.10.0",
+     "host_kind": "vm"
+    }
+   }
+  },
+  {
+   "why": "measure.psi: every key present",
+   "doc": {
+    "schema": "ameesh-host-state/1",
+    "state": "available",
+    "seq": 1791640000,
+    "until_ts": 1791676800.0,
+    "drain_deadline_ts": null,
+    "expires_ts": 1791640030.0,
+    "reason": "idle",
+    "caps": {
+     "max_concurrent": 2,
+     "cpu_share": 0.375,
+     "memory_mb": 10240,
+     "cpu_weight": 10,
+     "io_weight": 10,
+     "memory_high_mb": 9216,
+     "agent_memory_mb": 4608,
+     "disk_mb": 81920,
+     "tmp_mb": 2048,
+     "max_job_s": 14400,
+     "enforced": [
+      "cpu_share",
+      "memory_mb",
+      "cpu_weight",
+      "io_weight",
+      "memory_high_mb",
+      "agent_memory_mb"
+     ]
+    },
+    "freeze": null,
+    "windows": [
+     {
+      "start_ts": 1791652800.0,
+      "end_ts": 1791720000.0
+     }
+    ],
+    "offer": {
+     "cpu_max": 3.0,
+     "memory_max": 15032385536,
+     "disk_max": 85899345920
+    },
+    "measure": {
+     "ts": 1791640000.0,
+     "window_s": 60.0,
+     "cpu_count": 8,
+     "app_cpu": 1.6,
+     "guest_cpu": 2.1,
+     "mem_total_bytes": 34359738368,
+     "mem_available_bytes": 19327352832,
+     "swap_used_bytes": 0,
+     "guest_mem_bytes": 6442450944,
+     "psi": {},
+     "app_psi": null,
+     "disk_free_bytes": 107374182400,
+     "app_disk_free_bytes": null,
+     "tmp_path": "/tmp",
+     "tmp_fstype": "tmpfs",
+     "tmp_size_bytes": 17179869184,
+     "tmp_used_bytes": 536870912,
+     "on_ac": null,
+     "battery_percent": null,
+     "metered": null,
+     "user_idle_s": null,
+     "busy": null,
+     "lendable": {
+      "cpu": 3.0,
+      "memory_bytes": 10737418240,
+      "disk_bytes": 85899345920
+     }
+    },
+    "guard": {
+     "kind": "ameesh-guard",
+     "version": "1.10.0",
+     "host_kind": "vm"
+    }
+   }
+  },
+  {
+   "why": "measure.app_psi: every key present",
+   "doc": {
+    "schema": "ameesh-host-state/1",
+    "state": "available",
+    "seq": 1791640000,
+    "until_ts": 1791676800.0,
+    "drain_deadline_ts": null,
+    "expires_ts": 1791640030.0,
+    "reason": "idle",
+    "caps": {
+     "max_concurrent": 2,
+     "cpu_share": 0.375,
+     "memory_mb": 10240,
+     "cpu_weight": 10,
+     "io_weight": 10,
+     "memory_high_mb": 9216,
+     "agent_memory_mb": 4608,
+     "disk_mb": 81920,
+     "tmp_mb": 2048,
+     "max_job_s": 14400,
+     "enforced": [
+      "cpu_share",
+      "memory_mb",
+      "cpu_weight",
+      "io_weight",
+      "memory_high_mb",
+      "agent_memory_mb"
+     ]
+    },
+    "freeze": null,
+    "windows": [
+     {
+      "start_ts": 1791652800.0,
+      "end_ts": 1791720000.0
+     }
+    ],
+    "offer": {
+     "cpu_max": 3.0,
+     "memory_max": 15032385536,
+     "disk_max": 85899345920
+    },
+    "measure": {
+     "ts": 1791640000.0,
+     "window_s": 60.0,
+     "cpu_count": 8,
+     "app_cpu": 1.6,
+     "guest_cpu": 2.1,
+     "mem_total_bytes": 34359738368,
+     "mem_available_bytes": 19327352832,
+     "swap_used_bytes": 0,
+     "guest_mem_bytes": 6442450944,
+     "psi": {
+      "cpu_some": 3.2,
+      "mem_some": 0.0,
+      "mem_full": 0.0,
+      "io_some": 0.4
+     },
+     "app_psi": {
+      "cpu_some": 1.0
+     },
+     "disk_free_bytes": 107374182400,
+     "app_disk_free_bytes": null,
+     "tmp_path": "/tmp",
+     "tmp_fstype": "tmpfs",
+     "tmp_size_bytes": 17179869184,
+     "tmp_used_bytes": 536870912,
+     "on_ac": null,
+     "battery_percent": null,
+     "metered": null,
+     "user_idle_s": null,
+     "busy": null,
+     "lendable": {
+      "cpu": 3.0,
+      "memory_bytes": 10737418240,
+      "disk_bytes": 85899345920
+     }
+    },
+    "guard": {
+     "kind": "ameesh-guard",
+     "version": "1.10.0",
+     "host_kind": "vm"
+    }
+   }
+  },
+  {
+   "why": "measure.lendable: every key present",
+   "doc": {
+    "schema": "ameesh-host-state/1",
+    "state": "available",
+    "seq": 1791640000,
+    "until_ts": 1791676800.0,
+    "drain_deadline_ts": null,
+    "expires_ts": 1791640030.0,
+    "reason": "idle",
+    "caps": {
+     "max_concurrent": 2,
+     "cpu_share": 0.375,
+     "memory_mb": 10240,
+     "cpu_weight": 10,
+     "io_weight": 10,
+     "memory_high_mb": 9216,
+     "agent_memory_mb": 4608,
+     "disk_mb": 81920,
+     "tmp_mb": 2048,
+     "max_job_s": 14400,
+     "enforced": [
+      "cpu_share",
+      "memory_mb",
+      "cpu_weight",
+      "io_weight",
+      "memory_high_mb",
+      "agent_memory_mb"
+     ]
+    },
+    "freeze": null,
+    "windows": [
+     {
+      "start_ts": 1791652800.0,
+      "end_ts": 1791720000.0
+     }
+    ],
+    "offer": {
+     "cpu_max": 3.0,
+     "memory_max": 15032385536,
+     "disk_max": 85899345920
+    },
+    "measure": {
+     "ts": 1791640000.0,
+     "window_s": 60.0,
+     "cpu_count": 8,
+     "app_cpu": 1.6,
+     "guest_cpu": 2.1,
+     "mem_total_bytes": 34359738368,
+     "mem_available_bytes": 19327352832,
+     "swap_used_bytes": 0,
+     "guest_mem_bytes": 6442450944,
+     "psi": {
+      "cpu_some": 3.2,
+      "mem_some": 0.0,
+      "mem_full": 0.0,
+      "io_some": 0.4
+     },
+     "app_psi": null,
+     "disk_free_bytes": 107374182400,
+     "app_disk_free_bytes": null,
+     "tmp_path": "/tmp",
+     "tmp_fstype": "tmpfs",
+     "tmp_size_bytes": 17179869184,
+     "tmp_used_bytes": 536870912,
+     "on_ac": null,
+     "battery_percent": null,
+     "metered": null,
+     "user_idle_s": null,
+     "busy": null,
+     "lendable": {}
+    },
+    "guard": {
+     "kind": "ameesh-guard",
+     "version": "1.10.0",
+     "host_kind": "vm"
     }
    }
   }

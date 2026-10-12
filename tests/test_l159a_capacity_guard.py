@@ -26,7 +26,8 @@ GIB = 1024 ** 3
 
 #: the keywords the validator below implements; annotations are ignored
 KEYWORDS = {"type", "const", "enum", "required", "properties", "additionalProperties",
-            "items", "minimum", "maximum", "exclusiveMinimum", "uniqueItems"}
+            "items", "minimum", "maximum", "exclusiveMinimum", "uniqueItems",
+            "dependentRequired"}
 ANNOTATIONS = {"$schema", "$id", "title", "description"}
 TYPES = {
     "object": lambda v: isinstance(v, dict),
@@ -73,6 +74,10 @@ def errors(schema: dict, value, where: str = "$") -> list[str]:
         for key in schema.get("required") or ():
             if key not in value:
                 found.append("%s: %s required" % (where, key))
+        for key, needed in (schema.get("dependentRequired") or {}).items():
+            if key in value:
+                found += ["%s: %s required with %s" % (where, n, key)
+                          for n in needed if n not in value]
         for key, item in value.items():
             if key in props:
                 found += errors(props[key], item, "%s.%s" % (where, key))
@@ -140,6 +145,27 @@ class SchemaTest(unittest.TestCase):
         if measure is None:
             self.skipTest("resources.measure comes with L159d")
         self.assertEqual(set(measure(None)), set(props))
+
+
+class FreshnessTest(unittest.TestCase):
+    """Section 5.3: the state a guest obeys, given what it read and when
+    (codex #212 r2: an `available` state must not outlive its dead guard)."""
+
+    def test_golden_freshness(self):
+        data = golden("freshness.json")
+        self.assertEqual(data["max_state_ttl_s"], capacity_guard.MAX_STATE_TTL_S)
+        for case in data["cases"]:
+            with self.subTest(case["why"]):
+                self.assertEqual(capacity_guard.gate_state(case["doc"], case["now"],
+                                                           lending=case["lending"]),
+                                 case["expect"])
+
+    def test_non_finite_expiry(self):
+        doc = {"schema": "ameesh-host-state/1", "state": "available", "seq": 1}
+        for value in (float("inf"), float("nan"), True):
+            with self.subTest(value):
+                self.assertEqual(capacity_guard.gate_state(dict(doc, expires_ts=value), 0.0,
+                                                           lending=True), "stopped")
 
 
 class OfferTest(unittest.TestCase):

@@ -13,7 +13,9 @@ ameesh reads itself:
   dropped whole (the host lends nothing), never kept without one of its caps;
 * the paths of the gate (`STATE_PATH`, `ACK_PATH`) and the names of the two
   messages (`SCHEMA_HOST_STATE`, `SCHEMA_HOST_ACK`). Their JSON schemas are
-  `docs/schemas/`, and the golden sets `tests/dore/capacity_guard/`.
+  `docs/schemas/`, and the golden sets `tests/dore/capacity_guard/`;
+* the freshness of the state a guest obeys (`gate_state`): on a lending
+  host, a state without a valid, near `expires_ts` is `stopped`.
 
 The guard itself (`ameesh guard`, L159e) and the common measure
 (`resources.measure`, L159d) live elsewhere.
@@ -32,6 +34,12 @@ STATE_PATH = "/run/ameesh-gate/state/state.json"
 #: written by the guest; its directory is writable by the guest only
 ACK_PATH = "/run/ameesh-gate/ack/ack.json"
 STATES = ("available", "draining", "stopped")
+#: the farthest a state's `expires_ts` may lie ahead of its reader: a guard
+#: rewrites it every third of its life (90 s by default); further ahead, a
+#: dead guard's `available` would outlive it
+MAX_STATE_TTL_S = 300.0
+#: what an unreadable or stale gate counts as (`host_gate_fallback`)
+FALLBACK_LENDING, FALLBACK_CLASSIC = "stopped", "available"
 #: reasons with a fixed meaning (any other text is admitted, and shown as is)
 REASONS = (
     # devices (Nexlink Compute)
@@ -58,6 +66,32 @@ _WINDOW = re.compile(
     r"^\s*(?P<days>%s(?:-%s)?(?:,%s(?:-%s)?)*)"
     r"(?:\s+(?P<start>\d{2}:\d{2})-(?P<end>\d{2}:\d{2}))?"
     r"(?:\s+(?P<tz>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*))?\s*$" % ((_DAY,) * 4), re.I)
+
+
+def gate_state(doc, now: float, *, lending: bool) -> str:
+    """The state a guest obeys, given the state document it read (None:
+    absent or unreadable) at `now` (section 5.3 of the contract).
+
+    On a lending host the gate is closed by default: a document that is
+    unreadable, of another schema, of an unknown state, without a finite
+    `expires_ts` (missing or null included), expired (`now >= expires_ts`)
+    or expiring more than `MAX_STATE_TTL_S` ahead counts as `stopped`. On a
+    classic host an absent or null `expires_ts` is admitted (the gate
+    predates it); anything else unreadable or stale falls back to
+    `available`, as before."""
+    fallback = FALLBACK_LENDING if lending else FALLBACK_CLASSIC
+    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA_HOST_STATE \
+            or doc.get("state") not in STATES:
+        return fallback
+    seq, expires = doc.get("seq"), doc.get("expires_ts")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return fallback
+    if expires is None and not lending:
+        return doc["state"]
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)) \
+            or not math.isfinite(expires) or not now < expires <= now + MAX_STATE_TTL_S:
+        return fallback
+    return doc["state"]
 
 
 def parse_window(text) -> dict | None:

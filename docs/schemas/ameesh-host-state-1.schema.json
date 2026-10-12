@@ -2,7 +2,7 @@
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "$id": "https://github.com/manaty/ameesh/blob/main/docs/schemas/ameesh-host-state-1.schema.json",
  "title": "ameesh-host-state/1",
- "description": "The state a capacity guard writes for its guest (docs/GARDE-DE-CAPACITE.md). Every field after `seq` is optional; a reader ignores the fields it does not know, so the object stays open. An unreadable or expired state is `stopped` on a lending host.",
+ "description": "The state a capacity guard writes for its guest (docs/GARDE-DE-CAPACITE.md). Every field after `seq` is optional for a classic gate; a capacity guard (a state with `guard`) always writes `expires_ts`. A reader ignores the fields it does not know, so the object stays open. On a lending host, a state that is unreadable, expired, without `expires_ts` or with an `expires_ts` more than 300 s ahead counts as `stopped` (section 5.3).",
  "type": "object",
  "required": [
   "schema",
@@ -10,6 +10,11 @@
   "seq"
  ],
  "additionalProperties": true,
+ "dependentRequired": {
+  "guard": [
+   "expires_ts"
+  ]
+ },
  "properties": {
   "schema": {
    "const": "ameesh-host-state/1"
@@ -45,7 +50,7 @@
     "number",
     "null"
    ],
-   "description": "epoch s: past it the state is unreadable, so `stopped`; rewritten every third of its life"
+   "description": "epoch s: past it the state is unreadable, so `stopped` on a lending host; required from a capacity guard, at most 300 s ahead, rewritten every third of its life; missing or null on a lending host: `stopped`"
   },
   "reason": {
    "type": [
@@ -71,7 +76,7 @@
     "memory_mb": {
      "type": "integer",
      "minimum": 0,
-     "description": "hard cap of the whole guest"
+     "description": "hard cap of the whole guest; MiB (2^20 bytes), rounded down from bytes"
     },
     "cpu_weight": {
      "type": "integer",
@@ -85,19 +90,23 @@
     },
     "memory_high_mb": {
      "type": "integer",
-     "minimum": 0
+     "minimum": 0,
+     "description": "MiB (2^20 bytes), rounded down from bytes"
     },
     "agent_memory_mb": {
      "type": "integer",
-     "minimum": 0
+     "minimum": 0,
+     "description": "MiB (2^20 bytes), rounded down from bytes"
     },
     "disk_mb": {
      "type": "integer",
-     "minimum": 0
+     "minimum": 0,
+     "description": "MiB (2^20 bytes), rounded down from bytes"
     },
     "tmp_mb": {
      "type": "integer",
-     "minimum": 0
+     "minimum": 0,
+     "description": "MiB (2^20 bytes), rounded down from bytes"
     },
     "max_job_s": {
      "type": "integer",
@@ -191,7 +200,32 @@
     "null"
    ],
    "additionalProperties": true,
-   "description": "the common measure; every key present, null when not measured, never guessed",
+   "description": "the common measure; every key present (required), null when not measured, never guessed",
+   "required": [
+    "ts",
+    "window_s",
+    "cpu_count",
+    "app_cpu",
+    "guest_cpu",
+    "mem_total_bytes",
+    "mem_available_bytes",
+    "swap_used_bytes",
+    "guest_mem_bytes",
+    "psi",
+    "app_psi",
+    "disk_free_bytes",
+    "app_disk_free_bytes",
+    "tmp_path",
+    "tmp_fstype",
+    "tmp_size_bytes",
+    "tmp_used_bytes",
+    "on_ac",
+    "battery_percent",
+    "metered",
+    "user_idle_s",
+    "busy",
+    "lendable"
+   ],
    "properties": {
     "ts": {
      "type": [
@@ -260,6 +294,12 @@
       "null"
      ],
      "additionalProperties": true,
+     "required": [
+      "cpu_some",
+      "mem_some",
+      "mem_full",
+      "io_some"
+     ],
      "properties": {
       "cpu_some": {
        "type": [
@@ -301,6 +341,12 @@
       "null"
      ],
      "additionalProperties": true,
+     "required": [
+      "cpu_some",
+      "mem_some",
+      "mem_full",
+      "io_some"
+     ],
      "properties": {
       "cpu_some": {
        "type": [
@@ -416,6 +462,11 @@
       "null"
      ],
      "additionalProperties": true,
+     "required": [
+      "cpu",
+      "memory_bytes",
+      "disk_bytes"
+     ],
      "properties": {
       "cpu": {
        "type": [
