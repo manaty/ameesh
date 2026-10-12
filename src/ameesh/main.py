@@ -87,7 +87,7 @@
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
         mail; withdrawal by the requester; detail and proof (L124);
-  ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
+  ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
