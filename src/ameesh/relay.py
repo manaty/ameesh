@@ -1028,12 +1028,14 @@ def credential_ready(base_url: str, token: str, harness: str) -> bool:
     raise db_mod.Unavailable("relay credential status unavailable (HTTP %d)" % response.status)
 
 
-def probe_credentials(cfg, db, *, environ=None, transport=None) -> list[dict]:
-    """Recover relay failures on a new, positively authenticated server key.
+def probe_credentials(cfg, db, *, environ=None, transport=None, now=None) -> list[dict]:
+    """Recover relay failures on a positively authenticated server key.
 
     Called by the credential sentinel. No request without a configured relay
     key and an existing failure; no model generation. The conditional write
-    preserves a failure recorded during the probe, as in L226.
+    preserves a failure recorded during the probe, as in L226. The sentinel
+    timer spaces attempts by PERIOD_S; an unchanged key also waits that long
+    after the last refusal, so a transient 401 can recover without rotation.
     """
     from . import balance, sentinel
     env = os.environ if environ is None else environ
@@ -1050,7 +1052,12 @@ def probe_credentials(cfg, db, *, environ=None, transport=None) -> list[dict]:
     try:
         key = secrets.key("deepseek")
         fingerprint = sentinel._digest(key)
-        if not current.get("failing_fingerprint") or fingerprint == current["failing_fingerprint"]:
+        probe_time = time.time() if now is None else now
+        # A rotated key may be checked immediately. Without proof of rotation,
+        # wait one sentinel interval after the most recent authentication error.
+        if (not current.get("failing_fingerprint")
+                or fingerprint == current["failing_fingerprint"]) and \
+                probe_time < float(current.get("last_failure_ts") or 0) + sentinel.PERIOD_S:
             return [row]
         source = balance.DeepSeekBalance(env=dict(env, DEEPSEEK_API_KEY=key), transport=transport)
         if not source.fetch() or secrets.key("deepseek") != key:

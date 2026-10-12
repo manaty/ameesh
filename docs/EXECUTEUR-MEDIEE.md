@@ -417,13 +417,14 @@ de prendre une consigne ; il pose `auth_blocked: deepseek/relay` et conserve
 la consigne. Si le tour vient d'échouer, ce verdict empêche de compter un
 échec rapide. L'appareil ne lit ni n'écrit les opérations `credentials`.
 
-Après rotation de la clé serveur (`AMEESH_RELAY_DEEPSEEK_KEY_FILE`, fichier
-0600, ou `DEEPSEEK_API_KEY` dans l'environnement du service),
-`ameesh accounts check` sonde la nouvelle clé via le
+`ameesh accounts check` sonde la clé serveur (`AMEESH_RELAY_DEEPSEEK_KEY_FILE`,
+fichier 0600, ou `DEEPSEEK_API_KEY` dans l'environnement du service) via le
 [GET /user/balance de DeepSeek](https://api-docs.deepseek.com/api/get-user-balance/).
-La clé doit différer de la dernière clé refusée et la réponse doit être
-authentifiée et valide ; présence d'une clé ou erreur réseau ne suffisent
-pas. L'écriture saine est conditionnelle au compteur d'échecs lu avant la
+La réponse doit être authentifiée et valide ; présence d'une clé ou erreur
+réseau ne suffisent pas. La même clé peut rétablir la santé après un refus
+transitoire : la sonde attend 10 minutes après le dernier refus, puis le
+timer sentinelle renouvelle l'essai toutes les 10 minutes. Une clé différente
+peut être sondée immédiatement. L'écriture saine est conditionnelle au compteur d'échecs lu avant la
 sonde (`expect_failures`), et une rotation pendant la sonde invalide son
 résultat. La garde lève ensuite le blocage automatiquement. Le service de
 sonde doit avoir accès au même fichier ou environnement que le relais.

@@ -89,19 +89,19 @@ class RelayCredentialsTest(unittest.TestCase):
         self.assertEqual(self.provider.requests, [])
         self.credentials.report.assert_not_called()
 
-    def probe(self, key="new-key", transport=None):
+    def probe(self, key="new-key", transport=None, now=None):
         payload = {"is_available": True, "balance_infos": [
             {"currency": "USD", "total_balance": "1"}]}
         return relay.probe_credentials(
             self.cfg, self.relay.db, environ={"DEEPSEEK_API_KEY": key},
-            transport=transport or (lambda *args: (payload, "")))
+            transport=transport or (lambda *args: (payload, "")), now=now)
 
-    def test_probe_requires_new_key_and_positive_authenticated_response(self):
+    def test_probe_requires_positive_authenticated_response(self):
         self.credentials.health.return_value = {"relay": self.failure()}
         self.credentials.report.return_value = {"state": "healthy"}
         transport = mock.Mock(return_value=(None, "HTTPError"))
         self.assertEqual(self.probe(SERVER_KEY, transport)[0]["state"], "failing")
-        transport.assert_not_called()
+        transport.assert_called_once()
         self.assertEqual(self.probe(transport=transport)[0]["state"], "failing")
         self.credentials.report.assert_not_called()
         self.assertEqual(self.probe()[0]["state"], "healthy")
@@ -109,10 +109,43 @@ class RelayCredentialsTest(unittest.TestCase):
         self.assertEqual(args, ("server-host", "deepseek", "relay", "healthy"))
         self.assertEqual(kwargs["expect_failures"], 1)
 
+    def test_transient_401_recovers_same_key_after_backoff(self):
+        health = {}
+        self.credentials.health.side_effect = lambda *args: health
+
+        def report(host, harness, account, state, **kwargs):
+            if state == "failing":
+                health[account] = self.failure() | {"last_failure_ts": 1000}
+            else:
+                self.assertEqual(kwargs["expect_failures"], 1)
+                health[account] = {"state": "healthy"}
+            return {"state": state}
+
+        self.credentials.report.side_effect = report
+        self.provider.error_status = 401
+        self.assertEqual(self.post()[0], 503)
+        self.provider.error_status = 0
+        transport = mock.Mock(return_value=({"is_available": True, "balance_infos": [
+            {"currency": "USD", "total_balance": "1"}]}, ""))
+        self.assertEqual(self.probe(SERVER_KEY, transport, now=1599)[0]["state"], "failing")
+        transport.assert_not_called()
+        self.assertEqual(self.post()[0], 503)
+        self.assertEqual(self.probe(SERVER_KEY, transport, now=1600)[0]["state"], "healthy")
+        transport.assert_called_once()
+        self.assertEqual(transport.call_args.args[1]["Authorization"], "Bearer " + SERVER_KEY)
+        self.assertTrue(relay.credential_ready(self.base, TOKEN, "deepseek"))
+        self.assertEqual(self.post()[0], 200)
+
+    def test_rotated_key_bypasses_recent_failure_backoff(self):
+        self.credentials.health.return_value = {"relay": self.failure() | {"last_failure_ts": 1000}}
+        self.credentials.report.return_value = {"state": "healthy"}
+        self.assertEqual(self.probe(now=1001)[0]["state"], "healthy")
+
     def test_failure_during_probe_wins_and_key_replacement_is_not_accepted(self):
         self.credentials.health.return_value = {"relay": self.failure()}
         self.credentials.report.return_value = {"skipped": True}
-        self.assertEqual(self.probe()[0]["state"], "failing")
+        self.assertEqual(self.probe(SERVER_KEY)[0]["state"], "failing")
+        self.assertEqual(self.credentials.report.call_args.kwargs["expect_failures"], 1)
         self.credentials.report.reset_mock()
         with mock.patch.object(relay.ServerSecrets, "key", side_effect=["key-a", "key-b"]):
             self.assertEqual(self.probe()[0]["state"], "failing")
