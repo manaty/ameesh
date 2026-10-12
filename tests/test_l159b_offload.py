@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Heavy suites offloaded to a lending VM over SSH (lot L159b, mode b1).
 
-The client (`ameesh offload`) talks to the VM side (`ameesh.offload_shell`)
+The client (`ameesh offload`) talks to the VM side (`ameesh.platform.offload_shell`)
 through `tests/fakebin/fake-offload-ssh`, which plays sshd's forced command
 locally: real git, real processes, no network, no database.
 """
@@ -20,7 +20,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, offload, offload_shell
+from ameesh import adapters, offload
+from ameesh.platform import offload_shell
 
 from .support import REPO
 
@@ -700,8 +701,9 @@ class FallbackTest(OffloadBase):
 class ShellTest(OffloadBase):
     def shell(self, command: str, stdin: bytes = b"") -> subprocess.CompletedProcess:
         env = dict(self.env(), SSH_ORIGINAL_COMMAND=command)
-        return subprocess.run([sys.executable, "-m", "ameesh.offload_shell", "--config",
-                               self.config_path], input=stdin, env=env, capture_output=True)
+        return subprocess.run([sys.executable, "-m", "ameesh.platform.offload_shell",
+                               "--config", self.config_path], input=stdin, env=env,
+                              capture_output=True)
 
     def test_only_four_verbs(self):
         for command in ("", "bash", "sh -c id", "git upload-pack x", "rm -rf /"):
@@ -722,7 +724,7 @@ class ShellTest(OffloadBase):
         proc = subprocess.Popen(
             ["bash", "-c", 'sleep 60 & echo $! > "$0"; exec "$@"',
              os.path.join(self.tmp, "sibling"), sys.executable, "-m",
-             "ameesh.offload_shell", "--config", self.config_path],
+             "ameesh.platform.offload_shell", "--config", self.config_path],
             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
         try:
@@ -742,6 +744,13 @@ class ShellTest(OffloadBase):
         self.assertIn("mac", result)
         # the same command, alone on its streams, reaches the job checks
         self.assertEqual(self.shell("run acme-widget %s -- true" % ("0" * 40)).returncode, 2)
+        # a shared file on a stream (here /dev/null, open in many processes)
+        # is no session stream
+        res = subprocess.run([sys.executable, "-m", "ameesh.platform.offload_shell",
+                              "--config", self.config_path],
+                             env=dict(self.env(), SSH_ORIGINAL_COMMAND="status"),
+                             stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
 
     def test_a_planted_promisor_remote_never_runs(self):
         # r6 on #213: a job (same UID) makes the mirror a partial clone whose
@@ -925,6 +934,20 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(" -I /usr/local/lib/ameesh-guest/ameesh-offload-shell", res.stdout)
         self.assertIn('"profiles": "/etc/ameesh-guest/profiles"', res.stdout)
         self.assertNotIn("No such file", res.stderr)
+
+    def test_the_vm_shell_is_standalone(self):
+        # installed alone as /usr/local/lib/ameesh-guest/ameesh-offload-shell
+        # and run with python3 -I: nothing of ameesh can be imported there
+        import ast
+        with open(offload_shell.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, ast.dump(node))
+                self.assertNotEqual((node.module or "").split(".")[0], "ameesh")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotEqual(alias.name.split(".")[0], "ameesh")
 
     def test_shipped_profiles_load(self):
         profiles = os.path.join(REPO, "deploy", "guest", "profiles")

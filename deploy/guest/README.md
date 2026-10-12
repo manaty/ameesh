@@ -9,7 +9,7 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 | File | Role |
 |---|---|
 | `install.sh` | prepares the VM; run by its owner, as root (`--dry-run` shows everything first) |
-| `../../src/ameesh/offload_shell.py` | the VM side, installed as `/usr/local/lib/ameesh-guest/ameesh-offload-shell`; standard library only |
+| `../../src/ameesh/platform/offload_shell.py` | the VM side, installed as `/usr/local/lib/ameesh-guest/ameesh-offload-shell`; standard library only |
 | `job-postgres.sh` | a throwaway Postgres per job, rootless Podman (`/usr/local/lib/ameesh-guest/job-postgres`) |
 | `profiles/*.json` | what a job gets before its command: dependency cache, variables, hooks (`/etc/ameesh-guest/profiles/`) |
 

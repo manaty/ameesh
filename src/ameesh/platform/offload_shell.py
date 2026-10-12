@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """ameesh-offload-shell: the VM side of heavy-suite offloading (lot L159b,
 mode b1 of the L159 study, `docs/design/etudes/l159-capacite-des-hotes.md`).
+Linux only, and standalone: standard library only, no import of ameesh
+(installed alone, run with `python3 -I`); it sits in `ameesh.platform` because
+it reads /proc itself (L63).
 
 It is the forced command of the `ameesh-guest` SSH key: the key has no shell,
 no port forwarding, only these four verbs (read from SSH_ORIGINAL_COMMAND):
@@ -234,8 +237,11 @@ def foreign_holders() -> list[str]:
     own = set()
     for fd in (0, 1, 2):
         try:
-            own.add((os.readlink("/proc/self/fd/%d" % fd),
-                     fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE))
+            target = os.readlink("/proc/self/fd/%d" % fd)
+            # only the session's own objects: a shared file (/dev/null…) is
+            # open in many processes and carries no stream of the session
+            if target.startswith(("pipe:", "socket:")):
+                own.add((target, fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE))
         except OSError:
             pass
     targets = {target for target, _ in own}

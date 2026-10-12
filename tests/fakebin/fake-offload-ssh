@@ -4,7 +4,7 @@
 
 `AMEESH_OFFLOAD_SSH=tests/fakebin/fake-offload-ssh` makes the client call it
 like ssh (`[-o OPT]... HOST COMMAND`). It runs the VM side,
-`ameesh.offload_shell --config $AMEESH_FAKE_OFFLOAD_CONFIG`, with the command
+`ameesh.platform.offload_shell --config $AMEESH_FAKE_OFFLOAD_CONFIG`, with the command
 in SSH_ORIGINAL_COMMAND, as sshd does for a forced command. The host
 `unreachable` exits 255, as ssh does when it cannot connect.
 """
@@ -31,8 +31,8 @@ env["PYTHONPATH"] = src
 import subprocess
 import threading
 
-proc = subprocess.Popen([sys.executable, "-m", "ameesh.offload_shell", "--config",
-                         os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]], env=env,
+proc = subprocess.Popen([sys.executable, "-m", "ameesh.platform.offload_shell",
+                         "--config", os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]], env=env,
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE)
 

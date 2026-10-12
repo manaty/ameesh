@@ -39,7 +39,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=$(cd "$HERE/../.." && pwd)/src/ameesh/offload_shell.py
+SRC=$(cd "$HERE/../.." && pwd)/src/ameesh/platform/offload_shell.py
 GUEST=ameesh-guest
 ROOT=/srv/ameesh-guest
 ETC=/etc/ameesh-guest

@@ -26,7 +26,7 @@ local`, the default). A timeout, a cancel or a connection lost during the
 job is never rerun: the suite may still be running on the VM.
 
 `AMEESH_OFFLOAD_SSH` replaces the `ssh` command (tests, or extra options).
-The VM side is `ameesh.offload_shell` (forced command of the SSH key).
+The VM side is `ameesh.platform.offload_shell` (forced command of the SSH key).
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ import sys
 import tempfile
 import threading
 
-from .offload_shell import NONCE_RE, PREFIX, result_mac
+from .platform.offload_shell import NONCE_RE, PREFIX, result_mac
 
 #: exit code when the VM refused or stopped the job and no fallback is allowed
 EX_TEMPFAIL = 75
