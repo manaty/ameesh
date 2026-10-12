@@ -1375,7 +1375,10 @@ class CanonCliTest(_CanonDbCase):
         proc = self.mesh("canon", "sync", "--host", "banc", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ouvrier", proc.stdout)
-        self.assertIn("créé", proc.stdout)
+        # L156d : libellé anglais à l'affichage, valeur stockée dans le JSON
+        self.assertIn("created", proc.stdout)
+        self.assertNotIn("créé", proc.stdout)
+
         proc = self.mesh("show", "ouvrier")
         self.assertIn("responsible: human:bruno", proc.stdout)
         self.assertIn("canon    : canon:agents/ouvrier.md@", proc.stdout)

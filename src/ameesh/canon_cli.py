@@ -61,6 +61,15 @@ from .config import Config
 
 UNTRUSTED_TAG = "[NOT APPROVED] "
 
+#: L156d : libellés anglais des actions de `canon_sync` à l'affichage ; le
+#: JSON (`--json`, `SyncAction.to_dict`) garde les valeurs stockées
+ACTION_LABELS = {
+    "créé": "created", "mis à jour": "updated", "inchangé": "unchanged",
+    "conflit": "conflict", "laissé": "left", "déplacé": "moved",
+    "réintégré": "revived", "arrêté": "stopped", "arrêt demandé": "stop requested",
+    "hors canon": "off canon",
+}
+
 
 def _load(cfg: Config, args: argparse.Namespace) -> canon_mod.Canon:
     if getattr(args, "ref", None):
@@ -395,7 +404,10 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     if not report.actions:
         print("  no agent placed on %s" % host)
     for action in report.actions:
-        print("%s  %-16s %-14s %s" % (tag, action.agent, action.action, action.detail))
+        print("%s  %-16s %-14s %s" % (tag, action.agent,
+                                      ACTION_LABELS.get(action.action, action.action),
+                                      action.detail))
+
         for reason in action.blocked:
             print("%s  %-16s   blocked by %s" % (tag, "", reason))
     refused = [a.agent for a in report.actions
