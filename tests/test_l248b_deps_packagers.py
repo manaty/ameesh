@@ -85,6 +85,30 @@ class PackagerTests(l231._Base):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(text)["items"][0]["status"], "linked")
 
+    def test_comments_preserve_the_next_packager_command_and_refuse_links(self):
+        for script in ("# release build\nelectron-builder --linux",
+                       "echo ready # release build\nelectron-builder --linux",
+                       "echo ready; # release build\nnpx electron-builder --linux",
+                       "# first\n# second\nnpm exec -- electron-builder",
+                       "echo ready # release build\r\nelectron-builder"):
+            with self.subTest(script=script):
+                pkg = self.package(scripts={"dist": script})
+                installer = l231.FakeInstaller()
+                result = deps.link_package(pkg, self.cache, installer=installer)
+                self.assertEqual(result["status"], "packager-refused")
+                self.assertEqual(result["packagers"], ["electron-builder"])
+                self.assertEqual(installer.calls, [])
+
+    def test_comment_text_and_literal_hashes_do_not_introduce_commands(self):
+        for script in ("# electron-builder\necho ready",
+                       "echo ready # electron-builder",
+                       'echo "# comment\nelectron-builder"',
+                       "echo '# comment\nelectron-builder'",
+                       r"echo \# electron-builder"):
+            with self.subTest(script=script):
+                pkg = self.package(scripts={"dist": script})
+                self.assertEqual(deps_packagers.packagers(pkg), [])
+
     def test_script_detection_uses_command_positions_and_preserves_links_for_arguments(self):
         pkg = self.package()
         root = Path(pkg).parent
