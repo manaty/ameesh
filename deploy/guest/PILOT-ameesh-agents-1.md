@@ -33,15 +33,19 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
 * **The guest's volume: the owner's decision** (it costs money and changes
   the infrastructure). `/srv/ameesh-guest` is not a mount point today: one
   local 150 GB disk (`l_ssd`), 109 GB free; the VM is a GP1-S in `fr-par-1`.
-  - **Recommended** (study §4.1): a 100 GB Block Storage volume, 5K IOPS,
+  - **Recommended** (study §4.1): a 40 GB Block Storage volume, 5K IOPS,
     mounted on `/srv/ameesh-guest`. A guest that fills it never reaches the
-    system nor the host's own agents. Cost: €0.000130/GB/hour excluding VAT
+    system nor the host's own agents. Its size **is** the offer's `disk_max
+    40GiB`: nothing else enforces it (no filesystem quota; the guard's reclaim
+    watches `/`). A bigger volume needs a bigger `disk_max` in the offer and
+    the canon. Cost: €0.000130/GB/hour excluding VAT
     (scaleway.com/en/pricing/storage, read on 2026-10-12), so about
-    **€9.50 per month** for 100 GB (730 h), snapshots not included. From a
-    workstation with the `scw` CLI configured for the ameesh project:
+    **€3.80 per month** for 40 GB (730 h), snapshots not included; €9.50 for
+    100 GB. From a workstation with the `scw` CLI configured for the ameesh
+    project:
 
     ```sh
-    scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=100GB zone=fr-par-1
+    scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB zone=fr-par-1
     scw block volume wait <volume-id> zone=fr-par-1          # until "available"
     scw instance server list name=ameesh-agents-1 zone=fr-par-1
     scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
@@ -58,16 +62,17 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
     echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
       | sudo tee -a /etc/fstab
     sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
-    findmnt /srv/ameesh-guest                                # the volume, 100 GB
+    findmnt /srv/ameesh-guest                                # the volume, 40 GB
     ```
 
     `nofail`: the host boots even without the volume. The guest's runners
     do not start then (`RequiresMountsFor=/srv/ameesh-guest`): they never
     write on the root disk instead; the host's agents are not affected.
   - **Without a volume**: `--allow-rootfs` on the two install commands below.
-    The guest then shares `/` with the host's agents: `disk_max` is not a
-    filesystem quota, and only the guard's reclaim (under 10 GiB free on `/`)
-    holds it back. Not to be used while the owner has not chosen.
+    The guest then shares `/` with the host's agents: `disk_max` is
+    indicative only (the script says so), and only the guard's reclaim (under
+    10 GiB free on `/`) holds the guest back. Not to be used while the owner
+    has not chosen.
 
 ## Install (guard in observation, no guest runner started)
 
@@ -120,17 +125,22 @@ From the lightest to the full one; each step is enough on its own.
 
 | When | Command |
 |---|---|
-| The guard's caps get in the way of the host | `sudo deploy/guest/install-pilot.sh --set-guard-mode observe` |
+| The guard's caps get in the way of the host | `sudo deploy/guest/install-pilot.sh --set-guard-mode observe` (stops the guard, takes its caps off the slice and the runners, starts it again observing) |
 | A guest misbehaves | `sudo deploy/guest/install-pilot.sh --disable deepseek5` (its turn drains first, 180 s at most) |
 | The pilot stops (§4.4 target missed, natives delayed) | `sudo deploy/guest/install-pilot.sh --uninstall` |
 | Nothing of the pilot must stay | `sudo deploy/guest/install-pilot.sh --uninstall --purge` |
+
+An observing guard starts no runner again: one the enforcing guard had
+stopped (level 4) shows `inactive` in `--check`, and `--enable` starts it.
 
 `--uninstall` follows the study's order (§4.3): `ameesh guard drain`, the
 guest runners then the guard stopped and disabled, units, drop-ins and gate
 directories removed; the host's own agents (`ameesh-agents.slice`) are not
 touched. `--purge` also removes the secrets, the offer, and the user, the
-venv and the volume's content, only those the script created
-(`/etc/ameesh/pilot-install.state`). Then, outside the host: a canon PR puts
+venv and the guest's directories, only those the script created: it
+records each one, by its absolute path, before creating it
+(`/etc/ameesh/pilot-install.state`); a directory that was there before, a
+mount point, or anything outside them stays. Then, outside the host: a canon PR puts
 deepseek5 and deepseek6 back on manaty-mesh-1 and removes `policy.lend`, and
 the host's login role (L56) is dropped. A mounted volume is unmounted and
 detached by hand.

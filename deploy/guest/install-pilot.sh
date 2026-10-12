@@ -23,11 +23,14 @@
 #   --lend FILE          the offer, JSON: the `policy.lend` of the canon's
 #                        Host fiche (default: the one printed by --dry-run)
 #   --root DIR           the guest's volume (default /srv/ameesh-guest; a
-#                        dedicated mount point, --allow-rootfs otherwise)
+#                        dedicated mount point, --allow-rootfs otherwise);
+#                        the runner's unit is installed with it
 #   --path DIR           extra PATH of the runners, first (repeatable;
 #                        default: the directory of `dsh` if outside /usr)
-#   --guard-mode M       initial mode of the guard: observe (default) or enforce
-#   --set-guard-mode M   switch the installed guard (restarts it)
+#   --guard-mode M       mode of the guard: observe or enforce (default: the
+#                        installed one, observe on a first install)
+#   --set-guard-mode M   switch the installed guard (restarts it; observe
+#                        also takes the guard's caps off the guest)
 #   --enable AGENT…      enable and start the runners of these agents
 #   --disable AGENT…     stop and disable them (their turn drains first)
 #   --check              report the state of everything installed
@@ -35,19 +38,23 @@
 #   --purge              with --uninstall: also secrets, guard config,
 #                        venv, user and volume content this script created
 #
-# Installed (all of it removed by --uninstall; created-by-us facts kept in
-# /etc/ameesh/pilot-install.state so the rollback removes nothing else):
+# Installed (all of it removed by --uninstall; what this script created,
+# user and absolute paths, is recorded in /etc/ameesh/pilot-install.state
+# BEFORE it is created, and --purge removes only that):
 #   * user ameesh-guest (system, locked, no sudo, no docker), home
 #     $ROOT/home, $ROOT/{tmp,work}, all 0700;
 #   * /opt/ameesh/venv: ameesh[psycopg] from this checkout (root-owned);
 #   * /etc/systemd/system: ameesh-guest.slice, ameesh.slice.d/guest-weight.conf,
-#     ameesh-guest-runner@.service (+ a PATH drop-in), ameesh-guard.service;
+#     ameesh-guest-runner@.service (its paths on --root, + a PATH drop-in),
+#     ameesh-guard.service;
 #   * /etc/tmpfiles.d/ameesh-gate.conf: /run/ameesh-gate/{state,ack};
 #   * /etc/ameesh/guard.json (offer), guard.env (mode), guest.env and
 #     guest-<agent>.env (secrets, 0640 root:ameesh-guest, never overwritten).
 # Not done here (study §4.2, §4.3): the canon PR (Host `policy.lend`, the
 # guest agents' placements), the host's Postgres login role (L56), the
 # agents' clones under $ROOT/work.
+# `disk_max` is enforced by nothing but the volume's size: a volume of that
+# size holds it, the root filesystem (--allow-rootfs) does not.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -108,7 +115,11 @@ case "$MAX_AGENTS" in ''|*[!0-9]*) die "invalid --max-agents $MAX_AGENTS" ;; esa
 case "$GUARD_MODE" in ''|observe|enforce) ;; *) die "--guard-mode observe|enforce" ;; esac
 [ "$MODE" != guard-mode ] || [ -n "$GUARD_MODE" ] || die "--set-guard-mode observe|enforce"
 case "$ROOT" in /*) ;; *) die "--root must be absolute" ;; esac
+case "$ROOT" in *[!A-Za-z0-9/._-]*|*/../*|*/..|*/./*|*/.|*//*|*/) die "invalid --root $ROOT" ;; esac
+case "$ROOT" in /|/home|/tmp|/srv|/root|/opt|/usr|/etc|/var|/run|/mnt) die "--root $ROOT: a directory of its own expected" ;; esac
 [ "$PURGE" = 0 ] || [ "$MODE" = uninstall ] || die "--purge goes with --uninstall"
+# the tests' dry runs read a state of their own; a real run reads only $STATE
+[ "$DRY" = 1 ] && [ -n "${PILOT_TEST_STATE:-}" ] && STATE=$PILOT_TEST_STATE
 
 # run CMD…: executes, or prints it under --dry-run
 run() {
@@ -134,13 +145,67 @@ need_root() {
   [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 }
 
-# remember KEY: records that this script created KEY (user, venv, root)
+# remember ENTRY: records, before creating it, what this script creates:
+# `user`, or KIND and an absolute path, KIND being
+#   guest-tree / venv-tree   removed with its content by --purge
+#   guest-dir / venv-dir     removed by --purge only if empty
+# (guest-*: kept while the offload of L159b uses the volume)
 remember() {
-  if [ "$DRY" = 1 ]; then echo "+ record $1 in $STATE"; return; fi
+  if [ "$DRY" = 1 ]; then echo "+ record '$1' in $STATE"; return; fi
   install -d -m 0755 "$ETC"
-  grep -qx "$1" "$STATE" 2>/dev/null || echo "$1" >> "$STATE"
+  grep -qxF "$1" "$STATE" 2>/dev/null || echo "$1" >> "$STATE"
 }
-created() { grep -qx "$1" "$STATE" 2>/dev/null; }
+created() { grep -qxF "$1" "$STATE" 2>/dev/null; }
+
+# purgeable PATH: a directory of its own, two levels deep at least, never
+# a top directory (/home, /tmp, /work…), a user's home nor a system tree
+purgeable() {
+  case "$1" in /?*/?*) ;; *) return 1 ;; esac
+  case "$1" in *[!A-Za-z0-9/._-]*|*/../*|*/..|*/./*|*/.|*//*|*/) return 1 ;; esac
+  case "$1" in
+    /home/*/*|/root/*/*) return 0 ;;
+    /home/*|/root/*|/proc/*|/sys/*|/dev/*|/run/*|/etc/*|/usr/*|/boot/*|/bin/*|/sbin/*|/lib*|/var/lib|/var/log) return 1 ;;
+  esac
+}
+
+# the runtime properties `systemctl set-property --runtime` leaves
+CONTROL=/run/systemd/system.control
+
+# reset_caps: the caps an enforcing guard set (slice and runners, kept by
+# systemd after the guard stops) give way to the units' own: removed, then
+# the units' configured values applied again at once (a daemon-reload alone
+# does not promise to write the cgroup back). The guard is stopped first.
+reset_caps() {
+  local props u
+  say "the guard's caps taken off: the guest's units keep their own"
+  run rm -rf "$CONTROL/ameesh-guest.slice.d"
+  for u in $(runner_units); do run rm -rf "$CONTROL/$u.d"; done
+  run systemctl daemon-reload
+  props=$(grep -E '^(CPUWeight|IOWeight|CPUQuota|MemoryHigh|MemoryMax)=' \
+            "$UNITS/ameesh-guest.slice" 2>/dev/null | tr '\n' ' ' || true)
+  if [ -n "$props" ]; then
+    # shellcheck disable=SC2086
+    run systemctl set-property --runtime ameesh-guest.slice $props || true
+  fi
+  for u in $(runner_units); do
+    props=$(systemctl show --value --property=MemoryMax "$u" 2>/dev/null || true)
+    [ -n "$props" ] || props="<its unit's>"
+    run systemctl set-property --runtime "$u" "MemoryMax=$props" || true
+  done
+  # the values written again are the units' own: their drop-ins go too
+  run rm -rf "$CONTROL/ameesh-guest.slice.d"
+  for u in $(runner_units); do run rm -rf "$CONTROL/$u.d"; done
+  run systemctl daemon-reload
+}
+
+# the installed guard's mode (the unit's default: observe)
+installed_mode() {
+  if [ -f "$ETC/guard.env" ] && ! grep -q '^AMEESH_GUARD_ARGS=--observe' "$ETC/guard.env"; then
+    echo enforce
+  else
+    echo observe
+  fi
+}
 
 # guest runners known to systemd (loaded or enabled)
 runner_units() {
@@ -238,7 +303,14 @@ if [ "$MODE" = guard-mode ]; then
   need_root
   say "guard mode: $GUARD_MODE"
   set_guard_mode "$GUARD_MODE"
-  run systemctl restart ameesh-guard.service
+  if [ "$GUARD_MODE" = observe ]; then
+    # a stopping guard thaws the guest but leaves its caps: taken off here
+    run systemctl stop ameesh-guard.service
+    reset_caps
+    run systemctl start ameesh-guard.service
+  else
+    run systemctl restart ameesh-guard.service
+  fi
   exit 0
 fi
 
@@ -263,19 +335,42 @@ if [ "$MODE" = uninstall ]; then
   run rmdir --ignore-fail-on-non-empty "$UNITS/ameesh.slice.d" "$(dirname "$PATH_DROPIN")" || true
   run rm -f "$TMPFILES"
   run rm -rf /run/ameesh-gate
+  # the guard's runtime caps (systemd keeps them until the reboot)
+  run rm -rf "$CONTROL/ameesh-guest.slice.d" "$CONTROL"/ameesh-guest-runner@*.service.d
   run systemctl daemon-reload
   run rm -f "$ETC/guard.env"
   say "4. (yours) drop the host's Postgres login role (L56)"
   if [ "$PURGE" = 1 ]; then
     say "5. purge: secrets, offer, and what this script created"
     run rm -f "$ETC/guard.json" "$ETC/guest.env" "$ETC"/guest-*.env
-    if created venv; then run rm -rf "$VENV"; run rmdir --ignore-fail-on-non-empty "$(dirname "$VENV")"; fi
+    offload=0
     if [ -f /etc/ameesh-guest/offload.json ]; then
-      echo "kept user $GUEST and $ROOT: the offload (install.sh, L159b) uses them"
-    else
-      if created root-content; then run rm -rf --one-file-system "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; fi
-      if created user; then run userdel "$GUEST" || true; fi
+      offload=1
+      echo "kept user $GUEST and the guest's directories: the offload (install.sh, L159b) uses them"
     fi
+    # only the paths recorded (absolute, as created), the last created first;
+    # never the --root of this command line
+    if [ -f "$STATE" ]; then
+      while read -r kind path; do
+        case "$kind" in guest-*) [ "$offload" = 0 ] || continue ;; esac
+        case "$kind" in
+          guest-tree|venv-tree|guest-dir|venv-dir) ;;
+          *) continue ;;
+        esac
+        if ! purgeable "$path"; then
+          echo "not removed: $path (recorded, but not a path of its own)"
+        elif [ ! -e "$path" ]; then
+          continue
+        elif mountpoint -q "$path"; then
+          echo "kept $path: a mount point (unmount and detach it by hand)"
+        elif [ "${kind#*-}" = tree ]; then
+          run rm -rf --one-file-system "$path"
+        else
+          run rmdir --ignore-fail-on-non-empty "$path"
+        fi
+      done < <(tac "$STATE")
+    fi
+    if [ "$offload" = 0 ] && created user; then run userdel "$GUEST" || true; fi
     run rm -f "$STATE"
     run rmdir --ignore-fail-on-non-empty "$ETC" || true
   else
@@ -314,13 +409,23 @@ else
    "drain_seconds": 120, "calm_seconds": 600}'
 fi
 guard_json=$(python3 -I -c '
-import json, sys
+import json, os, sys
 sys.path.insert(0, sys.argv[4])
 from ameesh import capacity_guard
 lend = json.loads(sys.argv[1])
 offer, problems, unknown = capacity_guard.parse_lend(lend)
 if problems:
     sys.exit("invalid offer: " + "; ".join(problems))
+# disk_max: only the size of the guest volume holds it (no quota)
+root, disk_max = sys.argv[5], offer["disk_max"]
+if os.path.ismount(root):
+    st = os.statvfs(root)
+    if st.f_blocks * st.f_frsize > disk_max * 1.05:
+        print("warning: %s holds %.0f GiB, above disk_max %.0f GiB: disk_max is not enforced"
+              % (root, st.f_blocks * st.f_frsize / 2 ** 30, disk_max / 2 ** 30), file=sys.stderr)
+else:
+    print("warning: %s is not a volume of its own: disk_max is indicative only" % root,
+          file=sys.stderr)
 print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
                   "work_path": sys.argv[5], "lend": lend}, indent=2))
 ' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT") || die "offer refused"
@@ -330,32 +435,55 @@ if [ ${#EXTRA_PATH[@]} -eq 0 ] && dsh=$(command -v dsh 2>/dev/null); then
   case "$(dirname "$dsh")" in /usr/bin|/usr/local/bin|/bin) ;; *) EXTRA_PATH=("$(dirname "$dsh")") ;; esac
 fi
 
+# the guard's mode: the one asked, else the one installed (a reinstall never
+# switches an enforcing guard back to observe behind the owner's back)
+PREVIOUS_MODE=$(installed_mode)
+GUARD_MODE=${GUARD_MODE:-$PREVIOUS_MODE}
+
 say "1. user $GUEST and its volume $ROOT"
 if id -u "$GUEST" >/dev/null 2>&1; then
   echo "user $GUEST exists: kept as is"
 else
+  remember user
   run useradd --system --user-group --home-dir "$ROOT/home" --no-create-home \
               --shell /bin/bash --comment "ameesh guest (L159g)" "$GUEST"
-  remember user
 fi
-[ -d "$ROOT/work" ] || remember root-content
+# each directory recorded on its own, only if this script creates it: a
+# directory that was there (and its content) is never purged
+[ -d "$ROOT" ] || remember "guest-dir $ROOT"
 run install -d -m 0755 "$ROOT"
 for d in home tmp work; do
+  [ -d "$ROOT/$d" ] || remember "guest-tree $ROOT/$d"
   run install -d -m 0700 -o "$GUEST" -g "$GUEST" "$ROOT/$d"
 done
 
 say "2. ameesh in $VENV (root-owned; the guest can run it, not change it)"
-if [ -x "$VENV/bin/ameesh" ] && ! created venv; then
+if [ -x "$VENV/bin/ameesh" ] && ! created "venv-tree $VENV"; then
   echo "$VENV exists and was not made by this script: upgraded in place"
 else
-  [ -d "$VENV" ] || { run python3 -m venv "$VENV"; remember venv; }
+  if [ -d "$VENV" ] && [ ! -x "$VENV/bin/pip" ]; then
+    # a venv this script began and did not finish: made again
+    created "venv-tree $VENV" || die "$VENV exists without bin/pip and is not this script's"
+    run rm -rf "$VENV"
+  fi
+  if [ ! -d "$VENV" ]; then
+    [ -d "$(dirname "$VENV")" ] || remember "venv-dir $(dirname "$VENV")"
+    remember "venv-tree $VENV"
+    run python3 -m venv "$VENV" || {
+      run rm -rf "$VENV"
+      die "python3 -m venv failed (python3-venv, ensurepip?): nothing left in $VENV"
+    }
+  fi
 fi
 run "$VENV/bin/pip" install --quiet --upgrade "$CHECKOUT[psycopg]"
 
 say "3. units, gate directories, guard"
 run install -m 0644 "$HERE/ameesh-guest.slice" "$UNITS/"
 run install -D -m 0644 "$HERE/ameesh.slice.d/guest-weight.conf" "$UNITS/ameesh.slice.d/guest-weight.conf"
-run install -m 0644 "$HERE/ameesh-guest-runner@.service" "$UNITS/"
+# the runner's unit, its volume being $ROOT (WorkingDirectory, HOME, TMPDIR,
+# PATH, ReadWritePaths, RequiresMountsFor)
+sed "s#/srv/ameesh-guest#$ROOT#g" "$HERE/ameesh-guest-runner@.service" \
+  | put "$UNITS/ameesh-guest-runner@.service" 0644 root:root
 run install -m 0644 "$HERE/ameesh-guard.service" "$UNITS/"
 run install -m 0644 "$HERE/ameesh-gate.tmpfiles.conf" "$TMPFILES"
 if [ ${#EXTRA_PATH[@]} -gt 0 ]; then
@@ -367,7 +495,7 @@ Environment=PATH=$prefix:$ROOT/home/.local/share/mise/shims:$ROOT/home/.local/bi
 EOF
 fi
 put "$ETC/guard.json" 0644 root:root <<<"$guard_json"
-set_guard_mode "${GUARD_MODE:-observe}"
+set_guard_mode "$GUARD_MODE"
 
 say "4. secrets files (created empty, never overwritten)"
 secret() {
@@ -391,9 +519,14 @@ run systemctl daemon-reload
 run systemd-tmpfiles --create "$TMPFILES"
 # one measure with the installed ameesh and offer, nothing written
 run "$VENV/bin/ameesh" guard check --config "$ETC/guard.json"
+# a running guard is started again: it takes the new offer and mode
+run systemctl stop ameesh-guard.service
+if [ "$PREVIOUS_MODE" = enforce ] && [ "$GUARD_MODE" = observe ]; then
+  reset_caps
+fi
 run systemctl enable --now ameesh-guard.service
 
-say "done: the guard runs in ${GUARD_MODE:-observe}; no guest runner is started"
+say "done: the guard runs in $GUARD_MODE; no guest runner is started"
 cat <<EOF
 Next:
   1. fill $ETC/guest.env (AMEESH_DSN) and $ETC/guest-<agent>.env;
