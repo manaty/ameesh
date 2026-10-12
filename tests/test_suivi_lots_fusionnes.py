@@ -597,6 +597,42 @@ class MergeSweepTest(_Base):
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", branch)
         self.assertEqual(self.sync()["merged"], 1)
 
+    def test_403_dry_run_deuxieme_fusion_partielle(self):
+        # #403 : M1 partielle relevée, S vu en avance après M1, puis une
+        # deuxième fusion partielle M2 (de P seul) et S entré dans la cible
+        # par une autre branche : le dry-run juge comme le vrai relevé, M2
+        # pas encore relevée ne se compare pas à l'instant de M1
+        n = self.lot("parapluie")["id"]
+        self.db.execute("UPDATE work_items SET created_at = now() - interval '1 hour'"
+                        " WHERE id = %s", (n,))
+        branch = "lot/%d-un" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("p0")
+        _git(self.repo, "checkout", "-q", "develop")
+        partielle = "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", partielle, branch)
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")   # M1 relevée
+        m1 = work.get(self.db, n)["partial_merge"]
+        _git(self.repo, "checkout", "-q", branch)
+        self.commit("p")
+        p = _git(self.repo, "rev-parse", "HEAD")
+        self.commit("s")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.sync()                                               # S vu en avance après M1
+        s = work.get(self.db, n)["branch_head"]
+        _git(self.repo, "branch", "-q", "-f", "autre", s)
+        _git(self.repo, "branch", "-q", "-f", branch, p)          # poussée forcée à P
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", partielle, branch)   # M2
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", "autre")
+        _git(self.repo, "branch", "-q", "-f", branch, "develop")  # avance rapide
+        report = self.sync(dry_run=True)
+        self.assertEqual((report["results"][0]["result"], report["results"][0]["how"]),
+                         ("open", "partial"))
+        self.assertEqual(work.get(self.db, n)["partial_merge"], m1)   # rien d'écrit
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
     def test_l118d_r1_erreur_git_garde_le_lot_ouvert(self):
         # #346 r1 P2 : une ascendance illisible (code 128) n'est pas une preuve
         merge = {"sha": "m" * 40, "ts": 0.0, "parents": ["a" * 40, "b" * 40]}
