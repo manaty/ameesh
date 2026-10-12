@@ -811,12 +811,17 @@ class WorkItems(Domain):
     """Lots et journal de leurs transitions (ledger de reprise)."""
 
     @abc.abstractmethod
-    def set_app(self, item_id: int, app: str, *, actor: str) -> dict | None:
+    def set_app(self, item_id: int, app: str, *, actor: str,
+                if_empty: bool = False, assignee: str | None = None) -> dict | None:
         """L118c: journaled project correction, atomically with its old value."""
 
     @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
+
+    @abc.abstractmethod
+    def creator(self, item_id: int) -> str:
+        """Actor of the first journal entry, without truncating long journals."""
 
     @abc.abstractmethod
     def add(self, *, type: str, source: str, app: str, title: str, body: str,  # noqa: A002

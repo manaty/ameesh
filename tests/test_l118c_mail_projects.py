@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import db as db_mod, exploitation, projects, work, work_projects
+from ameesh import db as db_mod, decisions, exploitation, projects, storage, work, work_projects
 from .test_l118_assignments import _Base
 
 
@@ -88,6 +88,119 @@ class MailProjectTests(_Base):
         self.project("dev1", team="recipient")
         self.assertEqual(work_projects.mail_project(self.cfg, self.db, "human:owner", "dev1"),
                          "recipient")
+
+    def test_work_add_inherits_creator_and_rejects_explicit_blank(self):
+        self.project("dev1", team="creator")
+        self.project("dev2", team="assignee")
+        env = self.env(AGENT_MAIL_NAME="dev1")
+        proc = self.mesh("work", "add", "--title", "New", "--estimate", "1h",
+                         "--assignee", "dev2", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.list_items(self.db)[0]["app"], "creator")
+        proc = self.mesh("work", "add", "--title", "Blank", "--estimate", "1h",
+                         "--app", " ", env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("empty project", proc.stderr)
+        self.assertEqual(len(work.list_items(self.db)), 1)
+        proc = self.mesh("work", "add", "--title", "Override", "--estimate", "1h",
+                         "--app", "explicit", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.list_items(self.db)[0]["app"], "explicit")
+
+    def test_work_add_uses_bound_creator_even_with_an_explicit_actor(self):
+        self.project("dev1", team="bound")
+        self.project("orch", team="other")
+        proc = self.mesh("work", "add", "--title", "New", "--estimate", "1h",
+                         "--actor", "orch", env=self.env(AGENT_MAIL_NAME="dev1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.list_items(self.db)[0]["app"], "bound")
+
+    def test_decision_creation_inherits_requester_then_parent(self):
+        parent = work.add(self.db, title="Parent", app="parent")
+        self.project("dev1", team="requester")
+        view = decisions.ask(self.cfg, self.db, requester="dev1", question="Proceed?",
+                             new_lot="Decision", parent_lot=str(parent["id"]))
+        self.assertEqual(work.get(self.db, view["lot"])["app"], "requester")
+        self.project("dev1", team="")
+        view = decisions.ask(self.cfg, self.db, requester="dev1", question="Proceed?",
+                             new_lot="Child", parent_lot=str(parent["id"]))
+        self.assertEqual(work.get(self.db, view["lot"])["app"], "parent")
+        proc = self.mesh("decide", "ask", "--new-lot", "CLI child", "--parent-lot",
+                         str(parent["id"]), "--question", "Proceed?",
+                         env=self.env(AGENT_MAIL_NAME="dev1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.list_items(self.db)[0]["app"], "parent")
+
+    def test_creation_uses_only_own_canon_and_refuses_ambiguous_projects(self):
+        self.db.execute("UPDATE agent_registry SET canon = 'own' WHERE name = 'dev1'")
+        def canon(team, own=True):
+            return SimpleNamespace(owns=lambda name: own and name == "own",
+                                   agent=lambda name: SimpleNamespace(team=team))
+        with mock.patch.object(work, "configured_canons", return_value=[canon("foreign", False),
+                                                                                   canon("own")]):
+            self.assertEqual(work_projects.creation_project(self.cfg, self.db, "dev1"), "own")
+        with mock.patch.object(work, "configured_canons", return_value=[canon("a"), canon("b")]):
+            with self.assertRaisesRegex(work.WorkError, "ambiguous"):
+                work_projects.creation_project(self.cfg, self.db, "dev1")
+
+    def test_decision_creation_falls_back_to_source_mail_lot(self):
+        parent = work.add(self.db, title="Parent", app="parent")
+        proc = self.cli("send", "orch", "Proceed?", "--from", "dev1", "--lot", str(parent["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        mail_id = self.db.query("SELECT id FROM agent_mailbox ORDER BY id LIMIT 1")[0]["id"]
+        view = decisions.ask(self.cfg, self.db, requester="dev1", question="Proceed?",
+                             new_lot="Child", source_mail=mail_id)
+        self.assertEqual(work.get(self.db, view["lot"])["app"], "parent")
+
+    def test_unknown_creation_project_preserves_human_and_unclassified_flows(self):
+        self.assertEqual(work_projects.creation_project(self.cfg, self.db, "human:owner"), "")
+        self.assertEqual(work_projects.creation_project(self.cfg, self.db, "dev1", " "), "")
+
+    def test_backfill_is_guarded_dry_run_idempotent_and_uses_creation_event(self):
+        self.project("dev1", team="assigned")
+        self.project("orch", team="created")
+        assigned = work.add(self.db, title="Assigned", assignee="dev1", actor="orch")
+        created = work.add(self.db, title="Created", actor="orch")
+        for n in range(105):
+            work.note(self.db, created["id"], str(n), actor="dev2")
+        unknown = work.add(self.db, title="Unknown", actor="human:owner")
+        closed = work.add(self.db, title="Closed", actor="orch")
+        work.close(self.db, closed["id"], abandoned=True)
+        named = work.add(self.db, title="Named", app="existing", actor="orch")
+        before = {r["id"]: work.events(self.db, r["id"]) for r in (assigned, created, unknown)}
+        proc = self.mesh("work", "backfill-app", "--dry-run", "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("planned — assigned", proc.stdout)
+        self.assertIn("planned — created", proc.stdout)
+        self.assertEqual({i: work.events(self.db, i) for i in before}, before)
+        proc = self.mesh("work", "backfill-app", env=self.env(AGENT_MAIL_NAME="dev1"))
+        self.assertNotEqual(proc.returncode, 0)
+        proc = self.mesh("work", "backfill-app", "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for lot, project in ((assigned, "assigned"), (created, "created"), (unknown, ""),
+                             (closed, ""), (named, "existing")):
+            self.assertEqual(work.get(self.db, lot["id"])["app"], project)
+        self.assertEqual(work.events(self.db, assigned["id"])[0]["actor"], "human:owner")
+        self.assertEqual(work_projects.backfill_app(self.cfg, self.db, actor="human:owner"),
+                         [{"id": unknown["id"], "status": "skipped", "reason": "no known project"}])
+
+    def test_backfill_skips_ambiguous_assignee_without_creator_fallback(self):
+        lot = work.add(self.db, title="Ambiguous", assignee="dev1", actor="orch")
+        with mock.patch.object(work_projects, "agent_project",
+                               side_effect=work.WorkError("ambiguous project")):
+            rows = work_projects.backfill_app(self.cfg, self.db, actor="human:owner")
+        self.assertEqual(rows[0]["status"], "skipped")
+        self.assertEqual(work.get(self.db, lot["id"])["app"], "")
+
+    def test_backfill_storage_does_not_overwrite_a_changed_lot(self):
+        lot = work.add(self.db, title="Concurrent", assignee="dev1")
+        api = storage.of(self.db).work
+        self.assertIsNone(api.set_app(lot["id"], "p", actor="orch", if_empty=True, assignee="dev2"))
+        api.set_app(lot["id"], "manual", actor="orch")
+        events = work.events(self.db, lot["id"])
+        self.assertIsNone(api.set_app(lot["id"], "p", actor="orch", if_empty=True, assignee="dev1"))
+        self.assertEqual(work.get(self.db, lot["id"])["app"], "manual")
+        self.assertEqual(work.events(self.db, lot["id"]), events)
 
     def test_set_app_human_is_journaled_and_idempotent(self):
         lot = work.add(self.db, title="Unclassified")
