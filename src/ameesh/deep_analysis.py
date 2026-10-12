@@ -1,14 +1,16 @@
 """Analyse profonde automatique de l'auditeur (L317c, demande du propriétaire
 du 2026-10-12).
 
-Deux déclencheurs réveillent l'auditeur tout de suite, sans attendre son
-passage suivant :
+Un déclencheur réveille l'auditeur tout de suite, sans attendre son passage
+suivant. Le cœur n'en porte qu'un :
 
-* `bug_p1` (cœur) : un lot de type `bug` et de priorité 1 est ouvert par un
-  humain (`human:<id>`, ou un humain connu) ou par son chat (`chat-<humain>`)
-  — appelé par `work.add` ;
-* `release_withdrawn` : une release est retirée — apporté par le module IT
-  (L317a), qui appelle `request` ; le cœur n'a pas de notion de release.
+* `bug_p1` : un lot de type `bug` et de priorité 1 est ouvert par un humain
+  (`human:<id>`, ou un humain connu) ou par son chat (`chat-<humain>`) —
+  appelé par `work.add`.
+
+Un module déclare les siens (`register_trigger`) puis appelle `request` :
+ainsi le module IT (L317a) avec `release_withdrawn` ; le cœur n'a pas de
+notion de release.
 
 La demande est une ligne du journal du lot (préfixe `REQUEST_PREFIX`) et un
 courrier `event` urgent à chaque auditeur (`alert_briefs.auditors`). Le
@@ -21,15 +23,18 @@ docs/AUDITEUR.md, « Analyse profonde ».
 
 from __future__ import annotations
 
+import re
 import time
 
 from . import storage
 
-#: déclencheurs connus → libellé du courrier (`%s` : qui a déclenché)
+#: déclencheurs connus → libellé du courrier (`%s` : qui a déclenché) ; le
+#: cœur ne porte que `bug_p1`, les modules ajoutent les leurs
+#: (`register_trigger`)
 TRIGGERS = {
     "bug_p1": "priority-1 bug opened by %s",
-    "release_withdrawn": "release withdrawn by %s",
 }
+_TRIGGER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 #: préfixe de la ligne du journal du lot qui porte la demande
 REQUEST_PREFIX = "deep analysis requested"
 #: préfixe (casse ignorée) de la note du lot qui porte le premier rapport
@@ -45,6 +50,21 @@ STALLED_STATUSES = ("stopped", "blocked")
 #: fin de la ligne de demande : les auditeurs à qui elle est partie
 AUDITORS_MARK = "; auditor(s): "
 NO_AUDITOR = "none registered"
+
+
+def register_trigger(name: str, label: str) -> None:
+    """Déclare le déclencheur d'un module (ex. le module IT :
+    `register_trigger("release_withdrawn", "release withdrawn by %s")`).
+    `label` dit l'événement, avec un `%s` pour qui l'a déclenché. Redéclarer
+    le même libellé ne change rien ; un autre libellé pour un nom déjà
+    déclaré est refusé (ValueError)."""
+    if not _TRIGGER_NAME.match(name or ""):
+        raise ValueError("invalid deep analysis trigger name: %r" % (name,))
+    if not isinstance(label, str) or label.count("%s") != 1 or "%" in label.replace("%s", ""):
+        raise ValueError("deep analysis trigger label needs exactly one %%s: %r" % (label,))
+    if TRIGGERS.get(name, label) != label:
+        raise ValueError("deep analysis trigger %r already declared" % name)
+    TRIGGERS[name] = label
 
 
 def human_origin(db, actor: str, cfg=None) -> bool:
@@ -115,16 +135,23 @@ def request(db, item_id: int, trigger: str, *, actor: str, detail: str = "",
     if item is None:
         raise work.WorkError("lot %s not found" % item_id)
     now = time.time() if now is None else now
+    threads: list = []
     with db.transaction() as tx:
         storage.of(tx).work.lock_deep_analysis(item_id)
-        return _request_locked(tx, item, item_id, trigger, actor=actor, detail=detail,
-                               cfg=cfg, now=now)
+        out = _request_locked(tx, item, item_id, trigger, actor=actor, detail=detail,
+                              cfg=cfg, now=now, threads=threads)
+    # le fil externe après le commit seulement (#315 r2) : un envoi annulé
+    # n'y laisse rien
+    for record in threads:
+        record(db.cfg, db)
+    return out
 
 
-def _request_locked(db, item, item_id, trigger, *, actor, detail, cfg, now) -> dict:
+def _request_locked(db, item, item_id, trigger, *, actor, detail, cfg, now,
+                    threads) -> dict:
     from . import mail, registry, sous_utilisation, work
 
-    current = status(db, item_id, now=now)
+    current = status(db, item_id, now=now, cfg=cfg)
     if current and current["last_trigger"] == trigger and current["report_ts"] is None \
             and now - current["last_requested_ts"] < DEADLINE_S:
         return {"requested": False, "trigger": trigger, "auditors": [],
@@ -146,7 +173,7 @@ def _request_locked(db, item, item_id, trigger, *, actor, detail, cfg, now) -> d
     payload = {"urgent": True, "deep_analysis": trigger, "lot": int(item_id)}
     for name in names:
         mail.send(db, SENDER, name, text, kind="event", work_item_id=str(item_id),
-                  payload=payload)
+                  payload=payload, after_commit=threads)
     if orchestras:
         held = ("auditor(s) %s not running (%s): resume them, or have the analysis done"
                 % (", ".join(stalled), ", ".join(
@@ -154,7 +181,8 @@ def _request_locked(db, item, item_id, trigger, *, actor, detail, cfg, now) -> d
                 if stalled else "no auditor registered: have the analysis done")
         for name in orchestras:
             mail.send(db, SENDER, name, "%s\n%s." % (text, held), kind="event",
-                      work_item_id=str(item_id), payload=dict(payload, stalled=stalled))
+                      work_item_id=str(item_id), payload=dict(payload, stalled=stalled),
+                      after_commit=threads)
     note = "%s (%s): %s" % (REQUEST_PREFIX, trigger, why)
     if stalled:
         note += " [not running: %s; orchestrator(s) told: %s]" % (
@@ -188,19 +216,42 @@ def _auditors(db, cfg, listing=None) -> list[str]:
     return alert_briefs.auditors(listing, work.configured_canons(cfg))
 
 
-def _is_request(row: dict) -> bool:
-    return (row.get("note") or "").startswith(REQUEST_PREFIX)
+def _is_request(row: dict, requesters) -> bool:
+    """Une ligne de demande écrite par `ameesh`, un humain (`human:<id>`) ou
+    un orchestrateur (`requesters()`, lu seulement pour un autre acteur) :
+    celle d'un autre agent n'est pas une demande (#315 r2)."""
+    from . import work
+
+    if not (row.get("note") or "").startswith(REQUEST_PREFIX):
+        return False
+    actor = (row.get("actor") or "").strip()
+    return actor == SENDER or actor.startswith(work.HUMAN_PREFIX) or actor in requesters()
 
 
 def _is_report(row: dict, auditors) -> bool:
-    """Une note `Deep analysis: …` d'un auditeur nommé par la demande (ou de
-    la persona auditeur) : celle d'un autre acteur ne solde pas la mesure
-    (#315 r1)."""
-    from .alert_briefs import AUDITOR_NAME
-
+    """Une note `Deep analysis: …` d'un auditeur nommé par la demande : celle
+    d'un autre acteur ne solde pas la mesure (#315 r1, r2)."""
     actor = (row.get("actor") or "").strip()
     return (row.get("note") or "").strip().casefold().startswith(REPORT_PREFIX) \
-        and actor != SENDER and (actor in auditors or actor == AUDITOR_NAME)
+        and actor != SENDER and actor in auditors
+
+
+def _orchestrators(db, cfg):
+    """Les orchestrateurs, lus une fois et seulement s'il le faut."""
+    seen: list = []
+
+    def get() -> set:
+        if not seen:
+            from . import registry, sous_utilisation, work
+            try:
+                seen.append(set(sous_utilisation.orchestrators(
+                    cfg, db, registry.overview(db),
+                    declared=sous_utilisation.declared_orchestrators(),
+                    canons=work.configured_canons(cfg) if cfg is not None else [])))
+            except Exception:
+                seen.append(set())
+        return seen[0]
+    return get
 
 
 def _named(note: str) -> set:
@@ -220,7 +271,8 @@ def _trigger(note: str) -> str:
     return ""
 
 
-def status(db, item_id: int, *, now: float | None = None, events=None) -> dict | None:
+def status(db, item_id: int, *, now: float | None = None, events=None,
+           cfg=None) -> dict | None:
     """La dernière demande d'analyse du lot et son premier rapport, ou None.
 
     `{trigger, requested_ts, report_ts, reporter, delay_s, overdue,
@@ -230,10 +282,11 @@ def status(db, item_id: int, *, now: float | None = None, events=None) -> dict |
     court depuis la première (#315 r1) ; `last_*` disent la dernière."""
     now = time.time() if now is None else now
     rows = events if events is not None else storage.of(db).work.events(item_id, 500)
+    requesters = _orchestrators(db, cfg)
     rows = sorted(rows, key=lambda r: (r.get("created_ts") or 0, r.get("id") or 0))
     found = None
     for row in rows:
-        if _is_request(row):
+        if _is_request(row, requesters):
             if found is None or found["report_ts"] is not None:
                 found = {"trigger": _trigger(row["note"]), "requested_ts": row["created_ts"],
                          "report_ts": None, "reporter": None, "auditors": set()}
@@ -252,21 +305,21 @@ def status(db, item_id: int, *, now: float | None = None, events=None) -> dict |
     return found
 
 
-def measure(db, *, since_ts: float, now: float | None = None) -> list[dict]:
+def measure(db, *, since_ts: float, now: float | None = None, cfg=None) -> list[dict]:
     """Les demandes depuis `since_ts`, une par lot (la dernière), avec leur
     délai : la mesure du « premier rapport dans les 30 min »."""
     now = time.time() if now is None else now
     out = []
     for item_id in sorted({int(r["work_item_id"]) for r in
                            storage.of(db).work.events_noted(REQUEST_PREFIX, since_ts)}):
-        found = status(db, item_id, now=now)
+        found = status(db, item_id, now=now, cfg=cfg)
         if found is not None:
             out.append(dict(found, lot=item_id))
     return out
 
 
-def overdue(db, now: float | None = None) -> list[dict]:
+def overdue(db, now: float | None = None, cfg=None) -> list[dict]:
     """Les demandes des dernières 24 h restées sans rapport au-delà du délai."""
     now = time.time() if now is None else now
-    return [m for m in measure(db, since_ts=now - OVERDUE_WINDOW_S, now=now)
+    return [m for m in measure(db, since_ts=now - OVERDUE_WINDOW_S, now=now, cfg=cfg)
             if m["report_ts"] is None and m["overdue"]]

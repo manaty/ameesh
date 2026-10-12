@@ -1118,7 +1118,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
             # L317c: the auditor's automatic deep analysis and its measured delay
             from . import deep_analysis
-            item["deep_analysis"] = deep_analysis.status(db, args.id)
+            item["deep_analysis"] = deep_analysis.status(db, args.id, cfg=cfg)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0

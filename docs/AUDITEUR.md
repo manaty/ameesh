@@ -256,8 +256,16 @@ Deux déclencheurs :
   pas : l'orchestrateur qui en juge l'urgence demande l'analyse lui-même. Une
   session liée à un agent ne crée pas au nom d'un humain : son `--actor
   human:<id>` n'est pas cru ;
-* `release_withdrawn` : une release retirée, apporté par le module IT (L317a)
-  par `deep_analysis.request(db, <lot>, "release_withdrawn", actor=…)`.
+* `release_withdrawn` : une release retirée. Le cœur ne le connaît pas : le
+  module IT (L317a) le déclare (`deep_analysis.register_trigger(
+  "release_withdrawn", "release withdrawn by %s")`) puis appelle
+  `deep_analysis.request(db, <lot>, "release_withdrawn", actor=…)`. Tout
+  module peut déclarer ainsi son déclencheur.
+
+Seule une ligne de demande écrite par `ameesh`, un humain ou un orchestrateur
+compte ; celle d'un autre agent est ignorée. Les courriers et la ligne du
+journal sont écrits ensemble ou pas du tout, et le fil externe ne reçoit les
+courriers qu'une fois la demande enregistrée.
 
 L'analyse est celle de ce chapitre, limitée au défaut du lot. Elle remonte la
 chaîne et l'écrit sur le lot :
@@ -273,8 +281,9 @@ chaîne et l'écrit sur le lot :
 **Premier rapport dans les 30 min, mesuré** : une note du lot qui commence par
 « Deep analysis: » (`ameesh work note <lot> "Deep analysis: …"`), même
 partielle (ce qui est établi, ce qui reste à établir). Seule la note d'un
-auditeur à qui la demande est partie compte : celle d'un autre agent ou d'un
-humain ne solde pas la mesure. `ameesh work show <lot>` affiche le délai
+auditeur à qui la demande est partie compte : celle d'un autre agent, d'un
+humain ou d'un autre auditeur (même la persona `auditeur`) ne solde pas la
+mesure. `ameesh work show <lot>` affiche le délai
 (ligne `analysis`) ; sans rapport au-delà de 30 min, l'alerte
 `deep_analysis_overdue` part au responsable humain. Une demande répétée avant
 le rapport relance le courrier (pas avant 30 min pour le même déclencheur)

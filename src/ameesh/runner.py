@@ -1956,7 +1956,8 @@ class AgentWorker(threading.Thread):
         try:
             if not self.runner.is_auditor(self.name, self.agent):
                 return False
-            found = deep_analysis.status(self.db, int(payload.get("lot") or 0))
+            found = deep_analysis.status(self.db, int(payload.get("lot") or 0),
+                                         cfg=getattr(self, "cfg", None))
         except (db_mod.DbError, TypeError, ValueError):
             return False
         return bool(found and found["report_ts"] is None

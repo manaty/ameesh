@@ -17,7 +17,8 @@ import time
 import types
 from unittest import mock
 
-from ameesh import deep_analysis, exploitation, mail, notify, registry, runner, work
+from ameesh import (deep_analysis, exploitation, mail, notify, registry, runner,
+                    storage, work)
 
 from .support import PgTestCase
 
@@ -35,6 +36,11 @@ class _Base(PgTestCase):
         self.addCleanup(patcher.stop)
         for name in ("auditeur", "orch", "dev1"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # the IT module (L317a) declares its own trigger; the core only has bug_p1
+        triggers = mock.patch.dict(deep_analysis.TRIGGERS)
+        triggers.start()
+        self.addCleanup(triggers.stop)
+        deep_analysis.register_trigger("release_withdrawn", "release withdrawn by %s")
 
     def bug(self, actor="human:alice", **kw):
         kw.setdefault("type", "bug")
@@ -175,6 +181,53 @@ class TriggerTest(_Base):
         with self.assertRaises(ValueError):
             deep_analysis.request(self.db, lot["id"], "tag_deleted", actor="orch")
 
+    def test_the_core_only_knows_bug_p1_and_modules_register_theirs(self):
+        with mock.patch.dict(deep_analysis.TRIGGERS):
+            deep_analysis.TRIGGERS.pop("release_withdrawn")
+            self.assertEqual(sorted(deep_analysis.TRIGGERS), ["bug_p1"])
+            lot = work.add(self.db, title="release", actor="orch")
+            with self.assertRaises(ValueError):
+                deep_analysis.request(self.db, lot["id"], "release_withdrawn",
+                                      actor="human:alice")
+        deep_analysis.register_trigger("release_withdrawn", "release withdrawn by %s")
+        for name, label in (("release_withdrawn", "release pulled by %s"),
+                            ("Bad-Name", "x by %s"), ("tag_deleted", "no actor"),
+                            ("tag_deleted", "%s and %s"), ("tag_deleted", "100% by %s")):
+            with self.subTest(name=name, label=label), self.assertRaises(ValueError):
+                deep_analysis.register_trigger(name, label)
+
+    def test_the_external_thread_is_written_after_the_commit(self):
+        # #315 r2: a send failing midway leaves nothing in the thread either
+        registry.set_status(self.db, "auditeur", "stopped", status_text="test")
+        box = type(mail.storage.of(self.db).mailbox)
+        real = box.send
+        calls = []
+
+        def second_fails(store, *a, **kw):
+            # the store of the request's transaction, not self.db's
+            calls.append(a)
+            if len(calls) == 2:
+                raise RuntimeError("mailbox down")
+            return real(store, *a, **kw)
+
+        lot = work.add(self.db, title="release", actor="orch")
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "orch"}), \
+                mock.patch("ameesh.fil.record") as record, \
+                mock.patch.object(box, "send", autospec=True, side_effect=second_fails):
+            with self.assertRaises(RuntimeError):
+                deep_analysis.request(self.db, lot["id"], "release_withdrawn",
+                                      actor="human:alice", cfg=self.cfg)
+        record.assert_not_called()
+        self.assertIsNone(deep_analysis.status(self.db, lot["id"]))
+        self.assertEqual(self.auditor_mail(), [])
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "orch"}), \
+                mock.patch("ameesh.fil.record") as record:
+            out = deep_analysis.request(self.db, lot["id"], "release_withdrawn",
+                                        actor="human:alice", cfg=self.cfg)
+        self.assertTrue(out["requested"])
+        self.assertEqual(sorted(c.kwargs["recipients"][0] for c in record.call_args_list),
+                         ["auditeur", "orch"])
+
     def test_same_trigger_not_repeated_while_waiting(self):
         item = self.bug()
         again = deep_analysis.request(self.db, item["id"], "bug_p1", actor="human:alice")
@@ -219,6 +272,39 @@ class MeasureTest(_Base):
         self.assertEqual(deep_analysis.status(self.db, item["id"])["auditors"], ["auditeur"])
         work.note(self.db, item["id"], "Deep analysis: chain in progress", actor="auditeur")
         self.assertEqual(deep_analysis.status(self.db, item["id"])["reporter"], "auditeur")
+
+    def test_the_persona_does_not_report_for_another_auditor(self):
+        # #315 r2: a request naming only auditor-blue waits for auditor-blue
+        lot = work.add(self.db, title="plain", actor="orch")
+        storage.of(self.db).work.note(
+            lot["id"], "intake", "deep analysis requested (bug_p1): x; auditor(s): auditor-blue",
+            deep_analysis.SENDER)
+        work.note(self.db, lot["id"], "Deep analysis: done", actor="auditeur")
+        self.assertIsNone(deep_analysis.status(self.db, lot["id"])["report_ts"])
+        work.note(self.db, lot["id"], "Deep analysis: done", actor="auditor-blue")
+        self.assertEqual(deep_analysis.status(self.db, lot["id"])["reporter"], "auditor-blue")
+
+    def test_an_agent_cannot_write_a_request_and_report_it(self):
+        # #315 r2: only ameesh, a human or an orchestrator writes a request
+        item = self.bug()
+        work.note(self.db, item["id"], "deep analysis requested (bug_p1): fake; auditor(s): dev1",
+                  actor="dev1")
+        work.note(self.db, item["id"], "Deep analysis: nothing to see", actor="dev1")
+        found = deep_analysis.status(self.db, item["id"])
+        self.assertIsNone(found["report_ts"])
+        self.assertEqual(found["auditors"], ["auditeur"])
+        # an orchestrator's (or a human's) request does count
+        lot = work.add(self.db, title="plain", actor="orch")
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "orch"}):
+            work.note(self.db, lot["id"],
+                      "deep analysis requested (bug_p1): by hand; auditor(s): auditeur",
+                      actor="orch")
+            self.assertIsNotNone(deep_analysis.status(self.db, lot["id"]))
+        other = work.add(self.db, title="plain 2", actor="orch")
+        work.note(self.db, other["id"],
+                  "deep analysis requested (bug_p1): by hand; auditor(s): auditeur",
+                  actor="human:alice")
+        self.assertIsNotNone(deep_analysis.status(self.db, other["id"]))
 
     def test_a_repeated_request_keeps_the_first_deadline(self):
         # #315 r1: asked again after 30 min, the wait still runs from the first
