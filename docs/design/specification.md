@@ -118,6 +118,8 @@ type: Agent
 title: deepseek7                 # nom de l'agent (grammaire du registre)
 responsible: human:smichea       # REQUIS (R14)
 team: ameesh                     # équipe ou projet
+projects: [ameesh, nexlink]      # facultatif (L243) : le premier est le projet
+                                 # principal, et `team`, gardé, doit le valoir
 capabilities: [read, report-drift, propose]   # `approve` interdit (R8)
 harness: deepseek                # claude | codex | deepseek | …
 model: deepseek-…                # facultatif
@@ -333,8 +335,10 @@ revérification, un contexte illisible est un refus) et repliée dans
 `ameesh canon sync` (et le démarrage de l'exécuteur) met à jour, pour chaque
 agent admis sur l'hôte courant, les colonnes **déclaratives** du registre
 (`harness`, `host`, `cwd`, `admitted_hosts`, `admitted_tags`, `priority`,
-`memory_repository`, `model`, `budget`, `responsible`, `team`,
-`credential_mode`, `canon_ref` = chemin + SHA du fichier). Il ne touche jamais
+`memory_repository`, `model`, `budget`, `responsible`, `team`, `projects`,
+`credential_mode`, `canon_ref` = chemin + SHA du fichier). `projects` (L243,
+0388) est la liste de la fiche, sinon `[team]`, sinon une liste vide ; `team`
+en est le premier. Il ne touche jamais
 aux colonnes d'**état** (bail, session, statut, dépense, consigne). Le `cwd`
 vient de la politique de l'hôte (`work_dirs`, `work_roots`, `work_root`, §4.2),
 avec le repli transitoire sur le `cwd` d'une ancienne admission ; ce repli, ou
