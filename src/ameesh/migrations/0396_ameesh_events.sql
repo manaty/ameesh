@@ -32,7 +32,9 @@ create table if not exists ameesh_events (
     project     text,
     data        jsonb not null default '{}'::jsonb check (jsonb_typeof(data) = 'object'),
     tx          xid8 not null default pg_current_xact_id(),
-    created_at  timestamptz not null default now()
+    -- finite and never in the future (guard below): an `infinity` would
+    -- never expire, and stay the oldest row for good
+    created_at  timestamptz not null default now() check (isfinite(created_at))
 );
 create index if not exists ameesh_events_created_idx on ameesh_events (created_at);
 create index if not exists ameesh_events_tx_idx on ameesh_events (tx, id);
@@ -65,6 +67,54 @@ drop trigger if exists ameesh_events_guard on ameesh_events;
 create trigger ameesh_events_guard
     before update or delete on ameesh_events
     for each row execute function ameesh_events_guard();
+
+create or replace function ameesh_events_dated() returns trigger
+language plpgsql as $$
+begin
+    if new.created_at > now() + interval '1 day' then
+        raise exception 'ameesh_events: created_at in the future (%)', new.created_at;
+    end if;
+    return new;
+end $$;
+
+drop trigger if exists ameesh_events_dated on ameesh_events;
+create trigger ameesh_events_dated
+    before insert on ameesh_events
+    for each row execute function ameesh_events_dated();
+
+-- The retention's watermark: the greatest position (tx, id) it ever deleted,
+-- written in the SAME statement as the deletion. A reader whose position is
+-- below it may have lost events (reset); at or above it, it lost none. The
+-- deletion goes by `created_at`, whatever the order of the rows kept.
+create table if not exists ameesh_events_pruned (
+    one         boolean primary key default true check (one),
+    tx          xid8 not null,
+    id          bigint not null,
+    at          timestamptz not null default now()
+);
+
+-- The identity under which a position (tx, id) means something: the
+-- cluster (`system_identifier`) and its timeline, which a point-in-time
+-- recovery or a promotion changes (xids start again from the recovery
+-- point). The WAL insertion timeline is current at once after a promotion
+-- (the checkpoint's lags until the next checkpoint); a standby has none, it
+-- gives its checkpoint's. NULL when the functions are refused: every resume
+-- is then a reset.
+create or replace function ameesh_events_cluster() returns text
+language plpgsql stable as $$
+declare
+    timeline text;
+begin
+    begin
+        timeline := substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8);
+    exception when object_not_in_prerequisite_state then   -- in recovery
+        timeline := lpad(to_hex((select timeline_id from pg_control_checkpoint())), 8, '0');
+    end;
+    return (select to_hex(system_identifier) from pg_control_system()) || 't'
+        || lower(timeline);
+exception when insufficient_privilege then
+    return null;
+end $$;
 
 -- the event, written by every trigger below (and by `events.record`)
 create or replace function ameesh_event(p_type text, p_object text, p_project text,

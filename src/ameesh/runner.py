@@ -4684,6 +4684,11 @@ class Runner:
         try:
             gone = events_mod.prune(self.db, max_batches=events_mod.PRUNE_MAX_BATCHES,
                                     max_s=events_mod.PRUNE_MAX_S)
+            # rien supprimé alors qu'il reste des événements expirés : la
+            # rétention est bloquée (jamais un 0 silencieux)
+            left = 0 if gone else events_mod.expired(self.db)
+            if left:
+                raise ValueError("%d expired event(s) left, none deleted" % left)
         except (db_mod.DbError, ValueError) as exc:
             message = "event log retention not applied (%s)" % exc
             if message != self._events_prune_error:

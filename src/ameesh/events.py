@@ -35,13 +35,15 @@ its position. Each event has its own position (`format_position`,
 "tx-id-cluster"), the SSE `id`: resuming after it gives exactly the events
 that follow, none twice, none lost. An open transaction (any one, on the
 base) holds the delivery back until it ends; it never loses an event.
-`tx` only orders within ONE Postgres cluster: the position carries the
-cluster's `system_identifier` (hex), and a position of another cluster (a
-logical restore, a rebuilt base) is a reset, never a silent skip.
+`tx` only orders within ONE Postgres cluster and timeline: the position
+carries the cluster's `system_identifier` and its timeline
+(`ameesh_events_cluster()`, "<hex>t<timeline>"), and a position of another
+cluster or timeline (logical restore, point-in-time recovery, promotion) is
+a reset, never a silent skip.
 
-The retention deletes a **prefix** in (tx, id) order (it stops at the first
-event still kept, and waits for a locked row rather than skipping it): the
-oldest event kept says exactly what was lost.
+The retention deletes by `created_at` and raises, in the same statement, a
+**watermark**: the greatest position it deleted (`ameesh_events_pruned`). A
+position below it is a reset; it waits for a locked row rather than skip it.
 
 **Retention** (0033 §9): one year by default, `AMEESH_EVENTS_RETENTION_DAYS`
 on the host that prunes (at least 30: the table refuses to delete younger
@@ -73,7 +75,9 @@ PRUNE_BATCH = 10000
 PRUNE_MAX_BATCHES = 10
 PRUNE_MAX_S = 5.0
 _TYPE_RE = re.compile(r"^[a-z]+\.[a-z_]+$")
-_POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})-([0-9a-f]{1,16})$")
+_POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$")
+#: the cluster's identity when its functions are refused: no resume trusted
+UNKNOWN_CLUSTER = "none"
 _XID8_MAX = 2 ** 64 - 1
 _BIGINT_MAX = 2 ** 63 - 1
 
@@ -123,8 +127,7 @@ def prune(db, *, days: int | None = None, now: float | None = None,
           max_s: float | None = None, clock=time.monotonic) -> int:
     """Deletes the events older than `days` (default `retention_days()`), by
     batches, `max_batches` batches and `max_s` seconds at most (None: until
-    done); the number deleted. A prefix in (tx, id) order: it stops at the
-    first event still kept. A deletion that would outlast `max_s` (a lock, a
+    done); the number deleted. A deletion that would outlast `max_s` (a lock, a
     slow statement) fails with DbError: the batches before it stay done."""
     days = retention_days() if days is None else int(days)
     if days < MIN_RETENTION_DAYS:
@@ -145,6 +148,13 @@ def prune(db, *, days: int | None = None, now: float | None = None,
         batches += 1
         if n < batch or (max_batches is not None and batches >= max_batches):
             return total
+
+
+def expired(db, *, days: int | None = None, now: float | None = None) -> int:
+    """The number of events past the retention (what `prune` would delete)."""
+    days = retention_days() if days is None else int(days)
+    return storage.of(db).events.count_before(
+        (time.time() if now is None else now) - days * 86400.0)
 
 
 def _main_list(cfg, db, args) -> int:
@@ -213,5 +223,6 @@ def main(argv: list[str] | None = None) -> int:
         db.close()
 
 
-__all__ = ["CHANNEL", "TYPES", "format_position", "main", "parse_position", "prune", "record",
+__all__ = ["CHANNEL", "TYPES", "UNKNOWN_CLUSTER", "expired", "format_position", "main",
+           "parse_position", "prune", "record",
            "retention_days"]

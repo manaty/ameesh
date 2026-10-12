@@ -622,11 +622,12 @@ class Events(Domain):
         most `limit` (a listing for humans: ids are not in commit order)."""
 
     @abc.abstractmethod
-    def readable(self, position: tuple, limit: int) -> tuple[list[dict], bool]:
+    def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None]:
         """The reader's order: (the events after `position` = (tx, id) whose
         transaction is over for good (`tx` below the snapshot's xmin), by
-        (tx, id), at most `limit`, each row also carrying `tx`; whether
-        events after `position` wait for an older open transaction to end).
+        (tx, id), at most `limit`, each row also carrying `tx`; why events
+        after `position` wait, None if none does: "xmin" for an older open
+        transaction, "restore" for rows of another cluster above the counter).
         Both from ONE snapshot. Such a transaction can no longer add an event
         before the last one read."""
 
@@ -635,8 +636,10 @@ class Events(Domain):
         """`first`, `last`: the smallest and largest ids kept (None and 0 when
         empty); `head`: the position (tx, id) of the last readable event,
         `top`: of the last event written, `oldest`: of the first one kept
-        ((0, 0) when none); `cluster`: the Postgres cluster's identity
-        (`system_identifier`, hex), outside which a position means nothing."""
+        ((0, 0) when none); `pruned`: the greatest position the retention
+        deleted ((0, 0) when none); `cluster`: the identity of the cluster
+        and timeline, outside which a position means nothing (None when its
+        functions are refused)."""
 
     @abc.abstractmethod
     def count_before(self, before_ts: float) -> int:
@@ -644,8 +647,9 @@ class Events(Domain):
 
     @abc.abstractmethod
     def prune(self, before_ts: float, limit: int, timeout_s: float | None = None) -> int:
-        """Deletes at most `limit` events older than `before_ts`: a prefix in
-        (tx, id) order, up to the first event kept; the number deleted.
+        """Deletes at most `limit` events older than `before_ts` (the oldest
+        first) and raises the watermark `bounds()["pruned"]` in the same
+        statement; the number deleted.
         `timeout_s`: lock and statement timeout of the deletion (DbError past
         it). The table refuses an event younger than 30 days."""
 

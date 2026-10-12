@@ -40,7 +40,8 @@ position (tx, id) in commit order (`events`), keeps what its human may see
 (replay from the table, exactly once); `event: reset` says that events were
 lost (retention, a rebuilt base, another cluster): the client reloads its views;
 `event: delayed`, in place of the heartbeat, that events wait for an open
-transaction of the base (xmin) — nothing is lost, they come once it ends. A comment every 20 s keeps the connection
+transaction of the base (xmin), or behind rows of another cluster (logical
+restore: the log must be emptied) — nothing is lost, they come once it ends. A comment every 20 s keeps the connection
 alive; a stream ends after an hour (the client resumes); at most
 `MAX_STREAMS` streams at once, the others are 503 with `Retry-After`.
 """
@@ -276,6 +277,11 @@ def _openapi(ctx: Context, db, params, query) -> dict:
     return openapi()
 
 
+DELAY_REASONS = {"xmin": "open transaction (xmin)",
+                 "restore": "restored events above the transaction counter"
+                            " (logical restore: empty the log)"}
+
+
 def event_message(event: dict, cluster: str) -> str:
     """One SSE message: `id` is the event's position "tx-id-cluster", where a
     resume starts (strictly after it)."""
@@ -467,7 +473,7 @@ def openapi() -> dict:
                                          "(Retry-After)", "ameesh-error/1")
             params.append({"name": "Last-Event-ID", "in": "header", "required": False,
                            "schema": {"type": "string",
-                                      "pattern": "^[0-9]{1,20}-[0-9]{1,19}-[0-9a-f]{1,16}$"},
+                                      "pattern": "^[0-9]{1,20}-[0-9]{1,19}-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$"},
                            "description": "resume strictly after this position (the last "
                                           "`id:` received, \"tx-id-cluster\"); without it, the "
                                           "new events only"})
@@ -728,23 +734,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             bounds = self.read(lambda db: storage.of(db).events.bounds())
-            self._cluster = cluster = bounds["cluster"]
+            # None: the cluster's identity is refused to this role, so no
+            # resume can be trusted
+            self._cluster = cluster = bounds["cluster"] or events.UNKNOWN_CLUSTER
             reset = None
             if resume is None:
                 position = bounds["head"]
-            elif resume[1] != cluster:
-                # `tx` orders within one cluster only: a logical restore
-                # starts again lower, below a position of the old one
-                position, reset = bounds["head"], "another cluster"
+            elif resume[1] != cluster or cluster == events.UNKNOWN_CLUSTER:
+                # `tx` orders within one cluster and timeline only: a logical
+                # restore or a point-in-time recovery starts again lower,
+                # below a position of the old one
+                position, reset = bounds["head"], "another cluster or timeline"
             elif resume[0] > bounds["top"]:
                 # a position this base never gave: rebuilt, or another mesh
                 position, reset = bounds["head"], "unknown position"
             else:
                 position = resume[0]
-                # every position given is an event's, and the retention
-                # deletes a prefix: older than the oldest kept one, that
-                # event (and maybe others) went with the retention
-                if position != (0, 0) and position < bounds["oldest"]:
+                # below the retention's watermark (the greatest position it
+                # deleted), events after this one may be gone
+                if position < bounds["pruned"]:
                     reset = "events lost (retention)"
             self.close_connection = True
             self.send_response(200)
@@ -796,7 +804,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         hub = self.hub
         start = written = time.monotonic()
         generation = hub.generation
-        pending, waiting, waiting_since = True, False, None
+        pending, waiting, waiting_since, restore_logged = True, None, None, False
         while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
             if pending or waiting:
                 try:
@@ -816,11 +824,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             idle = time.monotonic() - written
             if idle >= HEARTBEAT_S:
                 if waiting_since is not None:
-                    # observable: events wait for an open transaction (xmin);
-                    # no `id`, the client's resume position does not move
+                    # observable: events wait for an open transaction (xmin),
+                    # or rows of another cluster sit above the counter
+                    # (logical restore); no `id`, the resume position stays
                     self._write("event: delayed\ndata: %s\n\n" % json.dumps(
-                        {"reason": "open transaction (xmin)",
+                        {"reason": DELAY_REASONS.get(waiting, DELAY_REASONS["xmin"]),
                          "waiting_s": round(time.monotonic() - waiting_since, 1)}))
+                    if waiting == "restore" and not restore_logged:
+                        log.warning("event stream: events of another cluster above the"
+                                    " transaction counter (logical restore): empty the log,"
+                                    " see EXPLOITATION (TRUNCATE ameesh_events)")
+                        restore_logged = True
                 else:
                     self._write(": heartbeat\n\n")
                 written = time.monotonic()

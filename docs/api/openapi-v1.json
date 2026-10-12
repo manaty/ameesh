@@ -899,7 +899,7 @@
             "name": "Last-Event-ID",
             "required": false,
             "schema": {
-              "pattern": "^[0-9]{1,20}-[0-9]{1,19}-[0-9a-f]{1,16}$",
+              "pattern": "^[0-9]{1,20}-[0-9]{1,19}-([0-9a-f]{1,16}t[0-9a-f]{8}|none)$",
               "type": "string"
             }
           }
