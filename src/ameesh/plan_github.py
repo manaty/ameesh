@@ -9,8 +9,11 @@ réimporté comme état — au plus signalé comme **proposition**.
 `ameesh work sync-github --repo R` (lecture seule de GitHub)
     lit les PR fusionnées (`gh pr list --state merged`) et ferme les lots
     qu'elles référencent : branche `lot/<id>` ou `lot/<id>-…` (identifiant
-    de fiche ; la plus longue correspondance l'emporte), ou ligne
-    `ameesh-lot: <id>` dans le corps. Une ligne `ameesh-work: <n>` désigne un
+    de fiche ; la plus longue correspondance l'emporte ; L118b : sans fiche
+    de ce nom, un `<id>` numérique est le lot de ce numéro), ou ligne
+    `ameesh-lot: <id>` dans le corps. Une ligne `ameesh-work-partial: <n>`
+    (L118b) retire le lot n : la PR n'en livre qu'une partie. Une ligne
+    `ameesh-work: <n>` désigne un
     lot précis (`work_items`) : la PR ne ferme alors que ceux-là ; L126 : un
     mot-clé de fermeture de GitHub (« Closes #12 ») désigne de même le lot
     dont l'issue est #12 (son `issue_ref`). Seuls les
@@ -72,12 +75,14 @@ from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
 from .connectors.git_merge import resolve_gh
-from .plan_git import WORK_TRAILER_RE
+from .plan_git import WORK_TRAILER_RE, partial_lots
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$")
 _LOT_LINE_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-lot[ \t]*:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$")
 #: une ligne `ameesh-work: <n>` (même forme dans un commit de fusion : `plan_git`)
 _WORK_LINE_RE = WORK_TRAILER_RE
+#: L118b : une branche de PR `lot/<id>` ou `lot/<id>-…` (id numérique d'un lot)
+LOT_HEAD_RE = re.compile(r"^lot/([1-9][0-9]{0,17})(?:-|$)")
 _MARKER_RE = re.compile(r"<!-- ameesh:package=([A-Za-z0-9][A-Za-z0-9._-]*)(?: d=([0-9a-f.]*))? -->")
 
 #: labels d'état d'une issue de lot
@@ -254,11 +259,19 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
             explicit = sorted(set(explicit) | {lot for issue in closes
                                                for lot in by_issue.get(issue.casefold(), ())})
         packages = packages_of_pr(pr, idents)
+        if not explicit and not packages:
+            # L118b : `lot/<id>-…` sans fiche de ce nom désigne le lot <id>
+            head = LOT_HEAD_RE.match(pr.get("headRefName") or "")
+            if head:
+                explicit = [int(head.group(1))]
         if explicit:
             targets = [(i, None) for i in explicit]
         else:
             targets = [(int(item["id"]), pid) for pid in packages
                        for item in st.work.by_package(pid)]
+        # L118b : une PR qui ne livre qu'une partie d'un lot ne le ferme pas
+        partial = partial_lots(pr.get("body"))
+        targets = [(i, pid) for i, pid in targets if i not in partial]
         for item_id, pid in targets:
             item = work_mod.get(db, item_id)
             entry = {"pr": ref, "work_item": item_id, "package": pid or (item or {}).get(

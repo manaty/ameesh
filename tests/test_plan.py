@@ -456,6 +456,19 @@ class GithubTest(_PlanDb):
         self.assertEqual(again["merged"], 0)
         self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()}, {"pr list"})
 
+    def test_sync_github_branche_lot_numero_et_pr_partielle(self):
+        # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR
+        # qui se déclare partielle ne le ferme pas
+        a = work.add(self.db, title="garde")
+        b = work.add(self.db, title="parapluie")
+        self.merged_pr(11, "lot/%d-garde" % a["id"], body="Lot.")
+        self.merged_pr(12, "lot/%d-un" % b["id"],
+                       body="Part.\n\nameesh-work-partial: %d" % b["id"])
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        by_item = {r["work_item"]: r["result"] for r in report["results"]}
+        self.assertEqual(by_item, {a["id"]: "merged"})
+        self.assertEqual(work.get(self.db, b["id"])["state"], "intake")
+
     def issue(self, prefix: str) -> dict:
         found = self.gh.issue(REPO, prefix)
         self.assertIsNotNone(found, prefix)
