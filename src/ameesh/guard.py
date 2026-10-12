@@ -578,12 +578,44 @@ def write_state(path: str, state: dict) -> None:
 
 
 def read_ack(path: str) -> dict | None:
-    """The guest's acknowledgement (`ameesh-host-ack/1`), None if absent or
-    unreadable."""
+    """The guest's acknowledgement (`ameesh-host-ack/1`), None if absent,
+    unreadable or ill-typed: the guest writes it, the guard never trusts it."""
     ack = read_json(path)
-    if not ack or ack.get("schema") != SCHEMA_HOST_ACK or not isinstance(ack.get("seq"), int):
+    if not ack or ack.get("schema") != SCHEMA_HOST_ACK:
+        return None
+    seq, in_turn = ack.get("seq"), ack.get("in_turn")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        return None
+    if not isinstance(ack.get("drained", False), bool) \
+            or not isinstance(ack.get("state", ""), str):
+        return None
+    if in_turn is not None and not (isinstance(in_turn, list)
+                                    and all(isinstance(t, str) for t in in_turn)):
         return None
     return ack
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def restore_decision(previous: dict, now: float) -> tuple[Decision, int | None]:
+    """The decision and the drain episode a restarted guard takes back from
+    its last state (`guard.decision`): a restart neither lowers the level nor
+    moves a freeze bound or a drain deadline. Nothing usable: level 0 now."""
+    saved = (previous.get("guard") or {}).get("decision") \
+        if isinstance(previous.get("guard"), dict) else None
+    if not isinstance(saved, dict):
+        return Decision(since_ts=now), None
+    level, reason, since = saved.get("level"), saved.get("reason"), saved.get("since_ts")
+    calm, episode = saved.get("calm_since_ts"), saved.get("drain_seq")
+    if not (isinstance(level, int) and level in LEVELS and isinstance(reason, str)
+            and _number(since) and since <= now and (calm is None or _number(calm))):
+        return Decision(since_ts=now), None
+    if not (isinstance(episode, int) and not isinstance(episode, bool)) or level != 3:
+        episode = None
+    return Decision(level, reason, float(since),
+                    None if calm is None else float(calm)), episode
 
 
 # --------------------------------------------------------------------------
@@ -602,7 +634,8 @@ class Guard:
         previous = read_json(cfg.state_path) or {}
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
-        self.decision = Decision(since_ts=clock())
+        # so do the level, the freeze bound and the drain deadline
+        self.decision, self.drain_seq = restore_decision(previous, clock())
         self.state: dict | None = None
         self.written_ts = 0.0
         self.last_key = None
@@ -612,16 +645,27 @@ class Guard:
         now = self.clock()
         reading = self.signals(now)
         ack = read_ack(self.cfg.ack_path)
-        drained = bool(ack and ack.get("drained") is True and self.state
-                       and ack.get("seq") == self.state.get("seq"))
+        # an acknowledgement holds for the whole drain episode: a seq the
+        # guard published since the drain began, whatever changed since
+        drained = bool(ack and ack.get("drained") is True and self.decision.level == 3
+                       and self.drain_seq is not None
+                       and self.drain_seq <= ack["seq"] <= self.seq)
         in_turn = len(ack.get("in_turn") or []) if ack else None
-        self.decision = decide(self.cfg.offer, reading, self.decision, now, drained=drained)
+        previous = self.decision
+        self.decision = decide(self.cfg.offer, reading, previous, now, drained=drained)
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
             state["seq"] = self.seq
+        if self.decision.level != 3:
+            self.drain_seq = None
+        elif self.drain_seq is None or previous.level != 3 \
+                or previous.since_ts != self.decision.since_ts:
+            self.drain_seq = self.seq
+        state["guard"]["decision"] = dict(dataclasses.asdict(self.decision),
+                                          drain_seq=self.drain_seq)
         due = now - self.written_ts >= STATE_TTL_S / 3
         if key != self.last_key or due:
             write_state(self.cfg.state_path, state)

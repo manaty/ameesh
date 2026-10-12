@@ -187,6 +187,115 @@ class StateTest(unittest.TestCase):
         self.assertEqual(g.step()["state"], "stopped")
 
 
+    def _guard(self, clock, readings):
+        return guard.Guard(self.cfg, signals=lambda now: dict(readings[0]),
+                           clock=lambda: clock[0])
+
+    def _ack(self, **fields):
+        os.makedirs(os.path.dirname(self.cfg.ack_path), exist_ok=True)
+        with open(self.cfg.ack_path, "w") as fh:
+            json.dump(dict({"schema": "ameesh-host-ack/1", "state": "draining"}, **fields), fh)
+
+    def test_ack_holds_for_the_drain_episode(self):
+        # codex #211 r1: a capacity change during the drain makes a new seq;
+        # the guest's acknowledgement of the drain still holds
+        clock = [0.0]
+        readings = [dict(self.reading, mem_available_bytes=1 * GIB)]
+        g = self._guard(clock, readings)
+        drain = g.step()
+        self.assertEqual(drain["state"], "draining")
+        clock[0] = 115.0
+        self._ack(seq=drain["seq"], drained=True, in_turn=[])
+        self.assertEqual(g.step()["state"], "draining")
+        readings[0]["guest_mem_bytes"] = 1 * GIB      # memory_high_mb falls: new seq
+        clock[0] = 118.0
+        later = g.step()
+        self.assertGreater(later["seq"], drain["seq"])
+        self.assertEqual(later["caps"]["memory_high_mb"], 1024)
+        clock[0] = 120.0
+        self.assertEqual(g.step()["state"], "draining")
+        # an acknowledgement from before the episode does not count
+        self._ack(seq=drain["seq"] - 1, drained=True)
+        clock[0] = 125.0
+        self.assertEqual(g.step()["state"], "stopped")
+        # nor one of the past episode once a new drain begins
+        readings[0]["mem_available_bytes"] = 20 * GIB
+        clock[0] = 1000.0
+        self.assertEqual(g.step()["level"], 4)        # calm counting
+        clock[0] = 1000.0 + self.cfg.offer.calm_seconds
+        self.assertEqual(g.step()["level"], 0)
+        self._ack(seq=later["seq"], drained=True)
+        readings[0]["mem_available_bytes"] = 1 * GIB
+        clock[0] += 5
+        again = g.step()
+        self.assertEqual(again["state"], "draining")
+        clock[0] += self.cfg.offer.drain_seconds + guard.STOP_GRACE_S
+        self.assertEqual(g.step()["state"], "stopped")
+
+    def test_restart_keeps_level_and_deadline(self):
+        # codex #211 r1: drain at t=0 (deadline 90), restart at t=115 under
+        # the same pressure: the stop still comes at 120, not 205
+        clock = [0.0]
+        readings = [dict(self.reading, mem_available_bytes=1 * GIB)]
+        first = self._guard(clock, readings).step()
+        self.assertEqual(first["drain_deadline_ts"], 90.0)
+        clock[0] = 115.0
+        g = self._guard(clock, readings)
+        held = g.step()
+        self.assertEqual((held["state"], held["drain_deadline_ts"]), ("draining", 90.0))
+        self.assertEqual(held["guard"]["decision"]["drain_seq"], first["seq"])
+        clock[0] = 120.0
+        self.assertEqual(self._guard(clock, readings).step()["state"], "stopped")
+        # an acknowledgement given before the restart still holds after it
+        os.remove(self.cfg.state_path)
+        clock[0] = 0.0
+        drain = self._guard(clock, readings).step()
+        self._ack(seq=drain["seq"], drained=True)
+        clock[0] = 200.0
+        self.assertEqual(self._guard(clock, readings).step()["state"], "draining")
+        # a restart during a freeze keeps its 60 s bound
+        os.remove(self.cfg.state_path)
+        readings[0] = dict(self.reading, psi_cpu_10=50.0)
+        clock[0] = 0.0
+        self.assertEqual(self._guard(clock, readings).step()["level"], 2)
+        clock[0] = 50.0
+        frozen = self._guard(clock, readings).step()
+        self.assertEqual(frozen["freeze"], {"since_ts": 0.0, "until_ts": 60.0})
+        clock[0] = 60.0
+        self.assertEqual(self._guard(clock, readings).step()["state"], "draining")
+        # nothing usable in the last state: level 0, seq kept
+        for saved in ({"seq": 7}, {"seq": 7, "guard": {"decision": {"level": 9}}},
+                      {"seq": 7, "guard": {"decision": {"level": "3", "reason": "x",
+                                                        "since_ts": 0}}},
+                      {"seq": 7, "guard": {"decision": {"level": 3, "reason": "x",
+                                                        "since_ts": 1e12}}}):
+            with open(self.cfg.state_path, "w") as fh:
+                json.dump(saved, fh)
+            restored = self._guard([100.0], [dict(self.reading)])
+            self.assertEqual((restored.decision.level, restored.decision.since_ts,
+                              restored.seq), (0, 100.0, 7), saved)
+
+    def test_ill_typed_ack_counts_as_none(self):
+        # codex #211 r1: the guest writes the acknowledgement; `"in_turn": 1`
+        # used to raise a TypeError that killed the guard
+        for bad in ({"seq": 3, "in_turn": 1}, {"seq": 3, "in_turn": [1]},
+                    {"seq": 3, "in_turn": "a"}, {"seq": True}, {"seq": 3.0},
+                    {"seq": 3, "drained": "yes"}, {"seq": 3, "drained": 1},
+                    {"seq": 3, "state": 4}):
+            self._ack(**bad)
+            self.assertIsNone(guard.read_ack(self.cfg.ack_path), bad)
+        self._ack(seq=3, drained=True, in_turn=["a", "b"])
+        self.assertEqual(guard.read_ack(self.cfg.ack_path)["in_turn"], ["a", "b"])
+        clock = [0.0]
+        readings = [dict(self.reading, mem_available_bytes=1 * GIB)]
+        g = self._guard(clock, readings)
+        drain = g.step()
+        self._ack(seq=drain["seq"], drained=True, in_turn=1)
+        clock[0] = 5.0
+        self.assertEqual(g.step()["caps"]["max_concurrent"], 0)   # no TypeError
+        clock[0] = 200.0
+        self.assertEqual(g.step()["state"], "stopped")
+
 class SignalsTest(unittest.TestCase):
     def test_psi_files_and_busy_units(self):
         with tempfile.TemporaryDirectory() as tmp:
