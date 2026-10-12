@@ -236,3 +236,68 @@ class FreezeTest(unittest.TestCase):
                               and _state(self.mcp) == "T"))
         self.assertEqual(self.freezer.thaw_all("test"), len(self.freezer.frozen) or 4)
         self.assertTrue(_wait(lambda: _state(self.heavy) != "T"))
+
+
+class TestCommandTest(unittest.TestCase):
+    def test_recognised_suites(self):
+        from ameesh.pressure_freeze import HEAVY_COMMAND, TEST_COMMAND
+        for line in ("node /x/node_modules/.bin/jest --runInBand", "npx vitest run",
+                     "python3 -m pytest tests", "python -m unittest tests.test_x",
+                     "npm test", "npm run test", "pnpm test -- -w 2", "yarn test:e2e",
+                     "go test ./...", "cargo test", "/usr/bin/pytest -x"):
+            with self.subTest(line=line):
+                self.assertTrue(TEST_COMMAND.search(line))
+        for line in ("node server.js", "npm run build", "vim jest.config.js",
+                     "python -m ameesh list", "git log --grep test"):
+            with self.subTest(line=line):
+                self.assertFalse(TEST_COMMAND.search(line))
+        for line in ("ameesh heavy -- npm test", "/home/u/.local/bin/ameesh heavy --nice 0 "
+                     "-- jest", "python3 -m ameesh heavy -- pytest"):
+            with self.subTest(line=line):
+                self.assertTrue(HEAVY_COMMAND.search(line))
+
+
+#: a fake harness whose tool is a "jest" suite, and one under `ameesh heavy`
+SUITES = r"""
+import subprocess, sys, time
+out = sys.argv[1]
+time.sleep(float(sys.argv[2]))
+seule = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "jest"])
+heavy = subprocess.Popen(["bash", "-c", "%s -c 'import subprocess, sys, time; "
+                          "subprocess.Popen([sys.executable, \"-c\", \"import time; "
+                          "time.sleep(120)\", \"jest\"]); time.sleep(120)' ameesh heavy --"
+                          % sys.executable])
+open(out, "w").write("%d %d" % (seule.pid, heavy.pid))
+time.sleep(120)
+"""
+
+
+@unittest.skipUnless(os.path.isdir("/proc"), "Linux /proc")
+class TestCapTest(unittest.TestCase):
+    def test_a_suite_outside_heavy_is_stopped_past_the_cap(self):
+        from ameesh import pressure_freeze
+        out = os.path.join(tempfile.mkdtemp(prefix="ameesh-453-cap-"), "pids")
+        harness = subprocess.Popen([sys.executable, "-c", SUITES, out, "0.6"],
+                                   start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(harness.pid, 9), harness.wait()))
+        self.assertTrue(_wait(lambda: os.path.exists(out) and open(out).read()))
+        with open(out) as fh:
+            seule, sous_heavy = map(int, fh.read().split())
+        sent, notes = [], []
+        worker = SimpleNamespace(proc=SimpleNamespace(pid=harness.pid), agent={},
+                                 _held_by_pressure=lambda v: False,
+                                 _fil_note=lambda text, meta=None: notes.append(text))
+        runner = SimpleNamespace(workers={"a1": worker}, host="h1", db=None,
+                                 cfg=SimpleNamespace(), background=SimpleNamespace(entries=[]),
+                                 host_pressure=lambda: {})
+        freezer = pressure_freeze.Freezer(runner, log=lambda *_: None)
+        time.sleep(1.2)
+        with mock.patch.dict(os.environ, {"AMEESH_HEAVY_MAX_S": "1"}), \
+                mock.patch.object(pressure_freeze, "HARNESS_STARTUP_S", 0.3), \
+                mock.patch("ameesh.mail.send", side_effect=lambda *a, **k: sent.append(a)):
+            freezer.tick()
+            self.assertTrue(_wait(lambda: _state(seule) in (None, "Z")))
+        self.assertTrue(_state(sous_heavy) not in (None, "Z"), "ameesh heavy has its own cap")
+        self.assertEqual(sent[0][1:3], ("ameesh", "a1"))
+        self.assertIn("Test suite stopped after", sent[0][3])
+        self.assertIn("ameesh heavy", notes[-1])

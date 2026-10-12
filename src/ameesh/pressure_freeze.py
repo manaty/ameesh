@@ -32,6 +32,7 @@ is signalled only if its start time is still the one seen when it was frozen
 from __future__ import annotations
 
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass
@@ -48,6 +49,20 @@ SHELLS = ("bash", "sh", "dash", "zsh", "ksh", "mksh", "fish")
 #: the harness (MCP servers start with it); later, it is a tool (`bash -c`
 #: execs a single command: a tool is not always a shell)
 HARNESS_STARTUP_S = 10.0
+
+
+#: #453 (2): a test suite launched by a turn outside `ameesh heavy`, recognised
+#: by its command line; capped like a heavy command (`heavy.max_duration`)
+TEST_COMMAND = re.compile(
+    r"(^|[/\s])(jest|vitest|mocha|pytest|py\.test|tox|nox)(\s|$)"
+    r"|\s-m\s+(unittest|pytest)(\s|$)"
+    r"|(^|[/\s])(npm|pnpm|yarn|bun)(\s+run)?\s+test(\s|:|$)"
+    r"|(^|[/\s])(go|cargo)\s+test(\s|$)")
+#: `ameesh heavy` in a command line: its command has its own cap
+HEAVY_COMMAND = re.compile(r"(^|[/\s])(ameesh|agent-mesh)(\.py)?\s+heavy(\s|$)"
+                           r"|\s-m\s+ameesh\s+heavy(\s|$)")
+#: the test-suite cap is checked at most this often (seconds)
+CAP_EVERY_S = 30.0
 
 
 @dataclass
@@ -130,6 +145,9 @@ class Freezer:
         self.kill = kill
         self.clock = clock
         self.frozen: dict[int, Frozen] = {}
+        #: #453 (2): suites stopped by the cap, `{pid: (start, SIGTERM at)}`
+        self.capped: dict[int, tuple] = {}
+        self._cap_at = float("-inf")
 
     # -- what the pressure pauses -------------------------------------------
     def _paused(self, worker, verdict: dict) -> bool:
@@ -171,12 +189,21 @@ class Freezer:
         try:
             verdict = self.runner.host_pressure()
         except Exception:
-            return
-        if not verdict.get("critical") and not self.frozen:
+            verdict = {}
+        cap_due = bool(self.capped) or now - self._cap_at >= CAP_EVERY_S
+        if not verdict.get("critical") and not self.frozen and not cap_due:
             return
         try:
             table = platform.process_table()
         except Exception:
+            return
+        if cap_due:
+            self._cap_at = now
+            try:
+                self.cap_tests(table, now)
+            except Exception as exc:
+                self.log("test suite cap failed (%s)" % exc)
+        if not verdict.get("critical") and not self.frozen:
             return
         starts = {p["pid"]: p.get("start") for p in table if not p["zombie"]}
         try:
@@ -228,6 +255,82 @@ class Freezer:
                     "the host has room, through ameesh heavy for a suite."
                     % (self._host(), int(maximum // 60), len(whats), _list(whats)))
             self._trace(agent, text, action="arret", mail=True)
+
+    # -- #453 (2): test suites outside `ameesh heavy` --------------------------
+    def tools_by_agent(self, table: list[dict]) -> dict[int, tuple[str, str]]:
+        """`{pid: (agent, what)}`: the tool processes of every turn in
+        progress and of the background work in grace, paused or not."""
+        out: dict[int, tuple[str, str]] = {}
+        for name, worker in dict(getattr(self.runner, "workers", {}) or {}).items():
+            proc = getattr(worker, "proc", None)
+            if proc is not None:
+                for pid in turn_tools(table, proc.pid):
+                    out[pid] = (name, "turn in progress")
+        tracker = getattr(self.runner, "background", None)
+        for entry in list(getattr(tracker, "entries", ()) or ()):
+            if entry.state == "running" and entry.pgid:
+                for pid in group_tools(table, entry.pgid, entry.lineage):
+                    out.setdefault(pid, (entry.agent, "background work"))
+        return out
+
+    def cap_tests(self, table: list[dict], now: float) -> list[int]:
+        """A test suite a turn launched outside `ameesh heavy` that runs for
+        longer than the heavy cap (`heavy.max_duration`) is stopped: SIGTERM
+        to it and its descendants, SIGKILL after `TERM_GRACE_S`, a message to
+        the agent. Only the top of a suite counts; never inside `ameesh
+        heavy`, which has its own cap. Returns the pids stopped."""
+        from . import heavy
+
+        for pid, (start, term_at) in list(self.capped.items()):
+            if now - term_at >= TERM_GRACE_S:
+                for victim in _descendants([p for p in table if not p["zombie"]], {pid}):
+                    self._signal(victim, None if victim != pid else start, signal.SIGKILL)
+                del self.capped[pid]
+        cap = heavy.max_duration(getattr(self.runner, "cfg", None))
+        if cap <= 0:
+            return []
+        by_pid = {p["pid"]: p for p in table if not p["zombie"]}
+        tools = self.tools_by_agent(table)
+        lines: dict[int, str] = {}
+
+        def line(pid: int) -> str:
+            if pid not in lines:
+                try:
+                    lines[pid] = " ".join((platform.command_line(pid) or "").split())
+                except Exception:
+                    lines[pid] = ""
+            return lines[pid]
+
+        def under_heavy_or_suite(pid: int) -> bool:
+            seen, parent = set(), by_pid.get(pid, {}).get("ppid")
+            while parent in tools and parent not in seen:
+                seen.add(parent)
+                if HEAVY_COMMAND.search(line(parent)) or TEST_COMMAND.search(line(parent)):
+                    return True
+                parent = by_pid.get(parent, {}).get("ppid")
+            return False
+
+        stopped: list[int] = []
+        for pid, (agent, what) in tools.items():
+            p = by_pid.get(pid)
+            if p is None or p.get("start") is None or pid in self.capped:
+                continue
+            if now - float(p["start"]) < cap or not TEST_COMMAND.search(line(pid)):
+                continue
+            if HEAVY_COMMAND.search(line(pid)) or under_heavy_or_suite(pid):
+                continue
+            if pid in self.frozen:
+                del self.frozen[pid]
+            for victim in _descendants(list(by_pid.values()), {pid}):
+                self._signal(victim, by_pid[victim].get("start"), signal.SIGTERM)
+                self._signal(victim, by_pid[victim].get("start"), signal.SIGCONT)
+            self.capped[pid] = (p.get("start"), now)
+            stopped.append(pid)
+            self._trace(agent, "Test suite stopped after %d min, the duration cap of a heavy "
+                        "command (heavy_max_seconds): %s. Run it through ameesh heavy (a "
+                        "slot of the host, its own cap: --max-duration), or narrow it."
+                        % (int(cap // 60), _describe(pid, what)), action="plafond", mail=True)
+        return stopped
 
     def thaw_all(self, reason: str) -> int:
         """Resumes everything frozen (runner stopping): never left stopped."""
