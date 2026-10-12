@@ -2655,12 +2655,16 @@ class AgentWorker(threading.Thread):
         The separate L232b controller prepares hosts and drains at a lot
         boundary. Only a persisted claim fence stops this source worker.
         """
-        if not getattr(self.runner, "relocate", False) or getattr(self.runner, "mediated", False):
+        if getattr(self.runner, "mediated", False):
             # Device relocation is controlled by the mesh server (L109).
             return False
-        from . import handoffs, storage, work
+        from . import handoffs, host_lifecycle, storage, work
         try:
-            active = storage.of(self.db).handoffs.active(self.name)
+            api = storage.of(self.db)
+            demand = api.host_lifecycle.demand(self.name, self.agent["host"])
+            if not getattr(self.runner, "relocate", False) and demand is None:
+                return False
+            active = api.handoffs.active(self.name)
             if active:
                 if active["fenced"]:
                     self.stopping.set()
@@ -2668,9 +2672,20 @@ class AgentWorker(threading.Thread):
                     return True
                 return False
             queued = bool(self.agent.get("pending_prompt") or work.open_lots(self.db, self.name))
+            missing = []
+            def ready(agent, target):
+                result = host_lifecycle.readiness(
+                    self.db, agent, target, adapter=getattr(self.runner, "_lifecycle_adapter", None),
+                    requirements_for=getattr(self.runner, "_lifecycle_requirements", None))
+                missing.extend(result["missing"])
+                return result
             candidate = handoffs.plan(self.db, self.agent,
-                                      limits_for=self.runner.handoff_limits_for, queued=queued)
+                                      limits_for=self.runner.handoff_limits_for, queued=queued,
+                                      demand=demand, readiness_for=ready if demand else None)
             if candidate is None:
+                if demand:
+                    api.host_lifecycle.progress(demand["host"], demand["generation"], self.name,
+                                                operation=None, missing=sorted(set(missing)) or ["fresh_admitted_capacity"])
                 return False
             remote = subprocess.run(["git", "-C", self.agent.get("cwd") or "", "remote", "get-url", "origin"],
                                     check=True, text=True, capture_output=True, timeout=10).stdout.strip()
@@ -5487,8 +5502,10 @@ class Runner:
         try:
             db = db_mod.connect(self.cfg)
             gate = self.host_gate
-            return resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
-                                         gate=gate.snapshot() if gate is not None else None)
+            reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
+                                            gate=gate.snapshot() if gate is not None else None)
+            Runner.host_lifecycle_once(self, db)
+            return reading
         except Exception as exc:  # jamais fatal pour l'exécuteur
             log_async("resources: reading failed (%s)" % type(exc).__name__)
             return None
@@ -5498,6 +5515,24 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def host_lifecycle_once(self, db) -> None:
+        """Drive durable requests with the enrolled helper, or record its named gap."""
+        from . import handoffs, host_lifecycle
+        try:
+            api = storage.of(db).host_lifecycle
+            api.detect_losses(actor=self.runner_id,
+                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+                              critical=host_lifecycle.critical_names(self.cfg, db))
+            api.expire_returns()
+            for control in api.listing():
+                if control["mode"] in ("draining", "returning", "lost"):
+                    host_lifecycle.advance_host(
+                        db, control["host"], limits_for=self.handoff_limits_for,
+                        adapter=getattr(self, "_lifecycle_adapter", None),
+                        requirements_for=getattr(self, "_lifecycle_requirements", None))
+        except (db_mod.DbError, handoffs.HandoffError, ValueError):
+            log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
     def start_resource_poll(self) -> None:
         """Relevé périodique des ressources (`AMEESH_RESOURCE_INTERVAL`,

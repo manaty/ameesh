@@ -309,7 +309,7 @@ docs outside `schema_migrations` rows.
 | --depend-de     | --depends-on                       | 4    | roadmap.py                | —                                                          |
 | --externe       | --external                         | 18   | mesh_cli.py (2)           | #194, #326, #412, #417, #420                               |
 | --fiche         | --card                             | 2    | roadmap.py                | —                                                          |
-| --organisation  | --organization                     | 2    | serve.py                  | —                                                          |
+| --organisation  | keep (British spelling, §5.4)      | 2    | serve.py                  | —                                                          |
 | --porteur       | --owner                            | 2    | roadmap.py                | —                                                          |
 | --pour          | --due                              | 14   | roadmap.py (2)            | —                                                          |
 | --projet        | --project                          | 4    | roadmap.py                | —                                                          |
@@ -369,7 +369,7 @@ collide with the module name or an English word, so a count would be meaningless
 | current                   | suggested              | comment                                                                                                                                    |
 |---------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | canon model field `fiche` | card                   | 6 dataclass fields in canon.py: Member, Agent, Host, Placement, WorkPackage, DecisionNote; the canon frontmatter itself has no `fiche` key |
-| `organisation`            | keep or `organization` | British spelling, also an OpenAPI field and --organisation; not French-only                                                                |
+| `organisation`            | keep (British spelling, §5.4) | British spelling, also an OpenAPI field and --organisation; not French-only                                                                |
 
 ### 2.7 Adjacent French identifiers: JSON/API keys and stored values
 
@@ -385,7 +385,7 @@ the most compatibility-sensitive part (the progress page and the v1 API read the
 | reprise                                                    | 5    | harness descriptor key (`reprise` argv) and runner thread meta                               |
 | debut                                                      | 5    | roadmap.py `real` object, plan_cli dest, tests                                               |
 | flux                                                       | 3    | scripts/test-parts.py result object, tests                                                   |
-| organisation                                               | 2    | serve.py /.well-known/ameesh and /api/v1/me                                                  |
+| organisation                                               | 2    | serve.py /.well-known/ameesh and /api/v1/me (kept, §5.4)                                     |
 | mesure                                                     | 2    | scripts/carte.py result object                                                               |
 | fil                                                        | 2    | fil.py thread trace meta                                                                     |
 | projet / liste / menage / jalons / fin / consigne / livree | 7    | scattered JSON keys and test fixtures                                                        |
@@ -505,7 +505,8 @@ stage 4.
 ### Stage 2 — CLI and free-file renames (3 PRs, no open-PR conflict)
 
 **2a — free CLI files.** `plan_cli.py` (`--debut/--fin/--livraison`), `roadmap.py`
-(`--pour`, `--projet`, `--porteur`, `--depend-de`, `--fiche`), `serve.py` (`--organisation`).
+(`--pour`, `--projet`, `--porteur`, `--depend-de`, `--fiche`). `serve.py` (`--organisation`) is
+out of this stage: decision §5.4 keeps the British spelling.
 Recipe: English option first, `dest=` stays the current attribute name during the transition,
 the French spelling gets its own hidden `DeprecatedAlias` argument (accepted, absent from
 `--help`, one line on stderr naming the canonical spelling):
@@ -527,8 +528,9 @@ names (names in §2.1/§2.2/§2.5). Also update `.github/workflows/carte.yml`, `
 Tests and CI call these scripts; do it in one PR so the workflow never sees a half-renamed tool.
 
 **2c — free-file function renames.** `identity.py` (`chantier_of` → `workstream_of`),
-`chat.py` (`consigne` → `instruction`), `plan_github.py` (`fiche_link` → `card_link`),
-`progress.py` (2 names), `roadmap_dev.py` (5 names), `storage/postgres/mailbox.py` (2 names).
+`chat.py` (`consigne` → `instruction`) and `watch.py` (same name), `plan_github.py`
+(`fiche_link` → `card_link`), `progress.py` (2 names), `roadmap_dev.py` (5 names).
+`storage/postgres/mailbox.py` (2 names) was already done in stage 1a (§1a, free files).
 Add aliases where the name is exported (`old = new`) and delete them in the cleanup PR.
 
 ### Stage 3 — database: `chantier` → `workstream` (2 migrations + 2 PRs)

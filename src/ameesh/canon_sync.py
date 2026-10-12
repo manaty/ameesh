@@ -350,12 +350,15 @@ def assess(canon: Canon, host: str,
     return CANON_OK, ""
 
 
-def known_projects(db: Db) -> set[str]:
+def known_projects(db: Db, cfg=None) -> set[str]:
     """L243 (#435) : les projets connus hors du canon — `github.projects` de
-    l'hôte et les projets des lots (`agent-project-unknown`)."""
+    l'hôte et les projets des lots (`agent-project-unknown`).
+
+    #495: a given `cfg` wins over `db.cfg`; with neither, no declared project."""
     from . import plan_github
     try:
-        declared = set(plan_github.settings_of(db.cfg).projects)
+        declared = set(plan_github.settings_of(
+            cfg if cfg is not None else getattr(db, "cfg", None)).projects)
     except plan_github.SettingsError:
         declared = set()
     return declared | set(storage.of(db).canon.lot_projects())

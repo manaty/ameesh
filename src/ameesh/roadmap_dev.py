@@ -17,7 +17,7 @@ from . import work as work_mod
 
 #: LA table. Clés génériques → valeurs du cycle actuel.
 CORRESPONDANCES = {
-    # jalons réels d'une tâche : clé générique → clé de `progress._jalons_de_lot`
+    # jalons réels d'une tâche : clé générique → clé de `progress._work_item_milestones`
     "jalons": {
         "demandee": "requested",
         "soumise": "frozen",
@@ -43,20 +43,20 @@ CORRESPONDANCES = {
 }
 
 
-def jalon(generic: str) -> str:
-    """La clé de `progress._jalons_de_lot` d'un jalon générique."""
+def milestone(generic: str) -> str:
+    """La clé de `progress._work_item_milestones` d'un jalon générique."""
     return CORRESPONDANCES["jalons"][generic]
 
 
-def livree(state: str | None) -> bool:
+def delivered(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_livres"]
 
 
-def abandonnee(state: str | None) -> bool:
+def abandoned(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_abandonnes"]
 
 
-def en_cours(state: str | None) -> bool:
+def in_progress(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_en_cours"]
 
 
@@ -64,6 +64,14 @@ def attend_decision(state: str | None) -> bool:
     return (state or "") in CORRESPONDANCES["etats_decision"]
 
 
-def etat_generique(shown_state: str | None) -> str:
+def generic_state(shown_state: str | None) -> str:
     """L'état générique d'une tâche depuis l'état affiché par `progress`."""
     return CORRESPONDANCES["etats_affiches"].get(shown_state or "", "en_cours")
+
+
+#: L148 (stage 2c): old spellings kept for the callers not yet renamed.
+jalon = milestone
+livree = delivered
+abandonnee = abandoned
+en_cours = in_progress
+etat_generique = generic_state

@@ -33,7 +33,7 @@ from ameesh.mediated_executor.stub import StaticAuth
 from ameesh.mediated_executor.stream import EventHub
 from ameesh.mediated_executor.interfaces import AuthError, Principal
 from ameesh.mediated_executor.dispatcher import ConnectionPool, PgDispatcher
-from ameesh.mediated_executor.server import ExecApp, ExecHTTPServer
+from ameesh.mediated_executor.server import ExecApp, ExecHTTPServer, RateLimiter
 
 from tests.support import PgTestCase
 
@@ -478,6 +478,10 @@ class PorteeTest(ServeurExecTest):
         reçus, canon…) : 404 sur les deux routes, rien d'exécuté."""
         names = [d + "." + m for d, ms in self.contract.refused.items() for m in ms]
         self.assertGreater(len(names), 150)
+        # This exhaustive scope probe exceeds the production burst budget
+        # as the interface grows. Its result must not depend on machine speed.
+        self.app.limiter = RateLimiter(2 * len(names))
+        self.app.ip_limiter = RateLimiter(2 * len(names))
         for name in names:
             for token, route in ((TOKEN, "/op"), (SESSION, "/session/op")):
                 resp = self.request("POST", route, {"schema": C.SCHEMA_OP, "op": name,
