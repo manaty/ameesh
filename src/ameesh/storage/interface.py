@@ -100,7 +100,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
-   turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
+   turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
                    set_worktree_status
@@ -2101,6 +2101,21 @@ class TurnResources(Domain):
         """Marque `orphan` une ressource qui survit à son tour."""
 
     @abc.abstractmethod
+    def settle(self, turn_id: str) -> None:
+        """L147 : solde (`done`) la ligne d'un tour dont plus rien ne survit
+        (groupe disparu au redémarrage de l'hôte, aucun conteneur en cours)."""
+
+    @abc.abstractmethod
+    def settle_many(self, turn_ids: Sequence[str]) -> int:
+        """#220 r3 : `settle` de plusieurs lignes en une écriture ; le nombre
+        de lignes soldées."""
+
+    @abc.abstractmethod
+    def mark_orphan_many(self, turn_ids: Sequence[str]) -> int:
+        """#220 r3 : `mark_orphan` (sans conteneurs) de plusieurs lignes en une
+        écriture ; seules celles qui n'étaient pas encore `orphan` changent."""
+
+    @abc.abstractmethod
     def get(self, turn_id: str) -> dict | None:
         """La ligne d'un tour (L73 : un conteneur étiqueté par ce tour), ou None."""
 
@@ -2111,6 +2126,13 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def orphans(self, host: str | None = None, limit: int = 50) -> list[dict]:
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def orphans_started_before(self, host: str, before_ts: float, after_id: int = 0,
+                               limit: int = 500) -> list[dict]:
+        """L147 : les lignes `orphan` de l'hôte ouvertes avant `before_ts`
+        (epoch), d'`id` supérieur à `after_id`, par `id` croissant : une page
+        de `limit` lignes au plus (pagination par `id`)."""
 
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:

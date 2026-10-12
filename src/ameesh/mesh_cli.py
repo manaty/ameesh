@@ -330,6 +330,17 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                           if latest.get("battery_percent") is not None else "",
                           limits.get("min_battery_percent"),
                           limits.get("stop_battery_percent")))
+            if latest.get("btrfs_unallocated_bytes") is not None \
+                    or latest.get("btrfs_metadata_headroom_bytes") is not None:
+                # #246: btrfs allocation, which `disque` (statvfs) does not show
+                print("  btrfs      non alloué %s (seuil %s%s) ; marge des métadonnées %s "
+                      "(seuil %s%s)" % (
+                          _fmt_bytes(latest.get("btrfs_unallocated_bytes")),
+                          _fmt_bytes(limits.get("min_btrfs_unallocated")),
+                          tag("min_btrfs_unallocated"),
+                          _fmt_bytes(latest.get("btrfs_metadata_headroom_bytes")),
+                          _fmt_bytes(limits.get("min_btrfs_metadata_headroom")),
+                          tag("min_btrfs_metadata_headroom")))
 
             for line in _host_measure_lines(latest, limits.get("lend")):
                 print(line)

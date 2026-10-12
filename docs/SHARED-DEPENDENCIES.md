@@ -36,7 +36,11 @@ point worktrees to it.
   `npm ci --prefix <temporary entry>` run FROM the package's directory, so a
   version manager's shim picks there what it picked for the key: a checkout
   that pins node 22 gets a tree built by node 22 and its npm, not by the
-  machine default. A source
+  machine default. The fill checks it again, from the same directory and
+  environment, before and after `npm ci`: if node or npm no longer answers
+  what the key says (a pin changed within those 10 s), the entry is
+  discarded, nothing is linked or installed (`local-kept`, with the reason),
+  and the next command resolves again. A source
   change doesn't change the key. A lockfile, patch, node or npm change gives
   a new entry. The link target depends only on the key.
 * **One install mode**: a fill is always a full development install,

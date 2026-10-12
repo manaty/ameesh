@@ -153,7 +153,7 @@ class JournalParCanonTest(_Authentificateurs):
         git(self.b, "fetch", "-q", "origin")
         done = self.sync_b(bootstrap_ref="").authenticators
         self.assertEqual(done.status, canon_sync.AUTH_REFUSED)
-        self.assertIn("ne descend pas", done.reason)
+        self.assertIn("does not descend", done.reason)
         self.declare(self.a, alice=[self.alice, self.alice2])
         self.assertSynced(self.sync_a(bootstrap_ref=""))
         states = {s["canon"]: s["auth_status"] for s in canon_sync.states(self.db, HOST)}

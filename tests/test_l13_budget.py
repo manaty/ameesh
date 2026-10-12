@@ -349,7 +349,17 @@ class BudgetGateTest(PgTestCase):
         self.assertTrue(worker._compta_marque(0, "tour", ""))
         sans = {k: v for k, v in os.environ.items()
                 if not k.endswith("_BIN") and not k.endswith("_BIN_DIR")}
+        # The binary is really absent, whatever the host: empty PATH, no
+        # fallback locations, no configured path. Patching `shutil.which` is
+        # not enough: `_scan` reads PATH and the known locations itself, so on
+        # a host where the harness is installed (dsh in /opt/node/bin) the
+        # check failed for a reason unrelated to the accounting.
+        empty = os.path.join(self.tmp, "no-binary")
+        os.makedirs(empty, exist_ok=True)
+        sans["PATH"] = empty
+        sans[adapters.SEARCH_ENV] = ""
         with mock.patch.dict(os.environ, sans, clear=True), \
+                mock.patch.dict(adapters._HARNESS_BINS, {}, clear=True), \
                 mock.patch("ameesh.adapters.shutil.which", return_value=None):
             with self.assertRaises(adapters.HarnessMissing):
                 adapter_for("deepseek")  # le binaire est bien introuvable

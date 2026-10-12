@@ -185,8 +185,8 @@ class CanauxTest(_Http, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l38-")
         self.log = os.path.join(self.tmp, "desktop.log")
-        self.msg = notify.Message("ameesh : agent arrêté avec du courrier (ouvrier)",
-                                  "[stopped_with_mail] agent ouvrier\ndétail", urgent=True)
+        self.msg = notify.Message("ameesh: agent stopped with mail (ouvrier)",
+                                  "[stopped_with_mail] agent ouvrier\ndetail", urgent=True)
 
     def tearDown(self):
         import shutil
@@ -224,13 +224,17 @@ class CanauxTest(_Http, unittest.TestCase):
         self.assertEqual(req["path"], "/ameesh-test")
         self.assertEqual(req["headers"]["Authorization"], "Bearer tk_secret")
         self.assertEqual(req["headers"]["Priority"], "high")
-        self.assertTrue(req["headers"]["Title"].startswith("=?UTF-8?B?"))
+        self.assertEqual(req["headers"]["Title"], self.msg.title)  # ASCII: as is
         self.assertEqual(req["body"], self.msg.body)
+        # a non-ASCII title (a lot or agent name) goes out RFC 2047 encoded
+        notify.Sender(env={"TEST_NTFY_TOKEN": "tk_secret"}).send(
+            canal, notify.Message("ameesh: lot « déploiement »", "corps"))
+        self.assertTrue(server.requests[1]["headers"]["Title"].startswith("=?UTF-8?B?"))
         # jeton nommé mais absent : échec permanent, rien n'est posté
         with self.assertRaises(notify.ChannelError) as ctx:
             notify.Sender(env={}).send(canal, self.msg)
         self.assertTrue(ctx.exception.permanent)
-        self.assertEqual(len(server.requests), 1)
+        self.assertEqual(len(server.requests), 2)
         # fichier 0600 accepté, 0644 refusé
         jeton = os.path.join(self.tmp, "ntfy.token")
         with open(jeton, "w", encoding="utf-8") as fh:

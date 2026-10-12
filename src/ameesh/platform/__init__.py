@@ -11,7 +11,8 @@ le reste du code. Un sous-module par sujet :
   chemin d'un descripteur, table des processus (groupes), sous-moissonneur et
   moisson d'un enfant, environnement initial d'un processus (L124) ;
 * `terminal` : le terminal de l'humain ;
-* `host` : mémoire, swap, charge, alimentation, système de fichiers.
+* `host` : mémoire, swap, charge, alimentation, système de fichiers,
+  allocation btrfs (#246).
 
 Appuyé sur psutil (roues binaires Linux, macOS, Windows) ; sous Linux, un
 repli par `/proc` reste en place si psutil est absent.
@@ -83,8 +84,8 @@ from .process import (alive, ancestry, become_subreaper, boot_time,  # noqa: E40
                       command_line, environ, fd_path, holders, open_fd_count, process_table,
                       reap, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402
-from .host import (CGROUP_ROOT, cgroup_cpu_seconds, cgroup_memory_bytes,  # noqa: E402
-                   cpu_busy_seconds, load_average, memory, mount_of, parse_pressure,
+from .host import (CGROUP_ROOT, btrfs_allocation, cgroup_cpu_seconds,  # noqa: E402
+                   cgroup_memory_bytes, cpu_busy_seconds, load_average, memory, mount_of, parse_pressure,
                    power, pressure)
 
 __all__ = [
@@ -94,4 +95,5 @@ __all__ = [
     "ticks_to_epoch", "human_tty", "load_average", "memory", "mount_of", "power",
     "CGROUP_ROOT", "cgroup_cpu_seconds", "cgroup_memory_bytes", "cpu_busy_seconds",
     "parse_pressure", "pressure", "user_paths", "UserPaths",
+    "btrfs_allocation",
 ]

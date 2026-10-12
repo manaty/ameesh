@@ -96,7 +96,7 @@ class ProbeTest(PgTestCase):
     def test_schema_absent(self):
         proc = self.probe("t_probe_absent_%s" % uuid.uuid4().hex[:6])
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("schéma absent", proc.stdout)
+        self.assertIn("schema missing", proc.stdout)
 
     def test_schema_absent_n_est_pas_cree(self):
         schema = "t_probe_rien_%s" % uuid.uuid4().hex[:6]
@@ -110,7 +110,7 @@ class ProbeTest(PgTestCase):
                        AMEESH_CONNECT_TIMEOUT="1")
         proc = self.mesh("doctor", "--probe", env=env)
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("base injoignable", proc.stdout)
+        self.assertIn("database unreachable", proc.stdout)
 
     def test_migration_manquante(self):
         schema = self.scratch_schema()
@@ -119,7 +119,7 @@ class ProbeTest(PgTestCase):
             "DELETE FROM schema_migrations WHERE version = %s", (derniere.version,))
         proc = self.probe(schema)
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("manquantes %s" % derniere.label, proc.stdout)
+        self.assertIn("missing %s" % derniere.label, proc.stdout)
         # la sonde n'a rien réappliqué
         self.assertIn(derniere.version, [m.version for m in migrations.check(self.scratch_db)[0]])
 
@@ -131,7 +131,7 @@ class ProbeTest(PgTestCase):
             (premiere.version,))
         proc = self.probe(schema)
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("modifiées %s" % premiere.label, proc.stdout)
+        self.assertIn("modified %s" % premiere.label, proc.stdout)
 
     def test_base_plus_recente_reste_ok(self):
         schema = self.scratch_schema()
@@ -140,7 +140,7 @@ class ProbeTest(PgTestCase):
             "VALUES (9999, 'future', 'x')")
         proc = self.probe(schema)
         self.assertEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("plus récente", proc.stdout)
+        self.assertIn("newer than this code", proc.stdout)
         self.assertIn("9999", proc.stdout)
 
 
