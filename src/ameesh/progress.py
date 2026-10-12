@@ -1,44 +1,43 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Vue temps réel de l'avancement (lot L24, décision 0024).
+"""Real-time progress view (lot L24, decision 0024).
 
   ameesh progress [--json] [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
-  ameesh progress --html FICHIER [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
+  ameesh progress --html FILE [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
 
-L'état courant et la frise du projet, **alimentés par ce qu'ameesh enregistre
-lui-même** (transitions des lots `work_items`, actions sous porte, tours et
-baux du registre, marqueur comptable, grand livre `turn_costs`) — jamais par
-git ni par le board :
+The project's current state and timeline, **fed by what ameesh records
+itself** (lot transitions in `work_items`, gated actions, registry turns and
+leases, accounting marker, `turn_costs` ledger) — never by git or the board:
 
-* **projets** (L62, en tête) : la vue de `ameesh projects` — par projet,
-  ses agents, leur état, leur lot en cours, non-lus, dépense 24 h, forfait ou
-  token, et ses lots ouverts sans agent ;
-* **lots** : jalons datés demande → gel → verdict → fusion quand ils sont
-  connus, état (actif, en revue, bloqué, approuvé, fusionné, fermé),
-  blocages ; et (L29) ce que le lot attend et de qui (`waiting_for`), s'il
-  stagne (`stale` : aucune activité depuis `--stale-after`, défaut 6 h),
-  sa fiche du plan et son epic ;
-* **epics** (L29) : les lots regroupés par epic du plan, avec la
-  progression (lots fusionnés / total) ;
-* **agents** : harnais, modèle, effort, état (travaille, repos, pause, arrêt),
-  durée et tâche du tour en cours ;
-* **jalons du projet** : les fiches `WorkPackage` de sorte `milestone` du
-  canon (L29), avec leur progression ; aucun n'est inventé ;
-* **budget** : dépense payée au token et valeur consommée sur les forfaits,
-  jamais additionnées (L95) ; dépense réelle tirée des soldes face à
-  l'estimation ; tokens d'entrée, de cache relu et de sortie ; tours en
-  échec à part ; toutes les fenêtres de tous les comptes déclarés.
-* **feuille de route** (L96, clé `roadmap`, schéma `ameesh-roadmap/1`) : le
-  Gantt des epics, tâches, jalons et engagements, prévu face au réel, ligne
-  du jour, retards et source de chaque élément ; affiché par défaut,
-  `--no-gantt` le retire.
+* **projects** (L62, first): the `ameesh projects` view — per project, its
+  agents, their state, their current lot, unread mail, 24 h spend, plan or
+  token, and its open lots without an agent;
+* **lots**: dated milestones request → freeze → verdict → merge when known,
+  state (active, in review, blocked, approved, merged, closed), blocks; and
+  (L29) what the lot is waiting for and from whom (`waiting_for`), whether
+  it is stale (`stale`: no activity for `--stale-after`, default 6 h), its
+  plan entry and its epic;
+* **epics** (L29): lots grouped by plan epic, with progress (merged lots /
+  total);
+* **agents**: harness, model, effort, state (working, idle, paused,
+  stopped), duration and task of the current turn;
+* **project milestones**: the canon's `WorkPackage` entries of kind
+  `milestone` (L29), with their progress; none is invented;
+* **budget**: pay-per-token spend and value consumed on plans, never added
+  together (L95); real spend from balances versus the estimate; input,
+  cache-read and output tokens; failed turns shown separately; every window
+  of every declared account.
+* **roadmap** (L96, key `roadmap`, schema `ameesh-roadmap/1`): Gantt of
+  epics, tasks, milestones and commitments, planned versus actual, today
+  line, delays and source of each item; shown by default, `--no-gantt`
+  removes it.
 
-Le JSON suit le schéma versionné `ameesh-progress/1`
-(`docs/PROGRESS.md`). `--html` écrit une page statique autonome (aucune
-ressource réseau, aucun serveur) qui rend ce JSON en frise.
+The JSON follows the versioned schema `ameesh-progress/1`
+(`docs/PROGRESS.md`). `--html` writes a self-contained static page (no
+network resource, no server) that renders this JSON as a timeline.
 
-Ce module ne fait que lire : toutes les lectures de base passent par
-`storage.of(db).progress` ; les jauges de forfait viennent de
-`cost.CostBook` (journaux locaux des harnais, lecture seule).
+This module only reads: every database read goes through
+`storage.of(db).progress`; plan gauges come from `cost.CostBook` (local
+harness logs, read-only).
 """
 from __future__ import annotations
 
@@ -75,10 +74,10 @@ LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
 AGENT_STATES = ("working", "idle", "paused", "stopped")
 
-_FR_LOT = {"active": "actif", "review": "en revue", "blocked": "bloqué",
-           "approved": "approuvé", "merged": "fusionné", "closed": "fermé"}
-_FR_AGENT = {"working": "travaille", "idle": "repos", "paused": "pause",
-             "stopped": "arrêt"}
+_FR_LOT = {"active": "active", "review": "in review", "blocked": "blocked",
+           "approved": "approved", "merged": "merged", "closed": "closed"}
+_FR_AGENT = {"working": "working", "idle": "idle", "paused": "paused",
+             "stopped": "stopped"}
 
 #: connecteur de fusion (L5) : son approbation vaut verdict, sa confirmation fusion
 MERGE_CONNECTOR = "git-merge"
@@ -86,19 +85,19 @@ _WAITING = ("blocked", "waiting_human")
 
 #: ce que la vue ne sait pas encore lire (dit dans le JSON, jamais deviné)
 MISSING = (
-    "jalons du projet : fiches WorkPackage `milestone` du canon synchronisé "
-    "(`ameesh canon sync`) ; leur date vient de la fiche (`date`, `delivery`) ou "
-    "de `ameesh work plan <fiche>` ; sans date, `at_ts` est null",
-    "feuille de route (L96) : dates prévues posées par `ameesh work plan` ou au "
-    "canon, engagements de `ameesh plan add` ; une date dite en conversation et "
-    "jamais enregistrée n'y est pas",
-    "jalons de lot : lus dans la table des jalons de lot (L10) quand un gel ou "
-    "un verdict y est déclaré, sinon déduits du journal des transitions et des "
-    "actions de fusion",
-    "effort : réglage local de l'hôte de l'agent (`ameesh set`), absent de la "
-    "base ; null pour un agent d'un autre hôte ou sans réglage",
-    "jauges de forfait : lues dans les journaux locaux des harnais de cet hôte "
-    "(`ameesh cost`) ; leur historique en base se lit par `ameesh cost gauges`",
+    "project milestones: `milestone` WorkPackage entries of the synced canon "
+    "(`ameesh canon sync`); their date comes from the entry (`date`, `delivery`) or "
+    "from `ameesh work plan <entry>`; without a date, `at_ts` is null",
+    "roadmap (L96): planned dates set by `ameesh work plan` or in the canon, "
+    "commitments from `ameesh plan add`; a date only mentioned in conversation "
+    "and never recorded is not there",
+    "lot milestones: read from the lot milestone table (L10) when a freeze or "
+    "a verdict is declared there, otherwise inferred from the transition log and "
+    "merge actions",
+    "effort: local setting on the agent's host (`ameesh set`), not in the "
+    "database; null for an agent on another host or without a setting",
+    "plan gauges: read from the local harness logs of this host "
+    "(`ameesh cost`); their history in the database is read with `ameesh cost gauges`",
 )
 
 
@@ -125,7 +124,7 @@ def parse_since(text: str | None, now: float) -> float:
     try:
         moment = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
-        raise ProgressError("--since illisible : %r (durée 16h, 2d… ou date ISO)" % text)
+        raise ProgressError("unreadable --since: %r (duration 16h, 2d... or ISO date)" % text)
     if moment.tzinfo is None:
         return time.mktime(moment.timetuple()) + moment.microsecond / 1e6
     return moment.timestamp()
@@ -683,7 +682,7 @@ def _duration(seconds) -> str:
     if seconds < 86400:
         minutes = (seconds % 3600) // 60
         return ("%d h %02d" % (seconds // 3600, minutes)) if minutes else "%d h" % (seconds // 3600)
-    return "%d j %d h" % (seconds // 86400, (seconds % 86400) // 3600)
+    return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
 def format_text(snap: dict, width: int | None = None) -> str:
@@ -699,15 +698,15 @@ def format_text(snap: dict, width: int | None = None) -> str:
                                  subsequent_indent=indent + "  ") or [indent])
 
     hours = (snap["window"]["to_ts"] - snap["window"]["from_ts"]) / 3600.0
-    line("avancement%s — %s (fenêtre %s)" % (
-        " de %s" % snap["project"] if snap.get("project") else "",
+    line("progress%s — %s (window %s)" % (
+        " of %s" % snap["project"] if snap.get("project") else "",
         _hm(now, now), _duration(hours * 3600)))
 
     if "projects" in snap:
         # L62 : qui travaille sur quoi, avant le détail des lots
         from . import projects as projects_mod
         out.append("")
-        line("PROJETS (%d en cours)" % sum(1 for p in snap["projects"] if p["active"]))
+        line("PROJECTS (%d active)" % sum(1 for p in snap["projects"] if p["active"]))
         out.extend(projects_mod.format_lines(
             {"generated_ts": now, "projects": snap["projects"]}, width,
             show_inactive=bool(snap.get("project")), indent="  "))
@@ -723,43 +722,43 @@ def format_text(snap: dict, width: int | None = None) -> str:
     for key, label in (("lots", "lots"), ("actions", "actions")):
         cut = (snap.get("truncated") or {}).get(key)
         if cut:
-            line("TRONQUÉ : %d %s affichés sur %d (borne %d)" % (
-                cut["shown"], label, cut["total"], cut["limit"]), "  ")
+            line("TRUNCATED: %d of %d %s shown (limit %d)" % (
+                cut["shown"], cut["total"], label, cut["limit"]), "  ")
     if not snap["lots"]:
-        line("aucun lot dans la fenêtre", "  ")
+        line("no lot in the window", "  ")
     for lot in snap["lots"]:
         m = lot["milestones"]
         state = _FR_LOT.get(lot["state"], lot["state"])
         stale = lot.get("stale")
         if stale:
             # un lot sans activité n'est pas dessiné comme actif
-            state = "STAGNANT %s (%s)" % (_duration(stale["idle_s"]), state)
+            state = "STALE %s (%s)" % (_duration(stale["idle_s"]), state)
         closed = lot.get("closed")
         if closed:
-            state = ("abandonné" if closed.get("reason") == "abandoned"
-                     else "remplacé par #%s" % closed.get("superseded_by"))
+            state = ("abandoned" if closed.get("reason") == "abandoned"
+                     else "superseded by #%s" % closed.get("superseded_by"))
         line("#%s %s — %s%s" % (lot["id"], state, lot["title"],
                                 " [%s]" % lot["epic"] if lot.get("epic") else ""), "  ")
-        line("demande %s · gel %s · verdict %s%s · fusion %s" % (
+        line("requested %s · frozen %s · verdict %s%s · merged %s" % (
             _hm(m["requested"], now), _hm(m["frozen"], now), _hm(m["verdict"], now),
             " (%s)" % lot["verdict"] if lot["verdict"] else "", _hm(m["merged"], now)),
             "    ")
         extra = []
         if lot["assignee"]:
-            extra.append("auteur %s" % lot["assignee"])
+            extra.append("author %s" % lot["assignee"])
         if lot["reviewer"]:
-            extra.append("revue %s" % lot["reviewer"])
+            extra.append("reviewer %s" % lot["reviewer"])
         if lot["blocked_verdicts"] or lot["blocks"]:
-            extra.append("blocages %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
+            extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
         if extra:
             line(" · ".join(extra), "    ")
         if lot.get("waiting_for"):
-            line("attend : %s" % lot["waiting_for"]["label"], "    ")
+            line("waiting for: %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):
             line(lot["delegation"]["label"], "    ")
         est = lot.get("estimate")
         if est and (est.get("minutes") or est.get("actual_minutes") is not None):
-            line("durée : %s" % est["label"], "    ")
+            line("duration: %s" % est["label"], "    ")
 
     epics = snap.get("epics") or []
     if epics:
@@ -767,93 +766,92 @@ def format_text(snap: dict, width: int | None = None) -> str:
         line("EPICS (%d)" % len(epics))
         for epic in epics:
             counted = epic["lots_total"] - epic["lots_abandoned"]
-            line("%s — %s : %d/%d lots fusionnés%s" % (
+            line("%s — %s: %d/%d lots merged%s" % (
                 epic["id"], epic["title"], epic["lots_merged"], counted,
-                " (%d abandonné(s))" % epic["lots_abandoned"] if epic["lots_abandoned"] else ""),
+                " (%d abandoned)" % epic["lots_abandoned"] if epic["lots_abandoned"] else ""),
                 "  ")
 
     out.append("")
     line("AGENTS (%d)" % len(snap["agents"]))
     if not snap["agents"]:
-        line("aucun agent", "  ")
+        line("no agent", "  ")
     for agent in snap["agents"]:
         since = agent["since_ts"]
         line("%s — %s%s" % (agent["name"], _FR_AGENT.get(agent["state"], agent["state"]),
-                            " depuis %s" % _duration(now - since) if since else ""), "  ")
-        line("%s · %s · effort %s" % (agent["harness"] or "?", agent["model"] or "défaut",
-                                      agent["effort"] or "défaut"), "    ")
+                            " for %s" % _duration(now - since) if since else ""), "  ")
+        line("%s · %s · effort %s" % (agent["harness"] or "?", agent["model"] or "default",
+                                      agent["effort"] or "default"), "    ")
         turn = agent.get("turn")
         if turn:
-            line("tour : %s" % (turn["task"] or turn["label"] or "en cours"), "    ")
+            line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
-            line("raison : %s" % agent["status_text"], "    ")
+            line("reason: %s" % agent["status_text"], "    ")
 
     out.append("")
     if snap["milestones"]:
-        line("JALONS (%d)" % len(snap["milestones"]))
+        line("MILESTONES (%d)" % len(snap["milestones"]))
         for ms in snap["milestones"]:
-            progress = ("%d/%d lots fusionnés" % (
+            progress = ("%d/%d lots merged" % (
                 ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0))
                 if "lots_total" in ms else "")
-            line("%s %s%s" % (ms["date"] if ms.get("date") else "sans date",
+            line("%s %s%s" % (ms["date"] if ms.get("date") else "no date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")
     else:
-        line("JALONS : aucun déclaré au canon")
+        line("MILESTONES: none declared in the canon")
 
     out.append("")
     budget = snap["budget"]
     sp = budget["spend"]
     line("BUDGET (USD)")
-    line("dépensé (payé au token, estimé) : 1 h %.2f · 24 h %.2f · fenêtre %.2f "
-         "(plafond %.2f/h)" % (
+    line("spent (pay-per-token, estimated): 1 h %.2f · 24 h %.2f · window %.2f "
+         "(cap %.2f/h)" % (
         sp["1h"]["paid_usd"], sp["24h"]["paid_usd"], sp["window"]["paid_usd"],
         budget["hourly_cap_usd"]), "  ")
     lim = budget.get("limits")
     if lim:
         # L70 : plafonds en vigueur et leur source (`ameesh budget`)
-        line("plafonds : %s/h (%s) · %s/jour (%s)%s" % (
-            "%.2f" % lim["per_hour_usd"] if lim.get("per_hour_usd") else "aucun",
+        line("caps: %s/h (%s) · %s/day (%s)%s" % (
+            "%.2f" % lim["per_hour_usd"] if lim.get("per_hour_usd") else "none",
             lim["per_hour_source"],
-            "%.2f" % lim["per_day_usd"] if lim.get("per_day_usd") else "aucun",
+            "%.2f" % lim["per_day_usd"] if lim.get("per_day_usd") else "none",
             lim["per_day_source"],
-            " · %d agent(s) à plafond propre" % len(lim["agents"]) if lim["agents"] else ""),
+            " · %d agent(s) with their own cap" % len(lim["agents"]) if lim["agents"] else ""),
             "  ")
     # L95 : la valeur des forfaits n'est pas une dépense, jamais additionnée
-    line("valeur consommée sur les forfaits (équivalent au barème, non payée au "
-         "tour) : 1 h %.2f · 24 h %.2f · fenêtre %.2f" % (
+    line("value consumed on plans (list-price equivalent, not paid per "
+         "turn): 1 h %.2f · 24 h %.2f · window %.2f" % (
              sp["1h"].get("plan_value_usd", 0.0), sp["24h"].get("plan_value_usd", 0.0),
              sp["window"].get("plan_value_usd", 0.0)), "  ")
     from . import balance as balance_mod
     for entry in budget.get("real") or []:
         line(balance_mod.describe(entry), "  ")
     for row in budget.get("by_agent") or []:
-        line("%s (%s%s) : %d tour(s)%s · entrée %s · cache relu %s · sortie %s · %.2f $" % (
-            row["agent"], row["harness"] or "?", ", payé" if row["paid"] else "",
-            row["turns"], " + %d en échec" % row["failed_turns"] if row.get("failed_turns")
+        line("%s (%s%s): %d turn(s)%s · input %s · cache read %s · output %s · $%.2f" % (
+            row["agent"], row["harness"] or "?", ", paid" if row["paid"] else "",
+            row["turns"], " + %d failed" % row["failed_turns"] if row.get("failed_turns")
             else "", _tokens(row.get("fresh_input_tokens", row["input_tokens"])),
             _tokens(row["cached_input_tokens"]), _tokens(row["output_tokens"]),
             row["usd"]), "  ")
     covered = {a["harness"] for a in budget.get("accounts") or []}
     for acc in budget.get("accounts") or []:
-        line("compte %s/%s%s%s : %s" % (
-            acc["harness"], acc["account"], " (actif)" if acc["active"] else "",
-            " — prochain choix" if acc["next"] else "",
-            ", ".join(_gauge_text(g) for g in acc["gauges"]) or "aucune jauge lue"), "  ")
+        line("account %s/%s%s%s: %s" % (
+            acc["harness"], acc["account"], " (active)" if acc["active"] else "",
+            " — next choice" if acc["next"] else "",
+            ", ".join(_gauge_text(g) for g in acc["gauges"]) or "no gauge read"), "  ")
         if acc["reason"]:
             line("↳ %s" % acc["reason"], "    ")
         if acc["losses"]:
-            line("↳ perdu à la remise à zéro si rien ne change : %s" % ", ".join(
-                "%s %.0f\u00a0%% dans %s" % (l["key"], l["lost"] * 100, _duration(l["in_s"]))
+            line("↳ lost at reset if nothing changes: %s" % ", ".join(
+                "%s %.0f%% in %s" % (l["key"], l["lost"] * 100, _duration(l["in_s"]))
                 for l in acc["losses"]), "    ")
     for plan in budget["plans"]:
         if plan["harness"] in covered:
             continue                # déjà montré compte par compte
-        # espace insécable avant « % » : la coupure ne l'isole jamais
-        line("forfait %s %s : %.0f\u00a0%% (rythme %.0f\u00a0%%)%s" % (
+        line("plan %s %s: %.0f%% (pace %.0f%%)%s" % (
             plan["harness"], plan["key"], plan["used"] * 100, plan["pace_cap"] * 100,
-            " — DÉPASSÉ" if plan["exceeded"] else ""), "  ")
+            " — EXCEEDED" if plan["exceeded"] else ""), "  ")
     if not budget["plans"] and not budget.get("accounts"):
-        line("forfaits : aucune jauge lue sur cet hôte", "  ")
+        line("plans: no gauge read on this host", "  ")
     return "\n".join(out)
 
 
@@ -861,17 +859,16 @@ def _tokens(n) -> str:
     """Un nombre de jetons lisible : 1 234, 12,3 k, 4,56 M."""
     n = int(n or 0)
     if n >= 1_000_000:
-        return ("%.2f M" % (n / 1e6)).replace(".", ",")
+        return "%.2f M" % (n / 1e6)
     if n >= 10_000:
-        return ("%.1f k" % (n / 1e3)).replace(".", ",")
+        return "%.1f k" % (n / 1e3)
     return str(n)
 
 
 def _gauge_text(g: dict) -> str:
-    text = "%s %.0f\u00a0%% (rythme %.0f\u00a0%%)" % (g["key"], g["used"] * 100,
-                                                     g["pace_cap"] * 100)
+    text = "%s %.0f%% (pace %.0f%%)" % (g["key"], g["used"] * 100, g["pace_cap"] * 100)
     if g.get("reset_passed"):
-        text += " remise à zéro passée"
+        text += " reset passed"
     return text
 
 
@@ -897,7 +894,7 @@ def render_html(snap: dict) -> str:
             .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
     if _DATA_MARK not in page:
-        raise ProgressError("gabarit de page sans emplacement de données")
+        raise ProgressError("page template has no data placeholder")
     return page.replace(_DATA_MARK, data, 1)
 
 
@@ -913,7 +910,7 @@ def write_html(path: str, snap: dict) -> None:
             os.unlink(tmp)
         except OSError:
             pass
-        raise ProgressError("écriture impossible : %s (%s)" % (path, exc))
+        raise ProgressError("cannot write %s (%s)" % (path, exc))
 
 
 # --------------------------------------------------------------------------
@@ -924,17 +921,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ameesh progress", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--json", action="store_true", help="schéma ameesh-progress/1")
-    parser.add_argument("--html", metavar="FICHIER", default=None,
-                        help="écrit la page statique de la frise (autonome, hors réseau)")
-    parser.add_argument("--project", default=None, help="projet (app, workstream, équipe)")
+    parser.add_argument("--json", action="store_true", help="ameesh-progress/1 schema")
+    parser.add_argument("--html", metavar="FILE", default=None,
+                        help="write the static timeline page (self-contained, offline)")
+    parser.add_argument("--project", default=None, help="project (app, workstream, team)")
     parser.add_argument("--since", default=DEFAULT_SINCE,
-                        help="début de la fenêtre : durée (16h, 2d) ou date ISO (défaut 24h)")
+                        help="window start: duration (16h, 2d) or ISO date (default 24h)")
     parser.add_argument("--no-gantt", action="store_true",
-                        help="sans la feuille de route en Gantt (affichée par défaut, L96)")
+                        help="omit the Gantt roadmap (shown by default, L96)")
     parser.add_argument("--stale-after", default=None,
-                        help="lot stagnant sans activité depuis cette durée (défaut "
-                             "AMEESH_STALE_AFTER, sinon 6h)")
+                        help="a lot is stale after this long without activity (default "
+                             "AMEESH_STALE_AFTER, else 6h)")
     return parser
 
 
@@ -959,23 +956,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.html:
             write_html(args.html, snap)
             if not args.json:
-                print("page écrite : %s" % args.html)
+                print("page written: %s" % args.html)
         if args.json:
             print(json.dumps(snap, ensure_ascii=False, indent=2, sort_keys=True))
         elif not args.html:
             print(format_text(snap))
         return 0
     except ProgressError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 2
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

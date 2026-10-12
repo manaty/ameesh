@@ -26,13 +26,13 @@ from .harnesses import ERROR, Finding
 
 def _print_findings(findings: list[Finding]) -> None:
     for f in findings:
-        print("%s%-32s %s" % ("ERREUR " if f.severity == ERROR else "avert. ",
+        print("%s%-32s %s" % ("ERROR  " if f.severity == ERROR else "warn.  ",
                               f.code, f.message))
 
 
 def _summary(findings: list[Finding]) -> str:
     errors = len(harnesses.errors(findings))
-    return "%d erreur(s), %d avertissement(s)" % (errors, len(findings) - errors)
+    return "%d error(s), %d warning(s)" % (errors, len(findings) - errors)
 
 
 def cmd_list(cfg, args: argparse.Namespace) -> int:
@@ -52,7 +52,7 @@ def cmd_list(cfg, args: argparse.Namespace) -> int:
             print("%-14s %-10s %-20s %-8s %s" % (
                 d.id, d.protocol, d.stream or "-", d.source, d.path))
     for f in findings:
-        prefix = "descripteur ignoré : " if f.severity == ERROR else "avertissement : "
+        prefix = "descriptor ignored: " if f.severity == ERROR else "warning: "
         print("%s%s" % (prefix, f), file=sys.stderr)
     return 1 if harnesses.errors(findings) else 0
 
@@ -69,22 +69,22 @@ def _show_json(descriptor: harnesses.HarnessDescriptor) -> None:
 
 def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
     print("%s — %s" % (descriptor.id, descriptor.name))
-    print("version        : %s (schéma %s)" % (descriptor.version,
+    print("version        : %s (schema %s)" % (descriptor.version,
                                                descriptor.schema_version))
     print("source         : %s (%s)" % (descriptor.source, descriptor.path))
-    print("empreinte      : sha256 %s" % (descriptor.sha256 or "?"))
+    print("fingerprint    : sha256 %s" % (descriptor.sha256 or "?"))
     print("description    : %s" % descriptor.description)
     if descriptor.repository:
-        print("dépôt          : %s" % descriptor.repository)
+        print("repository     : %s" % descriptor.repository)
     if descriptor.license:
-        print("licence        : %s" % descriptor.license)
-    print("protocole      : %s" % descriptor.protocol)
-    print("binaire        : %s%s" % (
+        print("license        : %s" % descriptor.license)
+    print("protocol       : %s" % descriptor.protocol)
+    print("binary         : %s%s" % (
         descriptor.binary,
-        " (env : %s)" % ", ".join(descriptor.binary_env) if descriptor.binary_env else ""))
-    print("commande       : %s" % (" ".join(descriptor.command) or "—"))
+        " (env: %s)" % ", ".join(descriptor.binary_env) if descriptor.binary_env else ""))
+    print("command        : %s" % (" ".join(descriptor.command) or "—"))
     if descriptor.attach:
-        print("interactif     : %s" % (" ".join(descriptor.interactive) or "—"))
+        print("interactive    : %s" % (" ".join(descriptor.interactive) or "—"))
         rule = descriptor.interactive_permission
         if rule:
             print("permission     : %s (default %s%s%s)" % (
@@ -97,34 +97,34 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
                     " (%s: agent setting only)" % ", ".join(rule["explicit_only"])
                     if rule.get("explicit_only") else ""))
     else:
-        print("interactif     : non déclaré (attach indisponible)")
+        print("interactive    : not declared (attach unavailable)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))
-    print("flux           : %s" % descriptor.stream)
+    print("stream         : %s" % descriptor.stream)
     for key in ("model", "effort", "tier"):
         setting = descriptor.settings()[key]
         if setting.flag:
             print("%-14s : %s" % (key, " ".join(setting.flag)))
         if setting.file:
-            print("%-14s : fichier gabarit (drapeau %s)" % (key, " ".join(setting.flag)))
+            print("%-14s : template file (flag %s)" % (key, " ".join(setting.flag)))
         if setting.default:
-            print("%-14s : défaut %s" % (key, setting.default))
+            print("%-14s : default %s" % (key, setting.default))
     if descriptor.env:
-        print("environnement  : %s" % ", ".join(
+        print("environment    : %s" % ", ".join(
             "%s=%s" % (k, v) for k, v in sorted(descriptor.env.items())))
     if descriptor.capabilities:
-        print("capacités ACP  : %s" % ", ".join(sorted(descriptor.capabilities)))
+        print("ACP capabilities: %s" % ", ".join(sorted(descriptor.capabilities)))
     if descriptor.authentication:
-        print("authentification : %s" % json.dumps(descriptor.authentication, ensure_ascii=False))
+        print("authentication : %s" % json.dumps(descriptor.authentication, ensure_ascii=False))
     if descriptor.hooks:
         print("hooks          : %s" % ", ".join(sorted(descriptor.hooks)))
     if descriptor.cost:
-        print("coût           : %s" % json.dumps(descriptor.cost, ensure_ascii=False))
+        print("cost           : %s" % json.dumps(descriptor.cost, ensure_ascii=False))
     if descriptor.permissions:
         print("permissions    : %s" % json.dumps(descriptor.permissions, ensure_ascii=False))
     if descriptor.distribution:
         print("distribution   : %s" % ", ".join(sorted(descriptor.distribution)))
     else:
-        print("distribution   : non décrite (installation par l'hôte, L17)")
+        print("distribution   : not described (installed by the host, L17)")
 
 
 def cmd_show(cfg, args: argparse.Namespace) -> int:
@@ -137,18 +137,18 @@ def cmd_show(cfg, args: argparse.Namespace) -> int:
     else:
         descriptor = harnesses.get(target)
         if descriptor is None:
-            print("descripteur inconnu : %r (connus : %s)"
-                  % (target, ", ".join(harnesses.known_ids()) or "aucun"), file=sys.stderr)
+            print("unknown descriptor: %r (known: %s)"
+                  % (target, ", ".join(harnesses.known_ids()) or "none"), file=sys.stderr)
             return 1
         findings = harnesses.validate(descriptor.document, path=descriptor.path)
     if args.json:
         _show_json(descriptor)
         for f in findings:
-            print("avert. %-32s %s" % (f.code, f.message), file=sys.stderr)
+            print("warn.  %-32s %s" % (f.code, f.message), file=sys.stderr)
     else:
         _show_text(descriptor)
         for f in findings:
-            print("avert. %-32s %s" % (f.code, f.message))
+            print("warn.  %-32s %s" % (f.code, f.message))
     return 0
 
 
@@ -165,7 +165,7 @@ def cmd_check(cfg, args: argparse.Namespace) -> int:
         }, ensure_ascii=False))
     else:
         if descriptor is not None:
-            print("%s : descripteur valide (%s, protocole %s, flux %s)"
+            print("%s: valid descriptor (%s, protocol %s, stream %s)"
                   % (path, descriptor.id, descriptor.protocol, descriptor.stream))
         _print_findings(findings)
         print(_summary(findings))
@@ -227,20 +227,20 @@ def cmd_versions(cfg, args: argparse.Namespace) -> int:
 
 def add_parsers(sub) -> None:
     """Branche `harness …` sur le parseur de mesh_cli."""
-    p_harness = sub.add_parser("harness", help="descripteurs de harnais (L16)")
+    p_harness = sub.add_parser("harness", help="harness descriptors (L16)")
     harness_sub = p_harness.add_subparsers(dest="harness_command")
 
-    p_list = harness_sub.add_parser("list", help="descripteurs connus (paquet + hôte)")
+    p_list = harness_sub.add_parser("list", help="known descriptors (package + host)")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_list)
 
-    p_show = harness_sub.add_parser("show", help="un descripteur, par identifiant ou fichier")
-    p_show.add_argument("identifiant")
+    p_show = harness_sub.add_parser("show", help="one descriptor, by id or file")
+    p_show.add_argument("identifiant", metavar="ID")
     p_show.add_argument("--json", action="store_true")
     p_show.set_defaults(func=cmd_show)
 
-    p_check = harness_sub.add_parser("check", help="valider un fichier de descripteur")
-    p_check.add_argument("fichier")
+    p_check = harness_sub.add_parser("check", help="validate a descriptor file")
+    p_check.add_argument("fichier", metavar="FILE")
     p_check.add_argument("--json", action="store_true")
     p_check.set_defaults(func=cmd_check)
 

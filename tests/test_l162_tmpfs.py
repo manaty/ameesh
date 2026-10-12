@@ -149,7 +149,7 @@ class ActiviteTest(unittest.TestCase):
         _write(os.path.join(entree, "g"), 10)
         borne = menage.scan_activity(entree, limit=2)
         self.assertFalse(borne["complete"])
-        self.assertIn("entrées", borne["why"])
+        self.assertIn("entries", borne["why"])
         self.assertFalse(menage.scan_activity(os.path.join(self.base, "absent"))["complete"])
 
     def test_plus_grosses_entrees(self):
@@ -161,7 +161,7 @@ class ActiviteTest(unittest.TestCase):
         self.assertTrue(top[0]["owner"])
         texte = menage.tmpfs_hint(top, menage.Policy())
         self.assertIn("gros", texte)
-        self.assertIn("action attendue", texte)
+        self.assertIn("expected action", texte)
         self.assertIn("2 h", texte)
         self.assertIn("ameesh menage", menage.tmpfs_hint([], menage.Policy()))
         self.assertEqual(menage.fmt_idle(5400), "90 min")
@@ -170,8 +170,8 @@ class ActiviteTest(unittest.TestCase):
         """#234 : depuis #222, une entrée nouvelle de /tmp n'est jamais imputée
         ni supprimée par le ménage ; l'action attendue ne le promet plus."""
         texte = menage.tmpfs_hint([], menage.Policy())
-        self.assertNotIn("supprime seul une entrée laissée par un tour", texte)
-        self.assertIn("d'avant #222", texte)
+        self.assertNotIn("deletes on its own an entry left by a turn", texte)
+        self.assertIn("before #222", texte)
         self.assertIn("tmp_orphan", texte)
 
 
@@ -182,7 +182,7 @@ class ConsigneTest(unittest.TestCase):
                 texte = mail._assemble(kind, ["— message n°1 de a :\n> x"], 0)
                 self.assertIn(adapters.TMP_NOTE, texte)
         self.assertIn("$TMPDIR", adapters.TMP_NOTE)
-        self.assertIn("500 Mo", adapters.TMP_NOTE)
+        self.assertIn("500 MB", adapters.TMP_NOTE)
         racine = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(racine, "docs", "ORCHESTRATEUR.md"), encoding="utf-8") as fh:
             orchestrateur = fh.read()
@@ -254,7 +254,7 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
         self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
                          [(chemin, None, None)])
         self.assertIn(menage.UNATTRIBUTED, signale[0]["detail"])
-        self.assertIn("jamais supprimé automatiquement", signale[0]["detail"])
+        self.assertIn("never deleted automatically", signale[0]["detail"])
         # le tour et l'agent témoins restent dans les données
         self.assertEqual((signale[0]["data"]["turn"], signale[0]["data"]["witness"],
                           signale[0]["data"]["lot"]), ("t" * 32, "a1", "9"))
@@ -385,7 +385,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         alertes = [a for a in exploitation.alerts(self.cfg, self.db)
                    if a["type"] == "tmp_orphan" and a.get("path") == entree]
         self.assertEqual(len(alertes), 1)
-        self.assertIn("jamais supprimé par ameesh : non attribué", alertes[0]["detail"])
+        self.assertIn("never deleted by ameesh: %s" % menage.UNATTRIBUTED, alertes[0]["detail"])
         subprocess.run(["rm", "-rf", entree], check=True)
         self._passage(menage.UNATTRIBUTED_REFRESH_S + 120)
         lignes = [r for r in hk.recent("pc", 3600, 50, kind="orphan") if r["path"] == entree]
@@ -451,13 +451,13 @@ class AbandonDbTest(_Systeme, PgTestCase):
         entries = self._tour(creer, impute="a1")
         signale = [e for e in entries if e["kind"] == "orphan"]
         self.assertEqual([e["path"] for e in signale], [abandon])
-        self.assertIn("jamais supprimé automatiquement", signale[0]["detail"])   # #222
+        self.assertIn("never deleted automatically", signale[0]["detail"])   # #222
         self.assertIn("ino", signale[0]["data"])
         # 30 min plus tard : il attend
         rapport = self._passage(1800.0)
         self.assertTrue(os.path.exists(abandon))
         self.assertEqual(rapport["orphans"][0]["status"], "attend")
-        self.assertIn("supprimé après 2 h", rapport["orphans"][0]["detail"])
+        self.assertIn("deleted after 2 h", rapport["orphans"][0]["detail"])
         # essai, 3 h plus tard : prévu, rien de supprimé
         essai = self._passage(3 * HEURE, dry_run=True)
         self.assertTrue(os.path.exists(abandon))
@@ -508,12 +508,12 @@ class AbandonDbTest(_Systeme, PgTestCase):
         rapport = self._passage(3 * HEURE)
         sorts = {o["path"]: (o["status"], o["detail"]) for o in rapport["orphans"]}
         self.assertEqual(sorts[ouvert][0], "attend")
-        self.assertIn("tenu par le processus %d" % occupant.pid, sorts[ouvert][1])
+        self.assertIn("held by process %d" % occupant.pid, sorts[ouvert][1])
         self.assertEqual(sorts[sale][0], "garde")
-        self.assertIn("travail git", sorts[sale][1])
-        self.assertIn("autre inode", sorts[homonyme][1])
-        self.assertIn("absent du registre", sorts[inconnu][1])
-        self.assertIn("hors du /tmp du système", sorts[dehors][1])
+        self.assertIn("git work",sorts[sale][1])
+        self.assertIn("different inode",sorts[homonyme][1])
+        self.assertIn("not in the registry", sorts[inconnu][1])
+        self.assertIn("outside the system /tmp",sorts[dehors][1])
         for chemin in (ouvert, sale, homonyme, inconnu, dehors):
             self.assertTrue(os.path.exists(chemin), chemin)
         self.assertEqual([e for e in rapport["entries"] if e["kind"] == "orphan"], [])
@@ -528,7 +528,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
                    if a["type"] == "tmp_orphan"]
         self.assertIn(sale, {a["path"] for a in alertes})
         self.assertNotIn(ouvert, {a["path"] for a in alertes})
-        self.assertTrue(all("supprimé par le ménage une fois inchangé" in a["detail"]
+        self.assertTrue(all("deleted by cleanup once unchanged" in a["detail"]
                             for a in alertes))
 
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
@@ -550,7 +550,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertIn("orphan_cleanup: false", rapport["orphans"][0]["detail"])
         rapport = self._passage(3 * HEURE, agents_in_turn={"a1"})
         self.assertTrue(os.path.exists(abandon))
-        self.assertIn("tour en cours", rapport["orphans"][0]["detail"])
+        self.assertIn("turn in progress", rapport["orphans"][0]["detail"])
         with mock.patch.dict(os.environ, {"AMEESH_HOUSEKEEPING": "off"}):
             self._passage(3 * HEURE)
         self.assertTrue(os.path.exists(abandon))
@@ -567,7 +567,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self._lecture(10.0)   # 83 % : pression (80 %) et alerte (60 %)
         alertes = {a["type"]: a for a in exploitation.alerts(self.cfg, self.db)}
         self.assertIn("ameesh menage", alertes["host_pressure"]["detail"])   # sans bilan
-        self.assertIn("action attendue", alertes["host_pressure"]["detail"])
+        self.assertIn("expected action", alertes["host_pressure"]["detail"])
         top = [{"path": "/tmp/preuve-images", "bytes": 4 * 1024 ** 3, "owner": "u",
                 "agent": "a1", "status": "attend"},
                {"path": "/tmp/jest_rs", "bytes": 1536 * 1024 ** 2, "owner": "u"}]
@@ -578,15 +578,15 @@ class AbandonDbTest(_Systeme, PgTestCase):
         for type_ in ("host_pressure", "tmpfs_full"):
             with self.subTest(type=type_):
                 detail = alertes[type_]["detail"]
-                self.assertIn("/tmp/preuve-images 4.0 GiB (u, laissé par a1 : attend)", detail)
+                self.assertIn("/tmp/preuve-images 4.0 GiB (u, left by a1: waiting)", detail)
                 self.assertIn("/tmp/jest_rs 1.5 GiB", detail)
-                self.assertIn("action attendue", detail)
+                self.assertIn("expected action", detail)
                 self.assertIn("$TMPDIR", detail)
                 self.assertEqual([e["path"] for e in alertes[type_]["tmp_top"]],
                                  ["/tmp/preuve-images", "/tmp/jest_rs"])
         proc = self.mesh("hosts")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("/tmp gros  /tmp/preuve-images 4.0 GiB", proc.stdout)
+        self.assertIn("/tmp large /tmp/preuve-images 4.0 GiB", proc.stdout)
 
     def test_le_bilan_releve_les_plus_gros_quand_le_tmpfs_se_remplit(self):
         _write(os.path.join(self.sys, "gros", "f"), 90000)
@@ -626,12 +626,12 @@ class TextesApres222Test(_Systeme, unittest.TestCase):
             ligne, menage.Policy(), base=self.sys, registered={"a1"}, protected=set(),
             running=set(), now=time.time() + 3 * HEURE)
         self.assertEqual(sort, "garde")
-        self.assertIn("jamais supprimé par ameesh : %s" % menage.UNATTRIBUTED, raison)
-        self.assertNotIn("absent du registre", raison)
+        self.assertIn("never deleted by ameesh: %s" % menage.UNATTRIBUTED, raison)
+        self.assertNotIn("not in the registry", raison)
 
     def test_l_en_tete_de_ameesh_menage(self):
         connue = {"path": self.entree, "bytes": 5000, "agent": None, "status": "garde",
-                  "detail": "jamais supprimé par ameesh : %s" % menage.UNATTRIBUTED,
+                  "detail": "never deleted by ameesh: %s" % menage.UNATTRIBUTED,
                   "command": "rm -rf -- %s" % self.entree}
         rapport = {"host": "pc", "dry_run": True, "entries": [], "plan": [], "skipped": [],
                    "orphans": [connue],
@@ -642,10 +642,10 @@ class TextesApres222Test(_Systeme, unittest.TestCase):
         with contextlib.redirect_stdout(sortie):
             menage.print_report(rapport)
         texte = sortie.getvalue()
-        self.assertNotIn("supprimées seules une fois abandonnées", texte)
-        self.assertIn("jamais supprimées par ameesh", texte)
-        self.assertNotIn("hors tour d'agent", texte)
-        self.assertIn("apparue pendant un tour, non attribuée : à décider", texte)
+        self.assertNotIn("deleted on their own once abandoned", texte)
+        self.assertIn("never deleted by ameesh", texte)
+        self.assertNotIn("outside any agent turn", texte)
+        self.assertIn("appeared during a turn, unattributed: to decide", texte)
 
     def test_la_consigne_de_l_orchestrateur(self):
         racine = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

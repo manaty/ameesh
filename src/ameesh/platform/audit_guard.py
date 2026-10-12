@@ -21,10 +21,10 @@ def available():
 
 def command(argv, seconds):
     if not available():
-        raise RuntimeError("scope mémoire de l'auditeur indisponible")
+        raise RuntimeError("auditor memory scope unavailable")
     seconds = min(WALL_SECONDS, float(seconds))
     if seconds <= 0:
-        raise RuntimeError("échéance auditeur invalide")
+        raise RuntimeError("invalid auditor deadline")
     return [shutil.which("systemd-run"), "--scope", "--quiet", "--no-ask-password",
             *(["--user"] if os.geteuid() != 0 else []),
             "--property=MemoryMax=%d" % MEMORY_MAX,
@@ -52,7 +52,8 @@ def memory_enforced(limit, *, proc=Path("/proc/self/cgroup"), root=Path("/sys/fs
 def main(args):
     limit = int(args[0])
     if args[1] != "--" or not memory_enforced(limit):
-        print("L234 : contrôle mémoire du scope absent ; harnais non exécuté", file=sys.stderr)
+        print("L234: no memory control on the scope; harness not run"
+, file=sys.stderr)
         return 125
     print(READY, flush=True)
     os.execvpe(args[2], args[2:], os.environ)

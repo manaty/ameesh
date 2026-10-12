@@ -54,7 +54,7 @@ class NotAvailable(RuntimeError):
         self.subject = subject
         self.system = system or SYSTEM
         self.reason = reason
-        super().__init__("%s indisponible sur %s : %s" % (subject, self.system, reason))
+        super().__init__("%s unavailable on %s: %s" % (subject, self.system, reason))
 
 
 def is_linux() -> bool:

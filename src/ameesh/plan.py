@@ -207,4 +207,4 @@ def describe_age(seconds) -> str:
         return "%d min" % (seconds // 60)
     if seconds < 86400:
         return "%d h" % (seconds // 3600)
-    return "%d j %d h" % (seconds // 86400, (seconds % 86400) // 3600)
+    return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)

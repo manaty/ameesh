@@ -57,7 +57,7 @@ class PriseDeLotTest(_Lots):
         self.assertEqual([(m["recipient"], m["kind"], m["work_item_id"]) for m in mails],
                          [("claude1", "event", str(lot["id"])),
                           ("orchestrateur", "event", str(lot["id"]))])
-        self.assertIn("geste irréversible ou de production", mails[0]["body"])
+        self.assertIn("any irreversible or production action", mails[0]["body"])
         self.assertIn("ameesh work assign %d" % lot["id"], mails[1]["body"])
         payload = mails[1]["payload"]
         payload = json.loads(payload) if isinstance(payload, str) else payload

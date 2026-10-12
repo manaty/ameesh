@@ -77,7 +77,7 @@ class AcpRpcError(AcpError):
     """Une requête JSON-RPC a rendu une erreur."""
 
     def __init__(self, code: Any, message: str, data: Any = None):
-        super().__init__("erreur JSON-RPC %s : %s" % (code, message))
+        super().__init__("JSON-RPC error %s: %s" % (code, message))
         self.code = code
         self.message = message
         self.data = data
@@ -131,27 +131,27 @@ def _validate_message(message: dict) -> None:
     lecture avant d'avoir enregistré la panne, et le tour attendait le délai.
     """
     if message.get("jsonrpc") != "2.0":
-        raise AcpError('message JSON-RPC sans `jsonrpc: "2.0"`')
+        raise AcpError('JSON-RPC message without `jsonrpc: "2.0"`')
     if "method" in message:
         method = message["method"]
         if not isinstance(method, str) or not method:
-            raise AcpError("`method` JSON-RPC invalide : %r" % (method,))
+            raise AcpError("invalid JSON-RPC `method`: %r" % (method,))
         if "id" in message and not _valid_rpc_id(message["id"]):
-            raise AcpError("`id` JSON-RPC invalide : %r" % (message["id"],))
+            raise AcpError("invalid JSON-RPC `id`: %r" % (message["id"],))
         params = message.get("params", {})
         if params is not None and not isinstance(params, dict):
-            raise AcpError("`params` JSON-RPC invalide (objet attendu)")
+            raise AcpError("invalid JSON-RPC `params` (object expected)")
         return
     if "id" not in message or not _valid_rpc_id(message["id"]):
-        raise AcpError("réponse JSON-RPC sans `id` valide")
+        raise AcpError("JSON-RPC response without a valid `id`")
     if ("result" in message) == ("error" in message):
-        raise AcpError("réponse JSON-RPC : exactement un de `result` ou `error` attendu")
+        raise AcpError("JSON-RPC response: exactly one of `result` or `error` expected")
     if "error" in message:
         error = message["error"]
         if not isinstance(error, dict) or not isinstance(error.get("message"), str) \
                 or not (isinstance(error.get("code"), int)
                         and not isinstance(error.get("code"), bool)):
-            raise AcpError("objet `error` JSON-RPC invalide")
+            raise AcpError("invalid JSON-RPC `error` object")
 
 
 class JsonRpcPeer:
@@ -214,12 +214,12 @@ class JsonRpcPeer:
     def _send(self, message: dict) -> None:
         with self._write_lock:
             if self.proc.stdin is None or self.proc.poll() is not None:
-                raise AcpError("l'agent ACP n'est plus vivant")
+                raise AcpError("the ACP agent is no longer alive")
             try:
                 self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
                 self.proc.stdin.flush()
             except (BrokenPipeError, OSError, ValueError) as exc:
-                raise AcpError("écriture vers l'agent ACP impossible : %s" % exc)
+                raise AcpError("cannot write to the ACP agent: %s" % exc)
 
     def notify(self, method: str, params: dict | None = None) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
@@ -246,9 +246,9 @@ class JsonRpcPeer:
             if cancel is not None and cancel.is_set():
                 raise AcpCancelled()
             if deadline is not None and time.monotonic() >= deadline:
-                raise AcpError("délai dépassé en attendant %s" % pending.id)
+                raise AcpError("timed out waiting for %s" % pending.id)
             if self._eof.is_set() and not pending.event.is_set():
-                raise AcpError("l'agent ACP s'est arrêté avant de répondre")
+                raise AcpError("the ACP agent stopped before answering")
 
     def request(self, method: str, params: dict | None = None, *,
                 timeout: float | None = None,
@@ -268,7 +268,7 @@ class JsonRpcPeer:
         try:
             self._read_messages()
         except BaseException as exc:  # ultime filet : jamais un fil mort silencieux
-            self._fail(AcpError("lecteur JSON-RPC interrompu : %r" % (exc,)))
+            self._fail(AcpError("JSON-RPC reader interrupted: %r" % (exc,)))
         finally:
             self._eof.set()
             with self._lock:
@@ -277,7 +277,7 @@ class JsonRpcPeer:
             for pending in pendings:
                 if not pending.event.is_set():
                     pending.error = {"code": -32000,
-                                     "message": "l'agent ACP s'est arrêté"}
+                                     "message": "the ACP agent stopped"}
                     pending.event.set()
 
     def _read_messages(self) -> None:
@@ -291,7 +291,7 @@ class JsonRpcPeer:
                     return
                 self.last_message = time.monotonic()
                 if len(line) > self.max_message:
-                    raise AcpError("message JSON-RPC trop grand (> %d caractères)"
+                    raise AcpError("JSON-RPC message too large (> %d characters)"
                                    % self.max_message)
                 line = line.strip()
                 if not line:
@@ -299,10 +299,10 @@ class JsonRpcPeer:
                 try:
                     message = json.loads(line)
                 except ValueError as exc:
-                    raise AcpError("ligne illisible sur la sortie de l'agent : %s"
+                    raise AcpError("unreadable line on the agent's output: %s"
                                    % line[:200]) from exc
                 if not isinstance(message, dict):
-                    raise AcpError("message JSON-RPC non objet")
+                    raise AcpError("JSON-RPC message is not an object")
                 _validate_message(message)
                 self._dispatch(message)
             except AcpError as exc:
@@ -310,7 +310,7 @@ class JsonRpcPeer:
                 return
             except Exception as exc:
                 # id non hachable, type inattendu, bogue de dispatch : fatal aussi
-                self._fail(AcpError("message JSON-RPC non conforme (%s) : %s"
+                self._fail(AcpError("non-compliant JSON-RPC message (%s): %s"
                                     % (type(exc).__name__, exc)))
                 return
 
@@ -324,14 +324,14 @@ class JsonRpcPeer:
             else:
                 handler = self._notification_handler
                 if handler is None:
-                    raise AcpError("notification ACP inattendue : %s" % message["method"])
+                    raise AcpError("unexpected ACP notification: %s" % message["method"])
                 handler(message["method"], params)
             return
         pending_id = message["id"]
         with self._lock:
             pending = self._pending.pop(pending_id, None)
         if pending is None:
-            raise AcpError("réponse à une requête inconnue (id %r)" % (pending_id,))
+            raise AcpError("response to an unknown request (id %r)" % (pending_id,))
         if "error" in message:
             pending.error = message["error"]
         else:
@@ -342,11 +342,11 @@ class JsonRpcPeer:
         if method in UNSUPPORTED_CLIENT_METHODS:
             self._send({"jsonrpc": "2.0", "id": request_id,
                         "error": {"code": -32601,
-                                  "message": "méthode client non supportée : %s" % method}})
-            raise AcpError("méthode client inattendue : %s" % method)
+                                  "message": "unsupported client method: %s" % method}})
+            raise AcpError("unexpected client method: %s" % method)
         handler = self._request_handler
         if handler is None:
-            raise AcpError("méthode client inattendue : %s" % method)
+            raise AcpError("unexpected client method: %s" % method)
         try:
             result = handler(method, params)
         except AcpRpcError as exc:
@@ -380,7 +380,7 @@ class JsonRpcPeer:
             try:
                 self.proc.wait(timeout=max(0.0, grace))
             except subprocess.TimeoutExpired:
-                log("l'agent ne répond pas au SIGTERM : SIGKILL")
+                log("the agent ignores SIGTERM: SIGKILL")
                 try:
                     self.proc.kill()
                 except OSError:
@@ -418,13 +418,13 @@ def permission_decision(permissions: Mapping[str, Any], tool_call: Mapping[str, 
     allow_kinds = {str(k).lower() for k in (permissions.get("allow_kinds") or [])}
     default = permissions.get("default") or "deny"
     if kind in deny_kinds:
-        decision, reason = "deny", "kind %s explicitement refusé" % kind
+        decision, reason = "deny", "kind %s explicitly denied" % kind
     elif default == "allow":
-        decision, reason = "allow", "politique par défaut : allow"
+        decision, reason = "allow", "default policy: allow"
     elif kind in allow_kinds:
-        decision, reason = "allow", "kind %s admis par allow_kinds" % kind
+        decision, reason = "allow", "kind %s allowed by allow_kinds" % kind
     else:
-        decision, reason = "deny", "kind %s non couvert (refus par défaut)" % kind
+        decision, reason = "deny", "kind %s not covered (denied by default)" % kind
     return decision, _option_id(options, decision == "allow"), reason
 
 
@@ -467,7 +467,7 @@ def _open_root(cwd: str) -> int:
     try:
         fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:  # pragma: no cover : tout système POSIX a une racine
-        raise AcpRpcError(-32002, "racine du système illisible : %s" % exc)
+        raise AcpRpcError(-32002, "filesystem root unreadable: %s" % exc)
     try:
         for composant in composants:
             suivant = os.open(composant,
@@ -477,9 +477,9 @@ def _open_root(cwd: str) -> int:
     except OSError as exc:
         os.close(fd)
         if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
-            log("dossier de travail atteint par un lien (%r) : refusé" % cwd)
-            raise AcpRpcError(-32002, "dossier de travail atteint par un lien : %s" % cwd)
-        raise AcpRpcError(-32002, "dossier de travail illisible : %s" % exc)
+            log("working directory reached through a link (%r): denied" % cwd)
+            raise AcpRpcError(-32002, "working directory reached through a link: %s" % cwd)
+        raise AcpRpcError(-32002, "working directory unreadable: %s" % exc)
     return fd
 
 
@@ -499,23 +499,23 @@ def _open_beneath(root_fd: int, cwd: str, path: Any, flags: int,
     lien, `-32002` pour une ouverture impossible.
     """
     if not isinstance(path, str) or not path:
-        raise AcpRpcError(-32602, "chemin attendu")
+        raise AcpRpcError(-32602, "path expected")
     racine = os.path.abspath(cwd)
     if os.pardir in path.split(os.sep):
-        log("fs refusé : composant `..` (%r, cwd %s)" % (path, cwd))
-        raise AcpRpcError(-32001, "chemin hors du dossier de travail de la session : %s"
+        log("fs denied: `..` component (%r, cwd %s)" % (path, cwd))
+        raise AcpRpcError(-32001, "path outside the session working directory: %s"
                           % (path,))
     absolu = path if os.path.isabs(path) else os.path.join(racine, path)
     absolu = os.path.normpath(absolu)
     rel = os.path.relpath(absolu, racine)
     if rel == os.curdir or rel == os.pardir or rel.startswith(os.pardir + os.sep):
-        log("fs refusé hors du dossier de travail (%r, cwd %s)" % (path, cwd))
-        raise AcpRpcError(-32001, "chemin hors du dossier de travail de la session : %s"
+        log("fs denied outside the working directory (%r, cwd %s)" % (path, cwd))
+        raise AcpRpcError(-32001, "path outside the session working directory: %s"
                           % (path,))
     composants = [c for c in rel.split(os.sep) if c not in ("", os.curdir)]
     if not composants:
-        log("fs refusé hors du dossier de travail (%r, cwd %s)" % (path, cwd))
-        raise AcpRpcError(-32001, "chemin hors du dossier de travail de la session : %s"
+        log("fs denied outside the working directory (%r, cwd %s)" % (path, cwd))
+        raise AcpRpcError(-32001, "path outside the session working directory: %s"
                           % (path,))
     courant = root_fd
     try:
@@ -530,10 +530,10 @@ def _open_beneath(root_fd: int, cwd: str, path: Any, flags: int,
         if courant != root_fd:
             os.close(courant)
         if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
-            log("fs refusé (lien ou composant interdit) : %r (cwd %s)" % (path, cwd))
-            raise AcpRpcError(-32001, "lien ou composant interdit dans le dossier de "
-                                      "travail : %s" % (path,))
-        raise AcpRpcError(-32002, "ouverture impossible (%s) : %s" % (path, exc))
+            log("fs denied (link or forbidden component): %r (cwd %s)" % (path, cwd))
+            raise AcpRpcError(-32001, "link or forbidden component in the working "
+                                      "directory: %s" % (path,))
+        raise AcpRpcError(-32002, "cannot open (%s): %s" % (path, exc))
     if courant != root_fd:
         os.close(courant)
     return ouvert
@@ -618,11 +618,11 @@ class AcpTurn:
 
     def _start(self) -> None:
         argv = [self.agent_binary, *self.descriptor.launcher, *self.descriptor.command]
-        log("lancement de l'agent : %s (cwd %s)" % (" ".join(argv[:4]) + " …", self.cwd))
+        log("starting the agent: %s (cwd %s)" % (" ".join(argv[:4]) + " …", self.cwd))
         try:
             self.peer = JsonRpcPeer(argv, cwd=self.cwd, env=self._agent_env())
         except OSError as exc:
-            raise AcpError("agent ACP illisible : %s" % exc)
+            raise AcpError("cannot start the ACP agent: %s" % exc)
         self.peer.set_handlers(self._on_request, self._on_notification)
 
     def _initialize(self) -> None:
@@ -637,7 +637,7 @@ class AcpTurn:
         }, timeout=self.init_timeout or None, cancel=self._cancel)
         version = result.get("protocolVersion") if isinstance(result, dict) else None
         if version != PROTOCOL_VERSION:
-            raise AcpError("version ACP %r non supportée (attendu %d)"
+            raise AcpError("unsupported ACP version %r (expected %d)"
                            % (version, PROTOCOL_VERSION))
         capabilities = (result or {}).get("agentCapabilities") or {}
         self.load_session = bool(capabilities.get("loadSession"))
@@ -650,8 +650,8 @@ class AcpTurn:
             self.peer.request("authenticate", {"methodId": auth_method},
                               timeout=self.init_timeout or None, cancel=self._cancel)
         elif auth_methods:
-            log("l'agent annonce des méthodes d'authentification (%s) mais le descripteur "
-                "n'en nomme aucune : on continue avec l'état local"
+            log("the agent announces authentication methods (%s) but the descriptor "
+                "names none: continuing with the local state"
                 % ", ".join(str(m.get("id")) for m in auth_methods if isinstance(m, dict)))
 
     def _session(self) -> None:
@@ -675,12 +675,12 @@ class AcpTurn:
                 return
             # Ni resume ni load : session neuve. Le résumé de reprise (L11) est
             # déjà dans la consigne quand l'exécuteur a tourné une session.
-            log("l'agent ne sait pas reprendre la session %s : session neuve" % self.session)
+            log("the agent cannot resume session %s: new session" % self.session)
         result = self.peer.request("session/new", params,
                                    timeout=self.init_timeout or None, cancel=self._cancel)
         session_id = result.get("sessionId") if isinstance(result, dict) else None
         if not session_id:
-            raise AcpError("session/new sans sessionId")
+            raise AcpError("session/new without sessionId")
         self.session_id = str(session_id)
         self.config_options = list((result or {}).get("configOptions") or [])
         self.emit({"type": "session", "sessionId": self.session_id})
@@ -708,11 +708,11 @@ class AcpTurn:
                 continue
             option = self._find_config(key)
             if option is None:
-                log("l'agent n'expose pas de réglage %s : valeur %r ignorée" % (key, value))
+                log("the agent exposes no %s setting: value %r ignored" % (key, value))
                 continue
             options = _flatten_options(option)
             if option.get("type") != "boolean" and options and str(value) not in options:
-                log("valeur %r hors des choix de l'option %s : ignorée"
+                log("value %r not among the choices of option %s: ignored"
                     % (value, option.get("id")))
                 continue
             try:
@@ -721,7 +721,7 @@ class AcpTurn:
                     "value": value,
                 }, timeout=self.init_timeout or None, cancel=self._cancel)
             except AcpError as exc:
-                log("réglage %s refusé par l'agent : %s" % (key, exc))
+                log("setting %s rejected by the agent: %s" % (key, exc))
                 continue
             if isinstance(result, dict) and isinstance(result.get("configOptions"), list):
                 self.config_options = list(result["configOptions"])
@@ -732,7 +732,7 @@ class AcpTurn:
     # -- notifications -----------------------------------------------------
     def _on_notification(self, method: str, params: dict) -> None:
         if method != "session/update":
-            raise AcpError("notification ACP inattendue : %s" % method)
+            raise AcpError("unexpected ACP notification: %s" % method)
         self._on_update(params)
 
     def _on_update(self, params: dict) -> None:
@@ -803,7 +803,7 @@ class AcpTurn:
             return self._permission(params)
         if method in ("fs/read_text_file", "fs/write_text_file"):
             return self._fs(method, params)
-        raise AcpRpcError(-32601, "méthode client non supportée : %s" % method)
+        raise AcpRpcError(-32601, "unsupported client method: %s" % method)
 
     def _permission(self, params: dict) -> dict:
         tool_call = params.get("toolCall")
@@ -816,7 +816,7 @@ class AcpTurn:
         self.emit({"type": "permission", "decision": decision,
                    "toolCallId": tool_call.get("toolCallId"), "title": tool_call.get("title"),
                    "kind": tool_call.get("kind"), "reason": reason})
-        log("permission %s (%s) : %s" % (decision, tool_call.get("kind") or "?", reason))
+        log("permission %s (%s): %s" % (decision, tool_call.get("kind") or "?", reason))
         if option_id is not None:
             return {"outcome": {"outcome": "selected", "optionId": option_id}}
         return {"outcome": {"outcome": "cancelled"}}
@@ -833,7 +833,7 @@ class AcpTurn:
         et rendue en erreur JSON-RPC, jamais exécutée.
         """
         if self._root_fd is None:  # pragma: no cover : acquis avant le premier fs/*
-            raise AcpRpcError(-32002, "dossier de travail non épinglé")
+            raise AcpRpcError(-32002, "working directory not pinned")
         path = params.get("path")
         if method == "fs/read_text_file":
             fd = _open_beneath(self._root_fd, self.cwd, path, os.O_RDONLY)
@@ -841,15 +841,15 @@ class AcpTurn:
                 fichier = os.fdopen(fd, encoding="utf-8")
             except (OSError, ValueError) as exc:
                 os.close(fd)
-                raise AcpRpcError(-32002, "lecture impossible : %s" % exc)
+                raise AcpRpcError(-32002, "cannot read: %s" % exc)
             try:
                 with fichier:
                     contenu = fichier.read(MAX_MESSAGE_CHARS + 1)
             except (OSError, UnicodeDecodeError, ValueError) as exc:
-                log("fs/read_text_file en échec (%r) : %s" % (path, exc))
-                raise AcpRpcError(-32002, "lecture impossible : %s" % exc)
+                log("fs/read_text_file failed (%r): %s" % (path, exc))
+                raise AcpRpcError(-32002, "cannot read: %s" % exc)
             if len(contenu) > MAX_MESSAGE_CHARS:
-                raise AcpRpcError(-32002, "fichier trop grand : %s" % path)
+                raise AcpRpcError(-32002, "file too large: %s" % path)
             ligne = params.get("line")
             limite = params.get("limit")
             if isinstance(ligne, int) and ligne > 1:
@@ -859,23 +859,23 @@ class AcpTurn:
             return {"content": contenu}
         content = params.get("content")
         if not isinstance(content, str):
-            raise AcpRpcError(-32602, "`content` texte attendu")
+            raise AcpRpcError(-32602, "text `content` expected")
         if len(content) > MAX_WRITE_CHARS:
-            raise AcpRpcError(-32002, "contenu trop grand (%d caractères)" % len(content))
+            raise AcpRpcError(-32002, "content too large (%d characters)" % len(content))
         fd = _open_beneath(self._root_fd, self.cwd, path,
                            os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
             fichier = os.fdopen(fd, "w", encoding="utf-8")
         except (OSError, ValueError) as exc:
             os.close(fd)
-            raise AcpRpcError(-32002, "écriture impossible : %s" % exc)
+            raise AcpRpcError(-32002, "cannot write: %s" % exc)
         try:
             with fichier:
                 fichier.write(content)
         except OSError as exc:
-            log("fs/write_text_file en échec (%r) : %s" % (path, exc))
-            raise AcpRpcError(-32002, "écriture impossible : %s" % exc)
-        log("fs/write_text_file : %r (cwd %s)" % (path, self.cwd))
+            log("fs/write_text_file failed (%r): %s" % (path, exc))
+            raise AcpRpcError(-32002, "cannot write: %s" % exc)
+        log("fs/write_text_file: %r (cwd %s)" % (path, self.cwd))
         return {}
 
     # -- tour --------------------------------------------------------------
@@ -890,19 +890,19 @@ class AcpTurn:
         while not pending.event.is_set():
             if self._cancel.is_set() and not cancelled:
                 cancelled = True
-                log("interruption : session/cancel")
+                log("interrupted: session/cancel")
                 try:
                     self.peer.notify("session/cancel", {"sessionId": self.session_id})
                 except AcpError as exc:
-                    log("session/cancel impossible : %s" % exc)
+                    log("session/cancel failed: %s" % exc)
                 # Laisse à l'agent le temps de conclure sur `cancelled`.
                 pending.event.wait(self.cancel_grace)
                 break
             if self.idle_timeout and \
                     time.monotonic() - self.peer.last_message > self.idle_timeout:
-                raise AcpError("inactivité de l'agent ACP depuis %ds" % int(self.idle_timeout))
+                raise AcpError("ACP agent idle for %ds" % int(self.idle_timeout))
             if deadline is not None and time.monotonic() >= deadline:
-                raise AcpError("délai du tour ACP dépassé")
+                raise AcpError("ACP turn timed out")
             pending.event.wait(0.1)
             # Une panne de protocole débloque la requête en vol : elle doit
             # arrêter le tour, jamais laisser la boucle attendre sans issue.
@@ -931,12 +931,12 @@ class AcpTurn:
             stop = "cancelled"
         except (AcpError, harnesses.DescriptorError) as exc:
             self.emit({"type": "error", "message": str(exc)})
-            log("échec du tour : %s" % exc)
+            log("turn failed: %s" % exc)
             self._close()
             return 1
         except Exception as exc:  # jamais de trace brute : un événement lisible
-            self.emit({"type": "error", "message": "panne du pont ACP : %s" % exc})
-            log("panne du pont ACP : %r" % exc)
+            self.emit({"type": "error", "message": "ACP bridge failure: %s" % exc})
+            log("ACP bridge failure: %r" % exc)
             self._close()
             return 1
         usage = None
@@ -968,7 +968,7 @@ class AcpTurn:
                                  if k in ("used", "size")}} if usage else {}),
                    **({"costUsd": cost} if cost is not None else {})})
         if stop not in ("end_turn", "cancelled"):
-            self.emit({"type": "error", "message": "fin de tour ACP : %s" % stop})
+            self.emit({"type": "error", "message": "ACP turn ended: %s" % stop})
             exit_code = 1
         self._close()
         return exit_code
@@ -987,30 +987,30 @@ class AcpTurn:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ameesh.acp", description="Pont ACP générique d'un tour d'exécuteur (L16).")
+        prog="ameesh.acp", description="Generic ACP bridge for one runner turn (L16).")
     sub = parser.add_subparsers(dest="command")
-    run = sub.add_parser("run", help="un tour : initialize, session, prompt, fin")
-    run.add_argument("--descriptor", required=True, help="descripteur du harnais (JSON)")
+    run = sub.add_parser("run", help="one turn: initialize, session, prompt, end")
+    run.add_argument("--descriptor", required=True, help="harness descriptor (JSON)")
     run.add_argument("--descriptor-sha256", default=None,
-                     help="empreinte attendue du descripteur : le pont refuse un fichier "
-                          "modifié depuis la construction de la commande")
-    run.add_argument("--agent", required=True, help="binaire de l'agent ACP")
-    run.add_argument("--prompt", required=True, help="consigne du tour")
-    run.add_argument("--session", default=None, help="session à reprendre")
+                     help="expected descriptor fingerprint: the bridge rejects a file "
+                          "modified since the command was built")
+    run.add_argument("--agent", required=True, help="ACP agent binary")
+    run.add_argument("--prompt", required=True, help="turn prompt")
+    run.add_argument("--session", default=None, help="session to resume")
     run.add_argument("--model", default=None)
     run.add_argument("--effort", default=None)
     run.add_argument("--tier", default=None)
-    run.add_argument("--cwd", default=None, help="dossier de session (défaut : courant)")
+    run.add_argument("--cwd", default=None, help="session directory (default: current)")
     run.add_argument("--timeout", type=float, default=0.0,
-                     help="délai global du tour en secondes (0 = aucun)")
+                     help="overall turn timeout in seconds (0 = none)")
     run.add_argument("--init-timeout", type=float, default=DEFAULT_INIT_TIMEOUT,
-                     help="délai d'initialize et de la session (défaut %g s)"
+                     help="initialize and session timeout (default %g s)"
                      % DEFAULT_INIT_TIMEOUT)
     run.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT,
-                     help="inactivité maximale de l'agent pendant un tour (défaut %g s ; "
-                     "0 = aucun)" % DEFAULT_IDLE_TIMEOUT)
+                     help="maximum agent idle time during a turn (default %g s; "
+                     "0 = none)" % DEFAULT_IDLE_TIMEOUT)
     run.add_argument("--cancel-grace", type=float, default=CANCEL_GRACE,
-                     help="attente après session/cancel avant SIGKILL (défaut %g s)"
+                     help="wait after session/cancel before SIGKILL (default %g s)"
                      % CANCEL_GRACE)
     return parser
 
@@ -1024,19 +1024,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         descriptor = harnesses.load(args.descriptor)
-        log("descripteur %s : %s (%s, sha256 %s)"
+        log("descriptor %s: %s (%s, sha256 %s)"
             % (descriptor.id, descriptor.path, descriptor.source,
                (descriptor.sha256 or "?")[:16]))
         if args.descriptor_sha256 and descriptor.sha256 != args.descriptor_sha256:
-            message = ("descripteur modifié depuis la construction de la commande "
-                       "(attendu %s, lu %s)" % (args.descriptor_sha256[:16],
+            message = ("descriptor modified since the command was built "
+                       "(expected %s, read %s)" % (args.descriptor_sha256[:16],
                                                 (descriptor.sha256 or "?")[:16]))
             print(json.dumps({"type": "error", "message": message}, ensure_ascii=False))
             log(message)
             return 2
     except harnesses.DescriptorError as exc:
         print(json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=False))
-        log("descripteur %s : %s" % (args.descriptor, exc))
+        log("descriptor %s: %s" % (args.descriptor, exc))
         return 2
 
     def _stop(_signum, _frame):

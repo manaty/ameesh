@@ -995,19 +995,19 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
                         "critical": value >= limit * critical_factor})
 
-    floor("min_mem_available", "mémoire disponible", reading.get("mem_available_bytes"),
+    floor("min_mem_available", "available memory", reading.get("mem_available_bytes"),
           limits["min_mem_available"], CRITICAL_MEM_FACTOR)
-    ceiling("max_swap_used", "swap utilisé", reading.get("swap_used_bytes"),
+    ceiling("max_swap_used", "swap used", reading.get("swap_used_bytes"),
             limits["max_swap_used"], CRITICAL_SWAP_FACTOR)
-    ceiling("max_load", "charge 1 min", reading.get("load1"),
+    ceiling("max_load", "1-min load", reading.get("load1"),
             limits["max_load"], CRITICAL_LOAD_FACTOR)
-    volume_floor("min_disk_free", "disque libre", "disk_free_bytes",
+    volume_floor("min_disk_free", "free disk", "disk_free_bytes",
                  limits["min_disk_free"], CRITICAL_DISK_FACTOR)
     # #246: btrfs allocation, which `disk_free` (statvfs) does not see; like
     # the other floors, a breach closes new turns well before the critical level
-    volume_floor("min_btrfs_unallocated", "btrfs non alloué", "btrfs_unallocated_bytes",
+    volume_floor("min_btrfs_unallocated", "btrfs unallocated", "btrfs_unallocated_bytes",
                  limits.get("min_btrfs_unallocated"), CRITICAL_BTRFS_FACTOR)
-    volume_floor("min_btrfs_metadata_headroom", "marge des métadonnées btrfs",
+    volume_floor("min_btrfs_metadata_headroom", "btrfs metadata headroom",
                  "btrfs_metadata_headroom_bytes",
                  limits.get("min_btrfs_metadata_headroom"), CRITICAL_BTRFS_FACTOR)
     # L73 : un /tmp en tmpfs vit en mémoire et en swap ; critique à mi-chemin
@@ -1015,7 +1015,7 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     part = tmpfs_fraction(reading)
     limit = limits.get("max_tmpfs_used")
     if part is not None and limit is not None and part > limit:
-        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s occupé"
+        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s used"
                     % (reading.get("tmp_path") or "/tmp"), "value": part, "limit": limit,
                     "critical": part >= limit + (1.0 - limit) / 2.0})
     # L159d: CPU pressure of the host; critical halfway between the ceiling
@@ -1029,7 +1029,7 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     if etat["state"] in ("low", "stop"):
         # L106 : jamais `critical` — la pause des agents peu prioritaires ne
         # sert à rien ici ; l'arrêt propre (`stop`) est l'affaire de l'exécuteur
-        out.append({"key": "min_battery_percent", "label": "batterie (sur batterie)",
+        out.append({"key": "min_battery_percent", "label": "battery (on battery power)",
                     "value": etat["battery_percent"], "limit": etat["min"],
                     "critical": False, "power": etat["state"]})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
@@ -1097,7 +1097,7 @@ def fmt_value(key: str, value) -> str:
 
 def describe(found: list[dict]) -> str:
     """Les franchissements en clair : « swap utilisé 17.5 GiB (seuil 16.0 GiB) »."""
-    return " ; ".join("%s %s (seuil %s)" % (b["label"], fmt_value(b["key"], b["value"]),
+    return "; ".join("%s %s (threshold %s)" % (b["label"], fmt_value(b["key"], b["value"]),
                                             fmt_value(b["key"], b["limit"]))
                       for b in found or [])
 

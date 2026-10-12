@@ -131,7 +131,7 @@ class PanneDeBaseTest(PgTestCase):
             lambda: registry.get(self.db, "panne")["status_text"] == "base injoignable"))
         row = registry.get(self.db, "panne")
         self.assertEqual(row["status"], "blocked")
-        self.assertIn("délai de connexion dépassé", row["last_error"])
+        self.assertIn("connection timeout exceeded", row["last_error"])
         self.assertNotIn("migrate", row["last_error"])
         self.pdb.coupe = False
         worker.wake.set()
@@ -219,7 +219,7 @@ class PanneDeBaseTest(PgTestCase):
                 mock.patch.object(accounts, "choose",
                                   side_effect=db_mod.DbError("psql : ERROR: deadlock detected")):
             raison = account_turn.choose(worker, mock.Mock())
-        self.assertIn("état des comptes indisponible", raison)
+        self.assertIn("account state unavailable", raison)
         self.assertNotIn("migrate", raison)
         with mock.patch.object(accounts, "profiles", return_value=[profil]), \
                 mock.patch.object(accounts, "choose", side_effect=db_mod.DbError(
@@ -289,7 +289,7 @@ class PanneDeBaseTest(PgTestCase):
 
     def test_explain_delai_de_connexion(self):
         texte = db_mod.explain(db_mod.Unavailable(TIMEOUT))
-        self.assertIn("délai de connexion dépassé", texte)
+        self.assertIn("connection timeout exceeded", texte)
         self.assertIn("AMEESH_CONNECT_TIMEOUT", texte)
         self.assertNotIn("migrate", texte)
 

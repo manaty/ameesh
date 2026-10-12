@@ -142,12 +142,12 @@ class UnrecordedTest(PgTestCase):
         self.assertEqual([e["id"] for e in report["unrecorded"]], [oublie])
         proc = self.mesh("work", "unrecorded")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("n°%d" % oublie, proc.stdout)
-        self.assertIn("alice → orch  [courrier]", proc.stdout)
+        self.assertIn("#%d" % oublie, proc.stdout)
+        self.assertIn("alice → orch  [mail]", proc.stdout)
         self.assertIn("ameesh work add", proc.stdout)
         proc = self.mesh("work", "unrecorded", "--since", "hier")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("--since illisible", proc.stderr)
+        self.assertIn("unreadable --since", proc.stderr)
         # aucune écriture : la commande ne touche ni au courrier ni aux lots
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM work_items")[0]["n"], 0)
 
@@ -155,12 +155,12 @@ class UnrecordedTest(PgTestCase):
         proc = self.mesh("work", "add", "--title", "L131 : demandes sans lot", "--source",
                          "alice : « liste les demandes sans lot »", "--priority", "1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("(priorité haute)", proc.stdout)
+        self.assertIn(" high)", proc.stdout)
         item, = work.list_items(self.db)
         self.assertEqual((item["priority"], item["source"]),
                          (1, "alice : « liste les demandes sans lot »"))
         proc = self.mesh("work", "show", str(item["id"]))
-        self.assertIn("priorité : 1 (haute)", proc.stdout)
+        self.assertIn(": 1 (high)", proc.stdout)
         proc = self.mesh("work", "add", "--title", "x", "--priority", "5")
         self.assertEqual(proc.returncode, 2)
         with self.assertRaises(work.WorkError):

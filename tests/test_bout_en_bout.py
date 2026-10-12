@@ -219,10 +219,10 @@ class BoutEnBoutTest(PgTestCase):
         self.commit = git(self.clone, "rev-parse", "origin/main")
 
         proc = self.run_mesh("canon", "check")
-        self.assertIn("canon valide — 0 erreur(s)", proc.stdout)
-        self.assertIn("état du canon pour %s : ok" % HOST, proc.stdout)
+        self.assertIn("canon valid — 0 error(s)", proc.stdout)
+        self.assertIn("canon state for %s: ok" % HOST, proc.stdout)
         self.assertIn(self.commit[:12], proc.stdout)            # lu au commit canonique
-        self.assertNotIn("NON APPROUVÉ", proc.stdout)
+        self.assertNotIn("NOT APPROVED", proc.stdout)
 
     # 2 ----------------------------------------------------------------------
     def etape_2_canon_sync(self) -> None:
@@ -253,7 +253,7 @@ class BoutEnBoutTest(PgTestCase):
             self.assertEqual({n: r["placement_ok"] for n, r in rows.items()},
                              {"orchestre": True, "relecteur": True})
         proc = self.run_mesh("canon", "check")
-        self.assertIn("registre  : ok pour %s" % HOST, proc.stdout)
+        self.assertIn("registry  : ok for %s" % HOST, proc.stdout)
 
     # 3 ----------------------------------------------------------------------
     def etape_3_executeur(self) -> None:
@@ -262,10 +262,10 @@ class BoutEnBoutTest(PgTestCase):
             proc = self.run_mesh("mail", "send", name,
                                  "Bonjour %s, le lot 7 d'acme-web est à préparer." % name,
                                  "--from", "alice")
-            self.assertIn("déposé pour : %s" % name, proc.stdout)
+            self.assertIn("dropped for: %s" % name, proc.stdout)
         out = self.run_runner()
         for name in ("orchestre", "relecteur"):
-            self.assertIn("bail acquis : %s" % name, out)
+            self.assertIn("lease acquired: %s" % name, out)
         turns = self.turns()
         self.assertEqual(sorted((t["harness"], t["env"]["AGENT_MAIL_NAME"]) for t in turns),
                          [("claude", "orchestre"), ("codex", "relecteur")], out)
@@ -286,7 +286,7 @@ class BoutEnBoutTest(PgTestCase):
     def etape_4_message_et_fil(self) -> None:
         text = ("Relecteur, le lot 7 est prêt : relis la PR %s avant la fusion." % PR)
         proc = self.run_mesh("mail", "send", "relecteur", text, AGENT_MAIL_NAME="orchestre")
-        self.assertIn("déposé pour : relecteur", proc.stdout)
+        self.assertIn("dropped for: relecteur", proc.stdout)
 
         proc = self.run_mesh("fil", "show", PROJECT)
         self.assertRegex(proc.stdout, r"(?m)^### \S+ — human:alice → agent:orchestre$")
@@ -318,7 +318,7 @@ class BoutEnBoutTest(PgTestCase):
         self.assertEqual(self.gh_calls("merge"), 0)              # le monde n'a pas été touché
         self.assertEqual(self.pr()["state"], "OPEN")
         proc = self.run_mesh("decisions", "--for", ALICE)
-        self.assertIn("actions à approuver", proc.stdout)
+        self.assertIn("actions to approve", proc.stdout)
         self.assertIn(action_id, proc.stdout)
         return action_id
 
@@ -344,7 +344,7 @@ class BoutEnBoutTest(PgTestCase):
         alice = next(m for m in loaded.members if m.title == "alice")
         self.assertEqual([a["credential_id"] for a in alice.authenticators],
                          [soft.credential_id])
-        self.assertIn("canon valide — 0 erreur(s)", self.run_mesh("canon", "check").stdout)
+        self.assertIn("canon valid — 0 error(s)", self.run_mesh("canon", "check").stdout)
         report = json.loads(self.run_mesh("canon", "sync", "--json").stdout)
         self.assertEqual((report["canon_status"], report["errors"]), ("ok", 0))
         # canon sync recopie Member.authenticators dans le registre de confiance (§8.2)
@@ -369,7 +369,7 @@ class BoutEnBoutTest(PgTestCase):
         self.assertEqual((data["digest"], data["action_digest"], data["approver"]),
                          (self.action["digest"], self.action["digest"], ALICE))
         proc = self.run_mesh("action", "fetch-receipt", action_id, rc=5)
-        self.assertIn("pas encore signée", proc.stdout)           # en attente du téléphone
+        self.assertIn("not signed yet", proc.stdout)           # en attente du téléphone
 
         done = banc_v1.approve(port, data["link"], soft)
         self.assertEqual(done["result"], {"request_id": data["request_id"],
@@ -378,7 +378,7 @@ class BoutEnBoutTest(PgTestCase):
         receipt_path = os.path.join(self.ws, "recu.json")
         proc = self.run_mesh("action", "fetch-receipt", action_id, "--out", receipt_path,
                              "--by", ALICE)
-        self.assertIn("reçu de la demande %s vérifié et attaché : action %s approved"
+        self.assertIn("receipt of request %s verified and attached: action %s approved"
                       % (data["request_id"], action_id), proc.stdout)
         with open(receipt_path, encoding="utf-8") as fh:
             receipt = json.load(fh)
@@ -387,10 +387,10 @@ class BoutEnBoutTest(PgTestCase):
                          ("ameesh-receipt/1", "webauthn", ALICE, action_id, ORCHESTRE))
         proc = self.run_mesh("receipt", "verify", receipt_path, "--digest",
                              self.action["digest"], "--action-id", action_id)
-        self.assertIn("reçu VALIDE : approve par %s (webauthn" % ALICE, proc.stdout)
+        self.assertIn("receipt VALID: approve by %s (webauthn" % ALICE, proc.stdout)
         # le lien est dans le fil du projet ; le jeton de service nulle part
         thread = self.run_mesh("fil", "show", PROJECT).stdout
-        self.assertIn("Demande d'approbation de l'action %s" % action_id, thread)
+        self.assertIn("Approval request for action %s" % action_id, thread)
         self.assertIn(data["link"], thread)
         self.assertNotIn(self.service_token, thread)
         return receipt_path
@@ -404,10 +404,10 @@ class BoutEnBoutTest(PgTestCase):
         self.assertEqual(self.pr()["state"], "MERGED")           # l'effet a eu lieu
         self.assertEqual(self.gh_calls("merge"), 1)
         proc = self.run_mesh("decisions", "--for", ALICE)
-        self.assertIn("issues inconnues à trancher", proc.stdout)
+        self.assertIn("unknown outcomes to settle", proc.stdout)
         self.assertIn(action_id, proc.stdout)
         # aucune nouvelle tentative : ni exécution, ni nouvelle liaison du reçu
-        self.assertIn("refus [state] : action %s : issue inconnue" % action_id,
+        self.assertIn("refused [state]: action %s: unknown outcome" % action_id,
                       self.run_mesh("action", "execute", action_id, rc=1).stderr)
         self.run_mesh("action", "approve", action_id, "--receipt", receipt_path, rc=1)
         self.assertEqual(self.gh_calls("merge"), 1)
@@ -416,7 +416,7 @@ class BoutEnBoutTest(PgTestCase):
     def etape_9_reconciliation(self, action_id: str, receipt_path: str) -> None:
         proc = self.run_mesh("action", "reconcile", action_id)
         merged = self.pr()["mergeCommit"]["oid"]
-        self.assertIn("réconciliée : confirmed (%s)" % merged, proc.stdout)
+        self.assertIn("reconciled: confirmed (%s)" % merged, proc.stdout)
         shown = json.loads(self.run_mesh("action", "show", action_id, "--json").stdout)
         self.assertEqual((shown["state"], shown["attempts"]), ("confirmed", 1))
         events = [event["event"] for event in shown["events"]]
@@ -433,15 +433,15 @@ class BoutEnBoutTest(PgTestCase):
         proc = self.run_mesh("receipt", "verify", receipt_path, "--digest",
                              self.action["digest"], "--action-id", action_id, rc=1)
         self.assertIn("[replay]", proc.stderr)
-        self.assertIn("aucune décision en attente",
+        self.assertIn("no pending decision",
                       self.run_mesh("decisions", "--for", ALICE).stdout)
         # chaque transition est lisible dans le fil du projet (§7.1)
         thread = self.run_mesh("fil", "show", PROJECT).stdout
-        for text in ("Action %s proposée par %s : git-merge merge sur %s" % (
+        for text in ("Action %s proposed by %s: git-merge merge on %s" % (
                          action_id, ORCHESTRE, PR),
-                     "Action %s approuvée" % action_id, "Action %s lancée" % action_id,
-                     "Action %s — issue INCONNUE" % action_id,
-                     "Action %s confirmée" % action_id):
+                     "Action %s approved" % action_id, "Action %s launched" % action_id,
+                     "Action %s — outcome UNKNOWN" % action_id,
+                     "Action %s confirmed" % action_id):
             self.assertIn(text, thread)
         self.assertRegex(thread, r"(?m)^### \S+ — agent:orchestre → human:alice$")
 

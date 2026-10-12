@@ -239,7 +239,7 @@ def format_report(rep: dict) -> list[str]:
             "—" if day["tmpfs_max"] is None else "%d %%" % round(day["tmpfs_max"] * 100),
             num(day["psi_cpu_p95"]), num(day["psi_mem_p95"]),
             num(day["turn_hours"], "%.2f"), num(day["guest_cpu_hours"], "%.2f")))
-    out.append("  lendable   CPU min %s ; memory min %s, median %s" % (
+    out.append("  lendable   CPU min %s; memory min %s, median %s" % (
         num(total["lendable_cpu_min"], "%.2f"), _fmt_bytes(total["lendable_memory_min"]),
         _fmt_bytes(total["lendable_memory_median"])))
     for c in rep["checks"]:

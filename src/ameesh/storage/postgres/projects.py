@@ -92,7 +92,8 @@ WITH unread AS (
                        (SELECT min(e.created_at) FROM work_item_events e
                          WHERE e.work_item_id = coalesce(ml.id, sw.id, a.id)
                            AND (e.actor IN (r.name, 'agent:' || r.name)
-                                OR position(('assigné à ' || r.name) in e.note) = 1)),
+                                OR position(('assigné à ' || r.name) in e.note) = 1
+                                OR position(('assigned to ' || r.name) in e.note) = 1)),
                        (SELECT min(m.created_at) FROM agent_mailbox m
                          WHERE m.sender = r.name
                            AND m.work_item_id = coalesce(ml.id, sw.id, a.id)::text)))::float8

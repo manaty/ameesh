@@ -60,20 +60,20 @@ def run_entrypoint(argv: list[str]) -> tuple[int, str]:
 class PublicEntrypointTest(unittest.TestCase):
     def test_models_est_route_et_n_est_pas_inconnu(self):
         code, err = run_entrypoint(["models", "list", "--json"])
-        self.assertNotIn("inconnue", err, "models doit être routé par main.py")
+        self.assertNotIn("unknown subcommand", err, "models doit être routé par main.py")
         self.assertNotEqual(code, 2, "2 est le code d'un routage refusé")
 
     def test_les_trois_sous_commandes_sont_routees(self):
         for argv in (["models", "list"], ["models", "show", "x"], ["models", "discover", "--dry-run"]):
             with self.subTest(argv=argv):
                 code, err = run_entrypoint(argv)
-                self.assertNotIn("inconnue", err, str(argv))
+                self.assertNotIn("unknown subcommand", err, str(argv))
                 self.assertNotEqual(code, 2, str(argv))
 
     def test_les_aides_sont_disponibles(self):
         code, err = run_entrypoint(["models", "--help"])
         self.assertEqual(code, 0)
-        self.assertNotIn("inconnue", err)
+        self.assertNotIn("unknown subcommand", err)
 
 
 if __name__ == "__main__":  # pragma: no cover
