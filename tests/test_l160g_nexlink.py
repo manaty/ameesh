@@ -208,5 +208,52 @@ class PathGatesLandTest(_Land):
         self.assertIn("domains stale", out["output"])
 
 
+class GeneratedLandTest(_Land):
+    """(a): a generated file is regenerated on the merged tree, never merged
+    nor resolved by rerere; its check gates the commit."""
+
+    def generate(self, check="grep -qx gen other.py"):
+        self.project = dataclasses.replace(self.project, generated=(radar.Generated(
+            "other.py", "printf 'gen\\n' > other.py", check),))
+
+    def test_changed_by_the_lot_regenerated(self):
+        self.generate()
+        self.queued(4)
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "show", "main:other.py"), "gen")
+
+    def test_conflict_on_it_is_regenerated_not_ejected(self):
+        self.queued(4)
+        _git(self.repo, "checkout", "-q", "main")
+        with open(os.path.join(self.repo, "other.py"), "w") as fh:
+            fh.write("z\n")
+        _git(self.repo, "commit", "-qam", "main moves other.py")
+        _git(self.repo, "push", "-q", "origin", "main")
+        self.generate()
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "show", "main:other.py"), "gen")
+
+    def test_failed_check_ejects_target_unmoved(self):
+        self.generate(check="echo domains.json stale; exit 1")
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("generated file other.py", self.fake.queue_rows[4]["reason"])
+        self.assertIn("domains.json stale", out["output"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_replay_never_counts_it_remaining(self):
+        replayer = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+        replayer.ensure()
+        a, b = (_git(self.repo, "rev-parse", r) for r in ("lot/1-a", "lot/2-b"))
+        plain = replayer.replay(a, b, "0" * 40)
+        self.assertEqual(plain["remaining"], ["shared.py"])
+        out = replayer.replay(a, b, "0" * 40, generated=frozenset({"shared.py"}))
+        self.assertEqual((out["state"], out["remaining"]), ("prepared", []))
+
+
 if __name__ == "__main__":
     unittest.main()

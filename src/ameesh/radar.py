@@ -618,7 +618,8 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
         resolutions.annotate(report, rows, {int(r["id"]): r for r in lots},
                              replayer=resolutions.Replayer(project.repo,
                                                            clone_dir(cfg, project.name)),
-                             cache=cache)
+                             cache=cache,
+                             generated=frozenset(g.path for g in project.generated))
     except Exception as exc:  # noqa: BLE001 - never fatal for the pass
         report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
 

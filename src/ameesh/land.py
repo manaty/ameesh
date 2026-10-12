@@ -96,13 +96,55 @@ def fresh_target(replayer, project, target: str) -> str:
                               "rev-parse")
 
 
-def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
+def _shell(command: str, path: str, timeout: float) -> str | None:
+    """Runs `command` in `path`: None if it passes, else the tail of its output."""
+    try:
+        proc = subprocess.run(command, shell=True, cwd=path, capture_output=True,
+                              timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return "timeout after %.0f s" % timeout
+    if proc.returncode == 0:
+        return None
+    out = (proc.stdout + proc.stderr).decode("utf-8", "replace").splitlines()
+    return "\n".join(out[-GATE_TAIL:]) or "exit %d" % proc.returncode
+
+
+def _regenerate(path: str, generated, touched, *, timeout: float = GATE_TIMEOUT_S) -> dict:
+    """L160g (#473): regenerates, on the merged tree in `path`, each
+    generated file in `touched` (in conflict, or changed by the lot), stages
+    it, then runs its check: `{ok, files, file, output}`."""
+    from . import resolutions
+    done = []
+    for item in generated:
+        if item.path not in touched:
+            continue
+        failed = _shell(item.regen, path, timeout)
+        if failed is None:
+            resolutions._check(resolutions._run(path, "add", "-A", "--", item.path), "add")
+            failed = _shell(item.check, path, timeout) if item.check else None
+        if failed is not None:
+            return {"ok": False, "files": done, "file": item.path, "output": failed}
+        done.append(item.path)
+    return {"ok": True, "files": done, "file": None, "output": ""}
+
+
+def merge(replayer, base: str, row: dict, rows: list[dict], *, generated=()) -> dict:
     """Merges the frozen commit of `row` into `base` in the clone, `rerere`
     primed by the resolutions `rows` of the lot. Leaves the merge committed
-    at HEAD: `{state: clean|replayed|conflict, files, sha}`."""
+    at HEAD: `{state: clean|replayed|conflict|generated, files, sha,
+    regenerated}`. `generated` (L160g, `radar.Generated`): those files are
+    never taken from a merge nor from rerere — regenerated on the merged
+    tree when in conflict or changed by the lot, then checked (`generated`:
+    the regeneration or its check failed, `output`)."""
     from . import resolutions
     path, run = replayer.path, resolutions._run
     lot = int(row["work_item_id"])
+    paths = {g.path for g in generated}
+    lot_side = set()
+    if paths:
+        fork = run(path, "merge-base", base, row["frozen_sha"])
+        lot_side = set(changed(path, resolutions._text(fork).strip(), row["frozen_sha"])
+                       or ()) if fork.returncode == 0 else set(paths)
     commits = [r["commit_sha"] for r in rows
                if lot in (int(r["work_item_id"]), int(r["other_item_id"]))]
     missing = set(replayer.prime(commits)) if commits else set()
@@ -114,18 +156,29 @@ def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
             shutil.copytree(replayer._store(sha), replayer._rr_cache(), dirs_exist_ok=True)
     proc = run(path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
                "merge", "--no-ff", "--no-commit", "--quiet", row["frozen_sha"])
-    state, files = "clean", []
+    state, files, regenerated = "clean", [], []
     try:
         if proc.returncode != 0:
             files = resolutions.unmerged(path)
-            remaining = resolutions.rerere_remaining(path) if files else []
-            left = sorted(set(remaining) | set(resolutions.with_markers(path, files)))
+            others = [f for f in files if f not in paths]
+            remaining = [f for f in resolutions.rerere_remaining(path) if f not in paths] \
+                if others else []
+            left = sorted(set(remaining) | set(resolutions.with_markers(path, others)))
             if not files or left:
                 run(path, "merge", "--abort")
                 return {"state": "conflict", "files": left or files,
                         "error": "" if files else resolutions._err(proc)[:300]}
-            resolutions._check(run(path, "add", "--", *files), "add")
-            state = "replayed"
+            if others:
+                resolutions._check(run(path, "add", "--", *others), "add")
+                state = "replayed"
+        touched = (set(files) | lot_side) & paths
+        if touched:
+            made = _regenerate(path, generated, touched)
+            if not made["ok"]:
+                run(path, "merge", "--abort")
+                return {"state": "generated", "files": [made["file"]],
+                        "output": made["output"]}
+            regenerated = made["files"]
         message = "Merge #%d « %s » (%s)\n\n%s: %d\n" % (
             lot, row.get("title") or "", row.get("branch") or row["frozen_sha"][:12],
             TRAILER, lot)
@@ -134,7 +187,8 @@ def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
     finally:
         replayer._empty_cache()
     sha = resolutions._check(run(path, "rev-parse", "HEAD"), "rev-parse")
-    return {"state": state, "files": files, "sha": sha}
+    return {"state": state, "files": [f for f in files if f not in paths], "sha": sha,
+            "regenerated": regenerated}
 
 
 def changed(path: str, base: str, sha: str) -> list | None:
@@ -153,15 +207,9 @@ def gates(project, path: str, *, files=None, timeout: float = GATE_TIMEOUT_S) ->
     for the `files` the merge touches (`radar.gates_for`)."""
     from . import radar
     for gate in radar.gates_for(project, files):
-        try:
-            proc = subprocess.run(gate, shell=True, cwd=path, capture_output=True,
-                                  timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "gate": gate, "output": "timeout after %.0f s" % timeout}
-        if proc.returncode != 0:
-            out = (proc.stdout + proc.stderr).decode("utf-8", "replace").splitlines()
-            return {"ok": False, "gate": gate,
-                    "output": "\n".join(out[-GATE_TAIL:]) or "exit %d" % proc.returncode}
+        failed = _shell(gate, path, timeout)
+        if failed is not None:
+            return {"ok": False, "gate": gate, "output": failed}
     return {"ok": True, "gate": None, "output": ""}
 
 
@@ -525,7 +573,14 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             base).returncode == 0:
         # #194 r4: another executor (an earlier epoch) already pushed it
         return landing.landed({"sha": base, "state": "already", "files": []}, base)
-    merged = merge(replayer, base, row, landing.ops.resolutions([lot]))
+    merged = merge(replayer, base, row, landing.ops.resolutions([lot]),
+                   generated=getattr(project, "generated", ()))
+    if merged["state"] == "generated":
+        return landing.eject("generated file %s: regeneration or check failed on the merged "
+                             "tree" % merged["files"][0],
+                             "Its output:\n%s\nFix the generator or its inputs on your branch, "
+                             "freeze again, then ameesh work queue add %d."
+                             % (merged["output"], lot), output=merged["output"])
     if merged["state"] == "conflict":
         return landing.eject("conflict on %s with %s at %s" % (
             ", ".join(merged["files"][:6]) or "?", row["target"], base[:12]),
