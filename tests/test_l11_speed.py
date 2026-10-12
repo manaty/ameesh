@@ -471,12 +471,44 @@ class CanonSyncTest(PgTestCase):
 
     def test_intervalle_nul_synchronise_seulement_au_demarrage(self):
         runner = self._runner(canon="/tmp/canon-fictif", interval=0.0)
+        runner.once = False
         appels: list = []
-        with mock.patch.object(Runner, "canon_sync_once",
-                               side_effect=lambda: appels.append(1) or True):
+
+        def sync():
+            appels.append(1)
+            runner._canon_complete = True  # tous les canons lus
+            return True
+
+        with mock.patch.object(Runner, "canon_sync_once", side_effect=sync):
             runner.start_canon_sync()
         self.assertEqual(appels, [1])
         self.assertIsNone(runner.canon_thread)
+        self.assertTrue(runner._gate_settled.is_set())
+
+    def test_porte_fixee_seulement_apres_un_sync_complet(self):
+        # L159f (codex r1 #279) : un premier sync en échec ne fixe pas la porte
+        # d'hôte (un hôte prêteur au canon illisible ne réclame rien) ; le sync
+        # est réessayé vite, et la porte est fixée au premier sync complet
+        cfg = dataclasses.replace(self.cfg, canon="/tmp/canon-fictif",
+                                  canon_sync_interval=3600.0)
+        runner = Runner(cfg, self.db, once=False)
+        self.assertFalse(runner._gate_settled.is_set())
+        resultats = [False, True]
+        appels: list = []
+
+        def sync():
+            appels.append(1)
+            runner._canon_complete = resultats.pop(0) if resultats else True
+            return runner._canon_complete
+
+        with mock.patch("ameesh.runner.GATE_SETTLE_RETRY_S", 0.05, create=True), \
+                mock.patch.object(Runner, "canon_sync_once", side_effect=sync):
+            runner.start_canon_sync()
+            self.wait_for(lambda: appels, timeout=3)
+            self.wait_for(runner._gate_settled.is_set, timeout=5)
+            self.assertEqual(len(appels), 2)  # réessayé sans attendre l'intervalle
+            runner.stop.set()
+            runner.canon_thread.join(timeout=5)
 
     def test_boucle_periodique_demarree_puis_arretee(self):
         runner = self._runner(canon="/tmp/canon-fictif", interval=3600.0)
