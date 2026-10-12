@@ -8,9 +8,11 @@ the critical episodes, the load, the `/tmp` tmpfs, the PSI, the turns and
 the guest CPU hosted, and the lendable capacity; then the study's targets,
 met or not.
 
-Times are weighted by the gap to the next reading, capped: a gap longer
-than `MAX_GAP_S` (no runner published) counts for nothing rather than for
-an unknown state.
+A state read at a reading (pressure, turns in progress) holds until the
+next reading; an average over the window before it (`guest_cpu`, over
+`cpu_window_s`) stands for that window. A gap longer than `MAX_GAP_S` (no
+runner published) counts for nothing rather than for an unknown state.
+Every interval is cut at midnight (local time) into the days it covers.
 """
 from __future__ import annotations
 
@@ -39,34 +41,76 @@ def percentile(values, q: float) -> float | None:
     return data[low] + (data[high] - data[low]) * (pos - low)
 
 
-def _weighted(readings: list[dict]) -> list[tuple[dict, float]]:
-    """Each reading with the time it stands for (gap to the next one)."""
+def _day(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+
+
+def _next_midnight(ts: float) -> float:
+    t = time.localtime(float(ts))
+    midnight = time.mktime((t.tm_year, t.tm_mon, t.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+    return midnight if midnight > ts else ts + 1.0  # never stalls on a DST oddity
+
+
+def _by_day(start: float, end: float) -> list[tuple[str, float]]:
+    """[start, end) cut at midnight: (day, seconds) for each day it covers."""
     out = []
-    for i, row in enumerate(readings):
-        gap = 0.0
-        if i + 1 < len(readings):
-            gap = float(readings[i + 1]["sampled_ts"]) - float(row["sampled_ts"])
-            if gap < 0 or gap > MAX_GAP_S:
-                gap = 0.0
-        out.append((row, gap))
+    while end > start:
+        cut = min(end, _next_midnight(start))
+        out.append((_day(start), cut - start))
+        start = cut
     return out
 
 
-def _summary(rows: list[tuple[dict, float]], limits: dict) -> dict:
-    pressure_s = turns_s = guest_cpu_s = 0.0
-    episodes = 0
+def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
+    """The time each reading stands for, cut by day: (day, row, held,
+    window) seconds — `held`, its state up to the next reading; `window`,
+    its averages (`guest_cpu`) over the window before it, at most the gap
+    to the previous reading (the earlier time is that reading's)."""
+    out = []
+    for i, row in enumerate(readings):
+        ts = float(row["sampled_ts"])
+        if i + 1 < len(readings):
+            gap = float(readings[i + 1]["sampled_ts"]) - ts
+            if 0 < gap <= MAX_GAP_S:
+                out += [(day, row, secs, 0.0) for day, secs in _by_day(ts, ts + gap)]
+        window = row.get("cpu_window_s")
+        before = ts - float(readings[i - 1]["sampled_ts"]) if i else None
+        if window is None:
+            window = before if before is not None and before <= MAX_GAP_S else 0.0
+        elif before is not None:
+            window = min(float(window), before)
+        window = min(max(float(window), 0.0), MAX_GAP_S)
+        if window > 0:
+            out += [(day, row, 0.0, secs) for day, secs in _by_day(ts - window, ts)]
+    return out
+
+
+def _episode_starts(readings: list[dict], limits: dict) -> list[dict]:
+    """The readings that open a critical episode; a hole in the measure
+    ends an episode."""
+    out = []
     previous_critical = False
-    for row, gap in rows:
-        verdict = resources.pressure(row, limits=limits)
-        if verdict["blocked"]:
-            pressure_s += gap
-        if verdict["critical"] and not previous_critical:
-            episodes += 1
-        # a hole in the measure ends an episode
-        previous_critical = verdict["critical"] and gap > 0
-        turns_s += (row.get("turns_in_progress") or 0) * gap
-        guest_cpu_s += (row.get("guest_cpu") or 0.0) * gap
-    readings = [row for row, _gap in rows]
+    previous_ts = None
+    for row in readings:
+        ts = float(row["sampled_ts"])
+        if previous_ts is not None and not 0 < ts - previous_ts <= MAX_GAP_S:
+            previous_critical = False
+        critical = resources.pressure(row, limits=limits)["critical"]
+        if critical and not previous_critical:
+            out.append(row)
+        previous_critical, previous_ts = critical, ts
+    return out
+
+
+def _summary(readings: list[dict], intervals, episodes: int, limits: dict) -> dict:
+    pressure_s = turns_s = guest_cpu_s = measured_s = 0.0
+    for _day_, row, held, window in intervals:
+        if held:
+            measured_s += held
+            if resources.pressure(row, limits=limits)["blocked"]:
+                pressure_s += held
+            turns_s += (row.get("turns_in_progress") or 0) * held
+        guest_cpu_s += (row.get("guest_cpu") or 0.0) * window
     cpus = [r.get("cpu_count") for r in readings if r.get("cpu_count")]
 
     def values(key):
@@ -75,7 +119,7 @@ def _summary(rows: list[tuple[dict, float]], limits: dict) -> dict:
     tmpfs = [resources.tmpfs_fraction(r) for r in readings]
     return {
         "samples": len(readings),
-        "measured_s": round(sum(gap for _row, gap in rows), 1),
+        "measured_s": round(measured_s, 1),
         "pressure_min": round(pressure_s / 60.0, 1),
         "critical_episodes": episodes,
         "cpu_count": max(cpus) if cpus else None,
@@ -104,19 +148,26 @@ def _int(value):
     return None if value is None else int(value)
 
 
-def _day(ts: float) -> str:
-    return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
-
-
 def report(host: str, readings: list[dict], limits: dict, *, days: float) -> dict:
     """The pilot report of `host` (schema `ameesh-pilot-report/1`) from its
     readings, oldest first, judged with its effective `limits`."""
-    rows = _weighted(sorted(readings, key=lambda r: float(r["sampled_ts"])))
-    by_day: dict[str, list] = {}
-    for row, gap in rows:
-        by_day.setdefault(_day(row["sampled_ts"]), []).append((row, gap))
-    total = _summary(rows, limits)
-    measured_days = total["measured_s"] / 86400.0
+    rows = sorted(readings, key=lambda r: float(r["sampled_ts"]))
+    intervals = _intervals(rows)
+    starts = _episode_starts(rows, limits)
+    daily: dict[str, dict] = {}
+
+    def day_of(name):
+        return daily.setdefault(name, {"readings": [], "intervals": [], "episodes": 0})
+
+    for row in rows:
+        day_of(_day(row["sampled_ts"]))["readings"].append(row)
+    for interval in intervals:
+        day_of(interval[0])["intervals"].append(interval)
+    for row in starts:
+        day_of(_day(row["sampled_ts"]))["episodes"] += 1
+    total = _summary(rows, intervals, len(starts), limits)
+    by_day = [dict(_summary(d["readings"], d["intervals"], d["episodes"], limits), day=name)
+              for name, d in sorted(daily.items())]
     cpus = total["cpu_count"]
     checks = []
 
@@ -124,9 +175,10 @@ def report(host: str, readings: list[dict], limits: dict, *, days: float) -> dic
         checks.append({"key": key, "value": value, "target": target,
                        "ok": None if value is None else ok})
 
-    per_day = (total["pressure_min"] / measured_days) if measured_days > 0 else None
-    check("pressure_min_per_day", _round(per_day, 1), TARGET_PRESSURE_MIN_PER_DAY,
-          per_day is not None and per_day < TARGET_PRESSURE_MIN_PER_DAY)
+    # the target holds for each day, not on average: the worst measured day
+    worst = max((d["pressure_min"] for d in by_day if d["measured_s"] > 0), default=None)
+    check("pressure_min_per_day", worst, TARGET_PRESSURE_MIN_PER_DAY,
+          worst is not None and worst < TARGET_PRESSURE_MIN_PER_DAY)
     load_target = TARGET_LOAD_P95_PER_CPU * cpus if cpus else None
     check("load_p95", total["load_p95"], load_target,
           load_target is not None and total["load_p95"] is not None
@@ -141,11 +193,10 @@ def report(host: str, readings: list[dict], limits: dict, *, days: float) -> dic
         "schema": "ameesh-pilot-report/1",
         "host": host,
         "days": days,
-        "first_ts": rows[0][0]["sampled_ts"] if rows else None,
-        "last_ts": rows[-1][0]["sampled_ts"] if rows else None,
+        "first_ts": rows[0]["sampled_ts"] if rows else None,
+        "last_ts": rows[-1]["sampled_ts"] if rows else None,
         "total": total,
-        "by_day": [dict(_summary(day_rows, limits), day=day)
-                   for day, day_rows in sorted(by_day.items())],
+        "by_day": by_day,
         "checks": checks,
     }
 

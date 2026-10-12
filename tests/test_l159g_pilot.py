@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import unittest
 
 from ameesh import pilot, resources, storage
@@ -68,6 +69,18 @@ class UnitsTest(unittest.TestCase):
         runner = unit("ameesh-guest-runner@.service")
         self.assertGreaterEqual(resources.parse_bytes(u["MemoryMax"][0]),
                                 resources.parse_bytes(runner["MemoryMax"][0]))
+
+    def test_parent_slice_yields_to_the_application(self):
+        # r1 P2: systemd nests the guest slice under ameesh.slice, so its
+        # weights only rank it among siblings; the parent's weight is the one
+        # that competes with system.slice and user.slice
+        self.assertEqual(resources.slice_path("ameesh-guest.slice").split(os.sep)[0],
+                         "ameesh.slice")
+        u = unit(os.path.join("ameesh.slice.d", "guest-weight.conf"))
+        self.assertEqual(u["CPUWeight"], ["10"])
+        self.assertEqual(u["IOWeight"], ["10"])
+        with open(os.path.join(GUEST, "ameesh-guest.slice"), encoding="utf-8") as fh:
+            self.assertIn("ameesh.slice.d/guest-weight.conf", fh.read())
 
     def test_guest_slice_is_measured(self):
         self.assertIn("ameesh-guest.slice", resources.GUEST_SLICES)
@@ -139,6 +152,62 @@ class ReportTest(unittest.TestCase):
         self.assertTrue(checks["psi_mem_p95"]["ok"])
         self.assertTrue(checks["critical_episodes"]["ok"])
         json.dumps(rep)
+
+    def test_pressure_target_holds_each_day(self):
+        # r1 P2: 15 min on one day and none on the next average 7.5 min/day,
+        # yet the first day misses the target
+        t0 = time.mktime((2027, 1, 15, 0, 0, 0, 0, 0, -1))
+        rows = [reading(t0 + 300 * i) for i in range(2 * 288 + 1)]
+        for i in (10, 11, 12):
+            rows[i]["mem_available_bytes"] = int(0.9 * GIB)   # blocked, 5 min each
+        rep = pilot.report("vm", rows, self.limits(), days=2)
+        self.assertEqual([d["pressure_min"] for d in rep["by_day"]], [15.0, 0.0, 0.0])
+        check = {c["key"]: c for c in rep["checks"]}["pressure_min_per_day"]
+        self.assertEqual(check["value"], 15.0)
+        self.assertFalse(check["ok"])
+        rows[12]["mem_available_bytes"] = 8 * GIB
+        check = {c["key"]: c for c in pilot.report("vm", rows, self.limits(),
+                                                     days=2)["checks"]}["pressure_min_per_day"]
+        self.assertEqual((check["value"], check["ok"]), (10.0, False))   # strictly under
+        rows[11]["mem_available_bytes"] = 8 * GIB
+        check = {c["key"]: c for c in pilot.report("vm", rows, self.limits(),
+                                                     days=2)["checks"]}["pressure_min_per_day"]
+        self.assertEqual((check["value"], check["ok"]), (5.0, True))
+
+    def test_guest_cpu_stands_for_the_window_before_its_reading(self):
+        # r1 P2: readings at 0/60/120 s, guest CPU None/0/60: the last one is
+        # the average over 60–120 s, i.e. 3600 CPU-s (1 h), not over 120 s–
+        t0 = 1_800_000_000.0
+        rows = [reading(t0, guest_cpu=None), reading(t0 + 60, guest_cpu=0.0),
+                reading(t0 + 120, guest_cpu=60.0)]
+        self.assertEqual(pilot.report("vm", rows, self.limits(), days=1)
+                         ["total"]["guest_cpu_hours"], 1.0)
+        # a shorter measured window counts only for itself
+        rows[2]["cpu_window_s"] = 30.0
+        self.assertEqual(pilot.report("vm", rows, self.limits(), days=1)
+                         ["total"]["guest_cpu_hours"], 0.5)
+        # a window longer than the gap to the previous reading is capped by it
+        rows[2]["cpu_window_s"] = 90.0
+        self.assertEqual(pilot.report("vm", rows, self.limits(), days=1)
+                         ["total"]["guest_cpu_hours"], 1.0)
+
+    def test_an_interval_across_midnight_is_cut(self):
+        # r1 P2: from 23:59 to 00:01, one minute on each day
+        midnight = time.mktime((2027, 1, 16, 0, 0, 0, 0, 0, -1))
+        blocked = int(0.9 * GIB)
+        rows = [reading(midnight - 120, mem_available_bytes=blocked, guest_cpu=None),
+                reading(midnight - 60, mem_available_bytes=blocked, guest_cpu=60.0),
+                reading(midnight + 60, mem_available_bytes=blocked, guest_cpu=60.0)]
+        rep = pilot.report("vm", rows, self.limits(), days=2)
+        first, second = rep["by_day"]
+        self.assertEqual((first["measured_s"], second["measured_s"]), (120.0, 60.0))
+        self.assertEqual((first["pressure_min"], second["pressure_min"]), (2.0, 1.0))
+        self.assertEqual((first["samples"], second["samples"]), (2, 1))
+        # guest CPU: 60 s before 23:59 and 60 s before midnight on the first
+        # day, the 60 s after it on the second
+        self.assertEqual((first["guest_cpu_hours"], second["guest_cpu_hours"]), (2.0, 1.0))
+        self.assertEqual(rep["total"]["measured_s"], 180.0)
+        self.assertEqual(rep["total"]["guest_cpu_hours"], 3.0)
 
     def test_no_reading(self):
         rep = pilot.report("vm", [], self.limits(), days=7)
