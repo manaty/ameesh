@@ -313,13 +313,16 @@ class Agents(interface.Agents):
         )
 
     @track_change("replaced", returns_none=True)
-    def set_session(self, name, session_id, account=None) -> None:
+    def set_session(self, name, session_id, account=None, *, harness=None, cwd=None) -> None:
         # L39 (0033) : la session ET le compte sous lequel elle tourne, en une
-        # écriture (NULL : hôte sans comptes déclarés)
+        # écriture (NULL : hôte sans comptes déclarés) ; #408 (0384) : et le
+        # harnais et le dossier de son ouverture, s'ils sont connus
+        connue = harness is not None or cwd is not None
         self.db.execute(
             "UPDATE agent_registry SET session_id = %s, session_account = %s,"
+            " session_harness = %s, session_cwd = %s, session_origin = %s,"
             " updated_at = now() WHERE name = %s",
-            (session_id, account, name),
+            (session_id, account, harness, cwd, session_id if connue else None, name),
         )
 
     def set_session_account(self, name, account) -> bool:

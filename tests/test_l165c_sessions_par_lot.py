@@ -34,6 +34,11 @@ class _Base(PgTestCase):
         self.assertIsNotNone(lease)
         return runner, lease
 
+    def origine(self, name: str) -> tuple:
+        row = self.db.query("SELECT session_harness, session_cwd, session_origin"
+                            "  FROM agent_registry WHERE name = %s", (name,))[0]
+        return (row["session_harness"], row["session_cwd"], row["session_origin"])
+
     @property
     def st(self):
         return storage.of(self.db).lot_sessions
@@ -47,20 +52,23 @@ class StockageTest(_Base):
         epoch = lease["lease_epoch"]
         storage.of(self.db).operations.set_session_work_item("a1", runner.runner_id, epoch,
                                                              str(a))
-        registry.set_session(self.db, "a1", "sess-a", "compte")
+        registry.set_session(self.db, "a1", "sess-a", "compte", harness="claude", cwd="/w")
         cle = dict(harness="claude", account="compte", cwd="/w")
         out = self.st.switch("a1", runner.runner_id, epoch, to_lot=str(b),
-                             current="sess-a", current_account="compte", **cle)
-        self.assertEqual(out, {"resumed": None, "parked": "sess-a", "discarded": None})
+                             current="sess-a", **cle)
+        self.assertEqual(out, {"resumed": None, "parked": "sess-a", "discarded": None,
+                               "discard_reason": None})
         agent = registry.get(self.db, "a1")
         self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, str(b)))
-        registry.set_session(self.db, "a1", "sess-b", "compte")
+        registry.set_session(self.db, "a1", "sess-b", "compte", harness="claude", cwd="/w")
         out = self.st.switch("a1", runner.runner_id, epoch, to_lot=str(a),
-                             current="sess-b", current_account="compte", **cle)
-        self.assertEqual(out, {"resumed": "sess-a", "parked": "sess-b", "discarded": None})
+                             current="sess-b", **cle)
+        self.assertEqual(out, {"resumed": "sess-a", "parked": "sess-b", "discarded": None,
+                               "discard_reason": None})
         agent = registry.get(self.db, "a1")
         self.assertEqual((agent["session_id"], agent["session_work_item"],
                           agent["session_account"]), ("sess-a", str(a), "compte"))
+        self.assertEqual(self.origine("a1"), ("claude", "/w", "sess-a"))
         lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a1")}
         self.assertEqual(lignes, {a: None, b: "sess-b"})
 
@@ -75,14 +83,86 @@ class StockageTest(_Base):
                 cle = dict(harness="claude", account="compte", cwd="/w")
                 storage.of(self.db).operations.set_session_work_item(
                     "a2", runner.runner_id, epoch, str(a))
-                self.st.switch("a2", runner.runner_id, epoch, to_lot=str(b),
-                               current="sess-%d" % i, current_account="compte",
-                               **cle)
+                registry.set_session(self.db, "a2", "sess-%d" % i, "compte",
+                                     harness="claude", cwd="/w")
+                out = self.st.switch("a2", runner.runner_id, epoch, to_lot=str(b),
+                                     current="sess-%d" % i, **cle)
+                self.assertEqual(out["parked"], "sess-%d" % i)
                 cle.update(autre)
                 out = self.st.switch("a2", runner.runner_id, epoch, to_lot=str(a),
                                      current=None, **cle)
-                self.assertEqual((out["resumed"], out["discarded"]), (None, "sess-%d" % i))
+                self.assertEqual((out["resumed"], out["discarded"], out["discard_reason"]),
+                                 (None, "sess-%d" % i, "origin"))
                 self.assertIsNone(registry.get(self.db, "a2")["session_id"])
+
+    def test_origine_notee_a_l_ouverture_pas_a_la_mise_de_cote(self):
+        """r1 #420 : A ouverte dans /old, le placement passe à /new, la bascule
+        vers B met A de côté avec /old ; le retour sur A dans /new ne la
+        reprend pas. Une session d'origine inconnue n'est jamais reprise."""
+        runner, lease = self.bail("a6")
+        a = work.add(self.db, title="A", assignee="a6")["id"]
+        b = work.add(self.db, title="B", assignee="a6")["id"]
+        epoch = lease["lease_epoch"]
+        storage.of(self.db).operations.set_session_work_item("a6", runner.runner_id, epoch,
+                                                             str(a))
+        registry.set_session(self.db, "a6", "sess-a", None, harness="claude", cwd="/old")
+        neuf = dict(harness="claude", account=None, cwd="/new")
+        self.assertEqual(self.st.switch("a6", runner.runner_id, epoch, to_lot=str(b),
+                                        current="sess-a", **neuf)["parked"], "sess-a")
+        ligne = {r["work_item_id"]: r for r in self.st.listing("a6")}[a]
+        self.assertEqual((ligne["harness"], ligne["cwd"]), ("claude", "/old"))
+        out = self.st.switch("a6", runner.runner_id, epoch, to_lot=str(a),
+                             current=None, **neuf)
+        self.assertEqual((out["resumed"], out["discarded"]), (None, "sess-a"))
+        # session sans origine connue (écrite sans harnais ni dossier) : pas reprise
+        registry.set_session(self.db, "a6", "sess-x", None)
+        self.st.switch("a6", runner.runner_id, epoch, to_lot=str(b), current="sess-x", **neuf)
+        out = self.st.switch("a6", runner.runner_id, epoch, to_lot=str(a), current=None,
+                             **neuf)
+        self.assertEqual((out["resumed"], out["discarded"]), (None, "sess-x"))
+        # l'origine décrit la session du registre seulement : une autre
+        # session courante (fichier local) est mise de côté sans origine
+        registry.set_session(self.db, "a6", "sess-y", None, harness="claude", cwd="/new")
+        self.st.switch("a6", runner.runner_id, epoch, to_lot=str(b), current="sess-z", **neuf)
+        out = self.st.switch("a6", runner.runner_id, epoch, to_lot=str(a), current=None,
+                             **neuf)
+        self.assertEqual((out["resumed"], out["discarded"]), (None, "sess-z"))
+
+    def test_lot_fini_ou_reassigne_jamais_repris_ni_mis_de_cote(self):
+        """r1 #420 : un courrier `--lot A` après la fusion, la clôture ou la
+        réassignation de A, avant le relevé des branches, ne reprend pas sa
+        session ; un lot fini n'est pas mis de côté (pas de ligne recréée)."""
+        runner, lease = self.bail("a7")
+        epoch = lease["lease_epoch"]
+        cle = dict(harness="claude", account=None, cwd="/w")
+        b = work.add(self.db, title="B", assignee="a7")["id"]
+        for fin in ("close", "assign"):
+            with self.subTest(fin=fin):
+                a = work.add(self.db, title="A", assignee="a7")["id"]
+                storage.of(self.db).operations.set_session_work_item(
+                    "a7", runner.runner_id, epoch, str(a))
+                registry.set_session(self.db, "a7", "sess-" + fin, None, **{
+                    k: cle[k] for k in ("harness", "cwd")})
+                self.assertEqual(self.st.switch("a7", runner.runner_id, epoch, to_lot=str(b),
+                                                current="sess-" + fin, **cle)["parked"],
+                                 "sess-" + fin)
+                if fin == "close":
+                    work.close(self.db, a, abandoned=True, actor="test")
+                else:
+                    work.assign(self.db, a, "human:quelqu-un")
+                out = self.st.switch("a7", runner.runner_id, epoch, to_lot=str(a),
+                                     current=None, **cle)
+                self.assertEqual((out["resumed"], out["discarded"], out["discard_reason"]),
+                                 (None, "sess-" + fin, "lot"))
+                self.assertIsNone(registry.get(self.db, "a7")["session_id"])
+                # la session ouverte sur le lot fini n'est pas mise de côté
+                registry.set_session(self.db, "a7", "sess-2-" + fin, None, **{
+                    k: cle[k] for k in ("harness", "cwd")})
+                out = self.st.switch("a7", runner.runner_id, epoch, to_lot=str(b),
+                                     current="sess-2-" + fin, **cle)
+                self.assertIsNone(out["parked"])
+                lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a7")}
+                self.assertIsNone(lignes.get(a))
 
     def test_bascule_fencee_par_le_bail(self):
         runner, lease = self.bail("a3")
@@ -195,6 +275,26 @@ class RoutageTest(_Base):
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-B")
             lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("w1")}
             self.assertEqual(lignes, {a: "sess-A", b: None})
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_placement_change_apres_ouverture_session_neuve(self):
+        """r1 #420 : A ouverte dans un dossier, le placement change avant la
+        bascule vers B : le retour sur A ne reprend pas sa session ailleurs."""
+        worker = self._worker("w3")
+        try:
+            a = work.add(self.db, title="A", assignee="w3")["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            self.assertEqual(self.origine("w3"), ("claude", self._cwd("w3"), "sess-A"))
+            self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = %s",
+                            (self._cwd("w3-new"), "w3"))
+            work.move(self.db, a, "qa")
+            b = work.add(self.db, title="B", assignee="w3")["id"]
+            self.tour(worker, b, "prends B", session="sess-B")
+            argv = self.tour(worker, a, "retour de relecture sur A", session="sess-A2")
+            self.assertNotIn("--resume", argv)
+            self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
         finally:
             worker.watchdog_stop.set()
 

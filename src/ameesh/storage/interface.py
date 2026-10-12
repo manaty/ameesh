@@ -222,9 +222,12 @@ class Agents(Domain):
         """Note l'instant du dernier réveil d'événements."""
 
     @abc.abstractmethod
-    def set_session(self, name: str, session_id: str, account: str | None = None) -> None:
+    def set_session(self, name: str, session_id: str, account: str | None = None, *,
+                    harness: str | None = None, cwd: str | None = None) -> None:
         """Enregistre la session du harnais et le compte sous lequel elle tourne
-        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré)."""
+        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré).
+        #408 : `harness`/`cwd` donnés, ceux de son ouverture (`session_origin`
+        = la session) ; sinon son origine est inconnue."""
 
     @abc.abstractmethod
     def set_session_account(self, name: str, account: str | None) -> bool:
@@ -2520,17 +2523,20 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def switch(self, name: str, owner: str, epoch: int, *, to_lot: str,
                harness: str | None, account: str | None, cwd: str | None,
-               current: str | None = None,
-               current_account: str | None = None) -> dict | None:
+               current: str | None = None) -> dict | None:
         """Change le lot de la session active, **fencé par le bail**, en une
-        transaction : la session active `current` (ouverte sous le compte
-        `current_account`) est mise de côté pour le lot de session noté au
-        registre (s'il est un lot), puis celle mise de côté pour `to_lot`
-        devient active si elle a été ouverte sous les harnais `harness`, compte
-        `account` (celui du prochain tour) et dossier `cwd` (sinon elle est écartée et la session
-        active est vide : une session neuve s'ouvrira). Rend `{resumed,
-        parked, discarded}` (identifiants ou None), ou None si le bail n'est
-        plus le nôtre (rien n'est écrit)."""
+        transaction : la session active `current` est mise de côté pour le lot
+        de session noté au registre (s'il est un lot encore ouvert et assigné
+        à l'agent), avec l'origine notée à son OUVERTURE (`session_harness`,
+        `session_cwd`, `session_account` si `session_origin` est `current` ;
+        inconnue sinon, elle ne sera pas reprise) ; puis celle mise de côté
+        pour `to_lot` devient active si ce lot est encore ouvert et assigné à
+        l'agent et qu'elle a été ouverte sous les harnais `harness`, compte
+        `account` (celui du prochain tour) et dossier `cwd` (sinon elle est
+        écartée et la session active est vide : une session neuve s'ouvrira).
+        Rend `{resumed, parked, discarded, discard_reason}` (identifiants ou
+        None ; raison `origin` ou `lot`), ou None si le bail n'est plus le
+        nôtre (rien n'est écrit)."""
 
     @abc.abstractmethod
     def listing(self, name: str | None = None) -> list[dict]:

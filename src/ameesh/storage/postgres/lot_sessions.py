@@ -20,55 +20,75 @@ _COLUMNS = """
 
 class LotSessions(interface.LotSessions):
 
-    def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None,
-               current_account=None):
+    def switch(self, name, owner, epoch, *, to_lot, harness, account, cwd, current=None):
         with self.db.transaction() as tx:
             reg = tx.query(
                 "SELECT session_work_item,"
+                "       session_origin IS NOT DISTINCT FROM %s AS origine,"
+                "       session_account, session_harness, session_cwd,"
                 "       (lease_owner = %s AND lease_epoch = %s"
                 "        AND lease_expires_at > clock_timestamp()) AS ours"
                 "  FROM agent_registry WHERE name = %s FOR UPDATE",
-                (owner, int(epoch), name))
+                (current, owner, int(epoch), name))
             if not reg or not reg[0]["ours"]:
                 return None
+            r = reg[0]
+            # l'origine notée à l'ouverture de la session (inconnue si le
+            # registre ne la décrit pas : elle ne sera pas reprise)
+            if r.get("origine"):
+                origine = (r.get("session_harness"), r.get("session_account"),
+                           r.get("session_cwd"))
+            else:
+                origine = (None, None, None)
             parked = None
-            courant = str(reg[0].get("session_work_item") or "").strip()
+            courant = str(r.get("session_work_item") or "").strip()
             if current and courant.isdigit() and courant != str(to_lot):
-                # la session active est gardée pour son lot (s'il existe encore)
+                # la session active est gardée pour son lot s'il est encore
+                # ouvert et assigné à l'agent (sinon la purge l'effacerait)
                 rows = tx.query(
                     "INSERT INTO agent_lot_sessions AS l"
                     "       (agent, work_item_id, session_id, harness, account, cwd, parked_at)"
                     " SELECT %s, w.id, %s, %s, %s, %s, clock_timestamp()"
-                    "   FROM work_items w WHERE w.id = %s"
+                    "   FROM work_items w"
+                    "  WHERE w.id = %s AND w.assignee = %s"
+                    "    AND w.state NOT IN " + _CLOSED +
                     " ON CONFLICT (agent, work_item_id) DO UPDATE"
                     "    SET session_id = excluded.session_id, harness = excluded.harness,"
                     "        account = excluded.account, cwd = excluded.cwd,"
                     "        parked_at = excluded.parked_at"
                     " RETURNING l.session_id",
-                    (name, current, harness, current_account, cwd, int(courant)))
+                    (name, current, *origine, int(courant), name))
                 parked = rows[0]["session_id"] if rows else None
-            resumed = discarded = None
+            resumed = discarded = raison = None
             if str(to_lot).isdigit():
                 rows = tx.query(
-                    "SELECT session_id, harness, account, cwd FROM agent_lot_sessions"
-                    " WHERE agent = %s AND work_item_id = %s FOR UPDATE",
+                    "SELECT l.session_id, l.harness, l.account, l.cwd,"
+                    "       (w.assignee = l.agent AND w.state NOT IN " + _CLOSED + ") AS ouvert"
+                    "  FROM agent_lot_sessions l JOIN work_items w ON w.id = l.work_item_id"
+                    " WHERE l.agent = %s AND l.work_item_id = %s FOR UPDATE OF l",
                     (name, int(to_lot)))
                 row = rows[0] if rows else None
                 if row and row.get("session_id"):
-                    if (row.get("harness"), row.get("account"), row.get("cwd")) \
+                    if not row.get("ouvert"):
+                        discarded, raison = row["session_id"], "lot"
+                    elif row.get("harness") is not None and row.get("cwd") is not None \
+                            and (row.get("harness"), row.get("account"), row.get("cwd")) \
                             == (harness, account, cwd):
                         resumed = row["session_id"]
                     else:
-                        discarded = row["session_id"]
+                        discarded, raison = row["session_id"], "origin"
                     tx.execute(
                         "UPDATE agent_lot_sessions SET session_id = NULL, parked_at = NULL"
                         " WHERE agent = %s AND work_item_id = %s", (name, int(to_lot)))
             tx.execute(
                 "UPDATE agent_registry SET session_id = %s, session_account = %s,"
+                "       session_harness = %s, session_cwd = %s, session_origin = %s,"
                 "       session_work_item = %s, updated_at = now()"
                 " WHERE name = %s",
-                (resumed, account if resumed else None, str(to_lot), name))
-            return {"resumed": resumed, "parked": parked, "discarded": discarded}
+                (resumed, account if resumed else None, harness if resumed else None,
+                 cwd if resumed else None, resumed, str(to_lot), name))
+            return {"resumed": resumed, "parked": parked, "discarded": discarded,
+                    "discard_reason": raison}
 
     def listing(self, name=None):
         sql = "SELECT " + _COLUMNS + " FROM agent_lot_sessions l"

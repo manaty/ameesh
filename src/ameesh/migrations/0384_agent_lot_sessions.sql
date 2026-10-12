@@ -9,6 +9,12 @@
 --     lots no longer assigned to the agent, are purged by the branch sweep.
 --   * agent_registry.lot_wake: 'on' | 'off' (rule 1 per agent; NULL = the
 --     runner's default, AMEESH_LOT_WAKE).
+--   * agent_registry.session_harness / session_cwd: the harness and cwd the
+--     ACTIVE session was opened under, written with its id when the harness
+--     announces it; session_origin is that id. They describe the active
+--     session only while session_origin = session_id (any other writer of
+--     session_id leaves the origin unknown): a session is put aside with the
+--     origin of its opening, never with the placement current at parking.
 CREATE TABLE IF NOT EXISTS agent_lot_sessions (
     agent text NOT NULL,
     work_item_id bigint NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
@@ -27,3 +33,7 @@ CREATE INDEX IF NOT EXISTS agent_lot_sessions_lot ON agent_lot_sessions(work_ite
 
 ALTER TABLE agent_registry ADD COLUMN IF NOT EXISTS lot_wake text
     CHECK (lot_wake IS NULL OR lot_wake IN ('on', 'off'));
+
+ALTER TABLE agent_registry ADD COLUMN IF NOT EXISTS session_harness text;
+ALTER TABLE agent_registry ADD COLUMN IF NOT EXISTS session_cwd text;
+ALTER TABLE agent_registry ADD COLUMN IF NOT EXISTS session_origin text;

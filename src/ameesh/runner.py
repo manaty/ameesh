@@ -447,7 +447,8 @@ class AgentWorker(threading.Thread):
         self._reprise = Reprise(getattr(runner, "db_retry_max", 60.0))
         self._consigne_a_restaurer = False
         self._base_marquee = False
-        self._session_en_attente: tuple[str, str | None] | None = None
+        #: (session, compte, harnais, dossier de son ouverture)
+        self._session_en_attente: tuple[str, str | None, str | None, str | None] | None = None
         #: hôte non prêt (L106) : binaire ou interpréteur du harnais
         #: introuvable — une erreur de l'HÔTE, jamais comptée comme un échec
         #: rapide de l'agent (L48). Blocage hérité d'un exécuteur précédent
@@ -1477,7 +1478,7 @@ class AgentWorker(threading.Thread):
             out = storage.of(self.db).lot_sessions.switch(
                 self.name, self.runner.runner_id, self.epoch, to_lot=lot,
                 harness=self.agent.get("harness"), account=nom, cwd=self.agent.get("cwd"),
-                current=session, current_account=self.agent.get("session_account"))
+                current=session)
         except db_mod.DbError as exc:
             log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
             return False
@@ -1512,8 +1513,12 @@ class AgentWorker(threading.Thread):
                 if out.get("parked") else "no session to put aside",
                 "session %s of lot %s resumed" % (repris, lot) if repris
                 else "new session for lot %s, opened on the resume brief" % lot,
-                " Session %s of lot %s not resumed (other harness, account or "
-                "directory)." % (out["discarded"], lot) if out.get("discarded") else ""),
+                " Session %s of lot %s not resumed (%s)." % (
+                    out["discarded"], lot,
+                    "lot finished or no longer assigned to the agent"
+                    if out.get("discard_reason") == "lot"
+                    else "other harness, account or directory, or unknown origin")
+                if out.get("discarded") else ""),
             meta={"action": "session-lot", "de": courant, "vers": lot,
                   "session": out.get("parked") or "", "reprise": repris or ""})
         return True
@@ -1709,8 +1714,8 @@ class AgentWorker(threading.Thread):
         """Session ouverte par le harnais pendant une panne : enregistrée au
         registre dès que possible (sinon le tour suivant reprendrait l'ancienne,
         `current_session` préférant le registre au fichier local)."""
-        session, compte = self._session_en_attente
-        registry.set_session(self.db, self.name, session, compte)
+        session, compte, harnais, dossier = self._session_en_attente
+        registry.set_session(self.db, self.name, session, compte, harness=harnais, cwd=dossier)
         self._session_en_attente = None
         if self.agent is not None:
             self.agent["session_id"] = session
@@ -3408,6 +3413,8 @@ class AgentWorker(threading.Thread):
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
         empreinte = sentinel.launch_fingerprint(self.agent.get("harness") or "", compte, env)
+        #: #408 : le harnais du lancement, origine d'une session qu'il ouvre
+        harnais_lance = self.agent.get("harness")
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
@@ -3492,17 +3499,20 @@ class AgentWorker(threading.Thread):
                         self.write_session_file(session_new)
                         # L39 (0030) : le compte d'origine de la session, en
                         # registre avec son id (le marqueur du flux reste la
-                        # source des relevés du tour)
+                        # source des relevés du tour) ; #408 : et le harnais
+                        # et le dossier de son ouverture, ceux du lancement
                         try:
                             registry.set_session(
                                 self.db, self.name, session_new,
-                                compte.name if compte is not None else None)
+                                compte.name if compte is not None else None,
+                                harness=harnais_lance, cwd=cwd)
                         except db_mod.DbError as exc:
                             # L72 : une panne de base ne tue pas le tour (le
                             # bail, lui, est défendu par le battement) ;
                             # l'enregistrement est rejoué après le tour.
                             self._session_en_attente = (
-                                session_new, compte.name if compte is not None else None)
+                                session_new, compte.name if compte is not None else None,
+                                harnais_lance, cwd)
                             log_async("[%s] session %s not recorded (%s): replayed "
                                       "after the turn" % (self.name, session_new,
                                                          db_mod.explain(exc)))
