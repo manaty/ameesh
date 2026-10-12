@@ -9,6 +9,8 @@ import { languageOf, translate } from "../i18n/index";
 import { base } from "../theme";
 
 export const CONFIG_CHANGED = "ameesh:config-changed";
+/** Sent (bubbling, composed) by a component whose token the mesh refused. */
+export const UNAUTHORIZED = "ameesh:unauthorized";
 
 export class AmeeshConfig extends LitElement {
   static override properties = {
@@ -18,6 +20,7 @@ export class AmeeshConfig extends LitElement {
     theme: { reflect: true },
     tokenProvider: { attribute: false },
     connected: { state: true },
+    refused: { state: true },
   };
   static override styles = [base, css`
     :host { display: contents; }
@@ -34,6 +37,8 @@ export class AmeeshConfig extends LitElement {
   theme = "auto";
   tokenProvider: TokenProvider | undefined;
   connected = false;
+  /** The form's token was refused by the mesh: said above the form. */
+  refused = false;
   #client: Client | null = null;
   #memoryToken: string | null = null;
 
@@ -50,6 +55,24 @@ export class AmeeshConfig extends LitElement {
   async #token(): Promise<string | null> {
     if (this.tokenProvider) return this.tokenProvider();
     return this.#memoryToken;
+  }
+
+  // the form's token refused: forget it and ask again (a host's provider is
+  // the host's to renew; no token kept, nothing to forget, no loop)
+  #onUnauthorized = () => {
+    if (this.tokenProvider || this.#memoryToken === null) return;
+    this.refused = true;
+    this.disconnect();
+  };
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    this.addEventListener(UNAUTHORIZED, this.#onUnauthorized);
+  }
+
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.removeEventListener(UNAUTHORIZED, this.#onUnauthorized);
   }
 
   /** Forget the token kept by the form (the provider is the host's). */
@@ -88,6 +111,7 @@ export class AmeeshConfig extends LitElement {
     if (!token) return;
     this.#memoryToken = token;
     if (input) input.value = "";
+    this.refused = false;
     this.connected = true;
     this.#changed();
   }
@@ -103,6 +127,7 @@ export class AmeeshConfig extends LitElement {
     return html`
       <form @submit=${this.#submit} aria-labelledby="title">
         <h2 id="title">${t("config.title")}</h2>
+        ${this.refused ? html`<p role="alert" class="critical">${t("error.unauthorized")}</p>` : ""}
         <label for="token">${t("config.token")}</label>
         <input id="token" type="password" autocomplete="off" spellcheck="false"
                aria-describedby="help" required>

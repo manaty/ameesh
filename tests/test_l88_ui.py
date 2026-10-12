@@ -71,6 +71,24 @@ class StandalonePageTest(ServerMixin, unittest.TestCase):
         status, _, _ = self.get("/ui/", method="HEAD", auth=False)
         self.assertEqual(status, 200)
 
+    def test_never_through_a_link(self):
+        # a listed file that is a link to a file out of the package: not served
+        static = os.path.join(self.tmp, "static")
+        os.mkdir(static)
+        secret = os.path.join(self.tmp, "secret.txt")
+        Path(secret).write_text("import secret")
+        os.symlink(secret, os.path.join(static, "ameesh-ui.js"))
+        Path(static, "page.css").write_text("body{}")
+        old, serve.UI_DIR = serve.UI_DIR, static
+        try:
+            status, _, body = self.get("/ui/ameesh-ui.js", auth=False)
+            self.assertEqual(status, 404)
+            self.assertNotIn(b"secret", body)
+            status, _, body = self.get("/ui/page.css", auth=False)
+            self.assertEqual((status, body), (200, b"body{}"))
+        finally:
+            serve.UI_DIR = old
+
     def test_guards_still_apply(self):
         status, _, _ = self.get("/ui/", auth=False, host="evil.example:%d" % self.port)
         self.assertEqual(status, 403)

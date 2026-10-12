@@ -71,6 +71,43 @@ test("client: token per request, typed path, query, errors", async () => {
   assert.throws(() => ui.expand("/t/{project}", {}), TypeError);
 });
 
+test("client: the token never leaves the mesh's origin", async () => {
+  const fetch = fakeFetch({ "/mesh/api/v1/me": [200, { schema: "ameesh-me/1" }] });
+  const client = ui.createClient({ baseUrl: "https://api.example/mesh/", tokenProvider: () => "secret", fetch });
+  for (const path of [".evil.example/api/v1/me", "//evil.example/api/v1/me", "api/v1/me",
+                      "@evil.example/x", "https://evil.example/x"]) {
+    await assert.rejects(client.request(path), TypeError, path);
+  }
+  assert.equal(fetch.calls.length, 0);
+  await client.request("/api/v1/me");
+  assert.equal(fetch.calls[0].path, "/mesh/api/v1/me");
+  const bare = ui.createClient({ baseUrl: "https://api.example", tokenProvider: () => "secret", fetch });
+  await assert.rejects(bare.request("//evil.example/x"), TypeError);
+  assert.equal(fetch.calls.length, 1);
+});
+
+test("stream: the server's retry stays within bounds, oversized ones ignored", async () => {
+  const parser = new ui.EventStreamParser();
+  parser.push("retry: 99999999999999999999\n\n");
+  assert.equal(parser.retry, null);
+  const delays = [];
+  const realTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms) => { delays.push(ms); return realTimeout(fn, 0); };
+  try {
+    let n = 0;
+    const client = { request: async () => {
+      n += 1;
+      if (n === 1) return new Response("retry: 9999999999\ndata: a\n\n");
+      if (n === 2) return new Response("retry: 0\ndata: b\n\n");
+      return new Response("", { status: 401 });
+    } };
+    await ui.readStream(client, "/x", { onEvent() {}, delay: 1000, maxDelay: 30000 });
+  } finally {
+    globalThis.setTimeout = realTimeout;
+  }
+  assert.deepEqual(delays, [30000, 500]);
+});
+
 test("i18n: both catalogues, plurals, parameters as text", () => {
   assert.equal(ui.translate("fr", "count.alerts", { n: 0 }), "0 alerte");
   assert.equal(ui.translate("en", "count.alerts", { n: 0 }), "0 alerts");

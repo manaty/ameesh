@@ -101,6 +101,31 @@ test("config token-form: asks, keeps in memory, then shows the app", async () =>
   assert.ok(config.shadowRoot.querySelector("form"));
 });
 
+test("config token-form: a refused token is forgotten and asked again", async () => {
+  const { config, app, fetch } = await mount(
+    '<ameesh-config token-form><ameesh-app standalone></ameesh-app></ameesh-config>', { token: null,
+      routes: { "/.well-known/ameesh": [200, DISCOVERY],
+                "/api/v1/me": [401, { schema: "ameesh-error/1", error: "unauthorized", message: "no" }] } });
+  const form = config.shadowRoot.querySelector("form");
+  config.shadowRoot.querySelector("input").value = "wrong-token";
+  form.dispatchEvent(new window.SubmitEvent("submit", { cancelable: true }));
+  await settle(config);
+  await settle(app);
+  await settle(config);
+  assert.equal(config.connected, false);
+  assert.ok(config.shadowRoot.querySelector("form"), "form shown again");
+  assert.match(config.shadowRoot.querySelector('[role="alert"]').textContent, /Token missing or refused/);
+  const sent = fetch.calls.filter((c) => c.path === "/api/v1/me").map((c) => c.headers.get("Authorization"));
+  // after the refusal, one reload without the token, then nothing: no loop
+  assert.deepEqual(sent.slice(sent.indexOf("Bearer wrong-token")), ["Bearer wrong-token", null]);
+  await settle(app);
+  assert.equal(fetch.calls.filter((c) => c.path === "/api/v1/me").length, sent.length);
+  await app.refresh();
+  const last = fetch.calls.filter((c) => c.path === "/api/v1/me").at(-1);
+  assert.equal(last.headers.get("Authorization"), null);
+  assert.deepEqual(await violations(), []);
+});
+
 test("config: theme passed to the components inside, host tokens honoured", async () => {
   const { config, app } = await mount(
     '<ameesh-config api-base="http://127.0.0.1:8780" theme="dark"><ameesh-app></ameesh-app></ameesh-config>');

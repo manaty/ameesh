@@ -7,7 +7,7 @@ import { LitElement, css, html } from "lit";
 import { ApiError, type Client, type Schemas } from "../api/client";
 import { languageOf, pick, translate, type Params } from "../i18n/index";
 import { base } from "../theme";
-import { CONFIG_CHANGED, configOf, type AmeeshConfig } from "./ameesh-config";
+import { CONFIG_CHANGED, UNAUTHORIZED, configOf, type AmeeshConfig } from "./ameesh-config";
 
 type State =
   | { kind: "idle" }
@@ -91,7 +91,7 @@ export class AmeeshApp extends LitElement {
       const code = error instanceof ApiError ? error.code : "network";
       this.state = { kind: "error", code };
       if (code === "unauthorized") {
-        this.dispatchEvent(new CustomEvent("ameesh:unauthorized", { bubbles: true, composed: true }));
+        this.dispatchEvent(new CustomEvent(UNAUTHORIZED, { bubbles: true, composed: true }));
       }
     }
   }

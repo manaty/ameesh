@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import urllib.parse
 from typing import Callable
@@ -575,11 +576,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if found is None:
             raise ApiError(404, "not_found", "no such file")
         name, ctype = found
+        path = os.path.join(UI_DIR, name)
+        # served without a token: never through a link, never out of the package
+        if os.path.commonpath([os.path.realpath(path), os.path.realpath(UI_DIR)]) \
+                != os.path.realpath(UI_DIR):
+            raise ApiError(404, "not_found", "interface not installed")
         try:
-            with open(os.path.join(UI_DIR, name), "rb") as fh:
-                body = fh.read()
-        except FileNotFoundError:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        except OSError:  # missing, or a link (ELOOP)
             raise ApiError(404, "not_found", "interface not installed") from None
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise ApiError(404, "not_found", "interface not installed")
+            body = fh.read()
         self._send(200, body, ctype, csp=UI_CSP)
 
     def send_error(self, code, message=None, explain=None) -> None:

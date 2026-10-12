@@ -49,14 +49,27 @@ export interface Client {
 
 export function createClient(options: ClientOptions): Client {
   const baseUrl = options.baseUrl.replace(/\/+$/, "");
+  const origin = new URL(baseUrl).origin;
+  const prefix = new URL(baseUrl).pathname.replace(/\/+$/, "");
   const doFetch = options.fetch ?? ((input, init) => fetch(input, init));
 
+  /** A path of this mesh, never another origin: the token goes with it. */
+  function resolve(path: string): string {
+    if (!path.startsWith("/") || path.startsWith("//")) {
+      throw new TypeError("path must start with a single '/': " + path);
+    }
+    const url = new URL(prefix + path, origin);
+    if (url.origin !== origin) throw new TypeError("path leaves the mesh: " + path);
+    return url.href;
+  }
+
   async function request(path: string, init: RequestInit = {}): Promise<Response> {
+    const url = resolve(path);
     const headers = new Headers(init.headers);
     headers.set("Accept", headers.get("Accept") ?? "application/json");
     const token = options.tokenProvider ? await options.tokenProvider() : null;
     if (token) headers.set("Authorization", "Bearer " + token);
-    return doFetch(baseUrl + path, {
+    return doFetch(url, {
       ...init, headers, credentials: "omit", cache: "no-store", redirect: "error",
     });
   }

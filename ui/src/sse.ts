@@ -57,7 +57,9 @@ export class EventStreamParser {
     if (field === "data") this.data.push(value);
     else if (field === "event") this.type = value;
     else if (field === "id" && !value.includes("\0")) this.lastId = value;
-    else if (field === "retry" && /^[0-9]+$/.test(value)) this.retry = Number(value);
+    else if (field === "retry" && /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value))) {
+      this.retry = Number(value);
+    }
     return null;
   }
 }
@@ -77,6 +79,8 @@ export interface StreamOptions {
 }
 
 const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
+/** Floor of a server's `retry:`, so a stream cannot ask for a reconnection storm. */
+const MIN_RETRY = 500;
 
 /** Reads `path` of the mesh until `signal` aborts; returns when stopped. */
 export async function readStream(client: Client, path: string, options: StreamOptions): Promise<void> {
@@ -115,7 +119,10 @@ export async function readStream(client: Client, path: string, options: StreamOp
     }
     if (options.signal?.aborted) return;
     options.onState?.(false);
-    await sleep(serverRetry ?? wait, options.signal);
+    // the server's `retry:` within [MIN_RETRY, max]: a huge value would
+    // overflow the timer (fired at once), a tiny one would hammer the mesh
+    await sleep(serverRetry === null ? wait
+      : Math.min(Math.max(serverRetry, MIN_RETRY), max), options.signal);
     wait = Math.min(wait * 2, max);
   }
 }
