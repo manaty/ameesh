@@ -2329,6 +2329,14 @@ class TurnResources(Domain):
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
 
     @abc.abstractmethod
+    def to_review(self, host: str, idle_s: float, after_id: int = 0,
+                  limit: int = 500) -> list[dict]:
+        """#339: the rows of `host` that may have outlived their resources:
+        `orphan` ones, and `running` ones whose turn (or grace period) ended
+        or started more than `idle_s` ago, of `id` above `after_id`, by
+        increasing `id`: a page of `limit` rows at most."""
+
+    @abc.abstractmethod
     def orphans_started_before(self, host: str, before_ts: float, after_id: int = 0,
                                limit: int = 500) -> list[dict]:
         """L147 : les lignes `orphan` de l'hôte ouvertes avant `before_ts`

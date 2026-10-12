@@ -156,6 +156,12 @@ BOOT_REVIEW_EVERY_S = 60.0
 BOOT_REVIEW_MAX_ROWS = 2000
 #: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
 BOOT_REVIEW_START = ("running", 0)
+#: #339: this host's rows whose group is gone are settled at start and then
+#: every LIVE_REVIEW_EVERY_S (L147's rule, with a liveness check in place of
+#: the boot time); a `running` row only once its turn (or grace period) is
+#: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
+LIVE_REVIEW_EVERY_S = 300.0
+LIVE_REVIEW_IDLE_S = 600.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -3895,6 +3901,10 @@ class Runner:
         self.boot_review_at: float | None = None
         #: et où reprend la revue suivante (phase, dernier id)
         self._boot_review_after = BOOT_REVIEW_START
+        #: #339 : prochaine revue des lignes dont le groupe est mort (horloge
+        #: monotone) et le dernier id revu
+        self.live_review_at: float = 0.0
+        self._live_review_after = 0
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -5342,6 +5352,59 @@ class Runner:
             self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
             return []
 
+    def settle_dead_turns(self) -> list[dict]:
+        """#339 : les lignes de CET hôte `orphan`, ou `running` depuis plus de
+        LIVE_REVIEW_IDLE_S (laissées par un exécuteur mort ou relancé), dont
+        le groupe de processus n'existe plus et qu'aucun conteneur étiqueté
+        par le tour ne fait tourner, sont soldées (`done`) — sans attendre un
+        redémarrage de l'hôte (L147). Une ligne sans groupe noté, un groupe
+        vivant (même réutilisé : on garde), un moteur muet : la ligne reste.
+        Pas avant le feu vert du démarrage (`_boot_settle_ready` : un
+        conteneur relancé par sa politique peut manquer encore). Rien n'est
+        supprimé ; au plus BOOT_REVIEW_MAX_ROWS lignes par passage, la suite
+        au passage suivant. Rend les lignes soldées. Ne lève jamais."""
+        from . import resources as resources_mod
+        self.live_review_at = time.monotonic() + LIVE_REVIEW_EVERY_S
+        boot = resources_mod.boot_time()
+        if boot and not self._boot_settle_ready(time.time() - boot):
+            return []
+        try:
+            turns = storage.of(self.db).turn_resources
+            rows: list = []
+            after = self._live_review_after
+            more = False
+            while True:
+                room = BOOT_REVIEW_MAX_ROWS - len(rows)
+                if room <= 0:
+                    more = True
+                    break
+                size = min(BOOT_ORPHAN_PAGE, room)
+                page = turns.to_review(self.host, LIVE_REVIEW_IDLE_S, after, size)
+                rows += page
+                if len(page) < size:
+                    break
+                after = int(page[-1]["id"])
+            self._live_review_after = after if more else 0
+            if more:
+                self.live_review_at = time.monotonic()  # la suite sans attendre
+            candidates = [row for row in rows
+                          if row.get("pgid") and not AgentWorker._group_alive(int(row["pgid"]))]
+            if not candidates:
+                return []
+            runtime = self.container_runtime()
+            running = self._running_containers(runtime)
+            dead = [row for row in candidates
+                    if self._containers_alive(running, runtime, row) == []]
+            turns.settle_many([row["turn_id"] for row in dead])
+            for row in dead:
+                log("turn %s of %s (%s): group %s gone, no container running — settled"
+                    % (row["turn_id"], row.get("agent"), row.get("status"), row["pgid"]))
+            return dead
+        except db_mod.DbError as exc:
+            log_async("turn resources not reviewed (%s); next review in %ds"
+                      % (db_mod.explain(exc), int(LIVE_REVIEW_EVERY_S)))
+            return []
+
     def _boot_settle_ready(self, uptime: float) -> bool:
         """#220 r2 : les conteneurs relancés au démarrage ont-ils eu le temps
         de l'être ? Pas avant BOOT_SETTLE_S de fonctionnement, ni tant que le
@@ -5424,6 +5487,7 @@ class Runner:
         # L106 : après l'écoute (un réveil n'attend pas ces vérifications)
         self.log_harnesses()
         self.report_boot_orphans()
+        self.settle_dead_turns()
         reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
@@ -5435,6 +5499,8 @@ class Runner:
                     log_async("power guard failed (%s)" % type(exc).__name__)
                 if self.boot_review_at is not None and time.monotonic() >= self.boot_review_at:
                     self.report_boot_orphans()      # #220 r2 : solde différé
+                if time.monotonic() >= self.live_review_at:
+                    self.settle_dead_turns()        # #339
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:

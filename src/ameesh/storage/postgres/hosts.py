@@ -302,6 +302,16 @@ class TurnResources(interface.TurnResources):
             (" AND" if where else " WHERE") + " status = 'orphan'"
             " ORDER BY started_at DESC, id DESC LIMIT %s", tuple(params))
 
+    def to_review(self, host, idle_s, after_id=0, limit=500) -> list[dict]:
+        # comme `stale_running` : une ligne en délai de grâce se juge sur la
+        # fin de son tour
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND id > %s AND (status = 'orphan' OR (status = 'running'"
+            "   AND coalesce(ended_at, started_at) < now() - make_interval(secs => %s)))"
+            " ORDER BY id LIMIT %s",
+            (host, int(after_id), float(idle_s), int(limit)))
+
     def orphans_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
         return self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources"
