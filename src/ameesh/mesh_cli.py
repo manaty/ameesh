@@ -288,6 +288,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     "measure": (res.measure(latest, limits.get("lend"))
                                 if latest is not None else None),
                     "pressure": verdict,
+                    # L64: what the last reading could not measure
+                    "unmeasured": res.unmeasured(latest),
                     "history": history,
                     "housekeeping": menage,
                 }, ensure_ascii=False, sort_keys=True), flush=True)
@@ -325,6 +327,10 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(latest.get("disk_free_bytes")),
                      latest.get("turns_in_progress")
                      if latest.get("turns_in_progress") is not None else "—"))
+            manque = res.unmeasured(latest)
+            if manque:
+                # L64: a measure the host cannot give, said rather than a "—"
+                print("  unmeasured %s" % ", ".join(manque))
             if latest.get("on_ac") is not None or latest.get("battery_percent") is not None:
                 # L106 : alimentation d'un portable
                 print("  power      %s%s; battery thresholds %s %% (no more turns), %s %% "
