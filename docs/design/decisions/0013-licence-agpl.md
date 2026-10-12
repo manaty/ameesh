@@ -1,52 +1,52 @@
 ---
 type: Decision
-title: "Licence d'ameesh : AGPL-3.0-only, avec accord de contribution"
-description: "ameesh sera publié sous GNU AGPL v3, variante only ; les contributions externes passent par un accord de contribution."
+title: "ameesh licence: AGPL-3.0-only, with a contribution agreement"
+description: "ameesh will be published under the GNU AGPL v3, only variant; external contributions go through a contribution agreement."
 status: stable
 tags: [licence, release]
 decided_by: human:smichea
 decision_date: 2026-10-04
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T01:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Le dépôt manaty/ameesh est privé jusqu'à la première release
-([0001](0001-nom-ameesh.md)) ; une licence devait être choisie avant le passage
-public. mesh-design recommandait Apache-2.0 (adoption, cohérence avec OKF) ;
-le propriétaire a choisi l'AGPL.
+The manaty/ameesh repository is private until the first release
+([0001](0001-nom-ameesh.md)); a licence had to be chosen before going
+public. mesh-design recommended Apache-2.0 (adoption, consistency with OKF);
+the owner chose the AGPL.
 
-# Décision
+# Decision
 
-- ameesh est publié sous **GNU Affero General Public License v3**, variante
-  **`AGPL-3.0-only`** : la version de la licence est fixée à la v3 ; seul un
-  titulaire des droits sur le code concerné peut décider de la changer.
-- Les **contributions externes** sont acceptées seulement sous un **accord de
-  contribution** (CLA, à rédiger) destiné à laisser à Manaty la possibilité de
-  relicencier (passage ultérieur à `or-later`, à une future version, ou double
-  licence).
+- ameesh is published under the **GNU Affero General Public License v3**,
+  **`AGPL-3.0-only`** variant: the licence version is fixed at v3; only a
+  holder of the rights on the code concerned can decide to change it.
+- **External contributions** are accepted only under a **contribution
+  agreement** (CLA, to be drafted) intended to leave Manaty the possibility of
+  relicensing (later move to `or-later`, to a future version, or dual
+  licensing).
 
-# Conséquences
+# Consequences
 
-- Quiconque fait tourner une version **modifiée** d'ameesh comme service
-  accessible par le réseau doit en offrir le code source à ses utilisateurs.
-- **Politique visée, conditionnée aux droits effectivement détenus** : pour le
-  code dont Manaty détient les droits, Manaty n'est pas contraint par sa propre
-  licence (double licence, intégration dans Nexlink). Pour le code d'autres
-  auteurs, cette liberté dépend des droits concédés par le CLA, qui n'est pas
-  encore rédigé ; **aucune garantie de relicenciement de code tiers** n'est
-  donnée ici. La titularité des contributions produites par des agents
-  opérés pour Manaty est à confirmer dans le même travail.
-- `or-later` a été écarté : il permettrait de choisir une future version de la
-  licence qui pourrait être plus permissive (par exemple sans la clause réseau).
-  Avec un CLA adéquat, `only` laisse ouverte une évolution ultérieure.
-- **Compatibilité des dépendances et des intégrations : étude à faire**, pas un
-  résultat acquis. Elle portera sur les licences et versions exactes de chaque
-  dépendance distribuée (bibliothèques WebAuthn, SDK MCP…) et sur la topologie
-  des intégrations (appel par API de services sous AGPL comme Zammad ou
-  Synapse, ou distribution combinée).
-- À faire avant le passage public : fichier `LICENSE` (texte officiel),
-  métadonnées du paquet, en-têtes SPDX, retrait du DSN de banc codé en dur
-  (lot en cours chez deepseek7) ; CLA et sa vérification sur les PR ; étude de
-  compatibilité des licences ; détection de secrets sur l'historique.
+- Anyone who runs a **modified** version of ameesh as a network-accessible
+  service must offer its source code to its users.
+- **Intended policy, conditional on the rights actually held**: for the
+  code Manaty holds the rights to, Manaty is not bound by its own
+  licence (dual licensing, integration into Nexlink). For code by other
+  authors, this freedom depends on the rights granted by the CLA, which is not
+  yet drafted; **no guarantee of relicensing third-party code** is
+  given here. Ownership of contributions produced by agents
+  operated for Manaty is to be confirmed in the same work.
+- `or-later` was rejected: it would allow choosing a future version of the
+  licence that could be more permissive (for example without the network clause).
+  With an adequate CLA, `only` leaves a later evolution open.
+- **Compatibility of dependencies and integrations: study to be done**, not an
+  established result. It will cover the exact licences and versions of each
+  distributed dependency (WebAuthn libraries, MCP SDK…) and the topology
+  of integrations (API calls to AGPL services such as Zammad or
+  Synapse, or combined distribution).
+- To do before going public: `LICENSE` file (official text),
+  package metadata, SPDX headers, removal of the hard-coded test bench DSN
+  (lot in progress at deepseek7); CLA and its verification on PRs; licence
+  compatibility study; secret detection on the history.
