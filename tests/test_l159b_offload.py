@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -305,10 +306,65 @@ class FallbackTest(OffloadBase):
         while time.time() < deadline and not self.running_jobs():
             time.sleep(0.2)
         time.sleep(1)  # the look-alike line is out
-        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run --nonce [0-9a-f]* acme-widget"])
+        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run acme-widget"])
         _out, err = client.communicate(timeout=30)
         self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
         self.assertIn(fake, err)  # relayed as the command's output
+        self.assertIn("not rerun on this machine", err)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_the_job_cannot_read_the_nonce_from_its_ancestors(self):
+        # codex r3 on #213: a job of the same UID read the nonce in
+        # /proc/<shell>/environ (SSH_ORIGINAL_COMMAND), printed a tagged
+        # `refused` and killed the shell: the client fell back to a local run
+        # while the job lived on. Here it tries every ancestor's environ and
+        # cmdline, and the shell's own stderr, then does the same
+        marker = os.path.join(self.tmp, "local-run")
+        report = os.path.join(self.tmp, "report.json")
+        attack = os.path.join(self.tmp, "attack.py")
+        with open(attack, "w") as fh:
+            fh.write(textwrap.dedent('''\
+                import json, os, re, signal, sys
+                found, denied, pid = set(), [], os.getppid()
+                shell = pid
+                while pid > 1:
+                    for name in ("environ", "cmdline"):
+                        try:
+                            with open("/proc/%%d/%%s" %% (pid, name), "rb") as fh:
+                                found.update(re.findall(rb"[0-9a-f]{32}", fh.read()))
+                        except OSError:
+                            denied.append("%%d/%%s" %% (pid, name))
+                    with open("/proc/%%d/stat" %% pid) as fh:
+                        pid = int(fh.read().rsplit(")", 1)[1].split()[1])
+                try:
+                    os.open("/proc/%%d/fd/2" %% shell, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    denied.append("%%d/fd/2" %% shell)
+                with open(%r, "w") as fh:
+                    json.dump({"shell": shell, "denied": denied,
+                               "found": sorted(x.decode() for x in found)}, fh)
+                for nonce in found:
+                    sys.stderr.write("%s%%s result %%s\\n" %% (nonce.decode(), json.dumps(
+                        {"outcome": "refused", "reason": "forged"})))
+                sys.stderr.flush()
+                os.kill(shell, signal.SIGKILL)
+                ''' % (report, offload_shell.PREFIX)))
+        client = subprocess.Popen(
+            [AMEESH, "offload", "run", "--", "sh", "-c",
+             'case "$PWD" in %s*) exec %s %s;; *) touch %s;; esac'
+             % (self.vm, sys.executable, attack, marker)],
+            cwd=self.repo, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(client.kill)
+        _out, err = client.communicate(timeout=60)
+        with open(report) as fh:
+            seen = json.load(fh)
+        shell = seen["shell"]
+        self.assertIn("%d/environ" % shell, seen["denied"])
+        self.assertIn("%d/fd/2" % shell, seen["denied"])
+        # argv (cmdline, still readable) carries no nonce: whatever hex it holds
+        # (snapshot ids…) forges nothing, the lines are relayed as output
+        self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
         self.assertIn("not rerun on this machine", err)
         self.assertFalse(os.path.exists(marker))
 
@@ -325,7 +381,7 @@ class FallbackTest(OffloadBase):
             time.sleep(0.2)
         self.assertTrue(self.running_jobs())
         # the "network" drops: the ssh process dies, its remote side with it
-        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run --nonce [0-9a-f]* acme-widget"])
+        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run acme-widget"])
         _out, err = client.communicate(timeout=30)
         self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
         self.assertIn("not rerun on this machine", err)
@@ -407,6 +463,11 @@ class ShellTest(OffloadBase):
             res = self.shell(command)
             self.assertEqual(res.returncode, 2, command)
             self.assertIn(b"allowed verbs", res.stderr)
+
+    def test_a_client_nonce_is_refused(self):
+        res = self.shell("run --nonce %s acme-widget %s -- true" % ("0" * 32, "0" * 40))
+        self.assertEqual(res.returncode, 2)
+        self.assertIn(b"--nonce is no longer accepted", res.stderr)
 
     def test_names_and_paths_are_validated(self):
         self.assertIn(b"invalid repository name", self.shell("put ../x --have").stderr)

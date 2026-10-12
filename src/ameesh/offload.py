@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 import shlex
 import signal
 import subprocess
@@ -41,7 +40,7 @@ import sys
 import tempfile
 import threading
 
-from .offload_shell import PREFIX
+from .offload_shell import NONCE_RE, PREFIX
 
 #: exit code when the VM refused or stopped the job and no fallback is allowed
 EX_TEMPFAIL = 75
@@ -168,19 +167,26 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
     """Runs `run …` on the VM: stdout passes through, stderr too except the
     protocol lines. Returns (ssh exit code, result object or None, job id
     or None)."""
-    # the command's stderr shares the stream: only lines tagged with this
+    # the command's stderr shares the stream: only lines tagged with the
     # session's nonce are protocol, a look-alike printed by the command is
-    # relayed as output and never taken for a result
-    nonce = secrets.token_hex(16)
-    tag = "%s%s " % (PREFIX, nonce)
-    proc = subprocess.Popen(remote.argv(words[0], "--nonce", nonce, *words[1:]),
+    # relayed as output and never taken for a result. The VM shell draws the
+    # nonce and announces it first (`N session`), before any job starts; no
+    # announce, no protocol at all (no result: never a local rerun)
+    proc = subprocess.Popen(remote.argv(*words),
                             stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
     state: dict = {"job": None, "result": None}
 
     def relay() -> None:
+        tag = None
         for raw in iter(proc.stderr.readline, b""):
             line = raw.decode(errors="replace")
-            if not line.startswith(tag):
+            if tag is None:
+                tag = ""
+                head, _, kind = line[len(PREFIX):].rstrip("\n").partition(" ")
+                if line.startswith(PREFIX) and NONCE_RE.match(head) and kind == "session":
+                    tag = "%s%s " % (PREFIX, head)
+                    continue
+            if not tag or not line.startswith(tag):
                 sys.stderr.write(line)
                 sys.stderr.flush()
                 continue

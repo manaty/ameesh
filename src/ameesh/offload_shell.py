@@ -15,12 +15,15 @@ no port forwarding, only these four verbs (read from SSH_ORIGINAL_COMMAND):
   status [<job>]           one JSON object per job (running or waiting)
   cancel <job>             stops a job
 
-Protocol lines go to stderr, prefixed with `ameesh-offload: ` and, when the
-client gives one (`<verb> --nonce N …`, 32 hex digits, per session), with
-that nonce: the command's own stderr shares the stream, and the client
-takes only lines carrying its nonce for protocol. A `run` always ends with
-`ameesh-offload: N result {json}` (outcome `done`, `refused`, `stopped`,
-`timeout`, `cancelled` or `error`); the client strips them.
+Protocol lines go to stderr, prefixed with `ameesh-offload: `; for `run`,
+also with the session nonce (32 hex digits) that this shell draws itself and
+announces on the first line, `ameesh-offload: N session`, before any job
+starts: the command's own stderr shares the stream, and the client takes only
+lines carrying that nonce for protocol. The nonce never passes through argv or
+an environment, and the shell makes itself non-dumpable, so a job of the same
+UID cannot read it in `/proc/<pid>/{environ,cmdline,mem,fd}`. A `run` always
+ends with `ameesh-offload: N result {json}` (outcome `done`, `refused`,
+`stopped`, `timeout`, `cancelled` or `error`); the client strips them.
 
 Each job runs:
 * under a concurrency token (`flock` on `locks/slot-N`; the client sees the
@@ -111,12 +114,24 @@ def _dir(cfg: dict, *parts: str) -> str:
     return path
 
 
-#: the client's per-session nonce (`<verb> --nonce N …`): every protocol line
-#: carries it, so a command printing a line shaped like the protocol (a fake
-#: `result`, `refused`…) on the same stderr is never taken for one; the job
-#: never receives it (its environment comes from `base_env`)
+#: the session nonce of a `run`, drawn here and announced first (`session`):
+#: every protocol line carries it, so a command printing a line shaped like
+#: the protocol (a fake `result`, `refused`…) on the same stderr is never taken
+#: for one. It lives only in this process's memory, which `_no_dump` closes
+#: to the job (same UID)
 NONCE = ""
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _no_dump() -> None:
+    """PR_SET_DUMPABLE 0: /proc/<pid>/{environ,cmdline,mem,fd} of this shell
+    become root's, so a job of the same UID reads neither the nonce nor the
+    session's streams through them. Reset by execve: the job's own processes
+    stay dumpable."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE, 0)")
 
 
 def emit(kind: str, payload: object = None) -> None:
@@ -850,7 +865,8 @@ def main(argv: list[str] | None = None) -> int:
     config = DEFAULT_CONFIG
     if argv[:1] == ["--config"] and len(argv) >= 2:
         config = argv[1]
-    request = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    # the request leaves the environment: no child inherits it
+    request = os.environ.pop("SSH_ORIGINAL_COMMAND", "")
     try:
         words = shlex.split(request)
     except ValueError:
@@ -858,13 +874,19 @@ def main(argv: list[str] | None = None) -> int:
     if not words or words[0] not in VERBS:
         sys.stderr.write(PREFIX + "allowed verbs: put, run, status, cancel\n")
         return 2
-    if words[1:2] == ["--nonce"]:
-        if len(words) < 3 or not NONCE_RE.match(words[2]):
-            sys.stderr.write(PREFIX + "invalid --nonce\n")
-            return 2
+    if "--nonce" in words[1:2]:
+        # a client's nonce would sit in argv and environments: no longer taken
+        sys.stderr.write(PREFIX + "--nonce is no longer accepted: update the client\n")
+        return 2
+    try:
+        _no_dump()
+    except OSError as exc:
+        sys.stderr.write(PREFIX + "error %s\n" % exc)
+        return 70
+    if words[0] == "run":
         global NONCE
-        NONCE = words[2]
-        words = words[:1] + words[3:]
+        NONCE = secrets.token_hex(16)
+        emit("session")
     try:
         cfg = load_config(config)
         return VERBS[words[0]](cfg, words[1:])
