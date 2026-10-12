@@ -229,21 +229,32 @@ def _tree_children(leader: int) -> list[int] | None:
     wrapper is a child subreaper — every orphaned descendant is reparented to
     it, so a live descendant always means a live child: one read of the
     kernel's list, no scan to race with a fork chain. Zombies (but the
-    command's) are reaped on the way. None if the list is not available."""
+    command's) are reaped on the way, and the list is read again after a
+    read that reaped one (#266 r1): a child that forked a replacement and
+    exited after the list was read had it reparented before turning zombie.
+    None if the list is not available."""
     from . import platform
-    try:
-        rows = platform.children()
-    except platform.NotAvailable:
-        return None
-    live = []
-    for row in rows:
-        if row["pid"] == leader:
-            continue
-        if row["zombie"]:
-            platform.reap(row["pid"])
-            continue
-        live.append(row["pid"])
-    return live
+    while True:
+        try:
+            rows = platform.children()
+        except platform.NotAvailable:
+            return None
+        live = []
+        reaped = False
+        for row in rows:
+            if row["pid"] == leader:
+                continue
+            if row["zombie"]:
+                reaped = platform.reap(row["pid"]) is not None or reaped
+                continue
+            live.append(row["pid"])
+        if not reaped:
+            return live
+
+
+def _tree_gone(leader: int) -> bool:
+    """No live descendant on two consecutive reads (#266 r1)."""
+    return not _tree_children(leader) and not _tree_children(leader)
 
 
 def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
@@ -251,26 +262,35 @@ def _drain_tree(leader: int, *, grace: float | None = None, sleep=time.sleep,
     """L131c: stops every descendant the command left (its group or not:
     nothing escapes a subreaper), each signalled by pid — a child's pid
     cannot be reused before its parent reaps it. SIGTERM, then SIGKILL after
-    `grace`, then `grace` more; True when none is left."""
+    `grace`, then `grace` more; True when none is left. A descendant that
+    may not be signalled (its credentials changed: setuid) is said once and
+    the others are still stopped (#266 r1)."""
     grace = GROUP_GRACE_S if grace is None else grace
+    refused: set = set()
     for signum in (signal.SIGTERM, signal.SIGKILL):
         sent: set = set()
         deadline = clock() + grace
         while True:
             live = _tree_children(leader)
-            if not live:
+            if not live and _tree_gone(leader):
                 return True
             if clock() >= deadline:
                 break
-            for pid in live:
+            for pid in live or ():
                 if pid not in sent:   # a grandchild reparented since
                     try:
                         os.kill(pid, signum)
                     except ProcessLookupError:
                         pass
+                    except PermissionError:
+                        if pid not in refused:
+                            refused.add(pid)
+                            print("ameesh heavy: process %d left by the command may not "
+                                  "be signalled (credentials changed)" % pid,
+                                  file=sys.stderr)
                     sent.add(pid)
             sleep(0.1)
-    return not _tree_children(leader)
+    return _tree_gone(leader)
 
 
 def _wait_unreaped(child, tty: int | None = None) -> int:
@@ -295,9 +315,12 @@ def _suspend(tty: int, pgid: int) -> None:
     terminal back and stops too, so the shell, which waits for the wrapper,
     gets its prompt back; on `fg` (SIGCONT, terminal given to the wrapper)
     the command gets the terminal and continues — on `bg` it just
-    continues."""
+    continues. The terminal is taken only from the command's group: a
+    command stopped in the background (SIGTTIN after `bg`) leaves it to
+    whoever holds it, the shell (#266 r1)."""
     try:
-        os.tcsetpgrp(tty, os.getpgrp())
+        if os.tcgetpgrp(tty) == pgid:
+            os.tcsetpgrp(tty, os.getpgrp())
     except OSError:
         pass
     os.kill(os.getpid(), signal.SIGSTOP)

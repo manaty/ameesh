@@ -3,6 +3,7 @@
 live in a temporary state directory, no database."""
 from __future__ import annotations
 
+import io
 import os
 import signal
 import subprocess
@@ -388,6 +389,73 @@ class DrainTest(unittest.TestCase):
             self.assertFalse(heavy._group_alive(4242))      # only a zombie left
             table.append({"pid": 3, "pgid": 4242, "zombie": False})
             self.assertTrue(heavy._group_alive(4242))
+
+
+class TreeReviewR1Test(unittest.TestCase):
+    """#266 r1 (codex)."""
+
+    @staticmethod
+    def _clock():
+        t = [0.0]
+
+        def clock():
+            t[0] += 1.0
+            return t[0]
+        return clock
+
+    def test_a_read_that_reaps_a_zombie_is_read_again(self):
+        # a listed child forks a setsid replacement and exits before its
+        # state is read: the zombie is reaped, its replacement must be seen
+        from ameesh import platform
+        reads = iter([[{"pid": 10, "zombie": True}], [{"pid": 11, "zombie": False}],
+                      [], [], [], [], []])
+        killed = []
+        with mock.patch.object(platform, "children", side_effect=lambda: next(reads)), \
+                mock.patch.object(platform, "reap", return_value=0), \
+                mock.patch.object(heavy.os, "kill",
+                                  side_effect=lambda pid, sig: killed.append((pid, sig))):
+            self.assertTrue(heavy._drain_tree(1, grace=5, sleep=lambda s: None,
+                                              clock=self._clock()))
+        self.assertEqual(killed, [(11, signal.SIGTERM)])
+
+    def test_a_leftover_that_may_not_be_signalled_does_not_stop_the_cleanup(self):
+        from ameesh import platform
+        killed = []
+
+        def kill(pid, sig):
+            if pid == 20:
+                raise PermissionError(1, "Operation not permitted")
+            killed.append((pid, sig))
+        rows = [{"pid": 20, "zombie": False}, {"pid": 21, "zombie": False}]
+        err = io.StringIO()
+        with mock.patch.object(platform, "children", return_value=rows), \
+                mock.patch.object(heavy.os, "kill", side_effect=kill), \
+                mock.patch.object(heavy.sys, "stderr", err):
+            self.assertFalse(heavy._drain_tree(1, grace=3, sleep=lambda s: None,
+                                               clock=self._clock()))
+        self.assertEqual(killed, [(21, signal.SIGTERM), (21, signal.SIGKILL)])
+        self.assertEqual(err.getvalue().count("process 20 "), 1)
+
+    def _suspend(self, owners):
+        owner = iter(owners)
+        moved = []
+        with mock.patch.object(heavy.os, "tcgetpgrp", side_effect=lambda fd: next(owner)), \
+                mock.patch.object(heavy.os, "tcsetpgrp",
+                                  side_effect=lambda fd, pg: moved.append(pg)), \
+                mock.patch.object(heavy.os, "getpgrp", return_value=300), \
+                mock.patch.object(heavy.os, "kill"), \
+                mock.patch.object(heavy, "_killpg", return_value=True) as cont:
+            heavy._suspend(7, 500)
+        cont.assert_called_once_with(500, signal.SIGCONT)
+        return moved
+
+    def test_a_command_stopped_in_the_background_leaves_the_terminal_to_the_shell(self):
+        # `bg` then a read of the terminal (SIGTTIN): the shell (999) holds
+        # the foreground, the wrapper must not take it
+        self.assertEqual(self._suspend([999, 999]), [])
+
+    def test_ctrl_z_then_fg_hands_the_terminal_back_to_the_command(self):
+        self.assertEqual(self._suspend([500, 300]), [300, 500])
 
 
 class NoteTest(unittest.TestCase):
