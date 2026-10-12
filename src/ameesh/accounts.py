@@ -891,7 +891,7 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
-           paced: bool = True, critical: bool = False) -> Choice:
+           paced: bool = True, critical: bool = False, margin: bool = False) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -918,6 +918,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     sans autre compte, le compte par défaut sert au-delà de son plafond
     implicite de 50 % (jamais en overage ; rythme et `overage_cap` tenus,
     même avec `paced=False`), en dernier.
+
+    `margin` (L242b (3), #389 r1) : un agent critique qui tourne sous un
+    harnais emprunté ne revient au sien qu'avec la réserve des non-critiques
+    (`RESERVE`) sous le rythme — sans cette marge, chaque franchissement du
+    plafond coûterait une rotation avec résumé.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -932,7 +937,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     def ev(profile: Profile) -> Evaluation:
         if profile.name not in cache:
             cache[profile.name] = evaluate(book, profile, items, now, environ,
-                                           record=not simulate, reserve=not critical)
+                                           record=not simulate,
+                                           reserve=margin or not critical)
         return cache[profile.name]
 
     active_name = row.get("account")

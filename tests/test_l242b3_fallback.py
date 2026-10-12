@@ -29,7 +29,7 @@ def _claude_au_seuil():
     return mock.patch.object(accounts, "choose", side_effect=choose)
 
 
-class RepliTest(_Base):
+class _Repli(_Base):
     def worker(self, name="orch", critical=True, fallbacks=("codex",)):
         self.claude, self.codex = self._claude_comptes(), self._codex_comptes()
         return self._worker(name, "claude", {"claude": self.claude, "codex": self.codex},
@@ -40,6 +40,8 @@ class RepliTest(_Base):
         return [r["harness"] for r in self.db.query(
             "SELECT harness FROM turn_costs WHERE agent = 'orch' ORDER BY id")]
 
+
+class RepliTest(_Repli):
     def test_aller_sous_codex_puis_retour(self):
         worker = self.worker()
         try:
@@ -142,3 +144,132 @@ class ChoixDuRepliTest(_Base):
             self.assertEqual(account_turn._harness(worker), "claude")
         finally:
             worker.watchdog_stop.set()
+
+
+class Relecture389Test(_Repli):
+    """#389 r1 : le P1 et les quatre P2."""
+
+    def test_harnais_du_tour_non_ecrit_le_tour_ne_part_pas(self):
+        worker = self.worker()
+        try:
+            reel = worker._state_note
+
+            def note(key, value):
+                return False if key == "turn_harness" else reel(key, value)
+            with mock.patch.object(worker, "_state_note", side_effect=note), \
+                    _claude_au_seuil():
+                self._tour(worker)
+            self.assertEqual(self.turns(), [])
+            self.assertEqual(self.harnais_du_grand_livre(), [])
+            self.assertEqual(self.db.query(
+                "SELECT count(*) AS n FROM spend_pending WHERE agent = 'orch'")[0]["n"], 0)
+        finally:
+            worker.watchdog_stop.set()
+
+    def _claude(self, marge_pause=True, codex_pause=False):
+        """claude au seuil avec la marge du retour seulement (sans elle, de la
+        marge) ; codex au seuil si `codex_pause`."""
+        reel = accounts.choose
+
+        def choose(db, host, harness, items, book, **kw):
+            if harness == "claude" and kw.get("margin") and marge_pause:
+                return accounts.Choice(None, items[0], reason=PAUSE)
+            if harness == "codex" and codex_pause:
+                return accounts.Choice(None, items[0], reason=PAUSE)
+            return reel(db, host, harness, items, book, **kw)
+        return mock.patch.object(accounts, "choose", side_effect=choose)
+
+    def test_le_retour_demande_une_marge(self):
+        worker = self.worker()
+        try:
+            # dernier tour sous claude : pas de marge, il reste sous claude
+            worker._state_note("turn_harness", "claude")
+            with self._claude():
+                worker._borrowed = None
+                self.assertEqual(worker.budget_reason(), "")
+                self.assertIsNone(worker._borrowed)
+            # sous codex emprunté : claude juste sous le plafond ne suffit pas
+            worker._state_note("turn_harness", "codex")
+            self.assertTrue(account_turn.borrowing(worker))
+            with self._claude():
+                worker._borrowed = None
+                self.assertEqual(worker.budget_reason(), "")
+                self.assertEqual(worker._borrowed[0], "codex")
+            # codex au seuil à son tour : claude, sans la marge, plutôt que la pause
+            with self._claude(codex_pause=True):
+                worker._borrowed = None
+                self.assertEqual(worker.budget_reason(), "")
+                self.assertIsNone(worker._borrowed)
+            # avec la marge, le retour
+            with self._claude(marge_pause=False):
+                worker._borrowed = None
+                self.assertEqual(worker.budget_reason(), "")
+                self.assertIsNone(worker._borrowed)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_pas_de_rotation_ordinaire_sous_un_autre_harnais(self):
+        worker = self.worker()
+        try:
+            self._tour(worker)
+            self.assertIsNotNone(worker.current_session())
+            self.assertEqual(account_turn.session_harness(worker), "claude")
+            self.assertTrue(worker._rotation_allowed())
+            # claude au seuil : le tour emprunterait codex, dont les comptes
+            # portent les mêmes noms — la rotation attend `continuity`
+            with _claude_au_seuil():
+                self.assertFalse(worker._rotation_allowed())
+            compte = registry.get(self.db, "orch")["session_account"] or "primaire"
+            self.assertFalse(account_turn.session_on(
+                worker, accounts.Profile("codex", compte, path=self.codex[0]["path"])))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_pas_de_resume_paye_au_dela_du_plafond(self):
+        worker = self.worker()
+        try:
+            self._tour(worker)
+            session = worker.current_session()
+            n = len(self.turns())
+            with mock.patch("ameesh.cost.CostBook.over", return_value="hourly budget: x"):
+                self.assertEqual(account_turn.paid_cap(worker, "deepseek"),
+                                 "hourly budget: x")
+                self.assertEqual(account_turn.paid_cap(worker, "claude"), "")  # forfait
+                self.assertTrue(account_turn.rotate_harness(worker, "deepseek", "codex",
+                                                            session))
+            self.assertEqual(len(self.turns()), n)            # aucun tour de résumé
+            self.assertEqual(worker.resume_origin, "ameesh")  # brief déterministe
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_le_resume_de_passation_survit_a_une_panne(self):
+        worker = self.worker()
+        try:
+            self._tour(worker)
+            session = worker.current_session()
+            with mock.patch("ameesh.cost.CostBook.over", return_value="hourly budget: x"):
+                self.assertTrue(account_turn.rotate_harness(worker, "deepseek", "codex",
+                                                            session))
+            attendu = worker.resume_summary
+            self.assertTrue(attendu)
+        finally:
+            worker.watchdog_stop.set()
+        # panne : un nouveau worker, même état local
+        self.db.execute("UPDATE agent_registry SET lease_owner = NULL, lease_expires_at = NULL"
+                        " WHERE name = 'orch'")
+        _runner, repris = self._worker("orch", "claude",
+                                       {"claude": self.claude, "codex": self.codex},
+                                       critical_agents=("orch",),
+                                       critical_fallback_harnesses=("codex",))
+        try:
+            self.assertEqual(repris.resume_summary, attendu)
+            self.assertEqual(repris.resume_origin, "ameesh")
+            n = len(self.turns())
+            self._tour(repris, "suite")
+            tour = self.turns()[n]
+            self.assertNotIn("--resume", tour["argv"])
+            self.assertIn(attendu[:60], " ".join(tour["argv"]) + tour.get("stdin", ""))
+            self.assertEqual(repris.resume_summary, "")
+            self.assertFalse(os.path.exists(repris._path(repris.RESUME_PENDING)))
+        finally:
+            repris.watchdog_stop.set()

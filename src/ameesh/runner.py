@@ -469,6 +469,7 @@ class AgentWorker(threading.Thread):
         #: L106 : le bail repris était celui d'une session `attach` morte (bail
         #: expiré sans être rendu) : un tour de reprise sur la même session
         self._reprise_attach = bool(str(agent.get("lease_owner") or "").startswith("attach:"))
+        self._resume_load()
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -1085,7 +1086,7 @@ class AgentWorker(threading.Thread):
             os.unlink(self._path("session"))
         except OSError:
             pass
-        self.resume_summary = ""
+        self._resume_drop()
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_reread = 0
@@ -1234,6 +1235,52 @@ class AgentWorker(threading.Thread):
         except OSError:
             pass
 
+    #: le résumé de reprise d'une session oubliée, en attente de la session
+    #: neuve qu'il ouvre (#389 r1 : il survit à une panne de l'exécuteur)
+    RESUME_PENDING = "resume-pending.json"
+
+    def _resume_keep(self, resume: str, origin: str) -> None:
+        """Le résumé de reprise retenu pour la session neuve : en mémoire et
+        dans l'état local, AVANT l'oubli de l'ancienne session — une panne
+        entre l'oubli et le lancement ne le perd pas (#389 r1)."""
+        self.resume_summary, self.resume_origin = resume, origin
+        path = self._path(self.RESUME_PENDING)
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump({"ts": time.time(), "resume": resume, "origin": origin}, fh,
+                          ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(path + ".tmp", path)
+        except OSError as exc:
+            log_async("[%s] resume summary not kept on disk (%s)" % (self.name, exc))
+
+    def _resume_drop(self) -> None:
+        """Le résumé de reprise a ouvert la session neuve, ou n'a plus lieu
+        d'être : oublié, en mémoire et sur disque."""
+        self.resume_summary = ""
+        try:
+            os.unlink(self._path(self.RESUME_PENDING))
+        except OSError:
+            pass
+
+    def _resume_load(self) -> None:
+        """Au démarrage du worker : le résumé de reprise resté en attente, si
+        aucune session n'a été ouverte depuis (sinon il est périmé)."""
+        try:
+            with open(self._path(self.RESUME_PENDING), encoding="utf-8") as fh:
+                pending = json.load(fh)
+        except (OSError, ValueError):
+            return
+        resume = pending.get("resume") if isinstance(pending, dict) else None
+        if not isinstance(resume, str) or not resume or self.current_session():
+            self._resume_drop()
+            return
+        self.resume_summary = resume
+        self.resume_origin = "ameesh" if pending.get("origin") == "ameesh" else "agent"
+        log_async("[%s] pending resume summary recovered (%d characters)"
+                  % (self.name, len(resume)))
+
     def maybe_rotate(self) -> bool:
         """Résume la session courante puis en ouvre une neuve (0018, R19).
 
@@ -1277,6 +1324,11 @@ class AgentWorker(threading.Thread):
         rotation attend : la bascule du prochain tour (`continuity`) résume
         sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
         if not self.budget_ok() or not self.auth_ready():
+            return False
+        if self.turn_harness() != account_turn.session_harness(self):
+            # #389 r1 : le tour partirait sous un autre harnais que celui de
+            # la session (repli L242b, ou retour) — c'est `continuity` qui
+            # change de harnais, avec le résumé sous l'ancien
             return False
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
@@ -1329,17 +1381,17 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
+        self._resume_keep(resume, "agent")
         # L'effacement est fencé par le bail : si un remplaçant a réclamé l'agent
         # entre-temps, sa session n'est pas touchée.
         if not registry.clear_session(self.db, self.name, self.runner.runner_id, self.epoch):
+            self._resume_drop()
             log_async("[%s] rotation cancelled: lease lost before the session was cleared"
                       % self.name)
             self._fil_note("Session rotation cancelled: the lease changed hands "
                            "before clearing; nothing was touched.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
-        self.resume_summary = resume
-        self.resume_origin = "agent"
         try:
             os.unlink(self._path("session"))
         except OSError:
@@ -1682,12 +1734,11 @@ class AgentWorker(threading.Thread):
                 pass
             try:
                 from . import reprise
-                self.resume_summary = reprise.deterministic_brief(
+                self._resume_keep(reprise.deterministic_brief(
                     self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
                     session=refusee, reason=motif,
                     consigne="This turn's instruction follows this brief: resume your "
-                             "work from there.")
-                self.resume_origin = "ameesh"
+                             "work from there."), "ameesh")
             except Exception as exc:  # un brief manquant n'empêche pas l'oubli
                 log_async("[%s] deterministic resume brief unavailable (%s)"
                           % (self.name, exc))
@@ -2062,21 +2113,32 @@ class AgentWorker(threading.Thread):
             state_dir=self.cfg.state_dir, db=self.db,
             tools={self.name: self.agent.get("harness") or ""},
             **limites.book_kwargs())
-        # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
-        # compte et la garde bascule au lieu de mettre en pause.
-        raison = account_turn.choose(self, book)
-        # L242b : un non-critique s'arrête plus tôt — sous le rythme (réserve,
-        # sans comptes déclarés ; avec, `accounts.choose` la prend) et à une
-        # part du plafond horaire payé au token du mesh
-        from . import accounts as accounts_mod
         critique = account_turn.is_critical(self)
-        part = 1.0 if critique else getattr(self.cfg, "noncritical_hourly_share", 0.75)
+        if not critique:
+            return self._own_reason(book, margin=True)
+        # L242b (3), #389 r1 : sous un harnais emprunté, le retour au sien
+        # demande la marge d'un non-critique (pas d'aller-retour à chaque
+        # franchissement du plafond) — sauf si aucun emprunt n'en a plus
+        retour = account_turn.borrowing(self)
+        raison = self._critical_fallback(self._own_reason(book, margin=retour), limites)
+        if raison and retour:
+            raison = self._own_reason(book, margin=False)
+        return raison
+
+    def _own_reason(self, book, *, margin: bool) -> str:
+        """La raison de pause sur son propre harnais, ou ''. L30 (0027) : avec
+        des comptes déclarés, le rythme se juge compte par compte et la garde
+        bascule au lieu de mettre en pause. L242b : `margin` (un non-critique,
+        ou un critique qui revient d'un emprunt) s'arrête plus tôt — sous le
+        rythme (réserve, sans comptes déclarés ; avec, `accounts.choose` la
+        prend) et à une part du plafond horaire payé au token du mesh."""
+        from . import accounts as accounts_mod
+        raison = account_turn.choose(self, book, margin=margin)
+        part = getattr(self.cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
         if raison is None:
-            raison = book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
-                               hourly_share=part)
-        else:
-            raison = raison or book.over(self.name, pace=False, hourly_share=part)
-        return self._critical_fallback(raison, limites) if critique else raison
+            return book.over(self.name, reserve=accounts_mod.RESERVE if margin else 0.0,
+                             hourly_share=part)
+        return raison or book.over(self.name, pace=False, hourly_share=part)
 
     def _critical_fallback(self, raison: str, limites) -> str:
         """L242b (3) : la pause budget d'un agent critique cède à un autre
@@ -2164,14 +2226,21 @@ class AgentWorker(threading.Thread):
         de sa ligne de grand livre, même rejouée après une panne."""
         return self._state_read("turn_harness") or (self.agent or {}).get("harness") or ""
 
-    def _state_note(self, key: str, value: str) -> None:
-        """Écrit une valeur d'état locale ; jamais fatal."""
+    def _state_note(self, key: str, value: str) -> bool:
+        """Écrit une valeur d'état locale, atomiquement ; jamais fatal. Rend
+        vrai si elle est écrite (#389 r1 : le harnais du tour l'exige)."""
+        path = os.path.join(self.state_dir, key)
         try:
             os.makedirs(self.state_dir, exist_ok=True)
-            with open(os.path.join(self.state_dir, key), "w", encoding="utf-8") as fh:
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
                 fh.write(value)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(path + ".tmp", path)
+            return True
         except OSError as exc:
             log_async("[%s] state %s not written (%s)" % (self.name, key, exc))
+            return False
 
     def _state_read(self, key: str) -> str:
         """Lit une valeur d'état locale (`model`, `effort`) ; '' si absente."""
@@ -3254,8 +3323,13 @@ class AgentWorker(threading.Thread):
         # une trace, on ne dépense pas (fail-closed, L13 B5). Le marqueur est
         # écrit atomiquement et lu au redémarrage ; la session sera résolue par
         # `record` au moment de l'écriture.
-        # L242b (3) : le harnais de la ligne de grand livre de ce tour
-        self._state_note("turn_harness", harness)
+        # L242b (3) : le harnais de la ligne de grand livre de ce tour ; non
+        # écrit, le tour ne part pas (#389 r1) — sa dépense serait comptée
+        # sous un autre harnais, hors du plafond payé au token
+        if not self._state_note("turn_harness", harness) \
+                or self._state_read("turn_harness") != harness:
+            self.fail_turn("accounting unavailable", "turn harness not written")
+            return False
         if not self._compta_marque(events_start, label, model):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
@@ -3343,7 +3417,7 @@ class AgentWorker(threading.Thread):
             # unique couvre toutes les causes (B5a-P, L11 B2).
             tue = self.kill_if_stop_requested()
             if resume and not tue:
-                self.resume_summary = ""  # le résumé a ouvert la session neuve
+                self._resume_drop()  # le résumé a ouvert la session neuve
             log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
             # L78: the writer owns its connection; harness output never waits
             # for SQL or the readable thread. ResidentWorker uses the same sink.

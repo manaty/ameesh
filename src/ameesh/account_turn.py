@@ -61,7 +61,7 @@ def _harness(worker) -> str:
     return own_harness(worker)
 
 
-def choose(worker, book=None, *, pause: bool = True) -> str | None:
+def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None) -> str | None:
     """Choisit le compte du prochain tour. None : aucun compte déclaré.
 
     Rend '' quand un compte est retenu (posé dans `worker._account`), la raison
@@ -69,6 +69,9 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     quand même, et le rythme ne met jamais en pause — mais L226b : un compte
     en overage ou au-dessus d'un plafond fixe n'est jamais retenu ; s'il n'en
     reste pas d'autre, la raison est rendue et le tour ne part pas.
+
+    `margin` (L242b) : la réserve des non-critiques sous le rythme ; par
+    défaut, pour un non-critique seulement (`accounts.choose`).
     """
     harness = own_harness(worker)        # L242b (3) : toujours le sien d'abord
     try:
@@ -84,7 +87,7 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
                                  agent=worker.name, paced=pause,
                                  session_account=session_account(worker, items),
-                                 critical=is_critical(worker))
+                                 critical=is_critical(worker), margin=bool(margin))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -166,6 +169,14 @@ def fallback(worker, reason: str, limits=None) -> str:
                                           "compte": profile.name if profile else None})
         return ""
     return reason
+
+
+def borrowing(worker) -> bool:
+    """L242b (3) : le dernier tour lancé est-il parti sous un autre harnais
+    que le sien (`turn_harness` de l'état local) ?"""
+    read = getattr(worker, "_state_read", None)
+    last = read("turn_harness") if callable(read) else ""
+    return bool(isinstance(last, str) and last and last != own_harness(worker))
 
 
 def session_harness(worker) -> str:
@@ -367,6 +378,10 @@ def session_on(worker, compte) -> bool:
     Vrai sans comptes déclarés (`compte` None) ou sans session."""
     if compte is None or not worker.current_session():
         return True
+    if compte.harness != session_harness(worker):
+        # #389 r1 : deux comptes de harnais différents peuvent porter le même
+        # nom — jamais la même session
+        return False
     previous = _session_account(worker)
     if previous is None:
         # session d'avant L30 : ouverte avec le dossier par défaut du harnais
@@ -483,6 +498,29 @@ def summary_possible(old, book, items, now: float | None = None, *,
     return True, ""
 
 
+def paid_cap(worker, harness: str) -> str:
+    """La raison qui interdit un tour payé au token sous `harness` (plafonds
+    du mesh et de l'agent, `CostBook.over` ; un forfait n'y est pas soumis),
+    ou ''. Une part du plafond horaire pour un non-critique (L242b (2)) ;
+    état illisible : interdit, dans le doute pas d'appel de modèle."""
+    budget_limits = getattr(getattr(worker, "runner", None), "budget_limits", None)
+    if budget_limits is None or harness not in cost_mod.paid_harnesses_of():
+        return ""
+    try:
+        limits = budget_limits(worker.db)
+        if limits.per_hour <= 0:
+            return ""
+        book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=worker.db,
+                                 tools={worker.name: harness}, **limits.book_kwargs())
+        part = 1.0 if is_critical(worker) else getattr(
+            worker.cfg, "noncritical_hourly_share", 0.75)
+        return book.over(worker.name, pace=False, hourly_share=part)
+    except db_mod.Unavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - dans le doute, pas de résumé
+        return "paid cap unreadable (%s)" % exc
+
+
 def rotate_harness(worker, old_harness: str, new_harness: str, session: str) -> bool:
     """L242b (3) : rotation avec résumé au changement de harnais. Le résumé se
     fait sous l'ANCIEN harnais et le compte de la session (sans compte
@@ -535,6 +573,15 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
         if not possible:
             _log("[%s] no summary under account %s: %s" % (worker.name, nom_ancien, raison))
     if possible:
+        # #389 r1 : le résumé est un appel de modèle sous l'ANCIEN harnais —
+        # payé au token, il tient dans le plafond du mesh comme un tour
+        raison = paid_cap(worker, harness)
+        if raison:
+            possible = False
+            _log("[%s] no summary under %s/%s: %s" % (worker.name, harness, nom_ancien,
+                                                      raison))
+
+    if possible:
         # le résumé se fait sous l'ANCIEN compte (et l'ancien harnais), qui
         # seul peut reprendre la session
         worker._account_override = old
@@ -568,13 +615,14 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
         except Exception as exc:  # un brief manquant ne bloque jamais la rotation
             _log("[%s] deterministic resume brief unavailable (%s)" % (worker.name, exc))
     worker._session_history(session, note)
+    # le cadre de reprise dit qui a écrit le bloc : l'agent, ou ameesh (L39) ;
+    # gardé sur disque avant l'oubli (#389 r1 : une panne ne le perd pas)
+    worker._resume_keep(resume, "ameesh" if sans_resume else "agent")
     if not registry.clear_session(worker.db, worker.name, worker.runner.runner_id,
                                   worker.epoch):
+        worker._resume_drop()
         _log("[%s] switch rotation cancelled: lease lost before clearing" % worker.name)
         return False
-    worker.resume_summary = resume
-    # le cadre de reprise dit qui a écrit le bloc : l'agent, ou ameesh (L39)
-    worker.resume_origin = "ameesh" if sans_resume else "agent"
     try:
         os.unlink(worker._path("session"))
     except OSError:

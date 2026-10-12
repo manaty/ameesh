@@ -516,16 +516,30 @@ change.
    The switch goes through a rotation with summary. The summary is made
    under the old harness and the session's account, the only ones that can
    resume it; when that is impossible, a deterministic brief is used (L39).
+   A paid-per-token old harness must still hold the mesh caps for the
+   summary, like a turn; otherwise the brief is used. The summary (or
+   brief) is kept in the agent's state (`resume-pending.json`) before the
+   old session is forgotten: a runner restarted before the new session
+   starts still opens it with the summary. An ordinary rotation (L11) never
+   runs while the next turn would go to another harness than the session's:
+   the switch does it.
    A fresh session then starts under the new harness. The agent's model,
    effort and tier do not follow it: the borrowed harness uses its own
    defaults. Each turn is counted under the harness it ran on (ledger,
-   mesh cap). The thread says "its turns run under codex/<account> until its
+   mesh cap): that harness is written to the agent's state before the
+   accounting marker, and the turn does not start if it cannot be. The
+   thread says "its turns run under codex/<account> until its
    own account has headroom again" and "Harness switch: …".
 
    **Coming back.** Before every turn the agent's own harness is evaluated
-   first. As soon as one of its accounts has headroom again (window reset),
-   it comes back by the same rotation, with the summary made under the
-   borrowed harness;
+   first. While the agent runs under a borrowed harness, it comes back only
+   when one of its accounts has the headroom of a non-critical agent: the
+   reserve of 10 points under the pace (`accounts.RESERVE`) and
+   `noncritical_hourly_share` of the hourly cap. Without that margin, each
+   crossing of a rising pace cap would cost a summary and a rotation. If no
+   borrowed harness has headroom left, its own account is used without the
+   margin rather than a pause. The return is the same rotation, with the
+   summary made under the borrowed harness;
 4. pause, once all of the above are exhausted.
 
 **Reserve for the critical agents** (L242b (2)). The other agents stop
