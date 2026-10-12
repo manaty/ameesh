@@ -543,6 +543,8 @@ class Evaluation:
     gauges: list = field(default_factory=list)
     until: float | None = None           #: remise à zéro attendue si au seuil
     problems: list = field(default_factory=list)
+    #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
+    held: tuple | None = None
     #: L226b: {gauge key: (cap, label)}, the cap each window is held to
     limits: dict = field(default_factory=dict)
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
@@ -687,6 +689,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # not what holds the account
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
                                                     result.limits[depasses[0].key])
+        result.held = (gauge.key, gauge.used)
         if label == "pace cap":
             result.reason = ("plan %s %s: %.0f%% used with %.0f%% of the window elapsed "
                              "(pace cap %.0f%%)" % (
@@ -746,6 +749,19 @@ class Choice:
     #: L242b : choix propre à un agent critique — le dernier choix partagé
     #: (`account_active`) n'a pas bougé, aucun forçage n'a été levé
     per_agent: bool = False
+
+
+def pause_label(evaluations: dict) -> str:
+    """L242b (4) : la pause en court, devant sa raison détaillée — le compte
+    qui se libère le premier : « pause (account secondaire, five_hour 96 %)
+    until 14:20; ». Vide si aucun compte n'a de remise à zéro datée."""
+    dated = [ev for ev in evaluations.values() if ev.until and ev.held]
+    if not dated:
+        return ""
+    first = min(dated, key=lambda ev: ev.until)
+    return "pause (account %s, %s %.0f %%) until %s; " % (
+        first.profile.name, first.held[0], first.held[1] * 100,
+        time.strftime("%H:%M", time.localtime(first.until)))
 
 
 def _label(evaluations: dict) -> str:
@@ -1000,8 +1016,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                               harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
                                   "reason") or "authentication failing")
                                   for p in items if p.name in sick)))
-        return Choice(None, active, reason="all %s accounts at threshold — %s"
-                      % (harness, _label(cache)))
+        return Choice(None, active, reason="%sall %s accounts at threshold — %s"
+                      % (pause_label(cache), harness, _label(cache)))
     target = ranked[0]
     why = reason_of(ranked, cache, now)
     if beyond:

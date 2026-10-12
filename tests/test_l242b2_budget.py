@@ -6,9 +6,10 @@ ce plafond horaire se compte sur la baisse réelle des soldes (décision de
 mesh-design du 2026-10-12)."""
 from __future__ import annotations
 
+import time
 from unittest import mock
 
-from ameesh import accounts, config, cost, storage
+from ameesh import accounts, budget, config, cost, progress, storage
 
 from .support import PgTestCase
 from .test_l242b_critical_accounts import _Comptes
@@ -33,6 +34,28 @@ class ReserveForfaitTest(_Comptes):
         limits = accounts.limits(self.items[1], [], self.now, reserve=True)
         self.assertEqual(limits, {})
         self.assertEqual(accounts.RESERVE, 0.10)
+
+
+class AffichageDeLaPauseTest(_Comptes):
+    def test_la_raison_commence_par_la_pause_en_court(self):
+        self.jauge("primaire", 96)
+        self.jauge("secondaire", 97)
+        pause = self.choose()
+        self.assertIsNone(pause.profile)
+        heure = time.strftime("%H:%M", time.localtime(self.now + 1800))
+        self.assertTrue(pause.reason.startswith("pause (account "), pause.reason)
+        self.assertIn(") until %s; all codex accounts at threshold" % heure, pause.reason)
+        self.assertRegex(pause.reason, r"codex-300min (96|97) %")
+
+    def test_une_pause_budget_n_est_jamais_un_arret(self):
+        for status, lease in (("blocked", False), ("running", False), ("idle", False)):
+            with self.subTest(status=status):
+                row = {"status": status, "lease_live": lease,
+                       "status_text": "budget : pause (account a, five_hour 96 %) until 14:20"}
+                self.assertEqual(progress.agent_state(row), "paused")
+        self.assertEqual(progress.agent_state({"status": "stopped",
+                                               "status_text": "budget : x"}), "stopped")
+        self.assertEqual(progress.BUDGET_PAUSE_PREFIX, budget.PAUSE_PREFIX)
 
 
 class _Paye(PgTestCase):

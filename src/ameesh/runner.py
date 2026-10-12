@@ -5741,6 +5741,13 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     if agent.get("status") == "stopped":
         print("agent %s stopped: nothing to attach" % name, file=sys.stderr)
         return 1
+    from . import budget as budget_pause
+    texte = agent.get("status_text") or ""
+    if agent.get("status") == "blocked" and texte.startswith(budget_pause.PAUSE_PREFIX):
+        # L242b (4) : dire la pause budget, pas un arrêt ; la session
+        # interactive reste possible (elle prend le compte actif du harnais)
+        print("agent %s in budget %s" % (name, texte[len(budget_pause.PAUSE_PREFIX):]),
+              file=sys.stderr)
     if (agent.get("host") or "") != cfg.host:
         print("agent %s pinned to %s, not to %s" % (name, agent.get("host") or "?", cfg.host),
               file=sys.stderr)

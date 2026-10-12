@@ -76,6 +76,8 @@ TASK_CHARS = 140
 LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
 AGENT_STATES = ("working", "idle", "paused", "stopped")
+#: `budget.PAUSE_PREFIX` (sans importer budget ici)
+BUDGET_PAUSE_PREFIX = "budget : "
 
 _FR_LOT = {"active": "active", "review": "in review", "blocked": "blocked",
            "approved": "approved", "merged": "merged", "closed": "closed"}
@@ -362,6 +364,11 @@ def build_action(row: dict) -> dict:
 def agent_state(row: dict) -> str:
     """travaille | repos | pause | arrêt, depuis le statut et le bail."""
     status = row.get("status") or ""
+    # L242b (4) : une pause budget se lit « paused », quel que soit le statut
+    # (jamais « stopped » faute de bail pendant la pause)
+    if status not in ("stopped", "dead") \
+            and (row.get("status_text") or "").startswith(BUDGET_PAUSE_PREFIX):
+        return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
     if status == "blocked":
