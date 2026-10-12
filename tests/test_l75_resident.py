@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import acp, adapters, harnesses, resident
 
@@ -365,18 +366,146 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertFalse(driver._writer.is_alive())
         self.assertTrue(driver.proc.stdin.closed)
 
-    def test_an_input_held_by_an_escaped_child_is_left_open(self):
+    def test_an_input_held_by_an_escaped_child_is_closed_once_the_writer_ends(self):
+        # #387: the writer outlives close() (slow poll here); the input is
+        # closed by whichever of the two ends last, here the writer
         driver = self.driver()
         driver.start()
         self.wait(driver.send("ORPHAN_IN DEAF"))
         self.orphan_pid()
         driver.send("z" * 2_000_000)
         self.until(lambda: not driver._outbox.qsize())
-        self.bounded(lambda: driver.close(0.3))
-        # the writer is still blocked in its write: its descriptor stays ours
+        with mock.patch.object(resident, "WRITE_POLL", 2.0):
+            time.sleep(0.3)  # the writer is in its (slow) poll
+            self.bounded(lambda: driver.close(0.1))
+            self.assertTrue(driver._writer.is_alive())
+            self.assertFalse(driver.proc.stdin.closed)
+            self.until(lambda: not driver._writer.is_alive(), 5)
+        self.assertTrue(driver.proc.stdin.closed)
+
+    def test_the_writer_wakes_up_when_the_harness_dies(self):
+        # #387: the harness dies while its writer waits on a full pipe that a
+        # child left behind still holds: the writer ends and the turn fails
+        driver = self.driver()
+        driver.start()
+        self.wait(driver.send("ORPHAN_IN DEAF"))
+        self.orphan_pid()
+        turn = driver.send("z" * 2_000_000)
+        self.until(lambda: not driver._outbox.qsize())
+        time.sleep(0.3)
         self.assertTrue(driver._writer.is_alive())
-        self.assertFalse(driver.proc.stdin.closed)
-        os.fstat(driver.proc.stdin.fileno())
+        os.kill(driver.pid, signal.SIGKILL)
+        self.until(lambda: not driver._writer.is_alive())
+        result = self.wait(turn, 5)
+        self.assertEqual(result.status, resident.FAILED)
+        self.assertIn("exited", result.error)
+
+    def test_the_outbox_is_bounded(self):
+        # #387: past MAX_OUTBOX_BYTES not yet written, an input is refused;
+        # a line counts until the harness has taken it whole
+        driver = self.driver()
+        driver.start()
+        with mock.patch.object(resident, "MAX_OUTBOX_BYTES", 3_000_000):
+            self.wait(driver.send("a" * 2_000_000))
+            self.wait(driver.send("DEAF " + "b" * 2_000_000))
+            turn = driver.send("z" * 2_000_000)  # written in part: still counted
+            with self.assertRaises(resident.ResidentError):
+                driver.steer("y" * 2_000_000, input_id="refused")
+        self.assertNotIn("refused", turn.inputs)
+        self.assertTrue(driver.alive)
+
+    def test_a_refused_steer_does_not_hold_the_turn(self):
+        # codex r1 (#387): a steer refused by the outbox is not awaited as
+        # unread: the turn still ends, and the next send is accepted
+        driver = self.driver()
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        with mock.patch.object(resident, "MAX_OUTBOX_BYTES", 1000):
+            with self.assertRaises(resident.ResidentError):
+                driver.steer("y" * 2000, input_id="refused")
+        result = self.wait(turn, 5)
+        self.assertEqual((result.status, result.inputs), (resident.COMPLETED, ("a",)))
+        self.assertEqual(self.wait(driver.send("next")).final, "ECHO:next")
+
+    def test_a_refused_interrupt_does_not_end_the_turn(self):
+        # codex r2 (#387): an interrupt refused by the outbox leaves the turn
+        # uninterrupted: the result of "a" does not end it before "b"
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        with mock.patch.object(resident, "MAX_OUTBOX_BYTES", 0):
+            self.assertFalse(driver.interrupt())
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs, result.final),
+                         (resident.COMPLETED, ("a", "b"), "ECHO:late"))
+        self.assertNotIn({"control": "interrupt"}, self.trace())
+
+    def test_a_refused_interrupt_is_undone_before_any_result(self):
+        # codex r3 (#387): the result of "a" read between the refusal and the
+        # rollback must not end the turn — the rollback happens before the
+        # lock is released. The refusal waits here until that result is read.
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        control = driver._control
+
+        def refused_then_result_read(*args, **kwargs):
+            try:
+                return control(*args, **kwargs)
+            except resident.InputRefused:
+                deadline = time.monotonic() + 10
+                while not driver._final.startswith("ECHO:"):   # a result was read
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                raise
+
+        with mock.patch.object(driver, "_control", refused_then_result_read), \
+                mock.patch.object(resident, "MAX_OUTBOX_BYTES", 0):
+            self.assertFalse(driver.interrupt())
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs, result.final),
+                         (resident.COMPLETED, ("a", "b"), "ECHO:late"))
+
+    def test_two_overlapping_refused_interrupts_restore_the_turn(self):
+        # codex r4 (#387): the second interrupt enters while the first is
+        # admitted, the first rolls back, then the second is refused: it must
+        # not restore the flags the first had set — "b" is still served
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        control = driver._control
+        second_entered, first_done = threading.Event(), threading.Event()
+        calls = []
+
+        def overlapping(*args, **kwargs):
+            first = not calls
+            calls.append(1)
+            if first:
+                self.assertTrue(second_entered.wait(10))
+                try:
+                    return control(*args, **kwargs)
+                finally:
+                    first_done.set()
+            second_entered.set()
+            self.assertTrue(first_done.wait(10))
+            return control(*args, **kwargs)
+
+        results = []
+        with mock.patch.object(driver, "_control", overlapping), \
+                mock.patch.object(resident, "MAX_OUTBOX_BYTES", 0):
+            other = threading.Thread(target=lambda: results.append(driver.interrupt()))
+            other.start()
+            self.until(lambda: calls)
+            results.append(driver.interrupt())
+            other.join(10)
+        self.assertEqual(results, [False, False])
+        self.assertFalse(driver._interrupting)
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs, result.final),
+                         (resident.COMPLETED, ("a", "b"), "ECHO:late"))
 
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was
@@ -577,6 +706,36 @@ class CodexAppServerTest(DriverCase):
         self.assertTrue(accepted)
         self.assertEqual(turn.result.inputs, ("a", "b"))
         self.assertIn("ECHO:steered", turn.result.final)
+
+    def test_a_steer_refused_before_the_interrupt_admission_is_not_served(self):
+        # codex r5 (#387): a refused steer queues its follow-up between the
+        # call to interrupt() and the admission of the request: the admission
+        # drops it, and the interrupted turn does not report it as served
+        driver = self.driver(env={"FAKE_CODEX_STEER_REFUSE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        self.until(lambda: driver._turn_id)
+        interrupt = driver._interrupt
+        entered, steered = threading.Event(), threading.Event()
+
+        def in_the_gap(*args, **kwargs):
+            entered.set()
+            self.assertTrue(steered.wait(10))
+            return interrupt(*args, **kwargs)
+
+        done: list = []
+        with mock.patch.object(driver, "_interrupt", in_the_gap):
+            other = threading.Thread(target=lambda: done.append(driver.interrupt()))
+            other.start()
+            self.assertTrue(entered.wait(10))
+            driver.steer("follow", input_id="b")
+            self.assertEqual(driver._followups, [("b", "follow")])
+            steered.set()
+            other.join(10)
+        self.assertEqual(done, [True])
+        result = self.wait(turn)
+        self.assertEqual(result.inputs, ("a",))
+        self.assertEqual(len(self.methods("turn/start")), 1)
 
     def test_a_steer_refused_after_the_interrupt_never_opens_a_turn(self):
         # codex r2 (#325): the interrupted end is recorded before the steer's
