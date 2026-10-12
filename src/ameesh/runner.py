@@ -3096,6 +3096,9 @@ class AgentWorker(threading.Thread):
             threading.Thread(target=self._audit_deadline_monitor,
                              args=(preempt_done, time.monotonic() + audit_seconds),
                              daemon=True).start()
+        #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
+        #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
+        empreinte = sentinel.fingerprint(self.agent.get("harness") or "", compte)
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
@@ -3374,12 +3377,11 @@ class AgentWorker(threading.Thread):
                 self.fast_failure = False
                 nom_harnais = self.agent.get("harness") or ""
                 account = auth_failure.account_name(compte)
-                # #210 : l'empreinte du jeton en place — la sentinelle ne lève
-                # l'échec que pour un autre jeton
+                # #210 : l'empreinte du jeton du tour (lue au lancement, pas
+                # maintenant) — la sentinelle ne lève l'échec que pour un autre
                 self._avec_reprise("account health", auth_failure.report, self.db,
                                    self.cfg.host, nom_harnais, account, "failing",
-                                   reason=raison_auth, source="turn",
-                                   fingerprint=sentinel.fingerprint(nom_harnais, compte))
+                                   reason=raison_auth, source="turn", fingerprint=empreinte)
                 if self._session_en_attente is not None:
                     self._avec_reprise("turn session", self._enregistre_session)
                 texte = auth_failure.status_text(nom_harnais, account)

@@ -158,10 +158,16 @@ def fingerprint(harness: str, profile=None, environ=None) -> str | None:
     if profile is None:
         profile = accounts_mod.Profile(harness=harness, name="")
     if profile.kind == "api_key_env":
+        # the key as the runner passes it (`accounts.apply_env` strips it):
+        # `key` and `key\n` are the same credential
         if profile.key_file:
-            return file_fingerprint(profile.key_file)
+            try:
+                with open(profile.key_file, encoding="utf-8") as fh:
+                    return _digest(fh.read().strip())
+            except (OSError, UnicodeDecodeError):
+                return None
         name = profile.key_env or profile.env or accounts_mod.default_key_env_of(harness)
-        return _digest(environ.get(name)) if name else None
+        return _digest(str(environ.get(name) or "").strip()) if name else None
     home = profile.home(environ)
     if harness == "claude":
         return _digest(_json_secret(os.path.join(home, ".credentials.json"),

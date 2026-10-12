@@ -302,6 +302,24 @@ class ReviewR1Test(unittest.TestCase):
         self.assertIsNone(sentinel.fingerprint("claude", accounts.Profile(
             "claude", "y", path=os.path.join(self.tmp, "absent"))))
 
+    def test_r3_api_key_fingerprint_ignores_the_whitespace_the_runner_strips(self):
+        # revoked-key failed, then rewritten as revoked-key\n: the runner still
+        # passes revoked-key, the failure must stay
+        key = os.path.join(self.tmp, "k.key")
+        keyed = accounts.Profile("deepseek", "k", kind="api_key_env", key_file=key)
+        by_env = accounts.Profile("deepseek", "e", kind="api_key_env",
+                                  key_env="DEEPSEEK_API_KEY_A")
+        found = set()
+        for text in ("revoked-key", "revoked-key\n", "  revoked-key \r\n"):
+            with open(key, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            found.add(sentinel.fingerprint("deepseek", keyed))
+            found.add(sentinel.fingerprint("deepseek", by_env, {"DEEPSEEK_API_KEY_A": text}))
+        self.assertEqual(found, {sentinel._digest("revoked-key")})
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write("\n")
+        self.assertIsNone(sentinel.fingerprint("deepseek", keyed))
+
     def test_p2_named_claude_probe_sheds_inherited_auth_variables(self):
         path = _claude_dir(self.tmp, "acct", refreshToken="x")
         profile = accounts.Profile("claude", "acct", path=path)

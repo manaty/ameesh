@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 
-from ameesh import account_turn, accounts, auth_failure, cost, exploitation, registry, storage
+from ameesh import (account_turn, accounts, auth_failure, cost, exploitation, registry,
+                    sentinel, storage)
 
 from .support import FAKEBIN
 from .test_l30_accounts import _Base, _codex_rollout
@@ -425,6 +428,31 @@ class RunnerTest(_AuthBase):
             fil = self._fil()
             self.assertIn("Turn failed authentication on claude/primaire", fil)
             self.assertIn("Block auth_blocked: claude/primaire lifted", fil)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_failure_records_the_credential_the_turn_started_with(self):
+        # #210 codex r3: the turn starts with A, the owner logs in with B
+        # during it, A's request fails — A is failing, not B
+        comptes = self._claude_comptes(partage=True)
+        creds = os.path.join(comptes[0]["path"], ".credentials.json")
+
+        def login(token):
+            with open(creds, "w", encoding="utf-8") as fh:
+                json.dump({"claudeAiOauth": {"refreshToken": token}}, fh)
+
+        login("token-A")
+        runner, worker = self._worker("re", "claude", {"claude": comptes})
+        relogin = "%s -c %s" % (sys.executable, shlex.quote(
+            "import json; json.dump({'claudeAiOauth': {'refreshToken': 'token-B'}}, "
+            "open(%r, 'w'))" % creds))
+        try:
+            self.assertIsNotNone(self._tour(worker, AMEESH_TEST_RUN=relogin, **self.LOGIN))
+            self.assertEqual(sentinel.fingerprint("claude", accounts.Profile(
+                "claude", "primaire", path=comptes[0]["path"])), sentinel._digest("token-B"))
+            sante = self._health("claude")["primaire"]
+            self.assertEqual((sante["state"], sante["failing_fingerprint"]),
+                             ("failing", sentinel._digest("token-A")))
         finally:
             worker.watchdog_stop.set()
 
