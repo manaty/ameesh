@@ -905,12 +905,17 @@ class Enforcer:
         stopped = self._systemctl("stop", self.cfg.slice)
         return killed and stopped
 
-    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
+    def apply(self, state: dict, cpu_count: int | None,
+              now: float | None = None) -> list[str]:
         """Enforces `state`: caps at every level, freeze at level 2; a drain
         thaws, and stops the jobs at its deadline; a stop kills and stops the
         guest's slice. Each is done once, retried while it fails. The `caps`
-        keys actually enforced."""
-        now = self.clock()
+        keys actually enforced.
+
+        `now` is the instant `state` was decided at: the deadline is judged
+        on the same clock as the decision (a manual request's expiry
+        included), never on a later one (codex #238 r4)."""
+        now = self.clock() if now is None else now
         caps = state.get("caps") or {}
         level = state.get("level", 0)
         deadline = state.get("drain_deadline_ts")
@@ -1003,8 +1008,11 @@ class Guard:
 
     def step(self) -> dict:
         """One evaluation: measure, decide, write when changed or due."""
+        reading = self.signals(self.clock())
+        # measuring takes time: the request's expiry, the decision and the
+        # drain deadline are judged on the clock read after it, right
+        # before enforcing (codex #238 r4)
         now = self.clock()
-        reading = self.signals(now)
         reading["drain_requested"] = drain_requested(self.cfg.drain_request_path, now)
         ack = read_ack(self.cfg.ack_path)
         # an acknowledgement holds for the whole drain episode: a seq the
@@ -1018,7 +1026,8 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"))
+            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"),
+                                                            now)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1

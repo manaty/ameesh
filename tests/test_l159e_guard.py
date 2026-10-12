@@ -910,6 +910,44 @@ class DrainStopTest(unittest.TestCase):
         self.clock[0] = 2130.0
         self.assertEqual(g.step()["state"], "stopped")
 
+    def test_request_expiry_and_deadline_on_one_clock(self):
+        # codex #238 r4: request until 1099, drain deadline 1100; the
+        # evaluation starts at 1098 and measuring takes 3 s: at 1101 the
+        # request is over on a healthy host, the drain ends, no job stopped
+        guard.request_drain(self.cfg.drain_request_path, 1000.0, 99)
+        slow = [0.0]
+
+        def signals(now):
+            self.clock[0] += slow[0]
+            return dict(self.reading)
+        g = guard.Guard(self.cfg, observe=False, signals=signals,
+                        clock=lambda: self.clock[0],
+                        enforcer=guard.Enforcer(self.cfg, run=self.fake, log=lambda t: None,
+                                                clock=lambda: self.clock[0]))
+        drain = g.step()
+        self.assertEqual((drain["level"], drain["drain_deadline_ts"]), (3, 1100.0))
+        self.clock[0], slow[0] = 1098.0, 3.0
+        self.assertEqual(g.step()["state"], "available")
+        self.assertEqual(self.stops(), [])
+        # still requested when the measure ends, and the deadline (1201)
+        # passed meanwhile: the jobs stop
+        guard.request_drain(self.cfg.drain_request_path, 1101.0, 200)
+        self.clock[0], slow[0] = 1101.0, 0.0
+        self.assertEqual(g.step()["drain_deadline_ts"], 1201.0)
+        self.clock[0], slow[0] = 1198.0, 3.0
+        g.step()
+        self.assertEqual(self.stops(), [["stop", "ameesh-job-*.scope"]])
+        # the enforcer judges the deadline at the decision's instant, not
+        # on its own later clock
+        self.calls.clear()
+        enforcer = guard.Enforcer(self.cfg, run=self.fake, log=lambda t: None,
+                                  clock=lambda: 1101.0)
+        state = {"level": 3, "caps": {}, "drain_deadline_ts": 1100.0}
+        enforcer.apply(state, 4, 1099.9)
+        self.assertEqual(self.stops(), [])
+        enforcer.apply(state, 4, 1100.0)
+        self.assertEqual(self.stops(), [["stop", "ameesh-job-*.scope"]])
+
     def test_cancelled_manual_drain_ends_at_level_4_too(self):
         # codex #238 r2: indefinite manual drain, level 4 at t=120, SIGKILL
         # fails; cancelled at 125: back to available, the kill not retried
