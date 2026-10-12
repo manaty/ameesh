@@ -2577,6 +2577,16 @@ class Handoffs(Domain):
     """L232a: destination reservations and durable lot-boundary handoffs."""
 
     @abc.abstractmethod
+    def controller(self, operation: str):
+        """Lock context yielding the journal DB, or None if another controller owns it.
+
+        Serialize bounded, idempotent adapter steps with cancel/retry. Journal
+        changes commit independently of this lock so the destination can claim
+        after activation. Adapters must impose timeouts; no agent-row lock
+        spans an external call.
+        """
+
+    @abc.abstractmethod
     def get(self, operation: str) -> dict | None: ...
 
     @abc.abstractmethod
@@ -2596,6 +2606,10 @@ class Handoffs(Domain):
 
     @abc.abstractmethod
     def reserve(self, operation: str, plan: dict, *, ttl: int) -> dict | None: ...
+
+    @abc.abstractmethod
+    def renew(self, operation: str, *, ttl: int) -> dict | None:
+        """Renew a held reservation after explicit adapter reconciliation and fresh readings."""
 
     @abc.abstractmethod
     def transition(self, operation: str, expected: str, state: str,

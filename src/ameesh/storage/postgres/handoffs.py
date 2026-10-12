@@ -1,15 +1,30 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L232a storage: reservations, lot-boundary fence and journaled CAS steps."""
 import json
+from contextlib import contextmanager
 
 from .. import interface
-from .registry import canon_governed_sql, placement_admitted_sql
+from .registry import placement_admitted_sql
+from ... import db as db_mod
 
 COLUMNS = "*, extract(epoch from reserved_until)::float8 AS reserved_until_ts"
 TERMINAL = ("verified", "cancelled")
 
 
 class Handoffs(interface.Handoffs):
+    @contextmanager
+    def controller(self, operation):
+        # Independent lock connection: each journal/fence change must commit
+        # before the next external effect, especially before enabling a turn.
+        lock_db = db_mod.connect(self.db.cfg)
+        try:
+            with lock_db.transaction() as tx:
+                rows = tx.query("SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS acquired",
+                                ("handoff-operation:" + operation,))
+                yield self.db if rows[0]["acquired"] else None
+        finally:
+            lock_db.close()
+
     def get(self, operation):
         rows = self.db.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE id = %s", (operation,))
         return rows[0] if rows else None
@@ -103,6 +118,36 @@ class Handoffs(interface.Handoffs):
             api._event(operation, "planned", "destination capacity reserved")
             return api.get(operation)
 
+    def renew(self, operation, *, ttl):
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != "held":
+                return None
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ("handoff-host:" + op["target"],))
+            agent = tx.query("SELECT * FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))[0]
+            destination = op["evidence"].get("held_at") in ("switched", "activated")
+            if (agent["host"] != (op["target"] if destination else op["source"])
+                    or (agent["canon"] or "") != op["plan"]["canon"]
+                    or agent["harness"] != op["plan"]["harness"] or agent["mode"] != "execute"
+                    or agent["status"] == "stopped" or op["target"] not in (agent["admitted_hosts"] or [])):
+                return None
+            fresh = tx.query("SELECT host FROM host_resources WHERE host=%s"
+                             " AND sampled_at <= clock_timestamp()"
+                             " AND sampled_at > clock_timestamp()-interval '60 seconds' LIMIT 1", (op["target"],))
+            states = tx.query("SELECT host FROM canon_state WHERE host IN (%s,%s) AND canon=%s"
+                              " AND status='ok' AND last_good_commit=%s",
+                              (op["source"],op["target"],op["plan"]["canon"],op["plan"]["canon_revision"]))
+            if not fresh or {r["host"] for r in states} != {op["source"],op["target"]}:
+                return None
+            row = tx.query("UPDATE host_handoffs SET reserved_until=clock_timestamp()+make_interval(secs=>%s),"
+                           " updated_at=clock_timestamp() WHERE id=%s AND state='held' RETURNING id",
+                           (ttl,operation))
+            if not row:
+                return None
+            Handoffs(tx)._event(operation, "held", "reservation renewed after explicit host reconciliation")
+            return Handoffs(tx).get(operation)
+
     def transition(self, operation, expected, state, *, evidence=None, detail=""):
         with self.db.transaction() as tx:
             rows = tx.query("UPDATE host_handoffs SET state = %s, evidence=evidence || %s::jsonb,"
@@ -151,9 +196,15 @@ class Handoffs(interface.Handoffs):
             if not op or op["state"] != "session_ready" or not op["fenced"]:
                 return None
             plan = op["plan"]
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ("handoff-host:" + op["target"],))
             rows = tx.query("SELECT * FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            if not rows:
+                return None
             agent = rows[0]
-            if (agent["host"] != op["source"] or agent["status"] in ("running", "stopped", "paused")
+            if ((agent["canon"] or "") != plan["canon"] or agent["mode"] != "execute"
+                    or agent["harness"] != plan["harness"]
+                    or agent["host"] != op["source"] or agent["status"] in ("running", "stopped", "paused")
                     or agent["lease_epoch"] not in (plan["epoch"], plan["epoch"]+1)
                     or agent["lease_owner"] not in (None, plan["owner"])
                     or op["target"] not in (agent["admitted_hosts"] or [])):
@@ -189,14 +240,24 @@ class Handoffs(interface.Handoffs):
                           (operation,))[0]
             if op["state"] != expected:
                 return None
-            if expected == "switched":
+            if state in ("activated", "verified"):
                 allowed = tx.query("SELECT name FROM agent_registry r WHERE name=%s AND host=%s"
-                                   " AND (NOT " + canon_governed_sql("r") + " OR ("
-                                   + placement_admitted_sql("r") + " AND EXISTS (SELECT 1 FROM canon_state s"
+                                   " AND mode='execute' AND status NOT IN ('paused','stopped')"
+                                   " AND coalesce(canon,'')=%s AND harness=%s"
+                                   " AND %s=ANY(admitted_hosts) AND " + placement_admitted_sql("r")
+                                   + " AND EXISTS (SELECT 1 FROM canon_state s"
                                    " WHERE s.host=r.host AND s.canon=coalesce(r.canon,'') AND s.status='ok'"
-                                   " AND s.last_good_commit=%s)))",
-                                   (op["agent"],op["target"],op["plan"]["canon_revision"]))
+                                   " AND s.last_good_commit=%s)",
+                                   (op["agent"],op["target"],op["plan"]["canon"],op["plan"]["harness"],
+                                    op["target"],op["plan"]["canon_revision"]))
                 if not allowed:
+                    return None
+            if state == "cancelled":
+                agent = tx.query("SELECT host,lease_owner,lease_epoch FROM agent_registry WHERE name=%s",
+                                 (op["agent"],))[0]
+                if (agent["host"] != op["source"]
+                        or agent["lease_owner"] not in (None, op["plan"]["owner"])
+                        or agent["lease_epoch"] not in (op["plan"]["epoch"], op["plan"]["epoch"]+1)):
                     return None
             tx.execute("UPDATE agent_registry SET handoff_fenced=false,updated_at=now() WHERE name=%s",
                        (op["agent"],))

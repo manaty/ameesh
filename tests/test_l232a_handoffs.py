@@ -3,8 +3,9 @@
 import os
 import subprocess
 import tempfile
-import time
 import threading
+import json
+import unittest
 from types import SimpleNamespace
 from unittest import mock
 
@@ -59,7 +60,7 @@ class HostAdapter:
                            executor_enabled=False)
 
     def verify(self, op):
-        return self.result(op, "verify", commit=COMMIT, turn_completed=True)
+        return self.result(op, "verify", commit=COMMIT, turn_completed=True, authenticated=True, caps_ready=True)
 
 
 class HandoffTest(PgTestCase):
@@ -231,7 +232,12 @@ class HandoffTest(PgTestCase):
             db=self.db, name="dev", agent=registry.get(self.db, "dev"),
             stopping=threading.Event(), wake=threading.Event())
         worker.agent["pending_prompt"] = "queued work"
-        with mock.patch("ameesh.runner.subprocess.run", return_value=SimpleNamespace(stdout="git@forge:manaty/app.git")):
+        actual_run = subprocess.run
+        def git_remote(argv, *args, **kwargs):
+            if argv[0] == "git":
+                return SimpleNamespace(stdout="git@forge:acme/app.git")
+            return actual_run(argv, *args, **kwargs)
+        with mock.patch("ameesh.runner.subprocess.run", side_effect=git_remote):
             self.assertFalse(AgentWorker.maybe_relocate(worker, {}))
         op = self.api.handoffs.active("dev")
         self.assertEqual(op["state"], "planned")
@@ -243,3 +249,244 @@ class HandoffTest(PgTestCase):
         self.assertTrue(AgentWorker.maybe_relocate(worker, {}))
         self.assertTrue(worker.stopping.is_set())
         self.assertTrue(worker.wake.is_set())
+
+    def test_controller_lock_excludes_concurrent_step_and_cancel(self):
+        op = self.drain()
+        with self.api.handoffs.controller(op["id"]) as locked:
+            self.assertIsNotNone(locked)
+            with self.assertRaisesRegex(handoffs.HandoffError, "another controller"):
+                self.advance(op)
+            with self.assertRaisesRegex(handoffs.HandoffError, "another controller"):
+                handoffs.cancel(self.db, op["id"], self.adapter)
+        self.assertEqual(self.advance(op)["state"], "published")
+
+    def test_admission_changed_during_admit_cannot_release_fence(self):
+        op = self.request()
+        for _ in range(6): op = self.advance(op)
+        self.assertEqual(op["state"], "switched")
+        def revoke(op):
+            self.db.execute("UPDATE agent_registry SET admitted_hosts=ARRAY['source'] WHERE name='dev'")
+            return self.adapter.prepare(op)
+        with mock.patch.object(self.adapter, "admit", side_effect=revoke):
+            held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
+        self.assertIsNone(registry.claim(self.db, "dev", "other", ttl_seconds=300))
+
+    def test_changed_canon_or_pause_refuses_destination_retry(self):
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        with mock.patch.object(self.adapter, "enable", return_value=False):
+            held = self.advance(op)
+        self.assertEqual(held["state"], "held")
+        self.db.execute("UPDATE canon_state SET last_good_commit='changed' WHERE host='target'")
+        handoffs.retry(self.db, op["id"], self.adapter)
+        self.assertEqual(self.advance(op)["state"], "held")
+        self.db.execute("UPDATE canon_state SET last_good_commit=%s WHERE host='target'", (COMMIT,))
+        self.db.execute("UPDATE agent_registry SET status='stopped' WHERE name='dev'")
+        handoffs.retry(self.db, op["id"], self.adapter)
+        self.assertEqual(self.advance(op)["state"], "held")
+        self.assertEqual(registry.get(self.db, "dev")["status"], "stopped")
+        self.assertEqual(self.adapter.calls.count("enable"), 0)
+
+    def test_enable_sees_committed_fence_release_and_pending_turn_is_not_failed(self):
+        from ameesh import db as db_mod
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        def enable(op):
+            agent = registry.get(other, "dev")
+            self.assertFalse(other.query("SELECT handoff_fenced FROM agent_registry WHERE name='dev'")[0]["handoff_fenced"])
+            self.assertEqual(agent["host"], "target")
+            return True
+        with mock.patch.object(self.adapter, "enable", side_effect=enable), mock.patch.object(
+                self.adapter, "verify", return_value={"ok": True, "pending": True}):
+            waiting = self.advance(op)
+        self.assertEqual((waiting["state"], waiting["fenced"]), ("activated", False))
+        self.assertEqual(self.advance(op)["state"], "verified")
+
+    def test_changed_agent_canon_before_switch_holds_source(self):
+        op = self.request()
+        for _ in range(5): op = self.advance(op)
+        self.assertEqual(op["state"], "session_ready")
+        self.db.execute("UPDATE agent_registry SET canon='other' WHERE name='dev'")
+        held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertEqual(registry.get(self.db, "dev")["host"], "source")
+        self.assertNotIn("enable", self.adapter.calls)
+
+    def test_expired_destination_requires_explicit_reconciled_renewal(self):
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        self.db.execute("UPDATE host_handoffs SET reserved_until=now()-interval '1 second' WHERE id=%s", (op["id"],))
+        held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        with self.assertRaises(handoffs.HandoffError):
+            handoffs.retry(self.db, op["id"], self.adapter)
+        self.db.execute("UPDATE host_resources SET sampled_at=now()-interval '2 minutes'")
+        with self.assertRaises(handoffs.HandoffError):
+            handoffs.retry(self.db, op["id"], self.adapter, renew_ttl=300)
+        self.reading("target", 24*GIB)
+        with mock.patch.object(self.adapter, "revalidate", return_value=False):
+            with self.assertRaises(handoffs.HandoffError):
+                handoffs.retry(self.db, op["id"], self.adapter, renew_ttl=300)
+        op = handoffs.retry(self.db, op["id"], self.adapter, renew_ttl=300)
+        self.assertEqual(op["state"], "activated")
+        self.assertEqual(registry.get(self.db, "dev")["host"], "target")
+        self.assertEqual(self.advance(op)["state"], "verified")
+        self.assertNotIn("restore_source", self.adapter.calls)
+
+    def test_cli_show_reads_journal_without_activation(self):
+        op = self.drain()
+        proc = self.mesh("handoff", "show", op["id"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["operation"]["state"], "drained")
+        self.assertEqual(result["events"][-1]["state"], "drained")
+        self.assertEqual(registry.get(self.db, "dev")["host"], "source")
+        missing = self.mesh("handoff", "show", "missing")
+        self.assertNotEqual(missing.returncode, 0)
+
+    def test_repository_credentials_cannot_enter_reservation(self):
+        for repository in ("https://user:secret@forge/app.git", "https://forge/app.git?token=secret"):
+            with self.assertRaises(handoffs.HandoffError):
+                handoffs.request(self.db, self.candidate(), repository=repository)
+        self.assertIsNone(self.api.handoffs.active("dev"))
+
+    def test_legacy_canon_move_cannot_bypass_active_handoff(self):
+        op = self.request()
+        self.api.canon.move_host("dev", "source", target="target", canon_ref="card",
+                                 diagnostic="legacy", ref="placement")
+        self.assertEqual(registry.get(self.db, "dev")["host"], "source")
+        self.assertEqual(self.api.handoffs.get(op["id"])["state"], "planned")
+
+    def test_admission_changed_after_activation_never_enables_destination(self):
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        self.db.execute("UPDATE agent_registry SET admitted_hosts=ARRAY['source'] WHERE name='dev'")
+        held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
+
+    def test_stale_canon_writer_cannot_restore_source_after_switch(self):
+        values = dict(registry.get(self.db, "dev"))
+        values.update(placement_ok=True, placement_diagnostic="", placement_ref="placement", canon_ref="card")
+        op = self.request()
+        for _ in range(6): op = self.advance(op)
+        self.assertEqual(op["state"], "switched")
+        self.api.canon.write_declared("dev", values)
+        self.assertEqual(registry.get(self.db, "dev")["host"], "target")
+        self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/agent")
+
+    def test_changed_release_and_unauthenticated_turn_hold_operation(self):
+        op = self.request()
+        for _ in range(6): op = self.advance(op)
+        changed = self.adapter.prepare(op)
+        changed["release_revision"] = "b"*40
+        with mock.patch.object(self.adapter, "admit", return_value=changed):
+            self.assertEqual(self.advance(op)["state"], "held")
+        self.assertNotIn("enable", self.adapter.calls)
+        handoffs.retry(self.db, op["id"], self.adapter)
+        op = self.advance(op)
+        with mock.patch.object(self.adapter, "verify", return_value={"ok": True, "commit": COMMIT,
+                "turn_completed": True, "authenticated": False, "caps_ready": True}):
+            self.assertEqual(self.advance(op)["state"], "held")
+
+    def test_malformed_adapter_proof_is_held(self):
+        op = self.request()
+        malformed = self.adapter.prepare(op)
+        malformed["release_revision"] = 123
+        with mock.patch.object(self.adapter, "prepare", return_value=malformed):
+            self.assertEqual(self.advance(op)["state"], "held")
+        self.assertNotIn("123", str(self.api.handoffs.get(op["id"])["evidence"]))
+
+    def test_simultaneous_planners_reserve_one_physical_slot(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from ameesh import db as db_mod
+        self.limits["max_agents"] = 1
+        registry.upsert(self.db, "dev2", harness="codex", host="source")
+        self.db.execute("UPDATE agent_registry SET admitted_hosts=ARRAY['source','target'] WHERE name='dev2'")
+        registry.claim(self.db, "dev2", "runner2", ttl_seconds=300)
+        candidates = [self.candidate(name) for name in ("dev", "dev2")]
+        ready = threading.Barrier(2)
+        def reserve(candidate):
+            other = db_mod.connect(self.cfg)
+            try:
+                ready.wait(timeout=10)
+                try:
+                    return handoffs.request(other, candidate, repository="git@forge:acme/app.git")["id"]
+                except handoffs.HandoffError:
+                    return None
+            finally:
+                other.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            result = list(pool.map(reserve, candidates))
+        self.assertEqual(sum(value is not None for value in result), 1)
+
+    def test_waiting_begin_turn_observes_committed_boundary_fence(self):
+        from ameesh import db as db_mod
+        op = self.request()
+        self.advance(op)
+        started = threading.Event()
+        result = []
+        def begin_turn():
+            other = db_mod.connect(self.cfg)
+            try:
+                started.set()
+                result.append(registry.begin_turn(other, "dev", "runner", self.lease["lease_epoch"], "racing"))
+            finally:
+                other.close()
+        thread = threading.Thread(target=begin_turn)
+        try:
+            with self.db.transaction() as tx:
+                tx.query("SELECT name FROM agent_registry WHERE name='dev' FOR UPDATE")
+                thread.start()
+                self.assertTrue(started.wait(10))
+                thread.join(0.1)
+                self.assertTrue(thread.is_alive())
+                self.assertEqual(storage.of(tx).handoffs.drain(op["id"])["state"], "drained")
+        finally:
+            if thread.ident is not None:
+                thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [False])
+
+    def test_agent_named_canon_is_used_instead_of_default_host_canon(self):
+        self.db.execute("UPDATE agent_registry SET canon='other' WHERE name='dev'")
+        self.assertIsNone(self.candidate())
+        for host in ("source", "target"):
+            self.api.canon.record_state(host, "ok", root="/other", source="local", commit=COMMIT,
+                                        good=True, diagnostic="", canon="other")
+        op = self.request()
+        self.assertEqual(op["plan"]["canon"], "other")
+        for _ in range(8): op = self.advance(op)
+        self.assertEqual(op["state"], "verified")
+
+
+class PublishedCheckoutTest(unittest.TestCase):
+    def test_actual_remote_identity_clean_exact_pushed_commit(self):
+        with tempfile.TemporaryDirectory(prefix="handoff-git-") as root:
+            remote = os.path.join(root, "origin.git")
+            checkout = os.path.join(root, "checkout")
+            def git(*args):
+                return subprocess.run(["git", *args], text=True, capture_output=True, check=True).stdout.strip()
+            git("init", "--bare", remote)
+            git("init", "-b", "lot/work", checkout)
+            git("-C", checkout, "config", "user.name", "Test")
+            git("-C", checkout, "config", "user.email", "test@example.invalid")
+            git("-C", checkout, "commit", "--allow-empty", "-m", "published")
+            git("-C", checkout, "remote", "add", "origin", remote)
+            git("-C", checkout, "push", "origin", "lot/work")
+            proof = handoffs.published_checkout(checkout, remote)
+            self.assertEqual(proof["commit"], git("-C", checkout, "rev-parse", "HEAD"))
+            with self.assertRaisesRegex(handoffs.HandoffError, "identity mismatch"):
+                handoffs.published_checkout(checkout, remote + "-other")
+            with open(os.path.join(checkout, "untracked"), "w") as file:
+                file.write("local work")
+            with self.assertRaisesRegex(handoffs.HandoffError, "dirty"):
+                handoffs.published_checkout(checkout, remote)
+            os.unlink(os.path.join(checkout, "untracked"))
+            git("-C", checkout, "commit", "--allow-empty", "-m", "unpublished")
+            with self.assertRaisesRegex(handoffs.HandoffError, "remote commit differs"):
+                handoffs.published_checkout(checkout, remote)

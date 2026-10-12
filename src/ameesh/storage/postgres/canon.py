@@ -248,6 +248,9 @@ class Canon(interface.Canon):
                 placement_profile = excluded.placement_profile,
                 canon           = excluded.canon,
                 updated_at      = now()
+            WHERE excluded.host = agent_registry.host
+               OR NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
+                              AND h.state NOT IN ('verified','cancelled'))
             RETURNING name
             """.replace("__CAPS__", _CAPS_SQL)
                .replace("__AHOSTS__", _CAPS_SQL)
@@ -326,6 +329,8 @@ class Canon(interface.Canon):
                    placement_profile = NULL,
                    updated_at = now()
              WHERE name = %s AND host = %s
+               AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
+                               AND h.state NOT IN ('verified','cancelled'))
             """,
             (target, canon_ref, diagnostic, ref, name, host))
 

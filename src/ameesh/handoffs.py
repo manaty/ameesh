@@ -8,6 +8,7 @@ its enrolled host/approved artifact policy, and return only allowlisted proofs.
 from __future__ import annotations
 
 import math
+from functools import wraps
 import os
 import re
 import subprocess
@@ -15,7 +16,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
-from . import projects, registry, resources, storage
+from . import projects, resources, storage
 
 GIB = 1024 ** 3
 MAX_AGE = 60
@@ -29,6 +30,10 @@ STEPS = {"planned": ("prepare", "prepared"), "drained": ("publish", "published")
 
 class HandoffError(ValueError):
     pass
+
+
+def _sha(value):
+    return isinstance(value, str) and SHA.fullmatch(value) is not None
 
 
 def _fresh(reading, now):
@@ -158,7 +163,7 @@ def published_checkout(directory, repository):
     branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
     commit = git("rev-parse", "HEAD")
     remote = git("ls-remote", "--exit-code", "origin", "refs/heads/"+branch).split()
-    if not SHA.fullmatch(commit) or not remote or remote[0] != commit:
+    if not _sha(commit) or not remote or remote[0] != commit:
         raise HandoffError("unpublished work: remote commit differs")
     return {"repository": repository, "branch": branch, "commit": commit}
 
@@ -175,19 +180,23 @@ def _proof(step, result, op):
         if (plan["harness"] in ("deepseek", "dsh")
                 and result.get("dsh_profile_ready") is not True):
             raise HandoffError("secret-free dsh profile/hooks not prepared")
-        if not SHA.fullmatch(result.get("release_revision") or ""):
+        if not _sha(result.get("release_revision")):
             raise HandoffError("destination release is not pinned")
+        if step == "admit" and result["release_revision"] != evidence.get("release_revision"):
+            raise HandoffError("destination release changed after preparation")
         return {"prepared": True, "release_revision": result["release_revision"]}
     if step == "publish":
-        if (result.get("repository") != plan["repository"] or not result.get("branch")
-                or not SHA.fullmatch(result.get("commit") or "") or result.get("clean") is not True
+        if (result.get("repository") != plan["repository"]
+                or not isinstance(result.get("branch"), str) or not result["branch"]
+                or any(ord(c) < 32 for c in result["branch"])
+                or not _sha(result.get("commit")) or result.get("clean") is not True
                 or result.get("remote_commit") != result.get("commit")):
             raise HandoffError("source work is not published at its exact commit")
         return {k: result[k] for k in ("repository", "branch", "commit")}
     if step == "transfer":
         if (result.get("commit") != evidence.get("commit") or result.get("repository") != plan["repository"]
                 or result.get("branch") != evidence.get("branch") or result.get("clean") is not True
-                or not os.path.isabs(result.get("cwd") or "")):
+                or not isinstance(result.get("cwd"), str) or not os.path.isabs(result["cwd"])):
             raise HandoffError("destination checkout mismatch or local work")
         return {"cwd": result["cwd"]}
     if step == "session":
@@ -196,8 +205,9 @@ def _proof(step, result, op):
             raise HandoffError("session must be prepared before executor enable")
         return {"session_mode": expected}
     if step == "verify":
-        if result.get("commit") != evidence.get("commit") or result.get("turn_completed") is not True:
-            raise HandoffError("destination turn or checkout not verified")
+        if (result.get("commit") != evidence.get("commit")
+                or not all(result.get(k) is True for k in ("turn_completed", "authenticated", "caps_ready"))):
+            raise HandoffError("destination authenticated turn, caps or checkout not verified")
         return {"verified": True}
     raise HandoffError("unknown host step")
 
@@ -221,6 +231,17 @@ def _adapter_call(adapter, step, op):
         raise HandoffError("host adapter failed: " + step) from None
 
 
+def _serialized(function):
+    @wraps(function)
+    def step(db, operation, adapter, **kwargs):
+        with storage.of(db).handoffs.controller(operation) as tx:
+            if tx is None:
+                raise HandoffError("another controller is processing this handoff")
+            return function(tx, operation, adapter, **kwargs)
+    return step
+
+
+@_serialized
 def advance(db, operation, adapter):
     """One recoverable step. L232b supplies the enrolled, idempotent host adapter.
 
@@ -244,21 +265,29 @@ def advance(db, operation, adapter):
         if state == "prepared":
             return api.drain(operation) or op  # active lot/turn keeps running
         if state == "session_ready":
-            return api.switch(operation, cwd=op["evidence"]["cwd"], brief=brief(op)) or op
+            switched = api.switch(operation, cwd=op["evidence"]["cwd"], brief=brief(op))
+            if switched is None:
+                raise HandoffError("source identity or destination admission changed before switch")
+            return switched
         if state == "drained":
             if _adapter_call(adapter, "stop_source", op) is not True:
                 raise HandoffError("source executor not stopped")
         if state == "activated":
-            if op["fenced"]:
-                op = api.unfence(operation, state, state) or api.get(operation)
+            op = api.unfence(operation, state, state)
+            if op is None:
+                raise HandoffError("destination admission changed before enable")
             if _adapter_call(adapter, "enable", op) is not True:
                 raise HandoffError("destination executor not enabled")
         step, next_state = STEPS[state]
-        proof = _proof(step, _adapter_call(adapter, step, op), op)
-        if state == "switched":
-            return api.unfence(operation, state, next_state) or api.get(operation)
-        if state == "activated":
-            return api.unfence(operation, state, next_state) or api.get(operation)
+        result = _adapter_call(adapter, step, op)
+        if step == "verify" and isinstance(result, dict) and result.get("ok") is True and result.get("pending") is True:
+            return op  # destination's first authenticated turn is still running
+        proof = _proof(step, result, op)
+        if state in ("switched", "activated"):
+            updated = api.unfence(operation, state, next_state)
+            if updated is None:
+                raise HandoffError("destination admission changed")
+            return updated
         return api.transition(operation, state, next_state, evidence=proof, detail=step) or api.get(operation)
     except HandoffError:
         # The source remains fenced after drain. No guessing, no automatic
@@ -266,6 +295,7 @@ def advance(db, operation, adapter):
         return api.hold(operation, state) or api.get(operation)
 
 
+@_serialized
 def cancel(db, operation, adapter):
     """Only before switching hosts: reconcile stopped source, then release its fence."""
     api = storage.of(db).handoffs
@@ -282,14 +312,28 @@ def cancel(db, operation, adapter):
     return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
 
 
-def retry(db, operation, adapter):
-    """Explicit retry of an idempotent step; expired reservations need reconciliation."""
+@_serialized
+def retry(db, operation, adapter, *, renew_ttl=None):
+    """Retry an idempotent step. renew_ttl explicitly reconciles an expired reservation.
+
+    Revalidate must include the current reservation footprint, host capacity,
+    stopped/active executors and existing checkout/session effects. Renewal
+    preserves placement and checkpoint; it never restores the source.
+    """
     api = storage.of(db).handoffs
     op = api.get(operation)
     if not op or op["state"] != "held":
         raise HandoffError("only a held operation can be retried")
-    if op["reserved_until_ts"] <= time.time() or _adapter_call(adapter, "revalidate", op) is not True:
-        raise HandoffError("reservation expired or prerequisites changed")
+    if _adapter_call(adapter, "revalidate", op) is not True:
+        raise HandoffError("host reconciliation or prerequisites changed")
+    if renew_ttl is not None:
+        if isinstance(renew_ttl, bool) or not isinstance(renew_ttl, int) or not 30 <= renew_ttl <= 7200:
+            raise HandoffError("reservation TTL outside 30..7200 seconds")
+        op = api.renew(operation, ttl=renew_ttl)
+        if op is None:
+            raise HandoffError("host identity, admission or fresh readings changed")
+    if op["reserved_until_ts"] <= time.time():
+        raise HandoffError("reservation expired; explicit host reconciliation and renewal required")
     previous = op["evidence"].get("held_at")
     if previous not in (*STEPS, "prepared", "session_ready"):
         raise HandoffError("missing recovery checkpoint")
