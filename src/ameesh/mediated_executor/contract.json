@@ -3700,7 +3700,7 @@
   }
  ],
  "refused": {
-  "interface_total": 372,
+  "interface_total": 373,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3775,7 +3775,8 @@
     "human_known",
     "set_mode",
     "upsert_unleased",
-    "wake_check"
+    "wake_check",
+    "note_unleased"
    ],
    "approvals": [
     "candidates",

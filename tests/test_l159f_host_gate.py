@@ -81,7 +81,7 @@ class ContractAgreementTest(unittest.TestCase):
 
 class DefaultsTest(unittest.TestCase):
     def cfg(self, **kw):
-        return config_mod.Config(**kw)
+        return config_mod.Config(**dict({"runner_id": "guest-test"}, **kw))
 
     def test_a_lending_host_has_a_closed_file_gate(self):
         self.assertEqual(host_gate.gate_kind(self.cfg(), lending=True), "file")

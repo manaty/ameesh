@@ -7,6 +7,10 @@ Extracted from the L112 gate of path B (`lot/v170-voie-b`,
 mediated device needs (socket gate, availability relay to the server). Path
 B can later import this module instead of its own copy.
 
+Guest runners on lending hosts select this gate by default (#501).
+Native runners select none unless explicitly configured. An ack permission
+error removes a native gate; guests remain closed until ack recovery.
+
 A guard (`ameesh guard`, L159e, or Nexlink Compute) writes
 `ameesh-host-state/1` to `/run/ameesh-gate/state/state.json` (temporary
 file, then `rename`). The runner reads it on inotify, else every 2 s, and
@@ -47,6 +51,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import dataclasses
+import errno
 import fcntl
 import json
 import math
@@ -416,6 +421,11 @@ class FileGate:
         self._part: tuple[str, int] | None = None
         self._last_seq = -1
         self._last_error = ""
+        self.ack_error: str = ""
+        self.ack_errno: int | None = None
+        self._ack_permission_denied = False
+        self._ack_retry_at = 0.0
+        self._ack_retry_delay = 1.0
         self._wake_r, self._wake_w = os.pipe()
         os.set_blocking(self._wake_r, False)
 
@@ -490,6 +500,8 @@ class FileGate:
         return self._publish(None) if self._part is not None else True
 
     def _publish(self, body: dict | None) -> bool:
+        if time.monotonic() < self._ack_retry_at:
+            return False
         parts = os.path.join(os.path.dirname(self.ack_path) or ".", "parts")
         lock = -1
         try:
@@ -515,12 +527,27 @@ class FileGate:
                 if _without_ts(_read_json(self.ack_path)) != _without_ts(merged):
                     _atomic_write(self.ack_path, merged)
         except OSError as exc:
-            self._log("host gate: ack not written (%s)" % exc)
+            message = str(exc)
+            if (exc.errno, message) != (self.ack_errno, self.ack_error):
+                self._log("host gate: ack not written (%s)" % exc)
+            self.ack_errno, self.ack_error = exc.errno, message
+            self._ack_permission_denied |= exc.errno in (errno.EACCES, errno.EPERM)
+            self._ack_retry_at = time.monotonic() + self._ack_retry_delay
+            self._ack_retry_delay = min(60.0, 2 * self._ack_retry_delay)
             return False
         finally:
             if lock >= 0:
                 os.close(lock)
+        if self.ack_error:
+            self._log("host gate: ack writable again")
+        self.ack_errno, self.ack_error = None, ""
+        self._ack_permission_denied = False
+        self._ack_retry_at, self._ack_retry_delay = 0.0, 1.0
         return True
+
+    @property
+    def ack_permission_denied(self) -> bool:
+        return self._ack_permission_denied
 
     def _drop_part(self) -> None:
         """Under the parts' lock, after `_closed` is set: a `_publish` running
@@ -576,17 +603,34 @@ def default_fallback(cfg, lending: bool = False) -> str:
     return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
 
 
-def gate_kind(cfg, lending: bool = False) -> str:
-    """The gate of this host: `host_gate`, else `file` on a lending host
-    (closed by default: no state, no claim) and '' on a classic one."""
+def is_guest(cfg, runner_id: str | None = None) -> bool:
+    """Guest runner identity or actual guest Unix account, never $USER."""
+    ident = runner_id if runner_id is not None else getattr(cfg, "runner_id", "")
+    if str(ident or "").startswith("guest-"):
+        return True
+    try:
+        import pwd
+        return pwd.getpwuid(os.geteuid()).pw_name == "ameesh-guest"
+    except (ImportError, KeyError):
+        return False
+
+
+def gate_choice(cfg, lending: bool = False, *, runner_id: str | None = None) -> tuple[str, str]:
+    """Explicit configuration wins; lending's default gate belongs to guests."""
     kind = str(getattr(cfg, "host_gate", "") or "").strip().lower()
     if kind == "none":
-        return ""
-    if not kind:
-        return "file" if lending else ""
-    if kind not in GATE_KINDS:
-        raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
-    return kind
+        return "", "explicit host_gate=none"
+    if kind:
+        if kind not in GATE_KINDS:
+            raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
+        return kind, "explicit host_gate=%s" % kind
+    if lending and is_guest(cfg, runner_id):
+        return "file", "guest runner on lending host"
+    return "", "native runner; guest gate excluded" if lending else "classic host default"
+
+
+def gate_kind(cfg, lending: bool = False, *, runner_id: str | None = None) -> str:
+    return gate_choice(cfg, lending, runner_id=runner_id)[0]
 
 
 def drain_seconds(cfg, offer: Optional[Mapping] = None) -> float:
@@ -599,10 +643,10 @@ def drain_seconds(cfg, offer: Optional[Mapping] = None) -> float:
     return float(seconds) if _number(seconds) and seconds > 0 else DEFAULT_DRAIN_S
 
 
-def from_config(cfg, *, lending: bool = False,
+def from_config(cfg, *, lending: bool = False, runner_id: str | None = None,
                 log: Callable[[str], None] | None = None) -> Optional[FileGate]:
     """The configured gate, or None (no gate: nothing changes)."""
-    if not gate_kind(cfg, lending):
+    if not gate_kind(cfg, lending, runner_id=runner_id):
         return None
     fallback = default_fallback(cfg, lending)
     return FileGate(str(getattr(cfg, "host_gate_path", "") or "") or STATE_PATH,
@@ -744,6 +788,9 @@ class GateController:
         only a later seq, or the same seq closing (the fallback of an
         unreadable file): a state read before the loop applied a newer one
         never reopens the controller (r5)."""
+        if getattr(self.gate, "ack_permission_denied", False) and is_guest(
+                getattr(self.runner, "cfg", None), getattr(self.runner, "runner_id", None)):
+            state = dataclasses.replace(state, state="stopped", reason="ack permission denied")
         now = self._clock()
         with self._lock:
             if newer_only and self._applied is not None and (
@@ -872,6 +919,14 @@ class GateController:
             merge = getattr(self.gate, "merge", None)
             if merge is not None:
                 merge()
+        if getattr(self.gate, "ack_permission_denied", False):
+            if is_guest(getattr(self.runner, "cfg", None),
+                        getattr(self.runner, "runner_id", None)):
+                self.apply(dataclasses.replace(state, state="stopped", reason="ack permission denied"))
+            else:
+                reject = getattr(self.runner, "reject_host_gate", None)
+                if reject is not None:
+                    reject(self, self.gate.ack_error)
         return ack
 
 
@@ -879,7 +934,7 @@ def controller_from_config(runner, *, lending: bool = False, offer: Optional[Map
                            log: Callable[[str], None] | None = None) -> Optional[GateController]:
     """The runner's controller, or None without a gate (`gate_kind`)."""
     cfg = runner.cfg
-    gate = from_config(cfg, lending=lending, log=log)
+    gate = from_config(cfg, lending=lending, runner_id=getattr(runner, "runner_id", None), log=log)
     if gate is None:
         return None
     return GateController(runner, gate, drain_s=drain_seconds(cfg, offer), log=log)

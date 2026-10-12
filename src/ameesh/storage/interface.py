@@ -218,6 +218,12 @@ class Agents(Domain):
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
 
     @abc.abstractmethod
+    def note_unleased(self, name: str, host: str, error: str) -> bool:
+        """Native runner's lease_not_taken diagnostic, only on its host and
+        without a live lease, after taking the row lock. Keeps agent status.
+        Cleared by a successful claim; refused to mediated executors."""
+
+    @abc.abstractmethod
     def mark_event_wake(self, name: str) -> None:
         """Note l'instant du dernier réveil d'événements."""
 

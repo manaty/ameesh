@@ -811,6 +811,13 @@ EOF
   for u in $(runner_units); do
     echo "     $u: $(systemctl is-enabled "$u" 2>/dev/null || true), $(systemctl is-active "$u" 2>/dev/null || true)"
   done
+  # #501: inspect live native runners without printing their environment.
+  # Separate helper keeps this addition independent of pilot provisioning.
+  if [ -z "$HOSTDIR" ]; then
+    python3 "$HERE/check-native-gates.py" || status=1
+  else
+    ok "native gate process check skipped on the test host"
+  fi
   host_says systemd-analyze verify "$UNITS/ameesh-guard.service" "$UNITS/ameesh-guest.slice" \
     >/dev/null 2>&1 && ok "systemd-analyze verify" || ko "systemd-analyze verify (run it for details)"
   exit $status
