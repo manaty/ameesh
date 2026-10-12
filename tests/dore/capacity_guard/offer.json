@@ -84,6 +84,37 @@
    }
   },
   {
+   "why": "the guard's own reclaim keys are read by the contract too (L479)",
+   "lend": {
+    "cpu_max": 2,
+    "memory_max": "8GiB",
+    "disk_max": "40GiB",
+    "reclaim": {
+     "io_pressure_max": "20%",
+     "disk_free_min": "10GiB",
+     "disk_paths": [
+      "/",
+      "/srv/ameesh-guest"
+     ]
+    }
+   },
+   "offer": {
+    "cpu_max": 2.0,
+    "memory_max": 8589934592,
+    "disk_max": 42949672960,
+    "reclaim": {
+     "io_pressure_max": 20.0,
+     "disk_free_min": 10737418240,
+     "disk_paths": [
+      "/",
+      "/srv/ameesh-guest"
+     ]
+    },
+    "drain_seconds": 90,
+    "calm_seconds": 600
+   }
+  },
+  {
    "why": "a cap missing: nothing lent",
    "lend": {
     "cpu_max": 3,
@@ -165,6 +196,34 @@
    },
    "problems": [
     "`reclaim.cpu_pressure_max`"
+   ]
+  },
+  {
+   "why": "the guard's io pressure is a percentage too (L479)",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "disk_max": "80GiB",
+    "reclaim": {
+     "io_pressure_max": "120%"
+    }
+   },
+   "problems": [
+    "`reclaim.io_pressure_max`"
+   ]
+  },
+  {
+   "why": "disk_paths is a non-empty list of paths (L479)",
+   "lend": {
+    "cpu_max": 3,
+    "memory_max": "4GiB",
+    "disk_max": "80GiB",
+    "reclaim": {
+     "disk_paths": "/"
+    }
+   },
+   "problems": [
+    "`reclaim.disk_paths`"
    ]
   },
   {

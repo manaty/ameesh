@@ -1039,7 +1039,15 @@ The `installer` step follows the same practice.
    A persona in a long turn does not block the others: the script goes back
    over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
-   A unit that does not stay active stops the script.
+   A unit that does not stay active stops the script. So does a runner that
+   held its persona's lease before the restart and does not take it again
+   (#502, `bail.sh`): the lease must be held by the unit's own runner (its
+   `--runner-id`, else host:pid), at an epoch past the one read before, and
+   still valid at the database clock, within 24 tries 5 s apart. A persona
+   without a lease before the restart is not checked: a WARNING names it, and
+   the summary counts it. This is a check at restart, not monitoring: a lease
+   lost after the first good reading is not seen, and a slow runner costs up
+   to about 130 s.
 7. `poste.sh controler`: `ameesh doctor`, `ameesh budget`,
    `ameesh accounts list`, `ameesh projects`, `ameesh alerts`, failed
    units, `doctor` of the old database.
@@ -1061,7 +1069,9 @@ personas run under `ameesh-runner@<p>` (system service, user
    Detached checkout, installation with psycopg. The previous commit is
    recorded in `/opt/ameesh/precedent`.
 3. `vm.sh redemarrer`: refuses as long as 0041 and 0042 are not applied,
-   then restarts each server persona outside a turn, one by one.
+   then restarts each server persona outside a turn, one by one, with the
+   same lease check as `poste.sh redemarrer` (#502), the database clock and
+   the unit's `--runner-id` being read on the server.
 4. `vm.sh controler`: active units, fifteen log lines per persona,
    `ameesh show`, `ameesh doctor` on the server.
 

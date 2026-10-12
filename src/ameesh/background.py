@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 
 from . import containers as containers_mod
 from . import platform, storage
+from .platform.signals import ProcessHandle, CLEANUP_SIGNAL_LOCK, PidfdWaitUnavailable
+from .mediated_executor.contract import NotSupportedRemotely
 
 #: noms de processus tenus pour des shells (tâche de fond d'un harnais)
 SHELLS = ("bash", "sh", "dash", "zsh", "ksh", "mksh", "fish")
@@ -156,6 +158,8 @@ class Job:
     code: int | None = None
     #: fin constatée (secondes epoch), None tant qu'il tourne
     ended: float | None = None
+    #: identity observed when this job was attributed to its turn
+    start: float | None = None
 
 
 @dataclass
@@ -169,9 +173,19 @@ class Entry:
     deadline: float
     grace_s: int
     jobs: dict = field(default_factory=dict)
-    #: tous les processus vus dans le groupe : un groupe dont aucun membre
-    #: n'en descend a été réattribué (numéro recyclé) — jamais tué
+    #: observed PIDs, for diagnostics only; never authority to send a signal
     lineage: set = field(default_factory=set)
+    #: stable handles captured while the turn's group was known
+    handles: dict = field(default_factory=dict)
+    #: a known member could not be held: cleanup cannot claim success
+    unverified: bool = False
+    #: observed groups of retained processes; diagnostic evidence only
+    groups_seen: set = field(default_factory=set)
+    #: direct children present before cleanup; newly adopted children are uncertain
+    children_before: set = field(default_factory=set)
+    watching_adoption: bool = False
+    #: tick and runner shutdown must not close a handle during signalling
+    process_lock: object = field(default_factory=threading.RLock, repr=False)
     #: autres processus vivants du groupe (descendants des racines)
     others: int = 0
     #: conteneurs du tour sans lot : en cours, et tous ceux vus
@@ -201,6 +215,8 @@ class Tracker:
     CONTAINERS_EVERY_S = 30.0
     #: zombies adoptés hors des tours suivis (démons détachés) : moissonnés
     STRAYS_EVERY_S = 60.0
+    UNKNOWN_ZOMBIES_WARN = 32
+    CLEANUP_SECTION_S = 2.0
     #: fin de tour : délai laissé aux processus qui se ferment avec le
     #: harnais (serveurs MCP) avant de parler de travail de fond
     SETTLE_S = 2.0
@@ -216,9 +232,14 @@ class Tracker:
         self.lock = threading.Lock()
         self.entries: list[Entry] = []
         #: l'exécuteur adopte-t-il les orphelins de ses tours (codes de sortie) ?
-        self.subreaper = False
+        self.subreaper = platform.become_subreaper()
         self._strays_at = 0.0
         self.thread: threading.Thread | None = None
+        self.observed_children: dict[int, float] = {}
+        self.observed_handles: dict[int, ProcessHandle] = {}
+        self.observed_lock = threading.Lock()
+        self.unknown_zombies = 0
+        self._zombies_warned = False
 
     # -- fil de suivi -------------------------------------------------------
     def start_monitor(self, stop: threading.Event) -> None:
@@ -235,7 +256,31 @@ class Tracker:
         self.thread.start()
 
     # -- fin de tour --------------------------------------------------------
-    def survivors(self, turn_id: str, pgid: int | None) -> tuple[list, list] | None:
+    def capture_before_wait(self, proc, *, wait: bool = True) -> dict:
+        """Capture survivors while an unreaped leader still reserves its PGID.
+
+        Popen's wait lock excludes concurrent poll/wait reaping. If another
+        caller already reaped it, observations cannot establish ownership.
+        """
+        if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
+            return {}
+        held = Entry(agent="capture", turn_id="", pgid=proc.pid,
+                     ended=0, deadline=0, grace_s=0)
+        try:
+            with proc._waitpid_lock:
+                if proc.returncode is not None:
+                    return {}
+                flags = os.WEXITED | os.WNOWAIT | (0 if wait else os.WNOHANG)
+                os.waitid(os.P_PID, proc.pid, flags)
+                table = platform.process_table()
+                self._capture(held, [p for p in table if p["pgid"] == proc.pid])
+            return held.handles
+        except Exception:
+            self._drop_handles(held)
+            return {}
+
+    def survivors(self, turn_id: str, pgid: int | None, *,
+                  handles: dict | None = None) -> tuple[list, list] | None:
         """À la fin d'un tour normal (harnais fini et moissonné) : ce qui
         tourne encore, `(processus vivants du groupe, conteneurs du tour sans
         lot)`, ou None si rien. Attend `SETTLE_S` au plus que le groupe se
@@ -246,8 +291,15 @@ class Tracker:
             fin = time.monotonic() + self.SETTLE_S
             while True:
                 try:
-                    vivants = self._members(pgid, platform.process_table())
+                    table = platform.process_table()
+                    vivants = self._members(pgid, table)
+                    observed = {p["pid"] for p in vivants}
+                    vivants += [p for p in table if p["pid"] not in observed
+                                and not p["zombie"] and p["pid"] in (handles or {})
+                                and handles[p["pid"]].live()]
                 except platform.NotAvailable:
+                    if handles:
+                        raise
                     return None
                 if not vivants or time.monotonic() >= fin:
                     break
@@ -260,7 +312,8 @@ class Tracker:
                               if not c.get("lot")]
             except Exception:  # un moteur indisponible n'est pas un travail
                 conteneurs = []
-        if not vivants and not conteneurs:
+        if not vivants and not conteneurs and not any(
+                h.live() for h in (handles or {}).values()):
             return None
         return vivants, conteneurs
 
@@ -274,15 +327,17 @@ class Tracker:
             if not p["zombie"]:
                 vivants.append(p)
                 continue
-            code = platform.reap(p["pid"])
-            if entry is not None and code is not None and p["pid"] in entry.jobs:
-                job = entry.jobs[p["pid"]]
-                if job.ended is None:
-                    job.code, job.ended = code, time.time()
+            job = entry.jobs.get(p["pid"]) if entry is not None else None
+            if job is not None:
+                if job.ended is None and job.start == p.get("start"):
+                    job.code, job.ended = self._reap_job(job), time.time()
+            else:
+                self._reap_observed(p["pid"], p.get("start"))
         return vivants
 
     def start(self, *, agent: str, turn_id: str, pgid: int | None, members: list,
-              containers: list, grace_s: int, now: float | None = None) -> Entry:
+              containers: list, grace_s: int, now: float | None = None,
+              handles: dict | None = None) -> Entry:
         """Inscrit le travail de fond d'un tour fini en délai de grâce."""
         now = time.time() if now is None else float(now)
         pids = {p["pid"] for p in members}
@@ -291,10 +346,15 @@ class Tracker:
                       lineage=set(pids) | ({pgid} if pgid else set()),
                       containers=list(containers),
                       containers_seen={c["id"]: c for c in containers},
-                      containers_at=now)
+                      containers_at=now, handles=dict(handles or {}))
+        # A snapshot after reaping proves identity, never turn ownership.
+        owned = self._owned_members(entry, members)
+        self._capture(entry, owned)
+        entry.unverified = entry.unverified or any(
+            p["pid"] not in entry.handles and not p["zombie"] for p in members)
         for p in members:
             if p["ppid"] not in pids:  # racine : son parent (le harnais) a fini
-                entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p))
+                entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p), start=p.get("start"))
         entry.others = len(members) - len(entry.jobs)
         with self.lock:
             self.entries.append(entry)
@@ -322,7 +382,8 @@ class Tracker:
             self.entries = [e for e in self.entries
                             if not (e.state != "running" and (e.reported or (
                                 e.closed is not None and now - e.closed > self.KEEP_S)))]
-        strays = self.subreaper and now - self._strays_at >= self.STRAYS_EVERY_S
+        strays = (self.subreaper and self.thread is not None
+                  and now - self._strays_at >= self.STRAYS_EVERY_S)
         if not suivis and not strays:
             return
         try:
@@ -342,31 +403,54 @@ class Tracker:
             self._reap_strays(table, suivis)
 
     def _refresh(self, entry: Entry, table: list[dict] | None, now: float) -> None:
+        with entry.process_lock:
+            self._refresh_owned(entry, table, now)
+            if table is not None:
+                reaped = {(job.pid, job.start) for job in entry.jobs.values()
+                          if job.code is not None}
+                # The stray pass shares this snapshot: consumed wait statuses
+                # must not appear there as unknown/unreaped zombies.
+                table[:] = [p for p in table
+                            if (p["pid"], p.get("start")) not in reaped]
+
+    def _refresh_owned(self, entry: Entry, table: list[dict] | None, now: float) -> None:
         vivants: list[dict] = []
+        if table is not None:
+            self._remember_groups(entry, table)
         if entry.pgid and table is not None:
-            membres = [p for p in table if p["pgid"] == entry.pgid]
-            parents = entry.lineage | {os.getpid()}  # adoptés : ppid = l'exécuteur
-            if membres and not any(p["pid"] in entry.lineage or p["ppid"] in parents
-                                   for p in membres):
-                # Le numéro du groupe a été réattribué (tous les processus du
-                # tour avaient fini) : on ne tue jamais ce nouveau groupe.
+            membres = self._owned_members(entry, table)
+            if not membres:
+                # Empty, zombie-only or no retained ownership proof. A
+                # remaining container never authorizes a later group signal.
+                # A live member without ownership proof is uncertain, not
+                # evidence of successful cleanup. Preserve it as orphaned.
+                entry.unverified = any(p["pgid"] == entry.pgid and not p["zombie"]
+                                       for p in table)
                 entry.pgid = None
-                membres = []
+                # Detached members remain ours through their retained handle.
+                for pid, handle in list(entry.handles.items()):
+                    if not handle.live():
+                        handle.close()
+                        del entry.handles[pid]
+            else:
+                self._capture(entry, membres)
             entry.lineage.update(p["pid"] for p in membres)
             vivants = self._members(entry.pgid, membres, entry) if entry.pgid else []
-            pids = {p["pid"] for p in vivants}
+            pids = {p["pid"] for p in vivants} | {
+                pid for pid, handle in entry.handles.items() if handle.live()}
             for job in entry.jobs.values():
                 if job.ended is None and job.pid not in pids:
-                    job.code, job.ended = platform.reap(job.pid), now
+                    job.code, job.ended = self._reap_job(job), now
             for p in vivants:  # un descendant dont le parent a fini : racine
                 if p["pid"] not in entry.jobs and p["ppid"] not in pids:
-                    entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p))
+                    entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p), start=p.get("start"))
             entry.others = sum(1 for p in vivants if p["pid"] not in entry.jobs)
         elif entry.pgid and table is None and _group_alive(entry.pgid):
             vivants = [{"pid": entry.pgid}]  # détail indisponible : le groupe vit
         if not vivants or now - entry.containers_at >= self.CONTAINERS_EVERY_S:
             self._containers(entry, now)
-        if not vivants and not entry.containers:
+        retained_live = any(h.live() for h in entry.handles.values())
+        if not vivants and not retained_live and not entry.containers:
             # le verdict de CE passage fait foi jusqu'à la fermeture : une
             # nouvelle sonde verrait un groupe au numéro recyclé (#458 r2)
             self._close(entry, "done", now, survives=False)
@@ -394,30 +478,260 @@ class Tracker:
         self._close(entry, "expired", now, survives=self._kill(entry))
 
     def _kill(self, entry: Entry) -> bool:
-        """SIGTERM au groupe, `TERM_GRACE_S`, puis SIGKILL ; zombies adoptés
-        moissonnés (sinon ils gardent le groupe « vivant »). Rend True si un
-        membre vivant survit au SIGKILL : le verdict que `_close` reprend."""
-        if not entry.pgid:
-            return False
-        for sig, delai in ((signal.SIGTERM, self.TERM_GRACE_S), (signal.SIGKILL, 2.0)):
+        with entry.process_lock:
+            return self._kill_owned(entry)
+
+    def _kill_owned(self, entry: Entry) -> bool:
+        """Terminate through retained handles, including reparented survivors.
+
+        Never signal a cached group number. New members may be captured only
+        while a live retained handle still anchors that group in this pass.
+        Unreadable tables or unavailable handles mean no numeric fallback.
+        """
+        if not entry.pgid and not entry.handles:
+            return entry.unverified
+        try:
             try:
-                os.killpg(entry.pgid, sig)
-            except ProcessLookupError:
-                return False  # ESRCH : groupe disparu
-            except OSError:
-                # EPERM & co : le signal n'est pas passé, le groupe vit encore
-                # (#458 r3) — un survivant, donc ressource orpheline
-                return True
-            fin = time.monotonic() + delai
-            while time.monotonic() < fin:
-                try:
-                    if not self._members(entry.pgid, platform.process_table(), entry):
-                        return False
-                except platform.NotAvailable:
-                    if not _group_alive(entry.pgid):
-                        return False
+                table = platform.process_table()
+            except Exception as exc:
+                self.log("[%s] background stop: process table unavailable; retained handles only (%s)"
+                         % (entry.agent, exc))
+                # Retained pidfds remain safe targets even without a scan.
+                # Missing membership information still makes cleanup uncertain.
+                entry.unverified = True
+                table = []
+            entry.children_before = {(p["pid"], p.get("start")) for p in table
+                                     if p["ppid"] == os.getpid()}
+            entry.watching_adoption = self.subreaper
+            self._remember_groups(entry, table)
+            members = self._owned_members(entry, table)
+            if not members:
+                entry.unverified |= any(p["pgid"] == entry.pgid and not p["zombie"]
+                                        for p in table)
+            self._capture(entry, members)
+            if not self.subreaper and any(h.live() for h in entry.handles.values()):
+                entry.unverified = True
+            self._signal_handles(entry, signal.SIGTERM)
+            end = time.monotonic() + self.TERM_GRACE_S
+            while time.monotonic() < end:
+                if not any(h.live() for h in entry.handles.values()):
+                    return self._survival_verdict(entry)
                 time.sleep(0.1)
-        return True
+            # Capture late children only through a still-owned live group.
+            # Previously captured children remain targets after reparenting
+            # or a process-group change, through their original handles.
+            try:
+                self._capture(entry, self._owned_members(entry, platform.process_table()))
+            except Exception:
+                pass
+            self._signal_handles(entry, signal.SIGKILL)
+            end = time.monotonic() + 2.0
+            while time.monotonic() < end:
+                if not any(h.live() for h in entry.handles.values()):
+                    return self._survival_verdict(entry)
+                time.sleep(0.1)
+            return self._survival_verdict(entry)
+        finally:
+            self._drop_handles(entry)
+
+    def _foreign_groups(self, entry: Entry) -> set[int] | None:
+        """Live ownership registry plus launches in this executor; None if unknown."""
+        groups = set(getattr(self.runner, "harness_pids", set())) - {entry.pgid}
+        if getattr(self.runner, "db", None) is None:
+            return groups
+        try:
+            resources = storage.of(self.runner.db).turn_resources
+            after = 0
+            while True:
+                rows = resources.running_started_before(
+                    self.runner.host, time.time() + 1, after_id=after, limit=200)
+                groups.update(int(r["pgid"]) for r in rows
+                              if r.get("pgid") and r["turn_id"] != entry.turn_id)
+                if len(rows) < 200:
+                    return groups
+                after = int(rows[-1]["id"])
+        except NotSupportedRemotely as exc:
+            if not getattr(self.runner, "mediated", False):
+                self.log("[%s] background ownership registry unavailable (%s)"
+                         % (entry.agent, exc))
+                return None
+            # Old mediated contracts cannot expose ownership. Keep the local
+            # harness protection and explicitly retain the uncertain verdict.
+            entry.unverified = True
+            self.log("[%s] background ownership registry unsupported; "
+                     "harness groups only, cleanup uncertain (%s)" % (entry.agent, exc))
+            return groups
+        except Exception as exc:
+            self.log("[%s] background ownership registry unavailable (%s)"
+                     % (entry.agent, exc))
+            return None
+
+    def _cleanup_remaining(self, entry: Entry, deadline: float) -> float:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            entry.unverified = True
+            return 0.0
+        return remaining
+
+    def _signal_handles(self, entry: Entry, signum: int) -> None:
+        foreign = self._foreign_groups(entry)
+        for handle in entry.handles.values():
+            was_stopped, stop_attempted, note = True, False, None
+            try:
+                with CLEANUP_SIGNAL_LOCK:
+                    deadline = time.perf_counter() + self.CLEANUP_SECTION_S
+                    if not handle.live():
+                        continue
+                    location = handle.location()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
+                    if foreign is None or location is None or any(g in foreign for g in location):
+                        entry.unverified = True
+                        note = "ownership changed or unknown; no signal"
+                        continue
+                    state = handle.state()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
+                    if state is None:
+                        entry.unverified |= bool(handle.live())
+                        continue
+                    # A self-stop after this read remains a job-control race.
+                    was_stopped = state in ("T", "t")
+                    remaining = self._cleanup_remaining(entry, deadline)
+                    if not remaining:
+                        continue
+                    stop_attempted = True
+                    if not handle.freeze(timeout=min(.5, remaining)):
+                        entry.unverified |= bool(handle.live())
+                        note = "stop not confirmed; no termination signal"
+                        continue
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
+                    location = handle.location()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
+                    if location is None or any(g in foreign for g in location):
+                        entry.unverified = True
+                        note = "ownership changed while stopping; no termination signal"
+                        continue
+                    state = handle.state()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
+                    if state not in ("T", "t"):
+                        entry.unverified |= bool(handle.live())
+                        continue
+                    handle.send(signum)
+                    self._cleanup_remaining(entry, deadline)
+            finally:
+                # Always release our stop, even after a scheduler pause or
+                # budget exhaustion. No lock, registry I/O or liveness probe
+                # may stand between this finally and the pidfd CONT.
+                if stop_attempted and not was_stopped:
+                    if not handle.send(signal.SIGCONT):
+                        self.log("[%s] background ERROR pid %s: SIGCONT failed"
+                                 % (entry.agent, handle.pid))
+                # Logging can block on I/O too: keep it outside the shared lock.
+                if note is not None:
+                    self.log("[%s] background pid %s: %s" % (entry.agent, handle.pid, note))
+
+    def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
+        for p in table:
+            handle = entry.handles.get(p["pid"])
+            if handle is not None and handle.live():
+                entry.groups_seen.add(p["pgid"])
+                entry.lineage.add(p["pid"])
+
+    def _survival_verdict(self, entry: Entry) -> bool:
+        """Include children forked in retained processes' detached groups.
+
+        Group and lineage observations only prevent a clean verdict; they
+        never authorize signalling a newly observed process.
+        """
+        live = any(h.live() for h in entry.handles.values())
+        groups = entry.groups_seen | ({entry.pgid} if entry.pgid else set())
+        roots = set(entry.handles) | entry.lineage
+        if groups or roots:
+            try:
+                table = platform.process_table()
+            except Exception:
+                return True
+            if entry.watching_adoption:
+                adopted = [p for p in table if p["ppid"] == os.getpid()
+                           and (p["pid"], p.get("start")) not in entry.children_before]
+                if any(not p["zombie"] for p in adopted):
+                    # Adoption preserves visibility after double-fork+setsid,
+                    # but multiple turns share this parent: no signalling proof.
+                    entry.unverified = True
+                    return True
+                for p in adopted:
+                    self._reap_observed(p["pid"], p.get("start"))
+            descendants = set(roots)
+            while True:
+                found = {p["pid"] for p in table
+                         if p["pgid"] in groups or p["ppid"] in descendants}
+                if found <= descendants:
+                    break
+                descendants.update(found)
+            if any(not p["zombie"] and (p["pgid"] in groups
+                                        or p["pid"] in descendants) for p in table):
+                return True
+        return entry.unverified or live
+
+    def _owned_members(self, entry: Entry, table: list[dict]) -> list[dict]:
+        members = [p for p in table if p["pgid"] == entry.pgid and not p["zombie"]]
+        if any(p["pid"] in entry.handles and entry.handles[p["pid"]].live()
+               for p in members):
+            return members
+        if members:
+            self.log("[%s] background group ownership unknown; no signal" % entry.agent)
+        return []
+
+    def _capture(self, entry: Entry, members: list[dict]) -> None:
+        for pid, handle in list(entry.handles.items()):
+            if not handle.live():
+                handle.close()
+                del entry.handles[pid]
+        own_group = os.getpgrp() if hasattr(os, "getpgrp") else None
+        eligible = [p for p in members if not p["zombie"] and p["pid"] != os.getpid()
+                    and p["pgid"] != own_group]
+        for p in eligible:
+            if p["pid"] in entry.handles:
+                continue
+            handle = ProcessHandle.open(p["pid"], p.get("start"))
+            if handle is not None:
+                entry.handles[p["pid"]] = handle
+            else:
+                self.log("[%s] background pid %s: no stable handle; no signal"
+                         % (entry.agent, p["pid"]))
+        if eligible:
+            entry.unverified = any(p["pid"] not in entry.handles for p in eligible)
+            with self.observed_lock:
+                for p in eligible:
+                    pid = p["pid"]
+                    if pid not in entry.handles or p.get("start") is None:
+                        continue
+                    if self.observed_children.get(pid) == p["start"]:
+                        continue
+                    old = self.observed_handles.pop(pid, None)
+                    if old is not None:
+                        old.close()
+                    # Keep the observation's kernel identity beyond entry cleanup.
+                    self.observed_children.pop(pid, None)
+                    try:
+                        observation = entry.handles[pid].duplicate()
+                    except OSError as exc:
+                        self.log("[%s] background pid %s: cannot retain wait handle (%s)"
+                                 % (entry.agent, pid, exc))
+                        continue
+                    self.observed_handles[pid] = observation
+                    self.observed_children[pid] = p["start"]
+
+    @staticmethod
+    def _drop_handles(entry: Entry) -> None:
+        with entry.process_lock:
+            for handle in entry.handles.values():
+                handle.close()
+            entry.handles.clear()
 
     def _close(self, entry: Entry, state: str, now: float, *, survives: bool) -> None:
         """Fin du suivi : ressource du tour fermée (orpheline si quelque chose
@@ -429,9 +743,13 @@ class Tracker:
         vide, ou survivant au SIGKILL) — jamais une nouvelle sonde de l'OS, qui
         peut tomber sur un numéro de groupe déjà réattribué (#458 r2)."""
         entry.closed = now
+        if entry.unverified:
+            self.log("[%s] background cleanup ownership unknown; resource remains orphan"
+                     % entry.agent)
+        self._drop_handles(entry)
         for job in entry.jobs.values():
             if job.ended is None:
-                job.code, job.ended = platform.reap(job.pid), now
+                job.code, job.ended = self._reap_job(job), now
         self._release_resource(entry, survives)
         self.log("[%s] background work of turn %s: %s" % (
             entry.agent, entry.turn_id[:8], self._outcome(entry, now, state)))
@@ -447,7 +765,7 @@ class Tracker:
                 restants = [c["id"] for c in runtime.turn_containers(entry.turn_id) or ()]
             except Exception:
                 restants = []
-        orphelin = bool(restants) or survives
+        orphelin = bool(restants) or survives or entry.unverified
         try:
             storage.of(db).turn_resources.close_turn(entry.turn_id, orphan=orphelin,
                                                      containers=restants or None)
@@ -462,27 +780,83 @@ class Tracker:
             self.log("[%s] cannot close the resource of turn %s (%s)"
                      % (entry.agent, entry.turn_id[:8], exc))
 
-    def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
-        """Zombies adoptés hors des tours (démons détachés de leur groupe) :
-        moissonnés, sans quoi ils s'accumulent sous l'exécuteur. Jamais un
-        harnais (ni en cours de lancement), ni un enfant du groupe de
-        l'exécuteur (git, psql, docker attendus par leur `subprocess`), ni un
-        membre d'un tour en cours ou suivi."""
-        moi = os.getpid()
+    def _reap_job(self, job: Job) -> int | None:
+        if job.start is None:
+            return None
+        with self.observed_lock:
+            if job.pid in self.observed_handles:
+                retained = True
+            else:
+                retained = False
+        if retained:
+            return self._reap_observed(job.pid, job.start)
+        return self._reap_identity(job.pid, job.start)
+
+    @staticmethod
+    def _reap_identity(pid: int, start) -> int | None:
+        # Only attributed jobs/observations may use this degraded fallback.
+        # The identity read cannot reserve PID/wait ownership.
+        if start is None:
+            return None
         try:
-            mon_groupe = os.getpgid(0)
-        except OSError:
-            return
+            current_start = platform.start_time(pid)
+        except (platform.NotAvailable, OSError):
+            return None
+        if current_start != start:
+            return None
+        return platform.reap(pid)
+
+    def _reap_observed(self, pid: int, start) -> int | None:
+        with self.observed_lock:
+            if start is None or self.observed_children.get(pid) != start:
+                return None
+            handle = self.observed_handles.get(pid)
+            if handle is None:
+                return None
+            try:
+                code = handle.reap()
+            except PidfdWaitUnavailable:
+                code = self._reap_identity(pid, start)
+            if code is not None:
+                handle.close()
+            return code
+
+    def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
+        """Reap only observed turn descendants, never an arbitrary Popen child."""
+        moi = os.getpid()
+        with self.observed_lock:
+            known = dict(self.observed_children)
         suivis_pgid = {e.pgid for e in suivis if e.pgid}
+        unknown = []
         with self.runner.launch_lock:
             proteges = set(self.runner.harness_pids)
             for p in table:
-                if p["ppid"] != moi or not p["zombie"] or p["pgid"] == mon_groupe:
+                if p["ppid"] != moi or not p["zombie"]:
                     continue
                 if p["pid"] in proteges or p["pgid"] in proteges \
                         or p["pgid"] in suivis_pgid:
                     continue
-                platform.reap(p["pid"])
+                if known.get(p["pid"]) != p.get("start") or p.get("start") is None:
+                    unknown.append(p["pid"])
+                    continue
+                if self._reap_observed(p["pid"], p.get("start")) is None:
+                    unknown.append(p["pid"])
+        self.unknown_zombies = len(unknown)
+        if len(unknown) >= self.UNKNOWN_ZOMBIES_WARN and not self._zombies_warned:
+            listed = ",".join(map(str, sorted(unknown)[:20]))
+            if len(unknown) > 20:
+                listed += " … et %s autres" % (len(unknown) - 20)
+            self.log("background alert: %s unknown or unreaped zombie children (PIDs %s); wait statuses preserved"
+                     % (len(unknown), listed))
+        self._zombies_warned = len(unknown) >= self.UNKNOWN_ZOMBIES_WARN
+        current = {p["pid"]: p.get("start") for p in table}
+        with self.observed_lock:
+            for pid, start in known.items():
+                if current.get(pid) != start and self.observed_children.get(pid) == start:
+                    del self.observed_children[pid]
+                    handle = self.observed_handles.pop(pid, None)
+                    if handle is not None:
+                        handle.close()
 
     # -- l'agent, au tour suivant --------------------------------------------
     def cap_deadline(self, deadline: float, reason: str) -> int:
