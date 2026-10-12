@@ -43,13 +43,26 @@ UNIT_DIR_ENV = "AMEESH_SYSTEMD_USER_DIR"
 #: the configuration of the timer's commands: ameesh's environment file of the
 #: host (the runner's convention), then the variables pinned at enable, which win
 HOST_ENV_FILE = "%h/.config/ameesh/env"
-#: variables that choose the database, the host and the configuration: those
-#: set when the watch is enabled are pinned in its environment file (codex r1,
-#: #303: a timer firing with the defaults reads another database, or skips
-#: delivery because the host differs)
-PINNED_ENV = tuple(prefix + name for name in (
-    "CONFIG", "DSN", "DATABASE_URL", "SCHEMA", "DRIVER", "BACKEND", "HOST", "STATE",
-    "THREADS") for prefix in ("AMEESH_", "AGENT_MESH_"))
+#: variables that choose the configuration, the database and the host, by
+#: canonical name, with the names `config.load` also reads, in its order. The
+#: values resolved when the watch is enabled are pinned under the canonical
+#: name and the other names are emptied (an empty value counts as unset): a
+#: timer firing with other values reads another database, or skips delivery
+#: because the host differs (codex r1 and r2, #303)
+PINNED_ENV = {
+    "AMEESH_CONFIG": ("AMEESH_CONFIG", "AGENT_MESH_CONFIG"),
+    "AMEESH_DSN": ("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
+                   "AGENT_MESH_DATABASE_URL"),
+    "AMEESH_SCHEMA": ("AMEESH_SCHEMA", "AGENT_MESH_SCHEMA"),
+    "AMEESH_DRIVER": ("AMEESH_DRIVER", "AGENT_MESH_DRIVER"),
+    "AMEESH_BACKEND": ("AMEESH_BACKEND", "AGENT_MESH_BACKEND"),
+    "AMEESH_HOST": ("AMEESH_HOST", "AGENT_MESH_HOST"),
+    "AMEESH_STATE": ("AMEESH_STATE", "AGENT_MESH_STATE"),
+    "AMEESH_THREADS": ("AMEESH_THREADS",),
+}
+#: a firing longer than this is stopped by systemd: it never holds the watch's
+#: row (and the moves or disables waiting for it) for long (codex r2, #303)
+FIRING_TIMEOUT_S = 300
 CONSIGNE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "consignes", "veille.md")
 
@@ -101,14 +114,24 @@ def env_name(agent: str) -> str:
     return "%s%s.env" % (UNIT_PREFIX, agent)
 
 
-def pinned_env(env: dict) -> str:
-    """The environment file of a watch: the `PINNED_ENV` variables set in
-    `env`, in systemd's quoting. A value on several lines is refused."""
-    lines = []
-    for name in PINNED_ENV:
-        value = env.get(name)
+def pinned_env(env: dict, host: str) -> str:
+    """The environment file of a watch: for each `PINNED_ENV` group set in
+    `env`, its resolved value under the canonical name and the other names
+    emptied; `AMEESH_HOST` always, the host the watch is recorded for. In
+    systemd's quoting; a value on several lines is refused."""
+    values: dict[str, str] = {}
+    for canonical, names in PINNED_ENV.items():
+        value = next((env[n] for n in names if env.get(n)), "")
+        if canonical == "AMEESH_HOST":
+            value = host
         if not value:
             continue
+        values[canonical] = value
+        for alias in names:
+            if alias != canonical:
+                values[alias] = ""
+    lines = []
+    for name, value in values.items():
         if "\n" in value or "\r" in value:
             raise WatchError("%s spans several lines: cannot pin it for the timer" % name)
         quoted = "".join("\\" + c if c in '\\"`$' else c for c in value)
@@ -125,12 +148,14 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
         "Description=ameesh watch of %(agent)s (L121, written by ameesh watch enable)\n"
         "[Service]\n"
         "Type=oneshot\n"
+        "TimeoutStartSec=%(timeout)d\n"
         "Environment=\"PATH=%(path)s\"\n"
         "EnvironmentFile=-%(host_env)s\n"
         "EnvironmentFile=-%(own_env)s\n"
         "ExecStart=\"%(ameesh)s\" watch send --agent %(agent)s\n"
         % {"agent": agent, "ameesh": ameesh, "path": path, "host_env": HOST_ENV_FILE,
-           "own_env": os.path.join(directory, env_name(agent))})
+           "own_env": os.path.join(directory, env_name(agent)),
+           "timeout": FIRING_TIMEOUT_S})
     timer = (
         "[Unit]\n"
         "Description=ameesh watch of %(agent)s, every %(every)s\n"
@@ -241,7 +266,7 @@ def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subproc
     path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
     files = units(agent, every_s, _ameesh_binary(), path, directory)
     # the pinned variables may hold a DSN with its password: owner only
-    files[env_name(agent)] = pinned_env(dict(source))
+    files[env_name(agent)] = pinned_env(dict(source), host)
     for name, text in files.items():
         tmp = os.path.join(directory, "." + name + ".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -309,24 +334,46 @@ def disable(cfg: Config, db, agent: str, *, run: Callable = subprocess.run,
 
 def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> str:
     """One firing: the instruction to `agent` when its watch is recorded for
-    this host; else nothing (disabled, or moved). The host check and the
-    sending are one transaction on the watch row (codex r1, #303): a move or a
-    disable waits for the firing, and a firing after them sends nothing. What
-    happened, in words."""
+    this host; else nothing (disabled, or moved). The host check, the message
+    and `last_sent_ts` are one transaction on the watch row (codex r1 and r2,
+    #303): a move or a disable waits for a firing in progress, a firing after
+    them sends nothing, and a firing that fails drops no message, so that the
+    next one never sends a second copy. `mail_send(tx, agent, text)` drops the
+    message in the transaction (tests). What happened, in words."""
+    from . import mail, undeliverable
+    host = cfg.host or ""
+    text = consigne(agent)
+    rows = storage.of(db).watches.list(agent)
+    if rows and rows[0]["host"] == host:
+        # the checks of `agent-mail send`, before the transaction (read only)
+        try:
+            undeliverable.check_send(cfg, db, sender=SENDER, dest=agent, explicit=True)
+        except undeliverable.Refused as exc:
+            raise WatchError("instruction to %s not sent: %s" % (agent, exc)) from exc
     if mail_send is None:
-        from . import cli
-        mail_send = cli.main
+        def mail_send(tx, recipient: str, body: str) -> int:
+            return mail.send(tx, SENDER, recipient, body, host=host, thread=False)
+    sent: list[int] = []
 
-    def deliver() -> None:
-        code = mail_send(["send", agent, consigne(agent), "--from", SENDER])
-        if code != 0:
-            raise WatchError("sending the instruction to %s failed (code %s)" % (agent, code))
-    row = storage.of(db).watches.deliver(agent, cfg.host or "", deliver)
+    def deliver(tx) -> None:
+        sent.append(mail_send(tx, agent, text))
+    try:
+        row = storage.of(db).watches.deliver(agent, host, deliver)
+    except WatchError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the unit fails, nothing was dropped
+        raise WatchError("sending the instruction to %s failed: %s" % (agent, exc)) from exc
     if row is None:
         return "no watch of %s: nothing sent (ameesh watch disable --agent %s removes " \
                "this timer)" % (agent, agent)
     if not row["sent"]:
         return "the watch of %s is on %s: nothing sent from here" % (agent, row["host"])
+    # committed: the readable thread, as `agent-mail send` writes it
+    agent_row = registry.get(db, agent)
+    fil.record(cfg, db, sender=SENDER, recipients=[agent], text=text,
+               project=fil.agent_project(agent_row) if agent_row else None,
+               mailbox_ids=[int(m) for m in sent if isinstance(m, int)],
+               meta={"host": host})
     return "instruction sent to %s" % agent
 
 

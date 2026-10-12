@@ -572,9 +572,10 @@ class Watches(Domain):
         """The watches (of `agent` only if given), by agent name."""
 
     @abc.abstractmethod
-    def deliver(self, agent: str, host: str, send: Callable[[], None]) -> dict | None:
+    def deliver(self, agent: str, host: str, send: Callable[[Any], None]) -> dict | None:
         """One firing, in one transaction: the watch row of `agent` is locked;
-        if it is on `host`, `send()` runs and `last_sent_ts` is set. A move or
+        if it is on `host`, `send(tx)` drops the message in that transaction
+        and `last_sent_ts` is set. A move or
         a disable from another host waits for the end of the firing. The row
         read (with `sent` true or false), None if there is no watch; `send`
         raising rolls the transaction back."""

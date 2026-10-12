@@ -44,7 +44,7 @@ class Watches(interface.Watches):
             row = dict(rows[0], sent=False)
             if row["host"] != host:
                 return row
-            send()
+            send(tx)
             tx.execute("update agent_watches set last_sent_at = now() where agent = %s",
                        (agent,))
             row["sent"] = True
