@@ -408,6 +408,25 @@ pr_de() {
   done
   return 1
 }
+# la description d'une PR sans le pied de l'outil : la ligne exacte « 🤖
+# Generated with [Claude Code](…) », les lignes d'attribution Co-Authored-By
+# <noreply@anthropic.com>, puis les lignes vides et séparateurs (---) de fin ;
+# une note qui parle d'autre chose reste
+sans_pied_d_outil() {
+  python3 -c '
+import re, sys
+outil = re.compile("^\\s*\U0001F916\uFE0F?\\s*Generated with \\[Claude Code\\]\\([^)]*\\)\\s*$")
+credit = re.compile(r"^\s*Co-Authored-By:.*<noreply@anthropic\.com>\s*$", re.I)
+fin = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})?\s*$")
+lignes = [l for l in sys.stdin.read().replace("\r", "").split("\n")
+          if not outil.match(l) and not credit.match(l)]
+while lignes and fin.match(lignes[-1]):
+    lignes.pop()
+while lignes and not lignes[0].strip():
+    lignes.pop(0)
+sys.stdout.write("\n".join(lignes))
+'
+}
 notes_de() {  # notes de la version $1 (commit $2), sur la sortie standard
   local main n corps
   main=$(git -C "$DEPOT" rev-parse --verify "$DISTANT/main^{commit}")
@@ -418,10 +437,9 @@ notes_de() {  # notes de la version $1 (commit $2), sur la sortie standard
   n=$(pr_de "$2") || { echo "notes introuvables pour $1 : ni docs/versions/$1.md dans $DISTANT/main, ni PR qui a fusionné ${2:0:7}" >&2; return 1; }
   corps=$(gh pr view "$n" -R "$(depot_github)" --json body --jq .body) \
     || { echo "description de la PR #$n illisible : pas de release $1" >&2; return 1; }
-  # la ligne d'outil en pied de description n'est pas une note de version ;
-  # il doit rester des notes une fois retirée
-  corps=$(tr -d '\r' <<<"$corps" | { grep -v '^🤖 Generated with' || true; } \
-    | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+  # le pied de l'outil n'est pas une note de version ; il doit rester des
+  # notes une fois retiré
+  corps=$(sans_pied_d_outil <<<"$corps")
   [ -n "${corps//[[:space:]]/}" ] || { echo "PR #$n sans notes (description vide, ou la seule ligne de l'outil) : pas de release $1" >&2; return 1; }
   printf '%s\n\nPR : #%s\n' "$corps" "$n"
 }
@@ -432,7 +450,7 @@ derniere_version() {  # la plus haute version étiquetée sur le distant (v1.2.3
 # publier REF [VERSION] : VERSION, la version attendue (rattraper) ; un écart
 # avec pyproject.toml de REF arrête tout
 publier() {
-  local ref=${1:-HEAD} attendue=${2:-} sha version tag distant ici notes plus_haute
+  local ref=${1:-HEAD} attendue=${2:-} sha version tag distant ici notes plus_haute publiee
   lire_distant
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
   version=$(version_de "$sha")
@@ -446,6 +464,14 @@ publier() {
   git -C "$DEPOT" merge-base --is-ancestor "$sha" "$DISTANT/main" \
     || { echo "${sha:0:7} n'est pas sur $DISTANT/main : rien n'est publié" >&2; exit 1; }
   distant=$(commit_distant "$tag")
+  publiee=0
+  if gh release view "$tag" -R "$(depot_github)" >/dev/null 2>&1; then
+    publiee=1
+  else
+    # les notes sont lues et validées avant tout effet de bord : pas
+    # d'étiquette poussée sans release possible (#348 r1)
+    notes=$(notes_de "$version" "$sha") || exit 1
+  fi
   if [ -n "$distant" ]; then
     [ "$distant" = "$sha" ] || { echo "$tag est déjà posée sur ${distant:0:7}, pas ${sha:0:7} : une étiquette publiée ne se déplace pas (une nouvelle version passe par un nouveau numéro dans pyproject.toml)" >&2; exit 1; }
     echo "étiquette : déjà posée"
@@ -459,11 +485,10 @@ publier() {
     fi
     fait git -C "$DEPOT" push "$DISTANT" "refs/tags/$tag"
   fi
-  if gh release view "$tag" -R "$(depot_github)" >/dev/null 2>&1; then
+  if [ "$publiee" = 1 ]; then
     echo "release : déjà publiée"
     return 0
   fi
-  notes=$(notes_de "$version" "$sha") || exit 1
   # « Latest » ne va qu'à la plus haute version : un rattrapage ne la vole pas,
   # ni ne la donne en passant à une version que la suite dépasse
   plus_haute=$( (derniere_version; echo "$version"; echo "${PREVUE:-}") | sort -V | tail -1)

@@ -205,19 +205,32 @@ class PublicationTest(unittest.TestCase):
         self.assertIn("illisible", done.stderr)
         self.assertEqual(self.gh()["releases"], {})
 
-    def test_p3_body_with_only_the_tool_line_fails(self):
-        # #309 r2 P3: notes must remain once the tool's footer line is removed
-        for body in ("", "  \n", "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
-                     "\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n"):
+    def test_p3_body_with_only_the_tool_footer_fails_before_any_tag(self):
+        # #309 r2 P3, #348 r1: notes must remain once the tool's footer is
+        # removed, and that is checked before the tag is made or pushed
+        tool = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+        for body in ("", "  \n", tool, "\n\n%s\n" % tool, "---\n%s" % tool,
+                     "%s\n\nCo-Authored-By: Claude <noreply@anthropic.com>" % tool,
+                     "\U0001F916\uFE0F Generated with [Claude Code](x)",
+                     "   %s   " % tool):
             self.pr(5, self.v100, body=body)
             done = self.run_script("publier", self.v100)
             self.assertNotEqual(done.returncode, 0, repr(body))
             self.assertIn("sans notes", done.stderr)
             self.assertEqual(self.gh()["releases"], {})
-        self.pr(5, self.v100, body="Real notes.\n\n🤖 Generated with [Claude Code](x)\n")
+            self.assertNotIn("v1.0.0", self.remote_tags())
+            self.assertEqual(_git(self.repo, "tag", "-l", "v1.0.0"), "")
+        self.pr(5, self.v100, body="Real notes.\n\n---\n\n%s\n" % tool)
         done = self.run_script("publier", self.v100)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.gh()["releases"]["v1.0.0"]["notes"], "Real notes.\n\nPR : #5")
+
+    def test_p3_a_note_about_generation_is_kept(self):
+        note = "\U0001F916 Generated with now displays the selected tool."
+        self.pr(5, self.v100, body=note)
+        done = self.run_script("publier", self.v100)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.gh()["releases"]["v1.0.0"]["notes"], note + "\n\nPR : #5")
 
     def test_latest_only_on_the_highest_version(self):
         self.pr(5, self.v100)
