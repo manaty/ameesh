@@ -271,12 +271,39 @@ role() {
   fi
 }
 
+epoque_bail() {  # lease epoch of persona $2 as seen by configuration $1
+  local sortie
+  if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json)
+  else sortie=$("$AMEESH" show "$2" --json); fi
+  python3 -c 'import json,sys; print(int(json.loads(sys.stdin.read() or "{}").get("lease_epoch") or 0))' \
+    <<<"$sortie"
+}
+
+# #502: an active unit does not prove that its runner works. The restarted
+# runner must take its persona's lease again: an owner, and an epoch past the
+# one read before the restart (claim and release both advance it; no clock is
+# compared), within 24 tries 5 s apart. A stopped persona is not expected to.
+bail_repris() {  # base persona epoch-before-restart
+  local sortie
+  for _ in $(seq 24); do
+    if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json)
+    else sortie=$("$AMEESH" show "$2" --json); fi
+    python3 -c 'import json, sys
+a = json.loads(sys.stdin.read() or "{}")
+sys.exit(0 if a.get("status") == "stopped" or (a.get("lease_owner")
+         and int(a.get("lease_epoch") or 0) > int(sys.argv[1])) else 1)' "$3" \
+      <<<"$sortie" && return 0
+    sleep 5
+  done
+  return 1
+}
+
 # Redémarre les unités $2… (base $1 : mesh | ancienne) une par une, chacune
 # au premier instant où sa persona n'est pas en tour. Une persona longue en
 # tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout.
 redemarrer_liste() {
   local base=$1; shift
-  local restantes=("$@") suivantes debut=$SECONDS u p st
+  local restantes=("$@") suivantes debut=$SECONDS u p st avant
   while [ ${#restantes[@]} -gt 0 ]; do
     suivantes=()
     for u in "${restantes[@]}"; do
@@ -284,10 +311,15 @@ redemarrer_liste() {
       [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
       st=$(statut "$base" "$p")
       if [ "$st" = running ]; then suivantes+=("$u"); continue; fi
+      avant=$(epoque_bail "$base" "$p")
       systemctl --user restart "$u"
       sleep 10
       if ! systemctl --user is-active --quiet "$u"; then
         echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
+        exit 1
+      fi
+      if ! bail_repris "$base" "$p" "$avant"; then
+        echo "$u: active, but $p did not take its lease again — journalctl --user -u $u -n 50; then « $0 retour »" >&2
         exit 1
       fi
       echo "$p : redémarré (était $st)"
