@@ -36,7 +36,7 @@ import time
 from typing import Sequence
 
 from . import storage
-from .db import Db
+from .db import Db, DbError
 from .storage.postgres import work as _pg
 
 STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
@@ -779,9 +779,18 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             "declared" if declared else "seen",
             " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
             " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
-        row = storage.of(db).work.close_merged(
-            item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-            frozen_id=frozen_id)
+        try:
+            row = storage.of(db).work.close_merged(
+                item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
+                frozen_id=frozen_id)
+        except DbError as exc:
+            # A refused module requirement is a per-lot result, allowing a
+            # merge sweep to continue with other projects. Other DB errors
+            # remain errors; the storage transaction already rolled back.
+            if "AMEESH_MODULE_RULE:" not in str(exc):
+                raise
+            return {"id": int(item_id), "result": "refused", "item": item,
+                    "detail": str(exc)}
         if row is not None:
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": "%s → merged" % state}
@@ -811,6 +820,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -
                         declared=True, extra=(note or "").strip())
     if done["result"] == "refused":
         item = done["item"]
+        if item["state"] != "closed":
+            raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
                         % (item_id, "abandoned" if item.get("close_reason") == "abandoned"
                            else "superseded by #%s" % item.get("superseded_by"), item_id))

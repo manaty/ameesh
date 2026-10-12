@@ -23,6 +23,15 @@ def federation(project="acme", names=None):
 
 
 class ModuleConfigurationTest(unittest.TestCase):
+    def test_module_refusal_is_per_lot_but_other_database_errors_propagate(self):
+        store = mock.Mock()
+        with mock.patch.object(work, "get", return_value={"id": 1, "state": "qa"}), \
+                mock.patch.object(work.storage, "of", return_value=store):
+            store.work.close_merged.side_effect = db_mod.DbError("AMEESH_MODULE_RULE: evidence missing")
+            self.assertEqual(work.close_merged(mock.Mock(), 1)["result"], "refused")
+            store.work.close_merged.side_effect = db_mod.DbError("database connection lost")
+            with self.assertRaises(db_mod.DbError):
+                work.close_merged(mock.Mock(), 1)
     def test_it_cli_parses_artifact_options_after_lot_and_preserves_program_arguments(self):
         with mock.patch.object(it, "prove", return_value={"id": 1}) as prove:
             it.main(mock.Mock(), ["proof", "123", "--artifact", "/artifact", "--runner", "python3",
@@ -165,11 +174,11 @@ class LifecycleGateTest(PgTestCase):
         self.assertEqual(work.merged(self.db, core, sha="abcdef1234")["result"], "merged")
 
     def test_missing_proof_blocks_manual_and_automatic_closure_and_go(self):
-        for action in (lambda: work.merged(self.db, self.lot, sha="abcdef1234"),
-                       lambda: work.close_merged(self.db, self.lot, source="sync-github"),
-                       lambda: work.milestone(self.db, self.lot, "verdict", verdict="ok")):
-            with self.assertRaises(db_mod.DbError):
-                action()
+        with self.assertRaises(work.WorkError):
+            work.merged(self.db, self.lot, sha="abcdef1234")
+        self.assertEqual(work.close_merged(self.db, self.lot, source="sync-github")["result"], "refused")
+        with self.assertRaises(db_mod.DbError):
+            work.milestone(self.db, self.lot, "verdict", verdict="ok")
         self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
         self.assertFalse(any(m["kind"] == "merged" for m in work.milestones(self.db, self.lot)))
         work.milestone(self.db, self.lot, "verdict", verdict="blocked")
@@ -198,8 +207,7 @@ class LifecycleGateTest(PgTestCase):
     def test_new_declaration_invalidates_proof_even_for_same_bytes(self):
         self.prove()
         it.declare(self.db, self.lot, self.artifact, actor="tester")
-        with self.assertRaisesRegex(db_mod.DbError, "proof"):
-            work.close_merged(self.db, self.lot)
+        self.assertEqual(work.close_merged(self.db, self.lot)["result"], "refused")
         it.prove(self.db, self.lot, self.artifact, actor="tester", runner=sys.executable)
         self.assertEqual(work.close_merged(self.db, self.lot)["result"], "merged")
 
@@ -212,10 +220,7 @@ class LifecycleGateTest(PgTestCase):
             other = db_mod.connect(self.cfg)
             try:
                 entered.set()
-                work.close_merged(other, self.lot, source="concurrent-sync")
-                result.append("closed")
-            except db_mod.DbError:
-                result.append("refused")
+                result.append(work.close_merged(other, self.lot, source="concurrent-sync")["result"])
             finally:
                 other.close()
 

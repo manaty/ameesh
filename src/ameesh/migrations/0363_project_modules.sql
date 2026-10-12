@@ -65,7 +65,7 @@ begin
                 where work_item_id = item.id and module = policy.module
                   and kind = requirement->>'subject_kind' order by id desc limit 1;
             if not found then
-                raise exception 'module %: lot % lacks current % milestone',
+                raise exception 'AMEESH_MODULE_RULE: module %: lot % lacks current % milestone',
                     policy.module, item.id, requirement->>'subject_kind';
             end if;
             perform 1 from work_module_milestones
@@ -73,13 +73,14 @@ begin
                   and kind = requirement->>'evidence_kind'
                   and subject = current_subject.subject and binding_id = current_subject.id;
             if not found then
-                raise exception 'module %: lot % lacks % for current subject %',
+                raise exception 'AMEESH_MODULE_RULE: module %: lot % lacks % for current subject %',
                     policy.module, item.id, requirement->>'evidence_kind', current_subject.subject;
             end if;
         end loop;
     end loop;
     if not admitted then
-        raise exception 'work item type % has no active module in project %', item.type, project_name;
+        raise exception 'AMEESH_MODULE_RULE: work item type % has no active module in project %',
+            item.type, project_name;
     end if;
 end $$;
 
