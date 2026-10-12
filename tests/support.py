@@ -36,8 +36,31 @@ BENCH_ENV_VARS = frozenset((
     "AMEESH_DRIVER", "AGENT_MESH_DRIVER",
     "AMEESH_DB_TRACE",
 ))
+#: L73/L142 : les caches de gestionnaires de paquets que le ménage redirige
+#: (`menage.CACHES`, `menage.XDG_CACHE`) sont un « choix de l'hôte » que le
+#: produit respecte — un agent exécuté par ameesh les porte donc dans son
+#: environnement (`npm_config_store_dir`…). La suite ne doit pas les hériter :
+#: un test qui veut ce cas les pose explicitement (`child_env`, `turn_env`).
+HOST_CACHE_PREFIXES = ("npm_config_", "pnpm_config_")
+HOST_CACHE_VARS = ("YARN_CACHE_FOLDER", "XDG_CACHE_HOME")
+
+
+def _host_cache_var(name: str) -> bool:
+    """Variable de cache des gestionnaires de paquets du poste (L73/L142)."""
+    return (name.lower().startswith(HOST_CACHE_PREFIXES)
+            or name in HOST_CACHE_VARS)
+
+
+def _drop_host_cache(env: dict) -> None:
+    """Retire de `env` les caches du poste (avant tout choix explicite)."""
+    for name in [n for n in env if _host_cache_var(n)]:
+        env.pop(name, None)
+
+
 for _name in list(os.environ):
-    if (_name.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))
+    if _host_cache_var(_name):
+        del os.environ[_name]
+    elif (_name.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))
             and _name not in BENCH_ENV_VARS):
         del os.environ[_name]
 #: et la configuration de l'hôte (~/.config/ameesh/config.json, ou l'ancienne
@@ -177,6 +200,11 @@ def hold_for_owner(db, lot_id: int, *, requester: str = "orchestrateur",
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)
+    # L73/L142 : les caches du poste (npm_config_*, pnpm_config_*,
+    # YARN_CACHE_FOLDER, XDG_CACHE_HOME) ne fuient pas non plus : le ménage les
+    # redirige et respecte un choix déjà posé. L'`update` final, lui, garde un
+    # choix explicite du test.
+    _drop_host_cache(env)
     # le canon et la règle R14 de la machine ne fuient pas dans les tests :
     # chaque test qui en a besoin les pose explicitement
     for name in ("AMEESH_CANON", "AMEESH_CANONS", "AMEESH_CANON_REF", "AMEESH_CANON_UNTRUSTED",
