@@ -12,6 +12,13 @@
 --
 -- Partial on `is not null`: mail without a lot and actions without a work item
 -- are never looked up this way, and the index stays small.
+--
+-- A plain build, not `CONCURRENTLY`: `migrate()` runs every migration inside
+-- one transaction (`db.script`), and Postgres refuses a concurrent build
+-- there. The mailbox is busy, so wait at most 5 s for the table's lock: if a
+-- writer holds it longer, the migration fails and stays pending instead of
+-- queueing every `agent_mailbox` writer behind the build.
+set local lock_timeout = '5s';
 
 create index if not exists agent_mailbox_work_item_idx
   on agent_mailbox (work_item_id) where work_item_id is not null;
