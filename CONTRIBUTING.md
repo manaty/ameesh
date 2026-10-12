@@ -106,6 +106,8 @@ the review without replacing it. Known limits: SQL strings are read with
 `standard_conforming_strings` on, the escapes of an `E''` string are not
 decoded (`E'\x44ROP'`), dollar tags are ASCII, `U&"…"` identifiers are not
 decoded, and a function body is never a statement, even when the migration
-runs it later (`SELECT f()`). To see the level of what is on
+runs it later (`SELECT f()`). In the CLI, imports hold for their whole
+scope, and a helper rebound by assignment, `global` or `nonlocal`, or called
+from a nested function, is not followed. To see the level of what is on
 `main` before preparing a version:
 `python3 scripts/version-level.py level $(git describe --tags --abbrev=0) origin/main`.

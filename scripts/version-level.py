@@ -39,14 +39,17 @@ body of a `DO` block is (in dollars or in a plain string), with the strings,
 plain or in dollars, it hands to `EXECUTE` or `format(…)`. A package module
 is reached by alias, by its full name (`ameesh.plan_cli.add_parsers`) or
 through a module that imports a helper and hands it on; an import inside a
-function binds only in that function.
+function binds only in that function (not in the functions it nests, nor
+around it), and hides a module function of the same name.
 
 Known limits (the script helps the CI and the auditor, it does not replace
 the review): strings are read with `standard_conforming_strings` on; the
 escapes of an `E''` string are not decoded (`E'\x44ROP'` is not seen as
 `DROP`); a dollar tag is ASCII; a `U&"…"` identifier is not decoded; a
 function body is not a statement even when the migration runs it later
-(`SELECT f()`).
+(`SELECT f()`). In Python, a scope's imports hold for the whole scope, not
+from their line on; a helper rebound by assignment, `global` or `nonlocal`,
+and a nested function's own calls, are not followed.
 
 The number must be the next one at its own level (1.9.0 → 1.9.1, 1.10.0 or
 2.0.0), and that level must not be below the floor. A level above the floor
@@ -209,6 +212,20 @@ def _sql(text: str, block: bool = False) -> str:
     return "".join(out)
 
 
+_NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _scope(nodes):
+    """The nodes of one scope: a nested function or class is its own scope,
+    its imports bind nothing here."""
+    todo = list(nodes)
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, _NESTED):
+            todo.extend(ast.iter_child_nodes(node))
+
+
 def _imports(nodes, module: str, init: bool = False,
              ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     """The package modules imported in `nodes` (one scope: a module without
@@ -219,7 +236,7 @@ def _imports(nodes, module: str, init: bool = False,
     package = (module.split(".") if module else []) if init else module.split(".")[:-1]
     modules: dict[str, str] = {}
     functions: dict[str, tuple[str, str]] = {}
-    for node in (one for top in nodes for one in ast.walk(top)):
+    for node in _scope(nodes):
         if isinstance(node, ast.ImportFrom):
             if node.level:
                 base = package[:len(package) - (node.level - 1)] if node.level > 1 else package
@@ -315,10 +332,14 @@ class _Parsers(ast.NodeVisitor):
         self.top = _imports([n for n in tree.body if n not in self.functions.values()],
                             module, init)
         self.scopes = {}
+        #: names a function imports itself: they hide the module's functions
+        self.own: dict[str, set[str]] = {}
         for name, function in self.functions.items():
             modules, imported = _imports(function.body, module, init)
             self.scopes[name] = (dict(self.top[0], **modules), dict(self.top[1], **imported))
+            self.own[name] = set(modules) | set(imported)
         self.modules, self.imported = self.top
+        self.local: set[str] = set()
         self.env: dict[str, tuple[str, ...]] = {}
         #: names bound to a literal string (a loop over literals, `x = "y"`)
         self.consts: dict[str, str] = {}
@@ -337,21 +358,22 @@ class _Parsers(ast.NodeVisitor):
         """The callees of every call of the file, each read in its scope."""
         scopes = [(None, [n for n in self.tree.body if n not in self.functions.values()])]
         scopes += [(name, function.body) for name, function in self.functions.items()]
-        saved = self.modules, self.imported
+        saved = self.modules, self.imported, self.local
         try:
             for name, nodes in scopes:
                 self.modules, self.imported = self.scopes.get(name, self.top)
+                self.local = self.own.get(name, set())
                 for node in (one for top in nodes for one in ast.walk(top)):
                     if isinstance(node, ast.Call) and self.callee(node.func):
                         yield self.callee(node.func)
         finally:
-            self.modules, self.imported = saved
+            self.modules, self.imported, self.local = saved
 
     def callee(self, func) -> tuple[str, str] | None:
         """The (module, function) of the package a call targets, if known
         (`plan_cli.add_parsers`, `ameesh.plan_cli.add_parsers`)."""
         if isinstance(func, ast.Name):
-            if func.id in self.functions:
+            if func.id in self.functions and func.id not in self.local:
                 return self.module, func.id
             return self.imported.get(func.id)
         if not isinstance(func, ast.Attribute):
@@ -500,16 +522,19 @@ class _Parsers(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def run(self, function, bound: dict[str, tuple[str, ...]], unbound: bool = True):
-        saved = self.env, self.consts, self.unbound, self.modules, self.imported
+        saved = (self.env, self.consts, self.unbound, self.modules, self.imported,
+                 self.local)
         self.env, self.consts, self.unbound = dict(bound), {}, unbound
         self.modules, self.imported = self.scopes[function.name]
+        self.local = self.own[function.name]
         self.package.stack.append((self.module, function.name))
         try:
             for statement in function.body:
                 self.visit(statement)
         finally:
             self.package.stack.pop()
-            self.env, self.consts, self.unbound, self.modules, self.imported = saved
+            (self.env, self.consts, self.unbound, self.modules, self.imported,
+             self.local) = saved
 
     def walk(self):
         for statement in self.tree.body:

@@ -326,6 +326,35 @@ class VersionLevelTest(unittest.TestCase):
         self.assertNotIn("queue link --none", options)
         self.assertNotIn("work drain --now", options)
 
+    def test_nested_scopes(self):
+        # codex #195 r6: a nested function's import does not rebind its
+        # enclosing builder's name; a function's own import hides a module
+        # function of the same name
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/plan_cli.py",
+                    'def fill(work):\n    work.add_parser("link")\n')
+        self._write("src/ameesh/other_cli.py", 'def fill(work):\n    pass\n')
+        self._commit("1.2.3", "helpers")
+        nested = ('from . import plan_cli as helper\n\n\ndef build(sub):\n'
+                  '    def unused():\n        from . import other_cli as helper\n'
+                  '    work = sub.add_parser("work").add_subparsers()\n'
+                  '    helper.fill(work)\n')
+        hidden = ('def fill(sub):\n    pass\n\n\ndef build(sub):\n'
+                  '    from .plan_cli import fill\n'
+                  '    work = sub.add_parser("work").add_subparsers()\n    fill(work)\n')
+        for name, cli in (("nested", nested), ("hidden", hidden)):
+            with self.subTest(name):
+                self._git("checkout", "-q", "-B", "case-" + name, "case")
+                self._write("src/ameesh/cli.py", cli)
+                self._commit("1.2.3", name)
+                self._git("tag", "-f", "base-" + name)
+                self.assertIn("work link", vl.surface("HEAD")["command"])
+                self._write("src/ameesh/cli.py", cli.replace("fill(work)", "fill(sub)"))
+                self._commit("1.2.3", "moved")
+                floor, reasons = vl.level("base-" + name, "HEAD")
+                self.assertEqual(floor, "major")
+                self.assertIn("command work link removed", reasons)
+
     def test_loop_over_literals(self):
         cli = ('def build(sub):\n    for action in ("approve", "retry"):\n'
                '        p = sub.add_parser(action)\n        p.add_argument("--by")\n'
