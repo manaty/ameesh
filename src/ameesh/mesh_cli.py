@@ -33,7 +33,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
-  agent-mesh menage [--dry-run | --apply] [--json]       agent cleanup (L73)
+  agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
@@ -640,10 +640,16 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
     return ci.cmd_ci(cfg, args)
 
 
+def cmd_housekeeping(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh housekeeping` (L73, L148) : voir `ameesh.housekeeping.cmd_housekeeping`."""
+    from . import housekeeping
+    return housekeeping.cmd_housekeeping(cfg, args)
+
+
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
-    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
-    from . import menage
-    return menage.cmd_menage(cfg, args)
+    """`ameesh menage` (L73), déprécié (L148) : alias caché de `housekeeping`."""
+    sys.stderr.write("menage is deprecated, use housekeeping\n")
+    return cmd_housekeeping(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -1945,8 +1951,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="window of --report, in days (default 7)")
     p_hosts.set_defaults(func=cmd_hosts)
 
-    p_menage = sub.add_parser(
-        "menage", help="cleanup of what agents create (L73); dry run by default")
+    p_housekeeping = sub.add_parser(
+        "housekeeping", help="cleanup of what agents create (L73); dry run by default")
+    mode = p_housekeeping.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="show only (default): nothing is removed")
+    mode.add_argument("--apply", action="store_true",
+                      help="apply (human or runner only, never an agent "
+                           "session)")
+    p_housekeeping.add_argument("--by", default="", help="who triggers it (log), e.g. human:alice")
+    p_housekeeping.add_argument("--json", action="store_true", help="`ameesh-menage/1` report")
+    p_housekeeping.set_defaults(func=cmd_housekeeping)
+
+    # L148 : `ameesh menage` reste accepté (une ligne sur stderr) ; sans
+    # `help=`, il ne figure pas dans la liste des commandes.
+    p_menage = sub.add_parser("menage")
     mode = p_menage.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="show only (default): nothing is removed")
