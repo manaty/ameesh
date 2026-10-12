@@ -1009,12 +1009,14 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     beyond = False
     if not ranked and critical:
         # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
-        # agent critique seulement, en dernier (jamais en overage)
+        # agent critique seulement, en dernier (jamais en overage) ; au retour
+        # d'un emprunt, avec la même marge (#389 r2)
         relaxed = dict(cache)
         for profile in candidates:
             if profile.default and profile.cap is None:
                 relaxed[profile.name] = evaluate(book, profile, items, now, environ,
-                                                 record=False, critical=True)
+                                                 record=False, critical=True,
+                                                 reserve=margin)
         # le rythme tient ici même garde désactivée (#324 r1)
         ranked = rank(candidates, relaxed, now)
         if ranked:

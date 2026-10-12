@@ -6,6 +6,7 @@ a de la marge — résumé sous le harnais emprunté. Le tour emprunté est comp
 sous son harnais (grand livre, plafond payé au token du mesh)."""
 from __future__ import annotations
 
+import errno
 import os
 from unittest import mock
 
@@ -273,3 +274,69 @@ class Relecture389Test(_Repli):
             self.assertFalse(os.path.exists(repris._path(repris.RESUME_PENDING)))
         finally:
             repris.watchdog_stop.set()
+
+
+class Relecture389r2Test(_Repli):
+    """#389 r2 : le résumé de passation tient jusqu'à une session connue, et
+    une rotation dont le résumé n'a pu être gardé sur disque n'a pas lieu."""
+
+    def _passation(self, worker):
+        self._tour(worker)
+        session = worker.current_session()
+        with mock.patch("ameesh.cost.CostBook.over", return_value="hourly budget: x"):
+            self.assertTrue(account_turn.rotate_harness(worker, "deepseek", "codex",
+                                                        session))
+        return session
+
+    def test_un_depart_avorte_garde_le_resume(self):
+        worker = self.worker()
+        try:
+            self._passation(worker)
+            attendu = worker.resume_summary
+            n = len(self.turns())
+            self._tour(worker, "suite", AMEESH_TEST_KILL_SELF="1")  # mort avant l'init
+            self.assertGreater(len(self.turns()), n)
+            self.assertEqual(worker.resume_summary, attendu)
+            self.assertTrue(os.path.exists(worker._path(worker.RESUME_PENDING)))
+            n = len(self.turns())
+            self._tour(worker, "suite")
+            tour = self.turns()[n]
+            self.assertIn(attendu[:60], " ".join(tour["argv"]) + tour.get("stdin", ""))
+            self.assertEqual(worker.resume_summary, "")
+            self.assertFalse(os.path.exists(worker._path(worker.RESUME_PENDING)))
+        finally:
+            worker.watchdog_stop.set()
+
+    def _disque_plein(self, worker):
+        reel = os.replace
+
+        def replace(src, dst, *a, **kw):
+            if str(dst) == worker._path(worker.RESUME_PENDING):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return reel(src, dst, *a, **kw)
+        return mock.patch("os.replace", side_effect=replace)
+
+    def test_resume_non_garde_la_rotation_n_a_pas_lieu(self):
+        worker = self.worker()
+        try:
+            self._tour(worker)
+            session = worker.current_session()
+            with mock.patch("ameesh.cost.CostBook.over", return_value="hourly budget: x"), \
+                    self._disque_plein(worker):
+                self.assertFalse(account_turn.rotate_harness(worker, "deepseek", "codex",
+                                                             session))
+            self.assertEqual(worker.current_session(), session)
+            self.assertEqual(worker.resume_summary, "")
+            self.assertFalse(os.path.exists(worker._path(worker.RESUME_PENDING)))
+            self.assertFalse(os.path.exists(worker._path(worker.RESUME_PENDING) + ".tmp"))
+            # au sondage : rotation requise (autre harnais) mais annulée — le
+            # tour ne part pas, la consigne reste
+            worker._state_note("session_harness", "deepseek")
+            n = len(self.turns())
+            with mock.patch("ameesh.cost.CostBook.over", return_value="hourly budget: x"), \
+                    self._disque_plein(worker):
+                self.assertIsNone(self._tour(worker, "suite"))
+            self.assertEqual(len(self.turns()), n)
+            self.assertEqual(worker.current_session(), session)
+        finally:
+            worker.watchdog_stop.set()

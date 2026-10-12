@@ -1239,11 +1239,12 @@ class AgentWorker(threading.Thread):
     #: neuve qu'il ouvre (#389 r1 : il survit à une panne de l'exécuteur)
     RESUME_PENDING = "resume-pending.json"
 
-    def _resume_keep(self, resume: str, origin: str) -> None:
+    def _resume_keep(self, resume: str, origin: str) -> bool:
         """Le résumé de reprise retenu pour la session neuve : en mémoire et
         dans l'état local, AVANT l'oubli de l'ancienne session — une panne
-        entre l'oubli et le lancement ne le perd pas (#389 r1)."""
-        self.resume_summary, self.resume_origin = resume, origin
+        entre l'oubli et le lancement ne le perd pas (#389 r1). Faux s'il
+        n'a pas pu être écrit : l'appelant garde alors l'ancienne session
+        (#389 r2)."""
         path = self._path(self.RESUME_PENDING)
         try:
             with open(path + ".tmp", "w", encoding="utf-8") as fh:
@@ -1254,6 +1255,13 @@ class AgentWorker(threading.Thread):
             os.replace(path + ".tmp", path)
         except OSError as exc:
             log_async("[%s] resume summary not kept on disk (%s)" % (self.name, exc))
+            try:
+                os.unlink(path + ".tmp")
+            except OSError:
+                pass
+            return False
+        self.resume_summary, self.resume_origin = resume, origin
+        return True
 
     def _resume_drop(self) -> None:
         """Le résumé de reprise a ouvert la session neuve, ou n'a plus lieu
@@ -1381,7 +1389,11 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
-        self._resume_keep(resume, "agent")
+        if not self._resume_keep(resume, "agent"):
+            self._fil_note("Session rotation cancelled: the resume summary could not "
+                           "be kept on disk. The old session is kept.",
+                           meta={"action": "rotation", "etat": "annulee"})
+            return False
         # L'effacement est fencé par le bail : si un remplaçant a réclamé l'agent
         # entre-temps, sa session n'est pas touchée.
         if not registry.clear_session(self.db, self.name, self.runner.runner_id, self.epoch):
@@ -2733,7 +2745,8 @@ class AgentWorker(threading.Thread):
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
         # plein tour).
-        account_turn.continuity(self)
+        if not account_turn.continuity(self):
+            return None  # #389 r2 : rotation requise mais annulée, rien consommé
         urgents = mail.unread_urgent(self.db, self.name)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
@@ -3415,9 +3428,7 @@ class AgentWorker(threading.Thread):
             # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
             # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
             # unique couvre toutes les causes (B5a-P, L11 B2).
-            tue = self.kill_if_stop_requested()
-            if resume and not tue:
-                self._resume_drop()  # le résumé a ouvert la session neuve
+            self.kill_if_stop_requested()
             log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
             # L78: the writer owns its connection; harness output never waits
             # for SQL or the readable thread. ResidentWorker uses the same sink.
@@ -3445,6 +3456,10 @@ class AgentWorker(threading.Thread):
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
+                        if resume:
+                            # #389 r2 : le résumé a ouvert une session connue
+                            # (gardé jusque-là : un départ avorté le rejoue)
+                            self._resume_drop()
                         # L242b (3) : le harnais de la session (rotation au
                         # changement de harnais, `account_turn.continuity`)
                         self._state_note("session_harness", harness)
@@ -3593,6 +3608,8 @@ class AgentWorker(threading.Thread):
         # L217b : la rotation entre deux tours juge sur ce même compteur
         self.last_turn_context = relus if relus_mesures else None
         self.last_turn_context_session = session_new or session or None
+        if resume and not session_new and not result_code and not error:
+            self._resume_drop()  # tour achevé sans id de session : livré
         if relus_sous_agents:
             log_async("[%s] tokens reread in the turn: %d main thread, %d subagents "
                       "(outside the cap)" % (self.name, relus, relus_sous_agents))

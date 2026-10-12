@@ -390,14 +390,16 @@ def session_on(worker, compte) -> bool:
     return previous == compte.name
 
 
-def continuity(worker) -> None:
+def continuity(worker) -> bool:
     """Session ouverte sous un autre compte : reprise, ou rotation avec résumé.
 
     Reprise quand le harnais le permet (`accounts.session_portable` : même
     stockage de sessions) ; sinon le résumé est produit sous l'ANCIEN compte,
     la session est oubliée, et le tour suivant repart du résumé sous le
     nouveau — et le fil le dit. Seulement s'il y a du travail : on ne résume
-    pas une session pour rien.
+    pas une session pour rien. Faux quand une rotation requise n'a pas eu
+    lieu (bail perdu, résumé non gardé sur disque) : le tour n'est pas tenté
+    (#389 r2).
     """
     harness = _harness(worker)
     session = worker.current_session()
@@ -406,29 +408,29 @@ def continuity(worker) -> None:
         # agent critique, ou retour au sien) — jamais reprenable : rotation
         # avec résumé sous l'ancien harnais, s'il y a du travail
         if worker.peek():
-            rotate_harness(worker, session_harness(worker), harness, session)
-        return
+            return rotate_harness(worker, session_harness(worker), harness, session)
+        return True
     try:
         items = accounts.profiles(worker.cfg, harness)
     except accounts.AccountError:
-        return
+        return True
     if not items:
-        return
+        return True
     new = for_turn(worker)
     if new is None or new is INVALID:
-        return
+        return True
     session = worker.current_session()  # même règle que le tour (L26 : oubli par restart)
     if not session:
-        return
+        return True
     previous = _session_account(worker)
     if previous == new.name:
-        return
+        return True
     if previous is None:
         # session d'avant L30 : ouverte avec le dossier par défaut du harnais,
         # résolu en son compte déclaré (L226b : santé et jauges sous son nom)
         old = legacy_profile(harness, items)
         if old.home() == new.home():
-            return
+            return True
     else:
         old = accounts.by_name(items, previous)
     if accounts.session_portable(harness, old, new):
@@ -447,10 +449,10 @@ def continuity(worker) -> None:
                 worker.agent["session_account"] = new.name
         except db_mod.DbError as exc:
             _log("[%s] session account not recorded (%s)" % (worker.name, exc))
-        return
+        return True
     if not worker.peek():
-        return
-    rotate(worker, harness, old, new, session)
+        return True
+    return rotate(worker, harness, old, new, session)
 
 
 def summary_possible(old, book, items, now: float | None = None, *,
@@ -617,7 +619,9 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
     worker._session_history(session, note)
     # le cadre de reprise dit qui a écrit le bloc : l'agent, ou ameesh (L39) ;
     # gardé sur disque avant l'oubli (#389 r1 : une panne ne le perd pas)
-    worker._resume_keep(resume, "ameesh" if sans_resume else "agent")
+    if not worker._resume_keep(resume, "ameesh" if sans_resume else "agent"):
+        _log("[%s] switch rotation cancelled: resume summary not kept on disk" % worker.name)
+        return False
     if not registry.clear_session(worker.db, worker.name, worker.runner.runner_id,
                                   worker.epoch):
         worker._resume_drop()

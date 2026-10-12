@@ -520,7 +520,11 @@ change.
    summary, like a turn; otherwise the brief is used. The summary (or
    brief) is kept in the agent's state (`resume-pending.json`) before the
    old session is forgotten: a runner restarted before the new session
-   starts still opens it with the summary. An ordinary rotation (L11) never
+   starts still opens it with the summary. It is dropped only once the new
+   session has reported its id (or its turn completed): a harness that dies
+   at launch leaves it for the next turn. If it cannot be written (disk
+   full), the rotation does not happen: the old session is kept and the
+   turn waits. An ordinary rotation (L11) never
    runs while the next turn would go to another harness than the session's:
    the switch does it.
    A fresh session then starts under the new harness. The agent's model,
@@ -535,7 +539,8 @@ change.
    first. While the agent runs under a borrowed harness, it comes back only
    when one of its accounts has the headroom of a non-critical agent: the
    reserve of 10 points under the pace (`accounts.RESERVE`) and
-   `noncritical_hourly_share` of the hourly cap. Without that margin, each
+   `noncritical_hourly_share` of the hourly cap, including on the default
+   account taken beyond its 50 % cap (step 2). Without that margin, each
    crossing of a rising pace cap would cost a summary and a rotation. If no
    borrowed harness has headroom left, its own account is used without the
    margin rather than a pause. The return is the same rotation, with the
