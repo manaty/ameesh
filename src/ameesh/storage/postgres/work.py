@@ -897,20 +897,21 @@ class WorkItems(interface.WorkItems):
     # -- file d'amélioration (L119, décision 0037) ------------------------------
     def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
                     team, required_capabilities, package_id, package_parent, note,
-                    actor) -> dict:
+                    actor, app="") -> dict:
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
                 INSERT INTO work_items
                     (type, source, title, body, state, expected_value, value_score,
-                     priority, team, required_capabilities, package_id, package_parent)
+                     priority, team, required_capabilities, package_id, package_parent,
+                     app)
                 VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s, %s::text[],
-                        %s, %s)
+                        %s, %s, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", ITEM_COLUMNS),
                 (source, title, body, expected_value, int(value_score), int(priority), team,
                  _catalog._text_array(required_capabilities) if required_capabilities else None,
-                 package_id, package_parent))
+                 package_id, package_parent, app or ""))
             item = rows[0]
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item

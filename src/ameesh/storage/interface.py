@@ -1280,9 +1280,12 @@ class WorkItems(Domain):
     def backlog_add(self, *, title: str, body: str, source: str, expected_value: str,
                     value_score: int, priority: int, team: str | None,
                     required_capabilities: list | None, package_id: str | None,
-                    package_parent: str | None, note: str, actor: str) -> dict:
+                    package_parent: str | None, note: str, actor: str,
+                    app: str = "") -> dict:
         """Crée un élément de la file : un lot `improvement` en `intake`, sans
-        assigné, et sa première ligne de journal ; rend le lot."""
+        assigné, et sa première ligne de journal ; rend le lot.
+
+        `app`: its project (L118c), empty when unknown."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int) -> list[dict]:

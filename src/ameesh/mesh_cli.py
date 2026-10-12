@@ -1131,7 +1131,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
-            return backlog.run(db, args)
+            return backlog.run(db, args, cfg)
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)
