@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -180,6 +182,16 @@ class DriverCase(unittest.TestCase):
         self.assertIsNotNone(result, "turn still running after %ss" % timeout)
         return result
 
+    def bounded(self, call, timeout: float = 10.0):
+        """`call()` in a thread: its result, or a failure if it does not
+        return within `timeout` (a deadlock fails, never hangs the suite)."""
+        box: list = []
+        thread = threading.Thread(target=lambda: box.append(call()), daemon=True)
+        thread.start()
+        thread.join(timeout)
+        self.assertFalse(thread.is_alive(), "blocked for more than %ss" % timeout)
+        return box[0] if box else None
+
     def until(self, predicate, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
         while not predicate():
@@ -259,6 +271,45 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertAlmostEqual(result.cost, 0.02)  # two harness turns
         self.assertEqual(result.usage["input_tokens"], 20)
         self.assertEqual(len([p for _r, p in self.events if "final" in p]), 2)
+
+    def test_large_steer_while_the_harness_fills_its_output(self):
+        # codex r1 (#325): a 1 MB steer while the harness writes 4 MB before
+        # reading its input; written under the lock, both pipes blocked
+        driver = self.driver(env={"FAKE_CLAUDE_FLOOD": "4000000"})
+        driver.start()
+        turn = driver.send("SLOW FLOOD", input_id="a")
+        self.until(lambda: {"user": "SLOW FLOOD"} in self.trace())
+        big = "y" * 1_000_000
+        self.bounded(lambda: driver.steer(big, input_id="b"))
+        result = self.bounded(lambda: turn.wait(30), 40)
+        self.assertEqual(result.status, resident.COMPLETED)
+        self.assertEqual(result.inputs, ("a", "b"))
+        self.assertEqual(result.final, ("ECHO:SLOW FLOOD\nECHO:" + big)[-resident.FINAL_MAX_CHARS:])
+
+    def test_close_never_waits_for_a_child_that_left_the_group(self):
+        # codex r1 (#325): a child that called setsid keeps the output open:
+        # close() returns all the same
+        driver = self.driver()
+        driver.start()
+        self.wait(driver.send("ORPHAN"))
+        [pid] = [t["orphan"] for t in self.trace() if "orphan" in t]
+        self.addCleanup(lambda: os.kill(pid, signal.SIGKILL) if _alive(pid) else None)
+        started = time.monotonic()
+        self.bounded(lambda: driver.close(0.3))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(driver.alive)
+
+    def test_an_interrupt_leaves_unread_inputs_unserved(self):
+        # codex r1 (#325): a steer the harness had not read when the turn was
+        # interrupted is not reported as served
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        time.sleep(0.1)
+        self.assertTrue(driver.interrupt())
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs), (resident.INTERRUPTED, ("a",)))
 
     def test_steer_outside_a_turn_is_a_send(self):
         driver = self.driver()
@@ -448,6 +499,34 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(turn.result.inputs, ("a", "b"))
         self.assertIn("ECHO:steered", turn.result.final)
 
+    def test_a_late_turn_start_answer_never_overwrites_the_next_turn(self):
+        # codex r1 (#325): the answer to turn/start A arrives after follow-up
+        # B started: the turn id stays B's
+        driver = resident.CodexAppServer(adapters.HarnessAdapter(
+            harnesses._build(codex_doc(), "p", "t"), sys.executable), cwd=self.tmp)
+        gates = [threading.Event(), threading.Event()]
+        starts: list = []
+
+        class Peer:
+            def request(self, method, params=None, **kwargs):
+                n = len(starts)
+                starts.append(params)
+                gates[n].wait(5)
+                return {"turn": {"id": "turn-%d" % (n + 1)}}
+        driver.peer = Peer()
+        driver._turn = resident.Turn("a")
+        first = threading.Thread(target=driver._turn_start, args=("A",))
+        first.start()
+        self.until(lambda: len(starts) == 1)
+        with driver._lock:
+            driver._turn_id = None  # A completed, its follow-up starts
+        gates[1].set()
+        driver._turn_start("B")
+        self.assertEqual(driver._turn_id, "turn-2")
+        gates[0].set()
+        first.join(5)
+        self.assertEqual(driver._turn_id, "turn-2")
+
     def test_interrupt(self):
         driver = self.driver()
         driver.start()
@@ -490,7 +569,7 @@ class AcpResidentTest(DriverCase):
         return [t for t in self.trace() if t.get("method") == name]
 
     def test_several_prompts_on_one_session(self):
-        driver = self.driver(env={"FAKE_ACP_MODE": "normal"})
+        driver = self.driver(env={"FAKE_ACP_MODE": "normal", "FAKE_ACP_COST_STEP": "0.02"})
         self.assertEqual(driver.start(), "sess-fake-1")
         first = self.wait(driver.send("one"))
         second = self.wait(driver.send("two"))
@@ -499,16 +578,36 @@ class AcpResidentTest(DriverCase):
             self.assertEqual(result.final, "bonjour")
             self.assertEqual(result.usage["context_tokens"], 1234)
             self.assertEqual(result.usage["context_window"], 200000)
+            # codex r1 (#325): the difference with the reading before it
             self.assertAlmostEqual(result.cost, 0.02)
+        self.assertEqual((first.cost_total, second.cost_total), (0.02, 0.04))
         self.assertEqual(len(self.methods("initialize")), 1)
         self.assertEqual(len(self.methods("session/new")), 1)
         self.assertEqual([t["text"] for t in self.methods("session/prompt")], ["one", "two"])
         self.assertTrue(driver.probe())  # session/list unknown: it answered
 
     def test_resume(self):
-        driver = self.driver(env={"FAKE_ACP_MODE": "resume"}, session="sess-9")
+        driver = self.driver(env={"FAKE_ACP_MODE": "resume", "FAKE_ACP_COST_STEP": "0.02"},
+                             session="sess-9")
         self.assertEqual(driver.start(), "sess-9")
         self.assertEqual(len(self.methods("session/resume")), 1)
+        first = self.wait(driver.send("one"))
+        self.assertIsNone(first.cost)  # cumulative before it unknown
+        self.assertAlmostEqual(self.wait(driver.send("two")).cost, 0.02)
+
+    def test_an_interrupt_drops_the_pending_follow_up(self):
+        # codex r1 (#325): steered then interrupted before the cancellation
+        # ends: the steered input was never prompted, so not served
+        driver = self.driver(env={"FAKE_ACP_MODE": "hang"})
+        driver.start()
+        turn = driver.send("long", input_id="a")
+        self.until(lambda: self.methods("session/prompt"))
+        with driver._lock:  # the end of the prompt waits for both
+            driver.steer("urgent", input_id="b")
+            self.assertTrue(driver.interrupt())
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs), (resident.INTERRUPTED, ("a",)))
+        self.assertEqual([t["text"] for t in self.methods("session/prompt")], ["long"])
 
     def test_steer_is_cancel_then_prompt(self):
         driver = self.driver(env={"FAKE_ACP_MODE": "hang_once"})
@@ -550,6 +649,14 @@ class AcpResidentTest(DriverCase):
         result = self.wait(driver.send("bye"))
         self.assertEqual(result.status, resident.FAILED)
         self.until(lambda: not driver.alive)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 if __name__ == "__main__":

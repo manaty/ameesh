@@ -17,7 +17,10 @@ It speaks the protocol its arguments name, as observed on the real harnesses
 The text of an input drives the turn: `SLOW` (a tool call of 0.6 s, inputs
 written meanwhile join the turn), `CRASH` (exit 3 mid-turn), `ERROR` (failed
 turn), `ASK` (the harness asks the client for a permission and reports the
-answer). The answer of a turn is `ECHO:<text>` per input served.
+answer), `FLOOD` (Claude: writes `FAKE_CLAUDE_FLOOD` bytes of output before
+reading its input again), `ORPHAN` (a child leaves the group with `setsid`
+and keeps the output open; its pid is traced). The answer of a turn is
+`ECHO:<text>` per input served.
 
 Environment: `FAKE_RESIDENT_LOG` (JSONL trace of argv and of what was
 received), `FAKE_CLAUDE_QUEUE=1` (an input written during a turn is not
@@ -70,6 +73,7 @@ class Claude:
         self.cost = 0.5 if "--resume" in argv else 0.0
         self.inbox: queue.Queue = queue.Queue()
         self.queued: list[dict] = []
+        self.resume = threading.Event()
 
     def next_message(self, timeout: float | None) -> dict | None | bool:
         try:
@@ -91,8 +95,24 @@ class Claude:
         content = (message.get("message") or {}).get("content") or [{}]
         return str(content[0].get("text") or "")
 
+    def read_input(self) -> None:
+        """The reader of the input. After a `FLOOD` input, it reads nothing
+        until the turn has written its output (a harness busy with it)."""
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            self.inbox.put(message)
+            if message.get("type") == "user" and "FLOOD" in json.dumps(message):
+                self.resume.wait(30)
+        self.inbox.put(None)
+
     def run(self) -> None:
-        threading.Thread(target=reader, args=(self.inbox,), daemon=True).start()
+        threading.Thread(target=self.read_input, daemon=True).start()
         while True:
             message = self.queued.pop(0) if self.queued else self.next_message(None)
             if message is None:
@@ -109,6 +129,18 @@ class Claude:
              "model": "fake-model"})
         texts = [self.replay(first)]
         trace({"user": texts[0]})
+        if "ORPHAN" in texts[0]:
+            orphan()
+        if "FLOOD" in texts[0]:
+            # the reader is paused: the input is not read while the output
+            # is written (a harness busy with its tool output)
+            total, chunk = int(os.environ.get("FAKE_CLAUDE_FLOOD", "4000000")), "x" * 65536
+            while total > 0:
+                out({"type": "assistant", "session_id": self.session, "message": {
+                    "id": "msg-%d" % total, "content": [{"type": "text", "text": chunk}],
+                    "usage": {"input_tokens": 1}}})
+                total -= len(chunk)
+            self.resume.set()
         interrupted = False
         if "CRASH" in texts[0]:
             sys.exit(3)
@@ -278,6 +310,14 @@ class Codex:
                 self.complete("interrupted")
         else:
             self.reply(mid, error={"code": -32601, "message": "unknown method %s" % method})
+
+
+def orphan() -> None:
+    """A child that leaves the group (setsid) and keeps the output open."""
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+    trace({"orphan": child.pid})
 
 
 def main() -> None:

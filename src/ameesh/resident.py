@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -201,12 +202,13 @@ def _kill_group(proc: subprocess.Popen, grace: float) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        _close_output(proc)
+    # the output is NOT closed here: the reader holds it until EOF, and a
+    # child that left the group (setsid) may keep it open (codex r1, #325);
+    # the reader closes it at EOF
 
 
 def _close_output(proc: subprocess.Popen) -> None:
-    """Close the harness's output once it has exited (the reader is at EOF
-    or stops on the closed file)."""
+    """Close the harness's output, by its reader once at EOF."""
     try:
         if proc.stdout is not None:
             proc.stdout.close()
@@ -346,6 +348,9 @@ class ResidentDriver:
             turn = self._turn
             if turn is None:
                 return False
+            # dropped follow-ups were never given to the harness: not served
+            # (codex r1, #325), the caller serves them again
+            self._unconfirmed.update(input_id for input_id, _text in self._followups)
             self._followups.clear()
             self._interrupting = True
         return self._interrupt(turn)
@@ -469,7 +474,13 @@ class ClaudeStreamJson(ResidentDriver):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._proc: subprocess.Popen | None = None
-        self._write_lock = threading.Lock()
+        #: lines for the writer thread: never written under the lock (a large
+        #: input and a harness that fills its output first would block both
+        #: pipes, codex r1, #325); None stops it
+        self._outbox: queue.Queue = queue.Queue()
+        self._writer: threading.Thread | None = None
+        #: wire uuid → input id, for the inputs not read when a turn ends
+        self._wire_inputs: dict[str, str] = {}
         self._controls: dict[str, dict] = {}
         self._control_seq = 0
         #: uuids written in the logical turn and not yet read by the harness
@@ -505,21 +516,46 @@ class ClaudeStreamJson(ResidentDriver):
         self._reader = threading.Thread(target=self._read_loop, daemon=True,
                                         name="resident-claude-reader")
         self._reader.start()
+        self._writer = threading.Thread(target=self._write_loop, daemon=True,
+                                        name="resident-claude-writer")
+        self._writer.start()
         # handshake: the harness answers once its startup hooks have run
         self._control({"subtype": "initialize"}, self.init_timeout)
         return self.session_id or ""
 
+    def close(self, grace: float = CLOSE_GRACE) -> None:
+        self._closed = True
+        self._outbox.put(None)
+        super().close(grace)
+
     # -- writing -----------------------------------------------------------
     def _write(self, message: dict) -> None:
+        """Queue a line for the writer thread (never blocks): lines reach the
+        harness in the order they were queued."""
         proc = self._proc
-        with self._write_lock:
-            if proc is None or proc.stdin is None or proc.poll() is not None:
-                raise ResidentError("resident harness is not running")
+        if proc is None or proc.stdin is None or proc.poll() is not None \
+                or self._dead is not None or self._closed:
+            raise ResidentError("resident harness is not running")
+        self._outbox.put((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    def _write_loop(self) -> None:
+        """Writes the queued lines on the harness's input, by its descriptor:
+        no Python buffer lock, so that closing the input never waits for a
+        blocked write."""
+        proc = self._proc
+        assert proc is not None and proc.stdin is not None
+        fd = proc.stdin.fileno()
+        while True:
+            data = self._outbox.get()
+            if data is None or self._closed:
+                return
             try:
-                proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                raise ResidentError("cannot write to the harness: %s" % exc)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+            except (OSError, ValueError) as exc:
+                self._died("cannot write to the harness: %s" % exc)
+                return
 
     def _control(self, request: dict, timeout: float, *,
                  turn: Turn | None = None) -> dict | None:
@@ -556,9 +592,10 @@ class ClaudeStreamJson(ResidentDriver):
                                                      response.get("error") or response))
         return response
 
-    def _user(self, text: str, wire: str) -> None:
+    def _user(self, text: str, wire: str, input_id: str) -> None:
         with self._lock:
             self._unread.add(wire)
+            self._wire_inputs[wire] = input_id
         self._write({"type": "user", "uuid": wire, "session_id": self.session_id or "",
                      "parent_tool_use_id": None,
                      "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
@@ -567,11 +604,13 @@ class ClaudeStreamJson(ResidentDriver):
     def _begin(self, text: str, input_id: str) -> None:
         with self._lock:
             self._unread.clear()
-        self._user(text, new_id())
+            self._wire_inputs.clear()
+        self._user(text, new_id(), input_id)
 
     def _steer(self, turn: Turn, text: str, input_id: str) -> None:
-        # written at once: the harness reads it at the next safe point
-        self._user(text, new_id())
+        # queued under the lock (unread before the turn can end), written at
+        # once by the writer: the harness reads it at the next safe point
+        self._user(text, new_id(), input_id)
 
     def _interrupt(self, turn: Turn) -> bool:
         try:
@@ -673,6 +712,10 @@ class ClaudeStreamJson(ResidentDriver):
                 self._final = str(event["result"])
             if self._unread and not self._interrupting:
                 return  # a steered input opens the next harness turn
+            # interrupted with inputs still unread: not served by this turn
+            # (codex r1, #325), the caller serves them again
+            self._unconfirmed.update(self._wire_inputs[w] for w in self._unread
+                                     if w in self._wire_inputs)
             if not event.get("is_error"):
                 status, error = COMPLETED, None
             elif self._interrupting:
@@ -702,6 +745,9 @@ class CodexAppServer(ResidentDriver):
         super().__init__(*args, **kwargs)
         self.peer: acp.JsonRpcPeer | None = None
         self._turn_id: str | None = None
+        #: number of the last `turn/start`: a late answer to an earlier one
+        #: never overwrites the turn id (codex r1, #325)
+        self._start_seq = 0
         self._watch: threading.Thread | None = None
 
     @property
@@ -769,6 +815,7 @@ class CodexAppServer(ResidentDriver):
             self._died("codex app-server protocol error: %s" % peer.fatal)
         else:
             self._died("resident harness exited (code %s)" % peer.proc.wait())
+            _close_output(peer.proc)  # the reader is at EOF
 
     # -- turn --------------------------------------------------------------
     def _input(self, text: str) -> list[dict]:
@@ -779,6 +826,9 @@ class CodexAppServer(ResidentDriver):
         params: dict = {"threadId": self.session_id, "input": self._input(text)}
         if self.effort:
             params["effort"] = self.effort
+        with self._lock:
+            self._start_seq += 1
+            seq = self._start_seq
         try:
             result = self.peer.request("turn/start", params, timeout=CONTROL_TIMEOUT)
         except acp.AcpError as exc:
@@ -786,7 +836,8 @@ class CodexAppServer(ResidentDriver):
         turn = (result or {}).get("turn") if isinstance(result, dict) else None
         if isinstance(turn, dict) and turn.get("id"):
             with self._lock:
-                self._turn_id = str(turn["id"])
+                if seq == self._start_seq and self._turn_id is None:
+                    self._turn_id = str(turn["id"])
 
     def _begin(self, text: str, input_id: str) -> None:
         with self._lock:
@@ -820,11 +871,13 @@ class CodexAppServer(ResidentDriver):
                         result.inputs = (*result.inputs, input_id)
                 return
         with self._lock:
+            if self._turn is turn and self._interrupting:
+                return None  # interrupted meanwhile: not served (left unconfirmed)
             self._unconfirmed.discard(input_id)
             if self._turn is turn:
                 # served by a new harness turn when the current one completes
                 self._followups.append((input_id, text))
-                return
+                return None
         # the turn ended without it (left out of its inputs): a new turn
         return self.send(text, input_id)
 
@@ -1044,6 +1097,7 @@ class AcpResident(ResidentDriver):
             self._died("ACP protocol error: %s" % peer.fatal)
         else:
             self._died("resident harness exited (code %s)" % peer.proc.wait())
+            _close_output(peer.proc)  # the reader is at EOF
 
     def close(self, grace: float = CLOSE_GRACE) -> None:
         super().close(grace)
@@ -1106,10 +1160,13 @@ class AcpResident(ResidentDriver):
             if client.size is not None:
                 self._window = client.size
             if client._last_cost is not None:
-                # cumulative over the session: the difference is this prompt's
-                cost = client._last_cost if client._cost_readings < 2 else max(
-                    client._last_cost - (client._first_cost or 0.0), 0.0)
-                self._cost = (self._cost or 0.0) + cost
+                # cumulative over the session: this prompt's cost is the
+                # difference with the reading before it (codex r1, #325), as
+                # for Claude; unknown for a resumed session without a base
+                if self.cost_base is not None:
+                    self._cost = (self._cost or 0.0) + max(
+                        client._last_cost - self.cost_base, 0.0)
+                self.cost_base = client._last_cost
                 self._cost_total = client._last_cost
         parsed = {"display": ["%s (%s)" % (adapters.END_OF_TURN_MARK, stop)]}
         if error:
