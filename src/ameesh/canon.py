@@ -63,7 +63,9 @@ try:  # facultatif : jamais requis
 except Exception:  # pragma: no cover - dépend de l'environnement
     _yaml = None
 
-PROFILE_TYPES = ("Agent", "Host", "Placement", "Member", "WorkPackage")
+#: `Persona` (L51, 0029/0032) replaces `Agent`; both card types remain
+#: readable during the transition.
+PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage")
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -750,6 +752,11 @@ class Member:
     roles: list[str] | None
     authenticators: list | None
     fiche: Fiche
+    #: L51 (0032 §2, 0033 §7): humans who can act in their place
+    #: (`deputies`) and receive escalations (`superiors`);
+    #: references use `human:<id>`.
+    deputies: list[str] | None = None
+    superiors: list[str] | None = None
 
 
 @dataclass
@@ -773,6 +780,16 @@ class Agent:
     #: fiche ; seul renseignement lu par la règle de visibilité (jamais un
     #: secret, jamais un droit).
     memory_repository: str | None = None
+    #: L51 (0029 §1): admitted harnesses in preference order (`Persona` card);
+    #: `harness` defaults to the first when omitted from the card.
+    harnesses: list[str] | None = None
+    #: L51 (0032): roles held by the persona, as declared (the role model
+    #: belongs to lot L58).
+    roles: list[str] | None = None
+
+    @property
+    def is_persona(self) -> bool:
+        return self.fiche.type == "Persona"
 
 
 @dataclass
@@ -1111,14 +1128,16 @@ class Canon:
             "readable": self.readable,
             "untrusted": self.untrusted,
             "sources": [s.to_dict() for s in self.sources],
-            "members": [dict(title=m.title, roles=m.roles, **fiche(m.fiche))
+            "members": [dict(title=m.title, roles=m.roles, deputies=m.deputies,
+                             superiors=m.superiors, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
-            "agents": [dict(title=a.title, responsible=a.responsible, team=a.team,
+            "agents": [dict(title=a.title, type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
+                            harnesses=a.harnesses, roles=a.roles,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
@@ -2057,7 +2076,9 @@ class _Loader:
         self.canon.members.append(Member(
             title=fiche.title, roles=roles,
             authenticators=authenticators if isinstance(authenticators, list) else None,
-            fiche=fiche))
+            fiche=fiche,
+            deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
+            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
 
     def _build_agent(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": fiche.title}
@@ -2091,13 +2112,15 @@ class _Loader:
                          "`memory`: mapping expected (ignored)", **where, **subject)
             else:
                 memory_repository = _text(memory.get("repository"))
+        harnesses = self._list(fiche, "harnesses", where, "agent-harnesses-invalid", **subject)
+        harness = _text(fiche.data.get("harness")) or (harnesses[0] if harnesses else None)
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
             team=_text(fiche.data.get("team")),
             capabilities=self._list(fiche, "capabilities", where, "agent-capabilities-invalid",
                                     **subject),
-            harness=_text(fiche.data.get("harness")),
+            harness=harness,
             model=_text(fiche.data.get("model")),
             provider=_text(fiche.data.get("provider")),
             credential_mode=_text(fiche.data.get("credential_mode")),
@@ -2107,7 +2130,13 @@ class _Loader:
             priority=0 if priority is None else priority,
             memory_repository=memory_repository,
             fiche=fiche,
+            harnesses=harnesses,
+            roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
         ))
+
+    def _build_persona(self, fiche: Fiche, where: dict) -> None:
+        """L51: read a `Persona` card like an `Agent` card (0029, 0032)."""
+        self._build_agent(fiche, where)
 
     def _build_host(self, fiche: Fiche, where: dict) -> None:
         subject = {"host": fiche.title}
@@ -2566,6 +2595,31 @@ def from_config_all(cfg, *, fetch: bool = False) -> list[Canon]:
 # Validation (§4.3)
 # ==========================================================================
 
+def _relationship_cycles(graph):
+    """Directed back-edge cycles, without recursion on untrusted member chains."""
+    done = set()
+    for start in graph:
+        if start in done:
+            continue
+        path = [start]
+        positions = {start: 0}
+        stack = [(start, iter(graph[start]))]
+        while stack:
+            node, edges = stack[-1]
+            target = next(edges, None)
+            if target is None:
+                stack.pop()
+                path.pop()
+                positions.pop(node)
+                done.add(node)
+            elif target in positions:
+                yield path[positions[target]:] + [target]
+            elif target not in done:
+                positions[target] = len(path)
+                path.append(target)
+                stack.append((target, iter(graph.get(target, ()))))
+
+
 def validate(canon: Canon) -> list[Finding]:
     """Constats de lecture + constats du profil. Une erreur est bloquante."""
     findings: list[Finding] = list(canon.load_findings)
@@ -2644,6 +2698,50 @@ def validate(canon: Canon) -> list[Finding]:
                 "harness %r of %s has no known descriptor (%s)"
                 % (agent.harness, agent.title, ", ".join(sorted(known_harnesses)) or "none"),
                 f, agent=agent.title)
+        for name in agent.harnesses or []:
+            if name != agent.harness and name not in known_harnesses:
+                add("agent-harness-unknown", ERROR,
+                    "harness %r (`harnesses`) of %s has no known descriptor" % (name, agent.title),
+                    f, agent=agent.title)
+        if agent.harnesses and agent.harness and agent.harness not in agent.harnesses:
+            add("agent-harness-outside-list", WARNING,
+                "`harness` %r of %s is absent from `harnesses` (%s)"
+                % (agent.harness, agent.title, ", ".join(agent.harnesses)),
+                f, agent=agent.title)
+
+    # -- human deputies and superiors (L51, 0032 §2, 0033 §7) --------------------
+    for member in canon.members:
+        for key, values in (("deputies", member.deputies), ("superiors", member.superiors)):
+            for ref in values or []:
+                resolved = canon.resolve_human(ref)
+                if resolved is None:
+                    add("member-%s-unresolved" % key, ERROR,
+                        "%s %r of %s does not resolve to a human Member (expected "
+                        "human:<id> of a unique Member card)" % (key, ref, member.title),
+                        member.fiche)
+                elif resolved == "human:%s" % member.title:
+                    add("member-%s-self" % key, ERROR,
+                        "%s of %s: a human cannot be their own %s"
+                        % (key, member.title, "deputy" if key == "deputies" else "superior"),
+                        member.fiche)
+
+    members_by_ref = {}
+    for member in canon.members:
+        ref = canon.resolve_human("human:%s" % member.title)
+        if ref is not None:
+            members_by_ref[ref] = member
+    for key in ("deputies", "superiors"):
+        graph = {}
+        for ref, member in members_by_ref.items():
+            graph[ref] = []
+            for target in getattr(member, key) or []:
+                resolved = canon.resolve_human(target)
+                if resolved in members_by_ref and resolved != ref:
+                    graph[ref].append(resolved)
+        for cycle in _relationship_cycles(graph):
+            add("member-%s-cycle" % key, ERROR,
+                "cycle in human %s: %s" % (key, " → ".join(cycle)),
+                members_by_ref[cycle[0]].fiche)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:
