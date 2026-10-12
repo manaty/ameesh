@@ -566,11 +566,13 @@ def reap(pid: int) -> int | None:
 # détenteurs d'un fichier
 # --------------------------------------------------------------------------
 
-def _inside(target: str, real: str, is_dir: bool) -> bool:
+def _inside(target: str, real: str | None, is_dir: bool) -> bool:
+    if real is None:  # L63b: command line only, no file to look for
+        return False
     return target == real or (is_dir and target.startswith(real.rstrip(os.sep) + os.sep))
 
 
-def holders(path: str, needle: str | None = None, exclude=(), *,
+def holders(path: str | None, needle: str | None = None, exclude=(), *,
             mapped: bool = False) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
@@ -580,11 +582,14 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
     détenteur : `{"pid", "why", "cmd"}`.
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
-    si ce processus-ci ne peut même pas lire SES fichiers ouverts, ou si l'OS
-    n'offre aucun moyen de les lire, `NotAvailable` : une liste vide voudrait
-    dire « personne ne tient la session », ce qui n'aurait pas été vérifié."""
-    real = os.path.realpath(path)
-    is_dir = os.path.isdir(real)
+    si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
+    n'offre aucun moyen de les lire, ou (L63b) si un processus du même
+    utilisateur refuse la lecture de ses fichiers ouverts (non dumpable) sans
+    être le gestionnaire de services, `NotAvailable` : une liste vide voudrait
+    dire « personne ne tient la session », ce qui n'aurait pas été vérifié.
+    `path` None : `needle` seul, l'OS toujours exigé (L63b)."""
+    real = os.path.realpath(path) if path else None
+    is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
     ps = _psutil()
     if ps is not None:
@@ -593,6 +598,41 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
         return _holders_proc(real, is_dir, needle, exclude, mapped)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
+
+
+def _service_manager(name: str, argv: list[str]) -> bool:
+    """L63b, as in `user_paths`: the user's service manager is never
+    readable; its name AND the base name of its argv[0] tell it."""
+    return name in SERVICE_MANAGER and bool(argv) \
+        and os.path.basename(argv[0]) in SERVICE_MANAGER
+
+
+def _runs_as(pid: str, uid: int) -> bool:
+    """L63b: does the process run as `uid`, real AND effective uid, on the
+    `Uid:` line of /proc/<pid>/status (readable even when it is not
+    dumpable; st_uid is root's then)? A setuid helper started by the user
+    (sudo, fusermount3) runs as root: not one of the user's harnesses."""
+    for line in _read_text(os.path.join(PROC, pid, "status")).splitlines():
+        if line.startswith("Uid:"):
+            return line.split()[1:3] == [str(uid)] * 2
+    return False
+
+
+def _owner(proc):
+    """Who a psutil process runs as: (real, effective) uid where the OS has
+    them (a setuid helper is root's, see `_runs_as`), else its user name."""
+    try:
+        uids = proc.uids()
+    except AttributeError:   # Windows
+        return proc.username()
+    return (uids.real, uids.effective)
+
+
+def _denied(denied: list[str]) -> None:
+    if denied:
+        raise NotAvailable("file holders",
+                           "open files of process(es) of this user unreadable: %s"
+                           % ", ".join(denied[:5]))
 
 
 def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | None:
@@ -607,22 +647,27 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
     me = os.getpid()
     try:
         ps.Process(me).open_files()
+        user = _owner(ps.Process(me))
     except Exception as exc:
         raise NotAvailable("file holders",
                            "open files unreadable even for this process (%s)"
                            % type(exc).__name__) from None
     found = []
+    denied: list[str] = []
     for proc in ps.process_iter():
         pid = proc.pid
         hit = ""
         try:
             with proc.oneshot():
+                refused = False
                 try:
                     for item in proc.open_files():
                         if _inside(os.path.realpath(item.path), real, is_dir):
                             hit = "open file"
                             break
-                except (ps.AccessDenied, ps.ZombieProcess, OSError):
+                except ps.AccessDenied:
+                    refused = True
+                except (ps.ZombieProcess, OSError):
                     pass
                 if not hit and is_dir:
                     try:
@@ -641,11 +686,19 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
                     argv = [str(a) for a in proc.cmdline()]
                 except (ps.AccessDenied, ps.ZombieProcess, OSError):
                     argv = []
+                if refused and not hit:
+                    try:
+                        name, mine = proc.name(), _owner(proc) == user
+                    except (ps.AccessDenied, ps.ZombieProcess, OSError):
+                        name, mine = "?", True  # unknown owner: a doubt
+                    if mine and not _service_manager(name, argv):
+                        denied.append("%d %s" % (pid, name))
         except ps.NoSuchProcess:
             continue
         row = _verdict(pid, hit, argv, needle, exclude)
         if row:
             found.append(row)
+    _denied(denied)
     return found
 
 
@@ -682,11 +735,16 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
                            "open files unreadable even for this process (%s)"
                            % exc) from None
     found = []
+    denied: list[str] = []
+    uid = os.getuid()
     for pid in pids:
         hit = ""
         fd_dir = os.path.join(PROC, pid, "fd")
+        refused = False
         try:
             fds = os.listdir(fd_dir)
+        except PermissionError:
+            fds, refused = [], True
         except OSError:
             fds = []
         for fd in fds:
@@ -710,9 +768,15 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
                 argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
         except OSError:
             argv = []
+        if refused and not hit:
+            mine = _runs_as(pid, uid)
+            name = _read_text(os.path.join(PROC, pid, "comm")).strip() or "?"
+            if mine and not _service_manager(name, argv):
+                denied.append("%s %s" % (pid, name))
         row = _verdict(int(pid), hit, argv, needle, exclude)
         if row:
             found.append(row)
+    _denied(denied)
     return found
 
 
