@@ -232,6 +232,12 @@ class ReportTest(unittest.TestCase):
             del row["cpu_window_s"]
         self.assertEqual(pilot.report("vm", rows, self.limits(), days=1)
                          ["total"]["guest_cpu_hours"], 0.0)
+        # readings 1 min apart, each averaged over the hour before it: the
+        # measured window is judged before it is cut to the 60 s gap
+        rows = [reading(t0 + 60 * i, guest_cpu=60.0, cpu_window_s=3600.0)
+                for i in range(3)]
+        total = pilot.report("vm", rows, self.limits(), days=1)["total"]
+        self.assertEqual((total["measured_s"], total["guest_cpu_hours"]), (120.0, 0.0))
 
     def test_pressure_target_is_judged_unrounded(self):
         # L159g2: 599 s shows as 10.0 min but is under the 10 min target
@@ -248,6 +254,12 @@ class ReportTest(unittest.TestCase):
         check = {c["key"]: c for c in pilot.report("vm", rows, self.limits(),
                                                      days=1)["checks"]}["pressure_min_per_day"]
         self.assertEqual((check["value"], check["ok"]), (10.0, False))
+        # 599.9999 s rounds to 600.0 in the summary, yet meets the target
+        rows[2]["sampled_ts"] = t0 + 599.9999
+        rep = pilot.report("vm", rows, self.limits(), days=1)
+        self.assertEqual(rep["total"]["pressure_s"], 600.0)
+        check = {c["key"]: c for c in rep["checks"]}["pressure_min_per_day"]
+        self.assertEqual((check["value"], check["ok"]), (10.0, True))
 
     def test_no_reading(self):
         rep = pilot.report("vm", [], self.limits(), days=7)

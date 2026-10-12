@@ -66,8 +66,8 @@ def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
     window) seconds — `held`, its state up to the next reading; `window`,
     its averages (`guest_cpu`) over the window before it, at most the gap
     to the previous reading (the earlier time is that reading's). A window
-    longer than `MAX_GAP_S` spans a hole in the measure: it counts for
-    nothing, as the gap itself does."""
+    longer than `MAX_GAP_S` — as measured, before that cap, or else the gap
+    itself — spans a hole in the measure: it counts for nothing."""
     out = []
     for i, row in enumerate(readings):
         ts = float(row["sampled_ts"])
@@ -79,9 +79,12 @@ def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
         before = ts - float(readings[i - 1]["sampled_ts"]) if i else None
         if window is None:
             window = before if before is not None else 0.0
-        elif before is not None:
-            window = min(float(window), before)
-        if 0 < float(window) <= MAX_GAP_S:
+        window = float(window)
+        if window > MAX_GAP_S:
+            continue
+        if before is not None:
+            window = min(window, before)
+        if window > 0:
             out += [(day, row, 0.0, secs) for day, secs in _by_day(ts - window, ts)]
     return out
 
@@ -103,13 +106,18 @@ def _episode_starts(readings: list[dict], limits: dict) -> list[dict]:
     return out
 
 
+def _pressure_s(intervals, limits: dict) -> float:
+    """The seconds held by readings that block new turns, unrounded."""
+    return sum(held for _day_, row, held, _window in intervals
+               if held and resources.pressure(row, limits=limits)["blocked"])
+
+
 def _summary(readings: list[dict], intervals, episodes: int, limits: dict) -> dict:
-    pressure_s = turns_s = guest_cpu_s = measured_s = 0.0
+    turns_s = guest_cpu_s = measured_s = 0.0
+    pressure_s = _pressure_s(intervals, limits)
     for _day_, row, held, window in intervals:
         if held:
             measured_s += held
-            if resources.pressure(row, limits=limits)["blocked"]:
-                pressure_s += held
             turns_s += (row.get("turns_in_progress") or 0) * held
         guest_cpu_s += (row.get("guest_cpu") or 0.0) * window
     cpus = [r.get("cpu_count") for r in readings if r.get("cpu_count")]
@@ -178,8 +186,10 @@ def report(host: str, readings: list[dict], limits: dict, *, days: float) -> dic
                        "ok": None if value is None else ok})
 
     # the target holds for each day, not on average: the worst measured day,
-    # judged on its seconds (599 s shows 10.0 min yet meets the target)
-    worst = max((d["pressure_s"] for d in by_day if d["measured_s"] > 0), default=None)
+    # judged on its unrounded seconds (599.9 s shows 10.0 min yet meets the
+    # target)
+    worst = max((_pressure_s(daily[d["day"]]["intervals"], limits)
+                 for d in by_day if d["measured_s"] > 0), default=None)
     check("pressure_min_per_day", None if worst is None else round(worst / 60.0, 1),
           TARGET_PRESSURE_MIN_PER_DAY,
           worst is not None and worst < TARGET_PRESSURE_MIN_PER_DAY * 60.0)
