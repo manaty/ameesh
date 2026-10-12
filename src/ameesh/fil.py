@@ -781,13 +781,26 @@ class FileTransport:
             entries = [e for e in entries if int(e.id.rpartition("#")[2]) > start]
         return entries
 
+    def census(self, thread: ThreadRef) -> tuple[list[Entry], int]:
+        """Toutes les entrées du fil et sa fin logique, lues sous un même
+        verrou : une entrée ajoutée ensuite est au-delà de cette fin."""
+        try:
+            fd, _ = self._locked(thread, fcntl.LOCK_SH, write=False)
+        except FileNotFoundError:
+            return [], 0
+        with open(fd, "rb") as fh:
+            data = fh.read()
+        shift = _expiry_of(data[:HEADER_SCAN])[0]
+        return parse(data, base=shift, key=thread.key), len(data) + shift
+
     def bounds(self, thread: ThreadRef) -> tuple[int, int] | None:
         """Après une expiration : (première position logique gardée, fin
         logique du fil à l'expiration) ; None si le fil n'a jamais expiré.
 
         `index` s'en sert : une entrée d'avant la première gardée a expiré
-        avant d'être indexée. La fin n'est qu'un repère : ce qui est déjà
-        compté, seule la base le sait (`counted_until`).
+        avant d'être indexée. Ce qui est déjà compté, seule la base le sait
+        (`counted_until`) ; une base en retard sur la fin (recomptage perdu)
+        recompte depuis le fichier (`_recount_if_behind`).
         """
         try:
             fd, _ = self._locked(thread, fcntl.LOCK_SH, write=False)
@@ -1054,8 +1067,10 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
     prend aussi. Une entrée expirée entre son écriture et son indexation
     n'est ni comptée ni citée ; une entrée déjà dans le fil quand la base l'a
     recompté (`counted_until`, écrit dans la transaction du recomptage) n'est
-    pas comptée deux fois. Le fichier ne prouve pas ce recomptage : une
-    expiration sans base, ou dont le recomptage a échoué, n'a rien compté.
+    pas comptée deux fois. Le fichier ne prouve pas ce recomptage : après
+    une expiration sans base, ou dont le recomptage n'a pas été validé
+    (échec, arrêt brutal après le renommage), la base est en retard sur le
+    fichier et recompte d'abord depuis lui (`_recount_if_behind`).
     """
     host = cfg.host if transport.name == "file" else ""
     key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
@@ -1065,6 +1080,7 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
         threads = storage.of(tx).threads
         counted = threads.lock(**key)
         bounds = transport.bounds(thread) if hasattr(transport, "bounds") else None
+        counted = _recount_if_behind(threads, key, transport, thread, counted, bounds)
         offset = _offset_of(external_id)
         if bounds is not None and offset is not None and offset < bounds[0]:
             return
@@ -1073,6 +1089,22 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
             excerpt=excerpt(entry.text), ts=float(entry.ts),
             trace={"fil": {"transport": transport.name, "id": external_id, "host": host}},
             count=not (counted is not None and offset is not None and offset < counted))
+
+
+def _recount_if_behind(threads, key: dict, transport, thread: ThreadRef,
+                       counted: int | None, bounds: tuple[int, int] | None) -> int | None:
+    """Sous le verrou de la ligne : si la dernière expiration du fichier
+    (`bounds`) n'a pas de recomptage validé en base (`counted` absent ou
+    avant sa fin), l'index reprend le fichier tel qu'il est (nombre
+    d'entrées, la plus récente, fin logique). Rend le `counted_until` à jour.
+    """
+    if bounds is None or (counted is not None and counted >= bounds[1]):
+        return counted
+    entries, end = transport.census(thread)
+    latest = max(reversed(entries), key=lambda e: e.ts) if entries else None
+    threads.expired(**{k: v for k, v in key.items() if k != "location"},
+                    kept=len(entries), last=_index_row(latest), end=end)
+    return end
 
 
 def _offset_of(entry_id: str) -> int | None:
@@ -1111,11 +1143,15 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
                            transport=transport.name, host=host)
                 with db.transaction() as tx:
                     threads = storage.of(tx).threads
-                    threads.lock(**key, location=transport.location(thread))
+                    counted = threads.lock(**key, location=transport.location(thread))
                     report = run()
                     if report["dropped"]:
                         threads.expired(**key, kept=report["kept"],
                                         last=_index_row(report["last"]), end=report["end"])
+                    else:
+                        # une expiration d'avant dont le recomptage a été perdu
+                        _recount_if_behind(threads, dict(key, location=None), transport,
+                                           thread, counted, transport.bounds(thread))
         except (OSError, ThreadError) as exc:
             reports.append({"thread": thread.key, "dropped": 0,
                             "error": " ".join(str(exc).split())[:200]})

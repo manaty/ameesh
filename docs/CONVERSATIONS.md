@@ -157,7 +157,9 @@ Shared threads keep **one year** of entries by default (0033 §9):
   (`thread_index.counted_until`, migration 0395): an entry before it is
   already counted and indexing it later does not count it twice. The file is
   not proof of a recount: after an expiry without a database (`fil expire`
-  without one) or whose recount failed, later indexing counts normally.
+  without one), or whose recount did not commit (failure, crash after the
+  rename), the index is behind the file's last expiry, and the next indexing
+  or expiry of that thread first recounts it from the file as it is.
   Between two entries with the same timestamp, the later one is the most
   recent.
 * **R12 outbox**: an undelivered copy older than thread retention is

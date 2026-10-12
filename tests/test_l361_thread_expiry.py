@@ -397,6 +397,46 @@ class IndexAndOutboxTest(PgTestCase):
             fil.index(self.db, self.cfg, transport, thread, e, entry_id)
         self.assertEqual(self.index_row("failed")["entries"], 2)
 
+    def test_recount_lost_after_the_rename_is_redone_from_the_file(self):
+        """r4 P2: the old entry was indexed; the rename happened, the recount
+        did not commit. The next indexing, or the next expiry, recounts."""
+        transport = fil.transport_for(self.cfg)
+        from ameesh.storage.postgres import threads as pg_threads
+
+        def lose_recount(lot):
+            fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"], text="old",
+                       ts=NOW - 500 * DAY, project="acme", lot=lot)
+            thread = fil.ThreadRef("acme", lot)
+            fresh = [entry("fresh %d" % n, 1) for n in (1, 2)]
+            fresh = [(e, transport.post(thread, e)) for e in fresh]  # not indexed yet
+            with mock.patch.object(pg_threads.Threads, "expired",
+                                   side_effect=RuntimeError("crash before commit")):
+                fil.expire(self.cfg, self.db, now=NOW)
+            self.assertEqual(len(transport.read(thread)), 2)  # renamed
+            self.assertEqual(self.index_row(lot)["entries"], 1)  # rolled back
+            return thread, fresh
+
+        # delayed indexing recounts from the file first
+        thread, fresh = lose_recount("index")
+        for e, entry_id in fresh:
+            fil.index(self.db, self.cfg, transport, thread, e, entry_id)
+        row = self.index_row("index")
+        self.assertEqual((row["entries"], row["last_excerpt"], row["last_entry_id"]),
+                         (2, "fresh 2", fresh[1][1]))
+        # a retried expiry drops nothing but recounts; indexing then adds nothing
+        thread, fresh = lose_recount("retry")
+        report = {r["thread"]: r for r in fil.expire(self.cfg, self.db, now=NOW)}
+        self.assertEqual(report["acme/retry"]["dropped"], 0)
+        row = self.index_row("retry")
+        self.assertEqual((row["entries"], row["last_excerpt"]), (2, "fresh 2"))
+        for e, entry_id in fresh:
+            fil.index(self.db, self.cfg, transport, thread, e, entry_id)
+        self.assertEqual(self.index_row("retry")["entries"], 2)
+        # one written after the repair counts normally
+        fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"], text="next",
+                   ts=NOW, project="acme", lot="retry")
+        self.assertEqual(self.index_row("retry")["entries"], 3)
+
     def test_expiry_waits_for_an_open_r12_drain_without_deadlock(self):
         """The drain holds the index row through its transaction, then writes
         the file: expiry takes the row first, then the file (same order)."""
