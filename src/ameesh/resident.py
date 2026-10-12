@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import select
 import signal
 import subprocess
 import sys
@@ -71,6 +72,11 @@ PROBE_TIMEOUT = 5.0
 CLOSE_GRACE = 2.0
 #: largest line read from the harness (memory guard)
 MAX_LINE_CHARS = acp.MAX_MESSAGE_CHARS
+#: bytes queued for the harness's input and not yet written: past it, an
+#: input is refused (a harness that stops reading never fills our memory)
+MAX_OUTBOX_BYTES = 16 * 1024 * 1024
+#: how often a writer waiting on a full pipe checks that the harness lives
+WRITE_POLL = 0.2
 #: final text kept per turn
 FINAL_MAX_CHARS = 100_000
 
@@ -85,6 +91,10 @@ _CODEX_NOT_ACTIONS = ("userMessage", "hookPrompt", "agentMessage", "reasoning", 
 
 class ResidentError(RuntimeError):
     """The resident harness cannot do what was asked (start, protocol, dead)."""
+
+
+class InputRefused(ResidentError):
+    """The line was never queued: the outbox is full (#387)."""
 
 
 class ResidentBusy(ResidentError):
@@ -352,13 +362,38 @@ class ResidentDriver:
             turn = self._turn
             if turn is None:
                 return False
+
+        def admit():
+            # lock held, at the admission of the request itself: the state
+            # put back is the one seen there, not a snapshot that another
+            # refused interrupt may roll back in between (codex r4, #387);
+            # follow-ups queued until then are dropped here too (codex r5)
+            previous = (self._interrupting, turn.interrupted)
+            dropped = list(self._followups)
+            added = {input_id for input_id, _text in dropped} - self._unconfirmed
             # dropped follow-ups were never given to the harness: not served
             # (codex r1, #325), the caller serves them again
-            self._unconfirmed.update(input_id for input_id, _text in self._followups)
+            self._unconfirmed.update(added)
             self._followups.clear()
             self._interrupting = True
             turn.interrupted = True
-        return self._interrupt(turn)
+
+            def undo() -> None:
+                # never written: the turn goes on, or its next result would end
+                # it before the steers still unread (codex r2); called with the
+                # lock still held from the refusal, so that no result is read
+                # in between (codex r3)
+                if self._turn is turn:
+                    self._interrupting, turn.interrupted = previous
+                    self._followups[:0] = dropped
+                    self._unconfirmed.difference_update(added)
+            return undo
+
+        try:
+            return self._interrupt(turn, admit)
+        except InputRefused as exc:
+            log("interrupt: %s" % exc)
+            return False
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
         """Does the harness answer? (process alive at least)"""
@@ -474,8 +509,11 @@ class ResidentDriver:
         """Serve the input in `turn`; another turn if it serves it instead."""
         raise NotImplementedError
 
-    def _interrupt(self, turn: Turn) -> bool:
-        """Interrupt `turn`, never the turn after it."""
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
+        """Interrupt `turn`, never the turn after it. `admit()`, called under
+        the lock once the request is admitted for `turn`, marks the turn
+        interrupted; the undo it returns puts the turn back as it was if the
+        request is never written (InputRefused), before the lock is released."""
         raise NotImplementedError
 
 
@@ -500,6 +538,12 @@ class ClaudeStreamJson(ResidentDriver):
         #: input and a harness that fills its output first would block both
         #: pipes, codex r1, #325); None stops it
         self._outbox: queue.Queue = queue.Queue()
+        #: bytes in the outbox or being written (bounded, MAX_OUTBOX_BYTES)
+        self._outbox_bytes = 0
+        #: the input is closed by whichever ends last: the writer or close()
+        self._input_lock = threading.Lock()
+        self._writer_gone = False
+        self._input_released = False
         self._writer: threading.Thread | None = None
         #: ends the reader after close (EOF may never come)
         self._stop_read = threading.Event()
@@ -557,15 +601,24 @@ class ClaudeStreamJson(ResidentDriver):
         return True
 
     def _close_input_late(self, grace: float) -> None:
-        # the group is killed: a write blocked on it fails (EPIPE) and the
-        # writer ends; only then is the descriptor closed, never under it
-        writer, proc = self._writer, self._proc
-        if writer is not None:
-            writer.join(grace)
-        if writer is not None and writer.is_alive():
-            log("writer still blocked (a child that left the group holds the input): "
-                "the input is left open")
-            return
+        # the group is killed and the writer sees it at its next poll; the
+        # descriptor is closed by whichever ends last, never under the writer
+        if self._writer is not None:
+            self._writer.join(grace)
+        self._release_input(writer=False)
+
+    def _release_input(self, *, writer: bool) -> None:
+        """The writer has ended (`writer`) or close() gives the input up: the
+        second of the two closes it (a writer still running after close()
+        closes it when it ends, #387)."""
+        with self._input_lock:
+            if writer:
+                self._writer_gone = True
+            else:
+                self._input_released = True
+            if not (self._writer_gone and self._input_released):
+                return
+        proc = self._proc
         try:
             if proc is not None and proc.stdin is not None:
                 proc.stdin.close()
@@ -584,39 +637,69 @@ class ClaudeStreamJson(ResidentDriver):
     # -- writing -----------------------------------------------------------
     def _write(self, message: dict) -> None:
         """Queue a line for the writer thread (never blocks): lines reach the
-        harness in the order they were queued."""
+        harness in the order they were queued. Refused past MAX_OUTBOX_BYTES
+        not yet written (a harness that no longer reads its input, #387)."""
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None \
                 or self._dead is not None or self._closed:
             raise ResidentError("resident harness is not running")
-        self._outbox.put((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+        data = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._input_lock:
+            if self._outbox_bytes + len(data) > MAX_OUTBOX_BYTES:
+                raise InputRefused("input refused: %d bytes not yet read by the harness "
+                                    "(at most %d)" % (self._outbox_bytes, MAX_OUTBOX_BYTES))
+            self._outbox_bytes += len(data)
+        self._outbox.put(data)
 
     def _write_loop(self) -> None:
         """Writes the queued lines on the harness's input, by its descriptor:
         no Python buffer lock, so that closing the input never waits for a
-        blocked write."""
+        blocked write. The descriptor is non-blocking: a full pipe is waited
+        on by `poll`, and the writer wakes up when the harness dies, even if
+        a child that left the group still holds the input (#387)."""
         proc = self._proc
         assert proc is not None and proc.stdin is not None
-        fd = proc.stdin.fileno()
-        while True:
-            data = self._outbox.get()
-            if data is None or self._closed:
-                return
-            try:
-                view = memoryview(data)
-                while view and not self._closed:
-                    view = view[os.write(fd, view):]
-            except (OSError, ValueError) as exc:
-                self._died("cannot write to the harness: %s" % exc)
-                return
+        try:
+            fd = proc.stdin.fileno()
+            os.set_blocking(fd, False)
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            while True:
+                data = self._outbox.get()
+                if data is None or self._closed:
+                    return
+                try:
+                    view = memoryview(data)
+                    while view and not self._closed:
+                        if proc.poll() is not None:
+                            self._died("resident harness exited (code %s) before reading "
+                                       "its input" % proc.returncode)
+                            return
+                        if not poller.poll(WRITE_POLL * 1000):
+                            continue
+                        try:
+                            view = view[os.write(fd, view):]
+                        except BlockingIOError:
+                            continue
+                except (OSError, ValueError) as exc:
+                    self._died("cannot write to the harness: %s" % exc)
+                    return
+                finally:
+                    with self._input_lock:
+                        self._outbox_bytes -= len(data)
+        finally:
+            self._release_input(writer=True)
 
     def _control(self, request: dict, timeout: float, *,
-                 turn: Turn | None = None) -> dict | None:
+                 turn: Turn | None = None, admit=None) -> dict | None:
         """Send a control request and wait for its answer; with `turn`, only
-        if it is still the running turn (None otherwise)."""
+        if it is still the running turn (None otherwise). `admit` is called
+        under the lock before the request is written; the undo it returns is
+        called, still under the lock, if it is never written (InputRefused)."""
         with self._lock:
             if turn is not None and self._turn is not turn:
                 return None
+            refused = admit() if admit is not None else None
             self._control_seq += 1
             request_id = "ameesh-%d" % self._control_seq
             slot = {"event": threading.Event(), "response": None}
@@ -624,8 +707,10 @@ class ClaudeStreamJson(ResidentDriver):
             try:
                 self._write({"type": "control_request", "request_id": request_id,
                              "request": request})
-            except ResidentError:
+            except ResidentError as exc:
                 self._controls.pop(request_id, None)
+                if refused is not None and isinstance(exc, InputRefused):
+                    refused()
                 raise
         try:
             deadline = time.monotonic() + timeout
@@ -649,9 +734,18 @@ class ClaudeStreamJson(ResidentDriver):
         with self._lock:
             self._unread.add(wire)
             self._wire_inputs[wire] = input_id
-        self._write({"type": "user", "uuid": wire, "session_id": self.session_id or "",
-                     "parent_tool_use_id": None,
-                     "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+        try:
+            self._write({"type": "user", "uuid": wire, "session_id": self.session_id or "",
+                         "parent_tool_use_id": None,
+                         "message": {"role": "user",
+                                     "content": [{"type": "text", "text": text}]}})
+        except BaseException:
+            # refused (outbox full, harness gone): never awaited as unread, or
+            # the turn would wait for it forever (codex r1, #387)
+            with self._lock:
+                self._unread.discard(wire)
+                self._wire_inputs.pop(wire, None)
+            raise
 
     # -- turn --------------------------------------------------------------
     def _begin(self, text: str, input_id: str) -> None:
@@ -665,10 +759,12 @@ class ClaudeStreamJson(ResidentDriver):
         # once by the writer: the harness reads it at the next safe point
         self._user(text, new_id(), input_id)
 
-    def _interrupt(self, turn: Turn) -> bool:
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
         try:
             return self._control({"subtype": "interrupt"}, CONTROL_TIMEOUT,
-                                 turn=turn) is not None
+                                 turn=turn, admit=admit) is not None
+        except InputRefused:
+            raise  # never written: `interrupt` puts the turn back as it was
         except ResidentError as exc:
             log("interrupt: %s" % exc)
             return False
@@ -947,8 +1043,13 @@ class CodexAppServer(ResidentDriver):
         # the turn ended without it (left out of its inputs): a new turn
         return self.send(text, input_id)
 
-    def _interrupt(self, turn: Turn) -> bool:
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
         assert self.peer is not None
+        with self._lock:
+            if self._turn is not turn:
+                return False
+            if admit is not None:
+                admit()  # nothing to refuse here: never undone
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
             with self._lock:
@@ -1283,10 +1384,12 @@ class AcpResident(ResidentDriver):
         self._followups.append((input_id, text))
         self._cancel()
 
-    def _interrupt(self, turn: Turn) -> bool:
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
         with self._lock:
             if self._turn is not turn:
                 return False  # ended meanwhile: the next turn is not touched
+            if admit is not None:
+                admit()
             return self._cancel()
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
