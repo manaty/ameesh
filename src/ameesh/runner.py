@@ -340,6 +340,8 @@ class AgentWorker(threading.Thread):
         self.fast_failure = False
         self.fast_failures = 0
         self.last_activity = time.monotonic()
+        #: #408 : dernière lecture des lots actionnables (règle 1)
+        self._lot_wake_checked = float("-inf")
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
@@ -452,7 +454,8 @@ class AgentWorker(threading.Thread):
         self._reprise = Reprise(getattr(runner, "db_retry_max", 60.0))
         self._consigne_a_restaurer = False
         self._base_marquee = False
-        self._session_en_attente: tuple[str, str | None] | None = None
+        #: (session, compte, harnais, dossier de son ouverture)
+        self._session_en_attente: tuple[str, str | None, str | None, str | None] | None = None
         #: hôte non prêt (L106) : binaire ou interpréteur du harnais
         #: introuvable — une erreur de l'HÔTE, jamais comptée comme un échec
         #: rapide de l'agent (L48). Blocage hérité d'un exécuteur précédent
@@ -1492,6 +1495,11 @@ class AgentWorker(threading.Thread):
             return None
         if len(assignes) == 1:
             return str(assignes[0]["id"])
+        # #408 : les lots en relecture ou en attente d'un humain ne comptent
+        # pas ; l'unique lot sur lequel l'agent peut avancer est celui du tour
+        actifs = [a for a in assignes if a.get("state") in ("intake", "build")]
+        if len(actifs) == 1:
+            return str(actifs[0]["id"])
         return None
 
     def _note_delegate_turn(self, spec: dict) -> None:
@@ -1531,28 +1539,28 @@ class AgentWorker(threading.Thread):
                       % (self.name, ", ".join("#%d" % i for i in debuts)))
 
     def lot_rotation_due(self, lot: str | None) -> bool:
-        """Rotation au changement de lot due ? (politique `par-lot`)
+        """Changement de session au changement de lot dû ? (politique `par-lot`)
 
         Seulement si le lot du tour est connu, que la session courante a un
-        lot noté et qu'il diffère, et qu'il y a bien une session à tourner.
-        Jamais pendant un tour.
+        lot noté et qu'il diffère. Jamais pendant un tour. #408 : même sans
+        session courante, celle mise de côté pour le lot du tour est reprise.
         """
         if not lot or self.proc is not None or self.session_policy() != "par-lot":
             return False
         courant = (self.agent or {}).get("session_work_item")
-        if not courant or str(courant) == str(lot):
-            return False
-        return bool(self.current_session())
+        return bool(courant) and str(courant) != str(lot)
 
     def rotate_for_lot(self, spec: dict | None) -> dict | None:
-        """Avant un tour : ouvre une session neuve si le lot change (0025).
+        """Avant un tour : passe à la session du lot du tour s'il change
+        (0025 ; #408, une session par lot).
 
-        Mécanisme L11 (résumé dans l'ancienne session, puis oubli fencé par le
-        bail) : la session neuve s'ouvre sur le résumé de reprise. Une
-        consigne déjà prise par `pick()` est remise en attente le temps du
-        tour de résumé, puis reprise. Si le résumé échoue, le tour part dans
-        l'ancienne session et le nouveau lot y est noté : pas de nouvelle
-        tentative à chaque tour (l'alerte « session trop grosse » veille).
+        La session courante est mise de côté pour son lot, sans résumé ni
+        oubli : un retour sur ce lot (relecture, décision, déblocage) la
+        reprendra avec `--resume`. Celle du lot du tour est reprise si elle a
+        été ouverte sous le même harnais, le même compte et le même dossier ;
+        sinon une session neuve s'ouvre sur le brief déterministe (L39) du
+        lot. Bail perdu ou base injoignable : le tour part dans la session
+        courante, le nouveau lot y est noté (pas de nouvel essai à chaque tour).
         """
         if not spec:
             return spec
@@ -1560,16 +1568,97 @@ class AgentWorker(threading.Thread):
         if not self.lot_rotation_due(lot):
             return spec
         courant = (self.agent or {}).get("session_work_item")
-        if spec.get("kind") == "prompt":
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-        ok = self._rotate("lot change %s → %s" % (courant, lot))
-        if not ok:
-            if storage.of(self.db).operations.set_session_work_item(
-                    self.name, self.runner.runner_id, self.epoch, str(lot)):
-                self.agent["session_work_item"] = str(lot)
-        if spec.get("kind") == "prompt":
-            return self.pick()
+        if not self._switch_lot(str(courant), str(lot)):
+            try:
+                if storage.of(self.db).operations.set_session_work_item(
+                        self.name, self.runner.runner_id, self.epoch, str(lot)):
+                    self.agent["session_work_item"] = str(lot)
+            except db_mod.DbError as exc:
+                log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
         return spec
+
+    def _switch_lot(self, courant: str, lot: str) -> bool:
+        """#408 : met de côté la session du lot `courant`, rend active celle
+        du lot `lot` (ou aucune : session neuve sur le brief du lot)."""
+        compte = account_turn.for_turn(self)
+        nom = None if compte is None or compte is account_turn.INVALID else compte.name
+        session = self.current_session()
+        # le harnais que le tour lancera (L242b : celui qu'un agent critique
+        # emprunte), pas celui de la fiche : une session n'est reprise que
+        # sous le harnais qui l'a ouverte
+        harnais = self.turn_harness()
+        try:
+            out = storage.of(self.db).lot_sessions.switch(
+                self.name, self.runner.runner_id, self.epoch, to_lot=lot,
+                harness=harnais, account=nom, cwd=self.agent.get("cwd"),
+                current=session)
+        except db_mod.DbError as exc:
+            log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
+            return False
+        if out is None:
+            log_async("[%s] session switch to lot %s cancelled: lease lost" % (self.name, lot))
+            return False
+        repris = out.get("resumed")
+        # L242b (3) : le marqueur local du harnais de la session suit la
+        # session active (celui de la session reprise ; aucun sans session,
+        # le tour qui l'ouvrira le note)
+        self._state_note("session_harness", harnais if repris else "")
+        if repris:
+            self.write_session_file(repris)
+            self.resume_summary = None
+        else:
+            try:
+                os.unlink(self._path("session"))  # sinon `current_session` le relirait
+            except OSError:
+                pass
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self.last_turn_reread = 0
+        self.last_turn_reread_session = None
+        self.last_turn_context = self.last_turn_context_session = None
+        if not repris:
+            self.resume_summary = self._lot_brief(lot, courant, out)
+            self.resume_origin = "ameesh"
+        log_async("[%s] session of lot %s %s, lot %s: %s"
+                  % (self.name, courant, "put aside" if out.get("parked") else "none",
+                     lot, "resumed (%s)" % repris if repris else "new session"))
+        self._fil_note(
+            "Lot change %s → %s: %s; %s.%s" % (
+                courant, lot,
+                "session %s put aside for lot %s" % (out["parked"], courant)
+                if out.get("parked") else "no session to put aside",
+                "session %s of lot %s resumed" % (repris, lot) if repris
+                else "new session for lot %s, opened on the resume brief" % lot,
+                " Session %s of lot %s not resumed (%s)." % (
+                    out["discarded"], lot,
+                    "lot finished or no longer assigned to the agent"
+                    if out.get("discard_reason") == "lot"
+                    else "other harness, account or directory, or unknown origin")
+                if out.get("discarded") else ""),
+            meta={"action": "session-lot", "de": courant, "vers": lot,
+                  "session": out.get("parked") or "", "reprise": repris or ""})
+        return True
+
+    def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
+        """Le brief déterministe (L39) d'une session neuve dédiée au lot `lot`."""
+        try:
+            from . import reprise, work as work_mod
+            item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
+            branche = (item or {}).get("branch")
+            return reprise.deterministic_brief(
+                self.cfg, self.db, self.agent, session=None,
+                reason="new session dedicated to lot #%s" % lot,
+                consigne="This session is dedicated to lot #%s%s. Your other lots keep "
+                         "their own sessions (the one of lot #%s is put aside and will "
+                         "be resumed when feedback arrives on it): work only on lot #%s "
+                         "here, in its own worktree and branch. This turn's instruction "
+                         "follows this brief." % (
+                             lot, " (branch %s)" % branche if branche else "",
+                             courant, lot))
+        except Exception as exc:  # un brief manquant n'empêche pas la bascule
+            log_async("[%s] lot brief unavailable (%s)" % (self.name, exc))
+            return None
 
     # -- dossier de travail déplacé (0018) ---------------------------------
     #: profondeur maximale de recherche d'un dossier de travail déplacé :
@@ -1742,8 +1831,8 @@ class AgentWorker(threading.Thread):
         """Session ouverte par le harnais pendant une panne : enregistrée au
         registre dès que possible (sinon le tour suivant reprendrait l'ancienne,
         `current_session` préférant le registre au fichier local)."""
-        session, compte = self._session_en_attente
-        registry.set_session(self.db, self.name, session, compte)
+        session, compte, harnais, dossier = self._session_en_attente
+        registry.set_session(self.db, self.name, session, compte, harness=harnais, cwd=dossier)
         self._session_en_attente = None
         if self.agent is not None:
             self.agent["session_id"] = session
@@ -2568,12 +2657,16 @@ class AgentWorker(threading.Thread):
         The separate L232b controller prepares hosts and drains at a lot
         boundary. Only a persisted claim fence stops this source worker.
         """
-        if not getattr(self.runner, "relocate", False) or getattr(self.runner, "mediated", False):
+        if getattr(self.runner, "mediated", False):
             # Device relocation is controlled by the mesh server (L109).
             return False
-        from . import handoffs, storage, work
+        from . import handoffs, host_lifecycle, storage, work
         try:
-            active = storage.of(self.db).handoffs.active(self.name)
+            api = storage.of(self.db)
+            demand = api.host_lifecycle.demand(self.name, self.agent["host"])
+            if not getattr(self.runner, "relocate", False) and demand is None:
+                return False
+            active = api.handoffs.active(self.name)
             if active:
                 if active["fenced"]:
                     self.stopping.set()
@@ -2581,9 +2674,20 @@ class AgentWorker(threading.Thread):
                     return True
                 return False
             queued = bool(self.agent.get("pending_prompt") or work.open_lots(self.db, self.name))
+            missing = []
+            def ready(agent, target):
+                result = host_lifecycle.readiness(
+                    self.db, agent, target, adapter=getattr(self.runner, "_lifecycle_adapter", None),
+                    requirements_for=getattr(self.runner, "_lifecycle_requirements", None))
+                missing.extend(result["missing"])
+                return result
             candidate = handoffs.plan(self.db, self.agent,
-                                      limits_for=self.runner.handoff_limits_for, queued=queued)
+                                      limits_for=self.runner.handoff_limits_for, queued=queued,
+                                      demand=demand, readiness_for=ready if demand else None)
             if candidate is None:
+                if demand:
+                    api.host_lifecycle.progress(demand["host"], demand["generation"], self.name,
+                                                operation=None, missing=sorted(set(missing)) or ["fresh_admitted_capacity"])
                 return False
             remote = subprocess.run(["git", "-C", self.agent.get("cwd") or "", "remote", "get-url", "origin"],
                                     check=True, text=True, capture_output=True, timeout=10).stdout.strip()
@@ -2724,8 +2828,15 @@ class AgentWorker(threading.Thread):
         d'échec rapide. Sain de nouveau : blocage levé, le tour part."""
         # Provider credentials and their health belong to the relay server.
         # The device has no account health authority or credential to inspect.
-        if self.runner.mediated or self.runner.dry_run:
+        if self.runner.dry_run:
             return True
+        if self.runner.mediated:
+            from . import relay
+            harness = self.turn_harness()
+            if self._relay_credential_ready():
+                return self._auth_release()
+            self._auth_block(harness, relay.CREDENTIAL_ACCOUNT, "relay server credential failing")
+            return False
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
             return True  # `account_turn.apply` refusera le tour, avec sa raison
@@ -2811,13 +2922,47 @@ class AgentWorker(threading.Thread):
                        "the agent resumes." % texte, meta={"action": "auth_reprise"})
         return True
 
+    def _relay_credential_ready(self) -> bool:
+        from . import relay
+        harness = self.turn_harness()
+        if harness not in relay.HARNESS_ENV:
+            return True
+        base = relay.relay_url({"AMEESH_RELAY_URL": os.environ.get("AMEESH_RELAY_URL", ""),
+                                "AMEESH_EXEC_URL": self.db.url or self.cfg.exec_url})
+        token = self.runner.session_token_for(self.name, self.runner.runner_id, self.epoch)
+        return relay.credential_ready(base, token, harness)
+
+    def _end_relay_auth_failure(self, cost) -> bool:
+        """Server-authenticated relay failure: retain the prompt, no fast retry.
+
+        The caller has already restored the prompt. A device never writes
+        credential health; it only uses the relay's verdict to mark its agent.
+        """
+        if not self.runner.mediated or self._avec_reprise(
+                "relay credential status", self._relay_credential_ready):
+            return False
+        from . import relay
+        self._auth_block(self.turn_harness(), relay.CREDENTIAL_ACCOUNT, "relay server credential failing")
+        self.fast_failure = False
+        if self._session_en_attente is not None:
+            self._avec_reprise("turn session", self._enregistre_session)
+        self._avec_reprise(
+            "end of turn", registry.end_turn,
+            self.db, self.name, self.runner.runner_id, self.epoch,
+            status="blocked", status_text=self._auth_status,
+            error="%s relay server credential failing" % auth_failure.STATUS_PREFIX,
+            cost_usd=cost)
+        self.last_activity = time.monotonic()
+        return True
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
         spec = self._pick()
         if spec is not None:
-            spec["lot"] = self.turn_lot(spec)
+            # #408 : le réveil sur un lot actionnable porte déjà son lot
+            spec["lot"] = spec.get("lot") or self.turn_lot(spec)
         return spec
 
     def _pick(self) -> dict | None:
@@ -2919,8 +3064,85 @@ class AgentWorker(threading.Thread):
             # l'exécuteur reprend la MÊME session (registre), une fois.
             self._reprise_attach = False
             return {"kind": "idle", "prompt": adapters.ATTACH_RESUME_PROMPT, "ids": []}
+        if all(mail.passive_reason(m) for m in messages):
+            # #408 : un courrier qui réveillera l'agent passe avant (fenêtre L125)
+            reveil = self._lot_wake_spec()
+            if reveil is not None:
+                return reveil
         if self.idle_due():
             return {"kind": "idle", "prompt": adapters.IDLE_PROMPT, "ids": []}
+        return None
+
+    #: #408 : intervalle minimal entre deux lectures des lots actionnables
+    LOT_WAKE_CHECK_S = 30.0
+
+    def lot_wake_enabled(self) -> bool:
+        """Règle 1 (#408) : réglage de l'agent (`ameesh set lot_wake=on|off`),
+        sinon celui de l'hôte (`AMEESH_LOT_WAKE`, actif par défaut)."""
+        reglage = ((self.agent or {}).get("lot_wake") or "").strip()
+        if reglage:
+            return reglage == "on"
+        return bool(getattr(self.cfg, "lot_wake", True))
+
+    def lot_wake_allowed(self, row: dict, now: float, base: float) -> bool:
+        """Un réveil sur ce lot est-il dû ? Le premier, oui. Si le lot a vécu
+        depuis le dernier réveil (lot, journal, branche, courrier), le compte
+        repart : un nouveau réveil après `base`. Sinon le réveil précédent
+        est resté sans effet : au plus `lot_wake_max` réveils, espacés d'un
+        délai doublé à chaque fois (plafonné à `idle_nudge`). Tout vit en
+        base : un redémarrage de l'exécuteur ne relance rien."""
+        wakes = int(row.get("wakes") or 0)
+        derniere = row.get("last_wake_ts")
+        if not wakes or derniere is None:
+            return True
+        vecu = row.get("activity_ts") is not None and (
+            row.get("wake_activity_ts") is None
+            or float(row["activity_ts"]) > float(row["wake_activity_ts"]) + 0.001)
+        ecoule = now - float(derniere)
+        if vecu:
+            return ecoule >= base
+        if wakes >= int(getattr(self.cfg, "lot_wake_max", 3)):
+            return False
+        plafond = max(base, float(self.runner.idle_nudge))
+        return ecoule >= min(base * (2 ** wakes), plafond)
+
+    def _lot_wake_spec(self) -> dict | None:
+        """Règle 1 (#408) : l'agent au repos depuis plus de `mail_batch` +
+        `lot_wake_margin` qui détient un lot `intake`/`build` (ni tenu, ni en
+        attente d'une décision ou d'un autre lot) est réveillé avec la
+        consigne de le reprendre, le plus prioritaire puis le plus ancien
+        d'abord ; le tour part dans la session de ce lot. Les gardes de
+        `_pick` (arrêt, budget, porte et pression d'hôte, authentification)
+        sont déjà passées."""
+        if not self.lot_wake_enabled():
+            return None
+        base = self.mail_batch() + float(getattr(self.cfg, "lot_wake_margin", 60.0))
+        repos = time.monotonic() - self.last_activity
+        dernier_tour = (self.agent or {}).get("last_turn_ts")
+        if dernier_tour:
+            repos = min(repos, time.time() - float(dernier_tour))
+        if repos < base:
+            return None
+        if time.monotonic() - self._lot_wake_checked < self.LOT_WAKE_CHECK_S:
+            return None
+        self._lot_wake_checked = time.monotonic()
+        import datetime as _dt
+        st = storage.of(self.db).lot_sessions
+        now = time.time()
+        try:
+            lots = st.actionable(self.name, today=_dt.date.today().isoformat())
+            for row in lots:
+                if not self.lot_wake_allowed(row, now, base):
+                    continue
+                note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
+                log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
+                          % (self.name, row["id"], row["state"], note.get("wakes")))
+                return {"kind": "idle", "ids": [], "lot": str(row["id"]),
+                        "prompt": adapters.LOT_WAKE_PROMPT % {
+                            "id": int(row["id"]), "title": row.get("title") or "",
+                            "state": row["state"]}}
+        except db_mod.DbError as exc:
+            log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
         return None
 
     def _mail_spec(self, messages: list[dict]) -> dict | None:
@@ -3578,6 +3800,8 @@ class AgentWorker(threading.Thread):
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
         empreinte = sentinel.launch_fingerprint(harness, compte, env)
+        #: #408 : le harnais du lancement, origine d'une session qu'il ouvre
+        harnais_lance = harness
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
@@ -3667,17 +3891,25 @@ class AgentWorker(threading.Thread):
                         self._state_note("session_harness", harness)
                         # L39 (0030) : le compte d'origine de la session, en
                         # registre avec son id (le marqueur du flux reste la
-                        # source des relevés du tour)
+                        # source des relevés du tour) ; #408 : et le harnais
+                        # et le dossier de son ouverture, ceux du lancement,
+                        # seulement si le tour l'OUVRE (une session reprise
+                        # garde l'origine de son ouverture)
+                        ouverte = session_new != session
+                        origine = (harnais_lance if ouverte else None,
+                                   cwd if ouverte else None)
                         try:
                             registry.set_session(
                                 self.db, self.name, session_new,
-                                compte.name if compte is not None else None)
+                                compte.name if compte is not None else None,
+                                harness=origine[0], cwd=origine[1])
                         except db_mod.DbError as exc:
                             # L72 : une panne de base ne tue pas le tour (le
                             # bail, lui, est défendu par le battement) ;
                             # l'enregistrement est rejoué après le tour.
                             self._session_en_attente = (
-                                session_new, compte.name if compte is not None else None)
+                                session_new, compte.name if compte is not None else None,
+                                *origine)
                             log_async("[%s] session %s not recorded (%s): replayed "
                                       "after the turn" % (self.name, session_new,
                                                          db_mod.explain(exc)))
@@ -3925,8 +4157,9 @@ class AgentWorker(threading.Thread):
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
-            # A relay failure cannot report global provider credential health
-            # or create a local credential block on a mediated device.
+            if self._end_relay_auth_failure(cost):
+                return False
+            # Only the server may report provider credential health.
             raison_auth = None if self.runner.mediated else auth_failure.classify(
                 error, self.last_final, auth_failure.stderr_tail(stderr_path, start=stderr_debut))
             if raison_auth:
@@ -4373,6 +4606,10 @@ class Runner:
         #: compris : `launch_lock`)
         from . import background as background_mod
         self.background = background_mod.Tracker(self, log=log_async)
+        #: #453 : une suite de tests lancée hors `ameesh heavy` a le plafond
+        #: de durée d'une commande lourde
+        from . import suite_cap
+        self.suite_cap = suite_cap.SuiteCap(self, log=log_async)
         self.launch_lock = threading.Lock()
         self.harness_pids: set[int] = set()
         self.turns = 0
@@ -5304,8 +5541,10 @@ class Runner:
         try:
             db = db_mod.connect(self.cfg)
             gate = self.host_gate
-            return resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
-                                         gate=gate.snapshot() if gate is not None else None)
+            reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
+                                            gate=gate.snapshot() if gate is not None else None)
+            Runner.host_lifecycle_once(self, db)
+            return reading
         except Exception as exc:  # jamais fatal pour l'exécuteur
             log_async("resources: reading failed (%s)" % type(exc).__name__)
             return None
@@ -5315,6 +5554,24 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def host_lifecycle_once(self, db) -> None:
+        """Drive durable requests with the enrolled helper, or record its named gap."""
+        from . import handoffs, host_lifecycle
+        try:
+            api = storage.of(db).host_lifecycle
+            api.detect_losses(actor=self.runner_id,
+                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+                              critical=host_lifecycle.critical_names(self.cfg, db))
+            api.expire_returns()
+            for control in api.listing():
+                if control["mode"] in ("draining", "returning", "lost"):
+                    host_lifecycle.advance_host(
+                        db, control["host"], limits_for=self.handoff_limits_for,
+                        adapter=getattr(self, "_lifecycle_adapter", None),
+                        requirements_for=getattr(self, "_lifecycle_requirements", None))
+        except (db_mod.DbError, handoffs.HandoffError, ValueError):
+            log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
     def start_resource_poll(self) -> None:
         """Relevé périodique des ressources (`AMEESH_RESOURCE_INTERVAL`,
@@ -5452,6 +5709,21 @@ class Runner:
                 except Exception:
                     pass
 
+    def lot_sessions_purge(self, db) -> list[dict]:
+        """#408 : les sessions mises de côté (et les réveils) des lots
+        fusionnés, livrés, fermés ou réassignés sont oubliées ; les
+        transcripts du harnais restent au ménage. Ne lève jamais."""
+        try:
+            purges = storage.of(db).lot_sessions.purge()
+        except db_mod.DbError as exc:
+            log_async("lot sessions not purged (%s)" % exc)
+            return []
+        for row in purges:
+            if row.get("session_id"):
+                log_async("[%s] session %s of lot #%s forgotten (lot finished or reassigned)"
+                          % (row["agent"], row["session_id"], row["work_item_id"]))
+        return purges
+
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
@@ -5471,6 +5743,7 @@ class Runner:
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
             if not self.dry_run:
                 self.measure_once(db)
+                self.lot_sessions_purge(db)
             self.radar_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
@@ -5724,6 +5997,22 @@ class Runner:
         return dict(verdict)
 
     # -- pression : orchestrateurs et épisodes ------------------------------
+    #: #453 : période du fil `plafond` (secondes ; le plafond lui-même n'est
+    #: relu que toutes les `suite_cap.CAP_EVERY_S`, hors arrêt en cours)
+    SUITE_CAP_TICK_S = 5.0
+
+    def start_suite_cap(self) -> None:
+        """#453 : le fil `plafond` arrête les suites de tests lancées hors
+        `ameesh heavy` au-delà du plafond d'une commande lourde (`suite_cap`)."""
+        def boucle() -> None:
+            while not self.stop.wait(self.SUITE_CAP_TICK_S):
+                try:
+                    self.suite_cap.tick()
+                except Exception as exc:  # jamais fatal à l'exécuteur
+                    log_async("test suite cap failed (%s)" % type(exc).__name__)
+
+        threading.Thread(target=boucle, daemon=True, name="plafond").start()
+
     def is_orchestrator(self, name: str) -> bool:
         """`name` est-il un orchestrateur ? Rôle au canon (`roles:
         [orchestrateur]` de sa fiche Agent) ou `AMEESH_ALERT_ORCHESTRATORS`."""
@@ -6238,6 +6527,7 @@ class Runner:
         # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
         # orphelins de ses tours (codes de sortie), et les suit.
         self.background.start_monitor(self.stop)
+        self.start_suite_cap()
         if not self.background.subreaper:
             log_async("background work of turns: no subreaper on this OS, "
                       "exit codes unknown")

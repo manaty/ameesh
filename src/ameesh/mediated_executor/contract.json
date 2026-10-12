@@ -286,6 +286,30 @@
      },
      "required": false,
      "default": null
+    },
+    {
+     "name": "harness",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "cwd",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -3676,7 +3700,7 @@
   }
  ],
  "refused": {
-  "interface_total": 360,
+  "interface_total": 378,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3713,7 +3737,9 @@
    "wakeups": "hors du sous-ensemble de l'exécuteur médié",
    "work": "hors du sous-ensemble de l'exécuteur médié",
    "watches": "CI watches: mesh server only",
-   "handoffs": "host handoff controller: mesh server only"
+   "handoffs": "host handoff controller: mesh server only",
+   "lot_sessions": "sessions put aside per lot and lot wakes (#408): runner of the mesh server only",
+   "host_lifecycle": "host withdrawal and loss recovery: mesh server only"
   },
   "operations": {
    "accounts": [
@@ -4071,6 +4097,7 @@
    "handoffs": [
     "active",
     "begin_effect",
+    "cancellation_guard",
     "controller",
     "cooling",
     "drain",
@@ -4080,11 +4107,32 @@
     "hold",
     "occupancy",
     "prepare_reconcile",
+    "promote_loss",
+    "recover_source",
     "renew",
     "reserve",
     "switch",
     "transition",
     "unfence"
+   ],
+   "lot_sessions": [
+    "actionable",
+    "listing",
+    "note_wake",
+    "purge",
+    "switch"
+   ],
+   "host_lifecycle": [
+    "agents",
+    "complete_return",
+    "demand",
+    "detect_losses",
+    "drain",
+    "expire_returns",
+    "get",
+    "listing",
+    "progress",
+    "undrain"
    ]
   }
  },

@@ -82,7 +82,8 @@ def _capacity(reading, limits):
     return max(0, (memory or 0)-limits["min_mem_available"]), max(0, (disk or 0)-limits["min_disk_free"])
 
 
-def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, disk_bytes=2*GIB):
+def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, disk_bytes=2*GIB,
+         demand=None, readiness_for=None):
     """Fresh admitted targets; sustained pressure or materially better spare capacity.
 
     limits_for returns the effective physical limits (strictest across canons),
@@ -92,22 +93,28 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
     if agent.get("status") in ("stopped", "paused") or agent.get("mode") != "execute":
         return None
     api = storage.of(db)
-    if api.handoffs.active(agent["name"]) or api.handoffs.cooling(agent["name"], COOLDOWN):
+    forced = demand is not None
+    if forced and demand.get("reason") not in ("host_drain", "host_return", "host_loss"):
+        raise HandoffError("invalid host lifecycle request")
+    if api.handoffs.active(agent["name"]) or (not forced and api.handoffs.cooling(agent["name"], COOLDOWN)):
         return None
     history = api.hosts.history(agent["host"], SAMPLES)
-    if not _readings_ready(history, now):
+    loss = forced and demand["reason"] == "host_loss"
+    if loss and (not history or now-history[-1]["sampled_ts"] < demand["loss_after"]):
+        return None
+    if not loss and not _readings_ready(history, now):
         return None
     limits = limits_for(agent["host"])
-    if not limits:
+    if not loss and not limits:
         return None
-    current_pressure = all(resources.pressure(r, limits=limits)["blocked"] for r in history)
-    cap = limits.get("max_agents")
+    current_pressure = not loss and all(resources.pressure(r, limits=limits)["blocked"] for r in history)
+    cap = (limits or {}).get("max_agents")
     if isinstance(cap,int) and cap > 0 and api.handoffs.occupancy(agent["host"]) >= cap:
         current_pressure = True
-    current_mem, _ = _capacity(history[-1], limits)
+    current_mem = 0 if loss else _capacity(history[-1], limits)[0]
     found = []
     for target in agent.get("admitted_hosts") or []:
-        if target == agent["host"]:
+        if target == agent["host"] or (forced and demand.get("target") and target != demand["target"]):
             continue
         rows = api.hosts.history(target, SAMPLES)
         target_limits = limits_for(target)
@@ -126,7 +133,9 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
         memory, disk = _capacity(rows[-1], target_limits)
         if memory < memory_bytes or disk < disk_bytes:
             continue
-        if not current_pressure and (not queued or memory < current_mem+memory_bytes):
+        if not forced and not current_pressure and (not queued or memory < current_mem+memory_bytes):
+            continue
+        if forced and (readiness_for is None or not readiness_for(agent, target).get("ready")):
             continue
         found.append({"agent": agent["name"], "source": agent["host"], "target": target,
                       "owner": agent.get("lease_owner"), "epoch": agent.get("lease_epoch"),
@@ -136,7 +145,10 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "max_agents": target_limits["max_agents"],
                       "requires_gate": target_limits.get("lend") is not None,
                       "sampled_ts": rows[-1]["sampled_ts"], "harness": agent["harness"],
-                      "reason": "source_pressure" if current_pressure else "spare_capacity",
+                      "reason": demand["reason"] if forced else ("source_pressure" if current_pressure else "spare_capacity"),
+                      **({"lifecycle_host": demand["host"], "lifecycle_generation": demand["generation"]}
+                         if forced else {}),
+                      **({"loss_after": demand["loss_after"]} if loss else {}),
                       "source_cwd": agent.get("cwd") or "",
                       "checkpoint_lot": agent.get("session_work_item"),
                       "project": projects.agent_project(agent) or ""})
@@ -146,7 +158,8 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
 def request(db, candidate, *, repository, ttl=900, now=None):
     """Reserve an admitted target; repository is an enrolled identity, never a directory label."""
     now = time.time() if now is None else now
-    if not candidate or not _fresh(candidate, now) or not repository or not candidate.get("owner"):
+    if (not candidate or not _fresh(candidate, now) or not repository
+            or (not candidate.get("owner") and candidate.get("reason") != "host_loss")):
         raise HandoffError("fresh plan, source lease and enrolled repository required")
     if not 30 <= ttl <= 7200:
         raise HandoffError("reservation TTL outside 30..7200 seconds")
@@ -195,6 +208,16 @@ def _proof(step, result, op):
     plan, evidence = op["plan"], op["evidence"]
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HandoffError("host step not ready: "+step)
+    if step == "recover_source":
+        if (result.get("source") != op["source"] or result.get("agent") != op["agent"]
+                or isinstance(result.get("lease_epoch"), bool) or isinstance(result.get("generation"), bool)
+                or result.get("lease_epoch") != plan["epoch"]
+                or result.get("generation") != plan["lifecycle_generation"]
+                or result.get("source_fenced") is not True or result.get("quiesced") is not True
+                or result.get("unpublished_work") is not False):
+            raise HandoffError("source loss requires scoped durable fencing and quiescence")
+        published = _proof("publish", result, op)
+        return dict(published, source_recovered=True)
     if step in ("prepare", "admit"):
         if (result.get("canon_revision") != plan["canon_revision"]
                 or not all(result.get(k) is True for k in ("credentials_ready", "caps_ready", "tooling_ready"))):
@@ -327,7 +350,7 @@ def _serialized(function):
     return step
 
 
-def _effect(api, adapter, step, op, *, enable_slot=None):
+def _effect(api, adapter, step, op, *, enable_slot=None, completion_api=None):
     if step not in ("revalidate", "restore_source"):
         # The domain API is bound to the same controller DB; host readings
         # come through storage, not through an adapter's cached admission.
@@ -359,7 +382,7 @@ def _effect(api, adapter, step, op, *, enable_slot=None):
         result = _adapter_call(adapter, step, intent)
     # An exception or lock loss leaves the durable intent in place: nobody
     # can overtake an external effect whose completion is unknown.
-    api.finish_effect(op["id"], intent["controller_epoch"])
+    (completion_api or api).finish_effect(op["id"], intent["controller_epoch"])
     return result
 
 
@@ -388,6 +411,12 @@ def advance(db, operation, adapter, *, enable_slot=None):
         if _effect(api, adapter, "revalidate", op) is not True:
             raise HandoffError("host policy, capacity or credentials changed")
         if state == "prepared":
+            if op["plan"].get("reason") == "host_loss":
+                proof = _proof("recover_source", _effect(api, adapter, "recover_source", op), op)
+                recovered = api.recover_source(operation, proof=proof)
+                if not recovered:
+                    raise HandoffError("lost source identity changed before recovery")
+                return recovered
             return api.drain(operation) or op  # active lot/turn keeps running
         if state == "session_ready":
             switched = api.switch(operation, cwd=op["evidence"]["cwd"], brief=brief(op))
@@ -421,6 +450,12 @@ def advance(db, operation, adapter, *, enable_slot=None):
 
 
 @_serialized
+def promote_loss(db, operation, adapter):
+    """Replan a fenced pre-switch checkpoint when its source becomes lost."""
+    return storage.of(db).handoffs.promote_loss(operation)
+
+
+@_serialized
 def cancel(db, operation, adapter):
     """Only before switching hosts: reconcile stopped source, then release its fence."""
     api = storage.of(db).handoffs
@@ -430,11 +465,19 @@ def cancel(db, operation, adapter):
     state = op["evidence"].get("held_at") if op["state"] == "held" else op["state"]
     if op["state"] == "cancelled":
         return op
+    if op["plan"].get("reason") == "host_loss":
+        raise HandoffError("lost source cannot be restored by ordinary cancellation")
     if state in ("switched", "activated", "verified"):
         raise HandoffError("destination may have new work; recovery requires reconciliation")
-    if _effect(api, adapter, "restore_source", op) is not True:
-        raise HandoffError("source recovery not verified")
-    return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
+    # Loss publication uses this same gate lock. Keep the current lifecycle
+    # check, restoration and fence release within one boundary.
+    with api.cancellation_guard(operation) as guarded:
+        control = storage.of(guarded.db).host_lifecycle.get(op["source"])
+        if control and control["mode"] == "lost":
+            raise HandoffError("lost source cannot be restored by ordinary cancellation")
+        if _effect(api, adapter, "restore_source", op, completion_api=guarded) is not True:
+            raise HandoffError("source recovery not verified")
+        return guarded.unfence(operation, op["state"], "cancelled") or guarded.get(operation)
 
 
 @_serialized
@@ -466,8 +509,10 @@ def retry(db, operation, adapter, *, renew_ttl=None):
         op = api.finish_effect(operation, pending["epoch"])
         if op["state"] != "held":
             op = api.hold(operation, op["state"])
-        if op["evidence"].get("cancel_requested"):
+        control = storage.of(db).host_lifecycle.get(op["source"])
+        if op["evidence"].get("cancel_requested") and (not control or control["mode"] != "lost"):
             return op  # explicit cancellation may now restore the source
+    op = api.promote_loss(operation) or op
     if _effect(api, adapter, "revalidate", op) is not True:
         raise HandoffError("host reconciliation or prerequisites changed")
     if renew_ttl is not None:

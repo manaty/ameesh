@@ -44,6 +44,11 @@ transaction of the base (xmin), or behind rows of another cluster (logical
 restore: the log must be emptied) — nothing is lost, they come once it ends. A comment every 20 s keeps the connection
 alive; a stream ends after an hour (the client resumes); at most
 `MAX_STREAMS` streams at once, the others are 503 with `Retry-After`.
+`GET /ui/` (L88) is the standalone page: the embeddable components
+(`ameesh-ui.js`, built from `ui/` and committed under `ameesh/ui/static/`)
+assembled full screen. Static files of a fixed list, no token (the page asks
+for it and keeps it in memory), under a strict CSP: scripts and styles of
+this origin only, no inline code, Trusted Types, API calls to this origin.
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -97,6 +103,21 @@ RETRY_MS = 3000
 POLL_S = 5.0
 #: an event held back by an open transaction is looked for again this often
 WAITING_POLL_S = 1.0
+#: the standalone page (L88): its own files and the API, nothing inline
+UI = "/ui"
+# the package's directory, then ui/static opened one name at a time from it,
+# never through a link (a directory link included)
+UI_ROOT = os.path.dirname(os.path.abspath(__file__))
+UI_PARTS = ("ui", "static")
+UI_FILES = {
+    "": ("index.html", "text/html; charset=utf-8"),
+    "ameesh-ui.js": ("ameesh-ui.js", "text/javascript; charset=utf-8"),
+    "ameesh-ui.css": ("ameesh-ui.css", "text/css; charset=utf-8"),
+    "page.css": ("page.css", "text/css; charset=utf-8"),
+}
+UI_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+          "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; "
+          "require-trusted-types-for 'script'; trusted-types lit-html")
 
 log = logging.getLogger("ameesh.serve")
 
@@ -636,11 +657,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- responses ----------------------------------------------------------
 
-    def _send(self, status: int, body: bytes, ctype: str, extra=()) -> None:
+    def _send(self, status: int, body: bytes, ctype: str, extra=(), csp: str = CSP) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for name, value in httpkit.BASE_HEADERS + (("Content-Security-Policy", CSP),) \
+        for name, value in httpkit.BASE_HEADERS + (("Content-Security-Policy", csp),) \
                 + tuple(extra):
             self.send_header(name, value)
         self.end_headers()
@@ -688,6 +709,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         if url.path == WELL_KNOWN:
             self._json(200, discovery(self.ctx))
+            return
+        if url.path == UI or url.path.startswith(UI + "/"):
+            self._ui(url.path)
             return
         found = match(url.path)
         if found is None:
@@ -849,6 +873,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             current = hub.wait(generation, timeout)
             if current != generation:
                 generation, pending = current, True
+    def _ui(self, path: str) -> None:
+        """The standalone page and its files: a fixed list, nothing else."""
+        if path == UI:
+            self._send(308, b"", "text/plain; charset=utf-8", (("Location", UI + "/"),))
+            return
+        found = UI_FILES.get(path[len(UI) + 1:])
+        if found is None:
+            raise ApiError(404, "not_found", "no such file")
+        name, ctype = found
+        # served without a token: never through a link, never out of the package
+        try:
+            fd = _ui_open(name)
+        except OSError:  # missing, or a link (ELOOP, ENOTDIR)
+            raise ApiError(404, "not_found", "interface not installed") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ApiError(404, "not_found", "interface not installed")
+            fh = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fh:
+            body = fh.read()
+        self._send(200, body, ctype, csp=UI_CSP)
 
     def send_error(self, code, message=None, explain=None) -> None:
         # never the request in the error page nor in the log
@@ -867,6 +915,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             args = ((m.group(1) + " " + m.group(2)) if m else "(malformed request)",) \
                 + tuple(args[1:])
         log.info(fmt, *args)
+
+
+def _ui_open(name: str) -> int:
+    """A descriptor of UI_ROOT/ui/static/<name>, each name opened from its
+    parent's descriptor without following a link: no race, no way out."""
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = os.O_RDONLY | os.O_NOFOLLOW | cloexec
+    fd = os.open(UI_ROOT, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    try:
+        for part in UI_PARTS:
+            parent, fd = fd, -1
+            try:
+                fd = os.open(part, nofollow | os.O_DIRECTORY, dir_fd=parent)
+            finally:
+                os.close(parent)
+        # non-blocking: a FIFO in place of a file must not hold the request
+        return os.open(name, nofollow | os.O_NONBLOCK, dir_fd=fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 class ServeHTTPServer(httpkit.BoundedHTTPServer):

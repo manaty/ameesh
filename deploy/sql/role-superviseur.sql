@@ -191,6 +191,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'turn_max_seconds', 'turn_mail_max',
         -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
         'turn_grace_seconds',
+        -- L165b (0384) : réveil sur lot actionnable, on/off (un réglage) ;
+        -- harnais, dossier et id de la session dont ils notent l'ouverture
+        -- (même nature que harness, cwd, session_id)
+        'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
@@ -247,6 +251,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'action_class', 'currency', 'reserved_by', 'reserved_at',
         'released_at', 'released_reason'
     ]),
+    -- L165b (0384): sessions put aside per (agent, lot) and the runner's
+    -- wake bookkeeping; a session id, like agent_registry.session_id
+    ('agent_lot_sessions', ARRAY[
+        'agent', 'work_item_id', 'session_id', 'harness', 'account', 'cwd',
+        'parked_at', 'wakes', 'last_wake_at', 'wake_activity_at', 'created_at'
+    ]),
     -- L385 (0373): explicit prerequisites and their audit attribution.
     ('work_item_dependencies', ARRAY[
         'work_item_id', 'blocker_id', 'created_by', 'created_at'
@@ -283,6 +293,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'host', 'harness', 'path', 'version', 'raw', 'observed_at'
     ]),
     -- L232a (0371) : état et réservations ; plans et preuves dans le rôle contenus
+    -- L232e (0380): withdrawal intent and agent origins; refusals in contents role
+    ('host_lifecycle', ARRAY[
+        'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at'
+    ]),
+    ('host_lifecycle_agents', ARRAY[
+        'host', 'generation', 'agent', 'critical', 'operation'
+    ]),
     ('host_handoffs', ARRAY[
         'id', 'agent', 'source', 'target', 'state', 'fenced',
         'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'

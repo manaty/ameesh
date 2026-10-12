@@ -116,3 +116,69 @@ L232a is tested with simulated adapters and local Git repositories. It does
 not install a real host adapter, enable production agents, copy secrets,
 perform root operations or authorise spending. L232b/c and provider login
 readiness supply those separate integrations.
+
+## Host drain, return and loss recovery (L232e)
+
+`ameesh host drain HOST [--for 8h]` closes new claims, turns and prompt
+consumption while preserving the current turn and lease. The persistent
+request takes precedence over later resource readings that say `available`.
+The controller considers critical agents first, checks receiving-host
+readiness and uses a handoff at a turn boundary. `ameesh host undrain HOST`
+requests their return; an elapsed `--for` duration makes the same request.
+Missing helper, secret requirements and host-scoped logins remain named
+refusals. These paths currently use simulated adapters.
+
+The runner detects a known host as `lost` after its latest resource sample
+is older than the larger of 180 seconds and three resource intervals, and
+none of its executing agents has a live lease. It rechecks both facts after
+locking the host gate and agent rows. An unobserved host is not classified
+as lost. An existing drain retains its generation and agent origins, but
+its automatic return timer is removed. A new heartbeat does not reopen
+claims on a lost host.
+`undrain` refuses a lost host; the planned-return path cannot bypass the
+recovery proof. A returning machine stays withdrawn until it is independently
+reconciled. Lost-host recovery moves agents forward rather than restoring an
+uncertain source executor.
+
+Detection preserves agent placement, expired leases and running-turn state;
+it is not proof that an executor has stopped. Critical agents become eligible
+for recovery after 180 seconds without a resource sample; other agents wait
+900 seconds. The detector's longer threshold still applies if three resource
+intervals exceed these delays. A fresh, admitted receiving host with matching
+canon, capacity and readiness remains mandatory.
+
+Recovery reserves capacity and fences source claims, then prepares the target.
+The enrolled adapter's `recover_source` receives the operation and controller
+epoch. It must durably disable the source executor (including delayed calls)
+and attest physical quiescence, absence of unpublished work and the exact
+clean Git checkpoint on the enrolled remote. Its result names `source`,
+`agent`, `lease_epoch` and lifecycle `generation`, with `source_fenced=true`,
+`quiesced=true`, `unpublished_work=false`, plus the ordinary publication
+fields (`repository`, `branch`, `commit`, `remote_commit`, `clean`). A stale
+epoch, mismatched scope or missing proof holds the operation. Unreachable
+source files are not evidence of cleanliness; an older remote checkpoint
+alone does not prove that the most recent work was published.
+
+After this proof, a transaction revokes the expired source epoch and records
+the published checkpoint before transfer/session/switch/admission/enable.
+The old runner cannot renew, finish a turn or reclaim the agent when the
+source returns. A helper timeout leaves a pending effect requiring explicit
+reconciliation; ordinary cancellation cannot restore a lost source.
+Heartbeat absence alone never enables a second executor.
+
+If a source is lost during an existing pre-switch drain, the controller
+converts that same operation to loss recovery while preserving its destination
+reservation. It keeps the source fenced, discards stale publication/session
+proofs and obtains the scoped recovery proof before proceeding. An unknown
+effect must first be explicitly reconciled. Restoration checks the source's
+current lifecycle under its gate lock, so a planned drain cannot restore a
+source that has since become lost.
+Restoration intent stays committed on the independent journal connection.
+Its completion and the cancellation fence release use the transaction owning
+the source gate lock. If that backend disconnects during restoration or before
+commit, both writes roll back and the pending intent still requires explicit
+quiescence reconciliation.
+
+All L232e host effects are currently tested with simulated adapters. The
+runner records `helper:L232b` when no enrolled implementation is supplied;
+real SSH, secret delivery and provider login integration depend on L232b/c/d.

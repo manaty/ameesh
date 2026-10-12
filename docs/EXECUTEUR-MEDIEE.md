@@ -401,6 +401,36 @@ plus de 24 h sont élaguées toutes les 10 minutes, l'audit après 90 jours.
   indisponible. Sans porte configurée, l'exécuteur médié rapporte
   `AlwaysAvailable`.
 
+### Santé de la clé du relais (#317)
+
+Un HTTP 401 amont, ou un 403 identifié comme erreur d'authentification,
+enregistre `credential_health` sur l'hôte **serveur**, harnais `deepseek`,
+compte réservé `relay`, source `relay` (migration 0402). L'empreinte est celle
+de la clé réellement envoyée ; le corps d'erreur du fournisseur n'est ni
+enregistré ni renvoyé à l'appareil. Un 403 de permission de modèle, un manque
+de crédit, un 429 et un incident réseau ne déclarent pas la clé en échec.
+
+Le relais rend HTTP 503 avec `error.type=relay_auth_blocked` sur les
+messages et sur `GET /api/exec/v1/llm/deepseek/v1/models` tant que ce compte
+est en échec. Le worker consulte cette route avec son jeton de session avant
+de prendre une consigne ; il pose `auth_blocked: deepseek/relay` et conserve
+la consigne. Si le tour vient d'échouer, ce verdict empêche de compter un
+échec rapide. L'appareil ne lit ni n'écrit les opérations `credentials`.
+
+`ameesh accounts check` sonde la clé serveur (`AMEESH_RELAY_DEEPSEEK_KEY_FILE`,
+fichier 0600, ou `DEEPSEEK_API_KEY` dans l'environnement du service) via le
+[GET /user/balance de DeepSeek](https://api-docs.deepseek.com/api/get-user-balance/).
+La réponse doit être authentifiée et valide ; présence d'une clé ou erreur
+réseau ne suffisent pas. La même clé peut rétablir la santé après un refus
+transitoire : la sonde attend 10 minutes après le dernier refus, puis le
+timer sentinelle renouvelle l'essai toutes les 10 minutes. Une clé différente
+peut être sondée immédiatement. L'écriture saine est conditionnelle au compteur d'échecs lu avant la
+sonde (`expect_failures`), et une rotation pendant la sonde invalide son
+résultat. La garde lève ensuite le blocage automatiquement. Le service de
+sonde doit avoir accès au même fichier ou environnement que le relais.
+`AMEESH_DEEPSEEK_API_BASE` permet de fixer l'origine de la sonde ; HTTPS est
+exigé hors boucle locale, et les redirections sont refusées.
+
 ## Client et mode médié (L109)
 
 Le client vit dans `src/ameesh/storage/remote/` :
