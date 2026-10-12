@@ -668,6 +668,75 @@ class CoupureTest(PgTestCase):
         self.assertNotIn(seul, alertes)
         self.assertNotIn(deja, alertes)
 
+    def _avant_le_demarrage(self, *turn_ids) -> None:
+        self.db.execute("UPDATE turn_resources SET started_at = now() - interval '2 hours'"
+                        " WHERE turn_id IN (%s)" % ", ".join(["%s"] * len(turn_ids)),
+                        turn_ids)
+
+    def _revue_au_demarrage(self, runtime=None) -> list:
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch.object(resources, "boot_time", return_value=time.time() - 3600), \
+                mock.patch.object(runner, "container_runtime", return_value=runtime), \
+                mock.patch.object(runner_mod, "log"):
+            return [r["turn_id"] for r in runner.report_boot_orphans()]
+
+    def test_tour_interrompu_sans_conteneur_note_interroge_le_moteur(self):
+        # codex r1 P2 : un tour interrompu ne note aucun conteneur (relevé en
+        # fin de tour) ; celui que sa politique relance après le redémarrage
+        # se lit par l'étiquette du tour
+        turns = storage.of(self.db).turn_resources
+        relance = "tour-relance-%s" % uuid.uuid4().hex[:6]
+        mort = "tour-mort-%s" % uuid.uuid4().hex[:6]
+        for turn in (relance, mort):
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(relance, mort)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = [
+            {"id": "c-relance", "name": "pg", "image": "postgres", "created": "",
+             "labels": {"ameesh.turn": relance}},
+            {"id": "c-autre", "name": "x", "image": "x", "created": "", "labels": {}}]
+        restes = self._revue_au_demarrage(moteur)
+        self.assertIn(relance, restes)
+        self.assertNotIn(mort, restes)
+        self.assertEqual(turns.get(relance)["status"], "orphan")
+        self.assertEqual(turns.get(mort)["status"], "done")
+        moteur.list_all.assert_called_once_with()       # un seul relevé
+        alertes = [a["turn"] for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "orphan_resource"]
+        self.assertIn(relance, alertes)
+
+    def test_moteur_muet_un_tour_interrompu_reste_signale(self):
+        turns = storage.of(self.db).turn_resources
+        tour = "tour-muet-%s" % uuid.uuid4().hex[:6]
+        turns.open_turn(tour, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(tour)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = None
+        self.assertIn(tour, self._revue_au_demarrage(moteur))
+        self.assertEqual(turns.get(tour)["status"], "orphan")
+
+    def test_toutes_les_orphelines_d_avant_le_demarrage_par_page(self):
+        # codex r1 P2 : plus de 500 orphelines, ou 500 plus récentes qui
+        # survivent — chaque ligne d'avant le démarrage est revue
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        anciennes = ["tour-ancien-%s-%d" % (jeton, i) for i in range(5)]
+        recentes = ["tour-recent-%s-%d" % (jeton, i) for i in range(3)]
+        for turn in anciennes + recentes:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+            turns.mark_orphan(turn)
+        self._avant_le_demarrage(*anciennes)
+        with mock.patch.object(runner_mod, "BOOT_ORPHAN_PAGE", 2):
+            restes = self._revue_au_demarrage()
+        for turn in anciennes:
+            self.assertEqual(turns.get(turn)["status"], "done", turn)
+            self.assertNotIn(turn, restes)
+        for turn in recentes:                 # ouvertes depuis : pas touchées
+            self.assertEqual(turns.get(turn)["status"], "orphan", turn)
+        page = turns.orphans_started_before(self.cfg.host, time.time(), 0, 2)
+        self.assertEqual(len(page), 2)
+        self.assertLess(int(page[0]["id"]), int(page[1]["id"]))
+
     def test_agent_place_sur_un_autre_hote_rendu_entre_deux_tours(self):
         # L147 : le canon a placé l'agent ailleurs pendant que ce worker
         # tenait son bail — il le rend, l'autre hôte peut le réclamer

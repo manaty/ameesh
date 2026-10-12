@@ -134,6 +134,9 @@ def log_async(message: str) -> None:
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
 
+#: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
+BOOT_ORPHAN_PAGE = 500
+
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
     """Écrit `data` sur `fd` **sans jamais attendre** le puits (diagnostic).
@@ -4492,6 +4495,7 @@ class Runner:
         (`done`) ; seule une ligne dont un conteneur tourne encore (relancé par
         sa politique de redémarrage), ou invérifiable faute de moteur, reste
         orpheline et signalée (alerte `orphan_resource`). Rien n'est supprimé.
+        Toutes les orphelines d'avant le démarrage sont revues, page par page.
         Rend les lignes restées orphelines. Ne lève jamais."""
         from . import resources as resources_mod
         boot = resources_mod.boot_time()
@@ -4500,12 +4504,18 @@ class Runner:
         try:
             turns = storage.of(self.db).turn_resources
             rows = turns.stale_running(max(0.0, time.time() - boot), self.host)
-            rows += [r for r in turns.orphans(self.host, 500)
-                     if float(r.get("started_ts") or boot) < boot]
+            after = 0
+            while True:
+                page = turns.orphans_started_before(self.host, boot, after, BOOT_ORPHAN_PAGE)
+                rows += page
+                if len(page) < BOOT_ORPHAN_PAGE:
+                    break
+                after = int(page[-1]["id"])
             runtime = self.container_runtime()
+            running = self._running_containers(runtime) if rows else {}
             kept = []
             for row in rows:
-                alive = self._containers_alive(runtime, row)
+                alive = self._containers_alive(running, runtime, row)
                 if alive is not None and not alive:
                     turns.settle(row["turn_id"])
                     log("tour %s de %s d'avant le redémarrage de l'hôte : groupe %s "
@@ -4526,17 +4536,30 @@ class Runner:
             return []
 
     @staticmethod
-    def _containers_alive(runtime, row) -> list | None:
-        """L147 : les conteneurs du tour encore en cours ([] : aucun) ; None
-        si la ligne en a et que le moteur ne peut pas le dire."""
-        if not row.get("containers"):
-            return []
+    def _running_containers(runtime) -> dict | None:
+        """L147 : les conteneurs en cours par étiquette de tour (`ameesh.turn`),
+        en un seul relevé ; {} sans moteur ; None si le moteur ne répond pas."""
         if runtime is None:
-            return None
-        listed = runtime.turn_containers(row["turn_id"])
+            return {}
+        listed = runtime.list_all()
         if listed is None:
             return None
-        return [c["id"] for c in listed]
+        out: dict = {}
+        for row in listed:
+            turn = (row.get("labels") or {}).get("ameesh.turn")
+            if turn:
+                out.setdefault(turn, []).append(row["id"])
+        return out
+
+    @staticmethod
+    def _containers_alive(running, runtime, row) -> list | None:
+        """L147 : les conteneurs du tour encore en cours ([] : aucun), lus par
+        l'étiquette du tour même si la ligne n'en note aucun — un tour
+        interrompu n'en note pas (relevé à la fin du tour). None si le moteur
+        ne répond pas, ou si la ligne en note et que l'hôte n'a pas de moteur."""
+        if running is None or (runtime is None and row.get("containers")):
+            return None
+        return list(running.get(row["turn_id"], []))
 
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s, courrier "

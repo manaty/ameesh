@@ -188,6 +188,13 @@ class TurnResources(interface.TurnResources):
             (" AND" if where else " WHERE") + " status = 'orphan'"
             " ORDER BY started_at DESC, id DESC LIMIT %s", tuple(params))
 
+    def orphans_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND status = 'orphan' AND started_at < to_timestamp(%s)"
+            "   AND id > %s ORDER BY id LIMIT %s",
+            (host, float(before_ts), int(after_id), int(limit)))
+
     def stale_running(self, older_than_s, host=None) -> list[dict]:
         where, params = "", [float(older_than_s)]
         if host:

@@ -2092,6 +2092,13 @@ class TurnResources(Domain):
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
 
     @abc.abstractmethod
+    def orphans_started_before(self, host: str, before_ts: float, after_id: int = 0,
+                               limit: int = 500) -> list[dict]:
+        """L147 : les lignes `orphan` de l'hôte ouvertes avant `before_ts`
+        (epoch), d'`id` supérieur à `after_id`, par `id` croissant : une page
+        de `limit` lignes au plus (pagination par `id`)."""
+
+    @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
         secondes (fin du tour, pour une ligne en délai de grâce) : un
