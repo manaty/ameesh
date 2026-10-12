@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 import unittest
@@ -68,6 +69,46 @@ class LeaderPopenTest(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(proc.reap(), -signal.SIGKILL)
         self.assertTrue(_group_gone(proc.pid))
+
+    def test_popen_internals_never_reap_behind_the_group(self):
+        # codex r3: communicate() interrupted, then the driver's close
+        proc = resident.spawn_leader(
+            [sys.executable, "-c", "import subprocess, sys, time; "
+             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+             "sys.exit(0)"], start_new_session=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(proc.reap)
+        self.assertEqual(proc.wait(5), 0)
+        # an interrupted communicate() waits through Popen._wait
+        with mock.patch.object(proc, "_communicate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                proc.communicate()
+        self.assertIsNone(proc.returncode)             # communicate/wait: not reaped
+        time.sleep(0.3)
+        self.assertFalse(_group_gone(proc.pid, timeout=0.2))   # its child still runs
+        resident._kill_group(proc, 0.1)
+        self.assertIsNotNone(proc.returncode)
+        self.assertTrue(_group_gone(proc.pid))
+
+    def test_an_orphaned_leader_is_cleaned_up_safely(self):
+        # codex r3: Popen.__del__ / subprocess._cleanup
+        proc = resident.spawn_leader([sys.executable, "-c", "pass"], start_new_session=True)
+        proc.wait(5)
+        pid = proc.pid
+        with mock.patch.object(os, "killpg", wraps=os.killpg) as killpg:
+            proc._internal_poll(_deadstate=sys.maxsize)
+        killpg.assert_called_once_with(pid, signal.SIGKILL)   # its group first
+        self.assertIsNotNone(proc.returncode)
+        self.assertEqual(_state(pid), "")
+
+    def test_kill_group_signals_under_the_reap_lock(self):
+        # codex r3: a reap between poll() and the signal never lets it out
+        proc = self._leader("import time; time.sleep(30)")
+        vraie = proc.poll
+        proc.poll = lambda: (vraie(), proc.reap())[0]   # reaped right after poll()
+        with mock.patch.object(os, "killpg", wraps=os.killpg) as killpg:
+            resident._kill_group(proc, 0.1)
+        self.assertEqual([c.args[1] for c in killpg.call_args_list], [signal.SIGKILL])
 
     def test_no_signal_once_reaped(self):
         proc = self._leader("pass")

@@ -211,10 +211,18 @@ class LeaderPopen(subprocess.Popen):
         self._exit = -info.si_status if killed else info.si_status
         return self._exit
 
-    def poll(self):
-        return self._peek()
+    # Popen's own internals, so that every path goes through them —
+    # `poll()`, `wait()`, `communicate()`, `__del__()` and
+    # `subprocess._cleanup()` (codex r3, #417)
+    def _internal_poll(self, _deadstate=None, **_ignored):
+        code = self._peek()
+        if code is not None and _deadstate is not None and self.returncode is None:
+            # an orphaned object (`__del__`, `_cleanup`): nobody will close it —
+            # its group is killed while its number is ours, then it is reaped
+            self.reap(timeout=0.0)
+        return code
 
-    def wait(self, timeout=None):
+    def _wait(self, timeout=None):
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             code = self._peek()
@@ -280,15 +288,21 @@ def _kill_group(proc: subprocess.Popen, grace: float, *, close_input: bool = Tru
             proc.stdin.close()
     except (OSError, ValueError):
         pass
+    signal_group = getattr(proc, "signal_group", None)
     for sig in (None, signal.SIGTERM, signal.SIGKILL):
         if sig is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                try:
+            if signal_group is not None:
+                # under the reap lock: only while the leader is unreaped (codex r3)
+                if not signal_group(sig):
                     proc.send_signal(sig)
-                except OSError:
-                    pass
+            else:
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        proc.send_signal(sig)
+                    except OSError:
+                        pass
         try:
             proc.wait(timeout=max(grace, 0.1) if sig != signal.SIGKILL else 1.0)
             break
