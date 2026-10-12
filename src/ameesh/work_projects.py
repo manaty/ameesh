@@ -14,9 +14,9 @@ def agent_project(cfg, db, name):
     values = set()
     for canon in work.configured_canons(cfg):
         if canon.owns(row.get("canon")):
-            agent = canon.agent(name)
-            if agent and agent.team and agent.team.strip():
-                values.add(agent.team.strip())
+            for agent in canon.agents:
+                if agent.title == name and agent.team and agent.team.strip():
+                    values.add(agent.team.strip())
     if len(values) > 1:
         raise work.WorkError("ambiguous project for %s" % name)
     return next(iter(values), "")
