@@ -72,6 +72,14 @@ class TransportTest(unittest.TestCase):
                          ["today"])
         self.assertEqual(self.transport.read(THREAD, since=ids[3]), [])
 
+    def test_latest_of_entries_written_in_the_same_second_stays_the_latest(self):
+        """r3 P2: a timestamp tie keeps the later entry, as indexing does."""
+        first, second = entry("first", 0), entry("second", 0)
+        ids = self.post(entry("old", 500), first, second)
+        self.assertEqual(first.ts, second.ts)
+        last = self.expire()["last"]
+        self.assertEqual((last.id, last.text), (ids[2], "second"))
+
     def test_next_ids_continue_as_if_nothing_expired(self):
         twin = fil.FileTransport(os.path.join(self.root, "twin"))
         olds = [entry("old %d" % n, 400 + n, author="agent:a%d" % n) for n in range(3)]
@@ -360,6 +368,34 @@ class IndexAndOutboxTest(PgTestCase):
                    ts=NOW, project="acme", lot="inflight")
         self.assertEqual((self.index_row("inflight")["entries"],
                           self.index_row("inflight")["last_excerpt"]), (2, "next"))
+
+    def test_expiry_without_a_committed_recount_counts_later_indexing(self):
+        """r3 P2: the file is no proof the index was recounted."""
+        transport = fil.transport_for(self.cfg)
+
+        def post(lot):
+            thread = fil.ThreadRef("acme", lot)
+            transport.post(thread, entry("old", 500))
+            fresh = [entry("fresh %d" % n, 1) for n in (1, 2)]
+            return thread, [(e, transport.post(thread, e)) for e in fresh]
+
+        # expiry without a database (the CLI fallback), then delayed indexing
+        thread, fresh = post("nodb")
+        self.assertEqual(fil.expire(self.cfg, None, now=NOW)[0]["dropped"], 1)
+        for e, entry_id in fresh:
+            fil.index(self.db, self.cfg, transport, thread, e, entry_id)
+        self.assertEqual(self.index_row("nodb")["entries"], 2)
+        # a recount that fails after the rename is rolled back: same thing
+        thread, fresh = post("failed")
+        from ameesh.storage.postgres import threads as pg_threads
+        with mock.patch.object(pg_threads.Threads, "expired",
+                               side_effect=RuntimeError("recount lost")):
+            report = fil.expire(self.cfg, self.db, now=NOW)
+        self.assertIn("error", [r for r in report if r["thread"] == "acme/failed"][0])
+        self.assertEqual(len(transport.read(thread)), 2)  # the file did expire
+        for e, entry_id in fresh:
+            fil.index(self.db, self.cfg, transport, thread, e, entry_id)
+        self.assertEqual(self.index_row("failed")["entries"], 2)
 
     def test_expiry_waits_for_an_open_r12_drain_without_deadlock(self):
         """The drain holds the index row through its transaction, then writes

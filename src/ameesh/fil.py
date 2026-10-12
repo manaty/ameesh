@@ -786,8 +786,8 @@ class FileTransport:
         logique du fil à l'expiration) ; None si le fil n'a jamais expiré.
 
         `index` s'en sert : une entrée d'avant la première gardée a expiré
-        avant d'être indexée ; une entrée d'avant la fin était déjà dans le fil
-        à l'expiration, l'index l'a déjà comptée.
+        avant d'être indexée. La fin n'est qu'un repère : ce qui est déjà
+        compté, seule la base le sait (`counted_until`).
         """
         try:
             fd, _ = self._locked(thread, fcntl.LOCK_SH, write=False)
@@ -872,8 +872,10 @@ class FileTransport:
             head = preamble + _expiry_block(note)
             if len(head) != head_len:
                 raise ThreadError("%s: expiry note width changed, refused" % thread.key)
+            # à égalité d'horodatage, la dernière écrite (comme l'index)
             report.update(dropped=dropped, shift=note["shift"], before=note["before"],
-                          last=max(kept, key=lambda e: e.ts) if kept else None)
+                          end=note["end"],
+                          last=max(reversed(kept), key=lambda e: e.ts) if kept else None)
             if dry_run:
                 return report
             self._sweep_temporaries(dir_fd, thread)
@@ -1050,8 +1052,10 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
 
     L361 : sous le verrou de la ligne du fil (`threads.lock`), que `expire`
     prend aussi. Une entrée expirée entre son écriture et son indexation
-    n'est ni comptée ni citée ; une entrée déjà dans le fil quand il a expiré
-    a été comptée par l'expiration, elle n'est pas comptée deux fois.
+    n'est ni comptée ni citée ; une entrée déjà dans le fil quand la base l'a
+    recompté (`counted_until`, écrit dans la transaction du recomptage) n'est
+    pas comptée deux fois. Le fichier ne prouve pas ce recomptage : une
+    expiration sans base, ou dont le recomptage a échoué, n'a rien compté.
     """
     host = cfg.host if transport.name == "file" else ""
     key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
@@ -1059,7 +1063,7 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
                                     if hasattr(transport, "location") else thread.key))
     with db.transaction() as tx:
         threads = storage.of(tx).threads
-        threads.lock(**key)
+        counted = threads.lock(**key)
         bounds = transport.bounds(thread) if hasattr(transport, "bounds") else None
         offset = _offset_of(external_id)
         if bounds is not None and offset is not None and offset < bounds[0]:
@@ -1068,7 +1072,7 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
             **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
             excerpt=excerpt(entry.text), ts=float(entry.ts),
             trace={"fil": {"transport": transport.name, "id": external_id, "host": host}},
-            count=not (bounds is not None and offset is not None and offset < bounds[1]))
+            count=not (counted is not None and offset is not None and offset < counted))
 
 
 def _offset_of(entry_id: str) -> int | None:
@@ -1111,7 +1115,7 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
                     report = run()
                     if report["dropped"]:
                         threads.expired(**key, kept=report["kept"],
-                                        last=_index_row(report["last"]))
+                                        last=_index_row(report["last"]), end=report["end"])
         except (OSError, ThreadError) as exc:
             reports.append({"thread": thread.key, "dropped": 0,
                             "error": " ".join(str(exc).split())[:200]})

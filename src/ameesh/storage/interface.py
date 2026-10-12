@@ -1807,17 +1807,19 @@ class Threads(Domain):
 
     @abc.abstractmethod
     def lock(self, *, project: str, lot: str, transport: str, host: str,
-             location: str) -> None:
+             location: str) -> int | None:
         """Verrouille la ligne du fil jusqu'à la fin de la transaction (créée
         vide au besoin) : expiration et indexation d'un même fil passent l'une
-        après l'autre (L361)."""
+        après l'autre (L361). Rend `counted_until` : la fin logique du fil au
+        dernier recomptage (`expired`), None s'il n'a jamais été recompté."""
 
     @abc.abstractmethod
     def expired(self, *, project: str, lot: str, transport: str, host: str,
-                kept: int, last: dict | None) -> None:
+                kept: int, last: dict | None, end: int) -> None:
         """Après une expiration (L361), sous `lock` : `kept` entrées restent ;
         `last` (entry_id, mailbox_id, author, excerpt, ts) est la plus récente
-        gardée, None si le fil est vide (aucune entrée expirée n'est citée)."""
+        gardée, None si le fil est vide (aucune entrée expirée n'est citée) ;
+        `end`, la fin logique du fil recompté, devient `counted_until`."""
 
 
 # --------------------------------------------------------------------------

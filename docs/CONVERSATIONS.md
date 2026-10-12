@@ -152,8 +152,14 @@ Shared threads keep **one year** of entries by default (0033 §9):
   file lock, the order the R12 drain already uses, and indexing takes the
   same row lock. The index then holds the number of entries kept and the
   most recent one; an emptied thread quotes no entry. An entry expired
-  between its write and its indexing is neither counted nor quoted; one
-  already in the file when it expired is not counted twice.
+  between its write and its indexing is neither counted nor quoted. The
+  recount records, in the same transaction, the thread's logical end
+  (`thread_index.counted_until`, migration 0395): an entry before it is
+  already counted and indexing it later does not count it twice. The file is
+  not proof of a recount: after an expiry without a database (`fil expire`
+  without one) or whose recount failed, later indexing counts normally.
+  Between two entries with the same timestamp, the later one is the most
+  recent.
 * **R12 outbox**: an undelivered copy older than thread retention is
   deleted by `Log.prune` (its thread entry would expire on arrival);
   younger ones still wait for delivery, past detail retention.

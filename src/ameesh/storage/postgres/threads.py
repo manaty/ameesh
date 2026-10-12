@@ -38,14 +38,16 @@ ON CONFLICT (project, lot, transport, host) DO UPDATE SET
 
 class Threads(interface.Threads):
 
-    def lock(self, *, project, lot, transport, host, location) -> None:
+    def lock(self, *, project, lot, transport, host, location) -> int | None:
         self.db.execute(
             "INSERT INTO thread_index (project, lot, transport, host, location)"
             " VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
             (project, lot, transport, host, location))
-        self.db.query(
-            "SELECT 1 FROM thread_index WHERE project = %s AND lot = %s AND transport = %s"
-            " AND host = %s FOR UPDATE", (project, lot, transport, host))
+        rows = self.db.query(
+            "SELECT counted_until FROM thread_index WHERE project = %s AND lot = %s"
+            " AND transport = %s AND host = %s FOR UPDATE", (project, lot, transport, host))
+        counted = rows[0]["counted_until"] if rows else None
+        return None if counted is None else int(counted)
 
     def index(self, *, project, lot, transport, host, location, entry_id, mailbox_ids,
               author, excerpt, ts, trace, count=True) -> None:
@@ -74,7 +76,7 @@ class Threads(interface.Threads):
              ORDER BY last_at DESC NULLS LAST, project, lot
             """)
 
-    def expired(self, *, project, lot, transport, host, kept, last) -> None:
+    def expired(self, *, project, lot, transport, host, kept, last, end) -> None:
         last = last or {}
         self.db.execute(
             """
@@ -85,7 +87,9 @@ class Threads(interface.Threads):
                    last_author     = coalesce(%s, last_author),
                    last_excerpt    = %s,
                    last_at         = coalesce(to_timestamp(%s), last_at),
+                   counted_until   = %s,
                    updated_at      = now()
              WHERE project = %s AND lot = %s AND transport = %s AND host = %s
             """, (int(kept), last.get("entry_id"), last.get("mailbox_id"), last.get("author"),
-                  last.get("excerpt") or "", last.get("ts"), project, lot, transport, host))
+                  last.get("excerpt") or "", last.get("ts"), int(end),
+                  project, lot, transport, host))
