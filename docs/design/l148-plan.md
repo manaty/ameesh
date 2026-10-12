@@ -114,9 +114,10 @@ It changes no code.
 
 | path                        | suggested                      | open PRs touching it   |
 |-----------------------------|--------------------------------|------------------------|
-| scripts/carte.py            | scripts/test_map.py            | —                      |
-| scripts/carte_mesure.py     | scripts/test_map_measure.py    | —                      |
-| scripts/ci-flux.py          | scripts/ci-flow.py             | —                      |
+| scripts/carte.py            | scripts/map.py (stage 2b)      | —                      |
+| scripts/carte_mesure.py     | scripts/map_measure.py (2b;    | —                      |
+|                             | old path kept as an alias)     |                        |
+| scripts/ci-flux.py          | scripts/ci-flow.py (stage 2b)  | —                      |
 | scripts/test-parallele.sh   | scripts/test-parallel.sh       | —                      |
 | deploy/mise-a-jour/         | deploy/update/                 | —                      |
 | .github/workflows/carte.yml | .github/workflows/test-map.yml | —                      |
@@ -526,6 +527,13 @@ English. A later PR swaps `dest` and the tests; the French strings leave in stag
 names (names in §2.1/§2.2/§2.5). Also update `.github/workflows/carte.yml`, `scripts/test.sh`,
 `tests/parts/*` and `scripts/version-level.py` expectations (it parses `add_parser` calls).
 Tests and CI call these scripts; do it in one PR so the workflow never sees a half-renamed tool.
+Done (2026-10-12, #147 stage 2b): `carte.py` → `map.py`, `carte_mesure.py` → `map_measure.py` (the
+old path stays as a compatibility alias for the `.pth` files installed before the rename; deleted
+at stage 7), `ci-flux.py` → `ci-flow.py`; `test-parts.py` keeps its already-English name, its 11
+functions, options and positionals are renamed. The plan's `test_map.py` / `test_map_measure.py`
+suggestions were a typo (the scripts are not tests). Dev-script options get **no** deprecated
+spelling: `scripts/version-level.py` reads only `src/ameesh/` (`SOURCES`), and every caller —
+workflows, `test-parallele.sh`, `test-plan.py`, tests, docs — is updated in the same PR.
 
 **2c — free-file function renames.** `identity.py` (`chantier_of` → `workstream_of`),
 `chat.py` (`consigne` → `instruction`) and `watch.py` (same name), `plan_github.py`
