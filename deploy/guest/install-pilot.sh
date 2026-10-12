@@ -67,11 +67,14 @@
 #   * by --enable, once (lot #483): /opt/ameesh/git-credential-guest, the
 #     git credential helper of the guest (it hands git the runner's GH_TOKEN,
 #     which systemd reads in guest-<agent>.env: never written elsewhere,
-#     never printed), named in the guest's ~/.gitconfig for
-#     https://github.com; the guest's ~/.dsh/hooks.json and profiles/,
-#     copied from --dsh-from, refused if a file looks like it holds a secret;
+#     never printed), the only helper of each clone (its .git/config: the
+#     helpers before reset); the guest's ~/.dsh/hooks.json and profiles/,
+#     from --dsh-from: read once without following a link, text files of
+#     the kinds a profile needs only, refused if one looks like it holds a
+#     secret, and what is checked is what is copied;
 #     and for each agent, its clone of its project in its work folder,
-#     detached on origin/BRANCH. What is there already is kept (never
+#     detached on origin/BRANCH (the token handed to git through a file of
+#     the guest's own, 0600, removed at exit: in no environment). What is there already is kept (never
 #     fetched, reset nor overwritten); a folder holding something else is
 #     refused. Everything in the guest's home and work is written as the
 #     guest, never by root.
@@ -108,9 +111,6 @@ CANON=""
 declare -A REPOS=()
 DSH_FROM=""
 HELPER=/opt/ameesh/git-credential-guest
-CREDENTIAL_KEY=credential.https://github.com.helper
-# the same answer as $HELPER, inline, for the check made before it exists
-LS_HELPER='!f() { [ "$1" = get ] && [ -n "$GH_TOKEN" ] && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
 
 die() { echo "install-pilot.sh: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -499,40 +499,192 @@ printf 'username=x-access-token\npassword=%s\n' "$GH_TOKEN"
 EOF
 }
 
-# the files of a dsh profile copied to the guest: hooks.json and the plain
-# files of each profile (no dot file, no link, no subdirectory: no session,
-# key, log nor installed module)
-dsh_files() {
-  local src=$1 f p
-  [ -f "$src/hooks.json" ] && [ ! -L "$src/hooks.json" ] && echo hooks.json
-  # profiles/ itself a link: nothing under it (codex #457 r1)
-  [ -d "$src/profiles" ] && [ ! -L "$src/profiles" ] || return 0
-  for p in "$src"/profiles/*/; do
-    [ -d "$p" ] && [ ! -L "${p%/}" ] || continue
-    valid_name "$(basename "$p")" || continue
-    for f in "$p"*; do
-      [ -f "$f" ] && [ ! -L "$f" ] || continue
-      case "$(basename "$f")" in *[!A-Za-z0-9._-]*) continue ;; esac
-      echo "profiles/$(basename "$p")/$(basename "$f")"
-    done
-  done
+# dsh_read list SRC / dsh_read tar SRC FILE… / dsh_read secrets FILE…
+# A dsh profile read by root once, never through a link (O_NOFOLLOW, each
+# directory opened from its parent): hooks.json and, in each profiles/<name>/,
+# its files of the kinds a profile needs (DSH_KINDS), text only (UTF-8, no
+# NUL, 1 MiB at most). A link, another kind of file, a binary or a file
+# that looks like it holds a secret refuses it all (dot files and
+# subdirectories of a profile are left: sessions, logs, modules).
+# `list` prints what would be copied; `tar` reads it all again, checks it
+# again and writes those FILEs, from the very bytes it checked, as a tar on
+# stdout (what is checked is what is copied: codex #457 r2); `secrets` names
+# the FILEs that look like they hold a secret (--check).
+DSH_KINDS='json yml yaml md txt toml'
+dsh_read() {
+  python3 -I - "$DSH_KINDS" "${PILOT_TEST_STAGE_HOOK:-}" "$DRY" "$@" <<'EOF'
+import io, os, re, stat, subprocess, sys, tarfile, time
+kinds, hook, dry, mode = sys.argv[1].split(), sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+args = sys.argv[5:]
+SECRET = re.compile(
+    rb"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    rb"|-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY|PuTTY-User-Key-File"
+    rb"""|(api[_-]?key|token|secret|passw(or)?d)["']?\s*[:=]\s*["']?[^"'\s,}]{8,}""", re.I)
+KEYNAME = re.compile(r"id_.*|.*\.(pem|key|p12|pfx|jks|keystore|der)", re.I)
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+MAX = 1 << 20
+
+def secret(name, data):
+    return bool(KEYNAME.fullmatch(name.rsplit("/", 1)[-1]) or SECRET.search(data))
+
+if mode == "secrets":
+    for f in args:
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read(MAX + 1)
+        except OSError:
+            continue
+        if secret(f, data):
+            print(f)
+    sys.exit(0)
+
+src, wanted = args[0], args[1:]
+bad, files = [], {}
+NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+def opened(name, dir_fd, directory):
+    try:
+        return os.open(name, NOFOLLOW | (os.O_DIRECTORY if directory else 0), dir_fd=dir_fd)
+    except OSError as exc:
+        bad.append("%s: %s" % (name, "a link" if exc.errno in (40, 20) else exc.strerror))
+
+def read(rel, name, dir_fd):
+    fd = opened(name, dir_fd, False)
+    if fd is None:
+        return
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            bad.append("%s: not a plain file" % rel); return
+        data = fh.read(MAX + 1)
+    if len(data) > MAX:
+        bad.append("%s: over 1 MiB" % rel); return
+    try:
+        if b"\0" in data:
+            raise ValueError
+        data.decode("utf-8")
+    except ValueError:
+        bad.append("%s: not text (UTF-8)" % rel); return
+    files[rel] = data
+
+if not os.path.isabs(src) or os.path.realpath(src) != os.path.normpath(src):
+    sys.exit("install-pilot.sh: --dsh-from %s goes through a symbolic link: give %s"
+             % (src, os.path.realpath(src)))
+root = opened(src, None, True)
+if root is None:
+    sys.exit("install-pilot.sh: %s: not copied: %s" % (src, "; ".join(bad)))
+read("hooks.json", "hooks.json", root)
+prof = opened("profiles", root, True)
+if prof is not None:
+    names = sorted(os.listdir(prof))
+    if hook and dry and mode == "tar":
+        subprocess.run(hook, shell=True, check=True)   # the tests' swap
+    for p in names:
+        if p.startswith("."):
+            continue
+        st = os.stat(p, dir_fd=prof, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode):
+            bad.append("profiles/%s: a link" % p); continue
+        if not stat.S_ISDIR(st.st_mode) or not NAME.fullmatch(p):
+            bad.append("profiles/%s: not a profile's directory" % p); continue
+        pfd = opened(p, prof, True)
+        if pfd is None:
+            continue
+        for f in sorted(os.listdir(pfd)):
+            rel = "profiles/%s/%s" % (p, f)
+            if f.startswith("."):
+                continue
+            st = os.stat(f, dir_fd=pfd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                continue
+            if not (stat.S_ISREG(st.st_mode) and NAME.fullmatch(f)
+                    and "." in f and f.rsplit(".", 1)[1].lower() in kinds):
+                bad.append("%s: not a file a profile needs (%s)" % (rel, ", ".join(kinds))); continue
+            read(rel, f, pfd)
+        os.close(pfd)
+    os.close(prof)
+os.close(root)
+secrets = [rel for rel, data in sorted(files.items()) if secret(rel, data)]
+if bad:
+    sys.exit("install-pilot.sh: %s: not copied:\n  %s" % (src, "\n  ".join(bad)))
+if secrets:
+    sys.exit("install-pilot.sh: not copied, they look like they hold a secret: %s" % " ".join(secrets))
+if "hooks.json" not in files or len(files) < 2:
+    sys.exit("install-pilot.sh: %s: no hooks.json, or no profile in profiles/" % src)
+if mode == "list":
+    print("\n".join(["hooks.json"] + sorted(r for r in files if r != "hooks.json")))
+    sys.exit(0)
+missing = [w for w in wanted if w not in files]
+if missing:
+    sys.exit("install-pilot.sh: %s changed while read: %s" % (src, " ".join(missing)))
+out = io.BytesIO()
+with tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as tar:
+    for rel in wanted:
+        info = tarfile.TarInfo(rel)
+        info.size, info.mode, info.mtime = len(files[rel]), 0o644, int(time.time())
+        tar.addfile(info, io.BytesIO(files[rel]))
+sys.stdout.buffer.write(out.getvalue())
+EOF
 }
-# looks_secret FILE…: the files that look like they hold a secret (a key,
-# a token, a password); their names only
-# (binary files read too; a private key, PEM or OpenSSH, by its content or
-# its usual name: codex #457 r1)
-looks_secret() {
-  local f
-  for f in "$@"; do
-    case "${f##*/}" in
-      id_rsa|id_dsa|id_ecdsa|id_ed25519|id_*_sk|*.pem|*.key|*.p12|*.pfx|*.jks|*.keystore) echo "$f" ;;
-    esac
-  done
-  grep -l -a -i -E \
-    -e 'sk-[A-Za-z0-9_-]{16,}' -e 'gh[pousr]_[A-Za-z0-9]{20,}' -e 'github_pat_[A-Za-z0-9_]{20,}' \
-    -e '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY' -e 'PuTTY-User-Key-File' \
-    -e '(api[_-]?key|token|secret|passw(or)?d)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[^"'"'"'[:space:],}]{8,}' \
-    -- "$@" 2>/dev/null || true
+looks_secret() { [ $# -eq 0 ] || dsh_read secrets "$@"; }
+
+# the guest's token file (codex #457 r2): a file of the guest's own, 0600,
+# in a private directory it makes (mktemp -d); written through a pipe (the
+# token in no argument, no environment), read by git's helper, removed at
+# exit
+CRED_DIR=
+cred_open() {
+  if [ "$DRY" = 1 ]; then
+    echo "+ runuser -u $GUEST -- mktemp -d"; CRED_DIR=/tmp/ameesh-cred.XXXXXX; return
+  fi
+  CRED_DIR=$(cd / && runuser -u "$GUEST" -- mktemp -d) && [[ "$CRED_DIR" =~ ^/[A-Za-z0-9/._-]+$ ]] \
+    || die "no private directory for the guest's token (mktemp -d)"
+  trap cred_close EXIT
+}
+cred_close() {
+  [ -n "$CRED_DIR" ] && [ "$DRY" = 0 ] || return 0
+  (cd / && runuser -u "$GUEST" -- rm -f -- "$CRED_DIR/token"; runuser -u "$GUEST" -- rmdir -- "$CRED_DIR") || true
+  CRED_DIR=
+}
+# cred_put AGENT: AGENT's GH_TOKEN in the token file, never traced
+cred_put() {
+  if [ "$DRY" = 1 ]; then
+    echo "+ (GH_TOKEN of $ETC/guest-$1.env) | runuser -u $GUEST -- sh -c 'umask 077 && cat > $CRED_DIR/token'"
+    return
+  fi
+  { quiet; } 2>/dev/null
+  local rc=0
+  token_of "$1" | (cd / && runuser -u "$GUEST" -- sh -c 'umask 077 && cat > "$1"' sh "$CRED_DIR/token") || rc=1
+  unquiet
+  [ "$rc" = 0 ] || die "the guest's token file was not written"
+}
+# git_cred CMD…: git as the guest, with the token file's helper alone: the
+# helpers of every config file reset on the command line (read after them
+# all), the config of the environment unset
+git_cred() {
+  local helper
+  helper=$(printf '!f() { [ "$1" = get ] || return 0; h=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in host=*) h=${l#host=} ;; esac; done; [ "$h" = github.com ] && [ -s %s ] && printf "username=x-access-token\\npassword=%%s\\n" "$(cat %s)"; }; f' \
+    "$CRED_DIR/token" "$CRED_DIR/token")
+  as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN GIT_TERMINAL_PROMPT=0 \
+    git -c credential.helper= -c "credential.helper=$helper" "$@"
+}
+# cred_helpers DIR: the helpers git uses in the clone in DIR, as the guest
+# sees them (its home; every file, includes followed), after the last reset;
+# DIR's own .git only (never a repository above it: an invalid clone reads
+# as no helper, a FAIL)
+# (none set: git says 1, an empty list; another failure: "unreadable")
+cred_helpers() {
+  local out rc=0
+  out=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_GLOBAL \
+          HOME="$(at "$GHOME")" XDG_CONFIG_HOME="$(at "$GHOME")/.config" \
+          git -c "safe.directory=*" --git-dir="$(at "$1")/.git" config --show-origin --get-all \
+          credential.helper 2>&1) || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) echo "unreadable (${out%%$'\n'*})"; return 0 ;;
+  esac
+  printf '%s\n' "$out" \
+    | awk -F'\t' '$2 == "" { n = 0; next } { list[++n] = $2 } END { for (i = 1; i <= n; i++) print list[i] }'
 }
 
 # --------------------------------------------------------------------------
@@ -589,11 +741,6 @@ EOF
      && [ "$(stat -c '%u %a' "$h")" = "$root_uid 755" ]; then
     ok "$HELPER (git credential helper, root 755)"
   else ko "$HELPER missing, changed, or not root 755 (--enable writes it)"; fi
-  # the helpers before reset (an empty one), then ours alone
-  if [ "$(git -C / config --file "$(at "$GHOME/.gitconfig")" --no-includes --get-all "$CREDENTIAL_KEY" \
-          2>/dev/null)" = "$(printf '\n%s' "$HELPER")" ]; then
-    ok "$GHOME/.gitconfig: $CREDENTIAL_KEY reset, then $HELPER alone"
-  else ko "$GHOME/.gitconfig: not $CREDENTIAL_KEY '' then $HELPER alone (--enable sets it)"; fi
   d=$(at "$GHOME/.dsh")
   if [ -f "$d/hooks.json" ] && [ -d "$d/profiles" ] && [ ! -L "$d" ] \
      && [ "$(stat -c %u "$d")" = "$guid" ]; then
@@ -626,6 +773,10 @@ EOF
       head=$(head -c 200 "$(at "$dir/.git/HEAD")" 2>/dev/null || true)
       case "$head" in "ref: "*) head=${head#ref: } ;; *) head="detached at ${head:0:12}" ;; esac
       ok "$dir: a clone of $origin, $head"
+      # the helpers git uses there, after the last reset: ours alone
+      helpers=$(cred_helpers "$dir")
+      [ "$helpers" = "$HELPER" ] && ok "$dir: credential.helper $HELPER alone" \
+        || ko "$dir: credential helpers in use: ${helpers:-none}, not $HELPER alone (--enable sets it)"
     else ko "$dir: not a clone of the guest's (--enable makes it)"; fi
   done
   for u in $(runner_units); do
@@ -660,7 +811,7 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
       resolved "$d" || die "$d goes through a symbolic link: refused, nothing done"
       ! mounts_under "$(at "$d")" || die "a mount point at or beneath $d: refused, nothing done"
     done
-    clones=()
+    clones=() kept=()
     while IFS=$'\t' read -r a project dir; do
       [ -n "${REPOS[$project]:-}" ] \
         || die "$a works on $project: give its forge, --repo $project=https://…#BRANCH"
@@ -671,6 +822,7 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
         [ -f "$(at "$dir/.git/index")" ] && [ ! -L "$(at "$dir/.git/index")" ] \
           || die "$dir is a clone of $origin never checked out: move it away first"
         echo "kept $dir: a clone of $origin (never fetched nor reset here)"
+        kept+=("$dir")
         continue
       fi
       if ! absent "$dir"; then
@@ -694,12 +846,14 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
         DSH_FROM=$(getent passwd "$SUDO_USER" | cut -d: -f6)/.dsh
       fi
       [ -n "$DSH_FROM" ] || die "no dsh profile in $dsh_dst: give --dsh-from DIR (a ~/.dsh)"
-      mapfile -t copy < <(dsh_files "$DSH_FROM")
-      [ "${copy[0]:-}" = hooks.json ] && [ ${#copy[@]} -gt 1 ] \
-        || die "$DSH_FROM: no hooks.json, or no profile in profiles/"
-      secrets=$(cd "$DSH_FROM" && looks_secret "${copy[@]}")
-      [ -z "$secrets" ] || die "not copied, they look like they hold a secret: $(echo $secrets)"
-      # what the guest has already is kept, never overwritten (codex #457 r1)
+      list=$(dsh_read list "$DSH_FROM") || exit 1
+      mapfile -t copy <<<"$list"
+      # what the guest has already is kept, never overwritten (codex #457 r1);
+      # no link on the way there (codex #457 r2), nor a directory taken for
+      # one (the copy is made as the guest all the same)
+      for d in "$dsh_dst" "$dsh_dst/profiles" $(printf '%s\n' "${copy[@]}" | sed -n 's#^\(profiles/[^/]*\)/.*#\1#p' | sort -u | sed "s#^#$dsh_dst/#"); do
+        [ ! -L "$(at "$d")" ] && ! not_a_dir "$d" || die "$d is a symbolic link or not a directory: refused, nothing done"
+      done
       keep=()
       for f in "${copy[@]}"; do
         if [ -e "$(at "$dsh_dst/$f")" ] || [ -L "$(at "$dsh_dst/$f")" ]; then
@@ -709,33 +863,27 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
       copy=("${keep[@]}")
     fi
     # each branch to clone exists, asked of the forge by the guest before
-    # anything is written (codex #457 r1); the token in git's environment
-    # only, handed by a helper that names it, never its value
+    # anything is written (codex #457 r1); the token through the guest's
+    # token file only (codex #457 r2)
+    [ ${#clones[@]} -eq 0 ] || cred_open
     for c in "${clones[@]}"; do
       read -r a dir spec <<<"$c"
-      { quiet; } 2>/dev/null
-      rc=0
-      GH_TOKEN=$(token_of "$a") GIT_TERMINAL_PROMPT=0 \
-        as_guest git -c credential.helper= -c "$CREDENTIAL_KEY=$LS_HELPER" \
-          ls-remote --exit-code --heads -- "${spec%%#*}" "refs/heads/${spec#*#}" || rc=$?
-      unquiet
-      [ "$rc" = 0 ] || die "${spec%%#*}: no branch ${spec#*#} (or the forge refused): nothing done"
+      cred_put "$a"
+      git_cred ls-remote --exit-code --heads -- "${spec%%#*}" "refs/heads/${spec#*#}" \
+        || die "${spec%%#*}: no branch ${spec#*#} (or the forge refused): nothing done"
     done
 
     say "the guest's git credential: $HELPER, for https://github.com"
     helper_text | put "$HELPER" 0755 root:root
-    # the helpers before it reset (an empty one), ours alone for github.com:
-    # a credential.helper=store set elsewhere never gets the token (codex #457 r1)
-    as_guest git config --file "$GHOME/.gitconfig" --replace-all "$CREDENTIAL_KEY" ""
-    as_guest git config --file "$GHOME/.gitconfig" --add "$CREDENTIAL_KEY" "$HELPER"
     if [ ${#copy[@]} -gt 0 ]; then
       say "the guest's dsh profile: ${copy[*]}, from $DSH_FROM"
       as_guest install -d -m 0700 "$dsh_dst"
-      # read by root, written by the guest
+      # read once by root (what was checked), written by the guest
       if [ "$DRY" = 1 ]; then
-        echo "+ tar -C $DSH_FROM -cf - ${copy[*]} | runuser -u $GUEST -- tar -C $dsh_dst -xf - --no-same-owner"
+        dsh_read tar "$DSH_FROM" "${copy[@]}" >/dev/null || exit 1
+        echo "+ (dsh_read tar $DSH_FROM ${copy[*]}) | runuser -u $GUEST -- tar -C $dsh_dst -xf - --no-same-owner"
       else
-        (cd / && tar -C "$DSH_FROM" -cf - -- "${copy[@]}" \
+        (cd / && dsh_read tar "$DSH_FROM" "${copy[@]}" \
            | runuser -u "$GUEST" -- tar -C "$dsh_dst" -xf - --no-same-owner) \
           || die "the dsh profile was not copied to $dsh_dst"
       fi
@@ -743,17 +891,19 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
     for c in "${clones[@]}"; do
       read -r a dir spec <<<"$c"
       say "$a: $dir, a clone of ${spec%%#*} detached on origin/${spec#*#}"
-      # the token from its secrets file, in the environment of git only,
-      # never traced
-      [ "$DRY" = 0 ] || echo "+ (GH_TOKEN of $ETC/guest-$a.env in the environment, never on a command line)"
-      { quiet; } 2>/dev/null
-      rc=0
-      GH_TOKEN=$(token_of "$a") GIT_TERMINAL_PROMPT=0 \
-        as_guest git -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" || rc=$?
-      unquiet
-      [ "$rc" = 0 ] || die "the clone of ${spec%%#*} failed"
+      cred_put "$a"
+      git_cred -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" \
+        || die "the clone of ${spec%%#*} failed"
       as_guest git -C "$dir" checkout --quiet --detach "origin/${spec#*#}" \
         || die "origin/${spec#*#} not checked out in $dir: a rerun refuses it, move it away"
+      kept+=("$dir")
+    done
+    cred_close
+    # each clone's helpers: those before reset (an empty one), then ours
+    # alone, in its own .git/config (read after the guest's every file)
+    for dir in "${kept[@]}"; do
+      as_guest git -C "$dir" config --local --replace-all credential.helper ""
+      as_guest git -C "$dir" config --local --add credential.helper "$HELPER"
     done
 
     for a in "${TARGETS[@]}"; do
