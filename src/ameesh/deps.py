@@ -51,7 +51,7 @@ import subprocess
 import sys
 import time
 
-from . import platform
+from . import platform, deps_packagers
 
 #: sub-directories of the cache root
 NM_DIR = "nm"
@@ -722,7 +722,7 @@ def git_exclude(link: str) -> str | None:
 
 def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
                  replace: bool = False, installer=npm_ci, env: dict | None = None,
-                 wait: float = FILL_WAIT_S) -> dict:
+                 wait: float = FILL_WAIT_S, force: bool = False) -> dict:
     """Give `pkg_dir` its shared `node_modules`; returns what was done:
 
     * `linked`: the symlink now points to the complete entry (`filled`
@@ -732,11 +732,24 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
     * `not-cached`: no complete entry and `fill_missing` is false;
     * `local`: the entry could not be filled, `npm ci` ran locally
       (`reason`), or `local-failed` if that failed too;
+    * `packager-refused`: this package needs a local tree for packaging
+      (`force` permits a development link); `package-invalid`: its manifest
+      could not be inspected;
     * `no-lockfile`."""
     pkg_dir = os.path.abspath(pkg_dir)
     result = {"package": pkg_dir}
     if not os.path.isfile(os.path.join(pkg_dir, LOCKFILE)):
         return dict(result, status="no-lockfile")
+    try:
+        packagers = deps_packagers.packagers(pkg_dir)
+    except (OSError, ValueError) as exc:
+        return dict(result, status="package-invalid", error=str(exc))
+    if packagers:
+        result["packagers"] = packagers
+        if not force:
+            return dict(result, status="packager-refused",
+                        reason=deps_packagers.local_reason(packagers) +
+                        "; --force overrides this refusal for development only")
     root = nm_root(cache_root)
     label = package_label(pkg_dir)
     tool = toolchain(pkg_dir, env)        # once: the key and the fill agree
@@ -808,10 +821,10 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
 
 def link_tree(top: str, cache_root: str, *, fill_missing: bool = True,
               replace: bool = False, installer=npm_ci, env: dict | None = None,
-              wait: float = FILL_WAIT_S) -> list[dict]:
+              wait: float = FILL_WAIT_S, force: bool = False) -> list[dict]:
     """`link_package` for every package under `top`."""
     return [link_package(p, cache_root, fill_missing=fill_missing, replace=replace,
-                         installer=installer, env=env, wait=wait)
+                         installer=installer, env=env, wait=wait, force=force)
             for p in find_packages(top)]
 
 
@@ -843,6 +856,8 @@ def make_local(pkg_dir: str, *, installer=npm_ci, env: dict | None = None) -> di
     a tool that needs a real directory."""
     link = os.path.join(os.path.abspath(pkg_dir), NODE_MODULES)
     result = {"package": os.path.abspath(pkg_dir)}
+    if not os.path.isfile(os.path.join(pkg_dir, LOCKFILE)):
+        return dict(result, status="no-lockfile", error="package-lock.json required for npm ci")
     if os.path.lexists(link) and not os.path.islink(link):
         return dict(result, status="local-kept")
     if os.path.islink(link):
@@ -851,7 +866,7 @@ def make_local(pkg_dir: str, *, installer=npm_ci, env: dict | None = None) -> di
         installer(os.path.abspath(pkg_dir), env)
     except FillError as exc:
         return dict(result, status="local-failed", error=str(exc))
-    return dict(result, status="local")
+    return dict(result, status="local", reason="local node_modules installed with npm ci")
 
 
 # --------------------------------------------------------------------------
@@ -1050,6 +1065,17 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
     if pkg is None or not os.path.isfile(os.path.join(pkg, LOCKFILE)):
         return passthrough()
     link = os.path.join(pkg, NODE_MODULES)
+    if command in INSTALL_COMMANDS:
+        try:
+            packagers = deps_packagers.packagers(pkg)
+        except (OSError, ValueError) as exc:
+            _say("invalid package.json: %s" % exc)
+            return 1
+        if packagers:
+            if os.path.islink(link):
+                os.unlink(link)
+            _say("%s: running the real npm locally" % deps_packagers.local_reason(packagers))
+            return passthrough()
     if command in TREE_COMMANDS:
         if os.path.islink(link):
             # a local tree from the lockfile first (never an empty one), then
@@ -1419,8 +1445,18 @@ def _status(top: str, cache_root: str) -> list[dict]:
             state = "local"
         else:
             state = "absent"
-        out.append({"package": pkg, "key": key, "node_modules": state,
-                    "cached": read_marker(entry_of(root, key)) is not None})
+        item = {"package": pkg, "key": key, "node_modules": state,
+                "cached": read_marker(entry_of(root, key)) is not None}
+        try:
+            packagers = deps_packagers.packagers(pkg)
+        except (OSError, ValueError) as exc:
+            item["warning"] = "invalid package.json: %s" % exc
+        else:
+            if packagers:
+                item["packagers"] = packagers
+                if os.path.islink(link):
+                    item["warning"] = deps_packagers.local_reason(packagers)
+        out.append(item)
     return out
 
 
@@ -1440,10 +1476,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="only link packages already in the cache")
     p_link.add_argument("--replace", action="store_true",
                         help="replace a local node_modules directory by the link")
+    p_link.add_argument("--force", action="store_true",
+                        help="allow packager projects to link for development; unlink before release")
     p_link.add_argument("--json", action="store_true")
     p_local = sub.add_parser(
-        "local", help="replace the link by a local node_modules (npm ci), e.g. before "
-                      "npm install <pkg>")
+        "local", aliases=["unlink"], help="replace the link by a local node_modules (npm ci), "
+                                         "before packaging or npm install <pkg>")
     p_local.add_argument("paths", nargs="*", help="packages (default: .)")
     p_local.add_argument("--json", action="store_true")
     p_status = sub.add_parser("status", help="each package: its key, link and cache state")
@@ -1459,8 +1497,8 @@ def main(argv: list[str] | None = None) -> int:
         items: list[dict] = []
         for top in paths:
             items += link_tree(top, cache_root, fill_missing=not args.no_fill,
-                               replace=args.replace)
-    elif args.command == "local":
+                               replace=args.replace, force=args.force)
+    elif args.command in ("local", "unlink"):
         items = [make_local(p) for top in paths for p in find_packages(top)]
     elif args.command == "status":
         items = [i for top in paths for i in _status(top, cache_root)]
@@ -1469,7 +1507,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps({"schema": SCHEMA, "cache_root": cache_root, "items": items},
                          ensure_ascii=False, sort_keys=True))
-    elif args.command in ("link", "local"):
+    elif args.command in ("link", "local", "unlink"):
         for item in items:
             print(_describe(item))
         if not items:
@@ -1479,6 +1517,8 @@ def main(argv: list[str] | None = None) -> int:
             print("  %-48s node_modules %-10s cache %s  key %s" % (
                 item["package"], item["node_modules"],
                 "complete" if item["cached"] else "missing", item["key"][:12]))
+            if item.get("warning"):
+                print("    WARNING: %s" % item["warning"])
     else:
         for item in items:
             marker = item["marker"]
@@ -1488,7 +1528,10 @@ def main(argv: list[str] | None = None) -> int:
                 marker.get("files", "?"),
                 "%.1f MiB" % (marker.get("bytes", 0) / 1024 ** 2),
                 len(live_links(item["path"]))))
-    failed = any(i.get("status") == "local-failed" for i in items)
+    failed = any(i.get("status") in ("local-failed", "packager-refused", "package-invalid",
+                                     "no-lockfile") for i in items)
+    if args.command == "unlink" and not items:
+        failed = True
     return 1 if failed else 0
 
 

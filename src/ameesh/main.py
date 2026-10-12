@@ -92,7 +92,7 @@
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
-  ameesh deps link|local|status|entries node_modules shared per lockfile (#248);
+  ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
