@@ -2,6 +2,7 @@
 """L159e — `ameesh guard`, tranche 1: offer, levels, state, observation loop."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import os
@@ -12,9 +13,19 @@ from unittest import mock
 
 from ameesh import guard
 
+from .test_l159a_capacity_guard import errors as schema_errors
+from .test_l159a_capacity_guard import schema
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = os.path.join(HERE, "dore", "capacity_guard", "levels.json")
 GIB = 1024 ** 3
+#: the three caps every offer must carry (contract §3), large enough to
+#: leave the computations alone
+CAPS = {"cpu_max": 8, "memory_max": "1TiB", "disk_max": "10TiB"}
+
+
+def lend(**fields) -> dict:
+    return dict(CAPS, **fields)
 
 
 def _epoch(text: str) -> float:
@@ -63,17 +74,52 @@ class OfferTest(unittest.TestCase):
         self.assertEqual(len(offer.windows), 2)
 
     def test_invalid_offers(self):
-        for lend in (None, {}, {"cpu_max": -1}, {"cpu_max": 1, "memory_max": "lots"},
-                     {"cpu_weight": 0}, {"reclaim": {"cpu_pressure_max": "120%"}},
-                     {"reclaim": {"busy_units": "x"}}, {"reclaim": {"busy_max": -1}},
-                     {"windows": ["someday"]}, {"windows": ["mon 25:00-26:00"]},
-                     {"drain_seconds": 0},
-                     # codex #211 r5: non-finite times kept the guard draining forever
-                     {"drain_seconds": 1e309}, {"drain_seconds": float("nan")},
-                     {"calm_seconds": float("inf")}, {"calm_seconds": 10 ** 400},
-                     {"cpu_max": float("nan")}, {"drain_seconds": True}):
-            with self.assertRaises(guard.GuardError, msg=lend):
-                guard.parse_offer(lend)
+        bad = [{"cpu_max": -1}, {"memory_max": "lots"},
+               {"cpu_weight": 0}, {"reclaim": {"cpu_pressure_max": "120%"}},
+               {"reclaim": {"busy_units": 3}}, {"reclaim": {"busy_max": -1}},
+               {"windows": ["someday"]}, {"windows": ["mon 25:00-26:00"]},
+               {"drain_seconds": 0},
+               # codex #211 r5: non-finite times kept the guard draining forever
+               {"drain_seconds": 1e309}, {"drain_seconds": float("nan")},
+               {"calm_seconds": float("inf")}, {"calm_seconds": 10 ** 400},
+               {"cpu_max": float("nan")}, {"drain_seconds": True},
+               {"reclaim": {"io_pressure_max": "120%"}},
+               {"reclaim": {"disk_paths": "/"}}]
+        for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
+            with self.assertRaises(guard.GuardError, msg=offer):
+                guard.parse_offer(offer)
+
+    def test_exactly_the_offers_of_the_contract(self):
+        # codex #211 r6: the guard reads the offer with the contract's reader;
+        # every golden offer the canon accepts, the guard accepts, and the
+        # other way round
+        with open(os.path.join(HERE, "dore", "capacity_guard", "offer.json")) as fh:
+            cases = json.load(fh)["cases"]
+        for case in cases:
+            with self.subTest(case["why"]):
+                if "offer" in case:
+                    offer = guard.parse_offer(case["lend"])
+                    self.assertEqual(offer.published, case["offer"])
+                else:
+                    with self.assertRaises(guard.GuardError):
+                        guard.parse_offer(case["lend"])
+        # overnight windows on a list of days, a calm of 0, a zone
+        offer = guard.parse_offer(lend(windows=["mon,wed 18:00-14:00 UTC",
+                                                "sun 18:00-20:00 Europe/Paris"],
+                                       calm_seconds=0))
+        self.assertEqual(offer.calm_seconds, 0.0)
+        # Wednesday 2026-10-14 23:00 UTC: Wednesday's night runs to Thursday 14:00
+        self.assertEqual(guard.window_end(offer, _epoch("2026-10-14T23:00:00")),
+                         (True, _epoch("2026-10-15T14:00:00")))
+        self.assertEqual(guard.window_end(offer, _epoch("2026-10-13T15:00:00"))[0], False)
+        # Sunday 17:00 UTC is 19:00 in Paris (summer time): open until 18:00 UTC
+        self.assertEqual(guard.window_end(offer, _epoch("2026-10-18T17:00:00")),
+                         (True, _epoch("2026-10-18T18:00:00")))
+        # the guard's own reclaim keys are published with the offer
+        offer = guard.parse_offer(lend(reclaim={"io_pressure_max": "20%",
+                                                "disk_free_min": "2GiB"}))
+        self.assertEqual(offer.published["reclaim"],
+                         {"io_pressure_max": 20.0, "disk_free_min": 2 * GIB})
 
     def test_windows(self):
         night = guard.parse_window("mon-fri 18:00-14:00 UTC")
@@ -93,12 +139,12 @@ class OfferTest(unittest.TestCase):
         self.assertEqual(weekend.end_if_open(_epoch("2026-10-17T10:00:00")),
                          _epoch("2026-10-19T00:00:00"))
         self.assertIsNone(weekend.end_if_open(_epoch("2026-10-16T10:00:00")))
-        offer = guard.parse_offer({"windows": ["mon-fri 18:00-14:00 UTC", "sat-sun"]})
+        offer = guard.parse_offer(lend(windows=["mon-fri 18:00-14:00 UTC", "sat-sun"]))
         self.assertEqual(guard.raw_level(offer, {}, _epoch("2026-10-12T15:00:00")),
                          (3, "window_end"))
         self.assertEqual(guard.raw_level(offer, {}, _epoch("2026-10-12T19:00:00")),
                          (0, "idle"))
-        self.assertEqual(guard.window_end(guard.parse_offer({"cpu_max": 1}), 0.0),
+        self.assertEqual(guard.window_end(guard.parse_offer(lend()), 0.0),
                          (True, None))
 
 
@@ -108,7 +154,7 @@ class StateTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = guard.GuardConfig(
             host="vm-test", max_agents=3,
-            offer=guard.parse_offer({"cpu_max": 3, "memory_max": "14GiB",
+            offer=guard.parse_offer({"cpu_max": 3, "memory_max": "14GiB", "disk_max": "10TiB",
                                      "agent_memory_max": "4GiB",
                                      "reclaim": {"memory_available_min": "6GiB",
                                                  "cpu_pressure_max": "20%"}}),
@@ -149,6 +195,33 @@ class StateTest(unittest.TestCase):
             stop = guard.build_state(self.cfg, guard.Decision(4, "app_memory", 50.0), 11,
                                      100.0, reading=self.reading)
             self.assertEqual((stop["state"], stop["drain_deadline_ts"]), ("stopped", None))
+
+    def test_states_match_the_schema(self):
+        # codex #211 r6: the published offer in bytes, cpu_share > 0; every
+        # level checked against docs/schemas/ameesh-host-state-1.schema.json
+        doc = schema("ameesh-host-state-1.schema.json")
+        with mock.patch.object(guard.resources, "lendable", None, create=True), \
+                mock.patch.object(guard.resources, "measure", None, create=True):
+            for level in range(5):
+                with self.subTest(level=level):
+                    state = guard.build_state(self.cfg, guard.Decision(level, "app_cpu", 50.0),
+                                              7, 100.0, reading=self.reading, in_turn=1)
+                    self.assertEqual(schema_errors(doc, state), [])
+            self.assertEqual(set(guard.MEASURE_KEYS) | {"lendable"},
+                             set(doc["properties"]["measure"]["required"]))
+            self.assertEqual((state["offer"]["memory_max"], state["offer"]["disk_max"]),
+                             (14 * GIB, 10 * 1024 * GIB))
+            # 0.001 CPU of 64: the smallest share, not 0.0
+            cfg = dataclasses.replace(self.cfg, offer=guard.parse_offer(lend(cpu_max=0.001)))
+            reading = dict(self.reading, cpu_count=64)
+            for level in (0, 1):
+                state = guard.build_state(cfg, guard.Decision(level, "idle", 0.0), 1, 100.0,
+                                          reading=reading)
+                self.assertEqual(state["caps"]["cpu_share"], guard.CPU_SHARE_MIN)
+                self.assertEqual(schema_errors(doc, state), [])
+        self.assertEqual(guard.cpu_share(0.125), 0.125)
+        self.assertEqual(guard.cpu_share(0.33333), 0.3334)
+        self.assertEqual(guard.cpu_share(3.0), 1.0)
 
     def test_lendable_capped_by_the_offer(self):
         # the measure (L159d, or the warm-up) never lends more than the offer
@@ -426,7 +499,7 @@ class SignalsTest(unittest.TestCase):
         # codex #211 r4: the guard measured no disk (sample() without a path),
         # so the lendable disk and caps.disk_mb never appeared
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer({"cpu_max": 1}),
+            cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer(lend()),
                                     work_path=tmp)
             reading = guard.read_signals(cfg, 100.0, psi=lambda avg: {},
                                          busy=lambda units: None)
@@ -451,6 +524,10 @@ class CliTest(unittest.TestCase):
             self.assertEqual(json.loads(printed)["schema"], "ameesh-host-state/1")
             # codex #211 r4: the disk of work_path, measured through sample()
             self.assertEqual(json.loads(printed)["caps"].get("disk_mb"), 1)
+            # codex #211 r6: the offer as published, in bytes, and the schema
+            self.assertEqual(json.loads(printed)["offer"]["memory_max"], 4 * GIB)
+            self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
+                                           json.loads(printed)), [])
             with mock.patch("sys.stderr"):
                 self.assertEqual(guard.main(["run", "--config", config]), 2)
             self.assertEqual(guard.main(["run", "--observe", "--once", "--config", config]), 0)
