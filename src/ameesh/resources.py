@@ -311,6 +311,18 @@ def docker_root(now: float | None = None) -> str | None:
     return root
 
 
+def tmp_paths(cfg, policy=None) -> list[str]:
+    """The turns' tmp root (with a state dir) and the system tmp (#306)."""
+    from . import menage as menage_mod
+    tmps = []
+    if getattr(cfg, "state_dir", None):
+        try:  # a reading never fails on a managed root
+            tmps.append(menage_mod.tmp_root(cfg, policy or menage_mod.Policy()))
+        except Exception:
+            pass
+    return tmps + [system_tmp()]
+
+
 def disk_paths(cfg, policy=None) -> list[str]:
     """The paths whose filesystems the guard watches (#253): every work root
     that exists (the current directory without any), the state dir, the deps
@@ -320,18 +332,14 @@ def disk_paths(cfg, policy=None) -> list[str]:
     from . import menage as menage_mod
     paths = [os.path.expanduser(root) for root in getattr(cfg, "worktree_roots", ()) or ()]
     paths = [p for p in paths if os.path.isdir(p)] or [os.getcwd()]
-    tmps = []
     state_dir = getattr(cfg, "state_dir", None)
     if state_dir:
         paths.append(state_dir)
-        policy = policy or menage_mod.Policy()
         try:  # a reading never fails on a managed root
-            paths.append(menage_mod.cache_root(cfg, policy))
-            tmps.append(menage_mod.tmp_root(cfg, policy))
+            paths.append(menage_mod.cache_root(cfg, policy or menage_mod.Policy()))
         except Exception:
             pass
-    tmps.append(system_tmp())
-    paths += [p for p in tmps if not menage_mod.in_memory(p)]
+    paths += [p for p in tmp_paths(cfg, policy) if not menage_mod.in_memory(p)]
     docker = docker_root()
     if docker:
         paths.append(docker)
@@ -420,6 +428,14 @@ def worst(vols: list[dict], field: str) -> dict | None:
     """The volume with the lowest reading of `field`, None when none reads it."""
     known = [v for v in vols or () if v.get(field) is not None]
     return min(known, key=lambda v: v[field]) if known else None
+
+
+def tmp_usage(tmps) -> dict:
+    """`fs_usage` of the fullest tmpfs among `tmps` (#306: the turns' tmp root
+    can be a tmpfs of its own), else of the last one (the system tmp)."""
+    usages = [fs_usage(p) for p in tmps]
+    known = [u for u in usages if tmpfs_fraction(u) is not None]
+    return max(known, key=tmpfs_fraction) if known else usages[-1]
 
 
 def system_tmp() -> str:
@@ -746,15 +762,16 @@ def measure(reading: dict | None, offer: dict | None = None) -> dict:
 
 
 def sample(host: str, *, path: str | None = None, now: float | None = None,
-           turns_in_progress: int | None = None, tmp: str | None = None,
+           turns_in_progress: int | None = None, tmp: str | list | None = None,
            paths: list[str] | None = None) -> dict:
     """Un relevé de l'hôte : les mesures lisibles, les autres à None.
 
     `paths` (#253, `disk_paths`) : les dossiers dont on mesure les systèmes de
     fichiers, un relevé par système distinct (`volumes`) ; les colonnes à plat
     gardent le PIRE relevé de chaque plancher, `disk_path` le chemin du disque
-    le moins libre. `path` seul : ce seul dossier. `now` permet aux tests de
-    fixer l'instant.
+    le moins libre. `path` seul : ce seul dossier. `tmp` : le /tmp mesuré, ou
+    une liste (#306, `tmp_paths`) dont le tmpfs le plus plein est gardé. `now`
+    permet aux tests de fixer l'instant.
     """
     vols = volumes(paths if paths is not None else [path] if path else [])
     out: dict = {
@@ -773,7 +790,8 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     low = worst(vols, "disk_free_bytes")
     out["disk_path"] = low["path"] if low is not None else (vols[0]["path"] if vols else path)
     out.update(_meminfo())
-    out.update(fs_usage(system_tmp() if tmp is None else tmp))
+    out.update(tmp_usage([system_tmp()] if tmp is None
+                         else [tmp] if isinstance(tmp, str) else tmp))
     out.update(power())
     # L159d: PSI, application and guest shares
     out.update(psi())
@@ -796,7 +814,8 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
         turns = storage.of(db).hosts.turns_in_progress(host)
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         turns = None
-    reading = sample(host, paths=disk_paths(cfg, policy), now=now, turns_in_progress=turns)
+    reading = sample(host, paths=disk_paths(cfg, policy), now=now, turns_in_progress=turns,
+                     tmp=tmp_paths(cfg, policy))
     # L159d: lendable capacity, on the 7 days of readings of the host
     try:
         basis = storage.of(db).hosts.lend_basis(host, LEND_WINDOW_S, LEND_SLOT_S,

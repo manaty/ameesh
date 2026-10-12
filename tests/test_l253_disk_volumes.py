@@ -94,6 +94,40 @@ class DiskPathsTest(_Tmp):
         self.assertEqual(self.paths(self.cfg())[-1], os.sep)
 
 
+class TmpfsRootsTest(_Tmp):
+    """#306 (2): state on a tmpfs and the turns' tmp root on another tmpfs:
+    both are sampled, the fullest one is the reading's tmp measure."""
+
+    def test_fullest_tmpfs_among_the_tmp_roots(self):
+        turn_tmp, system = self.dir("turn-tmp"), self.dir("tmp")
+        cfg = types.SimpleNamespace(worktree_roots=[], state_dir=self.dir("state"))
+        policy = menage.Policy(tmp_root=turn_tmp)
+        sizes = {turn_tmp: (10 * GIB, 9.5 * GIB), system: (12 * GIB, 1 * GIB)}
+
+        def usage(path, **_kw):
+            size, used = sizes[path]
+            return {"tmp_path": path, "tmp_fstype": "tmpfs",
+                    "tmp_size_bytes": int(size), "tmp_used_bytes": int(used)}
+
+        with mock.patch.dict(os.environ, {"AMEESH_SYSTEM_TMP": system}), \
+                mock.patch.object(menage, "in_memory", return_value=True), \
+                mock.patch.object(menage, "_disk_root", side_effect=lambda d, _: d), \
+                mock.patch.object(resources, "docker_root", return_value=None):
+            self.assertEqual(resources.tmp_paths(cfg, policy), [turn_tmp, system])
+            self.assertNotIn(turn_tmp, resources.disk_paths(cfg, policy))
+            with mock.patch.object(resources, "fs_usage", side_effect=usage):
+                reading = resources.sample("pc", paths=[], now=1.0,
+                                           tmp=resources.tmp_paths(cfg, policy))
+        self.assertEqual(reading["tmp_path"], turn_tmp)
+        self.assertEqual(resources.tmpfs_fraction(reading), 0.95)
+        limits = resources.thresholds({})
+        found = {b["key"]: b for b in resources.breaches(reading, limits)}
+        self.assertIn(turn_tmp, found["max_tmpfs_used"]["label"])
+        with mock.patch.object(resources, "fs_usage", side_effect=usage):
+            self.assertEqual(resources.sample("pc", paths=[], now=1.0,
+                                              tmp=system)["tmp_path"], system)
+
+
 class DockerRootTest(_Tmp):
     def run_docker(self, stdout="/var/lib/docker\n", code=0):
         return subprocess.CompletedProcess([], code, stdout=stdout, stderr="")
