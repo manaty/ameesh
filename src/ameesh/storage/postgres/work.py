@@ -419,7 +419,7 @@ class WorkItems(interface.WorkItems):
             return {}
         rows = self.db.query(
             """
-            SELECT w.id,
+            SELECT w.id, coalesce(b.id, 0) AS episode,
                    extract(epoch from coalesce(b.created_at, w.created_at))::float8
                        AS start_ts,
                    extract(epoch from (
@@ -433,7 +433,8 @@ class WorkItems(interface.WorkItems):
                     ORDER BY e.id DESC LIMIT 1) b ON true
              WHERE w.id IN (SELECT jsonb_array_elements_text(%s::jsonb)::bigint)
             """, (json.dumps(ids),))
-        return {int(r["id"]): {"start_ts": r["start_ts"], "first_ts": r["first_ts"]}
+        return {int(r["id"]): {"episode": int(r["episode"]), "start_ts": r["start_ts"],
+                               "first_ts": r["first_ts"]}
                 for r in rows}
 
     def events(self, item_id, limit) -> list[dict]:

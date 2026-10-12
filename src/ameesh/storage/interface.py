@@ -970,10 +970,11 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def waiting_episodes(self, item_ids: Sequence[int]) -> dict[int, dict]:
         """L233: for each lot, its current waiting episode, stable across
-        notes: `{id: {start_ts, first_ts}}` — `start_ts`, the time of the
-        lot's last journal line in another state than `waiting_human` (its
-        creation if none), `first_ts`, the first `waiting_human` line after
-        it (None if the state was set without a journal line)."""
+        notes: `{id: {episode, start_ts, first_ts}}` — `episode`, the id of
+        the lot's last journal line in another state than `waiting_human`
+        (0 if none), `start_ts`, its time (the lot's creation if none),
+        `first_ts`, the first `waiting_human` line after it (None if the
+        state was set without a journal line)."""
 
     @abc.abstractmethod
     def note(self, item_id: int, state: str, text: str, actor: str) -> None:

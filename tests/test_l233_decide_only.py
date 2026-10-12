@@ -133,6 +133,17 @@ class WaitingHumanTest(_Base):
         third = self._without_question()
         self.assertEqual(len(third), 1)
         self.assertNotEqual(notify.key_of(third[0]), notify.key_of(first[0]))
+        self.assertNotEqual(third[0]["episode"], first[0]["episode"])
+
+    def test_alert_key_tells_episodes_apart_within_a_second(self):
+        # `since` is rounded to the second: the episode (journal line id)
+        # keeps two episodes starting in the same second apart
+        base = {"type": "waiting_without_question", "agent": "dev1", "lot": 7,
+                "since": 1000.2}
+        self.assertNotEqual(exploitation.alert_key(dict(base, since=1000.2, episode=11)),
+                            exploitation.alert_key(dict(base, since=1000.4, episode=12)))
+        self.assertEqual(exploitation.alert_key(dict(base, episode=11)),
+                         exploitation.alert_key(dict(base, since=1000.4, episode=11)))
 
     def test_decisions_queue_does_not_count_unasked_lots(self):
         self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
