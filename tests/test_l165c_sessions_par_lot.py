@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L165b (#408) : un agent au repos n'attend jamais une relecture.
+
+Une session par (agent, lot), mise de côté quand l'agent passe à un autre lot
+et reprise (`--resume`) quand un retour arrive sur le premier ; réveil de
+l'exécuteur sur un lot actionnable (règle 1), borné et gardé en base.
+Postgres réel (les deux pilotes, AMEESH_DRIVER) ; faux harnais du banc."""
+from __future__ import annotations
+
+import os
+import time
+
+from ameesh import registry, storage, work
+from ameesh.runner import Runner
+
+from .support import PgTestCase
+
+
+class _Base(PgTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute("TRUNCATE agent_lot_sessions, work_items, agent_registry CASCADE")
+
+    def _cwd(self, name: str) -> str:
+        path = os.path.join(self.tmp, "work", name)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def bail(self, name: str):
+        runner = Runner(self.cfg, self.db, once=True)
+        self.register(name, "claude", cwd=self._cwd(name))
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        return runner, lease
+
+    @property
+    def st(self):
+        return storage.of(self.db).lot_sessions
+
+
+class StockageTest(_Base):
+    def test_bascule_met_de_cote_puis_reprend(self):
+        runner, lease = self.bail("a1")
+        a = work.add(self.db, title="A", assignee="a1")["id"]
+        b = work.add(self.db, title="B", assignee="a1")["id"]
+        epoch = lease["lease_epoch"]
+        storage.of(self.db).operations.set_session_work_item("a1", runner.runner_id, epoch,
+                                                             str(a))
+        registry.set_session(self.db, "a1", "sess-a", "compte")
+        cle = dict(harness="claude", account="compte", cwd="/w")
+        out = self.st.switch("a1", runner.runner_id, epoch, to_lot=str(b),
+                             current="sess-a", **cle)
+        self.assertEqual(out, {"resumed": None, "parked": "sess-a", "discarded": None})
+        agent = registry.get(self.db, "a1")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, str(b)))
+        registry.set_session(self.db, "a1", "sess-b", "compte")
+        out = self.st.switch("a1", runner.runner_id, epoch, to_lot=str(a),
+                             current="sess-b", **cle)
+        self.assertEqual(out, {"resumed": "sess-a", "parked": "sess-b", "discarded": None})
+        agent = registry.get(self.db, "a1")
+        self.assertEqual((agent["session_id"], agent["session_work_item"],
+                          agent["session_account"]), ("sess-a", str(a), "compte"))
+        lignes = {r["work_item_id"]: r["session_id"] for r in self.st.listing("a1")}
+        self.assertEqual(lignes, {a: None, b: "sess-b"})
+
+    def test_compte_harnais_ou_dossier_differents_ecartent_la_session(self):
+        runner, lease = self.bail("a2")
+        a = work.add(self.db, title="A", assignee="a2")["id"]
+        b = work.add(self.db, title="B", assignee="a2")["id"]
+        epoch = lease["lease_epoch"]
+        for i, autre in enumerate(({"account": "autre"}, {"harness": "codex"},
+                                   {"cwd": "/ailleurs"})):
+            with self.subTest(autre=autre):
+                cle = dict(harness="claude", account="compte", cwd="/w")
+                storage.of(self.db).operations.set_session_work_item(
+                    "a2", runner.runner_id, epoch, str(a))
+                self.st.switch("a2", runner.runner_id, epoch, to_lot=str(b),
+                               current="sess-%d" % i, **cle)
+                cle.update(autre)
+                out = self.st.switch("a2", runner.runner_id, epoch, to_lot=str(a),
+                                     current=None, **cle)
+                self.assertEqual((out["resumed"], out["discarded"]), (None, "sess-%d" % i))
+                self.assertIsNone(registry.get(self.db, "a2")["session_id"])
+
+    def test_bascule_fencee_par_le_bail(self):
+        runner, lease = self.bail("a3")
+        a = work.add(self.db, title="A", assignee="a3")["id"]
+        self.assertIsNone(self.st.switch("a3", "autre", lease["lease_epoch"], to_lot=str(a),
+                                         harness="claude", account=None, cwd="/w",
+                                         current="s"))
+        self.assertIsNone(self.st.switch("a3", runner.runner_id, lease["lease_epoch"] + 1,
+                                         to_lot=str(a), harness="claude", account=None,
+                                         cwd="/w", current="s"))
+        self.assertEqual(self.st.listing("a3"), [])
+
+    def test_purge_des_lots_finis_ou_reassignes(self):
+        runner, lease = self.bail("a4")
+        a = work.add(self.db, title="A", assignee="a4")["id"]
+        b = work.add(self.db, title="B", assignee="a4")["id"]
+        c = work.add(self.db, title="C", assignee="a4")["id"]
+        for lot in (a, b, c):
+            self.st.note_wake("a4", lot, time.time())
+        work.close(self.db, a, abandoned=True, actor="test")
+        work.assign(self.db, b, "human:quelqu-un")
+        purges = {r["work_item_id"] for r in self.st.purge()}
+        self.assertEqual(purges, {a, b})
+        self.assertEqual([r["work_item_id"] for r in self.st.listing("a4")], [c])
+
+    def test_reveils_comptes_jusqu_a_ce_que_le_lot_vive(self):
+        self.bail("a5")
+        a = work.add(self.db, title="A", assignee="a5")["id"]
+        t = time.time()
+        self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 1)
+        self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 2)
+        self.assertEqual(self.st.note_wake("a5", a, t + 5)["wakes"], 1)
+
+    def test_lots_actionnables(self):
+        self.bail("a6")
+        def lot(title, **kw):
+            return work.add(self.db, title=title, assignee="a6", **kw)["id"]
+        bas = lot("priorité basse", priority=3)
+        haut = lot("priorité haute", priority=1)
+        build = lot("en build")
+        work.move(self.db, build, "build")
+        qa = lot("en qa")
+        work.move(self.db, qa, "build")
+        work.move(self.db, qa, "qa")
+        tenu = lot("tenu")
+        work.note(self.db, tenu, "hold: attend la fin de #1", actor="a6")
+        repris = lot("tenu puis repris")
+        work.note(self.db, repris, "hold: un temps", actor="a6")
+        work.note(self.db, repris, "reprise", actor="a6")
+        bloque = lot("attend un autre lot")
+        bloqueur = work.add(self.db, title="bloqueur")["id"]
+        from ameesh import work_dependencies
+        work_dependencies.add(self.db, bloque, bloqueur, actor="test")
+        decision = lot("attend une décision")
+        storage.of(self.db).decisions.create(
+            sender="a6", recipient="human:*", body="faut-il ?",
+            payload={"decision": {"v": 1, "state": "pending", "question": "faut-il ?",
+                                  "options": [], "lot": decision,
+                                  "previous_state": "intake"}},
+            work_item_id=str(decision), host=None)
+        demain = lot("pour plus tard")
+        self.db.execute("UPDATE work_items SET planned_start = '2999-01-01' WHERE id = %s",
+                        (demain,))
+        ids = [r["id"] for r in self.st.actionable("a6")]
+        self.assertEqual(ids[:2], [haut, bas])
+        self.assertEqual(set(ids), {haut, bas, build, repris})
+        self.assertNotIn(demain, ids)
+        self.assertTrue(all(r["activity_ts"] for r in self.st.actionable("a6")))

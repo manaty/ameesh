@@ -39,6 +39,7 @@ from .wakeups import Wakeups
 from .watches import Watches
 from .work import WorkItems
 from .work_dependencies import WorkDependencies
+from .lot_sessions import LotSessions
 
 
 class PostgresStorage(interface.Storage):
@@ -64,6 +65,7 @@ class PostgresStorage(interface.Storage):
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
         self.work_dependencies = WorkDependencies(db)
+        self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
         self.actions = Actions(db)
         self.action_source = ActionSource(db)
