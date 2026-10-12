@@ -9,6 +9,7 @@ import unittest
 
 from ameesh import backlog, notify, storage, work
 
+from .support import hold_for_owner
 from .test_l119_backlog import HEURE, _Base, _seuils
 
 
@@ -183,7 +184,7 @@ class PriseDeLotTest(_Lots):
         confie = self.lot("déjà confié par courrier")
         work.move(self.db, confie["id"], "build")
         humain = self.lot("attend un humain")
-        work.move(self.db, humain["id"], "waiting_human")
+        hold_for_owner(self.db, humain["id"])
         self.db.execute("UPDATE agent_mailbox SET delivered_at = now()"
                         " WHERE recipient = 'claude1'")
         self.assertEqual(self.take(), [])

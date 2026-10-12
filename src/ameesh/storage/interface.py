@@ -958,9 +958,23 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
-             actor: str) -> dict | None:
+             actor: str, held: bool = False) -> dict | None:
         """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et
-        journalise ; None (rien d'écrit) s'il n'est plus en `current`."""
+        journalise ; None (rien d'écrit) s'il n'est plus en `current`.
+
+        `held` (L233): also require an open decision request for the lot, in
+        the same statement, the request row locked: an answer closing it
+        concurrently waits for this move (then releases the lot) or makes it
+        fail (None) — the lot never ends waiting with no request."""
+
+    @abc.abstractmethod
+    def waiting_episodes(self, item_ids: Sequence[int]) -> dict[int, dict]:
+        """L233: for each lot, its current waiting episode, stable across
+        notes: `{id: {episode, start_ts, first_ts}}` — `episode`, the id of
+        the lot's last journal line in another state than `waiting_human`
+        (0 if none), `start_ts`, its time (the lot's creation if none),
+        `first_ts`, the first `waiting_human` line after it (None if the
+        state was set without a journal line)."""
 
     @abc.abstractmethod
     def note(self, item_id: int, state: str, text: str, actor: str) -> None:
@@ -1765,6 +1779,21 @@ class Decisions(Domain):
         inconnue) — rien n'est écrit."""
 
     @abc.abstractmethod
+    def source_mail(self, message_id: int) -> dict | None:
+        """L233: mail `message_id` (id, sender, recipient, body, kind,
+        work_item_id, created_ts), or None — the source of a request filed
+        with `ameesh decide ask --from-mail`."""
+
+    @abc.abstractmethod
+    def prose_candidates(self, *, recipients: Sequence[str], since_ts: float,
+                         limit: int) -> list[dict]:
+        """L233: mail sent since `since_ts` by an agent (not `ameesh`, not a
+        human, not a chat) to one of `recipients` or to any `human:*`, that is
+        neither a request, a reply, an alert (`event`) nor a receipt, and that
+        no request names as its source (`payload.decision.source_mail`): the
+        `limit` most recent, oldest first, same columns as `source_mail`."""
+
+    @abc.abstractmethod
     def register_chat(self, name: str, *, human: str, host: str, harness: str,
                       cwd: str | None, status_text: str) -> dict | None:
         """Inscrit (ou rafraîchit) l'agent de conversation `name` : mode
@@ -2045,6 +2074,11 @@ class HostResources(Domain):
     @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
+
+    @abc.abstractmethod
+    def since(self, host: str, since_s: float) -> list[dict]:
+        """L159g: the readings of the host over the last `since_s` seconds,
+        oldest first (the pilot report)."""
 
     @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,

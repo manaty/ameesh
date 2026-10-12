@@ -9,7 +9,7 @@ import unittest
 
 from ameesh import exploitation, mail, registry, stagnation, storage, work
 
-from .support import PgTestCase
+from .support import PgTestCase, hold_for_owner
 
 
 class LabelExterneTest(unittest.TestCase):
@@ -246,7 +246,7 @@ class AlertesVivaciteTest(_Base):
         self.db.execute("INSERT INTO work_items (title, state, assignee) "
                         "VALUES ('externe', 'intake', 'coord')")
         attente = work.add(self.db, title="attend un humain", assignee="dort")
-        work.move(self.db, attente["id"], "waiting_human")
+        hold_for_owner(self.db, attente["id"])
         humain = work.add(self.db, title="humain", assignee="human:proprio")
         self.db.execute("DELETE FROM agent_registry WHERE name = 'ouvrier'")
         registry.set_status(self.db, "dort", "stopped", status_text="arrêté à la main",

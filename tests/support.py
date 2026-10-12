@@ -128,6 +128,24 @@ for _compte_var in ACCOUNT_ENV_VARS:
     os.environ.pop(_compte_var, None)
 
 
+def hold_for_owner(db, lot_id: int, *, requester: str = "orchestrateur",
+                   question: str = "which option?") -> int:
+    """L233: put lot `lot_id` in `waiting_human` the only allowed way — an
+    open owner decision request (a pending `request` row) for it. Returns
+    the request id."""
+    from ameesh import storage, work
+
+    item = work.get(db, int(lot_id))
+    row = storage.of(db).decisions.create(
+        sender=requester, recipient="human:*", body=question,
+        payload={"decision": {"v": 1, "state": "pending", "question": question,
+                              "options": [], "lot": int(lot_id),
+                              "previous_state": item["state"]}},
+        work_item_id=str(lot_id), host=None)
+    work.move(db, int(lot_id), "waiting_human", actor=requester)
+    return int(row["id"])
+
+
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)
