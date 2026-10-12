@@ -37,11 +37,11 @@ class AssignmentError(RuntimeError):
 
 def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
-    agent qui a confié des lots dans les 30 derniers jours, ou fiche Agent du
-    canon dont `roles` nomme un orchestrateur (`sous_utilisation.orchestrators`,
-    lu en dernier : le canon coûte une lecture du dépôt). `roles` : les rôles
-    du canon qui comptent (défaut : orchestrateur ; `work.CORRECTOR_ROLES`
-    ajoute les agents de conception)."""
+    fiche Agent du canon dont `roles` nomme un orchestrateur
+    (`sous_utilisation.orchestrators`), ou — tant qu'aucune fiche ne déclare
+    de rôles (L242c) — agent qui a confié des lots dans les 30 derniers
+    jours. `roles` : les rôles du canon qui comptent (défaut : orchestrateur ;
+    `work.CORRECTOR_ROLES` ajoute les agents de conception)."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -49,22 +49,29 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     if name in declared:
         return True
     try:
-        if name in {su._bare(n) for n in storage.of(db).operations.assigners(
-                since_s=su.ASSIGNERS_SINCE_S)}:
-            return True
+        from . import canon
+        configured = canon.load_configured(cfg) if cfg is not None else []
     except Exception:
-        pass
+        configured = []
+    if not su.roles_declared(configured):
+        try:
+            if name in {su._bare(n) for n in storage.of(db).operations.assigners(
+                    since_s=su.ASSIGNERS_SINCE_S)}:
+                return True
+        except Exception:
+            pass
     try:
-        canons = None
+        canons = configured
         if roles is not None:
             # Correction roles are authority from this agent's own canon,
             # never from a namesake card in another configured canon.
-            from . import canon, registry
+            from . import registry
             row = registry.get(db, name)
-            canons = [c for c in (canon.load_configured(cfg) if cfg is not None else [])
+            canons = [c for c in configured
                       if row is not None and c.owns(row.get("canon"))]
         return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
-                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES)
+                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES,
+                                        deduce=False)
     except Exception:
         return False
 

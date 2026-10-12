@@ -143,9 +143,6 @@ GATE_SETTLE_RETRY_S = 30
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
-#: L242b : rôles de conception au canon (agents critiques, avec les
-#: orchestrateurs et les auditeurs)
-DESIGN_ROLES = ("conception", "design")
 #: L147 (#220 r2) : un conteneur relancé par sa politique (unité du
 #: gestionnaire utilisateur, podman-restart) peut démarrer après l'exécuteur —
 #: aucune ligne n'est soldée moins de BOOT_SETTLE_S après le démarrage de
@@ -5195,25 +5192,22 @@ class Runner:
 
     def is_critical(self, name: str, agent=None) -> bool:
         """L242b : agent critique, jamais en pause budget tant qu'un compte a
-        de la marge — déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS`),
-        orchestrateur (`AMEESH_ALERT_ORCHESTRATORS`, ou rôle au canon),
-        conception (rôle `conception` ou `design` au canon) ou auditeur
-        (`is_auditor`). Un rôle ne compte que dans le canon propriétaire de
-        l'agent : une fiche en conflit dans un autre canon ne le rend pas
-        critique (#324 r1)."""
+        de la marge. L242c : déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS` :
+        la surcharge explicite ; `AMEESH_ALERT_ORCHESTRATORS`), sinon par un
+        rôle critique de sa fiche, dans son canon propriétaire seulement
+        (`sous_utilisation.critical_by_role` : `critical_roles` de
+        l'organisation, défaut orchestrateur, conception, auditeur, relecture)."""
         if name in (getattr(self.cfg, "critical_agents", None) or ()):
             return True
         if name in getattr(self, "_orchestrators_declared", ()):
             return True
-        from . import auditor as auditor_mod, sous_utilisation as su
+        from . import sous_utilisation as su
         canons = getattr(self, "_audit_canons", ())
-        roles = su.ORCHESTRATOR_ROLES + DESIGN_ROLES
         # le registre n'est lu que pour un nom candidat, comme `is_auditor`
-        if name in su.role_orchestrators(canons, roles):
-            row = agent if agent is not None else registry.get(self.db, name)
-            if row and auditor_mod.owned_card(row, canons, roles) is not None:
-                return True
-        return self.is_auditor(name, agent)
+        if name not in su.critical_candidates(canons):
+            return False
+        row = agent if agent is not None else registry.get(self.db, name)
+        return su.critical_by_role(dict(row or {}, name=name), canons)
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:

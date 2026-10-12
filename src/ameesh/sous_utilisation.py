@@ -99,6 +99,13 @@ LOTS_WAITING_ON_OTHERS = ("qa", "waiting_human", "blocked")
 ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
 #: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
 DESIGN_ROLES = ("conception", "design")
+#: L242c : rôles qui rendent un agent critique (jamais en pause budget tant
+#: qu'un compte a de la marge), par défaut ; une organisation les règle par
+#: `critical_roles` dans son federation.yaml (manaty/home#25)
+CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
+#: L242c : les autres noms reconnus d'un rôle dans `roles`/`role` d'une fiche
+ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
+                 "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -329,6 +336,70 @@ def role_orchestrators(canons, roles=None) -> set:
     return found
 
 
+def _card_roles(data) -> list:
+    named = (data or {}).get("roles") or (data or {}).get("role") or []
+    return [named] if isinstance(named, str) else list(named)
+
+
+def roles_declared(canons) -> bool:
+    """L242c : une fiche Agent d'un des canons déclare-t-elle des rôles ?
+    Alors seuls les rôles désignent orchestrateurs et agents critiques (plus
+    de déduction par les lots confiés)."""
+    return any(_card_roles(getattr(getattr(agent, "fiche", None), "data", None))
+               for canon in canons or [] for agent in getattr(canon, "agents", None) or [])
+
+
+def critical_roles(canon) -> tuple:
+    """L242c : les rôles critiques d'une organisation (`critical_roles` de son
+    federation.yaml, liste ; vide : aucun), sinon `CRITICAL_ROLES` ; en
+    minuscules, synonymes compris."""
+    declared = (getattr(canon, "federation", None) or {}).get("critical_roles")
+    if isinstance(declared, str):
+        declared = [declared]
+    if not isinstance(declared, (list, tuple)):
+        declared = CRITICAL_ROLES
+    out = []
+    for role in declared:
+        role = str(role).strip().lower()
+        if role:
+            out += [role, *ROLE_SYNONYMS.get(role, ())]
+    return tuple(dict.fromkeys(out))
+
+
+def critical_by_role(row, canons) -> bool:
+    """L242c : l'agent du registre `row` porte-t-il un rôle critique dans la
+    fiche de son canon propriétaire (une fiche en conflit dans un autre canon
+    ne compte pas, #324 r1) ? La persona `auditeur` sans fiche l'est tant que
+    le rôle auditeur est critique (sans canon : les rôles par défaut)."""
+    from .alert_briefs import AUDITOR_NAME
+    owners = [c for c in canons or [] if getattr(c, "readable", True)
+              and c.owns(row.get("canon"))]
+    if row.get("name") == AUDITOR_NAME and any(
+            "auditeur" in critical_roles(c) for c in owners or [None]):
+        return True
+    for canon in owners:
+        definition = canon.agent(row["name"])
+        if definition is None:
+            continue
+        wanted = set(critical_roles(canon))
+        if any(str(r).strip().lower() in wanted
+               for r in _card_roles(definition.fiche.data)):
+            return True
+    return False
+
+
+def critical_candidates(canons) -> set:
+    """Les noms qui PEUVENT être critiques par leur rôle (toute fiche, tout
+    canon) : un nom hors de cet ensemble évite la lecture du registre."""
+    from .alert_briefs import AUDITOR_NAME
+    found = {AUDITOR_NAME}
+    for canon in canons or []:
+        roles = critical_roles(canon)
+        if roles:
+            found |= role_orchestrators([canon], roles)
+    return found
+
+
 def declared_orchestrators(env=None) -> set:
     """Les orchestrateurs déclarés par `AMEESH_ALERT_ORCHESTRATORS` (noms
     séparés par des virgules, `agent:` admis)."""
@@ -337,12 +408,13 @@ def declared_orchestrators(env=None) -> set:
 
 
 def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
-                  roles=ORCHESTRATOR_ROLES) -> list:
+                  roles=ORCHESTRATOR_ROLES, deduce: bool | None = None) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
     `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
     a confié des lots (délégation ou `work assign`) dans les 30 derniers
-    jours. Seulement des agents du registre."""
+    jours — tant qu'aucune fiche ne déclare de rôles (L242c ; `deduce` le
+    tranche pour l'appelant). Seulement des agents du registre."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -352,11 +424,14 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
         except Exception:
             canons = []
     found |= role_orchestrators(canons, roles)
-    try:
-        found |= {_bare(n) for n in storage.of(db).operations.assigners(
-            since_s=ASSIGNERS_SINCE_S)}
-    except Exception:
-        pass
+    if deduce if deduce is not None else not roles_declared(canons):
+        # L242c : la déduction par les lots confiés, seulement tant qu'aucune
+        # fiche ne déclare de rôles
+        try:
+            found |= {_bare(n) for n in storage.of(db).operations.assigners(
+                since_s=ASSIGNERS_SINCE_S)}
+        except Exception:
+            pass
     # L123 : le chat du propriétaire transmet, il ne répartit pas
     from .chat import is_chat_agent
     chats = {row["name"] for row in listing if is_chat_agent(row)}

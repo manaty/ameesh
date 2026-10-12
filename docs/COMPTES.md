@@ -448,24 +448,32 @@ claude.ai settings.
 Owner requirement (2026-10-12, 09:55 and 10:00). On 2026-10-12 at 09:50 the
 orchestrator and mesh-design were paused on budget.
 
-**Who is critical.** An agent is critical when any of these holds:
+**Who is critical** (L242c). An agent is critical by a role on its canon
+Agent card (`roles:`, manaty/home#25), not by its name. The critical roles
+are set per organisation, by `critical_roles` in its `federation.yaml`:
 
-* it is declared in the host's `critical_agents` setting (list), or in
-  `AMEESH_CRITICAL_AGENTS` (comma-separated);
-* it is declared as an orchestrator (`AMEESH_ALERT_ORCHESTRATORS`), or its
-  canon Agent card has the role `orchestrateur`;
-* its canon Agent card has the role `conception` or `design`;
-* it is an auditor (the `auditeur` agent, or the `auditeur` role).
-
-A role counts only on the card in the agent's own canon. A conflicting card
-with the same name in another canon never makes an agent critical.
-
-The canon does not give these roles today, so declare the orchestrators and
-the design agent on each host:
-
-```json
-"critical_agents": ["orchestrateur", "mesh-design"]
+```yaml
+critical_roles: [orchestrateur, conception, auditeur, relecture]
 ```
+
+That list is the default when the key is absent; an empty list makes no
+role critical. Each role also matches its usual synonym: `orchestrator`,
+`design`, `auditor`, `review` or `reviewer`. The `auditeur` agent without a
+card is critical while `auditeur` is a critical role.
+
+A role counts only on the card in the agent's own canon, against that
+canon's `critical_roles`. A conflicting card with the same name in another
+canon never makes an agent critical.
+
+Two declarations still make an agent critical whatever its roles:
+
+* the host's `critical_agents` setting (list), or `AMEESH_CRITICAL_AGENTS`
+  (comma-separated): the explicit override, for an agent whose card does
+  not (yet) say it;
+* `AMEESH_ALERT_ORCHESTRATORS`.
+
+`ameesh resume`, when it plans the account of the next session, judges an
+agent the same way.
 
 **Per-agent choice.** For a critical agent, the account choice of § 2–4 is
 made for that agent alone:

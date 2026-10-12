@@ -616,6 +616,21 @@ def _local_session(cfg: Config, row: dict) -> str | None:
         return None
 
 
+def _critical(cfg: Config, row: dict) -> bool:
+    """L242c : comme `Runner.is_critical` — déclaré, ou rôle critique de sa
+    fiche dans son canon propriétaire."""
+    from . import sous_utilisation as su
+    if row["name"] in (getattr(cfg, "critical_agents", None) or ()) \
+            or row["name"] in su.declared_orchestrators():
+        return True
+    try:
+        from . import canon as canon_mod
+        canons = canon_mod.load_configured(cfg) if getattr(cfg, "canon", None) else []
+    except Exception:
+        canons = []
+    return su.critical_by_role(row, canons)
+
+
 def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     """Ce que `resume` fera de la session, SANS rien écrire.
 
@@ -653,8 +668,7 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine,
-                             critical=row["name"] in (getattr(cfg, "critical_agents", None)
-                                                      or ()))
+                             critical=_critical(cfg, row))
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
