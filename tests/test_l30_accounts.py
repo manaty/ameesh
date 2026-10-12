@@ -370,6 +370,31 @@ class ChoixTest(_Base):
         self.assertEqual([b["kind"] for b in self._bascules()],
                          ["manuel", "auto", "bascule", "manuel"])
 
+    def test_levee_du_forcage_garde_un_forcage_humain_concurrent(self):
+        """#295 : un humain force primaire entre la lecture de la ligne et la
+        levée du forçage de secondaire (au seuil) : son forçage tient."""
+        items = self._items()
+        now = time.time()
+        _codex_rollout(items[0].path, 5, now + 3600)
+        _codex_rollout(items[1].path, 95, now + 3600)
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                                       by="human:test"))
+        store = type(storage.of(self.db).accounts)
+        lever = store.set_auto
+
+        def humain_dabord(self_, host, harness, **kw):
+            accounts.force(self.db, host, harness, items, "primaire", by="human:concurrent")
+            return lever(self_, host, harness, **kw)
+
+        with mock.patch.object(store, "set_auto", humain_dabord):
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
+        self.assertEqual(choix.profile.name, "primaire")
+        self.assertTrue(choix.forced)
+        ligne = storage.of(self.db).accounts.active(self.cfg.host, "codex")
+        self.assertEqual((ligne["account"], ligne["forced"]), ("primaire", True))
+        self.assertEqual([b["kind"] for b in self._bascules()], ["manuel", "manuel"])
+
     def test_profil_invalide_jamais_choisi(self):
         comptes = self._codex_comptes()
         os.chmod(comptes[1]["path"], 0o755)

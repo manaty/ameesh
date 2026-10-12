@@ -221,7 +221,9 @@ evaluated the same way: a forced account past its caps is not launched.
 A forced account at its threshold (pace, caps or overage) does not hold the
 agents while another healthy account is under its own: the force is lifted
 (journaled `auto`) and the automatic choice runs (bureau, 2026-10-12). With
-no other account free, the force holds and the agents pause.
+no other account free, the force holds and the agents pause. The lift is
+fenced on the forced account that was read (#295): a human who forces another
+account in between keeps their force, applied as is for that turn.
 With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
 pauses, but these rules still hold: an account in overage or past `cap` /
 `overage_cap` is never chosen, and with no other account the agent is
