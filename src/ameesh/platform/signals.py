@@ -6,8 +6,13 @@ import os
 import select
 import signal
 import time
+import threading
 
 from .process import start_time, _stat_fields
+
+
+# Serialize background freezes with the independent suite-cap signal thread.
+CLEANUP_SIGNAL_LOCK = threading.RLock()
 
 
 class ProcessHandle:
@@ -33,6 +38,10 @@ class ProcessHandle:
                 os.close(fd)
             return None
 
+    def duplicate(self) -> "ProcessHandle":
+        """Retain this same kernel identity for the tracker's later waits."""
+        return ProcessHandle(self.pid, os.dup(self.fd))
+
     def live(self) -> bool:
         if self.fd is None:
             return False
@@ -53,6 +62,28 @@ class ProcessHandle:
         except OSError:
             return None
         return (group, session) if self.live() else None
+
+    def state(self) -> str | None:
+        """State of this live identity; None if no longer readable/live."""
+        if not self.live():
+            return None
+        try:
+            state = _stat_fields(self.pid)[0]
+            return state if self.live() else None
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def reap(self) -> int | None:
+        """Consume only this retained child's exit, never a reused numeric PID."""
+        if self.fd is None or not hasattr(os, "P_PIDFD"):
+            return None
+        try:
+            info = os.waitid(os.P_PIDFD, self.fd, os.WEXITED | os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return None
+        if info is None:
+            return None
+        return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
 
     def freeze(self, timeout: float = .5) -> bool:
         """Stop this identity and confirm delivery before checking ownership."""

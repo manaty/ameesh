@@ -23,6 +23,14 @@ def row(pid=7001, *, start=10.0, zombie=False):
             "start": start, "zombie": zombie}
 
 
+def fake_handle():
+    handle = mock.Mock()
+    handle.live.return_value = True
+    handle.state.side_effect = ["S", "T"] * 100
+    handle.duplicate.return_value.reap.return_value = None
+    return handle
+
+
 class BackgroundSignalTest(unittest.TestCase):
     def setUp(self):
         self.notes = []
@@ -74,7 +82,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_recycled_historical_pid_is_not_an_ownership_anchor(self):
         # The PID appears in lineage, but its captured process has exited.
-        old = mock.Mock()
+        old = fake_handle()
         old.location.return_value = (7000, 7000)
         old.live.return_value = False
         self.entry.handles[7001] = old
@@ -90,7 +98,7 @@ class BackgroundSignalTest(unittest.TestCase):
         self.assertTrue(any("ownership unknown" in note for note in self.notes))
 
     def test_unreadable_scan_cleans_retained_handles_but_stays_uncertain(self):
-        handle = mock.Mock()
+        handle = fake_handle()
         handle.location.return_value = (7000, 7000)
         self.entry.handles[7001] = handle
         self.tracker.TERM_GRACE_S = 0
@@ -108,7 +116,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_foreign_live_turn_session_is_never_signalled(self):
         self.runner.harness_pids = {7999}
-        held = mock.Mock()
+        held = fake_handle()
         held.live.return_value = True
         held.location.return_value = (7000, 7999)
         self.entry.handles[7001] = held
@@ -124,7 +132,7 @@ class BackgroundSignalTest(unittest.TestCase):
             "expiry-test", orphan=True, containers=None)
 
     def test_unreadable_ownership_registry_prevents_signalling(self):
-        held = mock.Mock()
+        held = fake_handle()
         held.live.return_value = True
         held.location.return_value = (7000, 7000)
         self.entry.handles[7001] = held
@@ -161,7 +169,7 @@ class BackgroundSignalTest(unittest.TestCase):
         self.assertTrue(store.return_value.turn_resources.close_turn.call_args.kwargs["orphan"])
 
     def test_uncaptured_child_after_leader_exit_keeps_resource_orphaned(self):
-        leader = mock.Mock()
+        leader = fake_handle()
         leader.location.return_value = (7000, 7000)
         leader.live.return_value = True
         with mock.patch.object(background.ProcessHandle, "open", return_value=leader), \
@@ -213,7 +221,7 @@ class BackgroundSignalTest(unittest.TestCase):
             "recycled-initial", orphan=True, containers=None)
 
     def test_detached_retained_child_stays_tracked_until_expiry(self):
-        child = mock.Mock()
+        child = fake_handle()
         child.location.return_value = (7000, 7000)
         child.live.return_value = True
         detached = row()
@@ -242,7 +250,7 @@ class BackgroundSignalTest(unittest.TestCase):
             "detached", orphan=True, containers=None)
 
     def test_shutdown_preserves_uncaptured_child_after_anchor_exit(self):
-        leader = mock.Mock()
+        leader = fake_handle()
         leader.location.return_value = (7000, 7000)
         leader.live.return_value = True
         with mock.patch.object(platform, "command_line", return_value="leader"), \
@@ -261,7 +269,7 @@ class BackgroundSignalTest(unittest.TestCase):
             "shutdown-child", orphan=True, containers=None)
 
     def test_term_exit_rescans_for_child_forked_after_capture(self):
-        leader = mock.Mock()
+        leader = fake_handle()
         leader.location.return_value = (7000, 7000)
         leader.live.return_value = True
 
@@ -430,7 +438,7 @@ class BackgroundSignalTest(unittest.TestCase):
         close.assert_called_once_with(42)
 
     def test_escalation_keeps_handles_when_group_number_is_recycled(self):
-        old = mock.Mock()
+        old = fake_handle()
         old.location.return_value = (7000, 7000)
         old.live.return_value = True
         self.entry.handles[7001] = old
@@ -453,7 +461,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_shutdown_cannot_close_fd_during_signalling(self):
         entered, release, closing, closed = (threading.Event() for _ in range(4))
-        old = mock.Mock()
+        old = fake_handle()
         old.location.return_value = (7000, 7000)
         old.live.return_value = True
         self.entry.handles[7001] = old

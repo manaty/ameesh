@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 from . import support  # noqa: F401
-from ameesh import background, platform
+from ameesh import background, platform, suite_cap
 from ameesh.platform.signals import ProcessHandle
 
 
@@ -118,20 +118,156 @@ class OwnershipRaceTest(unittest.TestCase):
         self.assertEqual(tracker.unknown_zombies, 32)
         self.assertEqual(len(notes), 1)
         self.assertIn("alert", notes[0])
+        self.assertIn("900000", notes[0])
+        self.assertIn("900031", notes[0])
 
-    def test_observed_descendant_is_peeked_before_reaping_in_runner_group(self):
+    def test_observed_descendant_uses_retained_pidfd(self):
         tracker = self.tracker()
         tracker.observed_children[900000] = 1.0
+        handle = mock.Mock()
+        tracker.observed_handles[900000] = handle
         row = {"pid": 900000, "ppid": os.getpid(), "pgid": os.getpgrp(),
                "start": 1.0, "zombie": True}
-        with mock.patch.object(platform, "exited_child", return_value=True) as peek, \
+        with mock.patch.object(platform, "exited_child") as peek, \
                 mock.patch.object(platform, "reap") as reap:
-            parent = mock.Mock()
-            parent.attach_mock(peek, "peek")
-            parent.attach_mock(reap, "reap")
             tracker._reap_strays([row], [])
-        self.assertEqual(parent.mock_calls, [mock.call.peek(900000), mock.call.reap(900000)])
+        peek.assert_not_called()
+        reap.assert_not_called()
+        handle.reap.assert_called_once_with()
         self.assertEqual(tracker.unknown_zombies, 0)
+
+    def test_preexisting_stop_is_preserved_on_registry_refusal(self):
+        tracker = self.tracker()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 start_new_session=True)
+        handle = None
+        try:
+            row = next(p for p in platform.process_table() if p["pid"] == child.pid)
+            handle = ProcessHandle.open(child.pid, row["start"])
+            self.assertTrue(handle.freeze())
+            entry = background.Entry(agent="test", turn_id="stop", pgid=child.pid,
+                                     ended=0, deadline=1, grace_s=1, handles={child.pid: handle})
+            sends = []
+            send = handle.send
+            def record(signum):
+                sends.append(signum)
+                return send(signum)
+            with mock.patch.object(tracker, "_foreign_groups", side_effect=[set(), None]), \
+                    mock.patch.object(handle, "send", side_effect=record):
+                tracker._signal_handles(entry, signal.SIGTERM)
+            self.assertEqual(handle.state(), "T")
+            self.assertNotIn(signal.SIGCONT, sends)
+            self.assertNotIn(signal.SIGTERM, sends)
+            self.assertTrue(entry.unverified)
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+            if handle is not None:
+                handle.close()
+
+    def test_pidfd_wait_after_another_waiter_cannot_consume_new_child(self):
+        tracker = self.tracker()
+        first = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 start_new_session=True)
+        handle = None
+        second = None
+        try:
+            row = next(p for p in platform.process_table() if p["pid"] == first.pid)
+            entry = background.Entry(agent="test", turn_id="wait", pgid=first.pid,
+                                     ended=0, deadline=1, grace_s=1)
+            tracker._capture(entry, [row])
+            handle = tracker.observed_handles[first.pid]
+            first.kill()
+            first.wait(timeout=5)
+            second = subprocess.Popen([sys.executable, "-c", "import os; os._exit(37)"],
+                                      start_new_session=True)
+            self.wait_for(lambda: os.waitid(os.P_PID, second.pid,
+                          os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None)
+            calls = []
+            waitid = os.waitid
+            def wait(kind, identity, flags):
+                calls.append((kind, identity))
+                return waitid(kind, identity, flags)
+            with mock.patch.object(os, "waitid", side_effect=wait):
+                self.assertIsNone(handle.reap())
+            self.assertEqual(calls, [(os.P_PIDFD, handle.fd)])
+            self.assertEqual(second.wait(timeout=5), 37)
+        finally:
+            if first.poll() is None:
+                first.kill()
+            first.wait(timeout=5)
+            if second is not None:
+                second.wait(timeout=5)
+            if handle is not None:
+                handle.close()
+            tracker._drop_handles(entry)
+
+    def test_suite_cap_cannot_resume_during_background_freeze(self):
+        tracker = self.tracker()
+        cap = suite_cap.SuiteCap(tracker.runner)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 start_new_session=True)
+        handle, worker = None, None
+        attempted, signalled = threading.Event(), threading.Event()
+        cap_handle = mock.Mock()
+        cap_handle.send.side_effect = lambda _: signalled.set()
+        item = suite_cap.Capped(None, "test", 0, {child.pid: cap_handle})
+        try:
+            row = next(p for p in platform.process_table() if p["pid"] == child.pid)
+            handle = ProcessHandle.open(child.pid, row["start"])
+            entry = background.Entry(agent="test", turn_id="cap", pgid=child.pid,
+                                     ended=0, deadline=1, grace_s=1, handles={child.pid: handle})
+            reads = 0
+            def cap_thread():
+                attempted.set()
+                cap._term(item, [])
+            def registry(_):
+                nonlocal reads, worker
+                reads += 1
+                if reads == 1:
+                    return set()
+                self.assertEqual(handle.state(), "T")
+                worker = threading.Thread(target=cap_thread)
+                worker.start()
+                self.assertTrue(attempted.wait(2))
+                self.assertFalse(signalled.wait(.1))
+                return {child.pid}  # refuse cleanup; suite-cap proceeds afterwards
+            with mock.patch.object(suite_cap, "gather"), \
+                    mock.patch.object(tracker, "_foreign_groups", side_effect=registry):
+                tracker._signal_handles(entry, signal.SIGTERM)
+                worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(signalled.is_set())
+            self.assertEqual(cap_handle.send.call_args_list,
+                             [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT)])
+        finally:
+            if worker is not None:
+                worker.join(timeout=2)
+            child.kill()
+            child.wait(timeout=5)
+            if handle is not None:
+                handle.close()
+
+    def test_pidfd_reap_returns_exit_and_signal_codes(self):
+        for signum in (None, signal.SIGKILL):
+            code = "import time,os; time.sleep(.5); os._exit(37)" if signum is None \
+                else "import time; time.sleep(60)"
+            child = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+            handle = None
+            try:
+                row = next(p for p in platform.process_table() if p["pid"] == child.pid)
+                handle = ProcessHandle.open(child.pid, row["start"])
+                if signum:
+                    child.kill()
+                self.wait_for(lambda: not handle.live())
+                self.assertEqual(handle.reap(), -int(signum) if signum else 37)
+                self.assertIsNone(handle.reap())
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                if handle is not None:
+                    handle.close()
 
     def test_recycled_observation_is_not_reaped(self):
         tracker = self.tracker()

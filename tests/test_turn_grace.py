@@ -238,6 +238,9 @@ class KillVerdictTest(unittest.TestCase):
                                side_effect=lambda: vivant if alive else []), \
                 mock.patch.object(handle, "live", side_effect=lambda: alive), \
                 mock.patch.object(handle, "location", return_value=(4242, 4242)), \
+                mock.patch.object(handle, "state", return_value="S"), \
+                mock.patch.object(handle, "duplicate", return_value=mock.Mock(
+                    reap=mock.Mock(return_value=None))), \
                 mock.patch.object(signal, "pidfd_send_signal", side_effect=send, create=True), \
                 mock.patch.object(background.os, "close") as close_fd, \
                 mock.patch.object(background.os, "killpg") as killpg, \

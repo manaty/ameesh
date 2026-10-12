@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from . import containers as containers_mod
 from . import platform, storage
-from .platform.signals import ProcessHandle
+from .platform.signals import ProcessHandle, CLEANUP_SIGNAL_LOCK
 from .mediated_executor.contract import NotSupportedRemotely
 
 #: noms de processus tenus pour des shells (tâche de fond d'un harnais)
@@ -233,6 +233,7 @@ class Tracker:
         self._strays_at = 0.0
         self.thread: threading.Thread | None = None
         self.observed_children: dict[int, float] = {}
+        self.observed_handles: dict[int, ProcessHandle] = {}
         self.observed_lock = threading.Lock()
         self.unknown_zombies = 0
         self._zombies_warned = False
@@ -323,7 +324,7 @@ class Tracker:
             if not p["zombie"]:
                 vivants.append(p)
                 continue
-            code = platform.reap(p["pid"])
+            code = self._reap_observed(p["pid"], p.get("start"))
             if entry is not None and code is not None and p["pid"] in entry.jobs:
                 job = entry.jobs[p["pid"]]
                 if job.ended is None:
@@ -428,7 +429,7 @@ class Tracker:
                 pid for pid, handle in entry.handles.items() if handle.live()}
             for job in entry.jobs.values():
                 if job.ended is None and job.pid not in pids:
-                    job.code, job.ended = platform.reap(job.pid), now
+                    job.code, job.ended = self._reap_observed(job.pid), now
             for p in vivants:  # un descendant dont le parent a fini : racine
                 if p["pid"] not in entry.jobs and p["ppid"] not in pids:
                     entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p))
@@ -555,6 +556,10 @@ class Tracker:
             return None
 
     def _signal_handles(self, entry: Entry, signum: int) -> None:
+        with CLEANUP_SIGNAL_LOCK:
+            self._signal_handles_locked(entry, signum)
+
+    def _signal_handles_locked(self, entry: Entry, signum: int) -> None:
         foreign = self._foreign_groups(entry)
         for handle in entry.handles.values():
             if not handle.live():
@@ -565,12 +570,17 @@ class Tracker:
                 self.log("[%s] background pid %s: ownership changed or unknown; no signal"
                          % (entry.agent, handle.pid))
                 continue
+            state = handle.state()
+            if state is None:
+                entry.unverified |= bool(handle.live())
+                continue
+            was_stopped = state in ("T", "t")
             delivered = False
             try:
                 # A group check alone races with setsid/setpgid in the target.
                 # Confirm SIGSTOP before checking both ownership sources again.
                 if not handle.freeze():
-                    entry.unverified |= handle.live()
+                    entry.unverified |= bool(handle.live())
                     self.log("[%s] background pid %s: stop not confirmed; no termination signal"
                              % (entry.agent, handle.pid))
                     continue
@@ -582,11 +592,16 @@ class Tracker:
                     self.log("[%s] background pid %s: ownership changed while stopping; no termination signal"
                              % (entry.agent, handle.pid))
                     continue
+                # Suite-cap cannot resume us while this shared lock is held.
+                # External SIGCONT can still invalidate a freeze: refuse if seen.
+                if handle.state() not in ("T", "t"):
+                    entry.unverified |= bool(handle.live())
+                    continue
                 delivered = handle.send(signum)
             finally:
                 # TERM handlers need to run; a refused signal or ownership
                 # change must not leave our temporary stop in effect.
-                if (signum != signal.SIGKILL or not delivered) and handle.live():
+                if not was_stopped and (signum != signal.SIGKILL or not delivered) and handle.live():
                     handle.send(signal.SIGCONT)
 
     def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
@@ -619,11 +634,7 @@ class Tracker:
                     entry.unverified = True
                     return True
                 for p in adopted:
-                    with self.observed_lock:
-                        observed = self.observed_children.get(p["pid"])
-                    if observed is not None and observed == p.get("start") \
-                            and platform.exited_child(p["pid"]):
-                        platform.reap(p["pid"])
+                    self._reap_observed(p["pid"], p.get("start"))
             descendants = set(roots)
             while True:
                 found = {p["pid"] for p in table
@@ -665,8 +676,18 @@ class Tracker:
         if eligible:
             entry.unverified = any(p["pid"] not in entry.handles for p in eligible)
             with self.observed_lock:
-                self.observed_children.update({p["pid"]: p["start"] for p in eligible
-                    if p["pid"] in entry.handles and p.get("start") is not None})
+                for p in eligible:
+                    pid = p["pid"]
+                    if pid not in entry.handles or p.get("start") is None:
+                        continue
+                    if self.observed_children.get(pid) == p["start"]:
+                        continue
+                    old = self.observed_handles.pop(pid, None)
+                    if old is not None:
+                        old.close()
+                    # Keep the observation's kernel identity beyond entry cleanup.
+                    self.observed_handles[pid] = entry.handles[pid].duplicate()
+                    self.observed_children[pid] = p["start"]
 
     @staticmethod
     def _drop_handles(entry: Entry) -> None:
@@ -691,7 +712,7 @@ class Tracker:
         self._drop_handles(entry)
         for job in entry.jobs.values():
             if job.ended is None:
-                job.code, job.ended = platform.reap(job.pid), now
+                job.code, job.ended = self._reap_observed(job.pid), now
         self._release_resource(entry, survives)
         self.log("[%s] background work of turn %s: %s" % (
             entry.agent, entry.turn_id[:8], self._outcome(entry, now, state)))
@@ -722,13 +743,25 @@ class Tracker:
             self.log("[%s] cannot close the resource of turn %s (%s)"
                      % (entry.agent, entry.turn_id[:8], exc))
 
+    def _reap_observed(self, pid: int, start=None) -> int | None:
+        with self.observed_lock:
+            if start is not None and self.observed_children.get(pid) != start:
+                return None
+            handle = self.observed_handles.get(pid)
+            if handle is None:
+                return None
+            code = handle.reap()
+            if code is not None:
+                handle.close()
+            return code
+
     def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
         """Reap only observed turn descendants, never an arbitrary Popen child."""
         moi = os.getpid()
         with self.observed_lock:
             known = dict(self.observed_children)
         suivis_pgid = {e.pgid for e in suivis if e.pgid}
-        unknown = 0
+        unknown = []
         with self.runner.launch_lock:
             proteges = set(self.runner.harness_pids)
             for p in table:
@@ -738,20 +771,22 @@ class Tracker:
                         or p["pgid"] in suivis_pgid:
                     continue
                 if known.get(p["pid"]) != p.get("start") or p.get("start") is None:
-                    unknown += 1
+                    unknown.append(p["pid"])
                     continue
-                if platform.exited_child(p["pid"]):
-                    platform.reap(p["pid"])
-        self.unknown_zombies = unknown
-        if unknown >= self.UNKNOWN_ZOMBIES_WARN and not self._zombies_warned:
-            self.log("background alert: %s unattributed zombie children; wait statuses preserved"
-                     % unknown)
-        self._zombies_warned = unknown >= self.UNKNOWN_ZOMBIES_WARN
+                self._reap_observed(p["pid"], p.get("start"))
+        self.unknown_zombies = len(unknown)
+        if len(unknown) >= self.UNKNOWN_ZOMBIES_WARN and not self._zombies_warned:
+            self.log("background alert: %s unattributed zombie children (PIDs %s); wait statuses preserved"
+                     % (len(unknown), ",".join(map(str, sorted(unknown)))))
+        self._zombies_warned = len(unknown) >= self.UNKNOWN_ZOMBIES_WARN
         current = {p["pid"]: p.get("start") for p in table}
         with self.observed_lock:
             for pid, start in known.items():
                 if current.get(pid) != start and self.observed_children.get(pid) == start:
                     del self.observed_children[pid]
+                    handle = self.observed_handles.pop(pid, None)
+                    if handle is not None:
+                        handle.close()
 
     # -- l'agent, au tour suivant --------------------------------------------
     def cap_deadline(self, deadline: float, reason: str) -> int:
