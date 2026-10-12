@@ -552,6 +552,16 @@ class ControllerTest(unittest.TestCase):
         entry.state = "done"
         self.assertTrue(self.ctl.tick().drained)
 
+    def test_refresh_reads_the_gate_not_the_last_applied_state(self):
+        # r4 P2: the guard closed the gate since the loop's last pass;
+        # `tick` alone keeps the applied state, `refresh` reads the file
+        self.gate.st = host_gate.GateState("draining", 2, reason="app_busy")
+        self.ctl.tick()
+        self.assertFalse(self.ctl.holds_turns())
+        self.assertFalse(self.ctl.refresh().may_claim)
+        self.assertTrue(self.ctl.holds_turns())
+        self.assertEqual(self.gate.acks[-1].state, "draining")
+
     def test_available_reopens_and_wakes_the_runner(self):
         self.state("stopped", 2)
         self.assertTrue(self.ctl.holds_turns())
@@ -649,6 +659,8 @@ class OnceTurnTest(PgTestCase):
             max_concurrent=lambda: None, holds_turns=lambda: holds["value"],
             describe=lambda: "draining (test, seq 2)",
             tick=lambda: self.events.append(("tick", runner.gate_foreground is not None)),
+            refresh=lambda: (runner.host_gate.tick(),
+                             types.SimpleNamespace(may_claim=not holds["value"]))[1],
             gate=types.SimpleNamespace(ack_path=os.path.join(self.tmp, "gate", "ack.json")))
         runner._gate_settled.set()
         return runner
@@ -662,9 +674,20 @@ class OnceTurnTest(PgTestCase):
             self.events.append(("turn", runner.gate_foreground is worker))
             return True
 
-        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn):
+        release = runner_mod.AgentWorker.release_lease
+
+        def slow_release(worker):
+            # r4 P1: while the lease is being returned (a slow base), a tick
+            # of the controller must still see it held
+            runner.host_gate.tick()
+            release(worker)
+            self.events.append(("released", runner.gate_foreground is worker))
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease", slow_release):
             runner.sweep()
-        self.assertEqual(self.events, [("tick", True), ("turn", True), ("tick", False)])
+        self.assertEqual(self.events, [("tick", True), ("turn", True), ("tick", True),
+                                       ("released", True), ("tick", False)])
         self.assertTrue(runner.did_turn)
 
     def test_a_gate_closed_before_the_turn_runs_none(self):
@@ -672,13 +695,16 @@ class OnceTurnTest(PgTestCase):
         from ameesh import runner as runner_mod
         holds = {"value": False}
         runner = self.once_runner(holds)
-        tick = runner.host_gate.tick
+        refresh = runner.host_gate.refresh
 
-        def closing_tick():
-            tick()
-            holds["value"] = True  # the guard closes the gate meanwhile
+        def closing_refresh():
+            holds["value"] = True  # the guard closed the gate meanwhile
+            return refresh()
 
-        runner.host_gate.tick = closing_tick
+        # holds_turns (the applied state) still says open: only the gate
+        # read again by `refresh` stops the turn (r4 P2)
+        runner.host_gate.holds_turns = lambda: False
+        runner.host_gate.refresh = closing_refresh
         with mock.patch.object(runner_mod.AgentWorker, "process_once",
                                side_effect=AssertionError("no turn")):
             runner.sweep()

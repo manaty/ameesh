@@ -4121,24 +4121,28 @@ class Runner:
                     gate = self.host_gate
                     if gate is not None:
                         # L159f (r3) : la part d'accusé de cet exécuteur dit
-                        # le bail tenu AVANT le tour, puis la porte est relue :
-                        # un autre exécuteur ne dit jamais l'hôte vidé pendant
-                        # ce tour, et une fermeture d'entre-temps l'empêche
+                        # le bail tenu AVANT le tour, puis la porte est relue
+                        # (le fichier, r4) : un autre exécuteur ne dit jamais
+                        # l'hôte vidé pendant ce tour, et une fermeture
+                        # d'entre-temps l'empêche
                         self.gate_foreground = worker
-                        gate.tick()
                     try:
-                        if gate is not None and gate.holds_turns():
+                        if gate is not None and not gate.refresh().may_claim:
                             log_async("host gate closed meanwhile (%s): no turn for %s"
                                       % (gate.describe(), agent["name"]))
                             ran = False
                         else:
                             ran = worker.process_once(self.wait)
                     finally:
-                        self.gate_foreground = None
-                        worker.release_lease()
-                        self._release_slot(agent["name"])
-                        if gate is not None:
-                            gate.tick()
+                        try:
+                            worker.release_lease()
+                            self._release_slot(agent["name"])
+                        finally:
+                            # r4 : compté jusqu'à la libération faite, sinon
+                            # le contrôleur dirait l'hôte vidé, bail tenu
+                            self.gate_foreground = None
+                            if gate is not None:
+                                gate.tick()
                     self.did_turn = self.did_turn or ran
                 else:
                     with self.lock:

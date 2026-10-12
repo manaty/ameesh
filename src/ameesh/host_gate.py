@@ -802,6 +802,14 @@ class GateController:
             self._log("host gate: %s -> stopped (%s, seq %d): no turn"
                       % (before, state.reason, state.seq))
 
+    def refresh(self) -> GateState:
+        """Reads the gate now, not at the loop's next pass, applies it and
+        ticks (`--once`, before its turn); gives the state read."""
+        state = self.gate.state()
+        self.apply(state)
+        self.tick()
+        return state
+
     def tick(self) -> GateAck:
         """Drain deadline, lateness, ack; gives the ack."""
         with self._tick_lock:
