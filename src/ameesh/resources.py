@@ -255,6 +255,21 @@ def _mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
     return platform.mount_of(path, mounts)
 
 
+def _fs_mount(path: str) -> tuple[str, str] | None:
+    """(point, type) of the mount `path` actually resolves to (#289 r2): the
+    one whose id the kernel gives (`mount_id`), else the deepest visible one
+    over the resolved path (`covering_mount`: a mount over a parent hides a
+    deeper one), else `mount_of` (no mountinfo: not Linux)."""
+    mounts = platform.mountinfo() if platform.is_linux() else []
+    if mounts:
+        wanted = platform.mount_id(path)
+        found = next((m for m in mounts if wanted is not None and m.get("id") == wanted),
+                     None) or platform.covering_mount(os.path.realpath(path), mounts)
+        if found is not None:
+            return found["point"], found["fstype"]
+    return _mount_of(path)
+
+
 def fs_usage(path: str | None, *, mounts: str | None = None) -> dict:
     """Occupation du système de fichiers de `path` (L73) : chemin, type
     (`tmpfs`, `ext4`…), taille et octets utilisés ; valeurs None si
@@ -263,7 +278,7 @@ def fs_usage(path: str | None, *, mounts: str | None = None) -> dict:
            "tmp_used_bytes": None}
     if not path or not os.path.isdir(path):
         return out
-    mount = _mount_of(path, mounts)
+    mount = _mount_of(path, mounts) if mounts is not None else _fs_mount(path)
     if mount is not None:
         out["tmp_fstype"] = mount[1]
     try:  # mêmes valeurs que statvfs (f_blocks, f_bfree), sur tous les OS
@@ -385,8 +400,20 @@ def _anchor(path: str) -> str | None:
             continue  # another filesystem, or this mount is overmounted
         if other.get("id") is None or platform.mount_id(other["point"]) != other["id"]:
             continue  # out of reach, or another filesystem shows there
+        if not _readable(other["point"]):
+            continue  # #289 r2: the btrfs ioctls need it open read-only
         return other["point"]
     return None
+
+
+def _readable(path: str) -> bool:
+    """Can `path` be opened read-only (what the btrfs ioctls and a listing
+    need; O_PATH alone succeeds on a mode-000 directory)?"""
+    try:
+        os.close(os.open(path, os.O_RDONLY))
+        return True
+    except OSError:
+        return False
 
 
 def _probe(path: str) -> str:

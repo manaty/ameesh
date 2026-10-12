@@ -128,6 +128,23 @@ class TmpfsRootsTest(_Tmp):
             self.assertEqual(resources.sample("pc", paths=[], now=1.0,
                                               tmp=system)["tmp_path"], system)
 
+    def test_the_tmp_type_is_the_mount_the_path_resolves_to(self):
+        # #289 r2 (2): a tmpfs at /turn/tmpfs, then an ext4 mounted over
+        # /turn: /turn/tmpfs/managed is on the ext4, never read as a tmpfs
+        managed = self.dir("turn", "tmpfs", "managed")
+        turn = os.path.join(self.tmp, "turn")
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 7, "point": os.path.join(turn, "tmpfs"), "dev": 7, "fstype": "tmpfs",
+                  "source": "tmpfs"},
+                 {"id": 8, "point": turn, "dev": 8, "fstype": "ext4", "source": "/dev/e"}]
+        for answer in (8, None):    # the kernel's mount id, else the visible mount
+            with mock.patch.object(platform, "is_linux", return_value=True), \
+                    mock.patch.object(platform, "mountinfo", return_value=table), \
+                    mock.patch.object(platform, "mount_id", return_value=answer):
+                reading = resources.fs_usage(managed)
+            self.assertEqual(reading["tmp_fstype"], "ext4")
+            self.assertIsNone(resources.tmpfs_fraction(reading))
+
     def test_a_tmp_root_not_created_yet_is_read_on_its_tmpfs(self):
         # #289 r1 (3): the managed tmp root does not exist yet on a 95 % full
         # tmpfs; the system tmp is at 10 %: the tmpfs it will live on is read
@@ -398,6 +415,26 @@ class VolumesTest(_Tmp):
                 # where the kernel does reach that mount, it is read there
                 ids[rescue_fs] = 4
                 self.assertEqual(resources._anchor(docker), rescue_fs)
+
+    def test_an_alternate_mount_must_open_read_only(self):
+        """#289 r2 (1): O_PATH opens a mode-000 directory; the btrfs ioctls
+        need O_RDONLY. /rescue (mode 000) and /rescue2 (readable) mount the
+        docker filesystem: /rescue2 is read."""
+        data, docker = self.untraversable_docker()
+        rescue, rescue2 = self.dir("rescue"), self.dir("rescue2")
+        os.chmod(rescue, 0)
+        self.addCleanup(os.chmod, rescue, 0o700)
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 2, "point": data, "dev": 2, "fstype": "btrfs", "source": "/dev/b"},
+                 {"id": 3, "point": docker, "dev": 3, "fstype": "btrfs", "source": "/dev/c"},
+                 {"id": 4, "point": rescue, "dev": 3, "fstype": "btrfs", "source": "/dev/c"},
+                 {"id": 5, "point": rescue2, "dev": 3, "fstype": "btrfs", "source": "/dev/c"}]
+        with mock.patch.object(platform, "mountinfo", return_value=table), \
+                mock.patch.object(platform, "mount_id", side_effect={rescue: 4, rescue2: 5}.get):
+            self.assertEqual(resources._anchor(docker), rescue2)
+            os.chmod(rescue2, 0)
+            self.addCleanup(os.chmod, rescue2, 0o700)
+            self.assertIsNone(resources._anchor(docker))
 
     def test_a_symlink_to_an_unreachable_mount_is_resolved(self):
         """#289 r1 (2): /docker -> /data/private/docker, a mount behind an
