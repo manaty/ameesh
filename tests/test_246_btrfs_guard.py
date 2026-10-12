@@ -215,6 +215,7 @@ class ReaderTest(_Tmp):
         fsid = bytes.fromhex(UUID.replace("-", ""))
         sizes = {1: 509943480320, 3: 4089446400}
         answer = {"count": 2}
+        missing: set[int] = set()
 
         def ioctl(fd, request, buf):
             if request == platform.host.BTRFS_IOC_FS_INFO:
@@ -226,12 +227,21 @@ class ReaderTest(_Tmp):
             if devid not in sizes:
                 raise OSError(19, "No such device")
             struct.pack_into("=QQ", buf, 24, sizes[devid] // 2, sizes[devid])
+            if devid not in missing:
+                path = ("/dev/sd%s" % "xabc"[devid]).encode()
+                buf[platform.host.BTRFS_DEV_PATH:platform.host.BTRFS_DEV_PATH + len(path)] = path
             return 0
 
         with mock.patch("fcntl.ioctl", ioctl):
             self.assertEqual(platform.host.btrfs_fs_info(self.tmp),
                              (fsid.hex(), [(509943480320, 254971740160),
                                            (4089446400, 2044723200)]))
+            # #311 r1: a missing device still answers, with an empty path:
+            # nothing can be allocated on it
+            missing.add(3)
+            self.assertEqual(platform.host.btrfs_fs_info(self.tmp),
+                             (fsid.hex(), [(509943480320, 254971740160),
+                                           (4089446400, 4089446400)]))
             # a device that does not answer: the fsid stays, the sizes are unknown
             answer["count"] = 3
             self.assertEqual(platform.host.btrfs_fs_info(self.tmp), (fsid.hex(), None))
@@ -308,16 +318,32 @@ class ProfileGrowthTest(_Tmp):
                                 ("raid1c4", 0), ("raid5", 20), ("raid6", 10)):
             with self.subTest(profile=profile):
                 self.assertEqual(platform.host.btrfs_growth(profile, free, 2), growth * GIB)
+        # #311 r1: RAID10 stripes equally over an even number of devices — a
+        # large device and three small ones hold 800 MiB, not RAID1's 1200
+        small = [100 * GIB, 400 * MIB, 400 * MIB, 400 * MIB]
+        self.assertEqual(platform.host.btrfs_growth("raid10", small, 2), 800 * MIB)
+        self.assertEqual(platform.host.btrfs_growth("raid1", small, 2), 1200 * MIB)
+        self.assertEqual(platform.host.btrfs_growth("raid10", [100 * GIB], 2), 0)
         # the kernel spreads mirrored chunks: three equal devices hold RAID1 on
         # half of their sum, RAID5 on two thirds
         even = [10 * GIB] * 3
         self.assertEqual(platform.host.btrfs_growth("raid1", even, 2), 15 * GIB)
+        self.assertEqual(platform.host.btrfs_growth("raid10", even, 2), 15 * GIB)
         self.assertEqual(platform.host.btrfs_growth("raid5", even, 2), 20 * GIB)
         # an unnamed profile: its copy factor, DUP on one device, a mirror on several
         self.assertEqual(platform.host.btrfs_growth(None, free, 1), 120 * GIB)
         self.assertEqual(platform.host.btrfs_growth(None, [100 * GIB], 2), 50 * GIB)
         self.assertEqual(platform.host.btrfs_growth(None, free, 2), 20 * GIB)
         self.assertEqual(platform.host.btrfs_growth(None, free, 3), 10 * GIB)
+
+    def test_degraded_raid1_cannot_grow(self):
+        # #311 r1: one of two devices missing (btrfs_fs_info gives it no room):
+        # 100 GiB unallocated on the other is no room for mirrored chunks
+        self.host.btrfs({"sda": (120 * GIB, 20 * GIB), "missing": (120 * GIB, 120 * GIB)},
+                        {"data": 32 * GIB - 64 * MIB, "metadata": 8 * GIB,
+                         "system": 64 * MIB},
+                        (4 * GIB, 4 * GIB - 256 * MIB, 256 * MIB), profiles=("raid1",))
+        self.assertEqual(self.host.read()["btrfs_metadata_headroom_bytes"], 0)
 
     def test_unnamed_profile_on_several_devices_reads_as_a_mirror(self):
         self.raid1_smaller_full(profiles=())

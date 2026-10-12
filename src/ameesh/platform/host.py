@@ -318,6 +318,9 @@ SYSFS = "/sys"
 #: _IOWR(0x94, 30, 4096 bytes)
 BTRFS_IOC_FS_INFO = (2 << 30) | (1024 << 16) | (0x94 << 8) | 31
 BTRFS_IOC_DEV_INFO = (3 << 30) | (4096 << 16) | (0x94 << 8) | 30
+#: offset of `path` in btrfs_ioctl_dev_info_args (devid, uuid, bytes_used,
+#: total_bytes, fsid, unused[377]): empty for a missing device
+BTRFS_DEV_PATH = 8 + 16 + 8 + 8 + 16 + 377 * 8
 #: total_bytes, then every space-info counter the kernel deducts from it
 #: (btrfs_space_info_used, fs/btrfs/space-info.h); bytes_zone_unusable too,
 #: when the kernel has it
@@ -343,7 +346,8 @@ def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
     `total_bytes` in the chunk tree, which can be smaller than the block
     device (filesystem shrunk, device grown without `btrfs filesystem
     resize`); the allocated bytes its `bytes_used`, the chunks carved on it
-    (#252)."""
+    (#252) — all of its size for a missing device (DEV_INFO still answers,
+    with an empty path): nothing can be allocated on it."""
     try:
         import fcntl
         import struct
@@ -367,6 +371,8 @@ def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
             except OSError:     # ENODEV: a device id freed by `device remove`
                 continue
             used, size = struct.unpack_from("=QQ", dev, 24)
+            if not dev[BTRFS_DEV_PATH:BTRFS_DEV_PATH + 1].strip(b"\0"):
+                used = size     # #311 r1: a missing device (empty path) takes nothing
             devices.append((size, used))
         return fsid, (devices if devices and len(devices) == count else None)
     except struct.error:
@@ -377,7 +383,10 @@ def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
 
 #: copies of a metadata chunk on distinct devices, per mirrored profile (the
 #: sysfs name of its directory under allocation/<kind>/)
-BTRFS_MIRRORS = {"raid1": 2, "raid10": 2, "raid1c3": 3, "raid1c4": 4}
+BTRFS_MIRRORS = {"raid1": 2, "raid1c3": 3, "raid1c4": 4}
+#: the step of the RAID10 simulation where devices tie: a metadata chunk is
+#: 1 GiB at most, so is its stripe on two devices
+BTRFS_RAID10_STEP = 1024 ** 3
 #: parity stripes and minimum devices of a parity profile
 BTRFS_PARITY = {"raid5": (1, 2), "raid6": (2, 3)}
 
@@ -406,12 +415,38 @@ def _striped_parity(free: list[int], parity: int, devs_min: int) -> int:
     return growth
 
 
+def _raid10(free: list[int]) -> int:
+    """What RAID10 chunks can still take of the per-device `free` space
+    (#311 r1): each chunk spans every device with room, rounded down to an
+    even number (the ones with the most room), its stripes equal — the
+    smallest room among them — half of them copies; with an odd number of
+    devices the one left out changes as the others fill (chunks of
+    `BTRFS_RAID10_STEP` stripes where they tie). Unlike RAID1, a small device fills with the others:
+    [100 GiB, 400 MiB x 3] holds 800 MiB, not 1200."""
+    left = sorted((f for f in free if f > 0), reverse=True)
+    growth = 0
+    while len(left) >= 2:
+        if left[0] - left[-1] <= BTRFS_RAID10_STEP:
+            return growth + sum(left) // 2  # (nearly) even devices: half of it all
+        width = len(left) - len(left) % 2
+        stripe = left[width - 1]
+        if width < len(left):   # one device left out: until it has more room
+            gap = left[width - 1] - left[width]
+            stripe = gap if gap > 0 else min(stripe, BTRFS_RAID10_STEP)
+        growth += stripe * width // 2
+        left = sorted((f - stripe if i < width else f for i, f in enumerate(left)),
+                      reverse=True)
+        left = [f for f in left if f > 0]
+    return growth
+
+
 def btrfs_growth(profile: str | None, free: list[int], copies: int) -> int:
     """What metadata of `profile` (the sysfs name, None when the kernel
     names none) can still grow into, given each device's unallocated
     `free` bytes (#252): single and RAID0 all of it, DUP half of each
-    device, a mirror (RAID1, RAID10, RAID1C3, RAID1C4) only what its copies
-    find on distinct devices — two devices, the smaller full, leave RAID1
+    device, a mirror (RAID1, RAID1C3, RAID1C4) only what its copies
+    find on distinct devices, RAID10 what equal stripes on an even number of
+    devices leave (`_raid10`) — two devices, the smaller full, leave RAID1
     nothing — RAID5/6 the stripes left. An unknown profile reads as
     `copies` copies (disk_total / total_bytes, rounded up): on one device
     DUP, on several a mirror, the smaller of what it could be."""
@@ -421,6 +456,8 @@ def btrfs_growth(profile: str | None, free: list[int], copies: int) -> int:
         return sum(f // 2 for f in free)
     if profile in BTRFS_MIRRORS:
         return _mirrored(free, BTRFS_MIRRORS[profile])
+    if profile == "raid10":
+        return _raid10(free)
     if profile in BTRFS_PARITY:
         return _striped_parity(free, *BTRFS_PARITY[profile])
     if copies <= 1:
