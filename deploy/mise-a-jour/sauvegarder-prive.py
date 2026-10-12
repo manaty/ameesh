@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -241,6 +242,62 @@ def upload(archive, host):
              "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + archive.name], env=env)
 
 
+def retrieve(credentials, host, name, sha256, output):
+    """Retrieve with the restore identity and publish only the pinned artifact.
+
+    The credentials file belongs to the separate recovery identity; upload
+    credentials inherited from the caller are never used by the curl child.
+    """
+    credentials = Path(credentials)
+    with credentials.open("r") as stream:
+        metadata = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077):
+            raise BackupError("restore credentials need a private owned regular file")
+        settings = json.load(stream)
+    access, secret, bucket, region = (settings[key] for key in
+                                     ("access_key", "secret_key", "bucket", "region"))
+    if (not all(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value)
+                for value in (bucket, region, host))
+            or not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name)
+            or not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+            or not all(isinstance(value, str) and value and not any(c in value for c in "\r\n\x00")
+                       for value in (access, secret))):
+        raise BackupError("invalid pinned recovery location or credentials")
+    output = Path(output)
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.parent.chmod(0o700)
+    if os.path.lexists(output):
+        raise BackupError("recovery destination already exists")
+    with tempfile.TemporaryDirectory(prefix=".recovery-", dir=output.parent) as staging:
+        private = Path(staging)
+        curl_config, archive = private / "curl.conf", private / "archive.dump"
+        with curl_config.open("x") as stream:
+            curl_config.chmod(0o600)
+            stream.write("user = " + json.dumps(access + ":" + secret, ensure_ascii=False) + "\n")
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("SCW_ACCESS_KEY", "SCW_SECRET_KEY")}
+        # No redirects: a recovery object is bound to this exact HTTPS origin
+        # and key, and authentication must never be forwarded elsewhere.
+        run(["curl", "--disable", "--config", str(curl_config), "--fail", "--silent", "--show-error",
+             "--retry", "3", "--proto", "=https", "--aws-sigv4", "aws:amz:" + region + ":s3",
+             "--output", str(archive),
+             "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + name], env=env)
+        if not archive.is_file() or archive.stat().st_size == 0 or digest(archive) != sha256:
+            raise BackupError("retrieved recovery artifact digest mismatch")
+        archive.chmod(0o600)
+        run(["pg_restore", "--list", str(archive)], env=env)
+        with archive.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.link(archive, output)
+        directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    return {"artifact_sha256": sha256, "retrieved": True}
+
+
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -256,6 +313,12 @@ def main():
     transfer = commands.add_parser("upload")
     transfer.add_argument("--file", required=True)
     transfer.add_argument("--host", required=True)
+    recovery = commands.add_parser("retrieve")
+    recovery.add_argument("--credentials", required=True)
+    recovery.add_argument("--host", required=True)
+    recovery.add_argument("--name", required=True)
+    recovery.add_argument("--sha256", required=True)
+    recovery.add_argument("--output", required=True)
     verify = commands.add_parser("verify-restore")
     verify.add_argument("--config", required=True)
     verify.add_argument("--file", required=True)
@@ -270,6 +333,8 @@ def main():
             print(json.dumps(proof))
         elif args.command == "upload":
             upload(args.file, args.host)
+        elif args.command == "retrieve":
+            print(json.dumps(retrieve(args.credentials, args.host, args.name, args.sha256, args.output)))
         else:
             proof = verify_restore(args.config, args.file, json.loads(Path(args.expected).read_text()))
             print(json.dumps(proof))

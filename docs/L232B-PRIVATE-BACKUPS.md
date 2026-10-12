@@ -37,14 +37,33 @@ database; runner credentials are not a substitute for that capability.
 
 `upload --file ARCHIVE --host HOST` uses a private curl configuration, disables
 the user's curl configuration and removes upload keys from the child
-environment. Upload success alone cannot prove remote recovery: retrieval
-using a separate restore identity, remote digest verification and pinned
-recovery-set retention remain controller work. The current server script
+environment. Upload success alone cannot prove remote recovery. The current server script
 expires ordinary local backups only after all required dump/upload steps
 succeed.
 
+`retrieve --credentials RECOVERY_CONFIG --host HOST --name OBJECT
+--sha256 SHA256 --output ARCHIVE` downloads an exact object using the
+separate recovery identity. The owned regular configuration file must be
+private (`0600` or stricter) and contains `access_key`, `secret_key`,
+`bucket` and `region`. Curl reads a short-lived private configuration;
+the child environment excludes inherited upload keys. The request uses a
+fixed HTTPS storage origin, with redirects disabled. Only a non-empty
+archive matching the pinned SHA-256 and readable by `pg_restore --list`
+is published, atomically, without replacing an existing destination.
+Failed download, digest or catalogue verification leaves no final artifact
+and removes staging credentials. Retrieval proves artifact integrity;
+`verify-restore` must still succeed before a release claims remote recovery.
+The expected digest and inventory must come from the pinned recovery set,
+not from an untrusted remote response.
+
 These utilities are a local development checkpoint. The release controller,
-host helper/bootstrap, private remote retrieval and retention, and versioned
-environment switching are still being built. Snapshot/restore unit tests use
-simulated connections; they do not claim a completed production backup or an
-end-to-end restored pilot.
+host helper/bootstrap, pinned retention and versioned environment switching
+are still being built. Retrieval tests simulate storage and do not claim
+an authenticated remote-storage pilot. `tests.test_l232b_backup_restore`
+uses the explicit test-bench DSN and newly created source/restoration
+databases to exercise real `pg_dump` and `pg_restore`. It verifies that
+committed writes after snapshot export do not change the archive inventory,
+that a wrong expected count fails verification, and that the disposable
+restore database is removed while the source remains intact. It requires
+compatible PostgreSQL clients and test-role database-creation permission.
+These tests do not claim a completed production backup or release pilot.

@@ -103,6 +103,82 @@ class PrivateBackupTest(unittest.TestCase):
                 backup.run(["pg_dump"])
         self.assertNotIn("CANARY-PASSWORD", str(error.exception))
 
+    def recovery_fixture(self):
+        credentials = self.root / "recovery.json"
+        credentials.write_text(json.dumps({"access_key": "RECOVERY-ACCESS", "secret_key": "RECOVERY-SECRET",
+                                           "bucket": "acme", "region": "fr-par"}))
+        credentials.chmod(0o600)
+        archive = self.root / "source.dump"
+        archive.write_bytes(b"archive")
+        return credentials, backup.digest(archive)
+
+    def test_retrieval_uses_separate_private_identity_and_pinned_origin(self):
+        credentials, sha = self.recovery_fixture()
+        seen = []
+
+        def child(args, *, env=None):
+            self.assertFalse(self.output.exists())
+            self.assertNotIn("RECOVERY-SECRET", str(args))
+            self.assertNotIn("SCW_SECRET_KEY", env)
+            self.assertNotIn("SCW_ACCESS_KEY", env)
+            if args[0] == "curl":
+                self.assertEqual(args[:2], ["curl", "--disable"])
+                self.assertNotIn("--location", args)
+                self.assertEqual(args[-1], "https://acme.s3.fr-par.scw.cloud/host-1/remote.dump")
+                config = Path(args[3])
+                self.assertIn("RECOVERY-SECRET", config.read_text())
+                self.assertNotIn("UPLOAD-SECRET", config.read_text())
+                self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+                seen.append(config)
+                Path(args[args.index("--output") + 1]).write_bytes(b"archive")
+            else:
+                self.assertEqual(args[:2], ["pg_restore", "--list"])
+        with mock.patch.dict(os.environ, {"SCW_ACCESS_KEY": "UPLOAD-ACCESS", "SCW_SECRET_KEY": "UPLOAD-SECRET"}), \
+                mock.patch.object(backup, "run", side_effect=child):
+            proof = backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output)
+        self.assertEqual(proof, {"artifact_sha256": sha, "retrieved": True})
+        self.assertEqual(self.output.read_bytes(), b"archive")
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+        self.assertFalse(seen[0].exists())
+
+    def test_failed_retrieval_never_publishes_an_artifact(self):
+        credentials, sha = self.recovery_fixture()
+        for failure in ("download", "digest", "catalogue", "empty"):
+            def child(args, *, env=None):
+                if args[0] == "curl":
+                    Path(args[args.index("--output") + 1]).write_bytes(
+                        b"wrong" if failure == "digest" else b"" if failure == "empty" else b"archive")
+                if (args[0] == "curl" and failure == "download"
+                        or args[0] == "pg_restore" and failure == "catalogue"):
+                    raise backup.BackupError("failed")
+            with self.subTest(failure=failure), mock.patch.object(backup, "run", side_effect=child):
+                with self.assertRaises(backup.BackupError):
+                    backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output)
+                self.assertFalse(self.output.exists())
+                self.assertEqual(list(self.output.parent.iterdir()), [])
+
+    def test_retrieval_refuses_replacement_even_of_a_dangling_link(self):
+        credentials, sha = self.recovery_fixture()
+        self.output.parent.mkdir()
+        self.output.symlink_to(self.root / "absent")
+        with mock.patch.object(backup, "run") as child, self.assertRaises(backup.BackupError):
+            backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output)
+        child.assert_not_called()
+        self.assertTrue(self.output.is_symlink())
+
+    def test_retrieval_refuses_public_credentials_or_unpinned_locations(self):
+        credentials, sha = self.recovery_fixture()
+        cases = [("host-1", "../remote.dump", sha), ("host-1", "remote.dump", ""),
+                 ("bad/host", "remote.dump", sha)]
+        with mock.patch.object(backup, "run") as child:
+            for host, name, digest in cases:
+                with self.subTest(host=host, name=name), self.assertRaises(backup.BackupError):
+                    backup.retrieve(credentials, host, name, digest, self.output)
+            credentials.chmod(0o644)
+            with self.assertRaises(backup.BackupError):
+                backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output)
+        child.assert_not_called()
+
     def restore_fixture(self):
         self.output.parent.mkdir(exist_ok=True)
         self.output.write_bytes(b"archive")
