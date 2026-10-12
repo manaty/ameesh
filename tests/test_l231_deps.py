@@ -864,6 +864,39 @@ class NexlinkVerificationTests(_Base):
         self.assertIsNone(deps.read_marker(deps.entry_of(root, done["key"])))
         self.assertEqual([n for n in os.listdir(root) if deps.TMP_SEP in n], [])
 
+    def test_r3_a_toolchain_changing_during_a_failed_install_has_no_fallback(self):
+        fakebin, log = self._toolchains()
+        pkg = _package(os.path.join(self.base, "main"))
+        pin = os.path.join(pkg, ".pin")
+        open(pin, "w").close()
+        calls = []
+
+        def installer(directory, env=None, *, lock_fd=None):
+            calls.append(directory)
+            os.unlink(pin)                              # the shim switches...
+            raise deps.FillError("npm ci failed (1): fake")   # ...and npm ci fails
+
+        with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}), \
+                mock.patch.object(deps, "toolchain", toolchain):
+            os.environ.pop("AMEESH_REAL_NPM", None)
+            done = deps.link_package(pkg, self.cache, installer=installer)
+            self.assertEqual(done["status"], "local-kept")
+            self.assertIn("toolchain changed during the fill (node v26, key v22", done["reason"])
+            self.assertEqual(len(calls), 1)             # no local npm ci in the package
+            self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+            self.assertEqual([m for m in deps._probes if m[0] == pkg], [])   # memo dropped
+            # a failure with the same toolchain still falls back to a local npm ci
+            open(pin, "w").close()
+            calls.clear()
+
+            def failing(directory, env=None, *, lock_fd=None):
+                calls.append(directory)
+                raise deps.FillError("npm ci failed (1): fake")
+
+            done = deps.link_package(pkg, self.cache, installer=failing)
+        self.assertEqual(done["status"], "local-failed")
+        self.assertEqual(len(calls), 2)
+
     def test_r1_4_toolchain_is_one_entry_not_kept_past_its_ttl(self):
         fakebin, _log = self._toolchains()
         pkg = _package(os.path.join(self.base, "main"))

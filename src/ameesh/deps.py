@@ -600,7 +600,13 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
         started = time.time()
         try:
             _check_toolchain(pkg_dir, tool, env, "before")
-            installer(stage, env, lock_fd=lock.fileno())
+            try:
+                installer(stage, env, lock_fd=lock.fileno())
+            except FillError:
+                # a failed install whose toolchain changed meanwhile: no
+                # fallback either (ToolchainChanged), and the memo is dropped
+                _check_toolchain(pkg_dir, tool, env, "during")
+                raise
             _check_toolchain(pkg_dir, tool, env, "after")
             modules = os.path.join(stage, NODE_MODULES)
             if os.path.islink(modules) or not os.path.isdir(modules):
