@@ -62,6 +62,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from . import platform as platform_mod
 from .capacity_guard import (ACK_PATH, FALLBACK_CLASSIC, FALLBACK_LENDING, SCHEMA_HOST_ACK,
                              SCHEMA_HOST_STATE, STATE_PATH, STATES, state_problem)
 
@@ -603,21 +604,27 @@ def default_fallback(cfg, lending: bool = False) -> str:
     return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
 
 
-# A confirmed or uncertain guest identity can never become native later.
+# Linux identity is cached; a confirmed or uncertain guest never becomes native.
 _guest_identity = False
+_native_identity = False
 _guest_identity_lock = threading.Lock()
 
 
 def is_guest(cfg, runner_id: str | None = None) -> bool:
-    """Guest signals and identity read failures latch for this process's life."""
-    global _guest_identity
+    """Linux identity is cached for life; other OSes only use the runner ID."""
+    global _guest_identity, _native_identity
+    ident = runner_id if runner_id is not None else getattr(cfg, "runner_id", "")
+    guest_id = str(ident or "").startswith("guest-")
+    if platform_mod.SYSTEM != "linux":
+        return guest_id  # pwd and kernel cgroups only identify Linux guests.
     with _guest_identity_lock:
         if _guest_identity:
             return True
-        ident = runner_id if runner_id is not None else getattr(cfg, "runner_id", "")
-        if str(ident or "").startswith("guest-"):
+        if guest_id:
             _guest_identity = True
             return True
+        if _native_identity:
+            return False
         try:
             import pwd
             uid = os.geteuid()
@@ -630,12 +637,11 @@ def is_guest(cfg, runner_id: str | None = None) -> bool:
             if uid == guest_uid:
                 _guest_identity = True
                 return True
-            # Kernel cgroup membership cannot be replaced by EnvironmentFile.
-            with open("/proc/self/cgroup", encoding="utf-8") as stream:
-                _guest_identity = any(
-                    part.startswith("ameesh-guest-runner@") and part.endswith(".service")
-                    for line in stream for part in line.rstrip().split("/"))
-        except (ImportError, KeyError, OSError, UnicodeError):
+            _guest_identity = any(
+                part.startswith("ameesh-guest-runner@") and part.endswith(".service")
+                for path in platform_mod.self_cgroup_paths() for part in path.split("/"))
+            _native_identity = not _guest_identity
+        except (ImportError, KeyError, OSError, UnicodeError, platform_mod.NotAvailable):
             _guest_identity = True
         return _guest_identity
 

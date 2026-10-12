@@ -2,21 +2,32 @@
 """Native/guest gate selection and bounded acknowledgement retries (#501)."""
 import errno
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 from . import support  # noqa: F401
-from ameesh import config, host_gate
+from ameesh import config, host_gate, platform
 
 
 class NativeGateTest(unittest.TestCase):
     def setUp(self):
-        import pwd
+        try:
+            import pwd
+        except ImportError:
+            self.skipTest("Linux UID identity tests require pwd")
         from types import SimpleNamespace
+        proc = tempfile.TemporaryDirectory()
+        self.addCleanup(proc.cleanup)
+        (Path(proc.name) / "self").mkdir()
+        (Path(proc.name) / "self" / "cgroup").write_text("0::/native.service\n")
         # Each test models a fresh runner process; production never resets it.
         for patch in (
             mock.patch.object(host_gate, "_guest_identity", False),
+            mock.patch.object(host_gate, "_native_identity", False),
+            mock.patch.object(platform, "SYSTEM", "linux"),
+            mock.patch.object(platform.process, "PROC", proc.name),
             mock.patch.object(pwd, "getpwall", return_value=[SimpleNamespace(pw_name="ameesh-guest")]),
             mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid() + 1)),
         ):
@@ -269,7 +280,8 @@ class NativeGateTest(unittest.TestCase):
         cfg = config.Config(runner_id="native:test")
         with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")):
             self.assertFalse(host_gate.is_guest(cfg))  # different numeric UID
-        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="renamed")), \
+        with mock.patch.object(host_gate, "_native_identity", False), \
+                mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="renamed")), \
                 mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())):
             self.assertTrue(host_gate.is_guest(cfg))
 
@@ -288,3 +300,80 @@ class NativeGateTest(unittest.TestCase):
             self.assertFalse(host_gate.is_guest(cfg))
             lookup.assert_not_called()
             self.assertEqual(host_gate.gate_choice(cfg, lending=True)[0], "")
+
+
+class PortableGateIdentityTest(unittest.TestCase):
+    def setUp(self):
+        for name in ("_guest_identity", "_native_identity"):
+            patch = mock.patch.object(host_gate, name, False, create=True)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_non_linux_native_never_reads_pwd_or_cgroup(self):
+        import builtins
+        from ameesh import platform
+        original_import = builtins.__import__
+        def without_pwd(name, *args, **kwargs):
+            if name == "pwd":
+                raise ImportError("pwd absent on Windows")
+            return original_import(name, *args, **kwargs)
+        for system in ("macos", "windows"):
+            with self.subTest(system=system), mock.patch.object(platform, "SYSTEM", system), \
+                    mock.patch("builtins.open", side_effect=FileNotFoundError("no proc")) as opened, \
+                    mock.patch("builtins.__import__", side_effect=without_pwd) as imported:
+                cfg = config.Config(runner_id="native:test")
+                self.assertFalse(host_gate.is_guest(cfg))
+                self.assertEqual(host_gate.gate_choice(cfg), ("", "classic host default"))
+                self.assertEqual(host_gate.gate_kind(config.Config(host_gate="none")), "")
+                opened.assert_not_called()
+                self.assertFalse(any(call.args[0] == "pwd" for call in imported.call_args_list))
+                self.assertFalse(host_gate._guest_identity)
+                self.assertTrue(host_gate.is_guest(config.Config(runner_id="guest-test")))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), "Linux UID tests require POSIX")
+    def test_linux_without_cgroup_stays_guest(self):
+        import pwd
+        from types import SimpleNamespace
+        from ameesh import platform
+        with mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch.object(pwd, "getpwall", return_value=[]), \
+                mock.patch("builtins.open", side_effect=FileNotFoundError("no cgroup")):
+            self.assertTrue(host_gate.is_guest(config.Config(runner_id="native:test")))
+            with self.assertRaisesRegex(ValueError, "guest.*file"):
+                host_gate.gate_choice(config.Config(host_gate="none"))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), "Linux UID tests require POSIX")
+    def test_linux_native_identity_reads_are_cached(self):
+        import pwd
+        from ameesh import platform
+        with mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch.object(pwd, "getpwall", return_value=[]) as accounts, \
+                mock.patch("builtins.open", mock.mock_open(read_data="0::/native.service\n")) as opened:
+            cfg = config.Config(runner_id="native:test")
+            self.assertFalse(host_gate.is_guest(cfg))
+            self.assertFalse(host_gate.is_guest(cfg))
+            accounts.assert_called_once()
+            opened.assert_called_once()
+            self.assertTrue(host_gate.is_guest(config.Config(runner_id="guest-test")))
+            self.assertTrue(host_gate.is_guest(cfg))
+
+
+class CgroupMembershipReaderTest(unittest.TestCase):
+    def test_reader_returns_v1_and_v2_kernel_memberships(self):
+        with mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch("builtins.open", mock.mock_open(read_data="0::/native.service\n2:cpu:/guest.slice\n")):
+            self.assertEqual(platform.self_cgroup_paths(), ("/native.service", "/guest.slice"))
+
+    def test_reader_refuses_missing_malformed_and_non_linux_memberships(self):
+        with mock.patch.object(platform, "SYSTEM", "linux"):
+            for data in ("", "malformed\n", "0::relative\n"):
+                with self.subTest(data=data), mock.patch("builtins.open", mock.mock_open(read_data=data)):
+                    with self.assertRaises(platform.NotAvailable):
+                        platform.self_cgroup_paths()
+            with mock.patch("builtins.open", side_effect=FileNotFoundError("absent")):
+                with self.assertRaises(platform.NotAvailable):
+                    platform.self_cgroup_paths()
+        with mock.patch.object(platform, "SYSTEM", "macos"), mock.patch("builtins.open") as opened:
+            with self.assertRaises(platform.NotAvailable):
+                platform.self_cgroup_paths()
+            opened.assert_not_called()
