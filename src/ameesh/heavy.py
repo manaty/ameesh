@@ -22,6 +22,11 @@ too, which do not inherit the descriptor (Python closes it) — and the
 wrapper keeps the slot until no process of the group is left. What the
 command started and left running when it ended is part of the suite: it gets
 SIGTERM, then SIGKILL after `GROUP_GRACE_S`, before the slot is released.
+The command is reaped only after that (codex review r3): its zombie keeps
+the group's number, so no unrelated group can take it and be signalled. On a
+terminal, the command's group gets the foreground while it runs (a suite that
+asks a question would otherwise stop on SIGTTIN), and the wrapper takes it
+back afterwards.
 """
 from __future__ import annotations
 
@@ -182,21 +187,49 @@ def _group_alive(pgid: int) -> bool:
     return False
 
 
+def _group_gone(pgid: int) -> bool:
+    """No live process of the group on two consecutive scans (codex review
+    r3): a worker that forks a replacement and exits between the listing of
+    /proc and the read of its stat escapes one scan, not two."""
+    return not _group_alive(pgid) and not _group_alive(pgid)
+
+
 def _drain_group(pgid: int, *, grace: float | None = None, sleep=time.sleep,
                  clock=time.monotonic) -> bool:
     """Waits until no process of the group `pgid` is left: SIGTERM to what
     the command left running, SIGKILL after `grace`, then `grace` more. True
-    when the group is gone."""
+    when the group is gone. The caller keeps the group's leader unreaped."""
     grace = GROUP_GRACE_S if grace is None else grace
     for signum in (signal.SIGTERM, signal.SIGKILL):
-        if not _group_alive(pgid) or not _killpg(pgid, signum):
+        if _group_gone(pgid) or not _killpg(pgid, signum):
             return True
         deadline = clock() + grace
         while clock() < deadline:
-            if not _group_alive(pgid):
+            if _group_gone(pgid):
                 return True
             sleep(0.1)
-    return not _group_alive(pgid)
+    return _group_gone(pgid)
+
+
+def _wait_unreaped(child) -> int:
+    """The command's exit code (negative: killed by that signal), waited for
+    WITHOUT reaping it (codex review r3): its zombie holds its pid, which is
+    also the group's number, until `child.wait()`."""
+    if not hasattr(os, "waitid") or not hasattr(os, "WNOWAIT"):
+        return child.wait()
+    info = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+    return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
+
+
+def _foreground_tty() -> int | None:
+    """stdin's descriptor when it is the controlling terminal and the
+    wrapper's group holds its foreground; None otherwise."""
+    try:
+        if os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp():
+            return 0
+    except OSError:
+        pass
+    return None
 
 
 def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
@@ -216,11 +249,21 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
             _killpg(child.pid, signum)  # the group, even once the command is gone
 
     previous = {sig: signal.signal(sig, relay) for sig in RELAYED}
+    tty = _foreground_tty()
+    if tty is not None:
+        # handing the terminal over and taking it back from the background
+        # would otherwise stop the wrapper (SIGTTOU)
+        previous[signal.SIGTTOU] = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    ttou = previous.get(signal.SIGTTOU, signal.SIG_DFL)
+    ttou = ttou if ttou in (signal.SIG_DFL, signal.SIG_IGN) else signal.SIG_DFL
     try:
         def lower():
             # its own process group (pgid = its pid), set before exec — Popen
             # returns after the exec, the group exists when signals are relayed
             os.setpgid(0, 0)
+            if tty is not None:
+                os.tcsetpgrp(tty, os.getpgrp())     # SIGTTOU ignored, inherited
+                signal.signal(signal.SIGTTOU, ttou)
             if nice:
                 os.nice(nice)
         try:
@@ -231,14 +274,21 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         _note_child(fh, child.pid)
         for signum in pending:
             relay(signum, None)
-        code = child.wait()
+        code = _wait_unreaped(child)
         if not _drain_group(child.pid):
             print("ameesh heavy: processes of the command (group %d) survive SIGKILL; "
                   "slot released" % child.pid, file=sys.stderr)
         return code if code >= 0 else 128 - code
     finally:
+        if tty is not None:
+            try:
+                os.tcsetpgrp(tty, os.getpgrp())
+            except OSError:
+                pass
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        if child is not None:
+            child.wait()            # reaped last: the group's number is free now
         release(fh)
 
 

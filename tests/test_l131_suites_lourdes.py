@@ -201,6 +201,10 @@ class RunChildTest(unittest.TestCase):
         proc, (suite, worker) = self._wrapper(self.SUITE % "1", grace=1.5, pids=2)
         proc.send_signal(signal.SIGTERM)
         self.assertTrue(self._gone(suite))
+        # codex r3: the command stays unreaped while its group drains — its
+        # zombie keeps the group's number from being reused
+        with open("/proc/%d/stat" % suite, encoding="utf-8") as fh:
+            self.assertEqual(fh.read().rsplit(") ", 1)[-1].split()[0], "Z")
         # the suite is gone, its worker is not: the slot stays held
         self.assertFalse(self._gone(worker, timeout=0.3))
         self.assertIsNone(proc.poll())
@@ -225,6 +229,58 @@ class RunChildTest(unittest.TestCase):
         got = heavy.acquire(self.one, max_wait_s=0)
         self.assertIsNotNone(got)
         heavy.release(got[1])
+
+    def test_a_suite_on_a_terminal_can_read_it(self):
+        # codex r3: on a controlling terminal the command's group gets the
+        # foreground; input() would otherwise stop on SIGTTIN, the wrapper
+        # waiting for ever with the slot
+        import pty
+        import termios
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
+        child = "print('got', input('?'), flush=True)"
+        code = ("import sys, types; from ameesh import heavy; "
+                "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1); "
+                "rc = heavy.run(cfg, [sys.executable, '-c', sys.argv[2]], nice=0); "
+                "import os; print('fg', os.tcgetpgrp(0) == os.getpgrp(), flush=True); "
+                "raise SystemExit(rc)")
+
+        def controlling():
+            import fcntl
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child],
+                                stdin=slave, stdout=slave, stderr=slave, env=env,
+                                start_new_session=True, preexec_fn=controlling)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        os.write(master, b"yes\n")
+        self.assertEqual(proc.wait(timeout=20), 0)
+        out = b""
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        self.assertIn(b"got yes", out)
+        self.assertIn(b"fg True", out)       # the wrapper took the terminal back
+
+
+class DrainTest(unittest.TestCase):
+    def test_one_empty_scan_is_not_enough(self):
+        # codex r3: a worker forks a replacement and exits between the
+        # listing of /proc and its stat — one scan sees nothing, the next does
+        scans = iter([False, True, False, False])
+        sent = []
+        with mock.patch.object(heavy, "_group_alive", side_effect=lambda pgid: next(scans)), \
+                mock.patch.object(heavy, "_killpg",
+                                  side_effect=lambda pgid, sig: sent.append(sig) or True):
+            self.assertTrue(heavy._drain_group(4242, grace=5, sleep=lambda s: None))
+        self.assertEqual(sent, [signal.SIGTERM])
 
 
 class NoteTest(unittest.TestCase):
