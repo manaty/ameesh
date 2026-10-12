@@ -23,18 +23,24 @@ threshold (hysteresis); `seq` grows on every change. The state expires
 (`expires_ts`, `state_ttl_s`, rewritten every third of it): a guard that
 stops leaves a state that soon reads as `stopped`.
 
-Tranche 1 (this module) **observes**: it decides and publishes, it enforces
-nothing (`--observe`). Kernel caps (`systemctl set-property --runtime`) and
-the freeze come with tranche 2, the drain and the stop with tranche 3.
+Levels 0 to 2 are enforced (tranche 2): the state's caps become properties
+of the guest's slice and of its agents' units (`systemctl set-property
+--runtime`: CPUWeight, IOWeight, CPUQuota, MemoryHigh, MemoryMax; MemoryMax per
+agent), and level 2 freezes the slice through a transient service that
+freezes, sleeps until the bound and thaws (systemd owns the freeze; stopped
+when the level drops, when the guard stops and when it starts). `caps.enforced` lists
+what is actually in force. `--observe` decides and publishes only. The wait
+for the drain and the stop come with tranche 3.
 
     ameesh guard check [--config F] [--json]       one measure, the decision, the state
-    ameesh guard run --observe [--config F]        the loop; writes the state file
+    ameesh guard run [--observe] [--config F]      the loop; writes the state file
 
 Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
 
     {"host": "vm-example", "max_agents": 3,
      "state_path": "/run/ameesh-gate/state/state.json",
      "ack_path": "/run/ameesh-gate/ack/ack.json",
+     "slice": "ameesh-guest.slice", "agent_units": "ameesh-guest-runner@*.service",
      "work_path": "/srv/ameesh-guest",
      "lend": {"cpu_max": 3, "cpu_weight": 10, "memory_max": "14GiB",
               "agent_memory_max": "4.5GiB", "disk_max": "80GiB",
@@ -54,6 +60,7 @@ import json
 import math
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -69,6 +76,9 @@ GUARD_KIND = "ameesh-guard"
 DEFAULT_CONFIG = "/etc/ameesh/guard.json"
 DEFAULT_STATE_PATH = "/run/ameesh-gate/state/state.json"
 DEFAULT_ACK_PATH = "/run/ameesh-gate/ack/ack.json"
+#: the guest's slice and its agents' units (study §2.1)
+DEFAULT_SLICE = "ameesh-guest.slice"
+DEFAULT_AGENT_UNITS = "ameesh-guest-runner@*.service"
 #: the guest's work directory (study §3): its free disk is what the guest uses
 DEFAULT_WORK_PATH = "/srv/ameesh-guest"
 
@@ -248,6 +258,8 @@ class GuardConfig:
     max_agents: int = 1
     state_path: str = DEFAULT_STATE_PATH
     ack_path: str = DEFAULT_ACK_PATH
+    slice: str = DEFAULT_SLICE
+    agent_units: str = DEFAULT_AGENT_UNITS
     work_path: str = DEFAULT_WORK_PATH
 
 
@@ -266,9 +278,15 @@ def load_config(path: str | None = None) -> GuardConfig:
     agents = raw.get("max_agents", 1)
     if isinstance(agents, bool) or not isinstance(agents, int) or agents < 0:
         raise GuardError("max_agents: integer >= 0 expected")
+    slice_name = raw.get("slice") or DEFAULT_SLICE
+    refused = refused_slice(slice_name)
+    if refused:
+        raise GuardError("slice %r refused: %s" % (slice_name, refused))
     return GuardConfig(host=str(host), offer=parse_offer(raw.get("lend")), max_agents=agents,
                        state_path=str(raw.get("state_path") or DEFAULT_STATE_PATH),
                        ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
+                       slice=slice_name,
+                       agent_units=str(raw.get("agent_units") or DEFAULT_AGENT_UNITS),
                        work_path=str(raw.get("work_path") or DEFAULT_WORK_PATH))
 
 
@@ -670,6 +688,299 @@ def restore_decision(previous: dict, now: float) -> tuple[Decision, int | None]:
 
 
 # --------------------------------------------------------------------------
+# enforcement (tranche 2): kernel caps and freeze through systemd
+# --------------------------------------------------------------------------
+
+def slice_properties(caps: dict, cpu_count: int | None) -> dict:
+    """systemd properties of the guest's slice for `caps` (study §1.7)."""
+    props: dict = {}
+    if caps.get("cpu_weight") is not None:
+        props["CPUWeight"] = str(int(caps["cpu_weight"]))
+    if caps.get("io_weight") is not None:
+        props["IOWeight"] = str(int(caps["io_weight"]))
+    if caps.get("cpu_share") is not None and cpu_count:
+        # CPUQuota is a share of ONE CPU: 150 % = one and a half CPU
+        props["CPUQuota"] = "%d%%" % max(1, round(caps["cpu_share"] * cpu_count * 100))
+    if caps.get("memory_high_mb") is not None:
+        props["MemoryHigh"] = "%dM" % int(caps["memory_high_mb"])
+    if caps.get("memory_mb") is not None:
+        props["MemoryMax"] = "%dM" % int(caps["memory_mb"])
+    return props
+
+
+#: a slice name the guard accepts: it goes into the name of the freezing unit
+#: and into its ExecStopPost= line, so no space, quote, `%`, `$` or backslash
+SLICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]*\.slice")
+#: the transient service that holds a freeze: it freezes the slice, sleeps
+#: until the bound (monotonic), then thaws, retried every 2 s. Stopping it
+#: thaws too (ExecStopPost=), and so does RuntimeMaxSec=, `FREEZE_BACKSTOP_S`
+#: past the bound. systemd owns the freeze: a guard killed at any instant
+#: never leaves the slice frozen past the bound. Its name carries the slice:
+#: a guard never touches the freeze of another slice
+FREEZE_UNIT = "ameesh-guard-freeze"
+FREEZE_BACKSTOP_S = 30
+FREEZE_SCRIPT = ('systemctl freeze "$0" && sleep "$1"; '
+                 'until systemctl thaw "$0"; do sleep 2; done')
+
+
+#: the slice the freezing services run in: a freeze never reaches its own
+#: helper (codex #237 r5)
+HELPER_SLICE = "ameesh-guard-helper.slice"
+#: slices never capped nor frozen: the root and those of the system
+SYSTEM_SLICES = ("-.slice", "system.slice", "user.slice")
+#: how long the guard waits for the slice to read `frozen` after starting
+#: its freezing service, and how often it looks
+FREEZE_CONFIRM_S, FREEZE_POLL_S = 2.0, 0.2
+
+
+def freeze_unit(slice_name: str) -> str | None:
+    """The freezing unit of a slice (`ameesh-guard-freeze-<slice>.service`),
+    None for a slice name the guard refuses."""
+    if not isinstance(slice_name, str) or not SLICE_RE.fullmatch(slice_name):
+        return None
+    return "%s-%s.service" % (FREEZE_UNIT, slice_name[:-len(".slice")])
+
+
+def slice_ancestors(name: str) -> list[str]:
+    """`a-b.slice` and the slices that hold it: `-.slice`, `a.slice`,
+    `a-b.slice` (systemd nests slices along the dashes of their names)."""
+    if name == "-.slice":
+        return [name]
+    parts = name[:-len(".slice")].split("-")
+    return ["-.slice"] + ["-".join(parts[:i + 1]) + ".slice" for i in range(len(parts))]
+
+
+def refused_slice(name: Any, cgroup: str | None = None) -> str | None:
+    """Why the guard refuses to cap or freeze the slice `name`, None if it
+    may: not a plain slice name, a system slice, or a slice that holds the
+    guard's helper or the guard itself (`cgroup`: its own cgroup path;
+    frozen, nothing would ever thaw it)."""
+    if freeze_unit(name) is None:
+        return "not a plain systemd slice name (letters, digits, ':_.-', ending in .slice)"
+    if name in SYSTEM_SLICES:
+        return "a system slice"
+    if name in slice_ancestors(HELPER_SLICE):
+        return "it holds the guard's helper (%s)" % HELPER_SLICE
+    own = host.own_cgroup() if cgroup is None else cgroup
+    for part in (own or "").split("/"):
+        if part.endswith(".slice") and SLICE_RE.fullmatch(part) \
+                and name in slice_ancestors(part):
+            return "it holds the guard itself (%s)" % own
+    return None
+
+
+#: which `caps` key each property enforces
+PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
+                 "MemoryHigh": "memory_high_mb", "MemoryMax": "memory_mb"}
+
+
+class Enforcer:
+    """Applies the state's caps with `systemctl set-property --runtime` (the
+    caps live as long as the boot, and stay in place if the guard stops) and
+    the level 2 freeze with `systemctl freeze` / `thaw`. Never raises: a
+    failed command is reported on stderr, and its caps are left out of
+    `caps.enforced`.
+
+    The guard never freezes the slice itself: one transient service per
+    slice (`freeze_unit`) freezes it, sleeps until the bound and thaws it, so
+    no delay of the guard, nor a wall clock going back, can leave a freeze
+    without its thaw (codex #237 r4). The guard thaws early by stopping that
+    service (its ExecStopPost= thaws), then by `systemctl thaw`. A freeze
+    started counts as possibly in force until a thaw succeeds: every
+    evaluation below level 2, and the guard's exit, thaw again until it
+    does."""
+
+    def __init__(self, cfg: GuardConfig, run: Callable | None = None,
+                 log: Callable | None = None, clock: Callable = time.time, *,
+                 cgroup: str | None = None, boottime: Callable = host.boottime,
+                 boot_id: Callable = host.boot_id, sleep: Callable = time.sleep):
+        self.cfg = cfg
+        self.run = run or subprocess.run
+        self.clock = clock
+        self.boottime, self.boot_id, self.sleep = boottime, boot_id, sleep
+        self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
+        self.applied: dict = {}          # unit -> {property: value} last applied
+        self.frozen = False              # possibly frozen: a thaw is owed
+        self.freeze_done = False         # the slice read `frozen` after a start
+        self.freeze_unit = freeze_unit(cfg.slice)
+        #: why this slice is never touched (system slice, holds the guard)
+        self.refused = refused_slice(cfg.slice, cgroup)
+        #: the freeze episode: its since_ts, the boot, and its bound on the
+        #: boot clock, kept across retries and restarts (codex #237 r5)
+        self.episode: dict | None = None
+
+    def _command(self, argv: list[str]) -> bool:
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log("%s: %s" % (" ".join(argv), exc))
+            return False
+        if proc.returncode != 0:
+            self.log("%s: code %s %s" % (" ".join(argv), proc.returncode,
+                                         (proc.stderr or "").strip()[:200]))
+            return False
+        return True
+
+    def _systemctl(self, *args: str) -> bool:
+        return self._command(["systemctl", *args])
+
+    def agent_units(self) -> list[str]:
+        """The loaded agent units of the guest."""
+        try:
+            proc = self.run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+                             "--no-pager", self.cfg.agent_units],
+                            capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode != 0:
+            return []
+        # the first word that is a unit name (some systemd versions prefix a
+        # failed unit with "●", even with --plain)
+        units = []
+        for line in proc.stdout.splitlines():
+            name = next((w for w in line.split() if "." in w), None)
+            if name:
+                units.append(name)
+        return units
+
+    def _set(self, unit: str, props: dict) -> set:
+        """Applies the properties that changed; the set of those in force."""
+        last = self.applied.setdefault(unit, {})
+        changed = {k: v for k, v in props.items() if last.get(k) != v}
+        if changed:
+            if not self._systemctl("set-property", "--runtime", unit,
+                                   *("%s=%s" % kv for kv in sorted(changed.items()))):
+                for key in changed:
+                    last.pop(key, None)
+                return {k for k in props if k not in changed}
+            last.update(changed)
+        return set(props)
+
+    def _quiet(self, *args: str) -> None:
+        # absent unit or failing command: harmless, not reported
+        try:
+            self.run(["systemctl", *args], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _freezer_state(self) -> str | None:
+        """The slice's FreezerState (`running`, `freezing`, `frozen`,
+        `thawing`), None when unreadable."""
+        try:
+            proc = self.run(["systemctl", "show", "--property=FreezerState", "--value",
+                             self.cfg.slice], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (proc.stdout or "").strip() or None if proc.returncode == 0 else None
+
+    def _confirmed(self) -> bool:
+        """The slice reads `frozen` within `FREEZE_CONFIRM_S`: a service
+        started is no proof (its freeze may fail, the shell still exits 0)."""
+        for _ in range(int(FREEZE_CONFIRM_S / FREEZE_POLL_S) + 1):
+            state = self._freezer_state()
+            if state == "frozen":
+                return True
+            if state not in ("freezing", "running"):
+                return False
+            self.sleep(FREEZE_POLL_S)
+        return False
+
+    def restore_episode(self, record: Any) -> None:
+        """The freeze episode a previous guard published (`guard.freeze`)."""
+        if isinstance(record, dict) and isinstance(record.get("boot_id"), str) \
+                and _number(record.get("since_ts")) and _number(record.get("boot_deadline")):
+            self.episode = {k: record[k] for k in ("since_ts", "boot_id", "boot_deadline")}
+
+    def _seconds_left(self, until: float, since: float | None) -> int | None:
+        """Whole seconds the freeze may still last: on the boot clock, from
+        the episode's bound when this episode already started a freeze (a
+        retry, a restart), else from `until` (at most `FREEZE_MAX_S`)."""
+        boot, now = self.boot_id(), self.boottime()
+        episode = self.episode
+        if boot is None or now is None:
+            left = min(FREEZE_MAX_S, until - self.clock())
+        elif episode and episode["since_ts"] == since and episode["boot_id"] == boot:
+            left = episode["boot_deadline"] - now
+        else:
+            left = min(FREEZE_MAX_S, until - self.clock())
+            self.episode = {"since_ts": since, "boot_id": boot, "boot_deadline": now + left}
+        return int(left) if left >= 1 else None
+
+    def freeze(self, on: bool, until: float | None = None,
+               since: float | None = None) -> bool:
+        """Freezes the guest's slice until `until` through its freezing
+        service (`since`: the episode's start), or thaws it; True if the
+        slice is as asked."""
+        if not on:
+            if not self.frozen:
+                return True
+            if self.freeze_unit is not None:
+                self._quiet("stop", self.freeze_unit)   # thaws as it stops
+            if not self._systemctl("thaw", self.cfg.slice):
+                return False          # owed: retried; the service still bounds it
+            self.frozen = self.freeze_done = False
+            return True
+        if self.freeze_done:
+            if self._freezer_state() == "frozen":
+                return True
+            self.log("slice %s no longer frozen: freeze started again" % self.cfg.slice)
+            self.freeze_done = False
+        seconds = None if until is None or self.refused else self._seconds_left(until, since)
+        if seconds is None:
+            self.log("freeze refused: %s" % (self.refused or "bound past"))
+            self.freeze(False)
+            return False
+        # a service left by a failed attempt or an earlier guard: stopped
+        # (it thaws), forgotten, then started anew for what is left
+        self._quiet("stop", self.freeze_unit)
+        self._quiet("reset-failed", self.freeze_unit)
+        # started: possibly in force even if systemd-run does not return
+        self.frozen = True
+        started = self._command([
+            "systemd-run", "--unit=%s" % self.freeze_unit, "--slice=%s" % HELPER_SLICE,
+            "--collect", "--quiet",
+            "--property=RuntimeMaxSec=%d" % (seconds + FREEZE_BACKSTOP_S),
+            "--property=ExecStopPost=systemctl thaw %s" % self.cfg.slice,
+            "/bin/sh", "-c", FREEZE_SCRIPT, self.cfg.slice, str(seconds)])
+        self.freeze_done = started and self._confirmed()
+        return self.freeze_done
+
+    def thaw_at_start(self) -> None:
+        """A guard that died during a freeze must not leave the guest frozen:
+        the slice counts as possibly frozen until a thaw succeeds (retried
+        at every evaluation below level 2). A refused slice is never touched."""
+        if self.refused:
+            return
+        self.frozen = True
+        self.freeze(False)
+
+    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
+        """Enforces `state` (levels 0 to 2; a drain or a stop thaws and keeps
+        the caps); the `caps` keys actually enforced, and `freeze` when the
+        slice reads frozen. A refused slice is never touched."""
+        if self.refused:
+            self.log("slice %s refused: %s; nothing enforced" % (self.cfg.slice, self.refused))
+            return []
+        caps = state.get("caps") or {}
+        done = self._set(self.cfg.slice, slice_properties(caps, cpu_count))
+        enforced = {PROPERTY_CAPS[p] for p in done}
+        if caps.get("agent_memory_mb") is not None:
+            units = self.agent_units()
+            per_agent = {"MemoryMax": "%dM" % int(caps["agent_memory_mb"])}
+            # every unit, even after a failure on one of them
+            done = [("MemoryMax" in self._set(u, per_agent)) for u in units]
+            if done and all(done):
+                enforced.add("agent_memory_mb")
+        freeze = state.get("freeze")
+        if freeze:
+            if self.freeze(True, freeze.get("until_ts"), freeze.get("since_ts")):
+                enforced.add("freeze")
+        else:
+            self.freeze(False)
+        return sorted(enforced)
+
+
+# --------------------------------------------------------------------------
 # the loop
 # --------------------------------------------------------------------------
 
@@ -677,12 +988,19 @@ class Guard:
     """The guard's state between two evaluations."""
 
     def __init__(self, cfg: GuardConfig, *, observe: bool = True,
-                 signals: Callable | None = None, clock: Callable = time.time):
+                 signals: Callable | None = None, clock: Callable = time.time,
+                 enforcer: Enforcer | None = None):
         self.cfg = cfg
         self.observe = observe
+        self.enforcer = None if observe else (enforcer or Enforcer(cfg, clock=clock))
+        if self.enforcer is not None:
+            self.enforcer.thaw_at_start()
         self.clock = clock
         self.signals = signals or (lambda now: read_signals(cfg, now))
         previous = read_json(cfg.state_path) or {}
+        if self.enforcer is not None and isinstance(previous.get("guard"), dict):
+            # a freeze retried after a restart gets only what its episode has left
+            self.enforcer.restore_episode(previous["guard"].get("freeze"))
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
         # so do the level, the freeze bound and the drain deadline
@@ -691,6 +1009,11 @@ class Guard:
         self.written_ts = 0.0
         self.last_key = None
         self.written_decision = None
+
+    def stop(self) -> None:
+        """Leaving: thaw the guest; the caps stay (slice properties)."""
+        if self.enforcer is not None:
+            self.enforcer.freeze(False)
 
     def step(self) -> dict:
         """One evaluation: measure, decide, write when changed or due."""
@@ -707,6 +1030,14 @@ class Guard:
         self.decision = decide(self.cfg.offer, reading, previous, now, drained=drained)
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
+        if self.enforcer is not None:
+            enforced = self.enforcer.apply(state, reading.get("cpu_count"))
+            # the schema's caps.enforced lists caps only: the freeze says it itself
+            state["caps"]["enforced"] = [k for k in enforced if k != "freeze"]
+            if state.get("freeze") is not None:
+                state["freeze"]["enforced"] = "freeze" in enforced
+            if self.enforcer.episode is not None:
+                state["guard"]["freeze"] = dict(self.enforcer.episode)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
@@ -728,6 +1059,11 @@ class Guard:
         return state
 
 
+def _terminate(*_args) -> None:
+    """SIGTERM (systemctl stop): leave through `Guard.stop` (thaw)."""
+    raise KeyboardInterrupt
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh guard",
                                      description="capacity guard of a lending VM (L159e)")
@@ -735,7 +1071,7 @@ def _parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="one measure, the decision and the state")
     check.add_argument("--config")
     check.add_argument("--json", action="store_true")
-    run = sub.add_parser("run", help="the guard loop (tranche 1: --observe only)")
+    run = sub.add_parser("run", help="the guard loop")
     run.add_argument("--config")
     run.add_argument("--observe", action="store_true",
                      help="decide and publish the state, enforce nothing")
@@ -763,13 +1099,15 @@ def main(argv: list[str] | None = None) -> int:
                      state["reason"]))
             print("caps: %s" % json.dumps(state["caps"], sort_keys=True))
         return 0
-    if not args.observe:
-        print("ameesh guard: enforcing caps comes with tranche 2 of L159e; "
-              "use --observe", file=sys.stderr)
-        return 2
-    guard = Guard(cfg, observe=True)
-    while True:
-        guard.step()
-        if args.once:
-            return 0
-        time.sleep(EVAL_S)
+    guard = Guard(cfg, observe=args.observe)
+    signal.signal(signal.SIGTERM, _terminate)
+    try:
+        while True:
+            guard.step()
+            if args.once:
+                return 0
+            time.sleep(EVAL_S)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        guard.stop()

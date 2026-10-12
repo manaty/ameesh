@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L159e — `ameesh guard`, tranche 1: offer, levels, state, observation loop."""
+"""L159e — `ameesh guard`: offer, levels, state, observation loop (tranche 1);
+caps and freeze enforced through systemd (tranche 2)."""
 from __future__ import annotations
 
 import dataclasses
@@ -529,6 +530,447 @@ class SignalsTest(unittest.TestCase):
             self.assertEqual(reading["disk_path"], tmp)
 
 
+class EnforcerTest(unittest.TestCase):
+    """Tranche 2: the caps become slice and unit properties, level 2 freezes."""
+
+    UNIT = "ameesh-guard-freeze-ameesh-guest.service"
+
+    def setUp(self):
+        self.cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer(lend(cpu_max=1)))
+        self.calls = []
+        self.failing = set()     # verbs that fail without acting
+        self.lying = set()       # verbs that act, then report a failure (timeout)
+        self.units = "ameesh-guest-runner@a.service loaded active running a\n" \
+                     "● ameesh-guest-runner@b.service loaded failed failed b\n"
+        self.logged = []
+        self.now = [1000.0]      # the guard's wall clock
+        self.mono = [0.0]        # systemd's monotonic clock
+        self.cost = {}           # seconds a command takes before it acts: verb -> s
+        self.frozen = set()      # frozen slices
+        self.services = {}       # freezing service -> [slice, thaw at, backstop at] (mono)
+        self.freeze_fails = False  # the service's `systemctl freeze` fails
+        self.enforcer = self.make(self.cfg)
+
+    def make(self, cfg, **kw):
+        """An enforcer on the fake systemd: the guard runs in system.slice,
+        the boot clock is systemd's, its sleep lets time pass."""
+        options = dict(run=self.fake, log=self.logged.append, clock=lambda: self.now[0],
+                       cgroup="/system.slice/ameesh-guard.service",
+                       boottime=lambda: self.mono[0], boot_id=lambda: "boot-1",
+                       sleep=self.tick)
+        options.update(kw)
+        return guard.Enforcer(cfg, **options)
+
+    def at(self, now):
+        self.now[0] = now
+        return self.enforcer
+
+    def tick(self, seconds, wall=None):
+        """Time passes: systemd's clock by `seconds`, the wall clock by `wall`
+        (the same by default); a freezing service thaws at its end."""
+        self.mono[0] += seconds
+        self.now[0] += seconds if wall is None else wall
+        for unit, (name, thaw_at, backstop) in list(self.services.items()):
+            if self.mono[0] >= min(thaw_at, backstop):
+                self.frozen.discard(name)
+                del self.services[unit]
+
+    def fake(self, argv, **kw):
+        """systemctl and systemd-run, as far as caps and the freeze go."""
+        self.calls.append(argv)
+        verb = self.verb(argv)
+        self.tick(self.cost.get(verb, 0))          # dispatch: the command acts late
+        if verb in self.failing:
+            return mock.Mock(returncode=1, stdout="", stderr="denied")
+        out, code = "", 0
+        if verb == "list-units":
+            out = self.units
+        elif verb == "show":
+            out = "frozen\n" if argv[-1] in self.frozen else "running\n"
+        elif verb == "systemd-run":
+            unit = argv[1].split("=", 1)[1]
+            props = dict(a.split("=", 1)[1].split("=", 1) for a in argv
+                         if a.startswith("--property="))
+            name, seconds = argv[-2], int(argv[-1])
+            self.assertEqual(argv[-5:-2], ["/bin/sh", "-c", guard.FREEZE_SCRIPT])
+            self.assertEqual(props["ExecStopPost"], "systemctl thaw " + name)
+            self.assertIn("--slice=" + guard.HELPER_SLICE, argv)
+            if unit in self.services:
+                code = 1                              # the unit already exists
+            elif self.freeze_fails:
+                pass                                  # freeze fails, the thaw loop exits 0
+            else:
+                self.frozen.add(name)                 # the script freezes, then sleeps
+                self.services[unit] = [name, self.mono[0] + seconds,
+                                       self.mono[0] + int(props["RuntimeMaxSec"])]
+        elif verb == "stop" and argv[2].startswith(guard.FREEZE_UNIT):
+            if argv[2] in self.services:              # ExecStopPost= thaws
+                self.frozen.discard(self.services.pop(argv[2])[0])
+            else:
+                code = 5
+        elif verb == "freeze":
+            self.frozen.add(argv[2])
+        elif verb == "thaw":
+            self.frozen.discard(argv[2])
+        if verb in self.lying:
+            code = 1
+        return mock.Mock(returncode=code, stdout=out, stderr="denied" if code else "")
+
+    @staticmethod
+    def verb(argv):
+        return argv[1] if argv[0] == "systemctl" else argv[0]
+
+    def freezes(self):
+        return [c for c in self.calls if c[1] in ("freeze", "thaw")]
+
+    def runs(self):
+        return [c for c in self.calls if c[0] == "systemd-run"]
+
+    def sets(self):
+        return [c[3:] for c in self.calls if c[1] == "set-property"]
+
+    def test_slice_properties(self):
+        self.assertEqual(
+            guard.slice_properties({"cpu_weight": 10, "io_weight": 10, "cpu_share": 0.125,
+                                    "memory_high_mb": 2048, "memory_mb": 8192}, 8),
+            {"CPUWeight": "10", "IOWeight": "10", "CPUQuota": "100%",
+             "MemoryHigh": "2048M", "MemoryMax": "8192M"})
+        # no CPU count: no quota (a share of nothing)
+        self.assertNotIn("CPUQuota", guard.slice_properties({"cpu_share": 0.5}, None))
+        self.assertEqual(guard.slice_properties({}, 8), {})
+
+    def test_apply_changes_only_and_freeze(self):
+        caps = {"cpu_weight": 10, "io_weight": 10, "cpu_share": 0.25, "memory_mb": 4096,
+                "memory_high_mb": 4096, "agent_memory_mb": 1024, "max_concurrent": 2}
+        done = self.enforcer.apply({"caps": dict(caps)}, 4)
+        self.assertEqual(done, ["agent_memory_mb", "cpu_share", "cpu_weight", "io_weight",
+                                "memory_high_mb", "memory_mb"])
+        self.assertEqual(self.sets(), [
+            ["ameesh-guest.slice", "CPUQuota=100%", "CPUWeight=10", "IOWeight=10",
+             "MemoryHigh=4096M", "MemoryMax=4096M"],
+            ["ameesh-guest-runner@a.service", "MemoryMax=1024M"],
+            ["ameesh-guest-runner@b.service", "MemoryMax=1024M"]])
+        # level 1: only the changed properties are sent
+        self.calls.clear()
+        reduced = dict(caps, cpu_share=0.125, memory_high_mb=1024)
+        self.at(10.0).apply({"caps": reduced}, 4)
+        self.assertEqual(self.sets(), [["ameesh-guest.slice", "CPUQuota=50%",
+                                        "MemoryHigh=1024M"]])
+        # level 2: frozen by its service, started once
+        self.calls.clear()
+        frozen = {"caps": reduced, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
+        self.assertIn("freeze", self.at(10.0).apply(frozen, 4))
+        self.at(10.0).apply(frozen, 4)
+        self.assertEqual(len(self.runs()), 1)
+        self.assertEqual(self.frozen, {"ameesh-guest.slice"})
+        # the level drops: the service stopped, the slice thawed
+        self.calls.clear()
+        self.assertNotIn("freeze", self.at(10.0).apply({"caps": reduced}, 4))
+        self.assertEqual([c[1:] for c in self.calls if c[1] in ("stop", "thaw")],
+                         [["stop", self.UNIT], ["thaw", "ameesh-guest.slice"]])
+        self.assertEqual((self.frozen, self.services), (set(), {}))
+
+    def test_failures_are_not_enforced(self):
+        self.failing = {"set-property", "systemd-run"}
+        caps = {"cpu_weight": 10, "agent_memory_mb": 1024}
+        state = {"caps": caps, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
+        self.assertEqual(self.at(10.0).apply(state, 4), [])
+        self.assertTrue(any("denied" in line for line in self.logged))
+        self.assertEqual(self.frozen, set())
+        # retried at the next evaluation, and in force once it works
+        self.failing = set()
+        self.calls.clear()
+        self.assertEqual(self.at(10.0).apply(state, 4),
+                         ["agent_memory_mb", "cpu_weight", "freeze"])
+        self.assertIn(["ameesh-guest.slice", "CPUWeight=10"], self.sets())
+        # no agent unit loaded: the per-agent cap is not in force
+        self.units = ""
+        self.assertNotIn("agent_memory_mb", self.at(10.0).apply({"caps": caps}, 4))
+        # systemctl missing: nothing in force, nothing raised
+        broken = guard.Enforcer(self.cfg, log=self.logged.append, clock=lambda: 10.0,
+                                run=lambda *a, **k: (_ for _ in ()).throw(OSError("none")))
+        self.assertEqual(broken.apply(state, 4), [])
+
+    def test_freeze_held_by_one_systemd_service(self):
+        # codex #237 r4: the guard never freezes the slice itself; a service
+        # freezes it, sleeps until the bound and thaws it, guard alive or not
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.assertIn("freeze", self.at(1010.0).apply(frozen, 4))
+        run = self.runs()
+        self.assertEqual(run, [[
+            "systemd-run", "--unit=" + self.UNIT, "--slice=ameesh-guard-helper.slice",
+            "--collect", "--quiet", "--property=RuntimeMaxSec=80",
+            "--property=ExecStopPost=systemctl thaw ameesh-guest.slice",
+            "/bin/sh", "-c", guard.FREEZE_SCRIPT, "ameesh-guest.slice", "50"]])
+        self.assertNotIn("freeze", [c[1] for c in self.calls if c[0] == "systemctl"])
+        # the guard is killed: the slice thaws at the bound all the same
+        self.tick(49)
+        self.assertEqual(self.frozen, {"ameesh-guest.slice"})
+        self.tick(1)
+        self.assertEqual((self.frozen, self.services), (set(), {}))
+        # past the bound, or under a second left: no freeze
+        fresh = self.make(self.cfg)
+        self.calls.clear()
+        self.now[0] = 1059.5
+        self.assertNotIn("freeze", fresh.apply(frozen, 4))
+        self.assertEqual((self.runs(), self.frozen), ([], set()))
+
+    def test_no_delay_leaves_a_freeze_past_its_bound(self):
+        # codex #237 r4 (P1): bound 1060, evaluation at 1055; the cleanup and
+        # the dispatch of systemd-run take 7 s each: the freeze starts late,
+        # and still lasts 5 s at most, guard killed or not
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.cost = {"stop": 7, "reset-failed": 7, "systemd-run": 7}
+        self.at(1055.0).apply(frozen, 4)
+        self.assertEqual(self.runs()[0][-1], "5")
+        self.assertEqual(self.frozen, {"ameesh-guest.slice"})
+        self.tick(5)
+        self.assertEqual((self.frozen, self.services), (set(), {}))
+        # (P1) the wall clock goes back: the freeze lasts what systemd's
+        # clock says, and never more than the longest freeze (a new episode)
+        self.cost = {}
+        self.calls.clear()
+        self.at(0.0).apply({"caps": {}}, 4)
+        frozen = {"caps": {}, "freeze": {"since_ts": 0.0, "until_ts": 1060.0}}
+        self.at(0.0).apply(frozen, 4)
+        self.assertEqual(self.runs()[0][-1], "60")
+        self.assertIn("--property=RuntimeMaxSec=90", self.runs()[0])
+        self.tick(59, wall=-100)
+        self.assertEqual(self.frozen, {"ameesh-guest.slice"})
+        self.tick(1, wall=-100)
+        self.assertEqual(self.frozen, set())
+
+    def test_guards_of_two_slices_never_touch_each_other(self):
+        # codex #237 r4 (P2): guard B, on another slice, starts, freezes and
+        # thaws; guard A's freeze and its service are left alone
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.at(1000.0).apply(frozen, 4)
+        other = dataclasses.replace(self.cfg, slice="guest-b.slice")
+        b = self.make(other)
+        self.calls.clear()
+        b.thaw_at_start()
+        b.apply(frozen, 4)
+        b.apply({"caps": {}}, 4)
+        self.assertFalse(any(self.UNIT in c or "ameesh-guest.slice" in c for c in self.calls))
+        self.assertIn(self.UNIT, self.services)
+        self.assertEqual(self.frozen, {"ameesh-guest.slice"})
+        self.assertEqual(guard.freeze_unit("guest-b.slice"),
+                         "ameesh-guard-freeze-guest-b.service")
+
+    def test_slice_names(self):
+        self.assertEqual(guard.freeze_unit("ameesh-guest.slice"), self.UNIT)
+        for bad in ("a b.slice", "x.slice\n", "-x.slice", "x.service", "$x.slice",
+                    "%i.slice", "a;b.slice", "x\\y.slice", "", None):
+            with self.subTest(bad):
+                self.assertIsNone(guard.freeze_unit(bad))
+        broken = self.make(dataclasses.replace(self.cfg, slice="a b.slice"))
+        self.assertNotIn("freeze", broken.apply(
+            {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}, 4))
+        self.assertEqual(self.runs(), [])
+
+    def test_slices_that_hold_the_helper_or_the_guard_are_refused(self):
+        # codex #237 r5 (P1): freezing system.slice (or any slice above the
+        # helper or the guard) would freeze what has to thaw it
+        self.assertEqual(guard.slice_ancestors("a-b-c.slice"),
+                         ["-.slice", "a.slice", "a-b.slice", "a-b-c.slice"])
+        own = "/apps.slice/apps-ops.slice/ameesh-guard.service"
+        for name in ("-.slice", "system.slice", "user.slice", "ameesh.slice",
+                     "ameesh-guard.slice", "ameesh-guard-helper.slice", "apps.slice",
+                     "apps-ops.slice", "a b.slice"):
+            with self.subTest(name):
+                self.assertIsNotNone(guard.refused_slice(name, own))
+        for name in ("ameesh-guest.slice", "apps-ops-x.slice", "ameesh-guard-helper-x.slice"):
+            with self.subTest(name):
+                self.assertIsNone(guard.refused_slice(name, own))
+        # the guard in a user's manager: its user slice is refused too
+        self.assertIsNotNone(guard.refused_slice(
+            "user-1000.slice", "/user.slice/user-1000.slice/user@1000.service/x.service"))
+        # a refused slice is never touched: no cap, no freeze, no thaw
+        for name in ("system.slice", "ameesh-guard.slice"):
+            refused = self.make(dataclasses.replace(self.cfg, slice=name))
+            refused.thaw_at_start()
+            self.assertEqual(refused.apply(
+                {"caps": {"cpu_weight": 10},
+                 "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}, 4), [])
+            self.assertEqual(self.calls, [])
+        self.assertTrue(any("refused" in line for line in self.logged))
+
+    def test_freeze_counted_only_when_the_slice_reads_frozen(self):
+        # codex #237 r5 (P2): the service starts, its freeze fails, the shell
+        # exits 0: not enforced, and retried at the next evaluation
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.freeze_fails = True
+        self.assertNotIn("freeze", self.at(1000.0).apply(frozen, 4))
+        self.assertTrue(any(c[1] == "show" and "--property=FreezerState" in c
+                            for c in self.calls))
+        self.freeze_fails = False
+        self.tick(5)
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual(len(self.runs()), 2)
+        # thawed behind the guard's back: started again, for what is left
+        self.frozen.clear()
+        self.tick(5)
+        left = int(60 - self.mono[0])     # the failed attempt polled 2.2 s
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], str(left))
+        self.assertLess(left, 50)
+
+    def test_retries_and_restarts_keep_the_episode_bound(self):
+        # codex #237 r5 (P2): a retry, or a restarted guard, gets what is
+        # left of the episode on the boot clock, never a fresh 60 s
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.assertIn("freeze", self.at(1000.0).apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "60")
+        self.tick(20)
+        self.services.clear()           # the service dies, the slice thaws
+        self.frozen.clear()
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "40")
+        # a new guard, the wall clock 100 s back: the published episode holds
+        self.tick(10, wall=-110)
+        restarted = self.make(self.cfg)
+        restarted.restore_episode(json.loads(json.dumps(self.enforcer.episode)))
+        restarted.thaw_at_start()
+        self.assertIn("freeze", restarted.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "30")
+        # another boot: the old episode means nothing, the wall clock decides
+        other = self.make(self.cfg, boot_id=lambda: "boot-2")
+        other.restore_episode(self.enforcer.episode)
+        other.thaw_at_start()
+        self.at(1050.0)
+        self.assertIn("freeze", other.apply(frozen, 4))
+        self.assertEqual(self.runs()[-1][-1], "10")
+        # ill-typed records are ignored
+        for bad in (None, 3, {"since_ts": "x", "boot_id": "b", "boot_deadline": 1},
+                    {"since_ts": 1, "boot_id": 2, "boot_deadline": 1},
+                    {"since_ts": 1, "boot_id": "b", "boot_deadline": float("inf")}):
+            fresh = self.make(self.cfg)
+            fresh.restore_episode(bad)
+            self.assertIsNone(fresh.episode, bad)
+
+    def test_guard_publishes_the_freeze_and_its_episode(self):
+        # the schema's caps.enforced lists caps only: the freeze reports
+        # itself (freeze.enforced); the episode is published for a restart
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = dataclasses.replace(
+                self.cfg, offer=guard.parse_offer(lend(reclaim={"cpu_pressure_max": "20%"})),
+                state_path=os.path.join(tmp, "state.json"),
+                ack_path=os.path.join(tmp, "ack.json"))
+            reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                       "mem_available_bytes": 12 * GIB, "disk_free_bytes": 50 * GIB,
+                       "psi_cpu_10": 50.0}
+            g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
+                            clock=lambda: self.now[0], enforcer=self.make(cfg))
+            state = g.step()
+            self.assertEqual(state["level"], 2)
+            self.assertNotIn("freeze", state["caps"]["enforced"])
+            self.assertTrue(state["freeze"]["enforced"])
+            self.assertEqual(state["guard"]["freeze"],
+                             {"since_ts": 1000.0, "boot_id": "boot-1",
+                              "boot_deadline": 60.0})
+            self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
+                                           state), [])
+            # restarted 20 s later: the slice thawed at start, frozen again
+            # for the 40 s the episode has left
+            self.tick(20)
+            g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
+                            clock=lambda: self.now[0], enforcer=self.make(cfg))
+            self.assertEqual(g.step()["freeze"]["enforced"], True)
+            self.assertEqual(self.runs()[-1][-1], "40")
+
+    def test_restart_takes_over_the_service(self):
+        # an earlier guard's service still holds the slice: the new guard
+        # stops it (it thaws) at start; a service left by a failed attempt is
+        # stopped and forgotten before a new one starts
+        self.frozen.add("ameesh-guest.slice")
+        self.services[self.UNIT] = ["ameesh-guest.slice", 40.0, 70.0]
+        self.enforcer.thaw_at_start()
+        self.assertEqual((self.frozen, self.services), (set(), {}))
+        self.lying = {"systemd-run"}
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.assertNotIn("freeze", self.at(1000.0).apply(frozen, 4))
+        self.lying = set()
+        self.calls.clear()
+        self.tick(5)
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.assertEqual([c[1:] for c in self.calls if c[0] == "systemctl"][:2],
+                         [["stop", self.UNIT], ["reset-failed", self.UNIT]])
+        self.assertEqual(self.services[self.UNIT][1], self.mono[0] + 55)
+
+    def test_freeze_attempted_is_thawed(self):
+        # codex #237 r1: systemd-run reports a failure (timeout, SIGTERM)
+        # after the service froze the slice: the drop of the level and stop() thaw
+        self.lying = {"systemd-run"}
+        frozen = {"caps": {}, "freeze": {"since_ts": 1000.0, "until_ts": 1060.0}}
+        self.assertNotIn("freeze", self.at(1000.0).apply(frozen, 4))
+        self.assertEqual(self.frozen, {"ameesh-guest.slice"})
+        self.lying = set()
+        self.at(1000.0).apply({"caps": {}}, 4)
+        self.assertEqual((self.frozen, self.services), (set(), {}))
+        self.lying = {"systemd-run"}
+        self.at(1000.0).apply(frozen, 4)
+        self.lying = set()
+        self.enforcer.freeze(False)                          # Guard.stop
+        self.assertEqual((self.frozen, self.services), (set(), {}))
+
+    def test_thaw_at_start_retried_until_it_works(self):
+        # codex #237 r1: a failed thaw at start is retried at each evaluation
+        self.failing = {"thaw"}
+        self.enforcer.thaw_at_start()
+        self.enforcer.apply({"caps": {}}, 4)
+        self.assertEqual(len(self.freezes()), 2)
+        self.failing = set()
+        self.enforcer.apply({"caps": {}}, 4)
+        self.enforcer.apply({"caps": {}}, 4)
+        self.assertEqual(len(self.freezes()), 3)             # once it worked, no more
+
+    def test_every_agent_capped_despite_a_failure(self):
+        # codex #237 r1: a failing first unit no longer skips the others
+        def fake(argv, **kw):
+            self.calls.append(argv)
+            bad = argv[1] == "set-property" and argv[3] == "ameesh-guest-runner@a.service"
+            out = self.units if argv[1] == "list-units" else ""
+            return mock.Mock(returncode=1 if bad else 0, stdout=out, stderr="")
+        enforcer = guard.Enforcer(self.cfg, run=fake, log=self.logged.append)
+        for _ in range(2):
+            self.assertNotIn("agent_memory_mb",
+                             enforcer.apply({"caps": {"agent_memory_mb": 1024}}, 4))
+        self.assertIn(["ameesh-guest-runner@b.service", "MemoryMax=1024M"], self.sets())
+
+    def test_guard_thaws_at_start_and_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = dataclasses.replace(
+                self.cfg, offer=guard.parse_offer(lend(cpu_max=2)),
+                state_path=os.path.join(tmp, "state.json"),
+                ack_path=os.path.join(tmp, "ack.json"))
+            reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                       "mem_available_bytes": 12 * GIB, "disk_free_bytes": 50 * GIB}
+            with mock.patch.object(guard.resources, "lendable", None, create=True), \
+                    mock.patch.object(guard.resources, "measure", None, create=True):
+                g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
+                                clock=lambda: 1000.0,
+                                enforcer=self.make(cfg))
+                self.assertEqual(self.calls[:2], [["systemctl", "stop", self.UNIT],
+                                                  ["systemctl", "thaw", "ameesh-guest.slice"]])
+                state = g.step()
+                self.assertEqual(state["guard"]["mode"], "enforce")
+                self.assertIn("cpu_share", state["caps"]["enforced"])
+                with open(cfg.state_path) as fh:
+                    self.assertEqual(json.load(fh)["caps"]["enforced"],
+                                     state["caps"]["enforced"])
+                g.enforcer.frozen = True
+                self.calls.clear()
+                g.stop()
+                self.assertEqual(self.freezes(), [["systemctl", "thaw", "ameesh-guest.slice"]])
+                # observing: no enforcer, no systemctl
+                self.calls.clear()
+                observer = guard.Guard(cfg, signals=lambda now: dict(reading),
+                                       clock=lambda: 1000.0)
+                self.assertEqual(observer.step()["caps"]["enforced"], [])
+                observer.stop()
+                self.assertEqual(self.calls, [])
+
+
 class CliTest(unittest.TestCase):
     def test_check_and_observe_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -550,13 +992,35 @@ class CliTest(unittest.TestCase):
             self.assertEqual(json.loads(printed)["offer"]["memory_max"], 4 * GIB)
             self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
                                            json.loads(printed)), [])
-            with mock.patch("sys.stderr"):
-                self.assertEqual(guard.main(["run", "--config", config]), 2)
-            self.assertEqual(guard.main(["run", "--observe", "--once", "--config", config]), 0)
+            calls = []
+
+            def run(argv, **kw):
+                calls.append(argv)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(guard.subprocess, "run", run), \
+                    mock.patch.object(guard.signal, "signal"):
+                self.assertEqual(guard.main(["run", "--once", "--config", config]), 0)
+            with open(os.path.join(tmp, "s", "state.json")) as fh:
+                self.assertEqual(json.load(fh)["guard"]["mode"], "enforce")
+            self.assertEqual(calls[:2], [
+                ["systemctl", "stop", "ameesh-guard-freeze-ameesh-guest.service"],
+                ["systemctl", "thaw", "ameesh-guest.slice"]])
+            self.assertTrue(any(c[1:3] == ["set-property", "--runtime"] for c in calls))
+            calls.clear()
+            with mock.patch.object(guard.subprocess, "run", run):
+                self.assertEqual(
+                    guard.main(["run", "--observe", "--once", "--config", config]), 0)
+            self.assertEqual([c for c in calls if c[0] == "systemctl"
+                              and c[1] in ("set-property", "freeze", "thaw")], [])
             with open(os.path.join(tmp, "s", "state.json")) as fh:
                 self.assertEqual(json.load(fh)["guard"]["kind"], "ameesh-guard")
             with open(config, "w") as fh:
                 json.dump({"lend": {"cpu_max": "three"}}, fh)
+            with mock.patch("sys.stderr"):
+                self.assertEqual(guard.main(["check", "--config", config]), 1)
+            # the slice goes into the freezing unit's ExecStopPost= line
+            with open(config, "w") as fh:
+                json.dump({"slice": "x.slice --now", "lend": {"cpu_max": 1}}, fh)
             with mock.patch("sys.stderr"):
                 self.assertEqual(guard.main(["check", "--config", config]), 1)
 
