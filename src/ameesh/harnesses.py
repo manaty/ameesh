@@ -13,7 +13,9 @@ capabilities, authentication, distribution), **étendu** par un espace de clés
 * hooks : `hooks` (déclaratif, pour le générateur de plugin de L17) ;
 * jauges et coût : `cost.source`, `cost.gauges`, `cost.paid_per_token` ;
 * permissions : `permissions` (refus par défaut) ;
-* réglages : `model`, `effort`, `tier` (`flag` ou livraison par fichier).
+* réglages : `model`, `effort`, `tier` (`flag` ou livraison par fichier) ;
+* resident mode (L75, decision 0035): `resident` (protocol of a harness process
+  kept open between turns, its arguments and its pinned minimum version).
 
 Deux sources, dans cet ordre :
 
@@ -42,6 +44,10 @@ from typing import Any, Iterable, Mapping
 SCHEMA_VERSION = "1"
 #: protocoles de pilotage
 PROTOCOLS = ("cli", "acp")
+#: L75: protocols of a resident harness process (drivers in `resident.py`)
+RESIDENT_PROTOCOLS = ("claude-stream-json", "codex-app-server", "acp")
+#: L75: known keys of `ameesh.resident`
+RESIDENT_KEYS = ("protocol", "launcher", "command", "new_session", "thread", "min_version")
 #: lecteurs de flux connus (implémentés dans `adapters.py`)
 STREAM_FORMATS = ("claude-stream-json", "codex-json", "dsh-json", "acp-json", "text")
 #: catégories de permission ACP (`ToolKind`)
@@ -64,7 +70,7 @@ AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
                "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
-               "cost", "permissions", "acp", "accounts", "install")
+               "cost", "permissions", "acp", "accounts", "install", "resident")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
 #: interactive session, `ameesh attach` and `ameesh chat`)
 INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
@@ -84,6 +90,8 @@ MANIFEST_KEYS = ("id", "name", "version", "schema_version", "description",
 ERROR = "error"
 WARNING = "warning"
 ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+#: L75: a pinned version (`2.1.286`, `0.2.0-rc.2`)
+_VERSION_TEXT_RE = re.compile(r"^\d+(\.\d+){0,2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$")
 ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -161,6 +169,8 @@ class HarnessDescriptor:
     permissions: Mapping[str, Any] = field(default_factory=dict)
     acp: Mapping[str, Any] = field(default_factory=dict)
     accounts: Mapping[str, str] = field(default_factory=dict)
+    #: L75: normalized `ameesh.resident` block ({} = one turn per event)
+    resident: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def paid_per_token(self) -> bool:
@@ -811,7 +821,92 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                     findings.append(Finding("harness-accounts-invalid", ERROR,
                                             "`ameesh.accounts.%s`: non-empty text expected" % key,
                                             path))
+    findings.extend(_check_resident(ameesh.get("resident"), protocol, path))
     return findings
+
+
+def _check_resident(value: Any, protocol: Any, path: str) -> list[Finding]:
+    """`ameesh.resident` (L75, decision 0035): how to keep a harness process
+    open between turns. `protocol` is one of `RESIDENT_PROTOCOLS`; `launcher`
+    and `command` are the arguments of the resident process (default: those of
+    the descriptor, for `acp` only); `new_session` the flag that names a new
+    session (`["--session-id"]`); `thread` the fixed parameters of a Codex
+    thread; `min_version` the pinned minimum version of the binary."""
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        return [Finding("harness-resident-invalid", ERROR,
+                        "`ameesh.resident`: object expected", path)]
+    findings = []
+    for key in value:
+        if key not in RESIDENT_KEYS:
+            findings.append(Finding("harness-key-unknown", WARNING,
+                                    "`ameesh.resident.%s`: unknown key (ignored)" % key, path))
+    kind = value.get("protocol")
+    if kind not in RESIDENT_PROTOCOLS:
+        findings.append(Finding("harness-resident-invalid", ERROR,
+                                "`ameesh.resident.protocol`: %s expected"
+                                % " | ".join(RESIDENT_PROTOCOLS), path))
+    elif protocol == "acp" and kind != "acp":
+        findings.append(Finding("harness-resident-invalid", ERROR,
+                                "`ameesh.resident.protocol` %r: an ACP harness is resident in "
+                                "ACP only" % kind, path))
+    for key in ("launcher", "command", "new_session"):
+        if key in value and _strings(value.get(key)) is None:
+            findings.append(Finding("harness-resident-invalid", ERROR,
+                                    "`ameesh.resident.%s`: list of strings expected" % key, path))
+    if kind in ("claude-stream-json", "codex-app-server") and not _strings(value.get("command")):
+        findings.append(Finding("harness-resident-invalid", ERROR,
+                                "`ameesh.resident.command` required for %s" % kind, path))
+    if kind == "acp" and protocol != "acp" and "launcher" not in value \
+            and "command" not in value:
+        findings.append(Finding("harness-resident-invalid", ERROR,
+                                "`ameesh.resident`: a command-line harness resident in ACP "
+                                "declares its ACP `launcher` or `command` (`--profile acp`)",
+                                path))
+    if "new_session" in value and kind != "claude-stream-json":
+        findings.append(Finding("harness-resident-invalid", WARNING,
+                                "`ameesh.resident.new_session` is only read for "
+                                "claude-stream-json (ignored)", path))
+    thread = value.get("thread")
+    if thread is not None:
+        if not isinstance(thread, dict) or not all(
+                isinstance(k, str) and isinstance(v, (str, bool)) for k, v in thread.items()):
+            findings.append(Finding("harness-resident-invalid", ERROR,
+                                    "`ameesh.resident.thread`: object name → text or boolean "
+                                    "expected", path))
+        elif kind != "codex-app-server":
+            findings.append(Finding("harness-resident-invalid", WARNING,
+                                    "`ameesh.resident.thread` is only read for "
+                                    "codex-app-server (ignored)", path))
+    minimum = value.get("min_version")
+    if minimum is None:
+        findings.append(Finding("harness-resident-unpinned", WARNING,
+                                "`ameesh.resident.min_version` absent: the resident protocol "
+                                "is used with any version of the binary", path))
+    elif not (isinstance(minimum, str) and _VERSION_TEXT_RE.match(minimum)):
+        findings.append(Finding("harness-resident-invalid", ERROR,
+                                "`ameesh.resident.min_version`: version expected "
+                                "(`2.1.286`, `0.2.0-rc.2`)", path))
+    return findings
+
+
+def _resident(ameesh: Mapping[str, Any]) -> dict:
+    """The normalized form of `ameesh.resident` ({} if absent or invalid).
+
+    `launcher` and `command` are resolved here: absent, the resident process
+    takes the descriptor's `launcher`, and its `command` too for an ACP
+    harness (a command-line harness resident in ACP declares its own)."""
+    value, protocol = ameesh.get("resident"), ameesh.get("protocol")
+    if not isinstance(value, dict) or errors(_check_resident(value, protocol, "")):
+        return {}
+    default_command = ameesh.get("command") if protocol == "acp" else ()
+    return {"protocol": value["protocol"],
+            "launcher": tuple(_strings(value.get("launcher", ameesh.get("launcher"))) or ()),
+            "command": tuple(_strings(value.get("command", default_command)) or ()),
+            "new_session": tuple(_strings(value.get("new_session")) or ()),
+            "thread": dict(value.get("thread") or {}),
+            "min_version": value.get("min_version") or ""}
 
 
 def _check_shape(value: Any, key: str, findings: list[Finding], path: str) -> None:
@@ -994,6 +1089,7 @@ def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
         accounts={k: str(v) for k, v in (ameesh.get("accounts") or {}).items()
                   if isinstance(k, str) and isinstance(v, str)}
         if isinstance(ameesh.get("accounts"), dict) else {},
+        resident=_resident(ameesh),
     )
 
 
