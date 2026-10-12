@@ -235,6 +235,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'action_class', 'currency', 'reserved_by', 'reserved_at',
         'released_at', 'released_reason'
     ]),
+    -- L385 (0373): explicit prerequisites and their audit attribution.
+    ('work_item_dependencies', ARRAY[
+        'work_item_id', 'blocker_id', 'created_by', 'created_at'
+    ]),
     ('thread_index', ARRAY[
         'project', 'lot', 'transport', 'host', 'location', 'last_entry_id',
         'last_mailbox_id', 'last_author', 'last_at', 'entries',
