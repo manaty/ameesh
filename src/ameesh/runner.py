@@ -390,9 +390,6 @@ class AgentWorker(threading.Thread):
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
         self.suite: str | None = None
         self.rotation_forcee: str | None = None
-        #: L147b : tours de résumé de rotation faits par ce worker (le placement
-        #: est relu après une passe qui en a fait un)
-        self.summary_turns = 0
         #: raison de la clôture du dernier tour (L105), None s'il a fini seul
         self.last_turn_closed: str | None = None
         #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
@@ -905,19 +902,24 @@ class AgentWorker(threading.Thread):
     def idle_due(self) -> bool:
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
 
-    def _moved_during_rotation(self, spec: dict | None) -> bool:
-        """L147b (codex r4 de #220) : une rotation a fait un tour de résumé
-        depuis le dernier contrôle de placement ; si le canon a placé l'agent
-        ailleurs pendant ce tour, aucun tour de travail ne part d'ici. La
-        consigne prise par `pick()` est remise en attente (le courrier n'est
-        pas consommé par `pick()`). Vrai : le worker rend son bail."""
+    def _moved_before_turn(self, spec: dict) -> bool:
+        """L147b (codex r4 de #220, r1 de #283) : le placement est relu après
+        `pick()`, juste avant le tour de travail — une rotation (taille, lot,
+        bascule de compte dans `pick()`) a pu y faire un tour de résumé, pendant
+        lequel le canon a placé l'agent ailleurs ; aucun tour de travail ne part
+        alors d'ici. La consigne prise par `pick()` est remise en attente (le
+        courrier n'est pas consommé par `pick()`), y compris si la base tombe
+        pendant ce contrôle (`_consigne_a_restaurer`, repris au retour de la
+        base). Vrai : le worker rend son bail."""
+        self._consigne_a_restaurer = spec.get("kind") == "prompt"
         ailleurs = self.placed_elsewhere()
+        if ailleurs and self._consigne_a_restaurer:
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        self._consigne_a_restaurer = False
         if not ailleurs:
             return False
-        if spec and spec.get("kind") == "prompt":
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-        log("[%s] placed on host %s, not %s, during a session rotation: no work turn "
-            "here, lease released" % (self.name, ailleurs, self.runner.host))
+        log("[%s] placed on host %s, not %s, before the work turn: no turn here, "
+            "lease released" % (self.name, ailleurs, self.runner.host))
         return True
 
     def placed_elsewhere(self) -> str:
@@ -1218,7 +1220,6 @@ class AgentWorker(threading.Thread):
         ancienne = self.current_session()
         log_async("[%s] session rotation (%s)" % (self.name, raison))
         self._refus_pression = False
-        self.summary_turns += 1         # L147b : un tour a eu lieu (placement relu)
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
         if not ok and self._refus_pression:
             # la pression est venue entre le choix et le lancement : la
@@ -3571,10 +3572,9 @@ class AgentWorker(threading.Thread):
                             "current turn" % (self.name, ailleurs, self.runner.host))
                         break
                     self.apply_restart_if_requested()
-                    resumes = self.summary_turns
                     self.maybe_rotate()
                     spec = self.rotate_for_lot(self.pick())
-                    if self.summary_turns != resumes and self._moved_during_rotation(spec):
+                    if spec is not None and self._moved_before_turn(spec):
                         break
                 except db_mod.Unavailable as exc:
                     self._panne_de_base(exc, "choosing the turn")

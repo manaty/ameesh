@@ -32,7 +32,7 @@ import uuid
 from unittest import mock
 
 from ameesh import adapters, exploitation, harnesses, hostcheck, mail, notify, registry
-from ameesh import resources, storage
+from ameesh import db as db_mod, resources, storage
 from ameesh import runner as runner_mod
 from ameesh.runner import AgentWorker, Runner
 
@@ -934,7 +934,7 @@ class CoupureTest(PgTestCase):
         registry.set_pending_prompt(self.db, "tournant", "travail")
 
         def rotation():
-            worker.summary_turns += 1        # le tour de résumé a eu lieu…
+            # le tour de résumé a eu lieu…
             self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
                             " WHERE name = 'tournant'")   # …et le canon a déplacé l'agent
             return True
@@ -947,6 +947,67 @@ class CoupureTest(PgTestCase):
         ligne = registry.get(self.db, "tournant")
         self.assertEqual(ligne["pending_prompt"], "travail")
         self.assertIsNone(ligne.get("lease_owner"))
+
+    def _worker(self, name):
+        self.register(name, "claude", cwd=self._cwd(name))
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        return worker
+
+    def test_place_ailleurs_pendant_une_bascule_de_compte_dans_pick(self):
+        # #283 r1 : la bascule de compte fait son résumé DANS pick()
+        # (account_turn.rotate) ; le canon déplace l'agent pendant ce résumé
+        worker = self._worker("bascule")
+        registry.set_pending_prompt(self.db, "bascule", "travail")
+        pick = worker.pick
+
+        def pick_avec_bascule():
+            spec = pick()
+            self.db.execute("UPDATE agent_registry SET host = 'autre-hote'"
+                            " WHERE name = 'bascule'")
+            return spec
+
+        with mock.patch.object(worker, "pick", side_effect=pick_avec_bascule), \
+                mock.patch.object(worker, "run_turn") as tour, \
+                mock.patch.object(runner_mod, "log"):
+            worker.run()
+        tour.assert_not_called()
+        ligne = registry.get(self.db, "bascule")
+        self.assertEqual(ligne["pending_prompt"], "travail")
+        self.assertIsNone(ligne.get("lease_owner"))
+
+    def test_base_perdue_au_controle_de_placement_la_consigne_survit(self):
+        # #283 r1 : pick() a pris A, le contrôle de placement lève Unavailable ;
+        # B arrive avant la reprise — A n'est pas perdue, les deux partent
+        worker = self._worker("panne")
+        registry.set_pending_prompt(self.db, "panne", "consigne A")
+        controles = []
+        reel = worker.placed_elsewhere
+
+        def placement():
+            controles.append(1)
+            if len(controles) == 2:          # celui d'après pick()
+                registry.set_pending_prompt(self.db, "panne", "consigne B")
+                raise db_mod.Unavailable("base coupée")
+            return reel()
+
+        tours = []
+
+        def tour(spec):
+            tours.append(spec.get("prompt"))
+            worker.stopping.set()
+            return True
+
+        with mock.patch.object(worker, "placed_elsewhere", side_effect=placement), \
+                mock.patch.object(worker, "_panne_de_base"), \
+                mock.patch.object(worker, "run_turn", side_effect=tour), \
+                mock.patch.object(runner_mod, "log"):
+            worker.run()
+        self.assertEqual(len(tours), 1)
+        self.assertIn("consigne A", tours[0])
+        self.assertIn("consigne B", tours[0])
 
     def test_doctor_signale_un_agent_mene_sans_unite(self):
         self.register("sansunite", "claude", cwd=self._cwd("sansunite"))
