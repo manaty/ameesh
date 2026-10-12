@@ -2076,6 +2076,11 @@ class HostResources(Domain):
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
 
     @abc.abstractmethod
+    def since(self, host: str, since_s: float) -> list[dict]:
+        """L159g: the readings of the host over the last `since_s` seconds,
+        oldest first (the pilot report)."""
+
+    @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,
                                version: str | None, raw: str | None) -> None:
         """L120: the last version read of `harness` on `host` (one row per
