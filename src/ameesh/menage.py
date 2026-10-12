@@ -35,7 +35,11 @@ l'humain. Quatre familles, quatre règles :
   sans tour en cours de leur agent ni processus dedans, et que leur HEAD est
   INTÉGRÉ à la branche principale distante (ancêtre, rebase, fusion écrasée :
   `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés (`worktree_kept`) au
-  responsable.
+  responsable. L230: one kept although its lot is merged is removed after 24 h
+  if clean and pushed; its branch stays.
+* **Build output of idle worktrees** (L230, [`build_artifacts`]):
+  `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
+  with no process of the user inside; never in a main checkout.
 
 * **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
   `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
@@ -75,6 +79,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from . import build_artifacts
 from . import platform
 from . import resources as resources_mod
 from . import storage
@@ -165,10 +170,15 @@ XDG_CACHE = ("xdg", ("XDG_CACHE_HOME",))
 
 #: états de lot qui terminent le cycle de vie des worktrees du lot
 LOT_ENDED = ("merged", "promoted", "closed")
+#: L230: of those, the lot states where the work reached main
+LOT_MERGED = ("merged", "promoted")
+#: L230: a worktree kept although its lot is merged is removed after this
+KEPT_MERGED_GRACE_S = 24 * 3600.0
 
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
-               "orphan_cleanup", "orphan_idle")
+               "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
+               "artifact_idle", "unreadable_ok")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -193,6 +203,19 @@ class Policy:
     orphan_cleanup: bool = True
     #: L162 : inactivité (secondes) avant cette suppression
     orphan_idle: float = DEFAULT_ORPHAN_IDLE_S
+    #: #248: node_modules shared per lockfile (npm wrapper, links, GC)
+    deps: bool = True
+    #: #248: idle time (seconds) before an unreferenced entry is deleted
+    deps_idle: float = 3 * 24 * 3600.0
+    #: L230: regenerable build dirs of idle worktrees (None: the defaults of
+    #: `build_artifacts.DEFAULT_RULES`; empty: none deleted)
+    artifacts: tuple | None = None
+    #: L230: inactivity (seconds) of a worktree before its artifacts go
+    artifact_idle: float = build_artifacts.DEFAULT_IDLE_S
+    #: L230: names of the user's processes whose unreadability (not dumpable:
+    #: capabilities, setuid) does not block a deletion; empty by default, set
+    #: per host in its Host card
+    unreadable_ok: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -241,13 +264,27 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert` : part attendue (0 < x <= 1, ou « 60% »)")
         else:
             parsed["tmpfs_alert"] = part
-    if raw.get("orphan_idle") is not None:
-        seconds = parse_idle(raw["orphan_idle"])
+    for key in ("orphan_idle", "deps_idle", "artifact_idle"):
+        if raw.get(key) is None:
+            continue
+        seconds = parse_idle(raw[key])
         if seconds is None:
-            problems.append("`orphan_idle` : durée attendue (ex. 2h, 90m, 7200)")
+            problems.append("`%s` : durée attendue (ex. 2h, 90m, 7200)" % key)
         else:
-            parsed["orphan_idle"] = seconds
-    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup"):
+            parsed[key] = seconds
+    if raw.get("artifacts") is not None:
+        rules, problem = build_artifacts.parse_rules(raw["artifacts"])
+        if rules is None:
+            problems.append("`artifacts` : %s" % problem)
+        else:
+            parsed["artifacts"] = tuple(str(r) for r in rules)
+    if raw.get("unreadable_ok") is not None:
+        names, problem = build_artifacts.parse_names(raw["unreadable_ok"])
+        if names is None:
+            problems.append("`unreadable_ok` : %s" % problem)
+        else:
+            parsed["unreadable_ok"] = names
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -279,7 +316,8 @@ def effective(canons, host: str) -> Policy:
     d'abord). Quotas, taille de signalement et seuil d'alerte : le plus strict
     (le plus bas), comme les limites physiques de L43. L162 : la suppression
     des entrées de /tmp abandonnées est coupée dès qu'UNE fiche la coupe, et
-    l'inactivité exigée est la plus longue."""
+    l'inactivité exigée est la plus longue. L230: `artifact_idle` too, the
+    longest."""
     values: dict = {}
     origin: dict = {}
     for canon in canons or ():
@@ -294,8 +332,9 @@ def effective(canons, host: str) -> Policy:
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
-            elif (key == "orphan_idle" and value > values[key]) or \
-                    (key == "orphan_cleanup" and value is False and values[key] is not False):
+            elif (key in ("orphan_idle", "deps_idle", "artifact_idle") and value > values[key]) or \
+                    (key in ("orphan_cleanup", "deps") and value is False
+                     and values[key] is not False):
                 values[key], origin[key] = value, label
     return Policy(origin=origin, **values)
 
@@ -693,6 +732,13 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
         out.update(containers_mod.install_shims(
             os.path.join(cfg.state_dir, MANAGED_DIR, "bin"),
             base_env.get("PATH") or os.defpath))
+    if policy.deps:
+        # #248: `npm ci` links the node_modules shared per lockfile; no
+        # install in a review worktree
+        from . import deps as deps_mod
+        out.update(deps_mod.install_shim(
+            os.path.join(cfg.state_dir, MANAGED_DIR, deps_mod.SHIM_DIR),
+            out.get("PATH") or base_env.get("PATH") or os.defpath))
     return out
 
 
@@ -1229,10 +1275,10 @@ def tmpfs_hint(top, policy: Policy) -> str:
 # worktrees
 # --------------------------------------------------------------------------
 
-def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT):
+def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT, env=None):
     try:
         proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc
@@ -1278,6 +1324,47 @@ def common_dir(cwd: str) -> str:
     return os.path.abspath(os.path.join(cwd, proc.stdout.strip()))
 
 
+def _scratch_merge_tree(path: str, ref: str):
+    """`git merge-tree --write-tree ref HEAD` whose new objects go to a
+    scratch directory (the repository's objects as alternates), deleted
+    afterwards: nothing is written in `.git` (L230, like the radar)."""
+    import tempfile
+    objects = _git(["rev-parse", "--path-format=absolute", "--git-path", "objects"], path)
+    if objects is None or objects.returncode != 0 or not objects.stdout.strip():
+        return None
+    scratch = tempfile.mkdtemp(prefix="ameesh-menage-merge-")
+    try:
+        env = dict(os.environ, GIT_OBJECT_DIRECTORY=scratch,
+                   GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.strip())
+        return _git(["merge-tree", "--write-tree", ref, "HEAD"], path, env=env)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def ignored_leftovers(path: str, rules=()) -> list[str] | None:
+    """L230: what `git status --ignored` lists in the worktree (modified,
+    untracked or ignored; a directory with nothing tracked inside as one
+    line), except the directories of the build output `rules` (none:
+    nothing is exempt). An ignored `.env` or dataset that removing the
+    worktree would delete. None if git cannot say."""
+    proc = _git(["--no-optional-locks", "status", "--porcelain", "--ignored",
+                 "--untracked-files=normal"], path)
+    if proc is None or proc.returncode != 0:
+        return None
+    out = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        rel = line[3:].strip().strip('"').rstrip("/")
+        parent, name = os.path.split(os.path.join(path, rel))
+        if line.startswith("!! ") and os.path.isdir(os.path.join(parent, name)) \
+                and not os.path.islink(os.path.join(parent, name)) \
+                and any(rule.matches(parent, name) for rule in rules):
+            continue
+        out.append(rel)
+    return out
+
+
 def _default_remote_ref(path: str) -> str:
     """Branche principale du dépôt distant (`origin/HEAD`, sinon `origin/main`,
     sinon `origin/master`) ; vide si aucune n'existe."""
@@ -1304,14 +1391,19 @@ def worktree_state(path: str) -> dict:
     Seul `integrated` autorise un retrait : une branche poussée mais pas
     fusionnée est du travail en cours (L73b)."""
     out = {"exists": os.path.isdir(path), "clean": False, "pushed": False,
-           "integrated": False, "locked": False, "head": "", "reason": ""}
+           "integrated": False, "locked": False, "head": "", "branch": "", "reason": "",
+           "gitdir": "", "submodules": ""}
     if not out["exists"]:
         out["reason"] = "dossier disparu"
         return out
     gitdir = _git(["rev-parse", "--absolute-git-dir"], path)
     if gitdir is not None and gitdir.returncode == 0 and gitdir.stdout.strip():
-        out["locked"] = os.path.exists(os.path.join(gitdir.stdout.strip(), "locked"))
-    status = _git(["status", "--porcelain", "--untracked-files=normal"], path)
+        out["gitdir"] = gitdir.stdout.strip()
+        out["locked"] = os.path.exists(os.path.join(out["gitdir"], "locked"))
+    out["submodules"] = submodules(path, out["gitdir"])
+    # L230: never a write in .git (no index refresh), dry run or not
+    status = _git(["--no-optional-locks", "status", "--porcelain", "--untracked-files=normal"],
+                  path)
     if status is None or status.returncode != 0:
         out["reason"] = "état git illisible"
         return out
@@ -1319,6 +1411,8 @@ def worktree_state(path: str) -> dict:
     out["clean"] = not dirty
     head = _git(["rev-parse", "HEAD"], path)
     out["head"] = head.stdout.strip() if head is not None and head.returncode == 0 else ""
+    branch = _git(["symbolic-ref", "-q", "--short", "HEAD"], path)
+    out["branch"] = branch.stdout.strip() if branch is not None and branch.returncode == 0 else ""
     remote = _git(["for-each-ref", "--contains", "HEAD", "--count=1", "refs/remotes"], path)
     out["pushed"] = bool(remote is not None and remote.returncode == 0 and remote.stdout.strip())
     ref = _default_remote_ref(path) if out["head"] else ""
@@ -1336,13 +1430,15 @@ def worktree_state(path: str) -> dict:
         if not out["integrated"]:
             # Fusion par écrasement (squash) : fusionner HEAD dans la branche
             # principale ne changerait rien (`git merge-tree`, git ≥ 2.38).
-            merged = _git(["merge-tree", "--write-tree", ref, "HEAD"], path)
+            merged = _scratch_merge_tree(path, ref)
             tree = _git(["rev-parse", ref + "^{tree}"], path)
             if merged is not None and merged.returncode == 0 and tree is not None \
                     and tree.returncode == 0 and merged.stdout.strip():
                 out["integrated"] = (merged.stdout.split()[0] == tree.stdout.strip())
     if out["locked"]:
         out["reason"] = "verrouillé (git worktree lock)"
+    elif out["submodules"]:
+        out["reason"] = "sous-modules (%s)" % out["submodules"]
     elif dirty:
         out["reason"] = "%d fichier(s) modifié(s) ou non suivi(s)" % len(dirty)
     elif not out["integrated"]:
@@ -1350,6 +1446,23 @@ def worktree_state(path: str) -> dict:
             out["head"][:12] or "?", ref or "la branche principale distante",
             "poussé mais non fusionné" if out["pushed"] else "commits non poussés")
     return out
+
+
+def submodules(path: str, gitdir: str) -> str:
+    """L230: why the worktree `path` may hold submodules ('' if it cannot):
+    a `.gitmodules`, or a non-empty `<gitdir>/modules` (their repositories,
+    with possibly unpushed commits, live in the worktree's administrative
+    directory). Unknown gitdir or unreadable `modules`: a doubt, said so."""
+    if os.path.lexists(os.path.join(path, ".gitmodules")):
+        return ".gitmodules"
+    if not gitdir:
+        return "dossier git du worktree inconnu"
+    try:
+        return "%s/modules" % gitdir if os.listdir(os.path.join(gitdir, "modules")) else ""
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return "%s/modules illisible (%s)" % (gitdir, exc.strerror or exc)
 
 
 def _under(path: str, root: str) -> bool:
@@ -1406,6 +1519,20 @@ def remove_worktree(path: str, repo: str) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, (proc.stderr or proc.stdout).strip()[:300] or "refusé par git"
     return True, ""
+
+
+def delete_merged_branch(branch: str, repo: str) -> str:
+    """L230: `git branch -d` (never `-D`: git itself refuses a branch not
+    merged) once its worktree is removed; what happened, for the journal."""
+    if not branch or not repo or not os.path.isdir(repo):
+        return ""
+    proc = _git(["branch", "-d", "--", branch], repo)
+    if proc is None:
+        return "branch %s kept: git unavailable" % branch
+    if proc.returncode != 0:
+        return "branch %s kept: %s" % (
+            branch, ((proc.stderr or proc.stdout).strip().splitlines() or ["refused by git"])[0])
+    return "branch %s deleted (merged)" % branch
 
 
 def prune_worktrees(repo: str) -> None:
@@ -1472,6 +1599,17 @@ class Turn:
                 raise
         if policy.worktrees:
             turn.worktrees_before = {w["path"] for w in list_worktrees(cwd)}
+        if policy.deps and cwd and os.path.isdir(cwd):
+            # #248: packages of the agent's worktree without node_modules get
+            # the shared tree when it is already in the cache (never installs)
+            from . import deps as deps_mod
+            try:
+                for done in deps_mod.link_ready(cwd, cache_root(cfg, policy)):
+                    turn.entries.append({
+                        "kind": "deps", "action": "linked", "path": done["package"],
+                        "agent": agent, "detail": "node_modules -> %s" % done["target"]})
+            except Exception:
+                pass                       # never blocks a turn
         turn.tmp_before = tmp_names()
         return turn
 
@@ -1628,7 +1766,9 @@ def _mtime(path: str) -> float | None:
 
 def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                    protected: set[str], now: float,
-                   running: set | None = None) -> tuple[list[dict], list[dict]]:
+                   running: set | None = None, artifacts=None,
+                   allow=(), lock_path: str | None = None, journal_path: str | None = None,
+                   skip_roots=()) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -1637,7 +1777,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
     en cours (`running`), au moins `WORKTREE_MIN_AGE_S` depuis son
     enregistrement et depuis la dernière modification de son dossier, non
     verrouillé, aucun processus dedans, propre, et HEAD INTÉGRÉ à la branche
-    principale distante (poussé ne suffit pas)."""
+    principale distante (poussé ne suffit pas).
+
+    L230: a worktree kept although its lot is merged (`LOT_MERGED`, state
+    of the lot in ameesh) is removed once kept for more than a day for the
+    same reason, if clean, pushed, without ignored files other than build
+    output (`artifacts` rules), and with no process of the user inside by
+    the strict check of the artifacts (`platform.user_paths`, `allow`);
+    how: `_remove_kept_merged` (host lock `lock_path`, journal
+    `journal_path`, managed roots `skip_roots`)."""
     entries: list[dict] = []
     plan: list[dict] = []
     running = set(running or ())
@@ -1697,8 +1845,52 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
             plan.append(dict(base, action="attend",
                              detail="%s ; un processus travaille dedans" % why))
             continue
-        if not st["clean"] or not st["integrated"]:
-            detail = "%s : gardé — %s" % (why, st["reason"])
+        detail = "%s : gardé — %s" % (why, st["reason"])
+        # L230: a worktree kept although its lot is merged goes once kept
+        # (same reason) for more than a day, if clean and its HEAD is on the
+        # remote: nothing is lost; its branch stays (not merged into main)
+        kept_merged = (state in LOT_MERGED and row["status"] == "kept"
+                       and row.get("detail") == detail and st["clean"] and st["pushed"]
+                       and not st["submodules"]
+                       and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
+        if kept_merged:
+            leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts))
+            if leftovers is None:
+                hold = "fichiers ignorés illisibles (git status --ignored)"
+            elif leftovers:
+                hold = "%d fichier(s) ignoré(s) hors artefacts de build (%s)" % (
+                    len(leftovers), leftovers[0])
+            else:
+                procs = platform.user_paths(allow=allow)
+                held = procs.holders(path)
+                hold = procs.doubt() or (
+                    "processus dedans (%s)" % ", ".join(held[:3]) if held else "")
+            if hold:
+                plan.append(dict(base, action="garde", detail="%s ; %s" % (detail, hold)))
+                continue
+            why = "%s ; gardé depuis plus de 24 h, propre et poussé" % why
+            if dry_run:
+                size, _whole = build_artifacts.size_of(
+                    path, budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+                plan.append(dict(base, action="retrait", bytes=size, detail=why))
+                continue
+            outcome, freed, note, built = _remove_kept_merged(
+                path, row.get("repo") or common_dir(path), st["gitdir"], artifacts=artifacts,
+                allow=allow,
+                lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots)
+            entries += [dict(base, kind="artifact", detail="%s ; %s" % (why, b.pop("detail")),
+                             **b) for b in built]
+            if outcome in ("garde", "attend"):
+                plan.append(dict(base, action=outcome, detail="%s ; %s" % (detail, note)))
+                continue
+            plan.append(dict(base, action="retrait", bytes=freed, detail=why))
+            store.set_worktree_status(row["id"], "removed", why)
+            entries.append(dict(base, action=outcome, bytes=freed,
+                                detail="%s : propre et poussé, supprimé (corbeille journalisée), "
+                                       "git worktree prune%s" % (why, " ; %s" % note if note
+                                                                  else "")))
+            continue
+        elif not st["clean"] or not st["integrated"] or st["submodules"]:
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
@@ -1713,13 +1905,153 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
         ok, error = remove_worktree(path, row.get("repo") or "")
         if ok:
             store.set_worktree_status(row["id"], "removed", why)
+            branch_note = delete_merged_branch(st["branch"], row.get("repo") or "") \
+                if st["integrated"] else ""
             entries.append(dict(base, action="removed", bytes=size,
-                                detail="%s : propre et intégré, git worktree remove" % why))
+                                detail="%s : propre et intégré, git worktree remove%s" % (
+                                    why, " ; %s" % branch_note if branch_note else "")))
         else:
             detail = "%s : retrait refusé par git — %s" % (why, error)
             store.set_worktree_status(row["id"], "kept", detail)
             entries.append(dict(base, action="kept", detail=detail))
     return entries, plan
+
+
+def _remove_kept_merged(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
+                        journal_path, skip_roots=()) -> tuple[str, int, str, list]:
+    """L230: removal of a worktree kept although its lot is merged, under the
+    host lock of the deleting passes (`build_artifacts`). Its build output
+    goes first like an idle worktree's (descriptors, journal, `.git`,
+    filesystem and managed-root protections); then the tree must be fully
+    clean, ignored files included (nothing exempt); then the processes are
+    read again, and the git lock (`<gitdir>/locked`) and submodules checked
+    again (`submodules`), right before its directory, still the planned one,
+    is renamed to a trash recorded in the journal and deleted; git forgets
+    it (`git worktree prune`; `git worktree remove` cannot follow a renamed
+    directory, its checks are the ones above, stricter).
+
+    (outcome, bytes freed, note, build output deleted): outcome `removed`,
+    `partial` (gone from its path, something left in its trash), or `garde`
+    / `attend` (note: why); the build output as journal entries (`path`,
+    `action` `deleted` or `partial`, `bytes`, `detail`)."""
+    built: list[dict] = []
+    if not lock_path or not journal_path:
+        return "garde", 0, "ni verrou ni journal du ménage", built
+    lock = build_artifacts._lock(lock_path)
+    if lock is None:
+        return "attend", 0, "un autre passage supprime sur l'hôte", built
+    try:
+        journal = build_artifacts.Journal(journal_path)
+        try:
+            skip_ids = [tuple(r["id"]) for r in journal.records() if r.get("id")]
+        except OSError as exc:
+            return "garde", 0, "journal du ménage illisible (%s)" % (exc.strerror or exc), built
+        budget = build_artifacts.Budget(build_artifacts.PASS_BUDGET_S)
+        rules = build_artifacts.rules_of(artifacts)
+        roots = [_real(p) for p in skip_roots if p]
+        avoid = build_artifacts._identities(roots)
+        real = _real(path)
+        ident = build_artifacts.identity(real)
+        parent_id = build_artifacts.identity(os.path.dirname(real))
+
+        def check() -> str:
+            # read again right before each rename: a process may have come in,
+            # `git worktree lock` or a submodule may have been done meanwhile
+            again = platform.user_paths(allow=allow)
+            held = again.holders(path)
+            refusal = again.doubt() or ("processus dedans (%s)" % ", ".join(held[:3])
+                                        if held else "")
+            if refusal or not gitdir:
+                return refusal or "dossier git du worktree inconnu"
+            if os.path.lexists(os.path.join(gitdir, "locked")):
+                return "verrouillé (git worktree lock)"
+            subs = submodules(path, gitdir)
+            return "sous-modules (%s)" % subs if subs else ""
+
+        def notes(done: dict) -> str:
+            more = done["left"][:3] + done["errors"][:3]
+            if done["stopped"]:
+                more.append("budget de temps atteint")
+            return " ; ".join(more)
+
+        freed = 0
+        found = build_artifacts.survey(path, rules, skip_roots=skip_roots, skip_ids=skip_ids,
+                                       budget=budget)
+        if not found["complete"]:
+            return "garde", 0, "artefacts : %s" % found["why"], built
+        if ident is None or found["identity"] != ident:
+            return "garde", 0, "dossier changé pendant le passage", built
+        for artifact in found["artifacts"]:
+            inside = [r for r in roots if _under(r, _real(artifact))]
+            refusal = ("contient une racine gérée (%s)" % inside[0]) if inside else \
+                build_artifacts.tracked(path, artifact)
+            if not refusal:
+                try:
+                    done = build_artifacts.remove_artifact(
+                        artifact, path, root=(real, ident), journal=journal, rules=rules,
+                        avoid=avoid, budget=budget, check=check)
+                except (OSError, ValueError) as exc:
+                    refusal = str(exc)
+                else:
+                    freed += done["bytes"]
+                    refusal = notes(done) and "supprimé en partie : %s" % notes(done)
+                    built.append({"path": artifact, "bytes": done["bytes"],
+                                  "action": "partial" if refusal else "deleted",
+                                  "detail": refusal or "regenerable build output",
+                                  "data": {"worktree": path, "trash": done["trash"]}})
+            if refusal:
+                return "garde", freed, "artefact %s : %s" % (artifact, refusal), built
+        leftovers = ignored_leftovers(path)
+        if leftovers is None:
+            return "garde", freed, "état git illisible (git status --ignored)", built
+        if leftovers:
+            return "garde", freed, "%d fichier(s) non suivi(s) ou ignoré(s) (%s)" % (
+                len(leftovers), leftovers[0]), built
+        try:
+            done = build_artifacts.remove_worktree_dir(
+                path, (real, ident), parent_id, journal=journal, avoid=avoid, budget=budget,
+                check=check)
+        except (OSError, ValueError) as exc:
+            return "garde", freed, "retrait refusé : %s" % exc, built
+        prune_worktrees(repo)
+        freed += done["bytes"]
+        if notes(done):
+            return "partial", freed, "reste dans %s : %s" % (done["trash"], notes(done)), built
+        return "removed", freed, "", built
+    finally:
+        lock.close()
+
+
+def _shared_roots() -> tuple:
+    """#248: the shared Rust target dirs (systemd drop-in), never entered."""
+    return (os.path.expanduser("~/.cache/cargo-target"),)
+
+
+def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool,
+                   now: float, skip_roots=(), lock_path: str | None = None,
+                   journal_path: str | None = None) -> dict:
+    """L230: the worktrees of the repositories of the registered agents (and
+    the tracked ones), their build artifacts deleted once idle; in a thread
+    at the lowest priority, one worktree at a time."""
+    rules = build_artifacts.rules_of(policy.artifacts)
+    tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"))
+    owner = {_real(row["path"]): row["agent"] for row in tracked}
+    agents = sorted(cwd_of.items(), key=lambda item: -len(item[1]))
+
+    def owner_of(path: str):
+        real = _real(path)
+        if real in owner:
+            return owner[real]
+        return next((name for name, cwd in agents if _under(real, _real(cwd))), None)
+
+    seeds = list(cwd_of.values()) + [row["path"] for row in tracked]
+    skip = tuple(skip_roots) + _shared_roots()
+    return build_artifacts.gently(
+        lambda: build_artifacts.run(
+            build_artifacts.worktrees(seeds, list_worktrees), rules,
+            idle_s=policy.artifact_idle, protected=list(cwd_of.values()), skip_roots=skip,
+            owner_of=owner_of, dry_run=dry_run, now=now, allow=policy.unreadable_ok,
+            lock_path=lock_path, journal_path=journal_path))
 
 
 def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
@@ -1818,7 +2150,7 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              include_lotless: bool = False, now: float | None = None,
-             runtime=None) -> dict:
+             runtime=None, artifact_scan: bool = True) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
@@ -1827,6 +2159,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       tourne (`busy` faux) ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
+    * L230: regenerable build dirs of idle worktrees (`build_artifacts`),
+      when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
       attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
       abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
@@ -1846,12 +2180,14 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     registered: set[str] = set()
     protected: set[str] = set()
+    cwd_of: dict[str, str] = {}
     running: set[str] = set(agents_in_turn)
     try:
         for row in storage.of(db).operations.listing():
             registered.add(row["name"])
             if row.get("cwd"):
                 protected.add(os.path.abspath(os.path.expanduser(row["cwd"])))
+                cwd_of[row["name"]] = os.path.abspath(os.path.expanduser(row["cwd"]))
             if row.get("status") == "running" and row.get("lease_live"):
                 running.add(row["name"])
     except Exception:  # registre illisible : on ne supprime aucun dossier d'agent
@@ -1952,6 +2288,31 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                              result["files"])})
         if result["over_quota"]:
             skipped.append("caches : quota encore dépassé (fichiers de moins d'une heure)")
+    # 2b. #248: node_modules shared per lockfile, entries no worktree links to
+    if policy.deps and registered is None:
+        skipped.append("deps : registre illisible, worktrees inconnus, aucune suppression")
+    elif policy.deps and os.path.isdir(croot) and _managed(croot):
+        from . import deps as deps_mod
+        def known_worktrees() -> list[str]:
+            # every worktree of the agents' repositories: links nobody
+            # recorded are found there before an entry is deleted
+            tops: set = set()
+            for cwd in sorted(protected):
+                tops.update(w["path"] for w in list_worktrees(cwd) if not w.get("bare"))
+            return sorted(tops | protected)
+
+        for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
+                                             dry_run=dry_run, worktrees=known_worktrees):
+            if line["action"] == "would-delete":
+                plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
+                             "bytes": line["bytes"], "detail": line["detail"]})
+            elif line["action"] == "kept":
+                skipped.append("deps %s gardé : %s" % (line["path"], line["detail"]))
+            else:
+                entries.append(line)
+    # L230: one deleting pass at a time on the host, and the journal of its trash dirs
+    lock_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.lock")
+    journal_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.journal")
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus
@@ -1959,9 +2320,26 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     elif policy.worktrees:
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              include_lotless=include_lotless,
-                                             protected=protected, now=now, running=running)
+                                             protected=protected, now=now, running=running,
+                                             artifacts=policy.artifacts,
+                                             allow=policy.unreadable_ok, lock_path=lock_path,
+                                             journal_path=journal_path,
+                                             skip_roots=(troot, croot, cfg.state_dir)
+                                             + _shared_roots())
         entries += wt_entries
         plan += wt_plan
+    # 3b. L230: regenerable build dirs of idle worktrees
+    if artifact_scan and registered is not None:
+        try:
+            art = _artifact_pass(db, host, policy, cwd_of=cwd_of, dry_run=dry_run, now=now,
+                                 skip_roots=(troot, croot, cfg.state_dir),
+                                 lock_path=lock_path, journal_path=journal_path)
+        except Exception as exc:  # jamais fatal pour le passage
+            art = {"entries": [], "plan": [], "skipped": [
+                "artifacts: pass impossible (%s)" % type(exc).__name__]}
+        entries += art["entries"]
+        plan += art["plan"]
+        skipped += art["skipped"]
     # 4. conteneurs : ceux des tours d'ameesh finis supprimés, autres signalés
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]

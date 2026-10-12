@@ -2004,7 +2004,8 @@ class HostResources(Domain):
 
     Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
     1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
-    tours en cours. Les mesures illisibles sont NULL : on ne devine pas.
+    tours en cours ; L159d: PSI, application and guest shares, lendable
+    capacity. Les mesures illisibles sont NULL : on ne devine pas.
     Instants rendus en secondes epoch (`sampled_ts`).
     """
 
@@ -2029,6 +2030,16 @@ class HostResources(Domain):
     @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
+
+    @abc.abstractmethod
+    def lend_basis(self, host: str, since_s: float, slot_s: float,
+                   percentile: float) -> dict:
+        """L159d: history behind the lendable capacity, over the last
+        `since_s` seconds: `samples`, `span_s` (time covered by readings
+        with `app_cpu`), `min_free_mem_bytes` (lowest `mem_available +
+        guest_mem`, over readings where both are known) and
+        `app_cpu_p95` (the `percentile` of the application's CPU averaged
+        per `slot_s` slot); None when not measured."""
 
     @abc.abstractmethod
     def usage(self, host: str, since_s: float) -> dict:
