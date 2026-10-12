@@ -201,6 +201,17 @@ def _kill_group(proc: subprocess.Popen, grace: float) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        _close_output(proc)
+
+
+def _close_output(proc: subprocess.Popen) -> None:
+    """Close the harness's output once it has exited (the reader is at EOF
+    or stops on the closed file)."""
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except (OSError, ValueError):
+        pass
 
 
 class ResidentDriver:
@@ -565,6 +576,7 @@ class ClaudeStreamJson(ResidentDriver):
         except Exception as exc:  # noqa: BLE001 — never a silent dead reader
             self._died("resident reader failed: %r" % (exc,))
         code = proc.wait()
+        _close_output(proc)
         self._died("resident harness exited (code %s)" % code)
         with self._lock:
             slots = list(self._controls.values())
