@@ -91,6 +91,7 @@
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh deps link|local|status|entries node_modules shared per lockfile (#248) ;
   ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
+  ameesh guard check|run --observe      garde de capacité d'une VM prêteuse (L159e) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -239,6 +240,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command in ACTION_COMMANDS:
         from . import actions_cli
         return actions_cli.main(argv)
+    if command == "guard":
+        # L159e : garde de capacité d'une VM prêteuse (service système, sans base)
+        from . import guard
+        return guard.main(rest)
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)
