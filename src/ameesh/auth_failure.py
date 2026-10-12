@@ -112,13 +112,16 @@ def failing(db, host: str, harness: str) -> dict[str, dict]:
 
 
 def report(db, host: str, harness: str, account: str, state: str, *, reason: str = "",
-           source: str, expires_at: float | None = None) -> dict:
-    """Records a credential's health; {} on a database without 0060."""
+           source: str, expires_at: float | None = None,
+           fingerprint: str | None = None) -> dict:
+    """Records a credential's health; {} on a database without 0060.
+    `fingerprint`: of the credential that failed (`sentinel.fingerprint`)."""
     from . import db as db_mod, storage
     try:
         return storage.of(db).credentials.report(host, harness, account, state,
                                                  reason=reason, source=source,
-                                                 expires_at=expires_at)
+                                                 expires_at=expires_at,
+                                                 fingerprint=fingerprint)
     except db_mod.Unavailable:
         raise
     except db_mod.DbError:

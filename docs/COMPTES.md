@@ -272,7 +272,16 @@ for the default credential of a harness without accounts. `state` is
 `healthy`, `failing` or `unknown`; `source` says who wrote it: the sentinel
 (`sentinel`, L226a), a failed turn (`turn`) or a human (`manual`).
 `failing_since` keeps the start of the failure, `expires_at` the forecast
-expiry the sentinel reports.
+expiry the sentinel reports. Each `failing` report also stamps
+`last_failure_at`, counts one more in `failures`, and keeps
+`failing_fingerprint`: a truncated SHA-256 of the credential then in place
+(refresh token of `.credentials.json` or `auth.json`, the key of an API-key
+account, the whole gcloud, gh or scw store), which tells two credentials
+apart without revealing either. The fingerprint is never in the supervisor
+contract (it lives in migration 0068, additive to 0060). A failed turn
+records the fingerprint of the credential it was launched with, read from
+the child's environment at launch: an API key is the exact value handed to
+the child, even if its key file is replaced during the turn.
 
 **End of turn.** A failed turn whose error, short answer (600 characters at
 most) or stderr tail (this turn's output only: `stderr.log` is appended to by
@@ -306,7 +315,17 @@ budget pause; once it lifts, an account still failing puts the
 
 **Recovery.** After the reconnection (`claude /login` in the account's
 folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
-and records it. Without it, declare it by hand:
+and records it — only if its probe is healthy AND the credential's
+fingerprint differs from the last failure's, whenever that credential was
+installed (a turn launched with A can fail after the owner installed B: B is
+cleared). Rewriting the same revoked token, or a failure recorded without
+a fingerprint, is no proof: the account stays `failing`. A failure a turn
+detected names no fix command: the sentinel's next probe adds the account's
+command to its reason (the owner's alert shows it), without touching the
+failure itself. The sentinel's write
+is conditional on the `failures` count it read, so a failure a turn records
+during the probe is never overwritten. Without the sentinel, or in those
+cases, declare it by hand:
 
 ```sh
 ameesh accounts healthy claude secondaire   # declared account
@@ -314,3 +333,112 @@ ameesh accounts healthy claude              # harness without declared accounts
 ```
 
 `ameesh accounts list --json` shows the table (`credentials`).
+
+## 6. Credential sentinel (L226a)
+
+Every 10 minutes, each host probes every credential its agents use and
+writes the result to `credential_health` (`source = 'sentinel'`):
+
+| harness | probe | forecast expiry | fix command in the alert |
+|---|---|---|---|
+| `claude` | per declared account (or default dir): `claude auth status` in its config dir says `loggedIn`. An expired access token (`expiresAt`) is **not** a failure: it lapses after a short idle time and is refreshed on use | `refreshTokenExpiresAt` | `CLAUDE_CONFIG_DIR=<dir> claude auth login` |
+| `codex` | per declared account: `auth.json` has a refresh token or an API key | — | `CODEX_HOME=<dir> codex login` |
+| `gcloud` | `gcloud auth print-access-token` | last interactive login (mtime of `credentials.db`) + Workspace session length | `gcloud auth login --update-adc` |
+| `gh` | `gh auth status` | — | `gh auth login -h github.com` |
+| `scw` | `scw account project list` | — | `scw init` |
+
+A harness whose binary is missing, or whose default credential file is
+absent without declared accounts, is not used on the host: it is skipped. A
+probe that cannot conclude (timeout, unreadable file) writes `unknown`,
+which is never a verdict. The same goes for a CLI probe (gcloud, gh, scw)
+that exits non-zero without saying its credential is refused: a network
+error (DNS, timeout, 5xx) or an unrecognized output is `unknown`, never
+`failing` — a `failing` credential only clears with another credential, so
+a transient error must not become one. The whole output is read (a refusal
+can come before many lines of other accounts). The fingerprint of gh and scw
+is that of the credential in effect: `GH_TOKEN` / `GITHUB_TOKEN`, or
+`SCW_SECRET_KEY`, when set (they override the store), else the store file. The sentinel reads names, paths and dates only and
+never prints a secret. An `api_key_env` account is checked for the presence
+of its key.
+
+Alerts, computed by `ameesh notify` from the table (all hosts):
+
+* `credential_failing` (pushed by default, urgent): a credential is
+  `failing`, from a probe or from a refused turn (L226b). Its detail ends with
+  the exact fix command. There is one alert per (host, harness, account,
+  start of failure), and it resolves when the credential is `healthy` again;
+* `credential_expiring` (pushed by default): a healthy credential's forecast
+  expiry is less than `warn_hours` away (default 24 h). This warns before
+  gcloud asks to log in again in the middle of a release.
+
+Setup on each host (systemd user units, same environment as the runner):
+
+```sh
+cp deploy/systemd/ameesh-credentials.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ameesh-credentials.timer
+ameesh accounts check --dry-run      # probe now, write nothing
+```
+
+Optional host configuration, key `credential_sentinel`:
+
+```json
+"credential_sentinel": {"probes": ["claude", "codex", "gcloud", "gh", "scw"],
+                        "gcloud_session_hours": 16, "warn_hours": 24}
+```
+
+`gcloud_session_hours` must match the Workspace admin setting
+(*Security > Google Cloud session control*). The default is 16 h.
+
+### Long-lived Claude token (`claude setup-token`): study and recommendation
+
+`claude setup-token` opens the same browser authorization as `/login` and
+prints a **one-year** OAuth token tied to the subscription (Pro, Max, Team,
+Enterprise). The token is not saved anywhere; the harness reads it from
+`CLAUDE_CODE_OAUTH_TOKEN`, which takes precedence over the `/login`
+credentials of the config dir. It only removes the dependency on the OAuth
+refresh of `.credentials.json`
+([docs](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)).
+
+Limits found:
+
+* scope `user:inference` only: model requests work (what agents need), but not
+  `claude usage`, Remote Control or claude.ai connectors;
+* `claude auth status` then shows `authMethod: oauth_token` and no org or
+  email, and has been reported `loggedIn: true` while requests got a 401. With
+  such a token, the sentinel's probe proves nothing, and only a refused turn
+  (L226b, `source = 'turn'`) reveals a dead token;
+* no documented expiry API: the sentinel cannot forecast the expiry unless the
+  creation date is declared;
+* revocation is done on the web (claude.ai settings), and the CLI cannot list
+  tokens;
+* a token can be minted for a different organization than intended, and that
+  cannot be checked afterwards;
+* ameesh has no account type for it yet. The `api_key_env` type would pass
+  the variable, but ameesh counts such an account as **paid per token**. It
+  would then be excluded from plan failover (rule "never extra spend") and
+  billed in the ledger as paid usage, which is wrong.
+
+**Recommendation: not yet for all agents; pilot on one account after a small
+lot.** That lot adds an account type `oauth_token` with these fields:
+`config_dir` (sessions and settings), `key_file` (0600, never in the
+configuration), and `token_created` (the sentinel's forecast is creation +
+365 days). It counts as a plan account (`credential_mode: subscription`). The
+pilot then checks that `rate_limit_event` still feeds the gauges. Until then,
+the sentinel's `auth status` probe and the L226b turn detection cover the
+OAuth refresh failure mode.
+
+Owner steps, once per account (only the owner can approve the login):
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-secondary claude setup-token
+# browser: sign in with THAT account's email, approve; the token prints once
+install -m 600 /dev/null ~/.config/ameesh/keys/claude-secondary.token
+$EDITOR ~/.config/ameesh/keys/claude-secondary.token   # paste the token, save
+date -I   # note the creation date for `token_created`
+```
+
+Then declare the account with the `oauth_token` type (after the lot above).
+To rotate a token, run the same steps again and revoke the old token in the
+claude.ai settings.
+
