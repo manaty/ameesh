@@ -75,7 +75,7 @@ MAX_STATE_BYTES = 65536
 
 #: `host_yield` of a turn the runner closed at its safe point (harness alone,
 #: `AgentWorker.HOST_SAFE_POINT`)
-SAFE_POINT = "point sûr"
+SAFE_POINT = "safe point"
 
 
 def _number(value: Any) -> bool:
@@ -676,7 +676,7 @@ class GateController:
         background = getattr(self.runner, "background", None)
         if not state.may_claim and self.deadline is not None and background is not None:
             # the background work of finished turns stops at the deadline too
-            background.cap_deadline(self.deadline, "l'hôte se retire (%s)" % state.reason)
+            background.cap_deadline(self.deadline, "the host is withdrawing (%s)" % state.reason)
         in_turn = sorted(w.name for w in workers if getattr(w, "proc", None) is not None)
         held = sorted(w.name for w in workers)
         left = background.running_count() if background is not None else 0

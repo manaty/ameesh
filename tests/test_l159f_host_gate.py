@@ -491,7 +491,7 @@ class RunnerObeysTheGateTest(PgTestCase):
         self.wait_for(lambda: len(self.turns()) == 1, timeout=30)
         self.wait_for(lambda: registry.get(self.db, "ferme")["turns"] == 1, timeout=30)
         out = self.stop(proc)
-        self.assertIn("porte d'hôte file", out)
+        self.assertIn("host gate file", out)
 
     def test_draining_stops_the_turn_at_a_safe_point_and_returns_the_lease(self):
         _write_state(self.state_path, seq=2)
@@ -514,7 +514,7 @@ class RunnerObeysTheGateTest(PgTestCase):
         _write_state(self.state_path, seq=4)
         self.wait_for(lambda: len(self.turns()) == 2, timeout=30)
         out = self.stop(proc)
-        self.assertIn("point sûr", out)
+        self.assertIn("safe point", out)
 
     def test_deadline_stops_a_turn_without_safe_point(self):
         _write_state(self.state_path, seq=2)

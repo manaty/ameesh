@@ -963,7 +963,7 @@ class AgentWorker(threading.Thread):
 
     #: L159f : le tour s'arrête au point sûr (le harnais seul, son travail de
     #: fond garde le délai de grâce, borné par l'échéance du retrait)
-    HOST_SAFE_POINT = "point sûr"
+    HOST_SAFE_POINT = "safe point"
 
     def yield_to_host(self, reason: str) -> None:
         """L159f : l'échéance du retrait est atteinte, ou l'hôte s'arrête —
@@ -972,9 +972,9 @@ class AgentWorker(threading.Thread):
         porte : l'arrêt part dans son propre fil."""
         self.host_yield = reason
         self.wake.set()
-        threading.Thread(target=self.stop_group_now, args=("l'hôte se retire : %s" % reason,),
+        threading.Thread(target=self.stop_group_now, args=("the host is withdrawing: %s" % reason,),
                          kwargs={"grace": 1.0}, daemon=True,
-                         name="%s-retrait" % self.name).start()
+                         name="%s-withdraw" % self.name).start()
 
     def _leave_for_host(self) -> None:
         """L159f : porte d'hôte fermée — plus aucun tour ici. Session écrite,
@@ -984,9 +984,9 @@ class AgentWorker(threading.Thread):
         échoit seul."""
         gate = getattr(self.runner, "host_gate", None)
         etat = gate.current if gate is not None else None
-        texte = "hôte indisponible (%s, %s) : reprise au retour de l'hôte" % (
+        texte = "host unavailable (%s, %s): resumes when the host is back" % (
             etat.state if etat else "?", etat.reason if etat else "?")
-        log_async("[%s] l'hôte se retire : bail rendu (%s)" % (self.name, texte))
+        log_async("[%s] the host is withdrawing: lease released (%s)" % (self.name, texte))
         if self.lease_lost.is_set():
             return
         try:
@@ -999,7 +999,7 @@ class AgentWorker(threading.Thread):
                                     "queued" if row.get("pending_prompt") else "idle",
                                     status_text=texte)
         except db_mod.DbError as exc:
-            log_async("[%s] état de retrait non écrit (%s)" % (self.name, db_mod.explain(exc)))
+            log_async("[%s] withdrawal state not written (%s)" % (self.name, db_mod.explain(exc)))
 
     def request_restart(self) -> None:
         """`ameesh restart` (L26) : arrêter le tour en cours, puis appliquer."""
@@ -3263,7 +3263,7 @@ class AgentWorker(threading.Thread):
                         # une clôture : le travail de fond garde sa grâce,
                         # bornée par l'échéance du retrait.
                         self.host_yield = self.HOST_SAFE_POINT
-                        self.stop_group_now("l'hôte se retire : tour arrêté au point sûr",
+                        self.stop_group_now("the host is withdrawing: turn stopped at a safe point",
                                             group=False)
                     if plafonne:
                         # L217b : le flux se lit jusqu'au bout, même après la
@@ -3404,16 +3404,16 @@ class AgentWorker(threading.Thread):
             # bail au passage suivant (`_leave_for_host`).
             raison = self.host_yield
             if self._session_en_attente is not None:
-                self._avec_reprise("session du tour", self._enregistre_session)
-            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                self._avec_reprise("turn session", self._enregistre_session)
+            self._avec_reprise("instruction put back in the queue", registry.restore_prompt,
                                self.db, self.name, self.runner.runner_id, self.epoch)
-            self._avec_reprise("statut de fin de tour", registry.set_status,
+            self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="tour interrompu : l'hôte se retire (%s)" % raison)
+                               status_text="turn interrupted: the host is withdrawing (%s)" % raison)
             self._fil_note(
-                "Tour interrompu après %ds : l'hôte se retire (%s). La consigne repart "
-                "en attente ; le travail reprendra dans la même session au retour de "
-                "l'hôte." % (int(duration), raison),
+                "Turn interrupted after %ds: the host is withdrawing (%s). The turn's "
+                "instruction goes back in the queue; the work resumes in the same "
+                "session when the host is back." % (int(duration), raison),
                 meta={"action": "retrait-hote", "raison": raison,
                       "tour_s": round(duration, 1)})
             return False
@@ -3846,7 +3846,7 @@ class Runner:
             key = (kind, bool(lending), host_gate_mod.drain_seconds(self.cfg, offer)) \
                 if kind else None
         except ValueError as exc:
-            log_async("porte d'hôte : %s" % exc)
+            log_async("host gate: %s" % exc)
             return
         with self._host_gate_lock:
             if key == self._host_gate_key:
@@ -3861,13 +3861,13 @@ class Runner:
             old.stop()
         if new is None:
             if old is not None:
-                log_async("porte d'hôte retirée (hôte %s)" % self.host)
+                log_async("host gate removed (host %s)" % self.host)
             return
-        log_async("porte d'hôte %s : %s (hôte %s, retrait en %ds, porte illisible = %s) : %s"
-                  % (key[0], new.gate.path, "prêteur" if lending else "classique",
+        log_async("host gate %s: %s (host %s, withdrawal within %ds, unreadable gate = %s): %s"
+                  % (key[0], new.gate.path, "lending" if lending else "classic",
                      int(new.drain_s), new.gate.fallback, new.describe()))
         if lending and str(getattr(self.cfg, "host_gate", "") or "") == "none":
-            log_async("porte d'hôte : `host_gate: none` sur un hôte prêteur")
+            log_async("host gate: `host_gate: none` on a lending host")
         if running:
             new.start()
 
@@ -3906,8 +3906,8 @@ class Runner:
             # dossier partagé inutilisable : au moins le plafond de cet exécuteur
             if not getattr(self, "_slot_error_logged", False):
                 self._slot_error_logged = True
-                log_async("porte d'hôte : places %s inutilisables (%s), plafond compté "
-                          "pour cet exécuteur seul" % (directory, exc))
+                log_async("host gate: slots %s unusable (%s), cap counted "
+                          "for this executor alone" % (directory, exc))
             with self.lock:
                 running = sum(1 for name, worker in self.workers.items()
                               if name != (agent or {}).get("name") and worker.is_alive())
@@ -4342,8 +4342,8 @@ class Runner:
             return True
         if not self._gate_settled.is_set() and not getattr(self, "_settle_logged", False):
             self._settle_logged = True
-            log_async("porte d'hôte : canon non lu en entier, aucune réclamation "
-                      "avant un sync complet (nouvel essai toutes les %ds)"
+            log_async("host gate: canon not read in full, no claim before a "
+                      "complete sync (retry every %ds)"
                       % GATE_SETTLE_RETRY_S)
         return False
 
