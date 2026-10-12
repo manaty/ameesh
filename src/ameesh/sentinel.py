@@ -179,13 +179,8 @@ def file_fingerprint(path: str | None) -> str | None:
         return None
 
 
-def _json_secret(path: str, *keys) -> str | None:
-    """The string at `keys` in a JSON file (None if absent or unreadable)."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            node = json.load(fh)
-    except (OSError, ValueError):
-        return None
+def _secret_at(node, *keys) -> str | None:
+    """The string at `keys` in a parsed JSON file (None if absent)."""
     for key in keys:
         node = node.get(key) if isinstance(node, dict) else None
     return node if isinstance(node, str) and node else None
@@ -212,13 +207,27 @@ def fingerprint(harness: str, profile=None, environ=None) -> str | None:
         return _digest(str(environ.get(name) or "").strip()) if name else None
     home = profile.home(environ)
     if harness == "claude":
-        return _digest(_json_secret(os.path.join(home, ".credentials.json"),
-                                    "claudeAiOauth", "refreshToken"))
+        try:
+            with open(os.path.join(home, ".credentials.json"), encoding="utf-8") as fh:
+                return _claude_fingerprint(json.load(fh))
+        except (OSError, ValueError):
+            return None
     if harness == "codex":
-        path = os.path.join(home, "auth.json")
-        return _digest(_json_secret(path, "tokens", "refresh_token")
-                       or _json_secret(path, "OPENAI_API_KEY"))
+        try:
+            with open(os.path.join(home, "auth.json"), encoding="utf-8") as fh:
+                return _codex_fingerprint(json.load(fh))
+        except (OSError, ValueError):
+            return None
     return None
+
+
+def _claude_fingerprint(node) -> str | None:
+    return _digest(_secret_at(node, "claudeAiOauth", "refreshToken"))
+
+
+def _codex_fingerprint(auth) -> str | None:
+    return _digest(_secret_at(auth, "tokens", "refresh_token")
+                   or _secret_at(auth, "OPENAI_API_KEY"))
 
 
 def launch_fingerprint(harness: str, profile, env: dict) -> str | None:
@@ -259,6 +268,10 @@ def _probe_env(environ, declared, profile, variable: str, home: str) -> dict:
     return env
 
 
+#: the verdict of a probe during which the credential was replaced
+REPLACED = "credential replaced during the probe; the next probe decides"
+
+
 def probe_claude(profile, now: float, environ=None, run=None,
                  declared=None) -> Verdict | None:
     """`claude auth status` in the account's config dir decides; never the
@@ -278,11 +291,15 @@ def probe_claude(profile, now: float, environ=None, run=None,
     fix = "CLAUDE_CONFIG_DIR=%s claude auth login" % shlex.quote(home)
     if not os.path.exists(path) and not profile.name and not profile.path:
         return None                   # no Claude credential here: not used on this host
-    expires = None
+    # #210 r5: the credential is read before the probe; a store replaced
+    # while `claude auth status` runs proves nothing about either credential.
+    # #313 r2: its expiry and its fingerprint come from the same read
+    expires = held = None
     try:
         with open(path, encoding="utf-8") as fh:
-            refresh_ms = ((json.load(fh) or {}).get("claudeAiOauth") or {}).get(
-                "refreshTokenExpiresAt")
+            node = json.load(fh)
+        held = _claude_fingerprint(node)
+        refresh_ms = ((node or {}).get("claudeAiOauth") or {}).get("refreshTokenExpiresAt")
         if isinstance(refresh_ms, (int, float)):
             expires = float(refresh_ms) / 1000
     except (OSError, ValueError, AttributeError):
@@ -300,7 +317,8 @@ def probe_claude(profile, now: float, environ=None, run=None,
     except ValueError:
         return Verdict("claude", name, "unknown",
                        "unreadable auth status (exit %s)" % code, expires)
-    held = fingerprint("claude", profile, environ)
+    if fingerprint("claude", profile, environ) != held:
+        return Verdict("claude", name, "unknown", REPLACED, expires)
     if not isinstance(status, dict) or not status.get("loggedIn"):
         return Verdict("claude", name, "failing", "claude auth status: not logged in",
                        expires, fix, fingerprint=held)
@@ -336,8 +354,9 @@ def probe_codex(profile, now: float, environ=None) -> Verdict | None:
         return Verdict("codex", name, "unknown", "unexpected content in %s" % path)
     tokens = auth.get("tokens")
     if (isinstance(tokens, dict) and tokens.get("refresh_token")) or auth.get("OPENAI_API_KEY"):
+        # #210 r5: the fingerprint of the file read, not of a second read
         return Verdict("codex", name, "healthy", "refresh token present", fix=fix,
-                       fingerprint=fingerprint("codex", profile, environ))
+                       fingerprint=_codex_fingerprint(auth))
     return Verdict("codex", name, "failing", "no refresh token nor API key", fix=fix)
 
 
@@ -363,11 +382,14 @@ def probe_gcloud(conf: dict, now: float, run=_run, environ=None) -> Verdict | No
     if not shutil.which("gcloud"):
         return None
     fix = "gcloud auth login --update-adc"
+    store = os.path.join(gcloud_config_dir(environ), "credentials.db")
+    held = file_fingerprint(store)
     code, out = run(["gcloud", "auth", "print-access-token", "--quiet"], output=True)
     expires = gcloud_forecast(conf["gcloud_session_hours"], environ)
     if code is None:
         return Verdict("gcloud", "", "unknown", "probe failed: %s" % out, expires)
-    store = os.path.join(gcloud_config_dir(environ), "credentials.db")
+    if file_fingerprint(store) != held:
+        return Verdict("gcloud", "", "unknown", REPLACED, expires)
     if code != 0:
         why = refused(out)
         if why is None:
@@ -375,9 +397,9 @@ def probe_gcloud(conf: dict, now: float, run=_run, environ=None) -> Verdict | No
                            % (code, _last_line(out) or "no output"), expires)
         return Verdict("gcloud", "", "failing",
                        "%s: %s" % (why, _last_line(out)) if out else why,
-                       expires, fix, fingerprint=file_fingerprint(store))
+                       expires, fix, fingerprint=held)
     return Verdict("gcloud", "", "healthy", "access token issued", expires, fix,
-                   fingerprint=file_fingerprint(store))
+                   fingerprint=held)
 
 
 def gh_store(environ=None) -> str:
@@ -395,12 +417,18 @@ def env_fingerprint(environ, names: tuple, store: str | None) -> str | None:
     """#210 r5: the credential in effect for a CLI — the first set variable
     of `names`, which overrides the CLI's store (gh: GH_TOKEN, GITHUB_TOKEN;
     scw: SCW_SECRET_KEY), else the store file."""
+    return env_override(environ, names) or file_fingerprint(store)
+
+
+def env_override(environ, names: tuple) -> str | None:
+    """#313 r1: the fingerprint of the first set variable of `names`, which
+    overrides the CLI's store; None when the store is in effect."""
     environ = os.environ if environ is None else environ
     for name in names:
         value = str(environ.get(name) or "").strip()
         if value:
             return _digest(value)
-    return file_fingerprint(store)
+    return None
 
 
 #: the variables that override each CLI's credential store
@@ -409,23 +437,26 @@ SCW_KEY_VARS = ("SCW_SECRET_KEY",)
 
 
 def probe_cli(harness: str, argv: list, fix: str, run=_run,
-              store: str | None = None, held: str | None = None) -> Verdict | None:
-    """`held`: the fingerprint of the credential in effect (`env_fingerprint`),
-    else that of `store`."""
+              store: str | None = None, override: str | None = None) -> Verdict | None:
+    """`override`: the fingerprint of a variable that overrides `store`
+    (`env_override`); without one, the store is the credential in effect,
+    fingerprinted once, before the probe (#313 r1)."""
     if not shutil.which(argv[0]):
         return None
+    held = override or file_fingerprint(store)
     code, out = run(argv, output=True)
     if code is None:
         return Verdict(harness, "", "unknown", "probe failed: %s" % out)
+    if not override and file_fingerprint(store) != held:
+        return Verdict(harness, "", "unknown", REPLACED)
     if code != 0:
         why = refused(out)
         if why is None:
             return Verdict(harness, "", "unknown", "probe failed (exit %s): %s"
                            % (code, _last_line(out) or "no output"))
         return Verdict(harness, "", "failing", "%s: %s" % (why, _last_line(out)), fix=fix,
-                       fingerprint=held or file_fingerprint(store))
-    return Verdict(harness, "", "healthy", "authenticated", fix=fix,
-                   fingerprint=held or file_fingerprint(store))
+                       fingerprint=held)
+    return Verdict(harness, "", "healthy", "authenticated", fix=fix, fingerprint=held)
 
 
 def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Verdict]:
@@ -444,11 +475,11 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
         elif harness == "gh":
             out.append(probe_cli("gh", ["gh", "auth", "status"], "gh auth login -h github.com",
                                  run, gh_store(environ),
-                                 env_fingerprint(environ, GH_TOKEN_VARS, gh_store(environ))))
+                                 env_override(environ, GH_TOKEN_VARS)))
         elif harness == "scw":
             out.append(probe_cli("scw", ["scw", "account", "project", "list", "-o", "json"],
                                  "scw init", run, scw_store(environ),
-                                 env_fingerprint(environ, SCW_KEY_VARS, scw_store(environ))))
+                                 env_override(environ, SCW_KEY_VARS)))
     return [v for v in out if v is not None]
 
 
@@ -481,14 +512,15 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
     read (`expect_failures`): a failure recorded meanwhile by a turn wins."""
     from . import storage
     rows = []
-    known: dict = {}
+    # #210 r5: health is read BEFORE the probes — a failure a turn records
+    # while they run then raises the count the conditional write expects
+    known: dict = {} if dry_run else {
+        harness: storage.of(db).credentials.health(cfg.host, harness)
+        for harness in settings(cfg)["probes"]}
     for verdict in probe_all(cfg, now, run, environ):
         row = {"host": cfg.host, "harness": verdict.harness, "account": verdict.account,
                "state": verdict.state, "reason": verdict.text(),
                "expires_at": verdict.expires_at, "previous": None}
-        if not dry_run and verdict.harness not in known:
-            known[verdict.harness] = storage.of(db).credentials.health(cfg.host,
-                                                                       verdict.harness)
         current = (known.get(verdict.harness) or {}).get(verdict.account) or {}
         kept = kept_failure(current, verdict)
         if kept:
