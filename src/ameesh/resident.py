@@ -697,9 +697,18 @@ class ClaudeStreamJson(ResidentDriver):
         with self._lock:
             self._unread.add(wire)
             self._wire_inputs[wire] = input_id
-        self._write({"type": "user", "uuid": wire, "session_id": self.session_id or "",
-                     "parent_tool_use_id": None,
-                     "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+        try:
+            self._write({"type": "user", "uuid": wire, "session_id": self.session_id or "",
+                         "parent_tool_use_id": None,
+                         "message": {"role": "user",
+                                     "content": [{"type": "text", "text": text}]}})
+        except BaseException:
+            # refused (outbox full, harness gone): never awaited as unread, or
+            # the turn would wait for it forever (codex r1, #387)
+            with self._lock:
+                self._unread.discard(wire)
+                self._wire_inputs.pop(wire, None)
+            raise
 
     # -- turn --------------------------------------------------------------
     def _begin(self, text: str, input_id: str) -> None:

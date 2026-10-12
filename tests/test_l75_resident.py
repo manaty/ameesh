@@ -414,6 +414,19 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertNotIn("refused", turn.inputs)
         self.assertTrue(driver.alive)
 
+    def test_a_refused_steer_does_not_hold_the_turn(self):
+        # codex r1 (#387): a steer refused by the outbox is not awaited as
+        # unread: the turn still ends, and the next send is accepted
+        driver = self.driver()
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        with mock.patch.object(resident, "MAX_OUTBOX_BYTES", 1000):
+            with self.assertRaises(resident.ResidentError):
+                driver.steer("y" * 2000, input_id="refused")
+        result = self.wait(turn, 5)
+        self.assertEqual((result.status, result.inputs), (resident.COMPLETED, ("a",)))
+        self.assertEqual(self.wait(driver.send("next")).final, "ECHO:next")
+
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was
         # interrupted is not reported as served
