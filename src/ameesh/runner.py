@@ -3438,7 +3438,8 @@ class AgentWorker(threading.Thread):
             log("[%s] could not attach the resources of turn %s (%s)"
                 % (self.name, turn_id[:8], exc))
 
-    def _close_turn_resource(self, turn_id: str, pgid: int | None) -> None:
+    def _close_turn_resource(self, turn_id: str, pgid: int | None, *,
+                             survives: bool = False) -> None:
         """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
 
         Un groupe encore vivant après l'arrêt escaladé, ou un conteneur qui
@@ -3454,7 +3455,7 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = bool(conteneurs) or bool(pgid and self._group_alive(pgid))
+        orphelin = survives or bool(conteneurs) or bool(pgid and self._group_alive(pgid))
         try:
             storage.of(self.db).turn_resources.close_turn(
                 turn_id, orphan=orphelin, containers=conteneurs or None)
@@ -3999,6 +4000,7 @@ class AgentWorker(threading.Thread):
             # sans lot — garde un délai de grâce (`background`). Sinon, ou
             # sans délai, le nettoyage habituel, tout de suite.
             fond = None
+            handoff_failed = False
             try:
                 if (proc is not None and pgid and proc.poll() is not None
                         and not self.runner.once and self.turn_grace_seconds() > 0
@@ -4008,7 +4010,9 @@ class AgentWorker(threading.Thread):
             except Exception as exc:  # dans le doute, le nettoyage d'avant
                 log_async("[%s] background work of turn %s not examined (%s)"
                           % (self.name, turn_id[:8], exc))
+                handoff_failed = True
                 fond = None
+            cleanup_survives = handoff_failed
             if fond is None:
                 # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
                 # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
@@ -4025,9 +4029,18 @@ class AgentWorker(threading.Thread):
                     containers=fond[1], grace_s=self.turn_grace_seconds(),
                     handles=background_handles)
             else:
-                for handle in background_handles.values():
-                    handle.close()
-                self._close_turn_resource(turn_id, pgid)
+                if background_handles:
+                    from .background import Entry
+                    # A failed handoff must not discard detached live targets.
+                    # Clean through their pidfds and retain uncertainty even
+                    # when all known handles exit successfully.
+                    cleanup = Entry(agent=self.name, turn_id=turn_id, pgid=pgid,
+                                    ended=0, deadline=0, grace_s=0,
+                                    handles=background_handles,
+                                    unverified=handoff_failed or any(
+                                        h.live() for h in background_handles.values()))
+                    cleanup_survives |= self.runner.background._kill(cleanup)
+                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives)
             self._background_handles = None
             self._menage_apres_tour(menage_tour, turn_id, spec)
             if conversation_recorder is not None:

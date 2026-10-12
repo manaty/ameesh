@@ -42,7 +42,7 @@ class BackgroundSignalTest(unittest.TestCase):
                 mock.patch.object(os, "killpg") as killpg:
             self.tracker._refresh(self.entry, [], now=2)
         killpg.assert_not_called()
-        close.assert_called_once_with(self.entry, "expired", 2)
+        close.assert_called_once_with(self.entry, "expired", 2, survives=False)
         self.assertIsNone(self.entry.pgid)
 
     def test_container_only_expiry_does_not_require_a_process_scan(self):
@@ -88,16 +88,21 @@ class BackgroundSignalTest(unittest.TestCase):
         self.assertIsNone(self.entry.pgid)
         self.assertTrue(any("ownership unknown" in note for note in self.notes))
 
-    def test_unreadable_scan_does_not_signal_retained_handles(self):
+    def test_unreadable_scan_cleans_retained_handles_but_stays_uncertain(self):
         handle = mock.Mock()
         self.entry.handles[7001] = handle
+        self.tracker.TERM_GRACE_S = 0
         with mock.patch.object(platform, "process_table", side_effect=OSError("unreadable")), \
+                mock.patch.object(background.time, "monotonic", side_effect=[0, 1, 2, 9]), \
                 mock.patch.object(os, "killpg") as killpg:
-            self.tracker._kill(self.entry)
-        handle.send.assert_not_called()
+            survives = self.tracker._kill(self.entry)
+        self.assertEqual(handle.send.call_args_list,
+                         [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT),
+                          mock.call(signal.SIGKILL)])
         handle.close.assert_called_once()
         killpg.assert_not_called()
         self.assertTrue(any("process table unavailable" in note for note in self.notes))
+        self.assertTrue(survives)
 
     def test_missing_pidfd_has_no_numeric_signal_fallback(self):
         with mock.patch.object(os, "pidfd_open", side_effect=OSError("unavailable"),
@@ -119,7 +124,7 @@ class BackgroundSignalTest(unittest.TestCase):
         killpg.assert_not_called()
         self.assertTrue(self.entry.unverified)
         with mock.patch.object(background.storage, "of") as store:
-            self.tracker._release_resource(self.entry)
+            self.tracker._release_resource(self.entry, survives=False)
         self.assertTrue(store.return_value.turn_resources.close_turn.call_args.kwargs["orphan"])
 
     def test_uncaptured_child_after_leader_exit_keeps_resource_orphaned(self):
@@ -297,6 +302,63 @@ class BackgroundSignalTest(unittest.TestCase):
             parent.wait(timeout=5)
             parent.stdout.close()
 
+    @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
+    def test_detached_child_forking_on_term_preserves_surviving_grandchild(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-detached-fork-") as tmp:
+            pidfile = os.path.join(tmp, "grandchild.pid")
+            code = ("import os,signal,subprocess,sys,time; from pathlib import Path\n"
+                    "def term(*_):\n"
+                    " p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+                    " Path(sys.argv[1]).write_text(str(p.pid))\n"
+                    " os._exit(0)\n"
+                    "signal.signal(signal.SIGTERM,term)\n"
+                    "print('ready',flush=True)\n"
+                    "time.sleep(60)\n")
+            child = subprocess.Popen([sys.executable, "-c", code, pidfile],
+                                     start_new_session=True, stdout=subprocess.PIPE, text=True)
+            held = None
+            grandchild = None
+            try:
+                import select
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0])
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                member = next(p for p in platform.process_table() if p["pid"] == child.pid)
+                held = ProcessHandle.open(child.pid, member["start"])
+                self.assertIsNotNone(held)
+                # A retained setsid child: its current group differs from the
+                # original turn group, which the next refresh retires.
+                entry = background.Entry(agent="test", turn_id="detached-fork", pgid=7000,
+                                         ended=0, deadline=1, grace_s=1,
+                                         handles={child.pid: held})
+                self.tracker.entries = [entry]
+                self.tracker.TERM_GRACE_S = .5
+                with mock.patch.object(background.storage, "of") as store:
+                    self.tracker.tick(now=0)
+                    self.assertIsNone(entry.pgid)
+                    self.tracker.tick(now=2)
+                    with open(pidfile) as f:
+                        grandchild = int(f.read())
+                    self.assertTrue(platform.alive(grandchild))
+                    store.return_value.turn_resources.close_turn.assert_called_once_with(
+                        "detached-fork", orphan=True, containers=None)
+            finally:
+                if grandchild is None and os.path.exists(pidfile):
+                    with open(pidfile) as f:
+                        grandchild = int(f.read())
+                if grandchild is not None:
+                    try:
+                        os.kill(grandchild, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if held is not None:
+                    held.send(signal.SIGKILL)
+                    held.close()
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                child.stdout.close()
+
     def test_handle_rejects_snapshot_start_mismatch_and_closes_fd(self):
         with mock.patch.object(os, "pidfd_open", return_value=42, create=True), \
                 mock.patch("ameesh.platform.signals.start_time", return_value=11.0), \
@@ -316,13 +378,14 @@ class BackgroundSignalTest(unittest.TestCase):
                 mock.patch.object(background.ProcessHandle, "open") as acquire, \
                 mock.patch.object(os, "killpg") as killpg, \
                 mock.patch.object(background.time, "monotonic", side_effect=[0, 1, 2, 9]):
-            self.tracker._kill(self.entry)
+            survives = self.tracker._kill(self.entry)
         acquire.assert_not_called()
         killpg.assert_not_called()
         self.assertEqual(old.send.call_args_list,
                          [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT),
                           mock.call(signal.SIGKILL)])
         old.close.assert_called_once()
+        self.assertTrue(survives)
 
     def test_shutdown_cannot_close_fd_during_signalling(self):
         entered, release, closing, closed = (threading.Event() for _ in range(4))
@@ -396,13 +459,14 @@ class BackgroundSignalTest(unittest.TestCase):
                                                containers=[], grace_s=1, now=0, handles=held.handles)
                 self.tracker.TERM_GRACE_S = .5
                 with mock.patch.object(os, "killpg") as killpg:
-                    self.tracker._kill(entry)
+                    survives = self.tracker._kill(entry)
                 killpg.assert_not_called()
                 self.assertEqual(parent.wait(timeout=5), -signal.SIGTERM)
                 self.assertTrue(select.select([fd], [], [], 5)[0],
                                 "reparented child survived escalation")
                 self.assertTrue(os.path.exists(detached), "child did not leave the old group")
                 self.assertEqual(entry.handles, {})
+                self.assertFalse(survives)
             finally:
                 if fd is not None:
                     try:

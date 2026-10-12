@@ -176,6 +176,8 @@ class Entry:
     handles: dict = field(default_factory=dict)
     #: a known member could not be held: cleanup cannot claim success
     unverified: bool = False
+    #: observed groups of retained processes; diagnostic evidence only
+    groups_seen: set = field(default_factory=set)
     #: tick and runner shutdown must not close a handle during signalling
     process_lock: object = field(default_factory=threading.RLock, repr=False)
     #: autres processus vivants du groupe (descendants des racines)
@@ -283,6 +285,8 @@ class Tracker:
                                 and not p["zombie"] and p["pid"] in (handles or {})
                                 and handles[p["pid"]].live()]
                 except platform.NotAvailable:
+                    if handles:
+                        raise
                     return None
                 if not vivants or time.monotonic() >= fin:
                     break
@@ -389,6 +393,8 @@ class Tracker:
 
     def _refresh_owned(self, entry: Entry, table: list[dict] | None, now: float) -> None:
         vivants: list[dict] = []
+        if table is not None:
+            self._remember_groups(entry, table)
         if entry.pgid and table is not None:
             membres = self._owned_members(entry, table)
             if not membres:
@@ -466,9 +472,13 @@ class Tracker:
             try:
                 table = platform.process_table()
             except Exception as exc:
-                self.log("[%s] background stop refused: process table unavailable (%s)"
+                self.log("[%s] background stop: process table unavailable; retained handles only (%s)"
                          % (entry.agent, exc))
-                return True  # no reliable verdict; preserve orphan status
+                # Retained pidfds remain safe targets even without a scan.
+                # Missing membership information still makes cleanup uncertain.
+                entry.unverified = True
+                table = []
+            self._remember_groups(entry, table)
             members = self._owned_members(entry, table)
             if not members:
                 entry.unverified |= any(p["pgid"] == entry.pgid and not p["zombie"]
@@ -500,19 +510,36 @@ class Tracker:
         finally:
             self._drop_handles(entry)
 
-    def _survival_verdict(self, entry: Entry) -> bool:
-        """One final observation includes children forked during signalling.
+    def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
+        for p in table:
+            handle = entry.handles.get(p["pid"])
+            if handle is not None and handle.live():
+                entry.groups_seen.add(p["pgid"])
+                entry.lineage.add(p["pid"])
 
-        Without a retained group anchor, remaining members cannot be signalled,
-        but their presence still prevents claiming successful cleanup.
+    def _survival_verdict(self, entry: Entry) -> bool:
+        """Include children forked in retained processes' detached groups.
+
+        Group and lineage observations only prevent a clean verdict; they
+        never authorize signalling a newly observed process.
         """
         live = any(h.live() for h in entry.handles.values())
-        if entry.pgid:
+        groups = entry.groups_seen | ({entry.pgid} if entry.pgid else set())
+        roots = set(entry.handles) | entry.lineage
+        if groups or roots:
             try:
                 table = platform.process_table()
             except Exception:
                 return True
-            if any(p["pgid"] == entry.pgid and not p["zombie"] for p in table):
+            descendants = set(roots)
+            while True:
+                found = {p["pid"] for p in table
+                         if p["pgid"] in groups or p["ppid"] in descendants}
+                if found <= descendants:
+                    break
+                descendants.update(found)
+            if any(not p["zombie"] and (p["pgid"] in groups
+                                        or p["pid"] in descendants) for p in table):
                 return True
         return entry.unverified or live
 
