@@ -1294,7 +1294,7 @@ class RestartTest(unittest.TestCase):
         self.at(g, 0.0)
         state = self.at(g, 130.0)
         self.assertEqual(state["state"], "stopped")
-        self.assertEqual(state["guard"]["stopped"]["units"], list(self.UNITS[:2]))
+        self.assertEqual(sorted(state["guard"]["stopped"]["units"]), list(self.UNITS[:2]))
         self.reading["mem_available_bytes"] = 12 * GIB
         self.at(g, 200.0)                                # calm counting from 200
         self.assertEqual(self.at(g, 800.0)["level"], 0)  # level 0: low from 800
@@ -1338,12 +1338,50 @@ class RestartTest(unittest.TestCase):
         # the new drain is not acknowledged: stopped again, the record kept
         state = self.at(g, 1130.0)
         self.assertEqual(state["state"], "stopped")
-        self.assertEqual(state["guard"]["stopped"]["units"], list(self.UNITS[:2]))
+        self.assertEqual(sorted(state["guard"]["stopped"]["units"]), list(self.UNITS[:2]))
         self.assertEqual(self.at(g, 1601.0)["level"], 0)
         self.at(g, 1900.0)
         self.assertEqual(self.starts, [])
         self.at(g, 1901.0)
         self.assertEqual(self.starts, list(self.UNITS[:2]))
+
+    def test_each_unit_keeps_the_instant_of_its_own_stop(self):
+        # codex #267 r1: the owner starts @1 again and stops it; a later stop
+        # (here, by a restarted guard, level 4 held) finds it stopped and
+        # must not move its instant past the owner's stop
+        g = self.guard()
+        self.at(g, 0.0)
+        stop = self.at(g, 130.0)["guard"]["stopped"]["units"]
+        self.mono[0] += 70
+        self.units[self.UNITS[0]] = ["inactive", int(self.mono[0] * 10 ** 6)]
+        g = self.guard()
+        self.assertEqual(self.at(g, 300.0)["guard"]["stopped"]["units"], stop)
+        self.reading["mem_available_bytes"] = 12 * GIB
+        self.at(g, 301.0)
+        self.assertEqual(self.at(g, 901.0)["level"], 0)
+        state = self.at(g, 1201.0)
+        self.assertEqual(self.starts, [self.UNITS[1]])
+        self.assertEqual(state["guard"]["restart"]["skipped"],
+                         {self.UNITS[0]: "stopped_by_owner"})
+
+    def test_a_manual_drain_after_the_stop_keeps_it(self):
+        # codex #267 r1: a manual drain asked while stopped, or cancelled
+        # before level 4, still keeps an earlier stop's units stopped
+        for cancel_at in (140.0, 900.0):
+            self.setUp()
+            g = self.stop_then_clear(self.guard()) if cancel_at > 800 else self.guard()
+            if cancel_at < 800:
+                self.at(g, 0.0)
+                self.at(g, 130.0)
+            guard.request_drain(self.cfg.drain_request_path, 0.0, None)
+            self.at(g, cancel_at - 5)
+            guard.cancel_drain(self.cfg.drain_request_path)
+            self.reading["mem_available_bytes"] = 12 * GIB
+            for t in (cancel_at, cancel_at + 600, cancel_at + 1200, cancel_at + 1800):
+                state = self.at(g, t)
+            self.assertEqual(state["level"], 0, cancel_at)
+            self.assertEqual(self.starts, [], cancel_at)
+            self.assertEqual(set(state["guard"]["restart"]["skipped"].values()), {"manual"})
 
     def test_a_freeze_restarts_the_window(self):
         g = self.stop_then_clear(self.guard())

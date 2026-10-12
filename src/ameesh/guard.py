@@ -860,7 +860,7 @@ class Enforcer:
         #: boot clock, kept across retries and restarts (codex #237 r5)
         self.episode: dict | None = None
         #: the agent units a stop found running, to start again (L159e4):
-        #: {units, boot_id, mono (systemd's monotonic clock once stopped),
+        #: {units: {unit: systemd's monotonic clock once stopped}, boot_id,
         #: manual, low_since}; published as `guard.stopped`
         self.stopped: dict | None = None
         #: the last restart: {ts, started, skipped}; published as `guard.restart`
@@ -1026,24 +1026,27 @@ class Enforcer:
         killed = self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units,
                                  self.cfg.job_units)
         stopped = self._systemctl("stop", self.cfg.slice)
-        record = self.stopped or {"units": [], "boot_id": self.boot_id(),
+        record = self.stopped or {"units": {}, "boot_id": self.boot_id(),
                                   "manual": False, "low_since": None}
-        record["units"] = sorted(set(record["units"]) | set(running))
-        # after the stop: a unit inactive since a later instant was started
-        # and stopped again by someone else
-        record["mono"] = self.monotonic()
+        # each unit keeps the instant of the stop that stopped it, after the
+        # stop: a unit inactive since a later instant was started and stopped
+        # again by someone else; a later stop (retry, new drain) that finds it
+        # stopped never moves it (codex #267 r1)
+        mono = self.monotonic()
+        record["units"] = dict(record["units"], **{u: mono for u in running})
         self.stopped = record
         return killed and stopped
 
     def restore_stopped(self, record: Any) -> None:
         """The units a previous guard stopped (`guard.stopped`)."""
-        if isinstance(record, dict) and isinstance(record.get("units"), list) \
-                and all(isinstance(u, str) for u in record["units"]) \
-                and isinstance(record.get("boot_id"), str) and _number(record.get("mono")) \
+        units = record.get("units") if isinstance(record, dict) else None
+        if isinstance(units, dict) and all(_number(m) for m in units.values()) \
+                and isinstance(record.get("boot_id"), str) \
                 and isinstance(record.get("manual"), bool) \
                 and (record.get("low_since") is None or _number(record.get("low_since"))):
             self.stopped = {k: record[k] for k in
-                            ("units", "boot_id", "mono", "manual", "low_since")}
+                            ("units", "boot_id", "manual", "low_since")}
+            self.stopped["units"] = dict(units)
 
     def _unit_show(self, unit: str) -> dict:
         try:
@@ -1065,7 +1068,7 @@ class Enforcer:
         record, self.stopped = self.stopped, None
         started, skipped = [], {}
         same_boot = record["boot_id"] == self.boot_id()
-        for unit in record["units"]:
+        for unit, stopped_at in sorted(record["units"].items()):
             if record["manual"]:
                 skipped[unit] = "manual"
                 continue
@@ -1076,7 +1079,7 @@ class Enforcer:
             inactive = resources.finite_float(shown.get("InactiveEnterTimestampMonotonic"))
             if shown.get("ActiveState") not in ("inactive", "failed") or inactive is None:
                 skipped[unit] = "running" if shown.get("ActiveState") else "unknown"
-            elif inactive / 1e6 > record["mono"]:
+            elif inactive / 1e6 > stopped_at:
                 skipped[unit] = "stopped_by_owner"
             elif self._systemctl("start", "--no-block", unit):
                 started.append(unit)
@@ -1089,7 +1092,7 @@ class Enforcer:
         return self.restarted
 
     def apply(self, state: dict, cpu_count: int | None,
-              now: float | None = None) -> list[str]:
+              now: float | None = None, *, manual: bool = False) -> list[str]:
         """Enforces `state`: caps at every level, freeze at level 2; a drain
         thaws, and stops the jobs at its deadline; a stop kills and stops the
         guest's slice. Each is done once, retried while it fails. The `caps`
@@ -1098,7 +1101,8 @@ class Enforcer:
 
         `now` is the instant `state` was decided at: the deadline is judged
         on the same clock as the decision (a manual request's expiry
-        included), never on a later one (codex #238 r4)."""
+        included), never on a later one (codex #238 r4). `manual`: a drain the
+        owner asked is in force; nothing stopped is started again."""
         if self.refused:
             self.log("slice %s refused: %s; nothing enforced" % (self.cfg.slice, self.refused))
             return []
@@ -1106,6 +1110,10 @@ class Enforcer:
         caps = state.get("caps") or {}
         level = state.get("level", 0)
         deadline = state.get("drain_deadline_ts")
+        if manual and self.stopped is not None:
+            # a drain the owner asked, at any level, even cancelled since:
+            # what was stopped stays stopped (codex #267 r1)
+            self.stopped["manual"] = True
         if self.stopped is not None:
             # the level at 1 or below for restart_after_seconds: start again
             low = self.stopped["low_since"] = None if level >= 2 else (
@@ -1119,8 +1127,7 @@ class Enforcer:
             self.jobs_stopped = self.stop_jobs()
         if level == 4 and not self.guest_stopped:
             self.guest_stopped = self.stop_guest()
-            if state.get("reason") == "manual":
-                self.stopped["manual"] = True
+            self.stopped["manual"] = self.stopped["manual"] or manual
         done = self._set(self.cfg.slice, slice_properties(caps, cpu_count))
         enforced = {PROPERTY_CAPS[p] for p in done}
         if caps.get("agent_memory_mb") is not None:
@@ -1241,7 +1248,8 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            enforced = self.enforcer.apply(state, reading.get("cpu_count"), now)
+            enforced = self.enforcer.apply(state, reading.get("cpu_count"), now,
+                                           manual=reading["drain_requested"])
             # the schema's caps.enforced lists caps only: the freeze says it itself
             state["caps"]["enforced"] = [k for k in enforced if k != "freeze"]
             if state.get("freeze") is not None:
