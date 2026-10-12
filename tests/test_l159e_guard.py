@@ -334,6 +334,14 @@ class StateTest(unittest.TestCase):
             json.dump({"schema": "ameesh-host-ack/1", "seq": 3,
                        "in_turn": ["x" * 1000] * 100}, fh)
         self.assertIsNone(guard.read_ack(self.cfg.ack_path))
+        # codex #211 r4: 64 KiB of nested arrays raise a RecursionError on the
+        # Pythons whose decoder counts depth (forced here: 3.14 parses them)
+        os.remove(self.cfg.ack_path)
+        with open(self.cfg.ack_path, "w") as fh:
+            fh.write("[" * 32000 + "]" * 32000)
+        self.assertIsNone(guard.read_ack(self.cfg.ack_path))
+        with mock.patch.object(guard.json, "loads", side_effect=RecursionError):
+            self.assertIsNone(guard.read_ack(self.cfg.ack_path))
         self._ack(seq=3, drained=True)
         self.assertEqual(guard.read_ack(self.cfg.ack_path)["seq"], 3)
 
@@ -403,6 +411,18 @@ class SignalsTest(unittest.TestCase):
             OSError("no systemctl"))))
 
 
+    def test_disk_of_the_guest_work_path(self):
+        # codex #211 r4: the guard measured no disk (sample() without a path),
+        # so the lendable disk and caps.disk_mb never appeared
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer({"cpu_max": 1}),
+                                    work_path=tmp)
+            reading = guard.read_signals(cfg, 100.0, psi=lambda avg: {},
+                                         busy=lambda units: None)
+            self.assertIsNotNone(reading["disk_free_bytes"])
+            self.assertEqual(reading["disk_path"], tmp)
+
+
 class CliTest(unittest.TestCase):
     def test_check_and_observe_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,11 +431,15 @@ class CliTest(unittest.TestCase):
                 json.dump({"host": "vm-test", "max_agents": 2,
                            "state_path": os.path.join(tmp, "s", "state.json"),
                            "ack_path": os.path.join(tmp, "a", "ack.json"),
-                           "lend": {"cpu_max": 2, "memory_max": "4GiB"}}, fh)
+                           "work_path": tmp,
+                           "lend": {"cpu_max": 2, "memory_max": "4GiB",
+                                    "disk_max": "1MiB"}}, fh)
             with mock.patch("sys.stdout") as out:
                 self.assertEqual(guard.main(["check", "--config", config, "--json"]), 0)
             printed = "".join(c.args[0] for c in out.write.call_args_list)
             self.assertEqual(json.loads(printed)["schema"], "ameesh-host-state/1")
+            # codex #211 r4: the disk of work_path, measured through sample()
+            self.assertEqual(json.loads(printed)["caps"].get("disk_mb"), 1)
             with mock.patch("sys.stderr"):
                 self.assertEqual(guard.main(["run", "--config", config]), 2)
             self.assertEqual(guard.main(["run", "--observe", "--once", "--config", config]), 0)

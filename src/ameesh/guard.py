@@ -35,6 +35,7 @@ Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
     {"host": "vm-example", "max_agents": 3,
      "state_path": "/run/ameesh-gate/state/state.json",
      "ack_path": "/run/ameesh-gate/ack/ack.json",
+     "work_path": "/srv/ameesh-guest",
      "lend": {"cpu_max": 3, "cpu_weight": 10, "memory_max": "14GiB",
               "agent_memory_max": "4.5GiB", "disk_max": "80GiB",
               "windows": ["mon-fri 18:00-14:00 UTC", "sat-sun"],
@@ -67,6 +68,8 @@ GUARD_KIND = "ameesh-guard"
 DEFAULT_CONFIG = "/etc/ameesh/guard.json"
 DEFAULT_STATE_PATH = "/run/ameesh-gate/state/state.json"
 DEFAULT_ACK_PATH = "/run/ameesh-gate/ack/ack.json"
+#: the guest's work directory (study §3): its free disk is what the guest uses
+DEFAULT_WORK_PATH = "/srv/ameesh-guest"
 
 #: evaluation period, state lifetime, longest freeze, grace after the drain
 #: deadline before the stop (seconds, study §1.5 and §1.6)
@@ -266,6 +269,7 @@ class GuardConfig:
     max_agents: int = 1
     state_path: str = DEFAULT_STATE_PATH
     ack_path: str = DEFAULT_ACK_PATH
+    work_path: str = DEFAULT_WORK_PATH
 
 
 def load_config(path: str | None = None) -> GuardConfig:
@@ -285,7 +289,8 @@ def load_config(path: str | None = None) -> GuardConfig:
         raise GuardError("max_agents: integer >= 0 expected")
     return GuardConfig(host=str(host), offer=parse_offer(raw.get("lend")), max_agents=agents,
                        state_path=str(raw.get("state_path") or DEFAULT_STATE_PATH),
-                       ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH))
+                       ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
+                       work_path=str(raw.get("work_path") or DEFAULT_WORK_PATH))
 
 
 # --------------------------------------------------------------------------
@@ -341,7 +346,7 @@ def _mem_total() -> int | None:
 def read_signals(cfg: GuardConfig, now: float, *, sample: Callable | None = None,
                  psi: Callable = read_psi, busy: Callable = busy_count) -> dict:
     """One flat reading of what the decision looks at."""
-    sample = sample or (lambda: resources.sample(cfg.host, now=now))
+    sample = sample or (lambda: resources.sample(cfg.host, path=cfg.work_path, now=now))
     reading = dict(sample())
     if reading.get("mem_total_bytes") is None:
         reading["mem_total_bytes"] = _mem_total()
@@ -614,7 +619,8 @@ def read_guest_json(path: str, limit: int = ACK_MAX_BYTES) -> dict | None:
         return None
     try:
         doc = json.loads(data.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: 64 KiB of nested arrays (codex #211 r4)
         return None
     return doc if isinstance(doc, dict) else None
 
