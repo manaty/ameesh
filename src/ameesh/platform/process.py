@@ -339,6 +339,49 @@ def become_subreaper() -> bool:
         return False
 
 
+def children(pid: int | None = None) -> list[dict]:
+    """Les enfants DIRECTS de `pid` (défaut : ce processus), zombies compris :
+    `pid`, `zombie`. Sous Linux, la liste du noyau
+    (`/proc/<pid>/task/<tid>/children`, lue d'un coup, sans balayer tous les
+    processus) ; sinon psutil ; sinon `NotAvailable` (L131c : un sous-
+    moissonneur sait ainsi exactement s'il lui reste des descendants)."""
+    pid = os.getpid() if pid is None else int(pid)
+    if _proc_ok():
+        tasks = os.path.join(PROC, str(pid), "task")
+        try:
+            tids = os.listdir(tasks)
+        except OSError as exc:
+            raise NotAvailable("enfants d'un processus", str(exc))
+        pids: list[int] = []
+        found = False
+        for tid in tids:
+            try:
+                with open(os.path.join(tasks, tid, "children"), encoding="ascii") as fh:
+                    pids += [int(x) for x in fh.read().split()]
+                found = True
+            except FileNotFoundError:
+                continue            # fil terminé, ou noyau sans CONFIG_PROC_CHILDREN
+            except (OSError, ValueError):
+                continue
+        if found:
+            out = []
+            for child in sorted(set(pids)):
+                try:
+                    zombie = _stat_fields(child)[0] in ("Z", "X")
+                except (OSError, ValueError, IndexError):
+                    continue        # moissonné entre-temps
+                out.append({"pid": child, "zombie": zombie})
+            return out
+    ps = _psutil()
+    if ps is not None:
+        try:
+            return [{"pid": c.pid, "zombie": c.status() == ps.STATUS_ZOMBIE}
+                    for c in ps.Process(pid).children()]
+        except (ps.NoSuchProcess, ps.AccessDenied) as exc:
+            raise NotAvailable("enfants d'un processus", str(exc))
+    raise NotAvailable("enfants d'un processus", "ni liste du noyau ni psutil")
+
+
 def reap(pid: int) -> int | None:
     """Moissonne `pid` s'il est un enfant TERMINÉ de ce processus : rend son
     code de sortie (négatif : tué par ce signal). None s'il tourne encore,
