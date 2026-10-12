@@ -1280,6 +1280,38 @@ in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
 (`pip install <paquet>`), then resume at `migrer`.
 
+## Update to 1.10.0 (path B, mediated executor)
+
+1.10.0 brings path B, the mediated executor (L107 to L115,
+[EXECUTEUR-MEDIEE.md](EXECUTEUR-MEDIEE.md)): a lent device, without database
+access, runs agents by talking to the mesh server through `/api/exec/v1`
+(contract 1.1). Three migrations follow main's 0057 (0058 to 0061 belong to
+other lots):
+
+| Migration | Lot | Content |
+|---|---|---|
+| **0062** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| **0063** `executor_identity` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
+| **0064** `model_relay` | L111 | `turn_costs.source` (`harness` by default), `executor`, `lease_owner`, `lease_epoch` |
+
+**Nothing changes for a classic host.** The tables are new, the `source`
+column has a default, and a 1.9.x executor runs without error on a migrated
+database: the three migrations are additive, so the L151 order below
+applies unchanged (migrate, install, restart). The spending cap ignores rows
+with `source = 'device'`, which no classic host writes. Without a host gate
+configured (`AMEESH_HOST_GATE`), the executor behaves as in 1.9.0.
+
+**Nothing is switched on.** The `ameesh serve --exec-only` server, a
+Postgres role of its own for the server (`ameesh_exec`, to be created), the
+image release key (IMAGE-EXECUTEUR.md §9), the signed image and the
+enrolment of a first device (`ameesh host enroll`) are separate deployment
+steps, each submitted to the owner.
+
+Rollback: the previous code. The database stays migrated; the previous code
+ignores the tables of 0062 and 0063 and the `source` column of 0064 (it then
+also counts `device` rows, which only exist once a device has been
+enrolled).
+
 ---
 
 ## Risks and mitigations

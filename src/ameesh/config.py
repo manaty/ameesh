@@ -149,7 +149,7 @@ class Config:
     dsn: str = DEFAULT_DSN
     schema: str = "public"
     driver: str = "auto"  # auto | psycopg | psql
-    backend: str = "auto"  # auto | pg | file
+    backend: str = "auto"  # auto | pg | file | mediated
     state_dir: str = _expand(DEFAULT_STATE)
     v0_state: str = _expand(DEFAULT_V0_STATE)
     config_dir: str = _expand(DEFAULT_V0_CONFIG)
@@ -365,6 +365,14 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: L109 : exécuteur médié (`backend: mediated`) — URL du serveur du mesh
+    #: (`/api/exec/v1`) et fichier 0600 du jeton d'accès de l'exécuteur (la
+    #: source réelle du jeton est l'identité de l'exécuteur, L110). Dans la
+    #: VM, la session du harnais reçoit AMEESH_EXEC_URL et AMEESH_EXEC_TOKEN.
+    exec_url: str = ""
+    exec_token_file: str = ""
+    #: L109: mediated host, provider/DB credentials remain on the server.
+    host_mediated: bool = False
     #: Off-device session backup; storage credentials come from the environment.
     session_backup: dict = field(default_factory=dict)
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
@@ -473,6 +481,7 @@ def load(env: dict | None = None) -> Config:
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf
     # Fils lisibles : AMEESH_THREADS > `threads_dir` du JSON > `<état>/fils`.
     threads_brut = pick("AMEESH_THREADS", default=cfg.threads_dir)
+    exec_token_file = pick("AMEESH_EXEC_TOKEN_FILE", default=cfg.exec_token_file)
     cfg = replace(
         cfg,
         dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
@@ -588,6 +597,8 @@ def load(env: dict | None = None) -> Config:
         shared_sessions=bool(_as_bool(pick("AMEESH_SHARED_SESSIONS",
                                            default=cfg.shared_sessions), False,
                                       "AMEESH_SHARED_SESSIONS")),
+        exec_url=str(pick("AMEESH_EXEC_URL", default=cfg.exec_url) or "").strip(),
+        exec_token_file=_expand(str(exec_token_file)) if exec_token_file else "",
     )
     # L42 (0031) : une liste venue de l'environnement remplace celle du fichier
     env_untrusted = _as_bool(pick("AMEESH_CANON_UNTRUSTED", "AGENT_MESH_CANON_UNTRUSTED",
@@ -637,10 +648,14 @@ def load(env: dict | None = None) -> Config:
         host_gate_ack=_expand(str(gate_ack)) if gate_ack else "",
         host_gate_fallback=str(pick("AMEESH_HOST_GATE_FALLBACK",
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
+        host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
+                                    False, "AMEESH_HOST_MEDIATED")),
         host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
                                         int(cfg.host_gate_drain))),
     )
-    if cfg.host_gate not in ("", "none", "file"):
+    if cfg.host_gate not in (("", "none", "file", "socket")
+                             if cfg.backend == "mediated" or cfg.host_mediated
+                             else ("", "none", "file")):
         raise SystemExit("AMEESH_HOST_GATE invalide : %r (file | none)" % cfg.host_gate)
     if cfg.host_gate_fallback not in ("", "available", "draining", "stopped"):
         raise SystemExit("AMEESH_HOST_GATE_FALLBACK invalide : %r "
@@ -665,8 +680,11 @@ def load(env: dict | None = None) -> Config:
         raise SystemExit("unreadable config: `harness_bins` expects {harness: path}")
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("invalid AGENT_MESH_DRIVER: %r" % cfg.driver)
-    if cfg.backend not in ("auto", "pg", "file"):
+    if cfg.backend not in ("auto", "pg", "file", "mediated"):
         raise SystemExit("invalid AGENT_MESH_BACKEND: %r" % cfg.backend)
+    if cfg.backend == "mediated" and not cfg.exec_url:
+        raise SystemExit("mediated backend: missing server URL (exec_url or "
+                         "AMEESH_EXEC_URL)")
     return cfg
 
 

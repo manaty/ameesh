@@ -1,0 +1,164 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "family": "work",
+ "cases": [
+  {
+   "name": "work.mark_delegate_turn/ok",
+   "op": "work.mark_delegate_turn",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "54187271-f076-5933-ada7-456199a112da"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "work.mark_delegate_turn",
+     "args": [
+      "inge-front",
+      [
+       812
+      ],
+      "délégation : tour de inge-front sur le lot"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      812
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "work.get/ok",
+   "op": "work.get",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "work.get",
+     "args": [
+      812
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "id": 812,
+      "project": "site",
+      "title": "Page d'accueil",
+      "state": "build",
+      "assignee": "inge-front",
+      "loops": 0
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "work.move/ok",
+   "op": "work.move",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "56a12d43-71e0-59bd-b625-994ec75664d6"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "work.move",
+     "args": [
+      812,
+      "qa"
+     ],
+     "kwargs": {
+      "current": "build",
+      "loops": 0,
+      "note": "PR ouverte",
+      "actor": "inge-front",
+      "held": false
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "id": 812,
+      "project": "site",
+      "title": "Page d'accueil",
+      "state": "qa",
+      "assignee": "inge-front",
+      "loops": 0
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "work.note/ok",
+   "op": "work.note",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "1a6d394d-7924-52e2-8ad8-d6ae008253f2"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "work.note",
+     "args": [
+      812,
+      "build",
+      "Tests verts.",
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}
