@@ -245,6 +245,15 @@ class ReservationTest(PgTestCase):
         self.assertIn("no migration reserved", proc.stdout)
 
 
+def _drivers():
+    """Les pilotes présents : la passe psql de la CI tourne sans psycopg."""
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        return ("psql",)
+    return ("psql", "psycopg")
+
+
 class ReservationsSimultaneesTest(PgTestCase):
     """#443 : deux réservations au même instant, sur les deux pilotes."""
 
@@ -272,8 +281,7 @@ class ReservationsSimultaneesTest(PgTestCase):
     def test_la_perdante_recalcule(self):
         """A tient 377 sans avoir validé ; B lit le même maximum, tente 377,
         attend sur l'index, échoue au commit de A et prend 378."""
-        for holder, other in (("psql", "psycopg"), ("psycopg", "psql"),
-                              ("psycopg", "psycopg"), ("psql", "psql")):
+        for holder, other in [(h, o) for h in _drivers() for o in _drivers()]:
             with self.subTest(holder=holder, other=other):
                 self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL")
                 a, b = self._lots(2)
@@ -329,7 +337,8 @@ class ReservationsSimultaneesTest(PgTestCase):
             finally:
                 conn.close()
 
-        threads = [threading.Thread(target=reserve, args=(i, ("psql", "psycopg")[k % 2]))
+        drivers = _drivers()
+        threads = [threading.Thread(target=reserve, args=(i, drivers[k % len(drivers)]))
                    for k, i in enumerate(ids)]
         for t in threads:
             t.start()

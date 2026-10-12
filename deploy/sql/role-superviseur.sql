@@ -422,8 +422,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- prévues
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
-        -- L122 (0053) : numéro de migration réservé par le lot
-        'migration',
+        -- L122 (0053) : numéro de migration réservé par le lot, et son
+        -- dépôt (#443, 0390)
+        'migration', 'migration_repo',
         -- L157b (0054) : taille déclarée du changement
         'change_size'
     ]),
