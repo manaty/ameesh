@@ -1375,13 +1375,20 @@ def _claude_usd(usage: dict, pin: float, pcache: float, pout: float,
     if tier is not None and (_num(usage, "input_tokens") + written
                              + _num(usage, "cache_read_input_tokens")) <= tier[0]:
         pin, pcache, pout = tier[1]
-    detail = usage.get("cache_creation") if isinstance(usage, dict) else None
-    hour = min(_num(detail, "ephemeral_1h_input_tokens"), written) \
-        if isinstance(detail, dict) else 0
+    hour = _hour_written(usage)
     return (_num(usage, "input_tokens") * pin
             + ((written - hour) * CACHE_WRITE_5M + hour * CACHE_WRITE_1H) * pin
             + _num(usage, "cache_read_input_tokens") * pcache
             + _num(usage, "output_tokens") * pout) / 1e6
+
+
+def _hour_written(usage) -> int:
+    """L225 : les écritures de cache qu'un usage Claude déclare en cache 1 h."""
+    detail = usage.get("cache_creation") if isinstance(usage, dict) else None
+    if not isinstance(detail, dict):
+        return 0
+    return min(_num(detail, "ephemeral_1h_input_tokens"),
+               _num(usage, "cache_creation_input_tokens"))
 
 
 #: L225 : les jetons d'une invite Claude (entrée, cache écrit, cache relu)
@@ -1400,12 +1407,26 @@ def _claude_tiered_usd(totals: Sequence[dict], calls: Sequence[dict], pin: float
     `calls` (`_claude_call_usages`) doit couvrir exactement l'invite de
     `totals` ; sinon None (l'appelant facture au palier haut, marqué). Le flux
     peut sous-déclarer la sortie d'un appel : le reste de la sortie agrégée va
-    au palier haut."""
+    au palier haut. De même pour la durée du cache : les écritures que
+    l'agrégat déclare en cache 1 h et que les appels ne disent pas passent du
+    tarif 5 min au tarif 1 h sur les écritures sans durée des appels, les plus
+    chères (palier haut) d'abord — un majorant, jamais sous l'agrégat."""
     calls = [u for u in calls if _has_tokens(u)]
     if not calls or any(_sum(calls, k) != _sum(totals, k) for k in PROMPT_KEYS):
         return None
     reste = max(_sum(totals, "output_tokens") - _sum(calls, "output_tokens"), 0)
-    return sum(_claude_usd(u, pin, pcache, pout, tier) for u in calls) + reste * pout / 1e6
+    usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in calls) + reste * pout / 1e6
+    heure = sum(map(_hour_written, totals)) - sum(map(_hour_written, calls))
+    sans_duree = sorted(((tier[1][0] if _prompt_tokens(u) <= tier[0] else pin,
+                          _num(u, "cache_creation_input_tokens") - _hour_written(u))
+                         for u in calls), reverse=True)
+    for prix, ecrits in sans_duree:
+        if heure <= 0:
+            break
+        part = min(heure, ecrits)
+        usd += part * (CACHE_WRITE_1H - CACHE_WRITE_5M) * prix / 1e6
+        heure -= part
+    return usd
 
 
 def _has_tokens(usage) -> bool:

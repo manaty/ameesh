@@ -307,11 +307,11 @@ class PalierHaikuRepriseTest(Sandbox, PgTestCase):
     """Session reprise sans repère : l'usage agrégé du `result` ne dit pas le
     palier de chaque requête (relecture codex r2, P2 `cost.py:1018`)."""
 
-    def _tour_repris(self, nom: str, *appels) -> cost.TurnUsage:
+    def _tour_repris(self, nom: str, *appels, usage: dict | None = None) -> cost.TurnUsage:
         self.events(nom, {"type": cost.TURN_MARKER, "resume": "s1", "ts": self.now},
                     {"type": "system", "subtype": "init", "session_id": "s1"}, *appels,
                     {"type": "result", "session_id": "s1", "total_cost_usd": 42.0,
-                     "usage": {"input_tokens": 120_000, "output_tokens": 2_000}})
+                     "usage": usage or {"input_tokens": 120_000, "output_tokens": 2_000}})
         return self.book().record(nom, start=1)
 
     def _alertes(self) -> list:
@@ -343,6 +343,42 @@ class PalierHaikuRepriseTest(Sandbox, PgTestCase):
         attendu = (120_000 * 0.10 + 20 * 0.50 + 1_980 * 2.50) / 1e6
         self.assertAlmostEqual(tour.usd, attendu, places=9)
         self.assertIsNone(tour.price_fallback)
+
+    def test_ecritures_1h_de_l_agregat_conservees(self):
+        # codex r3 : deux requêtes écrivent 60 000 jetons de cache sans durée,
+        # l'agrégat les déclare toutes en cache 1 h — 0,024 $, pas 0,015 $
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(
+            nom, _appel("m1", 0, 0, 0, ecrits=60_000), _appel("m2", 0, 0, 0, ecrits=60_000),
+            usage={"input_tokens": 0, "cache_creation_input_tokens": 120_000,
+                   "cache_creation": {"ephemeral_1h_input_tokens": 120_000},
+                   "output_tokens": 0})
+        self.assertAlmostEqual(tour.usd, 120_000 * 2.0 * 0.10 / 1e6, places=9)
+        self.assertIsNone(tour.price_fallback)
+
+    def test_ecritures_1h_sans_requete_au_palier_haut_d_abord(self):
+        # 60 000 écritures 1 h dans l'agrégat, aucune déclarée par requête :
+        # elles vont d'abord à la requête au palier haut (majorant)
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(
+            nom, _appel("m1", 0, 0, 0, ecrits=10_000), _appel("m2", 0, 0, 0, ecrits=110_000),
+            usage={"input_tokens": 0, "cache_creation_input_tokens": 120_000,
+                   "cache_creation": {"ephemeral_1h_input_tokens": 60_000},
+                   "output_tokens": 0})
+        attendu = (10_000 * 1.25 * 0.10 + 50_000 * 1.25 * 0.50 + 60_000 * 2.0 * 0.50) / 1e6
+        self.assertAlmostEqual(tour.usd, attendu, places=9)
+
+    def test_ecritures_1h_declarees_par_la_requete_comptees_une_fois(self):
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        appel = _appel("m2", 0, 0, 0, ecrits=110_000)
+        appel["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": 60_000}
+        tour = self._tour_repris(
+            nom, _appel("m1", 0, 0, 0, ecrits=10_000), appel,
+            usage={"input_tokens": 0, "cache_creation_input_tokens": 120_000,
+                   "cache_creation": {"ephemeral_1h_input_tokens": 60_000},
+                   "output_tokens": 0})
+        attendu = (10_000 * 1.25 * 0.10 + 50_000 * 1.25 * 0.50 + 60_000 * 2.0 * 0.50) / 1e6
+        self.assertAlmostEqual(tour.usd, attendu, places=9)
 
     def test_sans_usage_par_requete_palier_haut_marque_et_alerte(self):
         nom = self.agent("a1", "claude", "claude-haiku-5-5")
