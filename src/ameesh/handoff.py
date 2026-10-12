@@ -50,7 +50,7 @@ DEFAULT_MAX_PER_HOUR = 4
 DEFAULT_IDLE_S = 300.0
 #: lots lus par agent en pause
 LOTS_PER_AGENT = 50
-#: lignes de journal lues pour trouver la dernière attribution
+#: lignes de journal lues pour la note d'un lot sauté (une fois par pause)
 EVENTS_READ = 1000
 #: débuts de note d'une attribution (`work assign`, création, prises)
 _ASSIGN_NOTES = ("assigned to ", "assigné à ", "created and assigned to ")
@@ -63,12 +63,17 @@ def paused(row: dict) -> bool:
             and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX))
 
 
+def assign_prefixes() -> tuple:
+    """Débuts des notes d'une attribution du lot."""
+    from . import backlog
+    return _ASSIGN_NOTES + (backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE, HANDOFF_NOTE)
+
+
 def last_assigner(events: list) -> str:
     """L'acteur de la dernière attribution du lot (`events` du plus récent au
-    plus ancien) ; sans ligne d'attribution, celui de la création (la ligne la
-    plus ancienne)."""
-    from . import backlog
-    prefixes = _ASSIGN_NOTES + (backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE, HANDOFF_NOTE)
+    plus ancien, `assignment_events`) ; sans ligne d'attribution, celui de la
+    création (la ligne la plus ancienne)."""
+    prefixes = assign_prefixes()
     for event in events:
         if (event.get("note") or "").startswith(prefixes):
             return event.get("actor") or ""
@@ -138,6 +143,15 @@ def lot_git(item: dict, source: dict, *, host: str | None, worktrees: list,
         if build:
             return {"ok": False, "paths": None, "reason": "branch %s not pushed" % branch}
         return {"ok": True, "reason": "", "paths": []}
+    if build:
+        # `pushed` dit seulement que HEAD est sur UNE branche distante : le
+        # travail de la source doit être sur celle du lot, que le preneur
+        # reprend (codex r1, #409)
+        for path in dirs:
+            missing = _not_on_branch(path, branch, remote, git)
+            if missing:
+                return {"ok": False, "paths": None,
+                        "reason": "%s in %s not on origin/%s" % (missing, path, branch)}
     main = menage._default_remote_ref(repo)
     base = git(["merge-base", main, remote], repo) if main else None
     if base is None or base.returncode != 0 or not base.stdout.strip():
@@ -149,23 +163,42 @@ def lot_git(item: dict, source: dict, *, host: str | None, worktrees: list,
     return {"ok": True, "reason": "", "paths": [p for p in diff.stdout.split("\0") if p]}
 
 
+def _not_on_branch(path: str, branch: str, remote: str, git) -> str:
+    """Ce qui, dans le worktree `path`, manque à la branche distante du lot
+    (vide sinon) : sa branche locale `branch`, et HEAD quand il est sur
+    `branch`. Un autre dépôt sans cette branche n'a rien à y mettre."""
+    refs = []
+    local = git(["rev-parse", "--verify", "--quiet", "refs/heads/%s^{commit}" % branch], path)
+    if local is not None and local.returncode == 0:
+        refs.append("refs/heads/%s" % branch)
+    current = git(["symbolic-ref", "-q", "--short", "HEAD"], path)
+    if current is not None and current.returncode == 0 and current.stdout.strip() == branch:
+        refs.append("HEAD")
+    for ref in refs:
+        inside = git(["merge-base", "--is-ancestor", ref, remote], path)
+        if inside is None or inside.returncode != 0:
+            return "branch %s" % branch if ref != "HEAD" else "HEAD"
+    return ""
+
+
 def sensitive(paths: list, canons) -> str:
     """Pourquoi ce changement est sensible (vide sinon) : la classe de revue
-    de la politique du canon par défaut ; illisible, il l'est."""
+    de la politique de CHAQUE canon, pas du seul premier — un chemin sensible
+    pour l'un l'est (codex r1, #409) ; une politique illisible vaut sensible."""
     from . import review as review_mod
     if not paths:
         return ""
-    federation = getattr(canons[0], "federation", None) if canons else None
-    try:
-        policy, problems = review_mod.policy_from_federation(federation)
-        if any(severity == "error" for _code, severity, _text in problems):
-            return "review policy unreadable"
-        result = review_mod.classify(policy, paths)
-    except Exception as exc:
-        return "review class unknown (%s)" % exc
-    if result["class"] == "sensitive":
-        return "sensitive paths (%s)" % ", ".join(
-            f["path"] for f in result["files"] if f["class"] == "sensitive")[:300]
+    for federation in [getattr(c, "federation", None) for c in canons] or [None]:
+        try:
+            policy, problems = review_mod.policy_from_federation(federation)
+            if any(severity == "error" for _code, severity, _text in problems):
+                return "review policy unreadable"
+            result = review_mod.classify(policy, paths)
+        except Exception as exc:
+            return "review class unknown (%s)" % exc
+        if result["class"] == "sensitive":
+            return "sensitive paths (%s)" % ", ".join(
+                f["path"] for f in result["files"] if f["class"] == "sensitive")[:300]
     return ""
 
 
@@ -234,9 +267,15 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             return []           # rôles illisibles : on ne devine pas qui est critique
     if declared is None:
         declared = sous_utilisation.declared_orchestrators()
+    # jugé sur sa ligne du registre : elle seule porte son canon propriétaire
+    # (`canon`), sans lequel un agent critique d'un canon secondaire serait lu
+    # au canon par défaut (codex r1, #409) ; hors registre, rien n'est repris
+    agents = {row["name"]: registry.get(db, row["name"]) for row in sources}
     sources = [row for row in sources
-               if not auditor_mod.is_critical(cfg, db, row["name"], canons,
-                                              declared=declared, agent=row)]
+               if agents[row["name"]] is not None
+               and not auditor_mod.is_critical(cfg, db, row["name"], canons,
+                                               declared=declared,
+                                               agent=dict(row, **agents[row["name"]]))]
     if not sources:
         return []
     if orchestras is None:
@@ -300,8 +339,10 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 break
             if target is None:
                 continue
-            events = st.work.events(int(item["id"]), EVENTS_READ)
-            if last_assigner(events).startswith("human:"):
+            # la dernière attribution, quelle que soit la longueur du journal
+            # (codex r1, #409)
+            if last_assigner(st.work.assignment_events(
+                    int(item["id"]), assign_prefixes())).startswith("human:"):
                 continue
             if worktrees is None:
                 worktrees = st.housekeeping.worktrees(host, ("active", "kept")) if host else []
@@ -309,7 +350,8 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                               git=git)
             if not checked["ok"]:
                 if item["state"] == "build" and not dry_run and not _noted_since(
-                        events, float(source.get("status_since_ts") or 0.0)):
+                        st.work.events(int(item["id"]), EVENTS_READ),
+                        float(source.get("status_since_ts") or 0.0)):
                     st.work.note(int(item["id"]), item["state"],
                                  "%s (vers %s) : %s" % (SKIP_NOTE, target["name"],
                                                         checked["reason"]),
@@ -327,12 +369,18 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             except work.WorkError:
                 used.add(target["name"])        # non réveillable : preneur suivant
                 continue
-            row = st.work.assign(int(item["id"]), check["assignee"], current=source["name"],
-                                 note=handoff_note(item, source["name"], check["assignee"],
-                                                   reason),
-                                 actor=backlog.SENDER, states=STATES)
+            # tout relu sous verrou à l'écriture (codex r1, #409) : l'état
+            # contrôlé ci-dessus (pas un autre des STATES), la source encore en
+            # pause, le preneur encore sans lot, le plafond horaire
+            row = st.work.handoff(int(item["id"]), check["assignee"], current=source["name"],
+                                  state=item["state"], paused_prefix=budget_mod.PAUSE_PREFIX,
+                                  note_prefix=HANDOFF_NOTE, window_s=backlog.TAKE_WINDOW_S,
+                                  max_per_window=max_per_hour,
+                                  note=handoff_note(item, source["name"], check["assignee"],
+                                                    reason),
+                                  actor=backlog.SENDER)
             if row is None:
-                continue                        # lot changé entre-temps
+                continue                        # changé entre-temps
             payload = {"budget_handoff": {"lot": int(row["id"]), "from": source["name"],
                                           "to": check["assignee"]}}
             message_id = mail.send(db, backlog.SENDER, check["assignee"],

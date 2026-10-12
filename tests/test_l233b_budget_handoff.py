@@ -78,6 +78,31 @@ class LotGitTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("commits not pushed", out["reason"])
 
+    def test_pousse_ailleurs_que_sur_la_branche_du_lot(self):
+        # codex r1 (#409) : HEAD poussé sur une autre branche distante, celle
+        # du lot plus ancienne : le preneur repartirait d'une pointe périmée
+        self.write("src/b.py", "b = 1\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "local")
+        _git(self.repo, "push", "-q", "origin", "HEAD:backup")
+        _git(self.repo, "fetch", "-q", "origin")
+        out = self.check()
+        self.assertFalse(out["ok"])
+        self.assertIn("not on origin/lot/7", out["reason"])
+        # poussé sur la branche du lot : repris
+        _git(self.repo, "push", "-q", "origin", "lot/7")
+        self.assertTrue(self.check()["ok"])
+        # la branche locale du lot compte aussi quand HEAD est ailleurs
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "branch", "-f", "lot/7", "HEAD@{1}")
+        _git(self.repo, "checkout", "-q", "-b", "autre")
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "x")
+        _git(self.repo, "branch", "-f", "lot/7", "autre")
+        _git(self.repo, "push", "-q", "origin", "autre")
+        _git(self.repo, "fetch", "-q", "origin")
+        out = self.check()
+        self.assertIn("branch lot/7 in %s not on origin/lot/7" % self.repo, out["reason"])
+
     def test_branche_non_poussee_ou_absente(self):
         out = self.check(branch="lot/8")
         self.assertEqual((out["ok"], out["reason"]), (False, "branch lot/8 not pushed"))
@@ -118,6 +143,16 @@ class LotGitTest(unittest.TestCase):
         bad = types.SimpleNamespace(federation={"review_policies": {"risk_classes": {
             "default": "énorme"}}})
         self.assertEqual(handoff.sensitive(["src/a.py"], [bad]), "review policy unreadable")
+
+    def test_classe_de_revue_de_chaque_canon(self):
+        # codex r1 (#409) : un chemin sensible pour un canon secondaire l'est
+        def canon(rules):
+            return types.SimpleNamespace(federation={"review_policies": {"risk_classes": {
+                "default": "normal", "rules": rules}}})
+        principal = canon([])
+        secondaire = canon([{"paths": ["secrets/**"], "class": "sensitive"}])
+        self.assertEqual(handoff.sensitive(["secrets/k"], [principal]), "")
+        self.assertIn("secrets/k", handoff.sensitive(["secrets/k"], [principal, secondaire]))
 
 
 class _Handoff(_Base):
@@ -222,6 +257,33 @@ class HandoffTest(_Handoff):
                         ("claude1",))
         self.assertEqual(self.hand(), [])
         self.assertEqual(self.assignee(intake), "claude1")
+
+    def test_agent_critique_d_un_canon_secondaire(self):
+        # codex r1 (#409) : le canon propriétaire est lu au registre, pas dans
+        # la ligne du listing (sans `canon`, donc jugée au canon par défaut)
+        def canon(name, default, cards):
+            return types.SimpleNamespace(
+                readable=True, is_default=default, scope_unread=False, load_findings=[],
+                federation={}, agents=[types.SimpleNamespace(
+                    title=agent, fiche=types.SimpleNamespace(data={"roles": roles},
+                                                             path="", ref=""))
+                    for agent, roles in cards.items()],
+                owns=lambda c, name=name, default=default: (c or None) == name
+                or (default and not c),
+                agent=lambda n, cards=cards: None)
+        principal = canon("A", True, {})
+        secondaire = canon("B", False, {"claude1": ["design"]})
+        secondaire.agent = lambda n: next((a for a in secondaire.agents if a.title == n),
+                                          None)
+        self.team()
+        self.db.execute("UPDATE agent_registry SET canon = 'B' WHERE name = 'claude1'")
+        intake = self.lot("export")
+        self.assertEqual(self.hand(canons=[principal, secondaire]), [])
+        self.assertEqual(self.assignee(intake), "claude1")
+        # la même fiche dans un canon qui ne le possède pas ne compte pas
+        self.db.execute("UPDATE agent_registry SET canon = NULL WHERE name = 'claude1'")
+        out = self.hand(canons=[principal, secondaire])
+        self.assertEqual([m["item"]["id"] for m in out], [intake["id"]])
 
     def test_seulement_un_agent_claude_vers_un_agent_deepseek(self):
         self.agent("codex1", "codex", team="nexlink")
@@ -331,20 +393,74 @@ class HandoffTest(_Handoff):
         self.assertEqual(self.hand(max_per_hour=1), [])
         self.assertEqual(self.hand(max_per_hour=0), [])
 
+    def take(self, lot, *, current="claude1", state="intake", assignee="deepseek1",
+             max_per_window=4):
+        return storage.of(self.db).work.handoff(
+            lot["id"], assignee, current=current, state=state,
+            paused_prefix=budget.PAUSE_PREFIX, note_prefix=handoff.HANDOFF_NOTE,
+            window_s=3600, max_per_window=max_per_window,
+            note=handoff.HANDOFF_NOTE + " x", actor="ameesh")
+
     def test_lot_change_entre_temps(self):
+        # codex r1 (#409) : tout est relu à l'écriture, sous verrou
         self.team()
         lot = self.lot("export")
-        st = storage.of(self.db).work
-        # la réattribution exige encore l'assigné et l'état lus
-        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot["id"],))
-        self.assertIsNone(st.assign(lot["id"], "deepseek1", current="claude1", note="x",
-                                    actor="ameesh", states=handoff.STATES))
-        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s", (lot["id"],))
-        self.assertIsNone(st.assign(lot["id"], "deepseek1", current="dev9", note="x",
-                                    actor="ameesh", states=handoff.STATES))
-        row = st.assign(lot["id"], "deepseek1", current="claude1", note="x", actor="ameesh",
-                        states=handoff.STATES)
-        self.assertEqual(row["assignee"], "deepseek1")
+        self.assertIsNone(self.take(lot, state="build"))      # pas l'état contrôlé
+        self.assertIsNone(self.take(lot, current="dev9"))      # plus son assigné
+        self.assertIsNone(self.take(lot, max_per_window=0))    # plafond atteint
+        autre = self.lot("autre", assignee="deepseek1")
+        self.assertIsNone(self.take(lot))                      # preneur plus libre
+        self.db.execute("UPDATE work_items SET assignee = NULL WHERE id = %s",
+                        (autre["id"],))
+        self.db.execute("UPDATE agent_registry SET status = 'idle' WHERE name = 'claude1'")
+        self.assertIsNone(self.take(lot))                      # source sortie de pause
+        self.pause("claude1")
+        self.assertEqual(self.take(lot)["assignee"], "deepseek1")
+        self.assertIsNone(self.take(lot, current="deepseek1", assignee="deepseek2",
+                                    max_per_window=1))         # la reprise compte
+
+    def test_sortie_de_pause_pendant_le_controle(self):
+        # codex r1 (#409) : la source reprend pendant le contrôle git
+        self.team()
+        lot = self.lot("export")
+
+        def resumed(*args, **kwargs):
+            self.db.execute("UPDATE agent_registry SET status = 'idle', status_text = ''"
+                            " WHERE name = 'claude1'")
+            return GIT_OK
+
+        with mock.patch.object(handoff, "lot_git", side_effect=resumed):
+            self.assertEqual(self.hand(), [])
+        self.assertEqual(self.assignee(lot), "claude1")
+        self.assertEqual(self.mails(), [])
+
+    def test_attribution_humaine_au_dela_du_journal_lu(self):
+        # codex r1 (#409) : plus de EVENTS_READ notes après l'attribution humaine
+        self.team()
+        lot = self.lot("choisi", actor="human:proprio")
+        self.db.execute("INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                        " SELECT %s, 'intake', 'avancement ' || n, 'dev' || n"
+                        "   FROM generate_series(1, %s) n",
+                        (lot["id"], handoff.EVENTS_READ + 5))
+        self.assertEqual(self.hand(), [])
+        self.assertEqual(self.assignee(lot), "claude1")
+
+    def test_etat_valide_seulement(self):
+        # codex r1 (#409) : la réattribution exige l'état contrôlé, pas l'un
+        # des STATES : un lot passé d'intake à build entre-temps n'a pas eu
+        # son contrôle git
+        self.team()
+        lot = self.lot("export")
+
+        def build_meanwhile(*args, **kwargs):
+            self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
+                            (lot["id"],))
+            return GIT_OK
+
+        with mock.patch.object(handoff, "lot_git", side_effect=build_meanwhile):
+            self.assertEqual(self.hand(), [])
+        self.assertEqual(self.assignee(lot), "claude1")
+        self.assertEqual(self.mails(), [])
 
     def test_passage_de_notify(self):
         self.team()

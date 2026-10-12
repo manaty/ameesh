@@ -59,6 +59,9 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: L233b : une reprise sur pause budget à la fois pour tout le mesh
+_HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
+                 "hashtextextended(current_schema() || ':budget_handoff', 0))")
 
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
@@ -252,33 +255,57 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, note, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor,
-               states=None) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
-        en cours est effacée (issue `annulee` au registre). `states` (L233b) :
-        le lot doit encore être dans l'un de ces états."""
-        wanted = None if states is None else json.dumps(list(states))
+        en cours est effacée (issue `annulee` au registre)."""
         with self.db.transaction() as tx:
-            rows = tx.query(
-                "UPDATE work_items SET assignee = %%s, updated_at = now(),"
-                "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-                " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
-                "   AND state NOT IN ('merged', 'promoted', 'closed')"
-                "   AND (%%s::jsonb IS NULL"
-                "        OR state IN (SELECT jsonb_array_elements_text(%%s::jsonb)))"
-                " RETURNING %s" % ITEM_COLUMNS,
-                (assignee, int(item_id), current, wanted, wanted))
-            if not rows:
+            return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+
+    def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
+        """`assign` dans la transaction ouverte ; `state` : celui exigé."""
+        rows = self.db.query(
+            "UPDATE work_items SET assignee = %%s, updated_at = now(),"
+            "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+            " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
+            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+            "   AND (%%s::text IS NULL OR state = %%s)"
+            " RETURNING %s" % ITEM_COLUMNS,
+            (assignee, int(item_id), current, state, state))
+        if not rows:
+            return None
+        self.db.query(
+            "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
+            "       resolved_by = %s"
+            " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
+            (actor or "", int(item_id)))
+        self._event(int(item_id), rows[0]["state"], note, actor)
+        return rows[0]
+
+    def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
+                window_s, max_per_window, note, actor) -> dict | None:
+        """L233b : toutes les conditions relues sous le verrou, dans la
+        transaction qui écrit (codex r1, #409) : deux `notify` sur deux hôtes
+        ne dépassent ni le plafond ni ne donnent deux lots au même preneur ;
+        un agent sorti de pause entre le contrôle git et l'écriture garde son
+        lot (sa ligne reste verrouillée jusqu'au commit)."""
+        with self.db.transaction() as tx:
+            tx.query(_HANDOFF_LOCK)
+            taken = tx.query(
+                "SELECT count(*)::bigint AS n FROM work_item_events"
+                " WHERE created_at > now() - make_interval(secs => %s)"
+                "   AND starts_with(note, %s)", (float(window_s), note_prefix))
+            if int(taken[0]["n"]) >= int(max_per_window):
                 return None
-            tx.query(
-                "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
-                "       resolved_by = %s"
-                " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
-                (actor or "", int(item_id)))
-            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
-            return rows[0]
+            if tx.query("SELECT 1 FROM work_items WHERE assignee = %%s"
+                        "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
+                return None
+            if not tx.query("SELECT 1 FROM agent_registry WHERE name = %s"
+                            "   AND status = 'blocked' AND starts_with(status_text, %s)"
+                            " FOR SHARE", (current, paused_prefix)):
+                return None
+            return WorkItems(tx)._reassign(item_id, assignee, current, state, note, actor)
 
     # -- délégation à échéance (L40, 0030 point 5) ---------------------------
     def delegate(self, item_id, delegate, *, current, delegated_by, within_s, note,
@@ -910,6 +937,27 @@ class WorkItems(interface.WorkItems):
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
             " LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+
+    def assignment_events(self, item_id, prefixes) -> list[dict]:
+        return self.db.query(
+            """
+            (SELECT id, work_item_id, state, note, actor,
+                    extract(epoch from created_at)::float8 as created_ts
+               FROM work_item_events e
+              WHERE work_item_id = %s
+                AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(%s::jsonb) p
+                             WHERE starts_with(e.note, p))
+              ORDER BY id DESC LIMIT 1)
+            UNION ALL
+            (SELECT id, work_item_id, state, note, actor,
+                    extract(epoch from created_at)::float8 as created_ts
+               FROM work_item_events
+              WHERE work_item_id = %s
+              ORDER BY id LIMIT 1)
+            ORDER BY id DESC
+            """,
+            (int(item_id), json.dumps(list(prefixes)), int(item_id)),
+        )
 
     def handoff_lots(self, assignee, limit) -> list[dict]:
         return self.db.query(
