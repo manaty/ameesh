@@ -700,8 +700,9 @@ class OnceTurnTest(PgTestCase):
             # r4 P1: while the lease is being returned (a slow base), a tick
             # of the controller must still see it held
             runner.host_gate.tick()
-            release(worker)
+            done = release(worker)
             self.events.append(("released", runner.gate_foreground is worker))
+            return done
 
         with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
                 mock.patch.object(runner_mod.AgentWorker, "release_lease", slow_release):
@@ -709,6 +710,48 @@ class OnceTurnTest(PgTestCase):
         self.assertEqual(self.events, [("tick", True), ("turn", True), ("tick", True),
                                        ("released", True), ("tick", False)])
         self.assertTrue(runner.did_turn)
+
+    def test_a_lease_the_base_did_not_take_back_stays_counted(self):
+        # L159f4: release_lease failed (DbError): the lease stays held until
+        # it expires, so the part never says the host free before
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        calls = []
+
+        def flaky_release(worker):
+            calls.append(runner.gate_foreground is worker)
+            return len(calls) >= 3  # the base answers at the third try
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", return_value=True), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease", flaky_release):
+            runner.sweep()
+        self.assertEqual(calls, [True, True, True])
+        ticks = [held for kind, held in self.events if kind == "tick"]
+        self.assertTrue(all(ticks[:-1]), self.events)  # held while not returned
+        self.assertEqual(ticks[-1], False)
+
+    def test_a_lease_never_taken_back_is_held_until_it_expires(self):
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        expiry = {}
+
+        def turn(worker, _wait):
+            worker.lease_deadline = time.time() + 0.3
+            expiry["at"] = worker.lease_deadline
+            return True
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease",
+                                  return_value=False):
+            runner.sweep()
+            freed = time.time()
+        self.assertGreaterEqual(freed, expiry["at"])
+        self.assertEqual(self.events[-1], ("tick", False))
+        self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
 
     def test_a_gate_closed_before_the_turn_runs_none(self):
         from unittest import mock

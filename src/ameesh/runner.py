@@ -610,14 +610,19 @@ class AgentWorker(threading.Thread):
         self.lease_deadline = float(expires)
         return True
 
-    def release_lease(self) -> None:
+    def release_lease(self) -> bool:
+        """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
+        bail reste tenu jusqu'à son échéance (`lease_deadline`, plus
+        renouvelé). Perdu ou déjà repris par un autre : True, il n'est plus
+        à nous."""
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         if self.lease_lost.is_set():
-            return
+            return True
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
-            pass
+            return False
+        return True
 
     #: délai laissé au harnais entre SIGTERM et SIGKILL
     TERMINATE_GRACE = 3.0
@@ -4161,8 +4166,12 @@ class Runner:
                             ran = worker.process_once(self.wait)
                     finally:
                         try:
-                            worker.release_lease()
+                            released = worker.release_lease()
                             self._release_slot(agent["name"])
+                            if not released and gate is not None:
+                                # L159f4 : la part dit le bail tenu tant
+                                # qu'il l'est (nouvel essai, ou échéance)
+                                self._await_release(worker, gate)
                         finally:
                             # r4 : compté jusqu'à la libération faite, sinon
                             # le contrôleur dirait l'hôte vidé, bail tenu
@@ -4179,6 +4188,26 @@ class Runner:
                 if not registered:
                     self._release_slot(agent["name"])
                 raise
+
+    #: `--once` : intervalle des nouveaux essais d'un bail non rendu
+    RELEASE_RETRY_S = 5.0
+
+    def _await_release(self, worker, gate) -> None:
+        """`--once`, la base n'a pas pris le retour du bail : le worker reste
+        compté (`gate_foreground`) et la part le dit tenu, jusqu'à un retour
+        réussi ou l'échéance du bail (il n'est plus renouvelé) ; jamais
+        « vidé » bail tenu (L159f4). Un arrêt de l'exécuteur coupe l'attente :
+        sa part disparaît avec lui."""
+        until = worker.lease_deadline if worker.lease_deadline > 0 \
+            else time.time() + self.lease_ttl
+        log_async("[%s] lease not returned (base): counted as held until it is, "
+                  "or until it expires (%ds)" % (worker.name, max(0, until - time.time())))
+        while time.time() < until:
+            gate.tick()
+            if self.stop.wait(min(self.RELEASE_RETRY_S, max(0.0, until - time.time()))):
+                return
+            if worker.release_lease():
+                return
 
     def budget_limits(self, db) -> "budget_mod.Limits":
         """Les plafonds en vigueur (L70) : base (cache court) > config > défaut."""
