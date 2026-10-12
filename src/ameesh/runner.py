@@ -2722,8 +2722,15 @@ class AgentWorker(threading.Thread):
         d'échec rapide. Sain de nouveau : blocage levé, le tour part."""
         # Provider credentials and their health belong to the relay server.
         # The device has no account health authority or credential to inspect.
-        if self.runner.mediated or self.runner.dry_run:
+        if self.runner.dry_run:
             return True
+        if self.runner.mediated:
+            from . import relay
+            harness = self.turn_harness()
+            if self._relay_credential_ready():
+                return self._auth_release()
+            self._auth_block(harness, relay.CREDENTIAL_ACCOUNT, "relay server credential failing")
+            return False
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
             return True  # `account_turn.apply` refusera le tour, avec sa raison
@@ -2807,6 +2814,39 @@ class AgentWorker(threading.Thread):
         log_async("[%s] %s lifted: healthy account — resuming" % (self.name, texte))
         self._fil_note("Block %s lifted: a healthy account is available again, "
                        "the agent resumes." % texte, meta={"action": "auth_reprise"})
+        return True
+
+    def _relay_credential_ready(self) -> bool:
+        from . import relay
+        harness = self.turn_harness()
+        if harness not in relay.HARNESS_ENV:
+            return True
+        base = relay.relay_url({"AMEESH_RELAY_URL": os.environ.get("AMEESH_RELAY_URL", ""),
+                                "AMEESH_EXEC_URL": self.db.url or self.cfg.exec_url})
+        token = self.runner.session_token_for(self.name, self.runner.runner_id, self.epoch)
+        return relay.credential_ready(base, token, harness)
+
+    def _end_relay_auth_failure(self, cost) -> bool:
+        """Server-authenticated relay failure: retain the prompt, no fast retry.
+
+        The caller has already restored the prompt. A device never writes
+        credential health; it only uses the relay's verdict to mark its agent.
+        """
+        if not self.runner.mediated or self._avec_reprise(
+                "relay credential status", self._relay_credential_ready):
+            return False
+        from . import relay
+        self._auth_block(self.turn_harness(), relay.CREDENTIAL_ACCOUNT, "relay server credential failing")
+        self.fast_failure = False
+        if self._session_en_attente is not None:
+            self._avec_reprise("turn session", self._enregistre_session)
+        self._avec_reprise(
+            "end of turn", registry.end_turn,
+            self.db, self.name, self.runner.runner_id, self.epoch,
+            status="blocked", status_text=self._auth_status,
+            error="%s relay server credential failing" % auth_failure.STATUS_PREFIX,
+            cost_usd=cost)
+        self.last_activity = time.monotonic()
         return True
 
     def pick(self) -> dict | None:
@@ -3923,8 +3963,9 @@ class AgentWorker(threading.Thread):
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
-            # A relay failure cannot report global provider credential health
-            # or create a local credential block on a mediated device.
+            if self._end_relay_auth_failure(cost):
+                return False
+            # Only the server may report provider credential health.
             raison_auth = None if self.runner.mediated else auth_failure.classify(
                 error, self.last_final, auth_failure.stderr_tail(stderr_path, start=stderr_debut))
             if raison_auth:

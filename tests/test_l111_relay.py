@@ -38,6 +38,8 @@ class FakeProvider:
                                            "output_tokens": 0}
         self.usage_end = usage_end or {"output_tokens": 300}
         self.cut_after = cut_after
+        self.error_status = 0
+        self.error_type = "authentication_error"
         provider = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -49,6 +51,15 @@ class FakeProvider:
                 provider.requests.append({"path": self.path, "headers": dict(self.headers),
                                           "body": json.loads(body)})
                 req = provider.requests[-1]["body"]
+                if provider.error_status:
+                    payload = json.dumps({"error": {"type": provider.error_type,
+                                                    "message": "provider refused"}}).encode()
+                    self.send_response(provider.error_status)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 events = [
                     ("message_start", {"type": "message_start", "message": {
                         "id": "msg_1", "type": "message", "role": "assistant",
@@ -108,7 +119,7 @@ class RelaisTest(PgTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        for table in ("turn_costs", "budget_limits", "budget_events"):
+        for table in ("turn_costs", "budget_limits", "budget_events", "credential_health"):
             self.db.execute("DELETE FROM %s" % table)
         self.provider = FakeProvider()
         self.addCleanup(self.provider.close)
@@ -222,6 +233,26 @@ class RelaisTest(PgTestCase):
         self.assertGreaterEqual(row["output_tokens"], 5)
 
     # -- refus ----------------------------------------------------------------
+    def test_server_auth_failure_is_persisted_blocks_other_devices_and_recovers(self):
+        self.provider.error_status = 401
+        response, data = self.post(self.body())
+        self.assertEqual(response.status, 503)
+        self.assertEqual(json.loads(data)["error"]["type"], relay.AUTH_BLOCKED)
+        row = storage_of(self.db).credentials.health(self.relay.cfg.host, "deepseek")["relay"]
+        self.assertEqual((row["state"], row["source"], int(row["failures"])), ("failing", "relay", 1))
+        self.assertNotEqual(self.relay.cfg.host, identity().host)
+        self.assertEqual(storage_of(self.db).credentials.health(identity().host, "deepseek"), {})
+        self.provider.error_status = 0
+        self.assertEqual(self.post(self.body(), token="jeton-a2")[0].status, 503)
+        self.assertEqual(len(self.provider.requests), 1)
+        payload = {"is_available": True, "balance_infos": [
+            {"currency": "USD", "total_balance": "10.00"}]}
+        relay.probe_credentials(self.relay.cfg, self.db,
+                                environ={"DEEPSEEK_API_KEY": "rotated-server-key"},
+                                transport=lambda *args: (payload, ""))
+        self.relay.secrets.environ["DEEPSEEK_API_KEY"] = "rotated-server-key"
+        self.assertEqual(self.post(self.body())[0].status, 200)
+
     def test_modele_non_admis_refuse_sans_appel_au_fournisseur(self):
         response, data = self.post(self.body(model="deepseek-v4-pro"))
         self.assertEqual(response.status, 403)

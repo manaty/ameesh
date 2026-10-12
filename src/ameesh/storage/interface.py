@@ -669,7 +669,7 @@ class Credentials(Domain):
                fingerprint: str | None = None,
                expect_failures: int | None = None) -> dict:
         """Records `state` (healthy | failing | unknown) from `source`
-        (sentinel | turn | manual); `failing_since` is kept while failing and
+        (sentinel | turn | manual | relay); `failing_since` is kept while failing and
         cleared otherwise; `expires_at` (epoch, None = unknown) is the
         credential's forecast expiry, overwritten on each report. A `failing`
         report stamps `last_failure_at`, stores `fingerprint` (of the
