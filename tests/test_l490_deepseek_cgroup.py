@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -56,27 +57,43 @@ class PreloadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
-    def test_probe_is_denied_before_execution_and_esm_bindings_are_updated(self):
-        code = """
+    def test_only_provider_bindings_deny_probe_and_other_modules_keep_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "systemd-run"
+            binary.write_text('#!/bin/sh\nprintf "foreign-ok\\n"\n')
+            binary.chmod(0o755)
+            code = """
 import {createRequire} from 'node:module';
-import {spawnSync, spawn} from 'node:child_process';
+import {spawnSync as foreignSync} from 'node:child_process';
 import assert from 'node:assert/strict';
 const require=createRequire(import.meta.url);
 const policy=require(PRELOAD);
-policy.installPolicy();
-const probe=['--user','--scope','--unit=dsh-subprocess-probe-42-abcdef','--','sh','-c','exit 0'];
-const denied=spawnSync('/does/not/exist/systemd-run',probe);
+const bindings=policy.scopedBindings();
+const {writeFileSync}=await import('node:fs');
+const {pathToFileURL}=await import('node:url');
+const filename=FILE;
+writeFileSync(filename, bindings + '\\nexport {spawn, spawnSync};');
+const provider=await import(pathToFileURL(filename));
+const probe=['--user','--scope','--unit=dsh-subprocess-probe-42-abcdef','--','true'];
+const denied=provider.spawnSync('systemd-run',probe);
 assert.equal(denied.error.code,'ENOTSUP');
 assert.equal(denied.pid,0);
 assert.equal(denied.status,null);
-assert.throws(()=>spawn('systemd-run',['--user','--scope','--unit=dsh-subprocess-42-abcdef','--','true']), /requires review/);
-const ordinary=spawnSync(process.execPath,['-e','console.log("ordinary")'],{encoding:'utf8'});
+assert.throws(()=>provider.spawn('systemd-run',['--user','--scope','--unit=dsh-subprocess-42-abcdef','--','true']), /requires review/);
+for (const command of ['systemd-run',CUSTOM]) {
+  const foreign=foreignSync(command,probe,{encoding:'utf8'});
+  assert.equal(foreign.status,0);
+  assert.equal(foreign.stdout.trim(),'foreign-ok');
+}
+const custom=provider.spawnSync(CUSTOM,probe,{encoding:'utf8'});
+assert.equal(custom.status,0);
+const ordinary=provider.spawnSync(process.execPath,['-e','console.log("ordinary")'],{encoding:'utf8'});
 assert.equal(ordinary.status,0);
 assert.equal(ordinary.stdout.trim(),'ordinary');
-assert.equal(policy.isDshScope('systemd-run',['--user','--scope','--unit=other-42-abcdef']),false);
-assert.equal(policy.isDshScope('systemd-run',['--scope','--unit=dsh-subprocess-42-abcdef']),false);
 """.replace("PRELOAD", json.dumps(str(deepseek_cgroup.PRELOAD)))
-        self.run_node(code)
+            code = code.replace("FILE", json.dumps(str(Path(tmp) / "scoped.mjs")))
+            code = code.replace("CUSTOM", json.dumps(str(binary)))
+            self.run_node(code, dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"]))
 
     def test_unreviewed_provider_and_missing_module_are_loud_before_command(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,6 +115,34 @@ assert.equal(policy.isDshScope('systemd-run',['--scope','--unit=dsh-subprocess-4
                 self.assertEqual(result.returncode, 127, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
+
+    def test_profile_source_and_esm_exports_are_verified_without_vendor_dependency(self):
+        for absolute, conditional in ((False, False), (True, False), (False, True)):
+            with self.subTest(absolute=absolute, conditional=conditional), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                profile = root / "profile"
+                provider = profile / "node_modules/@deepseek-ai/dsh-subprocess-local"
+                provider.mkdir(parents=True)
+                # Keep main distinct and intact; the ESM export selects other bytes.
+                (provider / "main.js").write_text('// unchanged declared main\n')
+                source = 'console.log("UNREVIEWED PROFILE COMMAND RAN");\n'
+                actual = provider / "actual.js"
+                actual.write_text(source)
+                exports = {"import": "./actual.js", "require": "./main.js"} if conditional else "./actual.js"
+                (provider / "package.json").write_text(json.dumps({
+                    "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.1.5-rc.2",
+                    "type": "module", "main": "main.js", "exports": {".": exports}}))
+                importer = profile / "entry.mjs"
+                target = actual.as_uri() if absolute else "@deepseek-ai/dsh-subprocess-local"
+                importer.write_text("import " + json.dumps(target) + ";\n")
+                code = ("const policy=require(" + json.dumps(str(deepseek_cgroup.PRELOAD)) + ");"
+                        "policy.installLoader(); import(" + json.dumps(importer.as_uri()) + ");")
+                result = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 127, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
+                self.assertIn(str(provider / "package.json"), result.stderr)
+                self.assertIn(hashlib.sha256(source.encode()).hexdigest(), result.stderr)
 
     def test_preload_path_with_spaces_and_quotes_still_activates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,14 +193,30 @@ class PlacementCheckTest(unittest.TestCase):
 
 @unittest.skipUnless(NODE and PROVIDER and os.name == "posix", "optional installed dsh provider")
 class RealProviderTest(unittest.TestCase):
-    def invoke(self, mode, preload):
+    def invoke(self, mode, preload, profile=None, success=True):
         with tempfile.TemporaryDirectory(prefix="l490-") as tmp:
             root = Path(tmp)
             (root / "package.json").write_text('{"name":"@deepseek-ai/dsh"}')
-            scope = root / "node_modules/@deepseek-ai"
-            scope.mkdir(parents=True)
-            (scope / "dsh-subprocess-local").symlink_to(Path(PROVIDER).resolve())
-            entry = root / "entry.mjs"
+            (root / "node_modules").symlink_to(Path(PROVIDER).resolve().parent.parent)
+            entry_root = root
+            if profile:
+                entry_root = root / "profile"
+                provider = entry_root / "node_modules/@deepseek-ai/dsh-subprocess-local"
+                shutil.copytree(PROVIDER, provider)
+                manifest = provider / "package.json"
+                pkg = json.loads(manifest.read_text())
+                if profile == "version":
+                    pkg["version"] = "unexpected"
+                elif profile == "source":
+                    (provider / "lib/index.js").write_text('console.log("UNREVIEWED RAN");')
+                elif profile in ("exports", "import-condition"):
+                    (provider / "lib/alternate.js").write_text('console.log("UNREVIEWED RAN");')
+                    pkg["exports"]["."] = ({"import": "./lib/alternate.js",
+                        "require": "./lib/index.js", "default": "./lib/index.js"}
+                        if profile == "import-condition" else {"default": "./lib/alternate.js"})
+                manifest.write_text(json.dumps(pkg))
+            entry = entry_root / "entry.mjs"
+            (entry_root / "provider.yml").write_text("- name: '@deepseek-ai/dsh-subprocess-local'\n")
             shutil.copy(Path(__file__).with_name("l490_provider.mjs"), entry)
             env = os.environ.copy()
             env.pop("NODE_OPTIONS", None)
@@ -163,21 +224,43 @@ class RealProviderTest(unittest.TestCase):
                 env["NODE_OPTIONS"] = deepseek_cgroup.node_options("--max-old-space-size=256")
             result = subprocess.run([NODE, str(entry), PROVIDER, mode], env=env,
                                     capture_output=True, text=True, timeout=20)
+            if not success:
+                self.assertEqual(result.returncode, 127, result.stderr)
+                self.assertNotIn("UNREVIEWED RAN", result.stdout)
+                self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
+                return result
             self.assertEqual(result.returncode, 0, result.stderr)
-            return json.loads(result.stdout), result.stderr
+            self.assertTrue(result.stdout.strip(), "provider returned no report: " + result.stderr)
+            return json.loads(result.stdout.splitlines()[-1]), result.stderr
+
+    def test_actual_dsh_loader_checks_profile_override_and_keeps_cgroup(self):
+        fixed, _ = self.invoke("boot-ordinary", True, "reviewed")
+        self.assertEqual(fixed["groups"], [fixed["parent"]] * 4)
+        self.invoke("boot-ordinary", True, "import-condition", success=False)
+
+    def test_profile_provider_and_changed_exports_are_checked_before_execution(self):
+        for kind in ("version", "source", "exports", "import-condition"):
+            with self.subTest(kind=kind):
+                self.invoke("ordinary", True, kind, success=False)
+
+    def test_reviewed_profile_provider_keeps_cgroup(self):
+        fixed, _ = self.invoke("ordinary", True, "reviewed")
+        self.assertEqual(fixed["groups"], [fixed["parent"]] * 4)
 
     def test_without_preload_scope_with_preload_inherited_including_setsid(self):
         baseline, _ = self.invoke("ordinary", False)
         fixed, stderr = self.invoke("ordinary", True)
         self.assertIn("/dsh-subprocess-", baseline["groups"][0])
         self.assertNotEqual(baseline["parent"], baseline["groups"][0])
-        self.assertEqual(fixed["groups"], [fixed["parent"]] * 3)
+        self.assertEqual(fixed["groups"], [fixed["parent"]] * 4)
         self.assertIn("weaker process-tree containment", stderr)
         self.assertEqual(fixed["nodeOptions"], "--max-old-space-size=256")
+        self.assertEqual(fixed["childNodeOptions"], "--max-old-space-size=256")
 
     def test_pty_keeps_cgroup_and_terminates(self):
         fixed, _ = self.invoke("terminal", True)
-        self.assertEqual(fixed["groups"], [fixed["parent"]] * 3)
+        self.assertEqual(fixed["groups"], [fixed["parent"]] * 4)
+        self.assertEqual(fixed["childNodeOptions"], "--max-old-space-size=256")
 
     def test_normal_managed_process_termination_still_works(self):
         fixed, _ = self.invoke("terminate", True)

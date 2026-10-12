@@ -13,24 +13,43 @@ On Linux, the DeepSeek adapter adds the packaged `deepseek_cgroup.cjs` preload
 to `NODE_OPTIONS`, preserving existing options. This covers headless and attach
 launches; the resident ACP driver also uses the adapter environment.
 
-Before dsh starts, the preload resolves its actual installed provider and
-checks its version and the SHA-256 of `lib/index.js`. The reviewed module is:
+The preload uses Node's synchronous module hooks (**Node >=22.15**). An early
+availability check resolves the CLI provider through Node's `exports` rules.
+Independently, every actual provider module load is checked before evaluation,
+including **profile-local `node_modules` overrides**, absolute URLs used by
+the dsh loader, and ESM `import` conditions differing from `require`.
+The checked bytes are the source returned by Node's load chain, not `pkg.main`.
+The reviewed provider entry is:
 
 ```
 @deepseek-ai/dsh-subprocess-local 0.1.5-rc.2
 a3f85e92ce5eddc824348f83cf685d3e417a26c5f1ab602a81fe1bd13315fe2c
 ```
 
-The preload refuses only dsh's native scope probe, before any user command
-has run. The provider selects its existing process-group/PTY fallback;
-ordinary commands, their children, and `setsid` descendants inherit the
-caller's cgroup. Named ESM `child_process` bindings are updated too. An
-unexpected ordinary native scope launch is refused before execution. Other
-subprocesses, `systemd-run` invocations, the user bus and installed npm files
-are unaffected. The preload removes its own option before tool children start.
+The entry's imported helper modules are pinned too:
 
-A missing, changed or unreviewed provider logs a warning and exits 127 with
-no stdout/session. The headless runner classifies this as `host_not_ready`,
+```
+runner-launch-COYGu0Dl.js 674f0acce6cf7969a5cc9a5c188c7a8d76ff766434634b908d9a4b8a659b1c1a
+runner.js                16719698906a0508aa7163e8a200dd5eb023ba59fe64f451a2b570936e44d47b
+```
+
+For the verified entry only, the loader replaces its `child_process` import
+with module-local bindings refusing dsh's native scope probe before any user
+command runs. It changes the module source **in memory**, leaving installed
+files untouched and Node's global/CommonJS/ESM bindings intact. The provider
+selects its existing process-group/PTY fallback;
+ordinary commands, their children, and `setsid` descendants inherit the
+caller's cgroup. An unexpected ordinary native scope launch is refused before
+execution. Other
+subprocesses, `systemd-run` invocations, the user bus and installed npm files
+are unaffected, even with an executable named `systemd-run` and identical
+arguments. The preload removes its own option before tool children start,
+preserving other Node options in ordinary and PTY Node tool processes.
+
+A missing, changed or unreviewed provider, unavailable source or unsupported
+Node module-hook API logs a warning and exits 127 before provider execution.
+During normal startup this precedes any stdout/session, so the headless runner
+classifies it as `host_not_ready`,
 preserves the instruction and emits its existing operational alert. Review a
 provider upgrade and its regression results before changing the pin. There is
 no silent fallback to an unreviewed native scope path. A resident driver reports
@@ -84,10 +103,14 @@ DSH_TEST_SUBPROCESS_LOCAL=/path/to/node_modules/@deepseek-ai/dsh-subprocess-loca
   PYTHONPATH=src:tests python -m unittest tests.test_l490_deepseek_cgroup -v
 ```
 
-It proves the native-scope baseline, inherited cgroups for ordinary children
-and `setsid`, PTY placement, and normal termination. Standard CI runs the
-policy, incompatible-provider and read-only-check tests without this optional
-dependency. VM behavior remains to be measured after authorized deployment.
+It proves the native-scope baseline, inherited cgroups for ordinary children,
+`setsid` and Node grandchildren, PTY placement, and normal termination. It also
+uses **dsh's actual profile loader**, accepts a reviewed profile-local provider,
+and refuses version/source/export drift with the CLI provider unchanged.
+Standard CI runs the module-local binding, actual-source/exports rejection,
+incompatible-provider and read-only-check tests without this optional dependency.
+The PTY fixture waits for `setsid --wait` and the output stream's end before
+evaluating placement. VM behavior remains to be measured after authorized deployment.
 
 ## Reusable upstream report
 
