@@ -136,6 +136,26 @@ class _Refrozen(Exception):
 
 class WorkItems(interface.WorkItems):
 
+    def set_app(self, item_id, app, *, actor) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                            % ITEM_COLUMNS, (int(item_id),))
+            if not rows:
+                return None
+            item = rows[0]
+            if item.get("app") == app:
+                return item
+            rows = tx.query("UPDATE work_items SET app = %%s, updated_at = now()"
+                            " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                            (app, int(item_id)))
+            WorkItems(tx)._event(int(item_id), item["state"],
+                                 "project %r → %r" % (item.get("app"), app), actor)
+            return rows[0]
+
+    def without_project(self) -> list[dict]:
+        return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
+                             " AND state NOT IN %s ORDER BY id" % (ITEM_COLUMNS, _CLOSED))
+
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
