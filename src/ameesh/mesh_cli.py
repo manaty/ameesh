@@ -1924,6 +1924,13 @@ def cmd_models_discover(cfg, args) -> int:
     return 1 if failures and not getattr(args, "dry_run", False) else 0
 
 
+#: L148 : commandes encore acceptées pour la transition mais absentes de
+#: l'aide (`menage` → `housekeeping`), retirées au stage 7. argparse affiche
+#: les choix en clair dans la ligne d'usage : `build_parser` lui donne la
+#: liste visible par `metavar`.
+HIDDEN_COMMANDS = frozenset({"menage"})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-mesh", description=__doc__,
@@ -2368,6 +2375,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="files changed since REF (ref..HEAD + working tree)")
     canon_cli._canon_options(p_review)
     p_review.set_defaults(func=cmd_review_class)
+
+    # L148 : la ligne d'usage liste les sous-commandes en clair, y compris
+    # celles cachées ; on lui donne la liste visible (retirée au stage 7).
+    sub.metavar = "{%s}" % ",".join(
+        name for name in sub.choices if name not in HIDDEN_COMMANDS)
     return parser
 
 

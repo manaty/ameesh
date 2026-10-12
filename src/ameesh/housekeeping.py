@@ -2555,4 +2555,7 @@ cmd_menage = cmd_housekeeping
 
 __all__ = ["Policy", "parse_policy", "effective", "turn_env", "hold_tmp", "Turn", "run_pass",
            "measure", "evict_lru", "worktree_state", "list_worktrees", "cmd_housekeeping",
+           #: L148 : `from ameesh.menage import *` doit encore exposer
+           #: l'ancienne graphie, retirée au stage 7 (comme menage.py).
+           "cmd_menage",
            "caller_refusal", "orphan_pass", "tmp_top", "tmpfs_hint", "in_memory"]
