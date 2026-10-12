@@ -86,7 +86,21 @@ ID_FROM_DIRECTORY = "directory"
 FICHE_REF_RE = re.compile(
     r"^(?:(?P<canon>[A-Za-z0-9][A-Za-z0-9._-]{0,63})/)?(?P<member>[^:/\s]+):"
     r"(?P<path>\S*)@(?P<version>\S+)$")
-KNOWN_CAPABILITIES = ("read", "report-drift", "propose")
+KNOWN_CAPABILITIES = ("read", "report-drift", "propose", "integrate", "merge", "release")
+#: L150: what each capability allows. None of them carries a decision: R8
+#: keeps approval with humans; `merge` and `release` EXECUTE an approval that
+#: was already given (approved review, owner's go), they never replace it.
+CAPABILITY_MEANINGS = {
+    "read": "read the canon, the threads and the repositories",
+    "report-drift": "report a gap between the canon and reality",
+    "propose": "propose a change (branch, PR, action proposal)",
+    "integrate": "assemble others' work: rebase PRs, resolve conflicts, build an "
+                 "integration or release branch; never merges into the base branch",
+    "merge": "merge an approved PR into the base branch once its required reviews "
+             "and CI are green; never approves",
+    "release": "tag, publish and deploy a release once the owner's go is recorded; "
+               "never approves, never skips the release procedure",
+}
 #: R8 : l'autorité de décision est réservée aux humains
 FORBIDDEN_CAPABILITIES = ("approve",)
 EPHEMERAL_CAPABILITIES = ("read", "propose")
@@ -2231,8 +2245,8 @@ class _Loader:
                              % key, **where, **subject)
                     continue
                 parsed[key] = part
-            elif key in resources_mod.POWER_KEYS:
-                # L106 : seuils de batterie, en pourcentage
+            elif key in resources_mod.POWER_KEYS + resources_mod.PRESSURE_KEYS:
+                # L106 : seuils de batterie, en pourcentage ; L159d : pression CPU
                 percent = resources_mod.parse_percent(value)
                 if percent is None:
                     self.add("host-policy-invalid", ERROR,
