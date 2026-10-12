@@ -2312,6 +2312,13 @@ class TurnResources(Domain):
         de lignes soldées."""
 
     @abc.abstractmethod
+    def settle_unchanged(self, rows: Sequence[dict]) -> list[str]:
+        """#339 r2 : `settle` des lignes lues (`to_review`) qui n'ont pas
+        changé depuis — même statut, fin, groupe et conteneurs ; une ligne
+        qu'un tour a fermée, marquée ou prolongée entre-temps reste. Les
+        `turn_id` soldés."""
+
+    @abc.abstractmethod
     def mark_orphan_many(self, turn_ids: Sequence[str]) -> int:
         """#220 r3 : `mark_orphan` (sans conteneurs) de plusieurs lignes en une
         écriture ; seules celles qui n'étaient pas encore `orphan` changent."""

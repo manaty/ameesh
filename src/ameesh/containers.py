@@ -76,6 +76,8 @@ class Runtime:
 
     binary: str
     timeout: float = DEFAULT_TIMEOUT
+    #: #339 : contexte (docker) ou connexion (podman) interrogé, "" : le courant
+    context: str = ""
     #: injectable pour les tests : `(argv, capture_output, text, timeout)`
     run: object = subprocess.run
     _labels: dict = field(default_factory=dict)
@@ -89,8 +91,14 @@ class Runtime:
                    timeout=max(0.5, float(getattr(cfg, "container_timeout",
                                                 DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)))
 
+    def _argv(self, *args: str) -> list[str]:
+        if not self.context:
+            return [self.binary, *args]
+        flag = "--connection" if _engine(self.binary) == "podman" else "--context"
+        return [self.binary, flag, self.context, *args]
+
     def _ids(self, label: str) -> list[str]:
-        argv = [self.binary, "ps", "--no-trunc", "--quiet", "--filter", "label=%s" % label]
+        argv = self._argv("ps", "--no-trunc", "--quiet", "--filter", "label=%s" % label)
         try:
             proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
         except (OSError, subprocess.SubprocessError):
@@ -128,7 +136,7 @@ class Runtime:
     def list_all(self) -> list[dict] | None:
         """Tous les conteneurs EN COURS (L73, lecture seule) : `id`, `name`,
         `image`, `created`, `labels` ; None si le moteur ne répond pas."""
-        argv = [self.binary, "ps", "--no-trunc", "--format", "{{json .}}"]
+        argv = self._argv("ps", "--no-trunc", "--format", "{{json .}}")
         try:
             proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
         except (OSError, subprocess.SubprocessError):
@@ -169,7 +177,7 @@ class Runtime:
     def remove(self, ident: str) -> tuple[bool, str]:
         """`rm -f -v <id>` (L73) : réservé aux conteneurs ÉTIQUETÉS par un tour
         d'ameesh (l'appelant le vérifie) ; les volumes anonymes partent avec."""
-        argv = [self.binary, "rm", "-f", "-v", ident]
+        argv = self._argv("rm", "-f", "-v", ident)
         try:
             proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout * 6)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -184,6 +192,78 @@ class Runtime:
         if not agent:
             return []
         return self._ids("ameesh.agent=%s" % agent)
+
+
+def _engine(binary: str) -> str:
+    import os
+    return os.path.basename(binary).lower()
+
+
+def _is_shim(path: str) -> bool:
+    """Le script d'étiquetage d'un tour (L73), pas un moteur."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(len(SHIM) + 1) == SHIM
+    except OSError:
+        return False
+
+
+def _real_binary(name: str) -> str | None:
+    """Le premier `name` du PATH qui n'est pas un script d'étiquetage."""
+    import os
+    for directory in (os.environ.get("PATH") or os.defpath).split(os.pathsep):
+        found = shutil.which(name, path=directory or os.curdir)
+        if found and not _is_shim(found):
+            return found
+    return None
+
+
+def _contexts(runtime: Runtime) -> list[str] | None:
+    """#339 : les contextes (docker) ou connexions (podman) du moteur ; None
+    s'il ne répond pas."""
+    if _engine(runtime.binary) == "podman":
+        argv = [runtime.binary, "system", "connection", "list", "--format", "{{.Name}}"]
+    else:
+        argv = [runtime.binary, "context", "ls", "--format", "{{.Name}}"]
+    try:
+        proc = runtime.run(argv, capture_output=True, text=True, timeout=runtime.timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def all_runtimes(cfg, run=None) -> tuple[list[Runtime], list[str]]:
+    """#339 : tous les moteurs où un tour a pu lancer un conteneur étiqueté —
+    chaque moteur de CANDIDATES présent (les scripts d'étiquetage d'un tour
+    les couvrent tous) et celui que nomme la configuration, avec chacun de
+    leurs contextes (docker) ou connexions (podman). Rend (moteurs, muets) :
+    `muets`, les moteurs qui n'ont pas listé leurs contextes. Aucun si le
+    moteur est désactivé (`none` : aucune étiquette n'est posée)."""
+    import os
+    configured = runtime_binary(getattr(cfg, "container_runtime", "") or "")
+    if configured is None:
+        return [], []
+    timeout = max(0.5, float(getattr(cfg, "container_timeout", DEFAULT_TIMEOUT)
+                             or DEFAULT_TIMEOUT))
+    binaries: dict = {}
+    for binary in [configured] + [_real_binary(c) for c in CANDIDATES]:
+        if binary and not _is_shim(binary):
+            binaries.setdefault(os.path.realpath(binary), binary)
+    out: list[Runtime] = []
+    silent: list[str] = []
+    for binary in binaries.values():
+        base = Runtime(binary=binary, timeout=timeout, run=run or subprocess.run)
+        contexts = _contexts(base)
+        if contexts is None:
+            silent.append(binary)
+            continue
+        if _engine(binary) == "podman" or not contexts:
+            out.append(base)        # podman : le moteur local, puis ses connexions
+        out += [Runtime(binary=binary, timeout=timeout, run=base.run, context=c)
+                for c in contexts]
+    return out, silent
 
 
 def running_for_turn(cfg, turn_id: str) -> list[str]:

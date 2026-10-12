@@ -162,6 +162,10 @@ BOOT_REVIEW_START = ("running", 0)
 #: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
 LIVE_REVIEW_EVERY_S = 300.0
 LIVE_REVIEW_IDLE_S = 600.0
+#: #339 r2: a process of this user whose environment cannot be read keeps a
+#: row if it started after the row, less this margin (the harness starts
+#: just before its row is opened; the base's clock may drift from the host's)
+LIVE_REVIEW_START_SLACK_S = 300.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -5355,18 +5359,25 @@ class Runner:
     def settle_dead_turns(self) -> list[dict]:
         """#339 : les lignes de CET hôte `orphan`, ou `running` depuis plus de
         LIVE_REVIEW_IDLE_S (laissées par un exécuteur mort ou relancé), dont
-        le groupe de processus n'existe plus et qu'aucun conteneur étiqueté
-        par le tour ne fait tourner, sont soldées (`done`) — sans attendre un
-        redémarrage de l'hôte (L147). Une ligne sans groupe noté, un groupe
-        vivant (même réutilisé : on garde), un moteur muet : la ligne reste.
-        Pas avant le feu vert du démarrage (`_boot_settle_ready` : un
-        conteneur relancé par sa politique peut manquer encore). Rien n'est
-        supprimé ; au plus BOOT_REVIEW_MAX_ROWS lignes par passage, la suite
-        au passage suivant. Rend les lignes soldées. Ne lève jamais."""
+        plus rien ne survit sont soldées (`done`) — sans attendre un
+        redémarrage de l'hôte (L147). Plus rien : ni le groupe de processus,
+        ni un processus de l'utilisateur qui porte l'identifiant du tour
+        (`AMEESH_TURN_ID`, hérité même après `setsid`), ni un conteneur
+        étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
+        Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
+        réutilisé), processus à l'environnement illisible lancé après la
+        ligne, moteur muet, table des processus ou démarrage de l'hôte
+        inconnus. Pas avant le feu vert du démarrage (`_boot_settle_ready` :
+        un conteneur relancé par sa politique peut manquer encore). Une ligne
+        n'est soldée que si elle n'a pas changé depuis sa lecture
+        (`settle_unchanged`). Rien n'est supprimé ; au plus
+        BOOT_REVIEW_MAX_ROWS lignes par passage, la suite au passage suivant.
+        Rend les lignes soldées. Ne lève jamais."""
+        from . import containers as containers_mod, platform as os_layer
         from . import resources as resources_mod
         self.live_review_at = time.monotonic() + LIVE_REVIEW_EVERY_S
         boot = resources_mod.boot_time()
-        if boot and not self._boot_settle_ready(time.time() - boot):
+        if not boot or not self._boot_settle_ready(time.time() - boot):
             return []
         try:
             turns = storage.of(self.db).turn_resources
@@ -5391,14 +5402,49 @@ class Runner:
                           if row.get("pgid") and not AgentWorker._group_alive(int(row["pgid"]))]
             if not candidates:
                 return []
-            runtime = self.container_runtime()
-            running = self._running_containers(runtime)
+            try:
+                scan = os_layer.env_values("AMEESH_TURN_ID")
+            except os_layer.NotAvailable as exc:
+                log("turn resources not settled: %s; next review in %ds"
+                    % (exc, int(LIVE_REVIEW_EVERY_S)))
+                return []
+            unread = scan["unread"]
+            if None in unread:
+                log("turn resources not settled: a process with an unreadable "
+                    "environment and no start time; next review in %ds"
+                    % int(LIVE_REVIEW_EVERY_S))
+                return []
+            latest = max(unread, default=None)
+            candidates = [row for row in candidates
+                          if row["turn_id"] not in scan["values"]
+                          and (latest is None or row.get("started_ts") is None
+                               or latest < float(row["started_ts"]) - LIVE_REVIEW_START_SLACK_S)]
+            if not candidates:
+                return []
+            engines, silent = containers_mod.all_runtimes(self.cfg)
+            running: dict = {}
+            for engine in engines:
+                part = self._running_containers(engine)
+                if part is None:
+                    silent.append(engine.binary + (" (%s)" % engine.context
+                                                   if engine.context else ""))
+                    continue
+                for turn, ids in part.items():
+                    running.setdefault(turn, []).extend(ids)
+            if silent:
+                log("turn resources not settled: container engine %s not "
+                    "answering; next review in %ds"
+                    % (", ".join(silent), int(LIVE_REVIEW_EVERY_S)))
+                return []
+            # sans moteur, une ligne qui note des conteneurs reste
             dead = [row for row in candidates
-                    if self._containers_alive(running, runtime, row) == []]
-            turns.settle_many([row["turn_id"] for row in dead])
+                    if self._containers_alive(running, engines or None, row) == []]
+            settled = set(turns.settle_unchanged(dead))
+            dead = [row for row in dead if row["turn_id"] in settled]
             for row in dead:
-                log("turn %s of %s (%s): group %s gone, no container running — settled"
-                    % (row["turn_id"], row.get("agent"), row.get("status"), row["pgid"]))
+                log("turn %s of %s (%s): group %s gone, no process nor container "
+                    "left — settled" % (row["turn_id"], row.get("agent"),
+                                        row.get("status"), row["pgid"]))
             return dead
         except db_mod.DbError as exc:
             log_async("turn resources not reviewed (%s); next review in %ds"
