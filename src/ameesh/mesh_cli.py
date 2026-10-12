@@ -935,7 +935,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     if args.work_command == "move" and getattr(args, "correct", None) is not None:
         args.actor = work.corrector(cfg, db, args.actor)
         return
-    if args.work_command in _OWN_ACTOR or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -964,6 +964,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
             # création), avertissement pour un humain
             from . import estimates
+            from . import identity, work_projects
+            binding = identity.resolve_binding(cfg, db)
+            creator = binding.name if binding.ok else args.actor
+            args.app = work_projects.creation_project(cfg, db, creator, args.app)
             minutes = estimates.parse(args.estimate) if args.estimate else None
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
@@ -1243,6 +1247,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
             print("note added to lot #%d" % args.id)
+            return 0
+        if args.work_command == "set-app":
+            from . import work_projects
+            item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
+            print("lot #%d: project %s" % (item["id"], item["app"]))
+            return 0
+        if args.work_command == "backfill-app":
+            from . import work_projects
+            rows = work_projects.backfill_app(cfg, db, actor=args.actor, dry_run=args.dry_run)
+            for row in rows:
+                print("lot #%d: %s — %s" % (row["id"], row["status"],
+                                           row.get("project") or row.get("reason", "changed concurrently")))
             return 0
         if args.work_command == "milestone":
             row = work.milestone(
@@ -1888,7 +1904,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="an improvement backlog item goes through "
                              "`ameesh work backlog add` (L119)")
     pw_add.add_argument("--source", default="")
-    pw_add.add_argument("--app", default="")
+    pw_add.add_argument("--app", default=None,
+                        help="project; default: the creating agent's registry or own canon")
     pw_add.add_argument("--body", default=None)
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
@@ -2002,6 +2019,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
+
+    pw_app = work_sub.add_parser("set-app", help="correct a lot's project, with a journal entry")
+    pw_app.add_argument("id", type=int)
+    pw_app.add_argument("project")
+    pw_app.add_argument("--actor", default="",
+                        help="human, orchestrator or design agent; default: bound session")
+    pw_app.set_defaults(func=cmd_work)
+    pw_backfill = work_sub.add_parser("backfill-app", help="fill uniquely inferred projects of open lots")
+    pw_backfill.add_argument("--dry-run", action="store_true")
+    pw_backfill.add_argument("--actor", default="")
+    pw_backfill.set_defaults(func=cmd_work)
     pw_ms = work_sub.add_parser(
         "milestone", help="declare a timeline milestone (freeze, verdict) — R19")
     pw_ms.add_argument("id", type=int)
