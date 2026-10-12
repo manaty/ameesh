@@ -417,6 +417,77 @@ class PassTest(_Base):
         self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
         self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
 
+    def agents_queue(self, lot):
+        """`lot` queued from a clone of `self.repo` (its origin), whose
+        refs then stay as they were; the pass runs on that clone."""
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        self.ready(lot)
+        clone = resolutions.Replayer(agents, radar.clone_dir(self.cfg, "p"))
+        merge_queue.enter(None, lot, repo=agents, actor="orch", ci=None, clone=clone)
+        self.project = radar.Project(name="p", repo=agents, migrations=MIG)
+        return agents
+
+    def test_a_lot_absent_from_the_scan_is_fetched_all_the_same(self):
+        """Codex #188 r4: the agents' checkout recreated without the lot's
+        refs; the queue still fetches it, keeps it ranked while it holds,
+        ejects it on an unreviewed push, defers it once origin drops it."""
+        agents = self.agents_queue(1)
+        _git(agents, "update-ref", "-d", "refs/remotes/origin/lot/1-a")
+        report = self.run_pass(repo=agents)
+        self.assertNotIn(1, [b["work_item"] for b in report["branches"]])
+        self.assertEqual([(o["lot"], o["state"])
+                          for o in report["queue"]["targets"]["origin/main"]], [(1, "queued")])
+        self.assertEqual(self.fake.queue_rows[1]["rank"], 1)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "branch", "-q", "-D", "lot/1-a")
+        self.run_pass(repo=agents)
+        self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
+        self.assertIsNone(self.fake.queue_rows[1]["rank"])
+        self.assertEqual(self.fake.queue_rows[1]["reason"],
+                         "deferred: branch lot/1-a not found on origin")
+        _git(self.repo, "branch", "-q", "lot/1-a", self.fake.queue_rows[1]["frozen_sha"])
+        _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "B, unreviewed, pushed elsewhere")
+        self.run_pass(repo=agents)
+        self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
+        self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
+        self.assertEqual([to for to, _, _ in self.sent], ["a1"])
+
+    def test_the_stacked_trial_runs_on_the_fresh_target(self):
+        """Codex #188 r4: origin's main moves to a conflicting commit while
+        the agents' cached origin/main stays: the trial uses origin's."""
+        agents = self.agents_queue(1)
+        _commit_on(self.repo, "main", "shared.py",
+                   "Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n", "main moves elsewhere")
+        report = self.run_pass(repo=agents)
+        self.assertEqual([a["state"] for a in report["against_target"]], ["clean"])  # stale
+        self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
+        self.assertIn("stacked trial: conflict not covered on shared.py",
+                      self.fake.queue_rows[1]["reason"])
+        # origin's main unreachable: deferred, never a trial on the cached one
+        self.fake.queue_rows.clear()
+        self.ready(1)
+        self.fake.queue_add(1, target="origin/main", frozen_sha=self.tip(1), note="",
+                            actor="o")
+        with mock.patch.object(merge_queue, "stack",
+                               side_effect=AssertionError("stacked on a guess")):
+            _git(self.repo, "branch", "-q", "-m", "main", "trunk")
+            self.run_pass(repo=agents)
+        self.assertIsNone(self.fake.queue_rows[1]["rank"])
+        self.assertEqual(self.fake.queue_rows[1]["reason"],
+                         "deferred: target origin/main not found on origin")
+
+    def test_another_projects_lot_is_left_alone(self):
+        agents = self.agents_queue(1)
+        self.fake.lots[3]["branch"] = "lot/3-elsewhere"
+        self.fake.queue_add(3, target="origin/main", frozen_sha="3" * 40, note="", actor="o")
+        self.fake.queue_rows[3]["reason"] = "ranked by its own project"
+        report = self.run_pass(repo=agents)
+        self.assertEqual([o["lot"] for o in report["queue"]["targets"]["origin/main"]], [1])
+        self.assertNotIn("deferred", report["queue"])
+        self.assertEqual((self.fake.queue_rows[3]["state"], self.fake.queue_rows[3]["reason"]),
+                         ("queued", "ranked by its own project"))
+
     def test_merged_lot_lands(self):
         self.queue(4)
         self.fake.lots[4]["state"] = "merged"
@@ -453,9 +524,9 @@ class PassTest(_Base):
                  3: {"state": "clean", "files": []}}
         by_branch = {self.fake.lots[n]["branch"]: tips[n] for n in (1, 2, 3)}
         with mock.patch.object(merge_queue, "stack", return_value=trial), \
-                mock.patch.object(merge_queue, "branch_tip",
-                                  side_effect=lambda repo, branch, clone: (by_branch[branch],
-                                                                           repo)):
+                mock.patch.object(merge_queue, "fetch_fresh",
+                                  side_effect=lambda repo, names, clone: (
+                                      dict(by_branch, main="f" * 40), repo)):
             out = merge_queue.run_pass(self.cfg, None, self.project, report,
                                        replayer=mock.Mock())
         self.assertEqual([(o["lot"], o["state"]) for o in out["targets"]["main"]],

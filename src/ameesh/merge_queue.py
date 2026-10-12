@@ -86,34 +86,70 @@ def latest_verdict(rows: list[dict]) -> dict | None:
         if verdicts else None
 
 
-def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
-    """(tip, repository holding it) of a lot branch, read fresh. With an
-    `origin`, the branch is fetched from it now into the radar's clone
-    (`clone`, a `resolutions.Replayer`: never into the agents' repository);
-    neither a local branch nor the cached `origin/<branch>` counts, since
-    another host may have pushed since. No clone, or a failed fetch, raises
-    QueueError: no fetch, no tip. Without an `origin`, `repo` is the only
-    copy and its local branch is the tip."""
+def _remote_branch(name: str) -> str:
+    """The branch of `origin` that a lot branch or a target names:
+    `origin/main`, `refs/remotes/origin/main` and `main` all name `main`."""
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
+    """({name: commit, or None if there is no such branch}, repository holding
+    them) of the branches `names` (lot branches or targets), read fresh. With
+    an `origin`, they are listed on it, then fetched from it now into the
+    radar's clone (`clone`, a `resolutions.Replayer`: never into the agents'
+    repository), under QUEUE_REF; neither a local branch nor the cached
+    `origin/<branch>` counts, since another host may have pushed since. No
+    clone, or a remote that does not answer, raises QueueError: no fetch, no
+    tip. Without an `origin`, `repo` is the only copy and its local branches
+    are the tips."""
     from . import resolutions
+    names = sorted({n for n in names if n})
+    remote = {n: _remote_branch(n) for n in names}
     url = plan_git._out(repo, "remote", "get-url", "origin")
     if not url:
-        return plan_git._commit(repo, "refs/heads/" + branch), repo
+        return {n: plan_git._commit(repo, "refs/heads/" + remote[n]) for n in names}, repo
+    what = "branch%s %s" % ("es" if len(names) > 1 else "", ", ".join(names))
     if clone is None:
-        raise QueueError("branch %s: origin cannot be fetched without the radar's clone "
-                         "(ameesh work queue add finds it from the project)" % branch)
-    ref = QUEUE_REF + branch
+        raise QueueError("%s: origin cannot be fetched without the radar's clone "
+                         "(ameesh work queue add finds it from the project)" % what)
+    present: set = set()
     try:
         if not os.path.isdir(os.path.join(clone.path, ".git")):
             clone.ensure()  # an existing clone is not reset: the radar may use it
-        proc = resolutions._run(clone.path, "fetch", "--quiet", url,
-                                "+refs/heads/%s:%s" % (branch, ref), timeout=FETCH_TIMEOUT)
-        failed = resolutions._err(proc) if proc.returncode else None
+        wanted = sorted(set(remote.values()))
+        listing = resolutions._run(clone.path, "ls-remote", url,
+                                   *("refs/heads/" + b for b in wanted), timeout=FETCH_TIMEOUT)
+        failed = resolutions._err(listing) if listing.returncode else None
+        if failed is None:
+            listed = {line.split("\t", 1)[1] for line in resolutions._text(listing).splitlines()
+                      if "\t" in line}
+            present = {b for b in wanted if "refs/heads/" + b in listed}
+        if failed is None and present:
+            proc = resolutions._run(clone.path, "fetch", "--quiet", url,
+                                    *("+refs/heads/%s:%s%s" % (b, QUEUE_REF, b)
+                                      for b in sorted(present)), timeout=FETCH_TIMEOUT)
+            failed = resolutions._err(proc) if proc.returncode else None
     except (GitError, OSError) as exc:
         failed = str(exc)
     if failed is not None:
-        raise QueueError("cannot fetch branch %s from origin (%s): try again once "
-                         "the remote answers" % (branch, failed[:300]))
-    return plan_git._commit(clone.path, ref), clone.path
+        raise QueueError("cannot fetch %s from origin (%s): try again once the remote answers"
+                         % (what, failed[:300]))
+    return {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
+            else None for n in names}, clone.path
+
+
+def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
+    """(tip, repository holding it) of a lot branch, read fresh
+    (`fetch_fresh`). A branch that origin no longer has raises QueueError:
+    the commit the clone kept is not the tip."""
+    tips, where = fetch_fresh(repo, [branch], clone)
+    if tips[branch] is None and where != repo:
+        raise QueueError("cannot fetch branch %s from origin (no such branch there): push "
+                         "it again" % branch)
+    return tips[branch], where
 
 
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
@@ -386,46 +422,78 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                if a.get("state") == "conflict"}
     ejected: set = set()
     by_target: dict = {}
+    live = []
     for row in mine:
-        lot = int(row["work_item_id"])
         if row.get("item_state") in work.MERGED_STATES:
-            storage.of(db).work.queue_update(lot, state="landed", reason="merged",
+            storage.of(db).work.queue_update(int(row["work_item_id"]), state="landed",
+                                             reason="merged",
                                              note="merge queue of %s: landed" % row["target"],
                                              actor=work.SYSTEM_SENDER)
-            continue
-        branch = branches.get(lot)
-        if branch is None or branch.get("target") != row["target"]:
-            continue  # another repository, or not visible on this host
-        # the radar reads the agents' `origin/<branch>`, which may be stale
-        # either way: each pass fetches the branch, and that tip decides
-        if replayer is None:
-            from . import radar
-            replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+        else:
+            live.append(row)
+    if live and replayer is None:
+        from . import radar
+        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+    # the radar reads the agents' refs, which may be stale either way, or gone
+    # (a checkout recreated): each pass fetches the branch of every queued
+    # lot and its target, scanned or not, and those tips decide
+    failed = None
+    tips: dict = {}
+    where = project.repo
+    if live:
         try:
-            fresh, _ = branch_tip(project.repo, row.get("branch") or "", replayer)
+            tips, where = fetch_fresh(project.repo, [r.get("branch") for r in live]
+                                      + [r["target"] for r in live], replayer)
         except QueueError as exc:
-            # neither ejected nor ranked on a guess: out of the order until
-            # the next pass, its rank cleared so that no other lot shares it
-            reason = "deferred: %s" % exc
-            if row.get("rank") is not None or row.get("reason") != reason:
-                storage.of(db).work.queue_update(lot, clear_rank=True, reason=reason)
-            out.setdefault("deferred", []).append({"lot": lot, "reason": str(exc)})
+            failed = exc
+            where = replayer.path
+
+    def ours(row: dict) -> bool:
+        """A lot of this project: scanned here, or its frozen commit is in
+        the repository the queue reads (the queue holds every project's
+        lots)."""
+        return int(row["work_item_id"]) in branches \
+            or bool(plan_git._commit(where, row["frozen_sha"]))
+
+    def defer(row: dict, why: str) -> None:
+        # neither ejected nor ranked on a guess: out of the order until the
+        # next pass, its rank cleared so that no other lot shares it
+        reason = "deferred: %s" % why
+        if row.get("rank") is not None or row.get("reason") != reason:
+            storage.of(db).work.queue_update(int(row["work_item_id"]), clear_rank=True,
+                                             reason=reason)
+        out.setdefault("deferred", []).append({"lot": int(row["work_item_id"]),
+                                               "reason": why})
+
+    for row in live:
+        lot = int(row["work_item_id"])
+        if not ours(row):
+            continue  # another project's lot
+        tip, head = tips.get(row.get("branch")), tips.get(row["target"])
+        if failed is not None:
+            defer(row, str(failed))
             continue
-        if fresh:
-            branch = dict(branch, tip=fresh)
-        if not _same(branch["tip"], row["frozen_sha"]):
+        place = "origin" if where != project.repo else "the repository"
+        if tip is None:
+            defer(row, "branch %s not found on %s" % (row.get("branch") or "—", place))
+            continue
+        if head is None:
+            defer(row, "target %s not found on %s" % (row["target"], place))
+            continue
+        if not _same(tip, row["frozen_sha"]):
             reason = "branch moved past its freeze (%s, frozen %s)" % (
-                branch["tip"][:12], row["frozen_sha"][:12])
+                tip[:12], row["frozen_sha"][:12])
             out["mail"].append(_eject(db, row, reason, (
                 "Merge queue of %s, lot #%d « %s »: out of the queue, its branch %s moved "
                 "past the freeze (%s, frozen %s). A queued lot is frozen: freeze it again, "
                 "have it reviewed, then ameesh work queue add %d."
                 % (row["target"], lot, row.get("title") or "", row.get("branch") or "?",
-                   branch["tip"][:12], row["frozen_sha"][:12], lot)),
+                   tip[:12], row["frozen_sha"][:12], lot)),
                 {"project": project.name, "target": row["target"], "kind": "ejected"}))
             continue
         clash = against.get(lot)
-        if clash and _same(clash.get("tip"), row["frozen_sha"]):
+        if clash and clash.get("target") == row["target"] \
+                and _same(clash.get("tip"), row["frozen_sha"]):
             # no resolution is prepared against the target: the agent integrates it
             reason = "conflict with %s on %s" % (row["target"], ", ".join(
                 clash["files"][:6] or ["?"]))
@@ -440,17 +508,14 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                  "files": clash["files"]}))
             ejected.add(lot)
             continue
-        by_target.setdefault(row["target"], []).append(dict(row, tip=branch["tip"],
-                                                            target_head=branch["target_head"]))
+        # stacked on the target as origin has it now, not the agents' cached one
+        by_target.setdefault(row["target"], []).append(dict(row, tip=tip, target_head=head))
     try:
         resolution_rows = storage.of(db).work.resolutions(
             [int(r["work_item_id"]) for rs in by_target.values() for r in rs]) \
             if by_target else []
     except Exception:  # noqa: BLE001 - database without 0057: no replay
         resolution_rows = []
-    if replayer is None and by_target:
-        from . import radar
-        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     stacks = getattr(cache, "stacks", None) if cache is not None else None
     stacks = {} if stacks is None else stacks
     for target, entries in sorted(by_target.items()):
