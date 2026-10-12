@@ -11,6 +11,18 @@ from ameesh import config, host_gate
 
 
 class NativeGateTest(unittest.TestCase):
+    def setUp(self):
+        import pwd
+        from types import SimpleNamespace
+        # Each test models a fresh runner process; production never resets it.
+        for patch in (
+            mock.patch.object(host_gate, "_guest_identity", False),
+            mock.patch.object(pwd, "getpwall", return_value=[SimpleNamespace(pw_name="ameesh-guest")]),
+            mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid() + 1)),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
     def test_native_lender_does_not_take_guest_gate(self):
         cfg = config.Config(runner_id="native:test")
         self.assertEqual(host_gate.gate_kind(cfg, lending=True), "")
@@ -65,9 +77,10 @@ class NativeGateTest(unittest.TestCase):
         import pwd
         from types import SimpleNamespace
         cfg = config.Config(runner_id="native:test")
-        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")):
+        with mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())):
             self.assertEqual(host_gate.gate_kind(cfg, lending=True), "file")
-        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh")), \
+        with mock.patch.object(host_gate, "_guest_identity", False), \
+                mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid() + 1)), \
                 mock.patch.dict(os.environ, {"USER": "ameesh-guest"}):
             self.assertEqual(host_gate.gate_kind(cfg, lending=True), "")
 
@@ -157,7 +170,7 @@ class NativeGateTest(unittest.TestCase):
         from ameesh.runner import Runner
         for kind in ("none", "bogus"):
             with self.subTest(kind=kind), \
-                    mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")):
+                    mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())):
                 cfg = config.Config(runner_id="native:test", host_gate=kind)
                 with self.assertRaisesRegex(SystemExit, "guest.*file"):
                     Runner(cfg, None)
@@ -193,10 +206,85 @@ class NativeGateTest(unittest.TestCase):
         import pwd
         from types import SimpleNamespace
         from ameesh import runner
-        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")), \
+        with mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())), \
                 mock.patch.object(runner, "load_config", return_value=config.Config(host_gate="none")), \
                 mock.patch.object(runner, "_connect_at_start") as connect, \
                 mock.patch.object(runner.sys, "stderr", new_callable=io.StringIO) as stderr:
             self.assertEqual(runner.main(["--once", "--runner-id", "native:test"]), 2)
             self.assertIn("guest runner requires host_gate=file", stderr.getvalue())
             connect.assert_not_called()
+
+    def test_identity_lookup_errors_close_guest_gate(self):
+        import pwd
+        from types import SimpleNamespace
+        cfg = config.Config(runner_id="native:test", host_gate="none")
+        for error in (KeyError("unknown uid"), OSError(errno.EIO, "NSS unavailable")):
+            with self.subTest(error=error), mock.patch.object(host_gate, "_guest_identity", False, create=True), \
+                    mock.patch.object(pwd, "getpwuid", side_effect=error), \
+                    mock.patch("builtins.open", mock.mock_open(read_data="0::/native.service\n")):
+                with self.assertRaisesRegex(ValueError, "guest.*file"):
+                    host_gate.gate_choice(cfg)
+        for error in (FileNotFoundError("no cgroup"), PermissionError("unreadable cgroup")):
+            with self.subTest(error=error), mock.patch.object(host_gate, "_guest_identity", False, create=True), \
+                    mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="native")), \
+                    mock.patch("builtins.open", side_effect=error):
+                with self.assertRaisesRegex(ValueError, "guest.*file"):
+                    host_gate.gate_choice(cfg)
+
+    def test_guest_identity_survives_unit_rename(self):
+        import pwd
+        from types import SimpleNamespace
+        cfg = config.Config(runner_id="native:test")
+        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="native")), \
+                mock.patch("builtins.open", mock.mock_open(read_data="0::/ameesh-guest-runner@test.service\n")):
+            self.assertTrue(host_gate.is_guest(cfg))
+        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="native")), \
+                mock.patch("builtins.open", mock.mock_open(read_data="0::/renamed.service\n")):
+            self.assertTrue(host_gate.is_guest(cfg))
+
+    def test_guest_lookup_failure_after_eacces_does_not_detach(self):
+        import pwd
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = SimpleNamespace(cfg=config.Config(runner_id="native:test", host_gate="file"),
+                                     runner_id="native:test", workers={}, reject_host_gate=mock.Mock())
+            gate = host_gate.FileGate(ack_path=os.path.join(tmp, "ack.json"), use_inotify=False)
+            self.addCleanup(gate.close)
+            ctl = host_gate.GateController(runner, gate)
+            with mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())), \
+                    mock.patch.object(gate, "state", return_value=host_gate.GateState("available", 1)), \
+                    mock.patch.object(os, "makedirs", side_effect=PermissionError(errno.EACCES, "denied")):
+                ctl.refresh()
+                self.assertFalse(ctl.may_claim())
+            with mock.patch.object(pwd, "getpwuid", side_effect=KeyError("unknown uid")), \
+                    mock.patch("builtins.open", mock.mock_open(read_data="0::/renamed.service\n")):
+                ctl.tick()
+                runner.reject_host_gate.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "guest.*file"):
+                    host_gate.gate_choice(config.Config(runner_id="native:test", host_gate="none"))
+
+    def test_numeric_guest_uid_ignores_current_account_name(self):
+        import pwd
+        from types import SimpleNamespace
+        cfg = config.Config(runner_id="native:test")
+        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")):
+            self.assertFalse(host_gate.is_guest(cfg))  # different numeric UID
+        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="renamed")), \
+                mock.patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.geteuid())):
+            self.assertTrue(host_gate.is_guest(cfg))
+
+    def test_existing_guest_account_lookup_failure_is_sticky(self):
+        import pwd
+        cfg = config.Config(runner_id="native:test")
+        with mock.patch.object(pwd, "getpwnam", side_effect=KeyError("guest lookup failed")):
+            self.assertTrue(host_gate.is_guest(cfg))
+        self.assertTrue(host_gate.is_guest(cfg))
+
+    def test_missing_guest_account_with_successful_reads_stays_native(self):
+        import pwd
+        cfg = config.Config(runner_id="native:test")
+        with mock.patch.object(pwd, "getpwall", return_value=[]), \
+                mock.patch.object(pwd, "getpwnam", side_effect=KeyError("no guest account")) as lookup:
+            self.assertFalse(host_gate.is_guest(cfg))
+            lookup.assert_not_called()
+            self.assertEqual(host_gate.gate_choice(cfg, lending=True)[0], "")

@@ -603,24 +603,41 @@ def default_fallback(cfg, lending: bool = False) -> str:
     return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
 
 
+# A confirmed or uncertain guest identity can never become native later.
+_guest_identity = False
+_guest_identity_lock = threading.Lock()
+
+
 def is_guest(cfg, runner_id: str | None = None) -> bool:
-    """Guest runner identity or actual guest Unix account, never $USER."""
-    ident = runner_id if runner_id is not None else getattr(cfg, "runner_id", "")
-    if str(ident or "").startswith("guest-"):
-        return True
-    try:
-        import pwd
-        if pwd.getpwuid(os.geteuid()).pw_name == "ameesh-guest":
+    """Guest signals and identity read failures latch for this process's life."""
+    global _guest_identity
+    with _guest_identity_lock:
+        if _guest_identity:
             return True
-    except (ImportError, KeyError):
-        pass
-    # The kernel supplies cgroup membership; EnvironmentFile cannot override it.
-    try:
-        with open("/proc/self/cgroup", encoding="utf-8") as stream:
-            return any(part.startswith("ameesh-guest-runner@") and part.endswith(".service")
-                       for line in stream for part in line.rstrip().split("/"))
-    except OSError:
-        return False
+        ident = runner_id if runner_id is not None else getattr(cfg, "runner_id", "")
+        if str(ident or "").startswith("guest-"):
+            _guest_identity = True
+            return True
+        try:
+            import pwd
+            uid = os.geteuid()
+            pwd.getpwuid(uid)  # Validate lookup availability, without trusting its name.
+            # Successful enumeration distinguishes an absent guest account
+            # from a failed lookup. Never swallow KeyError from an account
+            # that exists: it is an uncertain identity and latches guest.
+            guest_exists = any(entry.pw_name == "ameesh-guest" for entry in pwd.getpwall())
+            guest_uid = pwd.getpwnam("ameesh-guest").pw_uid if guest_exists else None
+            if uid == guest_uid:
+                _guest_identity = True
+                return True
+            # Kernel cgroup membership cannot be replaced by EnvironmentFile.
+            with open("/proc/self/cgroup", encoding="utf-8") as stream:
+                _guest_identity = any(
+                    part.startswith("ameesh-guest-runner@") and part.endswith(".service")
+                    for line in stream for part in line.rstrip().split("/"))
+        except (ImportError, KeyError, OSError, UnicodeError):
+            _guest_identity = True
+        return _guest_identity
 
 
 def gate_choice(cfg, lending: bool = False, *, runner_id: str | None = None) -> tuple[str, str]:

@@ -80,6 +80,13 @@ class ContractAgreementTest(unittest.TestCase):
 
 
 class DefaultsTest(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        # Gate choices in each case model a fresh process.
+        patch = mock.patch.object(host_gate, "_guest_identity", False)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def cfg(self, **kw):
         return config_mod.Config(**dict({"runner_id": "guest-test"}, **kw))
 

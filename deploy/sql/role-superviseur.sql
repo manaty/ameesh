@@ -165,7 +165,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
         'status', 'status_text', 'model', 'budget_usd', 'spent_usd',
         'turns', 'last_error', 'lease_owner', 'lease_expires_at',
-        'lease_epoch', 'last_turn_at', 'last_seen', 'created_at',
+        'lease_epoch', 'lease_wait_since', 'last_turn_at', 'last_seen', 'created_at',
         'updated_at', 'public_key_fingerprint', 'key_updated_at',
         'key_revoked_at', 'key_role', 'responsible', 'team', 'provider',
         'credential_mode', 'ephemeral', 'ephemeral_expires_at',
