@@ -543,8 +543,29 @@ class ReviewR5RacesTest(unittest.TestCase):
             self.assertEqual((v.state, v.reason), ("unknown", sentinel.REPLACED))
             # GH_TOKEN overrides the store: its replacement does not matter
             v = sentinel.probe_cli("gh", ["gh", "auth", "status"], "fix", run, store,
-                                   held=sentinel._digest("T"))
+                                   override=sentinel._digest("T"))
             self.assertEqual((v.state, v.fingerprint), ("failing", sentinel._digest("T")))
+            # #313 r1: through probe_all, no override — the store is read
+            # once, before the probe: B replacing A during it is unknown,
+            # never B's refusal recorded against A
+            self._write(store, "A")
+            cfg = SimpleNamespace(host="h1", accounts={},
+                                  credential_sentinel={"probes": ["gh"]})
+            found = sentinel.probe_all(cfg, NOW, run, environ={"GH_CONFIG_DIR": self.tmp})
+            self.assertEqual((found[0].state, found[0].reason), ("unknown", sentinel.REPLACED))
+            self._write(store, "A")
+            found = sentinel.probe_all(cfg, NOW, run, environ={"GH_CONFIG_DIR": self.tmp,
+                                                               "GH_TOKEN": "T"})
+            self.assertEqual((found[0].state, found[0].fingerprint),
+                             ("failing", sentinel._digest("T")))
+            # the login lands between two reads before the probe (A, then B):
+            # one read only, so the check after the probe sees the change
+            reads = iter(["A", "B", "B", "B"])
+            with mock.patch.object(sentinel, "file_fingerprint",
+                                   side_effect=lambda path: next(reads)):
+                found = sentinel.probe_all(cfg, NOW, mock.Mock(return_value=(1, "HTTP 401")),
+                                           environ={"GH_CONFIG_DIR": self.tmp})
+            self.assertEqual((found[0].state, found[0].reason), ("unknown", sentinel.REPLACED))
             # gcloud: credentials.db replaced during print-access-token
             db = os.path.join(self.tmp, "credentials.db")
             self._write(db, "A")

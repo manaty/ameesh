@@ -418,12 +418,18 @@ def env_fingerprint(environ, names: tuple, store: str | None) -> str | None:
     """#210 r5: the credential in effect for a CLI — the first set variable
     of `names`, which overrides the CLI's store (gh: GH_TOKEN, GITHUB_TOKEN;
     scw: SCW_SECRET_KEY), else the store file."""
+    return env_override(environ, names) or file_fingerprint(store)
+
+
+def env_override(environ, names: tuple) -> str | None:
+    """#313 r1: the fingerprint of the first set variable of `names`, which
+    overrides the CLI's store; None when the store is in effect."""
     environ = os.environ if environ is None else environ
     for name in names:
         value = str(environ.get(name) or "").strip()
         if value:
             return _digest(value)
-    return file_fingerprint(store)
+    return None
 
 
 #: the variables that override each CLI's credential store
@@ -432,18 +438,17 @@ SCW_KEY_VARS = ("SCW_SECRET_KEY",)
 
 
 def probe_cli(harness: str, argv: list, fix: str, run=_run,
-              store: str | None = None, held: str | None = None) -> Verdict | None:
-    """`held`: the fingerprint of the credential in effect (`env_fingerprint`),
-    else that of `store`."""
+              store: str | None = None, override: str | None = None) -> Verdict | None:
+    """`override`: the fingerprint of a variable that overrides `store`
+    (`env_override`); without one, the store is the credential in effect,
+    fingerprinted once, before the probe (#313 r1)."""
     if not shutil.which(argv[0]):
         return None
-    stored = file_fingerprint(store)
-    held = held or stored
+    held = override or file_fingerprint(store)
     code, out = run(argv, output=True)
     if code is None:
         return Verdict(harness, "", "unknown", "probe failed: %s" % out)
-    # the store counts only when no variable overrides it
-    if held == stored and file_fingerprint(store) != stored:
+    if not override and file_fingerprint(store) != held:
         return Verdict(harness, "", "unknown", REPLACED)
     if code != 0:
         why = refused(out)
@@ -471,11 +476,11 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
         elif harness == "gh":
             out.append(probe_cli("gh", ["gh", "auth", "status"], "gh auth login -h github.com",
                                  run, gh_store(environ),
-                                 env_fingerprint(environ, GH_TOKEN_VARS, gh_store(environ))))
+                                 env_override(environ, GH_TOKEN_VARS)))
         elif harness == "scw":
             out.append(probe_cli("scw", ["scw", "account", "project", "list", "-o", "json"],
                                  "scw init", run, scw_store(environ),
-                                 env_fingerprint(environ, SCW_KEY_VARS, scw_store(environ))))
+                                 env_override(environ, SCW_KEY_VARS)))
     return [v for v in out if v is not None]
 
 
