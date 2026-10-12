@@ -3208,7 +3208,7 @@ class AgentWorker(threading.Thread):
                 conversation_recorder = Recorder(
                     self.cfg, agent=self.name, turn=turn_id, session=session,
                     project=fil.project_for(self.cfg, fil.agent_project(self.agent)),
-                    warn=log_async)
+                    reader=adapter.reader, warn=log_async)
                 conversation_recorder.append("input", spec.get("prompt") or "",
                                              author="ameesh:runner")
             with open(events_path, "a", encoding="utf-8") as events:

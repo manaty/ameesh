@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Mapping
 
-from . import db as db_mod, fil, storage
+from . import adapters, db as db_mod, fil, storage
 
 SCHEMA = "ameesh-conversation/1"
 CHANNEL = "ameesh_chat"
@@ -161,37 +161,50 @@ def safe_tool_name(name, fallback="tool"):
     return fallback if isinstance(fallback, str) and _TOOL_NAME.fullmatch(fallback) else "tool"
 
 
-def agent_text(raw, parsed):
+def _reader_protocol(reader):
+    """Trust the configured reader object, never a field supplied by stdout.
+
+    Exact built-in classes only: TextStream and unknown/custom readers have
+    no assistant provenance. A protocol-shaped JSON line is not evidence.
+    """
+    return {adapters.ClaudeStream: "claude", adapters.CodexStream: "codex",
+            adapters.DshStream: "dsh", adapters.AcpStream: "acp"}.get(type(reader))
+
+
+def agent_text(raw, parsed, *, reader=None):
     """Extract only typed assistant text, never arbitrary adapter display.
 
     The parsed event must identify displayed/final content too: L75 emits an
-    empty parsed event for another thread. Raw fields give the provenance;
-    display strings can be complete JSON envelopes with tool output.
+    empty parsed event for another thread. The configured reader establishes
+    the protocol; display strings can be JSON envelopes with tool output.
     """
+    protocol = _reader_protocol(reader)
+    if protocol is None:
+        return []
     if not isinstance(raw, Mapping) or not isinstance(parsed, Mapping) or raw.get("parent_tool_use_id"):
         return []
     if not parsed.get("display") and "final" not in parsed:
         return []
     kind = raw.get("type")
     text = None
-    if kind == "assistant":
+    if protocol == "claude" and kind == "assistant":
         message = raw.get("message")
         if isinstance(message, Mapping) and message.get("role", "assistant") == "assistant":
             return [c["text"] for c in message.get("content") or []
                     if isinstance(c, Mapping) and c.get("type") == "text"
                     and isinstance(c.get("text"), str)]
-    elif kind == "result" and not raw.get("is_error"):
+    elif protocol == "claude" and kind == "result" and not raw.get("is_error"):
         text = raw.get("result")
-    elif kind in ("text", "final"):
+    elif protocol in ("acp", "dsh") and kind in ("text", "final"):
         # ACP bridge and dsh explicitly distinguish text from thought/tool.
         text = raw.get("text")
-    elif kind == "stream_event":
+    elif protocol == "claude" and kind == "stream_event":
         event = raw.get("event")
         if isinstance(event, Mapping) and event.get("type") == "content_block_delta":
             delta = event.get("delta")
             if isinstance(delta, Mapping) and delta.get("type") == "text_delta":
                 text = delta.get("text")
-    else:
+    elif protocol == "codex":
         method = raw.get("method") or kind
         params = raw.get("params") or raw
         if isinstance(params, Mapping):
@@ -251,9 +264,10 @@ class Recorder:
     they wait for queue capacity instead of being dropped as live deltas.
     """
     def __init__(self, cfg, *, agent, turn, session=None, project=None, lot=None,
-                 connect=None, capacity=256, warn=None):
+                 connect=None, capacity=256, warn=None, reader=None):
         if not isinstance(capacity, int) or not 1 <= capacity <= 4096:
             raise ValueError("conversation queue capacity must be between 1 and 4096")
+        self.reader = reader
         self.cfg, self.agent, self.turn = cfg, identifier(agent), identifier(turn)
         self.session = identifier(session, optional=True)
         self.project, self.lot = project, lot
@@ -285,6 +299,8 @@ class Recorder:
             return False
 
     def on_event(self, raw, parsed):
+        if _reader_protocol(self.reader) is None:
+            return
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -301,7 +317,7 @@ class Recorder:
             self._put(("tool", name, {"tool": name, "status": status}))
         # Codex reports `final` on each completed agent message (including
         # commentary). Keep it live; only finish publishes the final to R12.
-        texts = agent_text(raw, parsed)
+        texts = agent_text(raw, parsed, reader=self.reader)
         if "final" in parsed:
             self.final_text = "".join(texts) if texts else ""
         for text in texts:

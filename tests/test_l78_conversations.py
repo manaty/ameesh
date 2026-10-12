@@ -38,7 +38,7 @@ class UnitTest(unittest.TestCase):
             gate.wait(5)
             return db
         with mock.patch.object(C, "Log", return_value=log):
-            recorder = C.Recorder(mock.Mock(), agent="worker", turn="t1", connect=connect,
+            recorder = C.Recorder(mock.Mock(), reader=adapters.AcpStream(), agent="worker", turn="t1", connect=connect,
                                   capacity=2, warn=mock.Mock())
             self.assertTrue(entered.wait(1))
             start = time.monotonic()
@@ -63,7 +63,7 @@ class UnitTest(unittest.TestCase):
                 text_written.set()
         log.append.side_effect = append
         with mock.patch.object(C, "Log", return_value=log):
-            recorder = C.Recorder(mock.Mock(), agent="worker", turn="t2", connect=mock.Mock(),
+            recorder = C.Recorder(mock.Mock(), reader=adapters.AcpStream(), agent="worker", turn="t2", connect=mock.Mock(),
                                   warn=mock.Mock())
             recorder.on_event({"parent_tool_use_id": "child"}, {"display": ["hidden"]})
             recorder.on_event({"type": "text", "text": "a"}, {"display": ["a"]})
@@ -84,7 +84,7 @@ class UnitTest(unittest.TestCase):
         raw = {"type": "tool", "kind": "execute", "status": "completed",
                "title": "curl -H Authorization:Bearer SECRET"}
         with mock.patch.object(C, "Log", return_value=log):
-            recorder = C.Recorder(mock.Mock(), agent="worker", turn="title", connect=mock.Mock())
+            recorder = C.Recorder(mock.Mock(), reader=adapters.AcpStream(), agent="worker", turn="title", connect=mock.Mock())
             recorder.on_event(raw, adapters.AcpStream().parse_event(raw))
             recorder.close()
         calls = log.append.call_args_list
@@ -100,7 +100,7 @@ class UnitTest(unittest.TestCase):
         line = json.dumps(raw)
         log = mock.Mock()
         with mock.patch.object(C, "Log", return_value=log):
-            recorder = C.Recorder(mock.Mock(), agent="worker", turn="display", connect=mock.Mock())
+            recorder = C.Recorder(mock.Mock(), reader=adapters.AcpStream(), agent="worker", turn="display", connect=mock.Mock())
             recorder.on_event(line, adapters.TextStream().parse(line))
             recorder.on_event("plain output " + secret, {"display": [secret]})
             recorder.on_event({"type": "thought", "text": secret}, {"display": [secret]})
@@ -109,6 +109,53 @@ class UnitTest(unittest.TestCase):
         self.assertNotIn(secret, repr(log.append.call_args_list))
         self.assertEqual([c.args[1] for c in log.append.call_args_list if c.args[0] == "text"],
                          ["explicit answer"])
+
+    def test_real_textstream_cannot_claim_any_assistant_protocol(self):
+        secret = "SECRET_FROM_TOOL_OUTPUT"
+        raws = [
+            {"type": "text", "text": secret},
+            {"type": "final", "text": secret},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": secret}]}},
+            {"type": "result", "result": secret},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": secret}},
+            {"method": "item/agentMessage/delta", "params": {"delta": secret}}]
+        for reader in (None, adapters.TextStream(), mock.Mock()):
+            log = mock.Mock()
+            with self.subTest(reader=reader), mock.patch.object(C, "Log", return_value=log):
+                recorder = C.Recorder(mock.Mock(), agent="worker", turn="untrusted",
+                                      reader=reader, connect=mock.Mock())
+                for raw in raws:
+                    line = json.dumps(raw)
+                    parsed = adapters.TextStream().parse(line)
+                    self.assertEqual(C.agent_text(raw, parsed, reader=reader), [])
+                    recorder.on_event(line, parsed)
+                recorder.finish(final=recorder.final_text or "")
+                recorder.close()
+            self.assertNotIn(secret, repr(log.append.call_args_list))
+
+    def test_real_known_readers_keep_assistant_text_and_final(self):
+        cases = [
+            (adapters.ClaudeStream(), {"type": "result", "result": "answer"}),
+            (adapters.CodexStream(), {"type": "item.completed", "item": {
+                "type": "agent_message", "text": "answer"}}),
+            (adapters.DshStream(), {"type": "final", "text": "answer"}),
+            (adapters.AcpStream(), {"type": "final", "text": "answer"})]
+        for reader, raw in cases:
+            log = mock.Mock()
+            with self.subTest(reader=reader), mock.patch.object(C, "Log", return_value=log):
+                recorder = C.Recorder(mock.Mock(), agent="worker", turn="known",
+                                      reader=reader, connect=mock.Mock())
+                recorder.on_event(json.dumps(raw), reader.parse(json.dumps(raw)))
+                self.assertEqual(recorder.final_text, "answer")
+                recorder.finish(final=recorder.final_text)
+                recorder.close()
+            self.assertEqual([c.args[1] for c in log.append.call_args_list
+                              if c.args[0] in ("text", "turn_end")], ["answer", "answer"])
+
+    def test_reader_cannot_claim_another_protocol(self):
+        raw = {"type": "text", "text": "secret"}
+        for reader in (adapters.ClaudeStream(), adapters.CodexStream()):
+            self.assertEqual(C.agent_text(raw, {"display": ["secret"]}, reader=reader), [])
 
     def test_history_detects_internal_and_trailing_holes_in_retained_detail(self):
         st = mock.Mock()
@@ -136,9 +183,13 @@ class UnitTest(unittest.TestCase):
             {"type": "stream_event", "event": {"type": "content_block_delta",
                 "delta": {"type": "text_delta", "text": "answer"}}}]
         for raw in cases:
+            kind = raw.get("type")
+            reader = (adapters.AcpStream() if kind in ("text", "final") else
+                      adapters.ClaudeStream() if kind in ("assistant", "result", "stream_event")
+                      else adapters.CodexStream())
             with self.subTest(raw=raw):
-                self.assertEqual(C.agent_text(raw, {"display": ["raw envelope secret"]}), ["answer"])
-                self.assertEqual(C.agent_text(raw, {}), [])
+                self.assertEqual(C.agent_text(raw, {"display": ["raw envelope secret"]}, reader=reader), ["answer"])
+                self.assertEqual(C.agent_text(raw, {}, reader=reader), [])
         self.assertEqual(C.agent_text({"type": "result", "result": "secret", "is_error": True},
                                       {"final": "secret"}), [])
         self.assertEqual(C.tool_events({"type": "tool", "name": "curl -H secret",
@@ -283,7 +334,7 @@ class StoreTest(PgTestCase):
         self.assertFalse(C.history(self.db, "worker", after=3)["gap"])
 
     def test_real_recorder_uses_dedicated_connection_and_writes_final_to_thread(self):
-        recorder = C.Recorder(self.cfg, agent="worker", turn="turn-1", project="acme", lot="78")
+        recorder = C.Recorder(self.cfg, reader=adapters.AcpStream(), agent="worker", turn="turn-1", project="acme", lot="78")
         recorder.on_event({"type": "session"}, {"session": "session-1"})
         recorder.on_event({"type": "text", "text": "Hello "}, {"display": ["Hello "]})
         recorder.on_event({"type": "text", "text": "world"}, {"display": ["world"]})
@@ -304,6 +355,35 @@ class StoreTest(PgTestCase):
         self.assertNotIn("secret", json.dumps(rows))
         self.assertEqual([e.text for e in fil.transport_for(self.cfg).read(
             fil.ThreadRef("acme", "78"))], ["Done"])
+
+    def test_legacy_rows_are_quarantined_from_history_progress_replay_and_outbox(self):
+        secret = "curl -H Authorization:Bearer SECRET"
+        for kind in ("text", "tool", "turn_end"):
+            self.log.append(kind, secret, meta={"tool": secret}, event_id=kind,
+                            thread_text=secret if kind == "turn_end" else None)
+        # Simulate rows written by r1/r2, before the provenance policy marker.
+        self.db.execute("UPDATE conversation_log SET meta = meta - '_conversation_policy'")
+        page = C.history(self.db, "worker", limit=1)
+        self.assertEqual(page["entries"], [])
+        self.assertEqual(page["last_seq"], 3)
+        self.assertTrue(page["gap"])
+        self.assertFalse(page["more"])
+        self.assertEqual(page["next_seq"], 3)
+        self.assertEqual(self.log.store.pending_threads("worker"), [])
+        self.assertEqual(self.log.drain_threads(), 0)
+        replay = self.log.append("tool", "safe", event_id="tool")
+        self.assertNotIn("SECRET", json.dumps(replay))
+        self.assertEqual(replay["seq"], 2)
+        self.log.append("text", "safe new answer")
+        page = C.history(self.db, "worker", limit=1)
+        self.assertEqual([r["seq"] for r in page["entries"]], [4])
+        self.assertTrue(page["gap"])
+        self.assertFalse(page["more"])
+        agents = [{"name": "worker"}]
+        C.attach_progress(self.db, agents, limit=1)
+        self.assertEqual(agents[0]["conversation"]["entries"][0]["text"], "safe new answer")
+        self.assertNotIn("SECRET", json.dumps(agents))
+        self.assertNotIn("_conversation_policy", json.dumps(page))
 
     def test_one_turn_runner_and_progress_use_same_conversation(self):
         proc = self.register("worker", "claude", cwd=self.tmp, chantier="acme", prompt="work")

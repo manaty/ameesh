@@ -65,13 +65,27 @@ L76 attaches a nonblocking sink to L75's reader callback:
 from ameesh.conversation import Recorder
 
 recorder = Recorder(cfg, agent=agent, turn=turn.id, session=session,
-                    project=project, lot=lot)
+                    project=project, lot=lot, reader=adapter.reader)
 driver = resident.driver_for(adapter, cwd=cwd, on_event=recorder.on_event)
 # After the logical turn completes (including its steered inputs):
 recorder.finish(final=result.final, status=result.status, cost=result.cost,
                 usage=result.usage, duration_s=result.duration_s)
 recorder.close()
 ```
+
+The sink validates the configured reader object against the built-in Claude,
+Codex, DeepSeek and ACP readers, then accepts only that reader's protocol.
+`TextStream`, missing readers and unknown readers cannot supply assistant
+text or tool events, even if stdout contains JSON shaped like agent events.
+The runner's final answer uses the same validated source.
+
+Earlier conversation producers had no reliable provenance. Their unmarked
+rows remain stored but are quarantined from history, progress, replay content
+and pending thread delivery. New storage writes carry a private policy marker;
+it is not accepted from caller metadata and is omitted from exported metadata.
+Quarantine preserves sequence heads, so history reports gaps and advances its
+cursor over hidden rows. Already delivered R12 thread files are outside this
+read quarantine.
 
 The writer owns a separate database connection; the callback only selects
 bounded fields and queues them. Agent text is grouped into slices of
