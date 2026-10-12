@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from unittest import mock
 
-from ameesh import deps, deps_packagers
+from ameesh import deps, deps_packagers, menage
 from . import test_l231_deps as l231
 
 
@@ -85,6 +85,60 @@ class PackagerTests(l231._Base):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(text)["items"][0]["status"], "linked")
 
+    def test_root_and_sibling_tooling_guard_the_app_without_their_own_lockfile(self):
+        pkg = self.package()
+        root = Path(pkg).parent
+        l231._git(str(root), "init", "-q", "-b", "main")
+        for directory in (root, root / "tools"):
+            with self.subTest(directory=directory):
+                directory.mkdir(exist_ok=True)
+                manifest = directory / "package.json"
+                manifest.write_text(json.dumps({"scripts": {
+                    "dist": "electron-builder --projectDir app"}}))
+                installer = l231.FakeInstaller()
+                refused = deps.link_package(pkg, self.cache, installer=installer)
+                self.assertEqual(refused["status"], "packager-refused")
+                self.assertEqual(installer.calls, [])
+                deps.link_package(pkg, self.cache, installer=installer, force=True)
+                self.assertIn("electron-builder", deps._status(pkg, self.cache)[0]["warning"])
+                done = deps.link_ready(pkg, self.cache)
+                self.assertEqual(done[0]["status"], "unlinked")
+                self.assertFalse(Path(pkg, "node_modules").is_symlink())
+                manifest.unlink()
+
+    def test_config_only_apps_refuse_links_and_warn_on_forced_links(self):
+        pkg = self.package()
+        manifest_path = Path(pkg, "package.json")
+        for config in ("build", *deps_packagers.BUILDER_CONFIGS):
+            with self.subTest(config=config):
+                if config == "build":
+                    manifest_path.write_text(json.dumps(dict(l231.MANIFEST, build={})))
+                else:
+                    Path(pkg, config).write_text("{}")
+                self.assertEqual(deps.link_package(pkg, self.cache)["status"],
+                                 "packager-refused")
+                deps.link_package(pkg, self.cache, installer=l231.FakeInstaller(), force=True)
+                self.assertIn("deps unlink", deps._status(pkg, self.cache)[0]["warning"])
+                Path(pkg, "node_modules").unlink()
+                if config == "build":
+                    manifest_path.write_text(json.dumps(l231.MANIFEST))
+                else:
+                    Path(pkg, config).unlink()
+
+    def test_repository_detection_stays_out_of_nested_repositories_and_symlinks(self):
+        pkg = self.package()
+        root = Path(pkg).parent
+        l231._git(str(root), "init", "-q", "-b", "main")
+        nested = root / "nested"
+        nested.mkdir()
+        l231._git(str(nested), "init", "-q", "-b", "main")
+        Path(nested, "package.json").write_text('{"build": {}}')
+        outside = Path(self.base, "outside")
+        outside.mkdir()
+        Path(outside, "package.json").write_text('{"build": {}}')
+        (root / "alias").symlink_to(outside, target_is_directory=True)
+        self.assertEqual(deps._packagers(pkg), [])
+
     def test_turn_start_never_links_a_packager_even_with_a_ready_entry(self):
         pkg = self.package(devDependencies={"pkg": "5"})
         l231._git(os.path.dirname(pkg), "init", "-q", "-b", "main")
@@ -92,6 +146,50 @@ class PackagerTests(l231._Base):
         os.unlink(os.path.join(pkg, "node_modules"))
         self.assertEqual(deps.link_ready(pkg, self.cache), [])
         self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+
+    def test_turn_start_removes_legacy_shared_link_and_keeps_local_and_external_trees(self):
+        pkg = self.package()
+        l231._git(os.path.dirname(pkg), "init", "-q", "-b", "main")
+        deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+        target = Path(os.path.realpath(os.path.join(pkg, "node_modules")))
+        # A link created before the packager declaration/corrective guard.
+        Path(pkg, "package.json").write_text(json.dumps(dict(l231.MANIFEST, build={})))
+        done = deps.link_ready(pkg, self.cache)
+        self.assertEqual(done[0]["status"], "unlinked")
+        self.assertIn("deps unlink", done[0]["reason"])
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+        self.assertTrue((target / "left-pad/lib/index.js").is_file())
+        self.assertEqual(deps.link_ready(pkg, self.cache), [])
+        local = Path(pkg, "node_modules")
+        local.mkdir()
+        (local / "keep").write_text("local")
+        self.assertEqual(deps.link_ready(pkg, self.cache), [])
+        self.assertEqual((local / "keep").read_text(), "local")
+        (local / "keep").unlink()
+        local.rmdir()
+        outside = Path(self.base, "external-modules")
+        outside.mkdir()
+        local.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(deps.link_ready(pkg, self.cache), [])
+        self.assertTrue(local.is_symlink())
+
+    def test_turn_begin_records_legacy_link_removal(self):
+        pkg = self.package(build={})
+        l231._git(os.path.dirname(pkg), "init", "-q", "-b", "main")
+        cfg = l231._Cfg(os.path.join(self.base, "state"))
+        policy = menage.Policy(worktrees=False)
+        cache = menage.cache_root(cfg, policy)
+        deps.link_package(pkg, cache, installer=l231.FakeInstaller(), force=True)
+        turn = menage.Turn.begin(cfg, policy, "dev7", pkg,
+                                 new_session=False, base_env={"PATH": ""})
+        try:
+            self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+            records = [item for item in turn.entries if item["kind"] == "deps"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["action"], "unlinked")
+            self.assertIn("deps unlink", records[0]["detail"])
+        finally:
+            turn.lock.release()
 
     def test_unlink_uses_lockfile_locally_and_leaves_other_cache_users_intact(self):
         pkg = self.package(devDependencies={"electron-builder": "26"})
@@ -162,6 +260,28 @@ Path('node_modules/transitive/index.js').write_text('module.exports = 1')
         self.assertTrue(Path(pkg, "node_modules").is_symlink())
         self.assertEqual(self.cli("unlink", pkg)[0], 1)
 
+    def test_unlink_mixed_paths_reports_missing_lock_and_installs_valid_package(self):
+        pkg = self.package()
+        deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+        Path(pkg, deps.LOCKFILE).unlink()
+        good = l231._package(os.path.join(self.base, "good"))
+        installer = l231.FakeInstaller()
+        original = deps.make_local
+        for command in ("unlink", "local"):
+            with self.subTest(command=command), mock.patch.object(
+                    deps, "make_local", side_effect=lambda p: original(p, installer=installer)):
+                code, output = self.cli(command, pkg, good, "--json")
+                self.assertEqual(code, 1)
+                items = json.loads(output)["items"]
+                self.assertEqual(items[0]["status"], "no-lockfile")
+                self.assertEqual(items[1]["status"],
+                                 "local" if command == "unlink" else "local-kept")
+                self.assertTrue(Path(pkg, "node_modules").is_symlink())
+        self.assertEqual(installer.calls, [good])
+        code, output = self.cli("unlink", str(Path(pkg).parent), "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(output)["items"][0]["status"], "no-lockfile")
+
     def test_invalid_manifest_refuses_link_and_status_explains_why(self):
         pkg = self.package()
         Path(pkg, "package.json").write_text("{broken")
@@ -210,3 +330,12 @@ class ShimTests(l231._Base):
         review = l231._package(os.path.join(self.base, "acme-review-release"),
                                manifest=dict(l231.MANIFEST, devDependencies={"pkg": "5"}))
         self.assertEqual(self._npm("ci", cwd=review), (1, []))
+
+    def test_root_config_prevents_wrapper_from_relinking_the_app(self):
+        pkg = l231._package(os.path.join(self.base, "worktree"))
+        root = Path(pkg).parent
+        l231._git(str(root), "init", "-q", "-b", "main")
+        deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+        Path(root, "package.json").write_text('{"build": {}}')
+        self.assertEqual(self._npm("ci", cwd=pkg), (0, [["ci"]]))
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))

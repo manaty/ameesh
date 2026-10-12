@@ -99,10 +99,21 @@ A PATH is a worktree (its packages are found down to depth 3, never through
 `deps link` refuses packages declaring `electron-builder`, `electron-packager`,
 `@electron/packager`, `pkg`, `@yao-pkg/pkg`, `nexe` or `@vercel/ncc`, including npm
 dependency aliases. It also detects their command names in `package.json`
-scripts (`ncc` for `@vercel/ncc`). The refusal happens before any install or
+scripts (`ncc` for `@vercel/ncc`). Electron-builder's `build` manifest key and
+`electron-builder.{yml,yaml,json,json5,js,cjs,ts}` files also trigger the guard,
+even when the tool is invoked externally through `npx`. Manifest configuration
+keys `pkg` and `nexe` are detected too. Within a git worktree, root and sibling
+manifests are inspected even without lockfiles: tooling anywhere in the same
+repository conservatively guards every package, since it may target another
+app with `--projectDir`. Nested repositories, hidden and generated directories,
+and directory symlinks are excluded. The refusal happens before any install or
 replacement of a local tree. `--force` allows a development link explicitly;
 it does not make the link suitable for a release. Turn-start linking applies
-the same guard. Scripts hidden in external JS or shell files cannot be inferred.
+the same guard and removes existing shared-cache links in detected projects,
+without installing dependencies. Run `deps unlink` to install a local tree
+before building. Real local trees and links outside the shared cache are kept.
+Scripts hidden in external JS or shell files without declarations or recognized
+configuration cannot be inferred.
 
 Before packaging, run in the package directory:
 
@@ -115,7 +126,9 @@ npm run dist
 `npm ci` locally, using `package-lock.json`, with development, optional and
 peer dependencies and lifecycle scripts enabled. It reports the local
 installation, leaves the shared cache and other worktrees' links intact, and
-returns a failure if npm fails or no lockfile is found. A local tree already
+returns a failure if npm fails or a requested package has no lockfile, including
+mixed requests where other packages succeed. Missing lockfiles are reported
+before removing their links. A local tree already
 present is kept; use `AMEESH_DEPS=off npm ci` to refresh it before a release.
 
 In a detected packaging project, the npm wrapper passes install commands to

@@ -8,6 +8,10 @@ import shlex
 PACKAGERS = frozenset(("electron-builder", "electron-packager", "@electron/packager",
                        "pkg", "@yao-pkg/pkg", "nexe", "@vercel/ncc"))
 COMMANDS = {"ncc": "@vercel/ncc"}
+BUILDER_CONFIGS = ("electron-builder.yml", "electron-builder.yaml",
+                   "electron-builder.json", "electron-builder.json5",
+                   "electron-builder.js", "electron-builder.cjs",
+                   "electron-builder.ts")
 DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 
 
@@ -22,6 +26,13 @@ def packagers(pkg_dir):
     if not isinstance(manifest, dict):
         raise ValueError("package.json must be an object")
     found = set()
+    if "build" in manifest or any(os.path.isfile(os.path.join(pkg_dir, name))
+                                  for name in BUILDER_CONFIGS):
+        found.add("electron-builder")
+    if "pkg" in manifest:
+        found.add("pkg")
+    if "nexe" in manifest:
+        found.add("nexe")
     for field in DEPENDENCIES:
         dependencies = manifest.get(field, {})
         if not isinstance(dependencies, dict):

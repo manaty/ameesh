@@ -720,6 +720,31 @@ def git_exclude(link: str) -> str | None:
     return pattern
 
 
+def _packagers(pkg_dir: str) -> list[str]:
+    """Conservative guard: root/sibling tooling can package any app in git.
+
+    Inspect manifests even without a lockfile. Never cross into nested git
+    repositories, generated trees, hidden directories or directory symlinks.
+    """
+    root = worktree_root(pkg_dir)
+    found = set(deps_packagers.packagers(pkg_dir))
+    if not root:
+        return sorted(found)
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if current != pkg_dir and os.path.isfile(os.path.join(current, "package.json")):
+            found.update(deps_packagers.packagers(current))
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if (entry.name.startswith(".") or entry.name in SKIP_DIRS
+                        or not entry.is_dir(follow_symlinks=False)
+                        or os.path.lexists(os.path.join(entry.path, ".git"))):
+                    continue
+                stack.append(entry.path)
+    return sorted(found)
+
+
 def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
                  replace: bool = False, installer=npm_ci, env: dict | None = None,
                  wait: float = FILL_WAIT_S, force: bool = False) -> dict:
@@ -741,7 +766,7 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
     if not os.path.isfile(os.path.join(pkg_dir, LOCKFILE)):
         return dict(result, status="no-lockfile")
     try:
-        packagers = deps_packagers.packagers(pkg_dir)
+        packagers = _packagers(pkg_dir)
     except (OSError, ValueError) as exc:
         return dict(result, status="package-invalid", error=str(exc))
     if packagers:
@@ -831,7 +856,9 @@ def link_tree(top: str, cache_root: str, *, fill_missing: bool = True,
 def link_ready(top: str, cache_root: str) -> list[dict]:
     """The runner's hook at the start of a turn (cheap, never installs): link
     the packages of the git worktree holding `top` that have NO
-    `node_modules` and whose entry is already complete. Nothing outside git:
+    `node_modules` and whose entry is already complete. Existing shared links
+    in packaging projects are removed without installing; run deps unlink to
+    install the required local tree. Nothing outside git:
     a turn started in a parent directory (`~/development/manaty`) would reach
     every worktree under it, review worktrees included (#249: 262 links from
     one turn). Never in a review worktree."""
@@ -840,9 +867,24 @@ def link_ready(top: str, cache_root: str) -> list[dict]:
         return []
     out = []
     for pkg in find_packages(root):
-        if os.path.lexists(os.path.join(pkg, NODE_MODULES)) or is_review_worktree(pkg):
+        if is_review_worktree(pkg):
             continue
         if worktree_root(pkg) != root:      # another worktree nested in this one
+            continue
+        link = os.path.join(pkg, NODE_MODULES)
+        if is_shared_link(link, cache_root):
+            try:
+                packagers = _packagers(pkg)
+            except (OSError, ValueError) as exc:
+                os.unlink(link)  # an unreadable manifest cannot preserve a shared tree
+                out.append(dict(package=pkg, status="unlinked", error=str(exc)))
+            else:
+                if packagers:
+                    os.unlink(link)
+                    out.append(dict(package=pkg, status="unlinked", packagers=packagers,
+                                    reason=deps_packagers.local_reason(packagers)))
+            continue
+        if os.path.lexists(link):
             continue
         done = link_package(pkg, cache_root, fill_missing=False)
         if done["status"] == "linked":
@@ -1067,7 +1109,7 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
     link = os.path.join(pkg, NODE_MODULES)
     if command in INSTALL_COMMANDS:
         try:
-            packagers = deps_packagers.packagers(pkg)
+            packagers = _packagers(pkg)
         except (OSError, ValueError) as exc:
             _say("invalid package.json: %s" % exc)
             return 1
@@ -1448,7 +1490,7 @@ def _status(top: str, cache_root: str) -> list[dict]:
         item = {"package": pkg, "key": key, "node_modules": state,
                 "cached": read_marker(entry_of(root, key)) is not None}
         try:
-            packagers = deps_packagers.packagers(pkg)
+            packagers = _packagers(pkg)
         except (OSError, ValueError) as exc:
             item["warning"] = "invalid package.json: %s" % exc
         else:
@@ -1499,7 +1541,15 @@ def main(argv: list[str] | None = None) -> int:
             items += link_tree(top, cache_root, fill_missing=not args.no_fill,
                                replace=args.replace, force=args.force)
     elif args.command in ("local", "unlink"):
-        items = [make_local(p) for top in paths for p in find_packages(top)]
+        items = []
+        for top in paths:
+            packages = [os.path.abspath(top)] if os.path.isfile(
+                os.path.join(top, "package.json")) else [
+                    p for p in _walk(top, SEARCH_DEPTH)
+                    if os.path.isfile(os.path.join(p, "package.json"))]
+            items += [make_local(p) for p in packages] if packages else [
+                dict(package=os.path.abspath(top), status="no-lockfile",
+                     error="no package-lock.json found in this path")]
     elif args.command == "status":
         items = [i for top in paths for i in _status(top, cache_root)]
     else:
