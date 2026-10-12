@@ -1512,6 +1512,10 @@ class Canon(Domain):
         `profile_fresh` et `in_turn`."""
 
     @abc.abstractmethod
+    def lot_projects(self) -> list[str]:
+        """L243 : les projets des lots (`app`), distincts."""
+
+    @abc.abstractmethod
     def write_declared(self, name: str, values: dict) -> None:
         """Écrit les colonnes déclaratives (crée l'agent au besoin) et le profil
         évalué des valeurs écrites, dans la même instruction."""

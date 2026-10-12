@@ -182,7 +182,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
         'turn_grace_seconds',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
