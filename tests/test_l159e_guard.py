@@ -5,6 +5,7 @@ drain (tranche 3)."""
 from __future__ import annotations
 
 import dataclasses
+import io
 import datetime as dt
 import json
 import math
@@ -1030,21 +1031,23 @@ class EnforcerTest(unittest.TestCase):
             self.assertTrue(g.step()["freeze"]["enforced"])
             self.assertEqual(self.runs()[-1][-1], "55")
 
-    def test_freeze_script_holds_the_bound_across_a_suspend(self):
-        # codex #276 r1: the script, run by sh on fake systemctl and sleep;
-        # each `sleep` moves the boot clock by its seconds, the third one
-        # spans a 300 s suspend: the clock is read again, the slice thaws
-        # at once (a single `sleep 50` would hold it 50 s after resume)
+    def freeze_script(self, uptime_s: str | None, suspend_at: int = 0) -> list[str]:
+        """FREEZE_SCRIPT run by sh on fake systemctl and sleep, bound 60.000:
+        each `sleep` moves the boot clock by its seconds, the `suspend_at`-th
+        one spans a 300 s suspend; `uptime_s` None: no clock to read. The
+        calls, in order."""
         with tempfile.TemporaryDirectory() as tmp:
             uptime, log = os.path.join(tmp, "uptime"), os.path.join(tmp, "log")
-            with open(uptime, "w") as fh:
-                fh.write("10.00 5.00\n")
+            if uptime_s is not None:
+                with open(uptime, "w") as fh:
+                    fh.write("%s 5.00\n" % uptime_s)
             for name, body in (
                     ("systemctl", 'echo "systemctl $*" >> "%s"' % log),
                     ("sleep", 'echo "sleep $*" >> "%s"; n=$(grep -c sleep "%s"); '
-                              'awk -v s="$1" -v n="$n" \'{print $1 + s + (n == 3 ? 300 : 0), $2}\' '
+                              'awk -v s="$1" -v n="$n" -v z=%d '
+                              '\'{print $1 + s + (n == z ? 300 : 0), $2}\' '
                               '"%s" > "%s.new" && mv "%s.new" "%s"'
-                              % (log, log, uptime, uptime, uptime, uptime))):
+                              % (log, log, suspend_at, uptime, uptime, uptime, uptime))):
                 path = os.path.join(tmp, name)
                 with open(path, "w") as fh:
                     fh.write("#!/bin/sh\n" + body + "\n")
@@ -1054,9 +1057,46 @@ class EnforcerTest(unittest.TestCase):
             subprocess.run(["/bin/sh", "-c", script, "ameesh-guest.slice", "60.000", "50"],
                            env=env, check=True, timeout=20)
             with open(log) as fh:
-                self.assertEqual(fh.read().splitlines(), [
-                    "systemctl freeze ameesh-guest.slice", "sleep 1", "sleep 1", "sleep 1",
-                    "systemctl thaw ameesh-guest.slice"])
+                return fh.read().splitlines()
+
+    def test_freeze_script_holds_the_bound_across_a_suspend(self):
+        # codex #276 r1: the clock is read again after the suspend, the
+        # slice thaws at once (a single `sleep 50` would hold it 50 s after
+        # resume)
+        self.assertEqual(self.freeze_script("10.00", suspend_at=3), [
+            "systemctl freeze ameesh-guest.slice", "sleep 1", "sleep 1", "sleep 1",
+            "systemctl thaw ameesh-guest.slice"])
+
+    def test_freeze_script_thaws_at_the_bound(self):
+        # codex #276 r2: the last wait is what is left, not a whole second
+        # (58.90 + 1 + 1 thawed at 60.90)
+        self.assertEqual(self.freeze_script("58.90"), [
+            "systemctl freeze ameesh-guest.slice", "sleep 1", "sleep 0.1",
+            "systemctl thaw ameesh-guest.slice"])
+        # an unreadable clock ends the wait
+        self.assertEqual(self.freeze_script(None), [
+            "systemctl freeze ameesh-guest.slice", "systemctl thaw ameesh-guest.slice"])
+
+    def test_a_persistent_write_failure_never_ends_the_guard(self):
+        # codex #276 r2: a full disk refuses the episode (no freeze), then the
+        # publication: reported, the guard keeps evaluating; the state is
+        # written as soon as the disk takes it again
+        import errno
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, make = self._guard_cfg(tmp)
+            g = make()
+            full = OSError(errno.ENOSPC, "No space left on device")
+            with mock.patch.object(guard, "write_state", side_effect=full), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                for _ in range(3):
+                    self.assertEqual(g.step()["level"], 2)
+                    self.tick(5)
+            self.assertEqual((self.runs(), os.path.exists(cfg.state_path)), ([], False))
+            self.assertIn("No space left on device", err.getvalue())
+            state = g.step()
+            self.assertTrue(state["freeze"]["enforced"])
+            with open(cfg.state_path) as fh:
+                self.assertEqual(json.load(fh)["seq"], state["seq"])
 
     def test_restart_takes_over_the_service(self):
         # an earlier guard's service still holds the slice: the new guard

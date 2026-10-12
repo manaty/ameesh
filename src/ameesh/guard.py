@@ -800,11 +800,12 @@ FREEZE_BACKSTOP_S = 30
 #: no delay in starting the service lengthens the freeze (L159e5); the
 #: clock is read again every second: a suspend (counted by the boot clock,
 #: not by `sleep` nor RuntimeMaxSec=) never holds it past the bound (codex
-#: #276 r1). `$2`: the seconds left, when there is no boot clock. An
+#: #276 r1); the last wait is only what is left (#276 r2). `$2`: the seconds left, when there is no boot clock. An
 #: unreadable clock ends the wait
 FREEZE_SCRIPT = ('systemctl freeze "$0" && { if [ -n "$1" ]; then '
-                 'while awk -v d="$1" \'{exit !($1 < d)}\' ' + host.UPTIME + '; '
-                 'do sleep 1; done; '
+                 'while s="$(awk -v d="$1" \'{l = d - $1; if (l <= 0) exit 1; '
+                 'print (l < 1 ? l : 1)}\' ' + host.UPTIME + ')"; '
+                 'do sleep "$s"; done; '
                  'else sleep "$2"; fi; }; '
                  'until systemctl thaw "$0"; do sleep 2; done')
 
@@ -1295,6 +1296,8 @@ class Guard:
         self.written_ts = 0.0
         self.last_key = None
         self.written_decision = None
+        #: the last write of the state failed: written again at the next step
+        self.write_failed = False
 
     def _persist_episode(self, episode: dict) -> bool:
         """A new freeze episode, written into the last published state before
@@ -1367,11 +1370,20 @@ class Guard:
         # units to start again, are written at once: a restart must not take
         # back a stale one
         decision = {k: state["guard"].get(k) for k in ("decision", "stopped", "restart")}
-        due = now - self.written_ts >= STATE_TTL_S / 3
+        due = now - self.written_ts >= STATE_TTL_S / 3 or self.write_failed
         if key != self.last_key or due or decision != self.written_decision:
-            write_state(self.cfg.state_path, state)
-            self.written_ts, self.written_decision = now, decision
-            self.published = state
+            try:
+                write_state(self.cfg.state_path, state)
+            except OSError as exc:
+                # a full or read-only disk: reported, written again at the
+                # next evaluation; the guard keeps deciding and enforcing
+                # (codex #276 r2). A guest that cannot read a fresh state
+                # stops on its own (the state expires)
+                print("ameesh guard: %s: %s" % (self.cfg.state_path, exc), file=sys.stderr)
+                self.write_failed = True
+            else:
+                self.written_ts, self.written_decision = now, decision
+                self.published, self.write_failed = state, False
         self.last_key, self.state = key, state
         return state
 
