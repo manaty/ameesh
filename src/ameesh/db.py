@@ -84,8 +84,36 @@ _CONNECT_HINTS = (
 )
 
 
+#: code SQLSTATE de PostgreSQL pour une violation d'unicité
+UNIQUE_VIOLATION = "23505"
+#: ce que le pilote psql imprime pour elle (il ne donne pas le code)
+_UNIQUE_VIOLATION_MARKER = "duplicate key value violates unique constraint"
+
+
 class DbError(RuntimeError):
-    """Erreur SQL ou de protocole."""
+    """Erreur SQL ou de protocole. `sqlstate` : le code du serveur quand le
+    pilote le donne (psycopg), None sinon (psql, qui n'imprime que le
+    message)."""
+
+    def __init__(self, message, *, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bool:
+    """`exc` est-elle la violation d'unicité de `constraint` (ou d'une
+    contrainte quelconque quand il est None) ? Le code SQLSTATE 23505 tranche
+    quand le pilote le donne ; le pilote psql ne le donne pas, son message
+    standard en tient lieu. Le nom de la contrainte est exigé : une autre
+    erreur qui le mentionne (« permission denied for relation ... ») n'est
+    pas une violation d'unicité (codex #478 r1)."""
+    if not isinstance(exc, DbError):
+        return False
+    if exc.sqlstate is not None:
+        unique = exc.sqlstate == UNIQUE_VIOLATION
+    else:
+        unique = _UNIQUE_VIOLATION_MARKER in str(exc)
+    return unique and (constraint is None or constraint in str(exc))
 
 
 class Unavailable(DbError):
@@ -1103,13 +1131,21 @@ def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())[:300]
 
 
+def _sqlstate(exc: Exception) -> str | None:
+    """Le code SQLSTATE d'une exception de pilote, quand il le donne :
+    psycopg 3 (`sqlstate`), psycopg 2 (`pgcode`)."""
+    state = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return state if isinstance(state, str) and state else None
+
+
 def _map_error(exc: Exception) -> DbError:
     text = _one_line(exc).lower()
+    state = _sqlstate(exc)
     if any(hint in text for hint in _CONNECT_HINTS):
-        return Unavailable(_one_line(exc))
+        return Unavailable(_one_line(exc), sqlstate=state)
     if "does not exist" in text and ("relation" in text or "table" in text):
-        return SchemaMissing(_one_line(exc))
-    return DbError(_one_line(exc))
+        return SchemaMissing(_one_line(exc), sqlstate=state)
+    return DbError(_one_line(exc), sqlstate=state)
 
 
 def is_unavailable(exc: BaseException) -> bool:

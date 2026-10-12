@@ -471,49 +471,145 @@ class ReservationsSimultaneesTest(PgTestCase):
             t.join(180)
         self.assertEqual(sorted(out.values()), list(range(377, 377 + len(ids))), out)
 
+
+#: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
+_INDEX = "work_items_migration_repo_idx"
+
+
+def _violation(*, marker=True, state=None) -> DbError:
+    """La violation d'unicité de l'index telle que le pilote la rend : le
+    marqueur standard de psql (`marker`) et/ou le code 23505 de psycopg
+    (`state`)."""
+    message = ('psql: ERROR:  duplicate key value violates unique constraint "%s"'
+               % _INDEX) if marker else "psycopg: %s" % _INDEX
+    exc = DbError(message)
+    if state is not None:
+        exc.sqlstate = state
+    return exc
+
+
+class _FakeTime:
+    """Horloge fausse d'un test de budget : `monotonic()` ne bouge que par
+    `sleep()`, qui est enregistré au lieu d'attendre (codex #478 r1)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+class RetryReservationTest(PgTestCase):
+    """#478 (codex r1) : le budget de réessais de la réservation, sans
+    ordonnancement réel ni verrou : les violations d'unicité sont injectées
+    et l'horloge est fausse."""
+
+    def setUp(self):
+        super().setUp()
+        self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                              NEXLINK.directory, ["376_b.sql"])
+
+    def _lot(self):
+        return work.add(self.db, title="lot", issue_ref="manaty/nexlink#1",
+                        actor="mesh-design")["id"]
+
+    def _reserve(self, exc, *, budget):
+        """`reserve_migration` sur un lot neuf, chaque essai levant `exc` :
+        rend (résultat ou exception, horloge, essais, tirages d'attente)."""
+        lot = self._lot()
+        clock = _FakeTime()
+        attempts, draws = [], []
+
+        def transaction():
+            attempts.append(clock.now)
+            raise exc
+
+        def uniform(low, high):
+            draws.append((low, high))
+            return high
+
+        with mock.patch.object(pg_work, "time", clock), \
+                mock.patch.object(pg_work, "_RESERVE_BUDGET_S", budget), \
+                mock.patch.object(pg_work, "random",
+                                  types.SimpleNamespace(uniform=uniform)), \
+                mock.patch.object(self.db, "transaction", side_effect=transaction):
+            try:
+                out = work.reserve_migration(self.db, lot, repo=self.nexlink)
+            except Exception as got:  # noqa: BLE001 - rapporté par l'assertion
+                out = got
+        return out, clock, attempts, draws
+
+    def test_l_attente_est_bornee_par_le_budget_restant(self):
+        # codex #478 r1 : avec 1 ms de budget, l'ancienne attente de 5 ms
+        # entamait une transaction après l'échéance ; l'attente est bornée au
+        # restant, et rien n'est retenté une fois l'échéance passée
+        got, clock, attempts, _ = self._reserve(_violation(), budget=0.001)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+        self.assertEqual(attempts, [0.0], "une seule transaction, avant l'échéance")
+        self.assertEqual(clock.slept, [0.001], "l'attente tient dans le budget")
+
+    def test_budget_nul_ne_retente_pas(self):
+        # codex #478 r1 : budget épuisé, la première violation rend la
+        # contention sans deuxième transaction ni attente
+        got, clock, attempts, _ = self._reserve(_violation(), budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(attempts, [0.0])
+        self.assertEqual(clock.slept, [])
+
+    def test_une_erreur_qui_nomme_l_index_sans_unicite_remonte(self):
+        # codex #478 r1 : « permission denied for relation
+        # work_items_migration_repo_idx » n'est pas une violation d'unicité :
+        # elle remonte telle quelle, jamais en WorkError de contention
+        denied = DbError("psql: ERROR:  permission denied for relation %s" % _INDEX)
+        got, _, _, _ = self._reserve(denied, budget=0.05)
+        self.assertIs(got, denied, got)
+
+    def test_la_violation_se_reconnait_au_code_ou_au_marqueur(self):
+        # codex #478 r1 : psycopg donne le code 23505 (sans le texte), psql
+        # donne le marqueur standard (sans code) ; les deux sont la
+        # contention de l'index
+        for exc in (_violation(), _violation(marker=False, state="23505")):
+            with self.subTest(exc=str(exc)):
+                got, _, _, _ = self._reserve(exc, budget=0.0)
+                self.assertIsInstance(got, work.WorkError, got)
+                self.assertEqual(str(got), "reservation contention, retry")
+
+    def test_le_code_du_pilote_est_garde_sur_la_dberror(self):
+        # codex #478 r1 : le code SQLSTATE du pilote (psycopg) survit à la
+        # traduction en DbError, seul moyen de distinguer 23505 d'une autre
+        # erreur qui nomme le même index
+        class DriverError(Exception):
+            sqlstate = "23505"
+
+        mapped = db_mod._map_error(DriverError("duplicate key value"))
+        self.assertEqual(mapped.sqlstate, "23505")
+        self.assertIsNone(db_mod._map_error(Exception("boom")).sqlstate)
+
+    def test_l_attente_plein_jitter_part_de_zero(self):
+        # codex #478 r1 (P3) : plein jitter — uniform(0, min(cap, base*2^n)) —
+        # et non uniform(base, wait) : le premier tirage part de 0, les
+        # suivants doublent jusqu'au plafond
+        got, _, _, draws = self._reserve(_violation(), budget=10.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(draws[:3], [(0.0, 0.005), (0.0, 0.01), (0.0, 0.02)])
+
     def test_budget_epuise_rend_workerror_lisible(self):
-        """#478 : le budget de réessais épuisé (forcé à 0 s) sous une
-        réservation simultanée rend un WorkError lisible, jamais la DbError
-        brute de l'index `work_items_migration_repo_idx`."""
-        a, b = self._lots(2)
-        held, done, out = threading.Event(), threading.Event(), {}
-
-        def hold():
-            conn = db_mod.connect(self.cfg, driver="psql")
-            try:
-                with conn.transaction() as tx:
-                    tx.query("UPDATE work_items SET migration = 377,"
-                             " migration_repo = 'manaty/nexlink' WHERE id = %s"
-                             " RETURNING id", (a,))
-                    held.set()
-                    done.wait(60)   # jusqu'à ce que B attende sur l'index
-            finally:
-                conn.close()
-
-        def reserve():
-            conn = db_mod.connect(self.cfg, driver="psql")
-            try:
-                out["b"] = work.reserve_migration(conn, b, repo=self.nexlink)
-            except Exception as exc:  # noqa: BLE001 - rapporté par l'assertion
-                out["b"] = exc
-            finally:
-                conn.close()
-
-        ta = threading.Thread(target=hold)
-        with mock.patch.object(pg_work, "_RESERVE_BUDGET_S", 0.0):
-            ta.start()
-            self.assertTrue(held.wait(30))
-            tb = threading.Thread(target=reserve)
-            tb.start()
-            # B est réellement bloquée sur l'index avant que A ne valide
-            self.assertTrue(self._blocked(), "B never waited on A's reservation")
-            done.set()
-            ta.join(30)
-            tb.join(60)
-        got = out.get("b")
+        """#478 : le budget de réessais épuisé rend un WorkError lisible,
+        jamais la DbError brute de l'index. Déterministe (codex #478 r1) :
+        violation injectée, horloge fausse — plus de verrou réel ni
+        d'attente de 60 s."""
+        got, clock, attempts, _ = self._reserve(_violation(), budget=0.0)
         self.assertIsInstance(got, work.WorkError, got)
         self.assertEqual(str(got), "reservation contention, retry")
         self.assertNotIsInstance(got, DbError)
+        self.assertEqual(attempts, [0.0])
+        self.assertEqual(clock.slept, [])
 
 
 if __name__ == "__main__":

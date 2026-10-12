@@ -14,7 +14,7 @@ import json
 import random
 import time
 
-from ...db import DbError
+from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
 
@@ -63,12 +63,15 @@ _HELD = """
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
-#: de temps (et non plus un nombre d'essais) et une attente aléatoire
-#: croissante, pour que 20 réservations simultanées se départagent sans
-#: épuiser les essais ; épuisé, `ReservationContention` (WorkError lisible).
+#: de temps (et non plus un nombre d'essais) et une attente plein jitter
+#: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
+#: 20 réservations simultanées se départagent sans épuiser les essais ;
+#: épuisé, `ReservationContention` (WorkError lisible).
 _RESERVE_BUDGET_S = 30.0
-_RESERVE_WAIT_MIN_S = 0.005
+_RESERVE_WAIT_BASE_S = 0.005
 _RESERVE_WAIT_MAX_S = 0.5
+#: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
+MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
@@ -633,9 +636,11 @@ class WorkItems(interface.WorkItems):
         `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
         dans l'UPDATE même ; l'index unique `work_items_migration_repo_idx`
         tranche entre deux réservations simultanées : la perdante attend un
-        délai aléatoire croissant et recalcule (nouvelle transaction), dans un
-        budget de temps ; épuisé, `ReservationContention` — jamais la DbError
-        de l'index (#478). Un `number` explicite déjà pris lève la DbError de
+        délai plein jitter croissant, borné au budget restant, et recalcule
+        (nouvelle transaction) ; épuisé, `ReservationContention` — jamais la
+        DbError de l'index (#478). Seule la violation d'unicité de cet index
+        réessaie : une autre erreur qui le nomme remonte telle quelle
+        (codex #478 r1). Un `number` explicite déjà pris lève la DbError de
         l'index, sans réessai."""
         if release:
             value, params = "NULL", ()
@@ -646,7 +651,7 @@ class WorkItems(interface.WorkItems):
         else:
             value, params = "%s", (int(number),)
         deadline = time.monotonic() + _RESERVE_BUDGET_S
-        wait = _RESERVE_WAIT_MIN_S
+        wait = _RESERVE_WAIT_BASE_S
         while True:
             try:
                 with self.db.transaction() as tx:
@@ -664,15 +669,21 @@ class WorkItems(interface.WorkItems):
                     return rows[0]
             except DbError as exc:
                 if (number is not None or release
-                        or "work_items_migration_repo_idx" not in str(exc)):
+                        or not is_unique_violation(exc, MIGRATION_INDEX)):
                     raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise interface.ReservationContention(
+                        "reservation contention, retry") from exc
+                # plein jitter (codex #478 r1) : uniform(0, min(plafond,
+                # base·2^n)) — les perdantes se répartissent au lieu de
+                # retenter ensemble — borné au budget restant pour n'entamer
+                # aucune transaction après l'échéance
+                time.sleep(random.uniform(0.0, min(wait, remaining)))
+                wait = min(wait * 2, _RESERVE_WAIT_MAX_S)
                 if time.monotonic() >= deadline:
                     raise interface.ReservationContention(
                         "reservation contention, retry") from exc
-                # plein jitter : les perdantes se répartissent au lieu de
-                # retenter ensemble, puis l'attente double jusqu'à un plafond
-                time.sleep(random.uniform(_RESERVE_WAIT_MIN_S, wait))
-                wait = min(wait * 2, _RESERVE_WAIT_MAX_S)
 
     def migration_holder(self, number, repo) -> dict | None:
         rows = self.db.query(

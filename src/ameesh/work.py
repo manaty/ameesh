@@ -37,7 +37,7 @@ import time
 from typing import Sequence
 
 from . import storage
-from .db import Db, DbError
+from .db import Db, DbError, is_unique_violation
 from .storage.postgres import work as _pg
 
 STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
@@ -386,7 +386,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         # jamais la DbError brute de l'index unique
         raise WorkError("reservation contention, retry") from exc
     except DbError as exc:
-        if number is None or "work_items_migration_repo_idx" not in str(exc):
+        # une autre erreur qui nomme l'index (permission refusée) n'est pas
+        # une réservation concurrente : elle remonte telle quelle (codex #478 r1)
+        if number is None or not is_unique_violation(exc, _pg.MIGRATION_INDEX):
             raise
         holder = storage.of(db).work.migration_holder(number, slug)
         raise WorkError("migration %s of %s already reserved by lot #%s (%s)" % (
