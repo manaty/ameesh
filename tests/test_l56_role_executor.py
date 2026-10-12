@@ -171,7 +171,9 @@ class RoleExecutorTest(PgTestCase):
                     "SET ameesh.owner_gesture = 'on'; INSERT INTO key_events "
                     "(name, holder, event) VALUES ('l56-owner', 'human', 'confirmed')",
                     "INSERT INTO key_holders (name, human, public_key, key_role) "
-                    "VALUES ('l56-agent', 'human:l56-agent', 'k6', 'agent')"):
+                    "VALUES ('l56-agent', 'human:l56-agent', 'k6', 'agent')",
+                    # #326 r4: nor move the journal's ids
+                    "SELECT setval('key_events_id_seq', 1000, true)"):
             proc = self.as_host(sql)
             self.assertNotEqual(proc.returncode, 0, sql)
         proc = self.as_host("UPDATE agent_registry SET public_key = 'k5', key_role = 'agent' "
@@ -180,6 +182,34 @@ class RoleExecutorTest(PgTestCase):
         self.assertEqual(self.db.query(
             "SELECT event, db_user FROM key_events WHERE name = 'l56-agent'"),
             [{"event": "registered", "db_user": self.login}])
+
+    def test_host_cannot_take_an_owner_key_away_nor_rename_onto_a_holder(self):
+        """#326 r4: the review's sequences, run as the executor."""
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("INSERT INTO agent_registry (name, public_key, public_key_fingerprint, "
+                       "key_role) VALUES ('l56-orch', 'ko', 'fo', 'owner') "
+                       "ON CONFLICT (name) DO NOTHING")
+            tx.execute("INSERT INTO key_holders (name, human, public_key, "
+                       "public_key_fingerprint, key_role) VALUES ('l56-alice', "
+                       "'human:l56-alice', 'ka', 'fa', 'agent') ON CONFLICT (name) DO NOTHING")
+        proc = self.as_host("UPDATE agent_registry SET key_revoked_at = clock_timestamp() "
+                            "WHERE name = 'l56-orch'")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for sql in ("UPDATE agent_registry SET public_key = NULL, "
+                    "public_key_fingerprint = NULL, key_role = 'agent' WHERE name = 'l56-orch'",
+                    "DELETE FROM agent_registry WHERE name = 'l56-orch'",
+                    "INSERT INTO agent_registry (name, public_key, public_key_fingerprint, "
+                    "key_role) VALUES ('l56-intruder', 'K', 'F', 'agent'); "
+                    "UPDATE agent_registry SET name = 'l56-alice' WHERE name = 'l56-intruder'"):
+            proc = self.as_host(sql)
+            self.assertNotEqual(proc.returncode, 0, sql)
+        self.assertEqual(self.db.query("SELECT public_key, key_role FROM agent_registry "
+                                       "WHERE name = 'l56-orch'"),
+                         [{"public_key": "ko", "key_role": "owner"}])
+        self.assertEqual(self.db.query("SELECT holder, public_key_fingerprint FROM mesh_keys "
+                                       "WHERE name = 'l56-alice'"),
+                         [{"holder": "human", "public_key_fingerprint": "fa"}])
 
     def test_public_schema_create_rolls_back(self):
         """PUBLIC schema CREATE makes the script roll back the new role."""

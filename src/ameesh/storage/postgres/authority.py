@@ -131,11 +131,17 @@ class Keys(interface.Keys):
               FROM key_events e
              WHERE e.key_role = 'owner' AND e.event IN ('registered', 'replaced')
                AND CASE WHEN e.owner_gesture THEN e.at >= to_timestamp(%s)
+                        -- #326 r4: a confirmation covers the key it names,
+                        -- registered before it by the server's clock (`at`,
+                        -- set by the trigger) — never by the id, a sequence's
+                        -- value; a registration still uncommitted when the
+                        -- owner confirmed has no confirmation of its own
                         ELSE NOT EXISTS (SELECT 1 FROM key_events c
                                           WHERE c.name = e.name AND c.event = 'confirmed'
-                                            AND c.id > e.id)
+                                            AND c.fingerprint = e.fingerprint
+                                            AND c.at > e.at)
                    END
-             ORDER BY e.id
+             ORDER BY e.at, e.id
             """,
             (since,),
         )
@@ -143,16 +149,28 @@ class Keys(interface.Keys):
     def confirm(self, name) -> int:
         with self.db.transaction() as tx:
             tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            # one confirmation per key the owner can see now: the current one,
+            # and every owner registration of that name already committed
             rows = tx.query(
                 """
                 INSERT INTO key_events (name, holder, event, key_role, fingerprint)
-                SELECT name, holder, 'confirmed', key_role, public_key_fingerprint
-                  FROM mesh_keys WHERE name = %s
+                SELECT DISTINCT ON (fingerprint) name, holder, 'confirmed', key_role,
+                       fingerprint
+                  FROM (SELECT name, holder, key_role,
+                               public_key_fingerprint AS fingerprint, 0 AS rank
+                          FROM mesh_keys WHERE name = %s AND public_key IS NOT NULL
+                        UNION ALL
+                        SELECT name, holder, key_role, fingerprint, 1
+                          FROM key_events
+                         WHERE name = %s AND key_role = 'owner'
+                           AND event IN ('registered', 'replaced')
+                           AND fingerprint IS NOT NULL) seen
+                 ORDER BY fingerprint, rank
                 RETURNING id
                 """,
-                (name,),
+                (name, name),
             )
-        return int(rows[0]["id"]) if rows else 0
+        return max((int(r["id"]) for r in rows), default=0)
 
     def registered(self) -> list[dict]:
         return self.db.query(

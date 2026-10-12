@@ -26,9 +26,13 @@
 -- The same holds for an owner key on an agent's row (#326 r2: the owner's
 -- authority delegated to an agent, `key register <agent> --role owner`):
 -- set, changed, moved to another name or brought back from a revocation by
--- the owner's gesture only. No agent may be created under a holder's name,
--- nor a holder under an agent's (#326 r3); a first owner key counts the
--- agents' owner keys too.
+-- the owner's gesture only, and so is taking it away: cleared, turned into
+-- an agent key, or its row deleted (#326 r4). No agent may be created under
+-- a holder's name or renamed to it, nor a holder created under an agent's
+-- (#326 r3, r4). The first owner key is a bootstrap that happens once: it
+-- counts the agents' owner keys too, and every owner key `key_events` ever
+-- recorded (#326 r4) — once an owner key has existed, any later one is the
+-- owner's gesture, whatever became of the first.
 -- Dates are the server's clock at the event (`clock_timestamp()`, not the
 -- transaction's start), never the writer's; every key event goes to
 -- `key_events`, append-only and written by these triggers only, which
@@ -177,7 +181,8 @@ begin
         if new.key_role = 'owner' and (
                 exists (select 1 from key_holders where key_role = 'owner')
                 or exists (select 1 from agent_registry
-                            where key_role = 'owner' and public_key is not null)) then
+                            where key_role = 'owner' and public_key is not null)
+                or exists (select 1 from key_events where key_role = 'owner')) then
             raise exception 'an owner key already exists: replacing it is the owner''s own gesture (key register --human % --replace, with the owner''s database role)', new.name
                 using errcode = 'insufficient_privilege';
         end if;
@@ -217,8 +222,11 @@ create trigger key_holders_events
 create or replace function agent_registry_not_a_key_holder() returns trigger
 language plpgsql as $$
 begin
+    if tg_op = 'UPDATE' and new.name = old.name then
+        return new;
+    end if;
     if exists (select 1 from key_holders where name = new.name) then
-        raise exception '% holds a human''s key: no agent is created under that name', new.name
+        raise exception '% holds a human''s key: no agent is created under that name, nor renamed to it', new.name
             using errcode = 'unique_violation';
     end if;
     return new;
@@ -227,18 +235,36 @@ $$;
 
 drop trigger if exists agent_registry_not_a_key_holder on agent_registry;
 create trigger agent_registry_not_a_key_holder
-    before insert on agent_registry
+    before insert or update of name on agent_registry
     for each row execute function agent_registry_not_a_key_holder();
 
 -- an agent's key (#326 r2): an owner key — the owner's authority delegated
 -- to an agent — is set, changed, moved to another name or brought back
--- from a revocation by the owner's own gesture only; an agent key and a
--- revocation stay free. The key's date is the server's.
+-- from a revocation by the owner's own gesture only; so is taking it away
+-- (#326 r4: cleared, made an agent key, its row deleted — revoked or not),
+-- unless the key holder of that name holds the very same key (the stopgap
+-- row of 0364, `key register --human`). An agent key and a revocation stay
+-- free. The key's date is the server's.
 create or replace function agent_registry_key_guard() returns trigger
 language plpgsql as $$
 declare
     changed boolean;
 begin
+    if tg_op <> 'INSERT' and old.key_role = 'owner' and old.public_key is not null
+            and not key_holders_owner_gesture()
+            and (tg_op = 'DELETE'
+                 or new.public_key is distinct from old.public_key
+                 or new.public_key_fingerprint is distinct from old.public_key_fingerprint
+                 or new.key_role is distinct from old.key_role)
+            and not exists (select 1 from key_holders h
+                             where h.name = old.name and h.key_role = 'owner'
+                               and h.public_key_fingerprint = old.public_key_fingerprint) then
+        raise exception 'the owner key on agent % is only removed by the owner''s own gesture (with the owner''s database role); a revocation is free (key revoke %)', old.name, old.name
+            using errcode = 'insufficient_privilege';
+    end if;
+    if tg_op = 'DELETE' then
+        return old;
+    end if;
     if tg_op = 'INSERT' then
         changed := new.public_key is not null;
     else
@@ -270,8 +296,8 @@ $$;
 
 drop trigger if exists agent_registry_key_guard on agent_registry;
 create trigger agent_registry_key_guard
-    before insert or update of public_key, public_key_fingerprint, key_role, key_revoked_at,
-                               key_updated_at, name on agent_registry
+    before insert or delete or update of public_key, public_key_fingerprint, key_role,
+                                         key_revoked_at, key_updated_at, name on agent_registry
     for each row execute function agent_registry_key_guard();
 
 drop trigger if exists agent_registry_key_events on agent_registry;
@@ -298,14 +324,16 @@ select r.name, r.responsible, r.public_key, r.public_key_fingerprint, r.key_role
 on conflict (name) do nothing;
 select set_config('ameesh.owner_gesture', '', true);
 
--- a name both a key holder and an agent with ANOTHER key (#326 r3: a race,
--- or a row slipped past the triggers) has no key at all: fail closed
+-- a name both a key holder and an agent with ANOTHER live key (#326 r3: a
+-- race, or a row slipped past the triggers) has no key at all: fail closed;
+-- once that agent key is revoked, the holder's key is back (#326 r4)
 create or replace view mesh_keys as
 select h.name, 'human' as holder, h.public_key, h.public_key_fingerprint, h.key_role,
        h.key_updated_at, h.key_revoked_at
   from key_holders h
  where not exists (select 1 from agent_registry r
                     where r.name = h.name and r.public_key is not null
+                      and r.key_revoked_at is null
                       and r.public_key_fingerprint is distinct from h.public_key_fingerprint)
 union all
 select r.name, 'agent', r.public_key, r.public_key_fingerprint, r.key_role,

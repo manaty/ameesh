@@ -32,6 +32,13 @@ class _Keys(_Base):
                                                      name)
         return private, public
 
+    def no_key_yet(self):
+        """An install where no key was ever registered: the bootstrap open
+        again. Only the tables' owner can (TRUNCATE skips the row triggers;
+        the executor has no TRUNCATE right) — a test's reset, never a path
+        of ameesh."""
+        self.db.execute("TRUNCATE key_holders, key_events RESTART IDENTITY")
+
     def registry_names(self):
         return {r["name"] for r in self.db.query("SELECT name FROM agent_registry")}
 
@@ -247,9 +254,7 @@ class OwnerKeyGuardTest(_Keys):
         with self.assertRaises(authority.AuthorityError):    # alice's, revoked, counts
             authority.register_human_key(self.db, "human:dave", signing.read_public(public),
                                          role="owner")
-        with self.db.transaction() as tx:
-            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
-            tx.execute("DELETE FROM key_holders")
+        self.no_key_yet()
         proc = self.mesh("key", "register", "--human", "dave", "--public-key", public,
                          "--role", "owner", env=self.mesh_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -293,9 +298,7 @@ class OwnerKeyGuardTest(_Keys):
                          ["alice#1", "orch#3"])
 
     def test_dates_are_the_servers_and_the_journal_is_untouchable(self):
-        with self.db.transaction() as tx:
-            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
-            tx.execute("DELETE FROM key_holders")
+        self.no_key_yet()
         self.db.execute("INSERT INTO key_holders (name, human, public_key, key_role, "
                         "key_updated_at, created_at) VALUES ('mallory', 'human:mallory', "
                         "'k', 'owner', now() - interval '30 days', "
@@ -304,20 +307,18 @@ class OwnerKeyGuardTest(_Keys):
                         60)
         self.assertEqual([a["reason"] for a in
                           exploitation._owner_key_registered(self.db, time.time())],
-                         ["alice#1", "mallory#3"])
+                         ["mallory#1"])
         for sql in ("UPDATE key_events SET at = now() - interval '30 days'",
                     "DELETE FROM key_events",
                     "INSERT INTO key_events (name, holder, event) "
                     "VALUES ('x', 'human', 'revoked')"):
             with self.assertRaises(DbError, msg=sql):
                 self.db.execute(sql)
-        self.assertEqual(len(self.db.query("SELECT 1 FROM key_events")), 3)
+        self.assertEqual(len(self.db.query("SELECT 1 FROM key_events")), 1)
 
     def test_a_holder_never_shadows_an_agent(self):
         # #326 r3: an agent with an owner key, no owner key holder
-        with self.db.transaction() as tx:
-            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
-            tx.execute("DELETE FROM key_holders")
+        self.no_key_yet()
         authority.register_key(self.db, "orch", signing.read_public(self.public), role="owner")
         for sql in ("INSERT INTO key_holders (name, human, public_key, public_key_fingerprint, "
                     "key_role) VALUES ('orch', 'human:orch', 'k', 'f', 'owner')",
@@ -341,9 +342,7 @@ class OwnerKeyGuardTest(_Keys):
 
     def test_event_dates_are_the_events_not_the_transactions(self):
         # #326 r3: a transaction opened long before the insert
-        with self.db.transaction() as tx:
-            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
-            tx.execute("DELETE FROM key_holders")
+        self.no_key_yet()
         with self.db.transaction() as tx:
             tx.query("SELECT pg_sleep(1.5)")
             tx.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
@@ -357,9 +356,7 @@ class OwnerKeyGuardTest(_Keys):
 
     def test_two_first_owner_keys_at_once(self):
         # #326 r2: two transactions, neither seeing the other's owner key
-        with self.db.transaction() as tx:
-            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
-            tx.execute("DELETE FROM key_holders")
+        self.no_key_yet()
         first = self.db.transaction()
         first.__enter__()
         first.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
@@ -383,3 +380,73 @@ class OwnerKeyGuardTest(_Keys):
         self.assertIn("key_holders_one_owner", outcome["second"])
         self.assertEqual([r["name"] for r in self.db.query(
             "SELECT name FROM key_holders WHERE key_role = 'owner'")], ["bootstrap"])
+
+    def test_taking_an_owner_key_away_never_reopens_the_bootstrap(self):
+        # #326 r4 P1: an agent with an owner key, no owner key holder
+        self.no_key_yet()
+        authority.register_key(self.db, "orch", signing.read_public(self.public), role="owner")
+        # straight SQL, as any agent could: a revocation is free...
+        self.assertTrue(authority.revoke_key(self.db, "orch"))
+        # ...taking the key away is not, revoked or not
+        for sql in ("UPDATE agent_registry SET public_key = NULL, "
+                    "public_key_fingerprint = NULL, key_role = 'agent' WHERE name = 'orch'",
+                    "UPDATE agent_registry SET key_role = 'agent' WHERE name = 'orch'",
+                    "UPDATE agent_registry SET public_key = 'k', "
+                    "public_key_fingerprint = 'f' WHERE name = 'orch'",
+                    "DELETE FROM agent_registry WHERE name = 'orch'"):
+            with self.assertRaises(DbError, msg=sql) as ctx:
+                self.db.execute(sql)
+            self.assertIn("own gesture", str(ctx.exception))
+        # even once the owner took it away, a first owner key never comes back
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("DELETE FROM agent_registry WHERE name = 'orch'")
+        self.assertEqual(self.db.query("SELECT 1 FROM agent_registry "
+                                       "WHERE key_role = 'owner'"), [])
+        with self.assertRaises(DbError) as ctx:
+            self.db.execute("INSERT INTO key_holders (name, human, public_key, "
+                            "public_key_fingerprint, key_role) "
+                            "VALUES ('mallory', 'human:mallory', 'k', 'f', 'owner')")
+        self.assertIn("an owner key already exists", str(ctx.exception))
+        # an agent key stays the agent's to clear
+        registry.upsert(self.db, "worker", harness="claude", host=self.cfg.host)
+        authority.register_key(self.db, "worker", signing.read_public(self.other))
+        self.db.execute("UPDATE agent_registry SET public_key = NULL, "
+                        "public_key_fingerprint = NULL WHERE name = 'worker'")
+
+    def test_no_agent_renamed_onto_a_holder(self):
+        # #326 r4 P2: alice holds the owner key (setUp)
+        registry.upsert(self.db, "intruder", harness="claude", host=self.cfg.host)
+        authority.register_key(self.db, "intruder", signing.read_public(self.other))
+        with self.assertRaises(DbError) as ctx:
+            self.db.execute("UPDATE agent_registry SET name = 'alice' "
+                            "WHERE name = 'intruder'")
+        self.assertIn("holds a human's key", str(ctx.exception))
+        self.assertEqual(self.fingerprint("alice"), self.first["fingerprint"])
+        # a name both, with two keys (a row past the triggers): no key; once
+        # the agent's key is revoked, the holder's is back
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute("INSERT INTO key_holders (name, human, public_key, "
+                       "public_key_fingerprint, key_role) "
+                       "VALUES ('intruder', 'human:bob', 'k', 'f', 'agent')")
+        self.assertIsNone(authority.key_info(self.db, "intruder"))
+        self.db.execute("UPDATE agent_registry SET key_revoked_at = now() "
+                        "WHERE name = 'intruder'")
+        info = authority.key_info(self.db, "intruder")
+        self.assertEqual((info["holder"], info["public_key_fingerprint"]), ("human", "f"))
+
+    def test_a_confirmation_is_ordered_by_the_clock_and_names_its_key(self):
+        # #326 r4 P2: ids are a sequence's values, the order is the server's clock
+        self.no_key_yet()
+        self.db.query("SELECT setval('key_events_id_seq', 1000, true)")
+        authority.register_human_key(self.db, ALICE, signing.read_public(self.public),
+                                     role="owner")                      # event 1001
+        self.db.query("SELECT setval('key_events_id_seq', 1, false)")
+        self.assertEqual(authority.confirm_key(self.db, "alice"), 1)
+        self.assertEqual(exploitation._owner_key_registered(self.db, time.time()), [])
+        confirmed = self.db.query("SELECT fingerprint FROM key_events "
+                                  "WHERE event = 'confirmed'")
+        self.assertEqual([r["fingerprint"] for r in confirmed],
+                         [signing.fingerprint(signing.read_public(self.public))])
+

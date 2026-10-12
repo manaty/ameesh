@@ -137,7 +137,10 @@ base64 of the 32-byte seed or key). Rules:
     overwritten; a first `owner` key only while no owner key exists at all
     (revoked ones count), and a unique index keeps `key_holders` to one
     owner key holder — two transactions registering one at once cannot both
-    commit, whatever their isolation level. The CLI writes a note to the
+    commit, whatever their isolation level. That first owner key is a
+    bootstrap that happens **once** (#326 r4): once `key_events` has
+    recorded an owner key, any later one is the owner's gesture, even after
+    the first was revoked, cleared or removed. The CLI writes a note to the
     owner's chat (`chat-<id>`) if it exists;
   * a **revocation** (`key revoke`) is open to all: it only removes
     authority;
@@ -151,13 +154,17 @@ base64 of the 32-byte seed or key). Rules:
   * an **owner key on an agent** (`key register <agent> --role owner`, the
     owner's authority delegated) is the same gesture (#326 r2): setting,
     changing, renaming or un-revoking it is refused outside the owner's
-    role; an `agent` key stays free;
-  * no agent is created under a key holder's name, nor a key holder under
-    an agent's (triggers on both tables, #326 r3): a holder's rotation is
+    role, and so is taking it away, revoked or not (#326 r4): clearing it,
+    turning it into an agent key, deleting its row. Revoking it stays free.
+    An `agent` key stays free;
+  * no agent is created under a key holder's name or renamed to it, nor a
+    key holder created under an agent's (triggers on both tables, #326 r3,
+    r4): a holder's rotation is
     never blocked by an agent that took its name meanwhile, and a holder
     never shadows an agent's key. A first owner key holder also counts the
-    agents' owner keys. Should a name still be both with two different keys
-    (a race), `mesh_keys` gives it no key at all;
+    agents' owner keys. Should a name still be both with two different live
+    keys (a race), `mesh_keys` gives it no key at all, until the agent's key
+    is revoked;
   * dates are the server's clock at the event: `key_updated_at`,
     `created_at` and `key_revoked_at` are set by the triggers to
     `clock_timestamp()` (not the transaction's start), whatever the writer
@@ -168,7 +175,12 @@ base64 of the 32-byte seed or key). Rules:
     `owner_key_registered` from it, pushed to `notify.default_human`
     (urgent): for 7 days when it was the owner's gesture; otherwise until
     the owner confirms it with their database role
-    (`ameesh key confirm <name>`, an event `confirmed`), with no time limit.
+    (`ameesh key confirm <name>`, with no time limit). A confirmation
+    names each key it covers (an event `confirmed` per fingerprint the
+    owner can see then) and covers only that key's registrations before it,
+    by the server's clock, never by the event's id: the executor can no
+    longer move the id sequence (`setval`; `role-executor.sql` revokes and
+    audits it, #326 r4).
     A backdated row, a revocation right after use or a transaction held open
     for days hides nothing. Registering your own first owner key with the
     executor's DSN therefore alerts until you confirm it.
