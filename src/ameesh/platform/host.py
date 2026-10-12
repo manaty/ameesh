@@ -10,6 +10,7 @@ l'appelant sache que rien n'a été lu.
 from __future__ import annotations
 
 import os
+import re
 
 from . import NotAvailable, is_linux
 from .process import PROC, _proc_ok, _psutil
@@ -317,14 +318,31 @@ SYSFS = "/sys"
 #: _IOWR(0x94, 30, 4096 bytes)
 BTRFS_IOC_FS_INFO = (2 << 30) | (1024 << 16) | (0x94 << 8) | 31
 BTRFS_IOC_DEV_INFO = (3 << 30) | (4096 << 16) | (0x94 << 8) | 30
+#: total_bytes, then every space-info counter the kernel deducts from it
+#: (btrfs_space_info_used, fs/btrfs/space-info.h); bytes_zone_unusable too,
+#: when the kernel has it
+BTRFS_UNAVAILABLE = ("total_bytes", "bytes_used", "bytes_may_use", "bytes_reserved",
+                     "bytes_pinned", "bytes_readonly")
+
+
+def _mount_field(field: str) -> str:
+    """A mountinfo path with its octal escapes (`\\040` space, `\\011`,
+    `\\012`, `\\134`) decoded."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
 
 def _mount_source(path: str, mountinfo: str) -> tuple[str, str, str] | None:
-    """(mount point, fstype, source) of the filesystem holding `path`, read
-    from a /proc/self/mountinfo file; None if unreadable. Of two mounts on
-    the same point the later one is visible (it hides the earlier)."""
+    """(mount point, fstype, source) of the mount the kernel resolves `path`
+    through, read from a /proc/self/mountinfo file; None if unreadable.
+
+    Walks the mount tree as path lookup does: from the root mount, at each
+    prefix of `path`, into the child mount on that point, then to the top of
+    a stack of mounts on the same point (a later one hides the earlier). A
+    mount hidden by a later mount over one of its ancestors (btrfs on
+    /work/cache, then ext4 over /work) is never reached: the longest
+    matching point is not enough."""
     real = os.path.realpath(path)
-    best: tuple[str, str, str] | None = None
+    mounts: list[tuple[str, str, str, str, str]] = []   # id, parent, point, fstype, source
     try:
         with open(mountinfo, encoding="utf-8") as fh:
             for line in fh:
@@ -332,14 +350,37 @@ def _mount_source(path: str, mountinfo: str) -> tuple[str, str, str] | None:
                 fields, rest = head.split(), tail.split()
                 if not sep or len(fields) < 5 or len(rest) < 2:
                     continue
-                point = fields[4].replace("\\040", " ")
-                root = point.rstrip("/")
-                if real == point or real.startswith(root + "/") or point == "/":
-                    if best is None or len(point) >= len(best[0]):
-                        best = (point, rest[0], rest[1])
+                mounts.append((fields[0], fields[1], _mount_field(fields[4]),
+                               rest[0], rest[1]))
     except (OSError, UnicodeDecodeError):
         return None
-    return best
+    ids = {mount[0] for mount in mounts}
+    #: (parent id, point) -> the last mount made there
+    children = {(mount[1], mount[2]): mount for mount in mounts}
+    roots = [mount for mount in mounts if mount[2] == "/"]
+    current = next((mount for mount in roots if mount[1] not in ids),
+                   roots[0] if roots else None)
+    if current is None:
+        return None
+
+    def top(mount):
+        seen = {mount[0]}
+        while (mount[0], mount[2]) in children:
+            mount = children[(mount[0], mount[2])]
+            if mount[0] in seen:
+                break
+            seen.add(mount[0])
+        return mount
+
+    current, prefix = top(current), ""
+    for part in real.split("/"):
+        if not part:
+            continue
+        prefix += "/" + part
+        child = children.get((current[0], prefix))
+        if child is not None:
+            current = top(child)
+    return current[2], current[3], current[4]
 
 
 def _int_file(path: str) -> int | None:
@@ -395,11 +436,14 @@ def btrfs_allocation(path: str | None, *, mountinfo: str | None = None,
     metadata, system, and mixed, data-reloc, metadata-treelog where the
     kernel has them). The device sizes are those the filesystem uses
     (`device_sizes`, the ioctls of `btrfs_device_sizes` by default, kept
-    only when their fsid is the sysfs one), else the block device sizes.
-    Metadata headroom = `total_bytes - bytes_used - bytes_may_use` of
-    `metadata` (of `mixed` on a mixed-group filesystem), 0 when reservations
-    exceed it. Not btrfs, not Linux, or unreadable: None (no guard fires on
-    an unknown)."""
+    only when their fsid is the sysfs one); without them unallocated is
+    unknown — the block device can be larger than the filesystem, so its
+    size would invent free space. Metadata headroom = `total_bytes` minus
+    every counter the kernel holds unavailable (`bytes_used`,
+    `bytes_may_use`, `bytes_reserved`, `bytes_pinned`, `bytes_readonly`,
+    `bytes_zone_unusable`) of `metadata` (of `mixed` on a mixed-group
+    filesystem), 0 when they exceed it. Not btrfs, not Linux, or unreadable:
+    None (no guard fires on an unknown)."""
     out: dict = {"btrfs_unallocated_bytes": None, "btrfs_metadata_headroom_bytes": None}
     if not path:
         return out
@@ -429,56 +473,15 @@ def btrfs_allocation(path: str | None, *, mountinfo: str | None = None,
     except OSError:
         return out
     meta_kind = "metadata" if "metadata" in kinds else "mixed"
-    meta = [_int_file(os.path.join(allocation, meta_kind, name))
-            for name in ("total_bytes", "bytes_used", "bytes_may_use")]
+    meta = [_int_file(os.path.join(allocation, meta_kind, name)) for name in BTRFS_UNAVAILABLE]
     if None not in meta:
-        out["btrfs_metadata_headroom_bytes"] = max(0, meta[0] - meta[1] - meta[2])
+        # bytes_zone_unusable only exists from Linux 5.12 (zoned devices)
+        zone = _int_file(os.path.join(allocation, meta_kind, "bytes_zone_unusable")) or 0
+        out["btrfs_metadata_headroom_bytes"] = max(0, meta[0] - sum(meta[1:]) - zone)
     carved = [_int_file(os.path.join(allocation, kind, "disk_total")) for kind in kinds]
     if not kinds or None in carved:
         return out
     used = (device_sizes or btrfs_device_sizes)(path)
     if used is not None and used[0] == uuid.replace("-", "") and used[1]:
         out["btrfs_unallocated_bytes"] = max(0, sum(used[1]) - sum(carved))
-        return out
-    try:
-        devices = sorted(os.listdir(os.path.join(fs, "devices")))
-    except OSError:
-        return out
-    # fallback: sysfs block sizes, always in 512-byte sectors
-    sizes = [_int_file(os.path.join(sysfs, "class", "block", dev, "size")) for dev in devices]
-    if devices and None not in sizes:
-        out["btrfs_unallocated_bytes"] = max(0, sum(sizes) * 512 - sum(carved))
-    return out
-    if mountinfo is None:
-        if not _proc_ok():
-            return out
-        mountinfo = os.path.join(PROC, "self", "mountinfo")
-    sysfs = sysfs or SYSFS
-    mount = _mount_source(path, mountinfo)
-    if mount is None or mount[1] != "btrfs":
-        return out
-    device = os.path.basename(os.path.realpath(mount[2]))
-    base = os.path.join(sysfs, "fs", "btrfs")
-    try:
-        uuids = sorted(os.listdir(base))
-    except OSError:
-        return out
-    fs = next((os.path.join(base, uuid) for uuid in uuids
-               if os.path.lexists(os.path.join(base, uuid, "devices", device))), None)
-    if fs is None:
-        return out
-    allocation = os.path.join(fs, "allocation")
-    meta = [_int_file(os.path.join(allocation, "metadata", name))
-            for name in ("total_bytes", "bytes_used", "bytes_may_use")]
-    if None not in meta:
-        out["btrfs_metadata_headroom_bytes"] = max(0, meta[0] - meta[1] - meta[2])
-    try:
-        devices = sorted(os.listdir(os.path.join(fs, "devices")))
-    except OSError:
-        return out
-    sizes = [_int_file(os.path.join(sysfs, "class", "block", dev, "size")) for dev in devices]
-    carved = [_int_file(os.path.join(allocation, kind, "disk_total")) for kind in BTRFS_KINDS]
-    if devices and None not in sizes and None not in carved:
-        # sysfs block sizes are always in 512-byte sectors
-        out["btrfs_unallocated_bytes"] = max(0, sum(sizes) * 512 - sum(carved))
     return out
