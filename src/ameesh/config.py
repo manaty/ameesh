@@ -180,6 +180,15 @@ class Config:
     #: temps ; un message urgent ou d'un humain réveille tout de suite.
     #: Réglable par agent (`ameesh set <agent> mail_batch=…`). 0 = réveil immédiat.
     mail_batch: float = 90.0
+    #: #408 (L165b, règle 1) : l'exécuteur réveille un agent au repos depuis
+    #: `mail_batch` + `lot_wake_margin` qui détient un lot actionnable
+    #: (`intake`/`build`), avec la consigne de le reprendre ; au plus
+    #: `lot_wake_max` réveils sans effet par lot (backoff doublé, en base),
+    #: puis l'auditeur prend le relais. Désactivable par hôte
+    #: (`AMEESH_LOT_WAKE=0`) ou par agent (`ameesh set <agent> lot_wake=off`).
+    lot_wake: bool = True
+    lot_wake_margin: float = 60.0
+    lot_wake_max: int = 3
     #: plafond (octets UTF-8) de la consigne entière d'un tour de courrier ;
     #: au-delà, les messages les plus récents attendent le tour suivant
     prompt_mail_max: float = 20000.0
@@ -378,6 +387,9 @@ class Config:
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
+    #: #453: duration cap of a heavy command (`ameesh heavy`), seconds or
+    #: `90m`/`2h`; `AMEESH_HEAVY_MAX_S` overrides it; 0 = no cap
+    heavy_max_seconds: float | str = 3600.0
     #: L226a: the `credential_sentinel` key of the host configuration
     #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
     credential_sentinel: dict = field(default_factory=dict)
@@ -504,6 +516,10 @@ def load(env: dict | None = None) -> Config:
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
         mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
                                _as_seconds(cfg.mail_batch, Config.mail_batch)),
+        lot_wake=bool(_as_bool(pick("AMEESH_LOT_WAKE"), cfg.lot_wake, "AMEESH_LOT_WAKE")),
+        lot_wake_margin=_as_seconds(pick("AMEESH_LOT_WAKE_MARGIN"),
+                                    _as_seconds(cfg.lot_wake_margin, Config.lot_wake_margin)),
+        lot_wake_max=max(0, int(_as_float(pick("AMEESH_LOT_WAKE_MAX"), cfg.lot_wake_max))),
         prompt_mail_max=_as_float(pick("AMEESH_PROMPT_MAIL_MAX"), cfg.prompt_mail_max),
         canon_sync_interval=_as_float(
             pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),

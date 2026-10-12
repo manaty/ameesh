@@ -33,6 +33,10 @@ fingerprint, or `unknown`, leaves the failure in place. The clearing
 write is conditional (`expect_failures`): a failure a turn records between
 the probe's read and its write is never overwritten.
 
+The server relay account is an exception: a positive authenticated balance
+response can clear a transient provider refusal with the same key, after
+one sentinel interval of backoff. It retains the conditional write above.
+
 A CLI probe (gcloud, gh, scw) that exits non-zero is `failing` only when its
 output says the credential is refused; a network error (DNS, timeout, 5xx)
 or anything unrecognized is `unknown` (#210 r4): a credential failure is
@@ -550,4 +554,7 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
             else:
                 row["previous"] = (done or {}).get("previous")
         rows.append(row)
+    if not dry_run:
+        from . import relay
+        rows.extend(relay.probe_credentials(cfg, db, environ=environ, now=now))
     return rows

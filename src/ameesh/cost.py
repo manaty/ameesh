@@ -56,11 +56,14 @@ from .gauge_cache import CLAUDE_GAUGES
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
 DEFAULT_PRICES = {
-    "deepseek-flash": [0.27, 0.07, 1.10],
+    # #475: DeepSeek's official peak price, read on 2026-10-12 at
+    # https://api-docs.deepseek.com/quick_start/pricing (cache miss, cache hit,
+    # output). Off-peak hours cost half; the peak price is the upper bound.
+    "deepseek-flash": [0.30, 0.006, 1.20],
     "deepseek-pro": [0.55, 0.14, 2.19],
     "gpt-6.1-sol": [1.25, 0.125, 10.0],
     "default-codex": [1.25, 0.125, 10.0],
-    "default-deepseek": [0.27, 0.07, 1.10],
+    "default-deepseek": [0.30, 0.006, 1.20],
     # L225 : barème officiel Anthropic, relevé le 2026-10-11 sur
     # https://platform.claude.com/docs/en/about-claude/pricing (entrée de base,
     # « cache hits and refreshes », sortie ; tarif standard, hors mode rapide,
