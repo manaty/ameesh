@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Durable withdrawal blocks new turns and gates, preserving current work."""
-from ameesh import registry, storage
+import threading
+
+from ameesh import db as db_mod, registry, storage
 from .support import PgTestCase
 
 
@@ -63,3 +65,65 @@ class HostLifecycleTest(PgTestCase):
         self.api.hosts.record({"host": "source", "gate_state": "stopped"})
         self.api.host_lifecycle.undrain("source", actor="orch")
         self.assertEqual(self.api.hosts.latest("source")["gate_state"], "stopped")
+
+    def test_waiting_turn_observes_committed_drain_without_agent_row_update(self):
+        started = threading.Event()
+        result, errors = [], []
+
+        def begin_turn():
+            other = db_mod.connect(self.cfg)
+            try:
+                started.set()
+                result.append(registry.begin_turn(other, "dev", "runner", self.lease["lease_epoch"], "racing"))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=begin_turn, daemon=True)
+        try:
+            with self.db.transaction() as tx:
+                tx.query("SELECT name FROM agent_registry WHERE name='dev' FOR UPDATE")
+                thread.start()
+                self.assertTrue(started.wait(5))
+                thread.join(0.1)
+                self.assertTrue(thread.is_alive())
+                storage.of(tx).host_lifecycle.drain("source", actor="orch")
+        finally:
+            if thread.ident is not None:
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [False])
+        self.assertEqual(registry.get(self.db, "dev")["status"], "idle")
+
+    def test_withdrawal_waits_for_enable_gate_boundary(self):
+        started = threading.Event()
+        result, errors = [], []
+
+        def withdraw():
+            other = db_mod.connect(self.cfg)
+            try:
+                started.set()
+                result.append(storage.of(other).host_lifecycle.drain("source", actor="orch"))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=withdraw, daemon=True)
+        try:
+            with self.api.hosts.gate_guard("source") as hosts:
+                thread.start()
+                self.assertTrue(started.wait(5))
+                thread.join(0.1)
+                self.assertTrue(thread.is_alive())
+                self.assertIsNone(self.api.host_lifecycle.get("source"))
+                self.assertEqual(hosts.latest("source")["gate_state"], "available")
+        finally:
+            if thread.ident is not None:
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["mode"], "draining")
+        self.assertEqual(self.api.hosts.latest("source")["gate_state"], "draining")
