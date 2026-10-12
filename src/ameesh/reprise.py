@@ -217,7 +217,7 @@ def locate(cfg: Config, harness: str, session_id: str,
     return None, None, searched
 
 
-def holders(path: str, session_id: str) -> list[dict]:
+def holders(path: str | None, session_id: str) -> list[dict]:
     """Les processus qui tiennent la session : fichier ouvert (ou dossier
     ouvert ou courant), ou id de session sur la ligne de commande (`codex
     resume <id>`, `claude --resume <id>`) — hors ce processus et ses
@@ -682,7 +682,9 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
     # refus (fail-closed). L63b (owner, decision #9413 b): no bypass, not even
     # --force — the open session is one of the guarantees without one
     try:
-        tenants = holders(path, session_id) if path else []
+        # no session file (dsh without its directory): the command lines are
+        # still read, and the host must still be able to read them
+        tenants = holders(path, session_id)
     except platform.NotAvailable as exc:
         raise RepriseError(
             "cannot check that session %s is closed on this host (%s): adoption "

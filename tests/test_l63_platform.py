@@ -8,6 +8,7 @@ installé) et par le repli /proc (psutil retiré).
 from __future__ import annotations
 
 import ast
+import contextlib
 import io
 import os
 import subprocess
@@ -186,6 +187,97 @@ class PlatformTest(unittest.TestCase):
             with self.assertRaises(platform.NotAvailable):
                 platform.holders(__file__, "x")
 
+    def _faux_proc(self, comm: str, cmdline: str | None, uids: str) -> str:
+        """Un /proc minimal : ce processus-ci (lisible) et le pid 4242, du
+        même utilisateur ou non (`uids` : réel effectif …), dont `fd` refuse
+        la lecture (non dumpable) et `cmdline` aussi si None."""
+        import tempfile
+        racine = tempfile.mkdtemp()
+        self.addCleanup(lambda: (os.chmod(os.path.join(racine, "4242", "fd"), 0o700),
+                                 subprocess.run(["rm", "-rf", racine])))
+        moi = os.path.join(racine, str(os.getpid()))
+        os.makedirs(os.path.join(moi, "fd"))
+        os.symlink(moi, os.path.join(racine, "self"))
+        autre = os.path.join(racine, "4242")
+        os.makedirs(os.path.join(autre, "fd"))
+        with open(os.path.join(autre, "comm"), "w") as fh:
+            fh.write(comm + "\n")
+        with open(os.path.join(autre, "status"), "w") as fh:
+            fh.write("Name:\t%s\nUid:\t%s\n" % (comm, uids))
+        with open(os.path.join(autre, "cmdline"), "w") as fh:
+            fh.write((cmdline or "") + "\0")
+        if cmdline is None:
+            os.chmod(os.path.join(autre, "cmdline"), 0)
+        os.chmod(os.path.join(autre, "fd"), 0)
+        return racine
+
+    def test_detenteur_du_meme_utilisateur_illisible(self):
+        """L63b : un processus de l'utilisateur, non dumpable, dont ni les
+        fichiers ouverts ni la ligne de commande ne se lisent, n'est pas une
+        observation vide : NotAvailable (repli /proc, psutil retiré)."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = "%d %d %d %d" % ((os.getuid(),) * 4)
+        cas = (("harnais muet", "node", None, moi, True),
+               ("gestionnaire de services", "(sd-pam)", "(sd-pam)", moi, False),
+               ("aide setuid (sudo)", "sudo", "sudo ls", "%d 0 0 0" % os.getuid(), False),
+               ("autre utilisateur", "node", None, "0 0 0 0", False))
+        for nom, comm, cmdline, uids, refus in cas:
+            with self.subTest(nom):
+                racine = self._faux_proc(comm, cmdline, uids)
+                with mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC", racine), \
+                        mock.patch.object(platform, "SYSTEM", "linux"):
+                    if refus:
+                        with self.assertRaises(platform.NotAvailable) as ctx:
+                            platform.holders(__file__, "x")
+                        self.assertIn("4242 node", str(ctx.exception))
+                    else:
+                        self.assertEqual(platform.holders(__file__, "x"), [])
+
+    def test_detenteur_du_meme_utilisateur_refuse_psutil(self):
+        """L63b, voie psutil : AccessDenied sur un processus de l'utilisateur
+        (réel et effectif) est un doute ; sur une aide setuid, non."""
+        class AccessDenied(Exception):
+            pass
+
+        class NoSuchProcess(Exception):
+            pass
+
+        class Proc:
+            def __init__(self, pid, effective, name="node"):
+                self.pid, self._eff, self._name = pid, effective, name
+
+            def oneshot(self):
+                return contextlib.nullcontext()
+
+            def open_files(self):
+                if self.pid == os.getpid():
+                    return []
+                raise AccessDenied()
+
+            def cmdline(self):
+                raise AccessDenied()
+
+            def name(self):
+                return self._name
+
+            def uids(self):
+                return mock.Mock(real=os.getuid(), effective=self._eff)
+
+        for nom, eff, refus in (("harnais", os.getuid(), True), ("setuid", 0, False)):
+            with self.subTest(nom):
+                faux = mock.MagicMock(AccessDenied=AccessDenied, NoSuchProcess=NoSuchProcess,
+                                      ZombieProcess=NoSuchProcess)
+                faux.Process.side_effect = lambda pid: Proc(pid, os.getuid())
+                faux.process_iter.return_value = [Proc(4242, eff)]
+                with mock.patch.object(platform, "psutil", faux):
+                    if refus:
+                        with self.assertRaises(platform.NotAvailable):
+                            platform.holders(__file__, "x")
+                    else:
+                        self.assertEqual(platform.holders(__file__, "x"), [])
+
     def test_mesures_de_l_hote(self):
         for nom, ctx in self.variants:
             with self.subTest(nom), ctx():
@@ -296,6 +388,30 @@ class AdoptFailClosedTest(PgTestCase):
         self.assertTrue(any("while it is still open" in a for a in avert))
         self.assertIn("while it is still open", self._fil())
         self.assertEqual(registry.get(self.db, "coord")["mode"], "execute")
+
+    def test_os_muet_sans_mock_de_holders(self):
+        """Ni psutil ni /proc (l'OS réellement muet, `holders` non simulé) :
+        refus avec ou sans --force — Codex avec son journal, et DeepSeek sans
+        dossier de sessions (DSH_HOME vers un magasin absent), qui sautait le
+        contrôle (revue #377 P1)."""
+        import dataclasses
+        from ameesh import registry, reprise
+        cfg, sid = self._session()
+        absent = os.path.join(self.tmp, "dsh-absent")
+        cfg_dsh = dataclasses.replace(cfg, accounts={"deepseek": [{"name": "d", "path": absent}]})
+        registry.upsert(self.db, "dsh", harness="deepseek", host=cfg.host, mode="externe")
+        for agent, harness, conf in (("coord", "codex", cfg), ("dsh", "deepseek", cfg_dsh)):
+            for force in (False, True):
+                with self.subTest(harness=harness, force=force), \
+                        mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC",
+                                          os.path.join(self.tmp, "pas-de-proc")), \
+                        mock.patch.dict(os.environ, {"DSH_HOME": absent}):
+                    with self.assertRaises(reprise.RepriseError) as ctx:
+                        reprise.adopt(conf, self.db, agent, session_id=sid,
+                                      harness=harness, force=force, warn=lambda _m: None)
+                    self.assertIn("cannot check", str(ctx.exception))
+                    self.assertEqual(registry.get(self.db, agent)["mode"], "externe")
 
     def test_cli_force_ne_contourne_pas(self):
         from ameesh import reprise
