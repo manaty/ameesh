@@ -214,6 +214,8 @@ class KillVerdictTest(unittest.TestCase):
 
     def _expire(self, error, *, shutdown=False):
         runner = mock.Mock()
+        runner.db = None
+        runner.harness_pids = set()
         runner.container_runtime.return_value = None
         tracker = background.Tracker(runner, log=lambda *a: None)
         tracker.TERM_GRACE_S = 0
@@ -235,6 +237,7 @@ class KillVerdictTest(unittest.TestCase):
         with mock.patch.object(background.platform, "process_table",
                                side_effect=lambda: vivant if alive else []), \
                 mock.patch.object(handle, "live", side_effect=lambda: alive), \
+                mock.patch.object(handle, "location", return_value=(4242, 4242)), \
                 mock.patch.object(signal, "pidfd_send_signal", side_effect=send, create=True), \
                 mock.patch.object(background.os, "close") as close_fd, \
                 mock.patch.object(background.os, "killpg") as killpg, \
@@ -376,6 +379,49 @@ class GraceTest(_Base):
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+    def test_failed_handoff_preserves_child_migrated_to_another_turn(self):
+        runner, worker = self._worker("fond-migrated")
+        pidfile = os.path.join(self.tmp, "migrated.pid")
+        ready = os.path.join(self.tmp, "migrated.ready")
+        foreign_turn = "foreign-live-turn"
+
+        def failed_scan(turn_id, pgid, *, handles):
+            with open(pidfile) as f:
+                pid = int(f.read())
+            self.assertIn(pid, handles)
+            self.wait_for(lambda: os.path.exists(ready), timeout=5)
+            storage.of(self.db).turn_resources.open_turn(
+                foreign_turn, "other-agent", runner.host, pgid=pid, label="foreign")
+            os.kill(pid, signal.SIGUSR1)
+            self.wait_for(lambda: os.getpgid(pid) == pid, timeout=5)
+            raise RuntimeError("handoff table unavailable")
+
+        # A process can only join a group in its own session. This foreign
+        # live resource is registered for the migrated child's resulting group.
+        code = ("import os,signal,time; from pathlib import Path; "
+                "signal.signal(signal.SIGUSR1,lambda *_:os.setpgid(0,0)); "
+                "Path(%r).touch(); time.sleep(60)") % ready
+        import shlex
+        command = "exec %s -c %s" % (shlex.quote(sys.executable), shlex.quote(code))
+        try:
+            with mock.patch.object(runner.background, "survivors", side_effect=failed_scan):
+                self._tour(worker, AMEESH_TEST_BACKGROUND=command,
+                           AMEESH_TEST_BACKGROUND_PID=pidfile)
+            pid = self._pid(pidfile)
+            self.assertTrue(platform.alive(pid))
+            resource = storage.of(self.db).turn_resources.get(
+                self.db.query("SELECT turn_id FROM turn_resources WHERE agent=%s",
+                              (worker.name,))[0]["turn_id"])
+            self.assertEqual(resource["status"], "orphan")
+        finally:
+            if os.path.exists(pidfile):
+                with open(pidfile) as f:
+                    migrated = int(f.read())
+                try:
+                    os.kill(migrated, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_la_fin_du_tour_laisse_finir_le_travail_de_fond(self):
         runner, worker = self._worker("fond-ok")

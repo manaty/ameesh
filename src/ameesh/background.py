@@ -178,6 +178,9 @@ class Entry:
     unverified: bool = False
     #: observed groups of retained processes; diagnostic evidence only
     groups_seen: set = field(default_factory=set)
+    #: direct children present before cleanup; newly adopted children are uncertain
+    children_before: set = field(default_factory=set)
+    watching_adoption: bool = False
     #: tick and runner shutdown must not close a handle during signalling
     process_lock: object = field(default_factory=threading.RLock, repr=False)
     #: autres processus vivants du groupe (descendants des racines)
@@ -224,7 +227,7 @@ class Tracker:
         self.lock = threading.Lock()
         self.entries: list[Entry] = []
         #: l'exécuteur adopte-t-il les orphelins de ses tours (codes de sortie) ?
-        self.subreaper = False
+        self.subreaper = platform.become_subreaper()
         self._strays_at = 0.0
         self.thread: threading.Thread | None = None
 
@@ -368,7 +371,8 @@ class Tracker:
             self.entries = [e for e in self.entries
                             if not (e.state != "running" and (e.reported or (
                                 e.closed is not None and now - e.closed > self.KEEP_S)))]
-        strays = self.subreaper and now - self._strays_at >= self.STRAYS_EVERY_S
+        strays = (self.subreaper and self.thread is not None
+                  and now - self._strays_at >= self.STRAYS_EVERY_S)
         if not suivis and not strays:
             return
         try:
@@ -478,15 +482,19 @@ class Tracker:
                 # Missing membership information still makes cleanup uncertain.
                 entry.unverified = True
                 table = []
+            entry.children_before = {(p["pid"], p.get("start")) for p in table
+                                     if p["ppid"] == os.getpid()}
+            entry.watching_adoption = self.subreaper
             self._remember_groups(entry, table)
             members = self._owned_members(entry, table)
             if not members:
                 entry.unverified |= any(p["pgid"] == entry.pgid and not p["zombie"]
                                         for p in table)
             self._capture(entry, members)
-            for handle in entry.handles.values():
-                handle.send(signal.SIGTERM)
-                handle.send(signal.SIGCONT)
+            if not self.subreaper and any(h.live() for h in entry.handles.values()):
+                entry.unverified = True
+            self._signal_handles(entry, signal.SIGTERM)
+            self._signal_handles(entry, signal.SIGCONT)
             end = time.monotonic() + self.TERM_GRACE_S
             while time.monotonic() < end:
                 if not any(h.live() for h in entry.handles.values()):
@@ -499,8 +507,7 @@ class Tracker:
                 self._capture(entry, self._owned_members(entry, platform.process_table()))
             except Exception:
                 pass
-            for handle in entry.handles.values():
-                handle.send(signal.SIGKILL)
+            self._signal_handles(entry, signal.SIGKILL)
             end = time.monotonic() + 2.0
             while time.monotonic() < end:
                 if not any(h.live() for h in entry.handles.values()):
@@ -509,6 +516,40 @@ class Tracker:
             return self._survival_verdict(entry)
         finally:
             self._drop_handles(entry)
+
+    def _foreign_groups(self, entry: Entry) -> set[int] | None:
+        """Live ownership registry plus launches in this executor; None if unknown."""
+        groups = set(getattr(self.runner, "harness_pids", set())) - {entry.pgid}
+        if getattr(self.runner, "db", None) is None:
+            return groups
+        try:
+            resources = storage.of(self.runner.db).turn_resources
+            after = 0
+            while True:
+                rows = resources.running_started_before(
+                    self.runner.host, time.time() + 1, after_id=after, limit=500)
+                groups.update(int(r["pgid"]) for r in rows
+                              if r.get("pgid") and r["turn_id"] != entry.turn_id)
+                if len(rows) < 500:
+                    return groups
+                after = int(rows[-1]["id"])
+        except Exception as exc:
+            self.log("[%s] background ownership registry unavailable (%s)"
+                     % (entry.agent, exc))
+            return None
+
+    def _signal_handles(self, entry: Entry, signum: int) -> None:
+        foreign = self._foreign_groups(entry)
+        for handle in entry.handles.values():
+            if not handle.live():
+                continue
+            location = handle.location()
+            if foreign is None or location is None or any(g in foreign for g in location):
+                entry.unverified = True
+                self.log("[%s] background pid %s: ownership changed or unknown; no signal"
+                         % (entry.agent, handle.pid))
+                continue
+            handle.send(signum)
 
     def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
         for p in table:
@@ -531,6 +572,17 @@ class Tracker:
                 table = platform.process_table()
             except Exception:
                 return True
+            if entry.watching_adoption:
+                adopted = [p for p in table if p["ppid"] == os.getpid()
+                           and (p["pid"], p.get("start")) not in entry.children_before]
+                if any(not p["zombie"] for p in adopted):
+                    # Adoption preserves visibility after double-fork+setsid,
+                    # but multiple turns share this parent: no signalling proof.
+                    entry.unverified = True
+                    return True
+                for p in adopted:
+                    if p["pid"] in roots or p["pgid"] in groups:
+                        platform.reap(p["pid"])
             descendants = set(roots)
             while True:
                 found = {p["pid"] for p in table
@@ -589,6 +641,9 @@ class Tracker:
         vide, ou survivant au SIGKILL) — jamais une nouvelle sonde de l'OS, qui
         peut tomber sur un numéro de groupe déjà réattribué (#458 r2)."""
         entry.closed = now
+        if entry.unverified:
+            self.log("[%s] background cleanup ownership unknown; resource remains orphan"
+                     % entry.agent)
         self._drop_handles(entry)
         for job in entry.jobs.values():
             if job.ended is None:

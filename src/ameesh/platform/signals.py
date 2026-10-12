@@ -43,6 +43,16 @@ class ProcessHandle:
         except (OSError, ValueError):
             return False
 
+    def location(self) -> tuple[int, int] | None:
+        """Current group/session, only while this retained identity is live."""
+        if not self.live():
+            return None
+        try:
+            group, session = os.getpgid(self.pid), os.getsid(self.pid)
+        except OSError:
+            return None
+        return (group, session) if self.live() else None
+
     def send(self, signum: int) -> None:
         if self.fd is None:
             return

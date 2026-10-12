@@ -75,6 +75,7 @@ class BackgroundSignalTest(unittest.TestCase):
     def test_recycled_historical_pid_is_not_an_ownership_anchor(self):
         # The PID appears in lineage, but its captured process has exited.
         old = mock.Mock()
+        old.location.return_value = (7000, 7000)
         old.live.return_value = False
         self.entry.handles[7001] = old
         foreign = [row(start=99.0)]
@@ -90,6 +91,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_unreadable_scan_cleans_retained_handles_but_stays_uncertain(self):
         handle = mock.Mock()
+        handle.location.return_value = (7000, 7000)
         self.entry.handles[7001] = handle
         self.tracker.TERM_GRACE_S = 0
         with mock.patch.object(platform, "process_table", side_effect=OSError("unreadable")), \
@@ -103,6 +105,37 @@ class BackgroundSignalTest(unittest.TestCase):
         killpg.assert_not_called()
         self.assertTrue(any("process table unavailable" in note for note in self.notes))
         self.assertTrue(survives)
+
+    def test_foreign_live_turn_session_is_never_signalled(self):
+        self.runner.harness_pids = {7999}
+        held = mock.Mock()
+        held.live.return_value = True
+        held.location.return_value = (7000, 7999)
+        self.entry.handles[7001] = held
+        self.tracker.entries = [self.entry]
+        self.tracker.TERM_GRACE_S = 0
+        with mock.patch.object(platform, "process_table", return_value=[row()]), \
+                mock.patch.object(background.time, "monotonic", side_effect=[0, 1, 2, 9]), \
+                mock.patch.object(background.storage, "of") as store:
+            self.tracker.stop_all("test")
+        held.send.assert_not_called()
+        self.assertTrue(self.entry.unverified)
+        store.return_value.turn_resources.close_turn.assert_called_once_with(
+            "expiry-test", orphan=True, containers=None)
+
+    def test_unreadable_ownership_registry_prevents_signalling(self):
+        held = mock.Mock()
+        held.live.return_value = True
+        held.location.return_value = (7000, 7000)
+        self.entry.handles[7001] = held
+        self.runner.db = object()
+        self.tracker.TERM_GRACE_S = 0
+        with mock.patch.object(platform, "process_table", return_value=[row()]), \
+                mock.patch.object(background.time, "monotonic", side_effect=[0, 1, 2, 9]), \
+                mock.patch.object(background.storage, "of", side_effect=OSError("registry")):
+            self.assertTrue(self.tracker._kill(self.entry))
+        held.send.assert_not_called()
+        self.assertTrue(self.entry.unverified)
 
     def test_missing_pidfd_has_no_numeric_signal_fallback(self):
         with mock.patch.object(os, "pidfd_open", side_effect=OSError("unavailable"),
@@ -129,6 +162,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_uncaptured_child_after_leader_exit_keeps_resource_orphaned(self):
         leader = mock.Mock()
+        leader.location.return_value = (7000, 7000)
         leader.live.return_value = True
         with mock.patch.object(background.ProcessHandle, "open", return_value=leader), \
                 mock.patch.object(platform, "command_line", return_value="fixture"), \
@@ -180,6 +214,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_detached_retained_child_stays_tracked_until_expiry(self):
         child = mock.Mock()
+        child.location.return_value = (7000, 7000)
         child.live.return_value = True
         detached = row()
         detached["pgid"] = 7001
@@ -208,6 +243,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_shutdown_preserves_uncaptured_child_after_anchor_exit(self):
         leader = mock.Mock()
+        leader.location.return_value = (7000, 7000)
         leader.live.return_value = True
         with mock.patch.object(platform, "command_line", return_value="leader"), \
                 mock.patch.object(platform, "reap", return_value=None), \
@@ -226,6 +262,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_term_exit_rescans_for_child_forked_after_capture(self):
         leader = mock.Mock()
+        leader.location.return_value = (7000, 7000)
         leader.live.return_value = True
 
         def send(signum):
@@ -305,6 +342,15 @@ class BackgroundSignalTest(unittest.TestCase):
     @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
                          and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
     def test_detached_child_forking_on_term_preserves_surviving_grandchild(self):
+        self._detached_fork_on_term()
+
+    @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
+    def test_detached_double_fork_with_new_session_preserves_uncertainty(self):
+        self.assertTrue(platform.become_subreaper())
+        self._detached_fork_on_term(double=True)
+
+    def _detached_fork_on_term(self, *, double=False):
         with tempfile.TemporaryDirectory(prefix="ameesh-detached-fork-") as tmp:
             pidfile = os.path.join(tmp, "grandchild.pid")
             code = ("import os,signal,subprocess,sys,time; from pathlib import Path\n"
@@ -315,6 +361,22 @@ class BackgroundSignalTest(unittest.TestCase):
                     "signal.signal(signal.SIGTERM,term)\n"
                     "print('ready',flush=True)\n"
                     "time.sleep(60)\n")
+            if double:
+                code = ("import os,signal,time; from pathlib import Path\n"
+                        "def term(*_):\n"
+                        " p=os.fork()\n"
+                        " if p: os.waitpid(p,0); os._exit(0)\n"
+                        " os.setsid()\n"
+                        " p=os.fork()\n"
+                        " if p:\n"
+                        "  while not Path(%r).exists(): time.sleep(.01)\n"
+                        "  os._exit(0)\n"
+                        " os.setsid()\n"
+                        " Path(%r).write_text(str(os.getpid()))\n"
+                        " time.sleep(60)\n"
+                        "signal.signal(signal.SIGTERM,term)\n"
+                        "print('ready',flush=True)\n"
+                        "time.sleep(60)\n") % (pidfile, pidfile)
             child = subprocess.Popen([sys.executable, "-c", code, pidfile],
                                      start_new_session=True, stdout=subprocess.PIPE, text=True)
             held = None
@@ -349,7 +411,8 @@ class BackgroundSignalTest(unittest.TestCase):
                 if grandchild is not None:
                     try:
                         os.kill(grandchild, signal.SIGKILL)
-                    except ProcessLookupError:
+                        os.waitpid(grandchild, 0)
+                    except (ProcessLookupError, ChildProcessError):
                         pass
                 if held is not None:
                     held.send(signal.SIGKILL)
@@ -368,6 +431,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_escalation_keeps_handles_when_group_number_is_recycled(self):
         old = mock.Mock()
+        old.location.return_value = (7000, 7000)
         old.live.return_value = True
         self.entry.handles[7001] = old
         self.tracker.TERM_GRACE_S = 0
@@ -390,6 +454,7 @@ class BackgroundSignalTest(unittest.TestCase):
     def test_shutdown_cannot_close_fd_during_signalling(self):
         entered, release, closing, closed = (threading.Event() for _ in range(4))
         old = mock.Mock()
+        old.location.return_value = (7000, 7000)
         old.live.return_value = True
         self.entry.handles[7001] = old
         self.tracker.TERM_GRACE_S = 0
