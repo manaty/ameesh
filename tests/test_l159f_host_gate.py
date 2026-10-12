@@ -740,18 +740,41 @@ class OnceTurnTest(PgTestCase):
         expiry = {}
 
         def turn(worker, _wait):
-            worker.lease_deadline = time.time() + 0.3
-            expiry["at"] = worker.lease_deadline
+            # r1 P2: the expiry read in the base is not compared with this
+            # host's wall clock (here 120 s ahead: the base's expiry looks
+            # past); only the monotonic bound taken after the base answered
+            worker.lease_deadline = time.time() - 60
+            worker.lease_held_until = time.monotonic() + 0.3
+            expiry["at"] = worker.lease_held_until
             return True
 
         with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
                 mock.patch.object(runner_mod.AgentWorker, "release_lease",
                                   return_value=False):
             runner.sweep()
-            freed = time.time()
+            freed = time.monotonic()
         self.assertGreaterEqual(freed, expiry["at"])
         self.assertEqual(self.events[-1], ("tick", False))
         self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
+    def test_release_is_tried_even_after_renewal_failures(self):
+        # r1 P2: three generic DbErrors at renewal set `lease_lost` before the
+        # lease expires; the base still gives it to us, so the return is
+        # tried (fenced by the epoch) and its failure reported
+        import threading
+        import types
+        from unittest import mock
+        from ameesh import db as db_mod, runner as runner_mod
+        worker = types.SimpleNamespace(
+            watchdog_stop=threading.Event(), lease_lost=threading.Event(),
+            db=None, name="a1", epoch=7, runner=types.SimpleNamespace(runner_id="r1"))
+        worker.lease_lost.set()
+        with mock.patch.object(runner_mod.registry, "release",
+                               side_effect=db_mod.DbError("down")) as release:
+            self.assertFalse(runner_mod.AgentWorker.release_lease(worker))
+        release.assert_called_once_with(None, "a1", "r1", 7)
+        with mock.patch.object(runner_mod.registry, "release", return_value=False):
+            self.assertTrue(runner_mod.AgentWorker.release_lease(worker))  # not ours
 
     def test_a_gate_closed_before_the_turn_runs_none(self):
         from unittest import mock

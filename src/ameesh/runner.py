@@ -331,6 +331,10 @@ class AgentWorker(threading.Thread):
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
+        #: L159f4 r1 : borne du bail sur l'horloge monotone de cet hôte, prise
+        #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
+        #: avant l'échéance de la base, quel que soit l'écart des horloges
+        self.lease_held_until = self._held_until()
         self.pgid: int | None = None  # groupe du harnais en cours
         #: dernier descripteur de harnais journalisé (chemin, empreinte) — L16
         self.descriptor_seen: tuple[str, str] = ("", "")
@@ -608,16 +612,20 @@ class AgentWorker(threading.Thread):
                       "%d failure(s)" % (self.name, self.renew_failures))
         self.renew_failures = 0
         self.lease_deadline = float(expires)
+        self.lease_held_until = self._held_until()
         return True
+
+    def _held_until(self) -> float:
+        return time.monotonic() + float(self.runner.lease_ttl)
 
     def release_lease(self) -> bool:
         """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
-        bail reste tenu jusqu'à son échéance (`lease_deadline`, plus
+        bail reste tenu jusqu'à son échéance (`lease_held_until`, plus
         renouvelé). Perdu ou déjà repris par un autre : True, il n'est plus
-        à nous."""
+        à nous. Le retour est tenté même `lease_lost` posé (r1) : des pannes
+        au renouvellement le posent sans que la base ait repris le bail ; le
+        retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
-        if self.lease_lost.is_set():
-            return True
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
@@ -4198,13 +4206,15 @@ class Runner:
         réussi ou l'échéance du bail (il n'est plus renouvelé) ; jamais
         « vidé » bail tenu (L159f4). Un arrêt de l'exécuteur coupe l'attente :
         sa part disparaît avec lui."""
-        until = worker.lease_deadline if worker.lease_deadline > 0 \
-            else time.time() + self.lease_ttl
+        # r1 : l'échéance lue en base n'est pas comparée à l'horloge murale
+        # de cet hôte (en avance, elle dirait la part libre bail tenu)
+        until = worker.lease_held_until
         log_async("[%s] lease not returned (base): counted as held until it is, "
-                  "or until it expires (%ds)" % (worker.name, max(0, until - time.time())))
-        while time.time() < until:
+                  "or until it expires (%ds)"
+                  % (worker.name, max(0, until - time.monotonic())))
+        while time.monotonic() < until:
             gate.tick()
-            if self.stop.wait(min(self.RELEASE_RETRY_S, max(0.0, until - time.time()))):
+            if self.stop.wait(min(self.RELEASE_RETRY_S, max(0.0, until - time.monotonic()))):
                 return
             if worker.release_lease():
                 return
