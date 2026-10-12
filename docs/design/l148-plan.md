@@ -9,8 +9,9 @@ just after the snapshot). The inventory below was re-anchored on `27ef6b49`: the
 references that had moved are updated, the three migrations and eight tables #216 added are
 counted (68 migration files, 64 tables, still no French name among them), and the new
 definitions and CLI options #216 introduced were checked: all English. What remains a
-`4a056a97` snapshot is §3's open-PR table and §2.2's `refs` column: #216 no longer counts in the
-conflict set, which must be re-read with `gh pr list` before each stage (§6).
+`4a056a97` snapshot is §3's open-PR table, the per-file open-PR columns of §2.2/§2.5 and the
+`refs` column: #216 no longer counts in the conflict set (it is removed from stage 4's wait
+list), and the set must be re-read with `gh pr list` before each stage (§6).
 
 This document is the deliverable of #469. It inventories the French identifiers still on
 `origin/main`, maps each of them to the open pull requests that touch the same files, and
@@ -37,8 +38,8 @@ It changes no code.
 **Key scoping facts found while building this inventory:**
 
 1. `porte_hote`, the first example in the lot body, **does not exist on `manaty/ameesh`
-   `origin/main`** (0 occurrences). It presumably lives in `manaty/nexlink`; this inventory
-   covers the ameesh repository only. If the other repositories must be inventoried too, say so.
+   `origin/main`** (0 occurrences). It lives in `manaty/nexlink`, which #147 does not cover
+   (§5.1): this inventory covers the ameesh repository only.
 2. The domain term **`lot` is kept** (mesh-design decision, message n°6795 relayed in
    `fils/ameesh/_projet.md` line 4031: keep `lot`, glossed "lot (work item)"). It appears in
    5 columns, 5 CLI options, 1 dataclass field and the `/api/v1/lots` routes; this plan treats it
@@ -453,7 +454,7 @@ Ordering rules used by the plan:
 ## 4. Plan: ordered small PRs
 
 Each stage is one or more small PRs. "Free" means no open PR touches the file. All PRs carry
-`ameesh-work: 147` (L148) once #147 starts, except this document's own PR (`ameesh-work: 469`).
+`ameesh-work: 147` (L148); this document's own PR carries `ameesh-work: 469`.
 
 ### Stage 0 — hygiene (one PR, ~10 lines, free files)
 
@@ -545,28 +546,28 @@ schema owner, because `work_items` already uses `work_item_id`.
 
 ### Stage 4 — hot files, after their open PRs merge (in this order)
 
-| order | file                                      | names                                                                                                                           | open PRs to wait for (or coordinate with)            |
-|-------|-------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| 4a    | src/ameesh/adapters.py                    | 1 (hors_path)                                                                                                                   | #420                                                 |
-| 4b    | src/ameesh/reprise.py                     | 2 (RepriseError, _fil)                                                                                                          | #377, #424                                           |
-| 4c    | src/ameesh/storage/postgres/operations.py | 1 (_sans_compte_nul)                                                                                                            | #420, #422                                           |
-| 4d    | src/ameesh/mail.py + background.py        | 3 (_tronque, boucle, lignee)                                                                                                    | #216, #394, #428                                     |
-| 4e    | src/ameesh/backend.py                     | 1 (chantier)                                                                                                                    | #216, #394                                           |
-| 4f    | src/ameesh/cli.py                         | 11 (_Remise, _attente, _tour_ecrit, _travail_du_tour, abandonner, avis_borne, avis_borne_travail, lire, prendre, reste, solder) | #216, #394, #417                                     |
-| 4g    | src/ameesh/mesh_cli.py                    | 6 (+ `--externe`)                                                                                                               | #194, #326, #412, #417, #420                         |
-| 4h    | src/ameesh/exploitation.py                | 2 (humain, politique)                                                                                                           | #194, #216, #326, #394, #420, #424                   |
-| 4i    | src/ameesh/canon.py                       | 5 (Fiche, _fiche, fiche, _read_fiches, host_fiches)                                                                             | #216, #394                                           |
-| 4j    | src/ameesh/runner.py                      | 37                                                                                                                              | #194, #216, #394, #417, #420, #421, #422, #423, #424 |
+| order | file                                      | names                                                                                                                           | open PRs to wait for (or coordinate with)      |
+|-------|-------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|
+| 4a    | src/ameesh/adapters.py                    | 1 (hors_path)                                                                                                                   | #420                                           |
+| 4b    | src/ameesh/reprise.py                     | 2 (RepriseError, _fil)                                                                                                          | #377, #424                                     |
+| 4c    | src/ameesh/storage/postgres/operations.py | 1 (_sans_compte_nul)                                                                                                            | #420, #422                                     |
+| 4d    | src/ameesh/mail.py + background.py        | 3 (_tronque, boucle, lignee)                                                                                                    | #394, #428                                     |
+| 4e    | src/ameesh/backend.py                     | 1 (chantier)                                                                                                                    | #394                                           |
+| 4f    | src/ameesh/cli.py                         | 11 (_Remise, _attente, _tour_ecrit, _travail_du_tour, abandonner, avis_borne, avis_borne_travail, lire, prendre, reste, solder) | #394, #417                                     |
+| 4g    | src/ameesh/mesh_cli.py                    | 6 (+ `--externe`)                                                                                                               | #194, #326, #412, #417, #420                   |
+| 4h    | src/ameesh/exploitation.py                | 2 (humain, politique)                                                                                                           | #194, #326, #394, #420, #424                   |
+| 4i    | src/ameesh/canon.py                       | 5 (Fiche, _fiche, fiche, _read_fiches, host_fiches)                                                                             | #394                                           |
+| 4j    | src/ameesh/runner.py                      | 37                                                                                                                              | #194, #394, #417, #420, #421, #422, #423, #424 |
 
 `Fiche`/`fiche` need a public alias: `Card = Fiche` (and a `fiche` property on the canon
 objects returning `card`) so canon consumers and the `to_dict` output keep working for one
 release; `to_dict` may then emit both keys.
 
-`runner.py` is the last file: 37 names, 9 open PRs, and the file also carries `Lancement`,
+`runner.py` is the last file: 37 names, 8 open PRs, and the file also carries `Lancement`,
 `Reprise`, `battement`, `veilleur` and the whole accounting vocabulary. One PR is enough; it
-must be rebased on the day the last of #194/#216/#394/#417/#420/#421/#422/#423/#424 merges.
+must be rebased on the day the last of #194/#394/#417/#420/#421/#422/#423/#424 merges.
 
-### Stage 5 — tests (needs a decision)
+### Stage 5 — tests (decision: (b) now)
 
 2 090 French `test_*` names in 155 files. Options:
 
@@ -577,8 +578,9 @@ must be rebased on the day the last of #194/#216/#394/#417/#420/#421/#422/#423/#
 - **(b) Out of scope** — keep French test names, which are prose-like and never leave the
   repository. Rename only the 22 French **test-file** names (§2.1) and the French helper
   classes/functions that are imported (`_fil`, `lire`, `ecrire`, `jamais`, `en_panne`…).
-- Recommendation: **(b) now, (a) after the open queue drains**, because the owner rule targets
-  code identifiers but the risk/benefit for test sentences is poor. mesh-design should confirm.
+- **Decision (mesh-design, 2026-10-12 17:52 UTC): (b) now, (a) once the open-PR queue has
+  drained** — the owner rule targets code identifiers, and the risk/benefit for `test_*`
+  sentences is poor.
 
 ### Stage 6 — JSON/API keys and stored values
 
@@ -586,9 +588,11 @@ must be rebased on the day the last of #194/#216/#394/#417/#420/#421/#422/#423/#
   `flow`, `measure`, `thread`, `project`, `list`, `housekeeping`, `milestones`, `end`,
   `instruction`, `delivered`) **in addition to** the French ones for one release; drop the French
   keys in a later release. `docs/api/openapi-v1.json` must list both during the transition.
-- Values: accept both spellings on input, write the English one, migrate rows in one migration
-  (`session_policy`, `mode`, orphan/delegation reasons, roadmap milestones, turn kinds). Keep the
-  existing `*_LABELS` translation tables as the read-side compatibility layer.
+- Values: **deferred out of #147** (mesh-design decision, §5.5): `par-lot`, `en_retard`,
+  `inconnu`, `externe` and the other stored vocabularies move to a separate later lot, which will
+  accept both spellings on input, write the English one, migrate the rows in one migration
+  (`session_policy`, `mode`, orphan/delegation reasons, roadmap milestones, turn kinds) and keep
+  the existing `*_LABELS` translation tables as the read-side compatibility layer.
 
 ### Stage 7 — cleanup
 
@@ -597,18 +601,20 @@ must be rebased on the day the last of #194/#216/#394/#417/#420/#421/#422/#423/#
 - Re-run this inventory by script; the target is 0 French identifiers outside the kept `lot`
   vocabulary and the 14 applied migration file names.
 
-## 5. Decisions requested from mesh-design
+## 5. Decisions (mesh-design, 2026-10-12 17:52 UTC)
 
-1. **Scope of repositories**: is `manaty/ameesh` the only repository for #147? (`porte_hote` is
-   not in it; `manaty/nexlink` likely has it.)
-2. **Tests**: option (a) or (b) in stage 5?
-3. **`lot`**: confirm the kept-term decision applies to code identifiers too (columns `lot`,
-   `--lot`, `ThreadRef.lot`, `/api/v1/lots`), not only to prose.
-4. **`organisation`**: British English — keep or normalize to `organization` (API change)?
-5. **Stored values**: do `par-lot`, `en_retard`, `inconnu`, `externe` count as identifiers for
-   #147, or are they covered by the L156c English-output work?
-6. **Priority**: stages 1–2 can start immediately without conflicting with any open PR; stage 4
-   is blocked on other lots. Should #147 start with stages 0–2 now and wait for the queue?
+`#147` is reassigned to `mty-amh-impl-04` (was `ameesh-dev7`); stages 0–2 start now, one small PR
+per stage, each carrying `ameesh-work: 147`. Answers to the six questions this section used to
+ask:
+
+1. **Repositories**: `manaty/ameesh` only — `manaty/nexlink` is not covered by #147, so
+   `porte_hote` stays out of scope.
+2. **Tests (stage 5)**: option (b) now, option (a) once the open-PR queue has drained.
+3. **`lot`**: the kept term applies to code identifiers too — the `lot` columns, `--lot`,
+   `ThreadRef.lot` and `/api/v1/lots` are not renamed.
+4. **`organisation`**: keep the British spelling; no API change for a spelling.
+5. **Stored values**: out of #147 for now; stage 6's value migration becomes a separate lot.
+6. **Start**: stages 0–2 now; stage 4 keeps waiting for the PRs that touch its files.
 
 ## 6. Limits
 
