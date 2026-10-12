@@ -8,7 +8,7 @@ import unittest
 
 from ameesh import registry, work
 
-from .support import PgTestCase
+from .support import PgTestCase, hold_for_owner
 
 
 class WorkTest(PgTestCase):
@@ -57,8 +57,8 @@ class WorkTest(PgTestCase):
         self.assertIn("épuisée", str(ctx.exception))
         # on peut encore bloquer ou attendre un humain
         self.assertEqual(work.move(self.db, item["id"], "blocked")["state"], "blocked")
-        self.assertEqual(
-            work.move(self.db, item["id"], "waiting_human")["state"], "waiting_human")
+        hold_for_owner(self.db, item["id"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "waiting_human")
 
     def test_journal_des_transitions(self):
         item = self._add()
