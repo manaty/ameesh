@@ -129,9 +129,11 @@ SCOPE_FIELDS = ("scope", "projects")
 #: l'organisation ; l'entrée d'un membre n'a pas de nommage propre.
 NAMING_KEY = "naming"
 #: L243 (#468) : un segment de nom est en minuscules, 2 à 6 caractères.
-NAMING_SEGMENT_RE = re.compile(r"^[a-z0-9]{2,6}$")
+#: `\Z` (et non `$`) : `$` accepte une fin de ligne, donc `"mty\n"` passerait
+#: et engendrerait un nom invalide.
+NAMING_SEGMENT_RE = re.compile(r"^[a-z0-9]{2,6}\Z")
 #: L243 (#468) : le numéro de séquence, deux chiffres puis trois après 99.
-NAMING_SEQ_RE = re.compile(r"^[0-9]{2,}$")
+NAMING_SEQ_RE = re.compile(r"^[0-9]{2,}\Z")
 NAMING_FIELDS = ("org", "projects", "roles")
 
 
@@ -1605,12 +1607,14 @@ class Naming:
         return {"org": self.org, "projects": dict(self.projects),
                 "roles": dict(self.roles)}
 
-    def project_segment(self, project: str) -> str:
+    def project_segment(self, project: str, known: Iterable[str] = ()) -> str:
         """Segment d'un projet : le nom court déclaré, sinon le nom tronqué à 6.
 
-        Une troncature qui rejoindrait le nom court d'un AUTRE dépôt est
+        Une troncature qui rejoindrait le segment d'un AUTRE dépôt connu est
         refusée (deux dépôts ne partagent jamais un segment), avec la clé
-        `naming.projects.<dépôt>` à déclarer."""
+        `naming.projects.<dépôt>` à déclarer. `known` : les noms de dépôts
+        connus du mesh mais absents de `naming.projects` (fiches, demande) —
+        sans eux, deux dépôts non déclarés tronqués pareil passeraient."""
         declared = self.projects.get(project)
         if declared:
             return declared
@@ -1619,8 +1623,10 @@ class Naming:
             raise NamingError(
                 "project %r has no usable short name (%r): declare "
                 "naming.projects.%s in the federation" % (project, short, project))
-        clash = sorted(key for key, segment in self.projects.items()
-                       if segment == short and key != project)
+        others = {str(key) for key in known} | set(self.projects)
+        others.discard(project)
+        clash = sorted(key for key in others
+                       if (self.projects.get(key) or str(key)[:6]) == short)
         if clash:
             raise NamingError(
                 "project %r: the 6-character name %r is already the short name of %s: "
@@ -1636,7 +1642,8 @@ class Naming:
                 "role %r has no short name in naming.roles (known: %s)" % (role, known))
         return declared
 
-    def prefix(self, role: str, projects: Iterable[str]) -> str:
+    def prefix(self, role: str, projects: Iterable[str],
+               known: Iterable[str] = ()) -> str:
         """Préfixe du nom : `<org>-<repo>-<role>-` (un projet) ou
         `<org>-<role>-` (plusieurs : le segment de dépôt disparaît)."""
         projects = list(projects)
@@ -1647,17 +1654,19 @@ class Naming:
                               % ", ".join(projects))
         parts = [self.org]
         if len(projects) == 1:
-            parts.append(self.project_segment(projects[0]))
+            parts.append(self.project_segment(projects[0], known))
         parts.append(self.role_segment(role))
         return "-".join(parts) + "-"
 
-    def next_name(self, role: str, projects: Iterable[str], taken: Iterable[str]) -> str:
+    def next_name(self, role: str, projects: Iterable[str], taken: Iterable[str],
+                  known: Iterable[str] = ()) -> str:
         """Premier numéro libre pour ce préfixe, sur deux chiffres (`01`).
 
         `taken` : tous les noms déjà pris (fiches, registre — agents arrêtés
         compris — et alias de #423) : un numéro déjà attribué n'est jamais
-        réutilisé tant que le nom reste réservé."""
-        prefix = self.prefix(role, projects)
+        réutilisé tant que le nom reste réservé. `known` : les dépôts connus
+        hors `naming.projects`, pour refuser une troncature ambiguë."""
+        prefix = self.prefix(role, projects, known)
         used = set()
         for name in taken:
             if not isinstance(name, str) or not name.startswith(prefix):
@@ -1727,6 +1736,25 @@ def parse_naming(value: Any) -> tuple[Naming | None, str | None]:
                                   % (seen[segment], key, segment))
                 seen[segment] = key
     return Naming(org=org, projects=out["projects"], roles=out["roles"]), None
+
+
+def known_projects(canons: Iterable, requested: Iterable[str] = ()) -> set:
+    """Noms de dépôts connus (L243, #468), hors `naming.projects` déclaré.
+
+    Ceux de la demande, puis ceux des fiches de chaque canon (`projects:`,
+    L243/#435 ; `team` sinon). `Naming.project_segment` s'en sert pour refuser
+    une troncature à 6 caractères que deux dépôts non déclarés partageraient :
+    sans cette liste, `catalogue` et `catalogapi` donneraient le même segment
+    `catalo` sans que rien ne le dise."""
+    known = {str(project) for project in requested if isinstance(project, str)}
+    for canon in canons:
+        naming = getattr(canon, "naming", None)
+        if naming is not None:
+            known.update(str(key) for key in naming.projects)
+        for agent in getattr(canon, "agents", ()) or ():
+            known.update(project for project in agent.effective_projects
+                         if isinstance(project, str))
+    return known
 
 
 def _profile_type(content: bytes | None) -> str | None:
@@ -2106,9 +2134,9 @@ class _Loader:
         if not isinstance(ext, dict):
             return
         raw = ext.get(NAMING_KEY)
-        if raw is None:
+        if NAMING_KEY not in ext:           # absent : aucune convention
             return
-        naming, problem = parse_naming(raw)
+        naming, problem = parse_naming(raw)  # `naming:` explicite (null) : invalide
         if problem:
             self.add("naming-invalid", ERROR,
                      "`extensions.%s.%s`: %s — no default agent name is generated"

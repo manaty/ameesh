@@ -28,6 +28,8 @@
                                          prochain nom libre <org>-<repo>-<role>-<seq>
                                          (L243, #468) : fiches, registre et rôles du
                                          nommage du canon
+  ameesh canon agent spawn|name …        mêmes commandes sous `canon` (L243, #468) ;
+                                         la place canonique du nommage
 
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
 (sinon AMEESH_CANON_REF, le `ref` du manifeste, origin/main), `--fetch`.
@@ -622,14 +624,27 @@ def _configured_canons(cfg: Config, args: argparse.Namespace) -> list[canon_mod.
 
     L243 (#468) : un nom d'agent est unique pour TOUS les canons, donc les
     noms déjà pris se lisent partout ; `--canon` ne choisit que le nommage
-    qui s'applique (voir `_naming_canon`)."""
+    qui s'applique (voir `_naming_canon`). Un `--canon DOSSIER` n'est donc pas
+    le SEUL canon lu : les canons configurés restent lus pour leurs
+    réservations (sinon le générateur rendrait un nom déjà déclaré ailleurs)."""
     if getattr(args, "ref", None):
         cfg = dataclasses.replace(cfg, canon_ref=args.ref)
     fetch = bool(getattr(args, "fetch", False))
     entries = canon_mod.configured(cfg)
     wanted = getattr(args, "canon", None)
     if wanted and (os.path.isdir(wanted) or not entries):
-        return [canon_mod.from_config(cfg, root=wanted, fetch=fetch)]
+        chosen = canon_mod.from_config(cfg, root=wanted, fetch=fetch)
+        if not entries:
+            return [chosen]
+        merged = [chosen]
+        seen = {os.path.realpath(chosen.root)}
+        for canon in canon_mod.from_config_all(cfg, fetch=fetch):
+            root = os.path.realpath(canon.root)
+            if root in seen:                # `--canon` désigne un canon configuré
+                continue
+            seen.add(root)
+            merged.append(canon)
+        return merged
     if len(entries) <= 1:
         return [canon_mod.from_config(cfg, fetch=fetch)]
     return canon_mod.from_config_all(cfg, fetch=fetch)
@@ -665,7 +680,8 @@ def _generated_name(naming, role: str | None, projects, canons: list, db) -> str
             "roles in its federation.yaml")
     if not role:
         raise canon_mod.NamingError("--role is required to generate a name")
-    return naming.next_name(role, projects or [], _taken_agent_names(canons, db))
+    known = canon_mod.known_projects(canons, projects or [])
+    return naming.next_name(role, projects or [], _taken_agent_names(canons, db), known)
 
 
 def cmd_agent_name(cfg: Config, args: argparse.Namespace) -> int:
@@ -747,38 +763,13 @@ def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
-def add_parsers(sub) -> None:
-    """Branche `canon …`, `placement …` et `agent …` sur le parseur de mesh_cli."""
-    p_canon = sub.add_parser("canon", help="OKF canon: check, show, sync")
-    canon_sub = p_canon.add_subparsers(dest="canon_command")
-    p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
-    _canon_options(p_check)
-    p_check.add_argument("--host", default=None,
-                         help="host whose state is diagnosed (otherwise AMEESH_HOST / this "
-                              "machine)")
-    p_check.set_defaults(func=cmd_check)
-    p_cshow = canon_sub.add_parser("show", help="cards read and their source")
-    _canon_options(p_cshow)
-    p_cshow.set_defaults(func=cmd_show)
-    p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
-    _canon_options(p_sync)
-    p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")
-    p_sync.add_argument("--bootstrap-ref", default=None, metavar="BRANCH",
-                        help="first bootstrap of the authenticator registry only "
-                             "(no AMEESH_CANON_REF, no commit applied yet): trusted "
-                             "canonical branch (origin/<BRANCH>), logged; "
-                             "ignored afterwards")
-    p_sync.set_defaults(func=cmd_sync)
+def _add_agent_parsers(parent) -> None:
+    """`agent spawn|name` (L243, #468), branché aux DEUX endroits.
 
-    p_place = sub.add_parser("placement", help="governed placement (C4): check")
-    place_sub = p_place.add_subparsers(dest="placement_command")
-    p_pcheck = place_sub.add_parser(
-        "check", help="admitted or refused placements, and admissible placements (read-only)")
-    _canon_options(p_pcheck)
-    p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
-    p_pcheck.set_defaults(func=cmd_placement_check)
-
-    p_agent = sub.add_parser("agent", help="ephemeral agents, and names (L243)")
+    `ameesh canon agent …` est la place canonique (le nommage est une
+    propriété du canon) ; `ameesh agent …` reste branché pour les scripts et
+    la documentation existants. Codex r1 (#452) : le premier chemin manquait."""
+    p_agent = parent.add_parser("agent", help="ephemeral agents, and names (L243)")
     agent_sub = p_agent.add_subparsers(dest="agent_command")
     p_spawn = agent_sub.add_parser(
         "spawn", help="create an ephemeral (responsible inherited from the creator, read/propose)")
@@ -802,3 +793,38 @@ def add_parsers(sub) -> None:
     p_name.add_argument("--project", action="append", default=None,
                         help="project the agent works on; repeat for a multi-project agent")
     p_name.set_defaults(func=cmd_agent_name)
+
+
+def add_parsers(sub) -> None:
+    """Branche `canon …` (dont `canon agent …`), `placement …` et `agent …`."""
+    p_canon = sub.add_parser("canon", help="OKF canon: check, show, sync")
+    canon_sub = p_canon.add_subparsers(dest="canon_command")
+    p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
+    _canon_options(p_check)
+    p_check.add_argument("--host", default=None,
+                         help="host whose state is diagnosed (otherwise AMEESH_HOST / this "
+                              "machine)")
+    p_check.set_defaults(func=cmd_check)
+    p_cshow = canon_sub.add_parser("show", help="cards read and their source")
+    _canon_options(p_cshow)
+    p_cshow.set_defaults(func=cmd_show)
+    p_sync = canon_sub.add_parser("sync", help="canon → host registry (§4.4)")
+    _canon_options(p_sync)
+    p_sync.add_argument("--host", default=None, help="host (otherwise AMEESH_HOST / this machine)")
+    p_sync.add_argument("--bootstrap-ref", default=None, metavar="BRANCH",
+                        help="first bootstrap of the authenticator registry only "
+                             "(no AMEESH_CANON_REF, no commit applied yet): trusted "
+                             "canonical branch (origin/<BRANCH>), logged; "
+                             "ignored afterwards")
+    p_sync.set_defaults(func=cmd_sync)
+    _add_agent_parsers(canon_sub)
+
+    p_place = sub.add_parser("placement", help="governed placement (C4): check")
+    place_sub = p_place.add_subparsers(dest="placement_command")
+    p_pcheck = place_sub.add_parser(
+        "check", help="admitted or refused placements, and admissible placements (read-only)")
+    _canon_options(p_pcheck)
+    p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
+    p_pcheck.set_defaults(func=cmd_placement_check)
+
+    _add_agent_parsers(sub)

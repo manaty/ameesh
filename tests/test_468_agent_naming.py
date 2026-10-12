@@ -95,6 +95,37 @@ class NamingConfigTest(_TmpMixin, unittest.TestCase):
             self.assertIn("naming", found[0].message)
             self.assertTrue(found[0].message, block)
 
+    def test_naming_segment_refuses_a_trailing_newline(self):
+        """Codex r1 (#452, P2) : `$` laissait passer `"mty\\n"`."""
+        root = self.example_copy()
+        cases = [
+            "      org: \"mty\\n\"\n",
+            "      org: mty\n      projects: {acme-web: \"amh\\n\"}\n",
+            "      org: mty\n      roles: {implementer: \"impl\\n\"}\n",
+        ]
+        for block in cases:
+            write(root, "federation.yaml",
+                  FEDERATION + "extensions:\n  ameesh:\n    naming:\n" + block)
+            loaded, findings = self.check(root)
+            self.assertIsNone(loaded.naming, block)
+            self.assertFinding(findings, "naming-invalid")
+        # et un segment valide reste accepté (le contrôle n'est pas trop strict)
+        write(root, "federation.yaml", FEDERATION + NAMING)
+        loaded, findings = self.check(root)
+        self.assertEqual(canon.errors(findings), [], findings)
+        self.assertEqual(loaded.naming.org, "mty")
+
+    def test_explicit_naming_null_is_invalid(self):
+        """Codex r1 (#452, P2) : `naming:` (null) était traité comme absent."""
+        root = self.example_copy()
+        for value in ("naming:\n", "naming: null\n", "naming: ~\n"):
+            write(root, "federation.yaml",
+                  FEDERATION + "extensions:\n  ameesh:\n    " + value)
+            loaded, findings = self.check(root)
+            self.assertIsNone(loaded.naming, value)
+            found = self.assertFinding(findings, "naming-invalid")
+            self.assertIn("mapping expected", found[0].message)
+
     def test_naming_is_a_root_key_only(self):
         """`naming` dans l'entrée d'un membre n'a pas de sens : ignoré, dit."""
         root = self.example_copy()
@@ -182,6 +213,25 @@ class NamingGeneratorTest(unittest.TestCase):
         with self.assertRaises(canon.NamingError) as caught:
             clash.next_name("implementer", ["catalogue"], [])
         self.assertIn("naming.projects.catalogue", str(caught.exception))
+
+    def test_truncation_clash_between_undeclared_repos_is_refused(self):
+        """Codex r1 (#452, P2) : `catalogue` et `catalogapi` donnent `catalo`."""
+        naming = self.naming(projects={})
+        # sans la liste des dépôts connus, la troncature reste permise
+        self.assertEqual(naming.next_name("implementer", ["catalogue"], []),
+                         "mty-catalo-impl-01")
+        # connus (fiches, demande), deux dépôts qui tronquent pareil : refus
+        with self.assertRaises(canon.NamingError) as caught:
+            naming.next_name("implementer", ["catalogue"], [],
+                             known=["catalogue", "catalogapi"])
+        self.assertIn("naming.projects.catalogue", str(caught.exception))
+        # le nom court déclaré de l'autre dépôt lève l'ambiguïté
+        declared = canon.Naming(org="mty", projects={"catalogapi": "capi"},
+                                roles={"implementer": "impl"})
+        self.assertEqual(declared.next_name("implementer", ["catalogue"], []),
+                         "mty-catalo-impl-01")
+        self.assertEqual(declared.next_name("implementer", ["catalogapi"], []),
+                         "mty-capi-impl-01")
 
     def test_role_and_projects_are_never_guessed(self):
         naming = self.naming()
@@ -312,3 +362,54 @@ class NamingCliTest(_CanonDbCase):
                          env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
         self.assertIn("--role", proc.stderr)
+
+    def test_agent_group_is_reachable_under_canon_too(self):
+        """Codex r1 (#452, P2) : `canon agent name|spawn` sortait en code 2."""
+        self.naming()
+        self.sync()
+        proc = self.mesh("canon", "agent", "name", "--role", "implementer",
+                         "--project", "acme-web", env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "mty-amh-impl-01")
+        proc = self.mesh("canon", "agent", "spawn", "--by", "orchestre",
+                         "--ttl", "30m", "--role", "implementer",
+                         "--project", "acme-web", env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("mty-amh-impl-01", proc.stdout)
+        # le chemin historique reste branché, sur le même générateur
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "acme-web", env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "mty-amh-impl-02")
+
+    def test_canon_dir_keeps_the_other_canons_reservations(self):
+        """Codex r1 (#452, P2) : `--canon DOSSIER` perdait les réservations."""
+        self.naming()
+        other = self.example_copy()
+        write(other, "federation.yaml", "id: acme-other\nroot: acme\nmembers: []\n")
+        write(other, "agents/employe-01.md", card("mty-amh-impl-01"))
+        env = self.cli_env(AMEESH_CANONS="%s:%s" % (self.root, other))
+        proc = self.mesh("agent", "name", "--canon", self.root, "--role",
+                         "implementer", "--project", "acme-web", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "mty-amh-impl-02")
+
+    def test_truncation_clash_with_a_card_project_is_refused(self):
+        """Codex r1 (#452, P2) : deux dépôts non déclarés, même troncature."""
+        self.naming()
+        write(self.root, "agents/employe-catalogue.md",
+              card("employe-catalogue", projects=["catalogue"]))
+        write(self.root, "agents/employe-api.md",
+              card("employe-api", projects=["catalogapi"]))
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "catalogue", env=self.cli_env())
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("naming.projects.catalogue", proc.stderr)
+        # déclarer le nom court de l'AUTRE dépôt lève le refus
+        write(self.root, "federation.yaml",
+              FEDERATION + NAMING.replace(
+                  "      projects:\n", "      projects:\n        catalogapi: capi\n"))
+        proc = self.mesh("agent", "name", "--role", "implementer",
+                         "--project", "catalogue", env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "mty-catalo-impl-01")
