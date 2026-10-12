@@ -1124,13 +1124,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
-            if getattr(args, "backlog_command", None) == "add":
-                # L118c: the item inherits its creator's project, as `work add` does
-                from . import identity, work_projects
-                binding = identity.resolve_binding(cfg, db)
-                creator = binding.name if binding.ok else args.actor
-                args.app = work_projects.creation_project(cfg, db, creator)
-            return backlog.run(db, args)
+            return backlog.run(db, args, cfg)
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)

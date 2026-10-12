@@ -131,6 +131,31 @@ class MailProjectTests(_Base):
         self.assertEqual((unknown["title"], unknown["app"]), ("Unknown", ""))
         self.assertIn(unknown["id"], [a["lot"] for a in work_projects.alerts(self.db)])
 
+    def test_backlog_api_inherits_and_validates_the_project(self):
+        from ameesh import backlog
+        self.project("dev1", team="creator")
+        item = backlog.add(self.db, title="Api", expected_value="one rule", value_score=30,
+                           actor="dev1")
+        self.assertEqual(item["app"], "creator")
+        for app in ("unconfigured-project", " "):
+            with self.subTest(app=app), self.assertRaises(backlog.BacklogError):
+                backlog.add(self.db, title="Refused", expected_value="kept", value_score=30,
+                            actor="dev1", app=app)
+        item = backlog.add(self.db, title="Known", expected_value="kept", value_score=30,
+                           actor="dev2", app=" creator ")
+        self.assertEqual(item["app"], "creator")
+        proc = self.mesh("work", "backlog", "add", "--title", "Flag", "--value", "kept",
+                         "--score", "30", "--app", "nowhere",
+                         env=self.env(AGENT_MAIL_NAME="dev2"))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("unknown project", proc.stderr)
+        proc = self.mesh("work", "backlog", "add", "--title", "Flag", "--value", "kept",
+                         "--score", "30", "--app", "creator",
+                         env=self.env(AGENT_MAIL_NAME="dev2"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.list_items(self.db)[0]["app"], "creator")
+        self.assertNotIn("Refused", [i["title"] for i in work.list_items(self.db)])
+
     def test_decision_creation_inherits_requester_then_parent(self):
         parent = work.add(self.db, title="Parent", app="parent")
         self.project("dev1", team="requester")
