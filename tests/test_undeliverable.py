@@ -49,14 +49,14 @@ class FonctionsTest(unittest.TestCase):
             ("deepseek1", "manaty", "idle"), ("dev", "", "idle"))]
         near = undeliverable.suggestions("orchestrator", rows, role_names=["orchestrateur"],
                                          team="manaty")
-        self.assertEqual(near, [("orchestrateur", "orchestrateur de l'équipe manaty")])
+        self.assertEqual(near, [("orchestrateur", "orchestrator of team manaty")])
         near = undeliverable.suggestions("claude33", rows)
-        self.assertEqual(near[0], ("claude3", "1 lettre d'écart, arrêté"))  # le plus proche
-        self.assertEqual(near[1], ("claude1", "2 lettres d'écart"))
+        self.assertEqual(near[0], ("claude3", "1 letter apart, stopped"))  # le plus proche
+        self.assertEqual(near[1], ("claude1", "2 letters apart"))
         near = [n for n, _ in undeliverable.suggestions("deep", rows)]
         self.assertEqual(near, ["deepseek1"])                  # même début
         self.assertEqual(undeliverable.suggestions("mesh", [{"name": "mesh-design"}]),
-                         [("mesh-design", "même début")])
+                         [("mesh-design", "same prefix")])
         self.assertEqual(undeliverable.suggestions("zzzzzz", rows), [])
         # nom court : une lettre au plus
         self.assertEqual([n for n, _ in undeliverable.suggestions("dvx", rows)], [])
@@ -94,12 +94,12 @@ class FonctionsTest(unittest.TestCase):
                   "successor": "mesh-design", "orchestrators": ["orchestrateur", "claude3"]}
         briefs = undeliverable.orchestrator_briefs(alerte)
         self.assertEqual(list(briefs), ["orchestrateur"])     # jamais à la boîte morte
-        self.assertIn("15 message(s) adressé(s) à claude3", briefs["orchestrateur"])
+        self.assertIn("15 message(s) addressed to claude3", briefs["orchestrateur"])
         self.assertIn("ameesh mail forward claude3 mesh-design", briefs["orchestrateur"])
         alerte.update(agent="orchestrator", reason="inconnu", suggestions=["orchestrateur"])
         text = undeliverable.orchestrator_briefs(alerte)["orchestrateur"]
-        self.assertIn("« orchestrator », absent du registre", text)
-        self.assertIn("Noms proches : orchestrateur", text)
+        self.assertIn('"orchestrator", not in the registry', text)
+        self.assertIn("Close names: orchestrateur", text)
         self.assertEqual(undeliverable.orchestrator_briefs({"type": "idle_capacity"}), {})
 
     def test_consigne_et_hook_disent_le_renvoi(self):
@@ -111,7 +111,7 @@ class FonctionsTest(unittest.TestCase):
         rendu = cli.render([mail.normalize(row)])
         self.assertIn("[forwarded: first addressed to claude3", rendu)
         # un message ordinaire : rendu inchangé (JSON des hooks identique à la v0)
-        self.assertNotIn("renvoyé", cli.render([mail.normalize(dict(row, forwarded_from=None))]))
+        self.assertNotIn("[forwarded", cli.render([mail.normalize(dict(row, forwarded_from=None))]))
 
     def test_vue_par_projet(self):
         board = {
@@ -144,7 +144,7 @@ class FonctionsTest(unittest.TestCase):
         # sans courrier en souffrance : rien ne change
         view = projects.build(dict(board, dead_letters=[]), now=NOW, paid_harnesses=())
         self.assertEqual(view["undeliverable"], 0)
-        self.assertNotIn("souffrance", projects.format_text(view, 120))
+        self.assertNotIn("undeliverable", projects.format_text(view, 120))
 
 
 class _Base(PgTestCase):
@@ -185,10 +185,10 @@ class EnvoiRefuseTest(_Base):
                          AMEESH_ALERT_ORCHESTRATORS="orchestrateur,chef-b")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("message non déposé — « orchestrator » n'est pas dans le registre",
+        self.assertIn('message not dropped — "orchestrator" is not in the registry',
                       proc.stderr)
         # le rôle : l'orchestrateur de l'équipe de l'expéditeur, pas celui d'une autre
-        self.assertIn("noms proches : orchestrateur (orchestrateur de l'équipe manaty)",
+        self.assertIn("close names: orchestrateur (orchestrator of team manaty)",
                       proc.stderr)
         self.assertNotIn("chef-b", proc.stderr)
         self.assertIsNone(registry.get(self.db, "orchestrator"))   # aucun fantôme
@@ -196,7 +196,7 @@ class EnvoiRefuseTest(_Base):
         # distance d'édition, sans rôle déclaré
         proc = self.send("claude33", "Bonjour.", AGENT_MAIL_NAME="claude1")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("claude3 (1 lettre d'écart)", proc.stderr)
+        self.assertIn("claude3 (1 letter apart)", proc.stderr)
         self.assertIsNone(registry.get(self.db, "claude33"))
         # « all » reste une destination ; un nom illisible reste invalide
         proc = self.send("all", "Point d'équipe.", AGENT_MAIL_NAME="claude1")
@@ -223,16 +223,16 @@ class EnvoiRefuseTest(_Base):
         self.stop("claude3")
         proc = self.send("claude3", "Verdict : ok, gèle.", AGENT_MAIL_NAME="claude1")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("message non déposé — claude3 est arrêté (depuis le ", proc.stderr)
-        self.assertIn("raison : manuel — arrêté à la main", proc.stderr)
-        self.assertIn("responsable : human:proprio", proc.stderr)
-        self.assertIn("son travail a été repris par mesh-design", proc.stderr)
+        self.assertIn("message not dropped — claude3 is stopped (since ", proc.stderr)
+        self.assertIn("reason: manuel — arrêté à la main", proc.stderr)
+        self.assertIn("responsible: human:proprio", proc.stderr)
+        self.assertIn("its work was taken over by mesh-design", proc.stderr)
         self.assertIn("--queue", proc.stderr)
         self.assertEqual(self.pending("claude3"), [])
         proc = self.send("claude3", "Pour ta reprise.", "--queue", AGENT_MAIL_NAME="claude1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("déposé pour : claude3", proc.stdout)
-        self.assertIn("attention : claude3 est arrêté", proc.stderr)
+        self.assertIn("dropped for: claude3", proc.stdout)
+        self.assertIn("warning: claude3 is stopped", proc.stderr)
         self.assertEqual(self.pending("claude3"), ["Pour ta reprise."])
 
     def test_en_pause_au_repos_ou_mort_reste_accepte(self):
@@ -250,19 +250,19 @@ class EnvoiRefuseTest(_Base):
         proc = self.send("orchestrateur", "Rapport.", "--from", "claude3",
                          AGENT_MAIL_NAME="mesh-design")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("l'expéditeur claude3 est arrêté", proc.stderr)
-        self.assertIn("identité liée à cette session (agent-mail whoami) : mesh-design",
+        self.assertIn("sender claude3 is stopped", proc.stderr)
+        self.assertIn("identity bound to this session (agent-mail whoami): mesh-design",
                       proc.stderr)
-        self.assertIn("renvoyez sans --from", proc.stderr)
+        self.assertIn("resend without --from", proc.stderr)
         # identité résolue de la session (AGENT_MAIL_NAME) : refusée aussi
         proc = self.send("orchestrateur", "Rapport.", AGENT_MAIL_NAME="claude3")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("cette session parle au nom de claude3", proc.stderr)
+        self.assertIn("this session speaks on behalf of claude3", proc.stderr)
         # identité liée au bail d'un agent arrêté : la raison est dite
         proc = self.send("orchestrateur", "Rapport.", AGENT_MAIL_NAME="claude3",
                          AMEESH_RUNNER_ID="runner-x", AMEESH_LEASE_EPOCH="1")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("expéditeur non lié (claude3 : agent arrêté)", proc.stderr)
+        self.assertIn("unbound sender (claude3: ", proc.stderr)
         self.assertEqual(self.pending("orchestrateur"), [])
 
     def test_session_liee_a_un_agent_arrete(self):
@@ -274,7 +274,7 @@ class EnvoiRefuseTest(_Base):
         self.stop("claude3")
         proc = self.send("orchestrateur", "Rapport.", env=env)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("cette session est liée à claude3", proc.stderr)
+        self.assertIn("this session is bound to claude3", proc.stderr)
         self.assertIn("agent-mail unbind --session s-1 --harness claude", proc.stderr)
 
     def test_diffusion_ecarte_les_agents_arretes(self):
@@ -282,7 +282,7 @@ class EnvoiRefuseTest(_Base):
         proc = self.send("all", "Point d'équipe à 15 h.", AGENT_MAIL_NAME="orchestrateur")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("claude3", proc.stdout)
-        self.assertIn("non déposé pour claude3 (arrêté", proc.stderr)
+        self.assertIn("not dropped for claude3 (stopped", proc.stderr)
         self.assertEqual(self.pending("claude3"), [])
         self.assertEqual(self.pending("claude1"), ["Point d'équipe à 15 h."])
         skipped: list = []
@@ -359,7 +359,7 @@ class AlerteTest(_Base):
             "orchestrators_declared": ("orchestrateur",)})
         [brief] = [m for m in mail.unread(self.db, "orchestrateur")]
         self.assertEqual((brief["sender"], brief["kind"]), ("ameesh", "event"))
-        self.assertIn("Courrier en souffrance : 1 message(s) adressé(s) à claude3",
+        self.assertIn("Undeliverable mail: 1 message(s) addressed to claude3",
                       brief["body"])
         self.assertIn("ameesh mail forward claude3", brief["body"])
         payload = mail.message_payload(brief)
@@ -416,12 +416,12 @@ class RenvoiTest(_Base):
         # à blanc : rien ne bouge
         proc = self.mesh("mail", "forward", "claude3", "mesh-design", "--dry-run")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("à blanc : 2 message(s) en attente pour claude3 (arrêté)", proc.stdout)
+        self.assertIn("dry run: 2 pending message(s) for claude3 (stopped)", proc.stdout)
         self.assertEqual(len(mail.unread(self.db, "claude3")), 2)
         proc = self.mesh("mail", "forward", "claude3", "mesh-design",
                          env=self.env(AGENT_MAIL_NAME="orchestrateur"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("2 message(s) re-livré(s) de claude3 (arrêté) à mesh-design", proc.stdout)
+        self.assertIn("2 message(s) re-delivered from claude3 (stopped) to mesh-design", proc.stdout)
         self.assertEqual(mail.unread(self.db, "claude3"), [])
         copies = mail.unread(self.db, "mesh-design")
         self.assertEqual([(c["sender"], c["body"], c["kind"]) for c in copies],
@@ -449,14 +449,14 @@ class RenvoiTest(_Base):
                         stdin=json.dumps({"hook_event_name": "SessionStart",
                                           "cwd": self.tmp}))
         contexte = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("— de claude1 à ", contexte)
+        self.assertIn("— from claude1 at ", contexte)
         self.assertIn("[forwarded: first addressed to claude3", contexte)
         fil = self.mesh("fil", "show", "manaty")
-        self.assertIn("Renvoi de 2 message(s) en souffrance : la boîte de claude3", fil.stdout)
+        self.assertIn("Forwarded 2 undeliverable message(s): the mailbox of claude3", fil.stdout)
         # plus rien à renvoyer
         proc = self.mesh("mail", "forward", "claude3", "mesh-design")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("rien à renvoyer", proc.stdout)
+        self.assertIn("nothing to forward", proc.stdout)
 
     def test_boite_d_un_nom_inconnu_et_refus(self):
         mail.send(self.db, "claude1", "orchestrator", "Rapport (faute de nom).")
@@ -470,14 +470,14 @@ class RenvoiTest(_Base):
         mail.send(self.db, "claude1", "claude3", "Pour toi.")
         proc = self.mesh("mail", "forward", "claude3", "mesh-design")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("renvoi refusé — claude3 n'est pas arrêté", proc.stderr)
+        self.assertIn("forward refused — claude3 is not stopped", proc.stderr)
         self.assertIn("agent-runner stop claude3", proc.stderr)
         self.assertEqual(self.pending("claude3"), ["Pour toi."])
         self.stop("claude3")
         # vers un nom inconnu ou un agent arrêté : refusé
         with self.assertRaises(undeliverable.Refused) as ctx:
             undeliverable.forward(self.cfg, self.db, "claude3", "mesh-desing", actor="x")
-        self.assertIn("mesh-design (1 lettre d'écart)", str(ctx.exception))
+        self.assertIn("mesh-design (1 letter apart)", str(ctx.exception))
         self.stop("mesh-design")
         with self.assertRaises(undeliverable.Refused):
             undeliverable.forward(self.cfg, self.db, "claude3", "mesh-design", actor="x")
