@@ -277,6 +277,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                                 "admissions": admissions.get(canon.id, 0)}
                                for canon, fiche in fiches],
                     "latest": latest,
+                    # #253: every filesystem the host writes to, its own reading
+                    "volumes": (latest or {}).get("volumes") or [],
                     # L159d: the offer, and the common measure (study §1.4)
                     # whose lendable capacity it caps
                     "offer": limits.get("lend"),
@@ -341,6 +343,18 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                           _fmt_bytes(latest.get("btrfs_metadata_headroom_bytes")),
                           _fmt_bytes(limits.get("min_btrfs_metadata_headroom")),
                           tag("min_btrfs_metadata_headroom")))
+            for volume in latest.get("volumes") or []:
+                # #253: each filesystem the guard watches; the lines above are
+                # the worst of them
+                others = [p for p in volume.get("paths") or [] if p != volume.get("path")]
+                print("  volume     %s : libre %s%s%s" % (
+                    volume.get("path"), _fmt_bytes(volume.get("disk_free_bytes")),
+                    " ; btrfs non alloué %s, marge des métadonnées %s" % (
+                        _fmt_bytes(volume.get("btrfs_unallocated_bytes")),
+                        _fmt_bytes(volume.get("btrfs_metadata_headroom_bytes")))
+                    if volume.get("btrfs_unallocated_bytes") is not None
+                    or volume.get("btrfs_metadata_headroom_bytes") is not None else "",
+                    " (aussi %s)" % ", ".join(others) if others else ""))
 
             for line in _host_measure_lines(latest, limits.get("lend")):
                 print(line)
