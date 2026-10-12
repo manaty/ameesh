@@ -56,6 +56,7 @@ class AuditReportingTest(unittest.TestCase):
                 mock.patch("ameesh.sous_utilisation.orchestrators", return_value=["orch", "other"]):
             findings = exploitation._module_deviations(None, mock.Mock(), listing)
         self.assertEqual(findings[0]["orchestrators"], ["orch"])
+        self.assertEqual(findings[0]["schema"], exploitation.ALERT_SCHEMA)
         briefs = alert_briefs.briefs(findings[0], listing, auditor_names=["auditeur"])
         self.assertEqual(set(briefs), {"orch", "auditeur"})
         self.assertIn("execution proof", briefs["orch"])
@@ -72,6 +73,11 @@ class AuditReportingTest(unittest.TestCase):
         self.assertNotEqual(key, notify.key_of(dict(alert, declaration_id=18)))
         self.assertNotEqual(key, notify.key_of(dict(alert, rule="other")))
         self.assertEqual(key, notify.key_of(dict(alert, agent="reassigned")))
+
+    def test_auditing_never_executes_artifact(self):
+        with mock.patch("ameesh.modules.it.execution.execute") as execute:
+            self.finding()
+        execute.assert_not_called()
 
     def test_generic_alert_defaults_to_human_channel_and_has_readable_details(self):
         self.assertIn("module_deviation", notify.parse_config({}).types)
@@ -152,3 +158,4 @@ class AuditEvidenceTest(PgTestCase):
         self.assertEqual(len(sender.sent), 2)
         self.assertIn("resolved", sender.sent[-1][1].body)
         self.assertEqual(notifier.state["briefs"], {})
+
