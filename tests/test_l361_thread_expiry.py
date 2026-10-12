@@ -296,14 +296,20 @@ class TransportTest(unittest.TestCase):
         self.post(entry("old", 500), entry("kept", 1))
         fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
         with mock.patch.object(runner, "log_async") as logged:
-            reports = runner.Runner.expire_threads_once(fake, None, now=NOW)
+            reports = runner.Runner.expire_threads_once(fake, None, now=NOW, clock=0.0)
             self.assertEqual(reports[0]["dropped"], 1)
             self.assertIn("1 entry before", logged.call_args.args[0])
-            self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600))
-            self.assertIsNotNone(runner.Runner.expire_threads_once(fake, None, now=NOW + DAY))
+            self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600,
+                                                                clock=3600.0))
+            # r8: the day is counted on the monotonic clock, not the wall one
+            self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 2 * DAY,
+                                                                clock=7200.0))
+            self.assertIsNotNone(runner.Runner.expire_threads_once(fake, None, now=NOW + DAY,
+                                                                   clock=DAY))
             with mock.patch.object(fil, "expire", side_effect=RuntimeError("boom")):
                 self.assertIsNone(runner.Runner.expire_threads_once(fake, None,
-                                                                    now=NOW + 2 * DAY))
+                                                                    now=NOW + 2 * DAY,
+                                                                    clock=2 * DAY))
             self.assertIn("thread expiry failed", logged.call_args.args[0])
 
 
@@ -361,6 +367,47 @@ class MediatedHostTest(TransportTest):
         self.assertIsNone(runner.Runner.expire_threads_once(fake, self.remote_db(),
                                                             now=NOW + 3600))
 
+
+    def test_host_mediated_refused_too(self):
+        # r8: `host_mediated` with another backend keeps its threads local;
+        # its database unavailable, `fil expire` still refuses, no connection
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root,
+                                  host_mediated=True)
+        self.assertNotEqual(cfg.backend, "mediated")
+        self.post(entry("old", 500), entry("kept", 1))
+        before = self.read_bytes()
+        with self.assertRaises(fil.ExpiryUnavailable):
+            fil.expire(cfg, None, now=NOW)
+        from ameesh import db as db_mod
+        with mock.patch.object(fil, "transport_for", return_value=self.transport), \
+                mock.patch.object(db_mod, "connect",
+                                  side_effect=db_mod.Unavailable("no credentials")) as connect, \
+                self.assertRaises(fil.ExpiryUnavailable):
+            fil.cmd_expire(cfg, types.SimpleNamespace(days=None, dry_run=False))
+        connect.assert_not_called()
+        self.assertEqual(self.read_bytes(), before)
+
+    def test_notice_thread_survives_an_error(self):
+        # r8: an exception of a notice is logged and the loop goes on
+        cfg = self.mediated_cfg()
+        calls = []
+        stop = threading.Event()
+        twice = threading.Event()
+
+        def once(db):
+            calls.append(db)
+            if len(calls) == 2:
+                twice.set()
+            raise RuntimeError("boom")
+        fake = types.SimpleNamespace(cfg=cfg, stop=stop, expire_threads_once=once)
+        # the loop's wait made short: the second notice comes at once
+        stop.wait = lambda timeout: stop.is_set()
+        with mock.patch.object(runner, "log_async") as logged:
+            runner.Runner._start_thread_expiry_notice(fake)
+            self.assertTrue(twice.wait(5))
+            stop.set()
+        self.assertIn("thread expiry notice failed (RuntimeError: boom)",
+                      logged.call_args_list[0].args[0])
 
     def mediated_cfg(self):
         return dataclasses.replace(config_mod.Config(), threads_dir=self.root,

@@ -132,9 +132,11 @@ EXPIRY_UNAVAILABLE = ("thread expiry is not available on a mediated executor hos
 
 
 def expiry_unavailable(cfg: Config, db=None) -> bool:
-    """Hôte d'exécuteur médié : par sa configuration (`backend: mediated`),
-    que sa connexion existe ou non (r7), ou par sa connexion distante."""
-    return getattr(cfg, "backend", "") == "mediated" or storage.is_remote(db)
+    """Hôte d'exécuteur médié : par sa configuration (`backend: mediated`, ou
+    `host_mediated` dont les fils restent locaux, r8), que sa connexion
+    existe ou non (r7), ou par sa connexion distante."""
+    return (getattr(cfg, "backend", "") == "mediated" or bool(getattr(cfg, "host_mediated", False))
+            or storage.is_remote(db))
 
 
 # --------------------------------------------------------------------------

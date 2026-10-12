@@ -5686,14 +5686,19 @@ class Runner:
                           % (row["agent"], row["session_id"], row["work_item_id"]))
         return purges
 
-    def expire_threads_once(self, db, now: float | None = None) -> list | None:
+    def expire_threads_once(self, db, now: float | None = None,
+                            clock: float | None = None) -> list | None:
         """L361: thread retention (0033 §9), at most once a day, from the
         housekeeping pass: entries older than `thread_retention_days` leave
         this host's thread files. Never raises."""
         now = time.time() if now is None else now
-        if now < getattr(self, "_threads_expire_next", 0.0):
+        # the day counted on the monotonic clock (r8), the wall clock kept
+        # for the retention thresholds
+        tick = time.monotonic() if clock is None else clock
+        due = getattr(self, "_threads_expire_next", None)
+        if due is not None and tick < due:
             return None
-        self._threads_expire_next = now + 86400.0
+        self._threads_expire_next = tick + 86400.0
         if getattr(self, "mediated", False):  # no database, no local housekeeping
             log_async("thread expiry skipped: %s" % fil.EXPIRY_UNAVAILABLE)
             return None
@@ -5810,10 +5815,16 @@ class Runner:
         """#421 r7 : un exécuteur médié n'a pas de ménage local ; l'expiration
         des fils non disponible y est dite au démarrage puis une fois par
         jour (`expire_threads_once`), quel que soit l'intervalle du ménage."""
-        def boucle() -> None:
-            self.expire_threads_once(None)
-            while not self.stop.wait(3600.0):
+        def avis() -> None:
+            try:
                 self.expire_threads_once(None)
+            except Exception as exc:  # the notice's thread never dies of it
+                log_async("thread expiry notice failed (%s: %s)" % (type(exc).__name__, exc))
+
+        def boucle() -> None:
+            avis()
+            while not self.stop.wait(3600.0):
+                avis()
 
         threading.Thread(target=boucle, daemon=True, name="fils-expiration").start()
 
