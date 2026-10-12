@@ -184,7 +184,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L165b (0384) : réveil sur lot actionnable, on/off (un réglage)
         'lot_wake',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
