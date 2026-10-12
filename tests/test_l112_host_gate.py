@@ -365,7 +365,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_defauts_et_reglages(self):
         cfg = self.charge()
-        self.assertEqual((cfg.host_gate, cfg.host_mediated, cfg.host_gate_drain), ("", False, 90.0))
+        self.assertEqual((cfg.host_gate, cfg.host_mediated, cfg.host_gate_drain), ("", False, 0.0))
         self.assertIsNone(H.from_config(cfg))  # hôte classique : aucune porte
         cfg = self.charge(AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH="/x/state.json",
                           AMEESH_HOST_MEDIATED="1", AMEESH_HOST_GATE_DRAIN="30")
