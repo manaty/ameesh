@@ -202,7 +202,7 @@ class OwnershipRaceTest(unittest.TestCase):
                 handle.close()
             tracker._drop_handles(entry)
 
-    def test_suite_cap_cannot_resume_during_background_freeze(self):
+    def test_suite_cap_is_not_blocked_by_registry_io(self):
         tracker = self.tracker()
         cap = suite_cap.SuiteCap(tracker.runner)
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
@@ -210,7 +210,11 @@ class OwnershipRaceTest(unittest.TestCase):
         handle, worker = None, None
         attempted, signalled = threading.Event(), threading.Event()
         cap_handle = mock.Mock()
-        cap_handle.send.side_effect = lambda _: signalled.set()
+        def cap_signal(signum):
+            if signum == signal.SIGCONT:
+                handle.send(signum)
+                signalled.set()
+        cap_handle.send.side_effect = cap_signal
         item = suite_cap.Capped(None, "test", 0, {child.pid: cap_handle})
         try:
             row = next(p for p in platform.process_table() if p["pid"] == child.pid)
@@ -230,12 +234,16 @@ class OwnershipRaceTest(unittest.TestCase):
                 worker = threading.Thread(target=cap_thread)
                 worker.start()
                 self.assertTrue(attempted.wait(2))
-                self.assertFalse(signalled.wait(.1))
-                return {child.pid}  # refuse cleanup; suite-cap proceeds afterwards
+                self.assertTrue(signalled.wait(2))
+                return set()  # final state check must notice suite-cap resumed it
             with mock.patch.object(suite_cap, "gather"), \
-                    mock.patch.object(tracker, "_foreign_groups", side_effect=registry):
+                    mock.patch.object(tracker, "_foreign_groups", side_effect=registry), \
+                    mock.patch.object(handle, "send", wraps=handle.send) as sends:
                 tracker._signal_handles(entry, signal.SIGTERM)
                 worker.join(timeout=2)
+            self.assertNotIn(mock.call(signal.SIGTERM), sends.call_args_list)
+            self.assertTrue(entry.unverified)
+            self.assertTrue(handle.live())
             self.assertFalse(worker.is_alive())
             self.assertTrue(signalled.is_set())
             self.assertEqual(cap_handle.send.call_args_list,

@@ -158,6 +158,8 @@ class Job:
     code: int | None = None
     #: fin constatée (secondes epoch), None tant qu'il tourne
     ended: float | None = None
+    #: identity observed when this job was attributed to its turn
+    start: float | None = None
 
 
 @dataclass
@@ -324,11 +326,12 @@ class Tracker:
             if not p["zombie"]:
                 vivants.append(p)
                 continue
-            code = self._reap_observed(p["pid"], p.get("start"))
-            if entry is not None and code is not None and p["pid"] in entry.jobs:
-                job = entry.jobs[p["pid"]]
-                if job.ended is None:
-                    job.code, job.ended = code, time.time()
+            job = entry.jobs.get(p["pid"]) if entry is not None else None
+            if job is not None:
+                if job.ended is None and job.start == p.get("start"):
+                    job.code, job.ended = self._reap_job(job), time.time()
+            else:
+                self._reap_observed(p["pid"], p.get("start"))
         return vivants
 
     def start(self, *, agent: str, turn_id: str, pgid: int | None, members: list,
@@ -350,7 +353,7 @@ class Tracker:
             p["pid"] not in entry.handles and not p["zombie"] for p in members)
         for p in members:
             if p["ppid"] not in pids:  # racine : son parent (le harnais) a fini
-                entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p))
+                entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p), start=p.get("start"))
         entry.others = len(members) - len(entry.jobs)
         with self.lock:
             self.entries.append(entry)
@@ -429,10 +432,10 @@ class Tracker:
                 pid for pid, handle in entry.handles.items() if handle.live()}
             for job in entry.jobs.values():
                 if job.ended is None and job.pid not in pids:
-                    job.code, job.ended = self._reap_observed(job.pid), now
+                    job.code, job.ended = self._reap_job(job), now
             for p in vivants:  # un descendant dont le parent a fini : racine
                 if p["pid"] not in entry.jobs and p["ppid"] not in pids:
-                    entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p))
+                    entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p), start=p.get("start"))
             entry.others = sum(1 for p in vivants if p["pid"] not in entry.jobs)
         elif entry.pgid and table is None and _group_alive(entry.pgid):
             vivants = [{"pid": entry.pgid}]  # détail indisponible : le groupe vit
@@ -556,53 +559,50 @@ class Tracker:
             return None
 
     def _signal_handles(self, entry: Entry, signum: int) -> None:
-        with CLEANUP_SIGNAL_LOCK:
-            self._signal_handles_locked(entry, signum)
-
-    def _signal_handles_locked(self, entry: Entry, signum: int) -> None:
         foreign = self._foreign_groups(entry)
         for handle in entry.handles.values():
-            if not handle.live():
-                continue
-            location = handle.location()
-            if foreign is None or location is None or any(g in foreign for g in location):
-                entry.unverified = True
-                self.log("[%s] background pid %s: ownership changed or unknown; no signal"
-                         % (entry.agent, handle.pid))
-                continue
-            state = handle.state()
-            if state is None:
-                entry.unverified |= bool(handle.live())
-                continue
-            was_stopped = state in ("T", "t")
-            delivered = False
+            was_stopped, delivered = True, False
             try:
-                # A group check alone races with setsid/setpgid in the target.
-                # Confirm SIGSTOP before checking both ownership sources again.
-                if not handle.freeze():
-                    entry.unverified |= bool(handle.live())
-                    self.log("[%s] background pid %s: stop not confirmed; no termination signal"
-                             % (entry.agent, handle.pid))
-                    continue
+                with CLEANUP_SIGNAL_LOCK:
+                    if not handle.live():
+                        continue
+                    location = handle.location()
+                    if foreign is None or location is None or any(g in foreign for g in location):
+                        entry.unverified = True
+                        self.log("[%s] background pid %s: ownership changed or unknown; no signal"
+                                 % (entry.agent, handle.pid))
+                        continue
+                    state = handle.state()
+                    if state is None:
+                        entry.unverified |= bool(handle.live())
+                        continue
+                    was_stopped = state in ("T", "t")
+                    if not handle.freeze():
+                        entry.unverified |= bool(handle.live())
+                        self.log("[%s] background pid %s: stop not confirmed; no termination signal"
+                                 % (entry.agent, handle.pid))
+                        continue
+                # Registry I/O must not delay suite-cap TERM/CONT. It may
+                # resume this target here; the final local check refuses it.
                 current_foreign = self._foreign_groups(entry)
-                location = handle.location()
-                if current_foreign is None or location is None or any(
-                        g in current_foreign for g in location):
-                    entry.unverified = True
-                    self.log("[%s] background pid %s: ownership changed while stopping; no termination signal"
-                             % (entry.agent, handle.pid))
-                    continue
-                # Suite-cap cannot resume us while this shared lock is held.
-                # External SIGCONT can still invalidate a freeze: refuse if seen.
-                if handle.state() not in ("T", "t"):
-                    entry.unverified |= bool(handle.live())
-                    continue
-                delivered = handle.send(signum)
+                # Later registry ownership changes remain a residual race.
+                with CLEANUP_SIGNAL_LOCK:
+                    location = handle.location()
+                    if current_foreign is None or location is None or any(
+                            g in current_foreign for g in location):
+                        entry.unverified = True
+                        self.log("[%s] background pid %s: ownership changed while stopping; no termination signal"
+                                 % (entry.agent, handle.pid))
+                        continue
+                    if handle.state() not in ("T", "t"):
+                        entry.unverified |= bool(handle.live())
+                        continue
+                    delivered = handle.send(signum)
             finally:
-                # TERM handlers need to run; a refused signal or ownership
-                # change must not leave our temporary stop in effect.
-                if not was_stopped and (signum != signal.SIGKILL or not delivered) and handle.live():
-                    handle.send(signal.SIGCONT)
+                with CLEANUP_SIGNAL_LOCK:
+                    # Preserve stops that existed before cleanup.
+                    if not was_stopped and (signum != signal.SIGKILL or not delivered) and handle.live():
+                        handle.send(signal.SIGCONT)
 
     def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
         for p in table:
@@ -686,7 +686,14 @@ class Tracker:
                     if old is not None:
                         old.close()
                     # Keep the observation's kernel identity beyond entry cleanup.
-                    self.observed_handles[pid] = entry.handles[pid].duplicate()
+                    self.observed_children.pop(pid, None)
+                    try:
+                        observation = entry.handles[pid].duplicate()
+                    except OSError as exc:
+                        self.log("[%s] background pid %s: cannot retain wait handle (%s)"
+                                 % (entry.agent, pid, exc))
+                        continue
+                    self.observed_handles[pid] = observation
                     self.observed_children[pid] = p["start"]
 
     @staticmethod
@@ -712,7 +719,7 @@ class Tracker:
         self._drop_handles(entry)
         for job in entry.jobs.values():
             if job.ended is None:
-                job.code, job.ended = self._reap_observed(job.pid), now
+                job.code, job.ended = self._reap_job(job), now
         self._release_resource(entry, survives)
         self.log("[%s] background work of turn %s: %s" % (
             entry.agent, entry.turn_id[:8], self._outcome(entry, now, state)))
@@ -743,9 +750,29 @@ class Tracker:
             self.log("[%s] cannot close the resource of turn %s (%s)"
                      % (entry.agent, entry.turn_id[:8], exc))
 
-    def _reap_observed(self, pid: int, start=None) -> int | None:
+    def _reap_job(self, job: Job) -> int | None:
+        if job.start is None:
+            return None
         with self.observed_lock:
-            if start is not None and self.observed_children.get(pid) != start:
+            if job.pid in self.observed_handles:
+                retained = True
+            else:
+                retained = False
+        if retained:
+            return self._reap_observed(job.pid, job.start)
+        # Only attributed jobs may use this degraded fallback. The identity
+        # read narrows reuse races; it cannot reserve PID/wait ownership.
+        try:
+            current_start = platform.start_time(job.pid)
+        except (platform.NotAvailable, OSError):
+            return None
+        if current_start != job.start:
+            return None
+        return platform.reap(job.pid)
+
+    def _reap_observed(self, pid: int, start) -> int | None:
+        with self.observed_lock:
+            if start is None or self.observed_children.get(pid) != start:
                 return None
             handle = self.observed_handles.get(pid)
             if handle is None:
