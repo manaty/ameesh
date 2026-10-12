@@ -341,6 +341,20 @@ class ResidentRunnerTest(PgTestCase):
         self.assertIn("resident start failed",
                       worker._resident_refusal(self.adapter, False))
 
+    def test_a_relayed_turn_never_uses_the_resident(self):
+        # L111: the relay's session token is for one turn — never kept by a
+        # resident process past it
+        from ameesh import relay as relay_mod
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self.assertIsNotNone(rp)
+        with mock.patch.object(relay_mod, "apply_turn_env", return_value=True):
+            self._turn(worker, "relaye")       # the fake speaks resident only
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertEqual(len(self._starts()), 1)  # the relayed turn ran on its own
+
     def test_refusals(self):
         runner, worker = self._worker()
         self.assertEqual(worker._resident_refusal(self.adapter, False), "")

@@ -986,6 +986,67 @@ class RunnerTest(PgTestCase):
                 proc.kill()
                 proc.wait(timeout=5)
 
+    #: échéance de publication du harnais : borne de sûreté du fil sonde,
+    #: jamais une mesure du produit (un tour peut être lent sous charge).
+    PUBLICATION_DELAI = 10.0
+
+    #: borne de la mise à mort après publication : bien en deçà du sommeil du
+    #: faux harnais (`AMEESH_TEST_SLEEP` = 5 s), donc un harnais encore vivant
+    #: à l'échéance prouve que le tour l'a attendu au lieu de le tuer.
+    MORT_HARNAIS_DELAI = 2.0
+
+    def _popen_du_harnais(self, publie: dict, apres_lancement):
+        """Remplace `subprocess.Popen` pendant un tour : le harnais seul.
+
+        `ameesh.runner.subprocess` est le module stdlib : patcher `Popen`
+        intercepte **tous** les sous-processus du processus, les requêtes du
+        pilote `psql` comprises — une attente dans le wrapper faisait alors
+        dépendre la durée du tour du nombre d'allers-retours en base (flocon
+        du publication_tardive sous psql). Seul le lancement du harnais (le
+        seul à demander sa propre session) est intercepté : `apres_lancement`
+        court après le vrai `Popen` et avant la publication de `self.proc`,
+        donc l'ordre « le déclencheur conclut avant la publication » est
+        garanti sans aucune attente dormante.
+        """
+        vrai_popen = subprocess.Popen
+
+        def popen(*args, **kwargs):
+            proc = vrai_popen(*args, **kwargs)
+            if kwargs.get("start_new_session"):  # le harnais (pas le pilote psql)
+                publie["proc"] = proc
+                apres_lancement(proc)
+            return proc
+
+        return mock.patch("ameesh.runner.subprocess.Popen", side_effect=popen)
+
+    def _surveille_mort(self, publie: dict) -> threading.Event:
+        """Sonde la mort du harnais publié, sans attente dormante fixe.
+
+        Le fil rend la main dès que `publie["proc"]` est publié et mort, dans
+        `MORT_HARNAIS_DELAI` ; l'échéance court à partir de la publication,
+        jamais du début du tour, et `run_turn` peut finir sa comptabilité
+        (sous psql, une requête par échange) sans peser sur la mesure.
+        """
+        mort = threading.Event()
+
+        def sonde():
+            debut = time.monotonic()
+            while "proc" not in publie and time.monotonic() - debut < self.PUBLICATION_DELAI:
+                time.sleep(0.005)
+            proc = publie.get("proc")
+            if proc is None:
+                return
+            fin = time.monotonic() + self.MORT_HARNAIS_DELAI
+            while time.monotonic() < fin:
+                if proc.poll() is not None:
+                    mort.set()
+                    return
+                time.sleep(0.005)
+
+        threading.Thread(target=sonde, daemon=True,
+                         name="sonde-mort-harnais").start()
+        return mort
+
     def test_harnais_publie_apres_la_perte_du_bail_est_tue(self):
         """Sonde codex3 B5a-P : course de publication du Popen.
 
@@ -1000,25 +1061,24 @@ class RunnerTest(PgTestCase):
         self.assertIsNotNone(lease)
         agent = registry.get(self.db, "pubrace")
         worker = AgentWorker(runner, agent, lease)
-        vrai_popen = subprocess.Popen
+        publie: dict = {}
+        mort = self._surveille_mort(publie)
 
-        def popen_retarde(*args, **kwargs):
-            proc = vrai_popen(*args, **kwargs)
+        def veilleur_a_conclu(_proc):
             worker.lease_lost.set()  # le veilleur a conclu avant la publication
-            time.sleep(0.05)
-            return proc
 
         fakebin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakebin")
         env = {"AMEESH_BIN_DIR": fakebin, "AMEESH_TEST_SLEEP": "5",
                "AMEESH_TEST_LOG": self.turns_log}
-        debut = time.monotonic()
         try:
             with mock.patch.dict(os.environ, env, clear=False), \
-                    mock.patch("ameesh.runner.subprocess.Popen", side_effect=popen_retarde):
+                    self._popen_du_harnais(publie, veilleur_a_conclu):
                 ok = worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
-            ecoule = time.monotonic() - debut
             self.assertFalse(ok)
-            self.assertLess(ecoule, 2.0, "le harnais publié doit être tué, pas attendu")
+            self.assertIn("proc", publie, "le harnais doit avoir été lancé")
+            self.assertTrue(mort.wait(self.MORT_HARNAIS_DELAI),
+                            "le harnais publié doit être tué, pas attendu")
+            self.assertEqual(publie["proc"].returncode, -signal.SIGKILL)
             self.assertEqual(registry.get(self.db, "pubrace").get("pending_prompt"), "tour")
         finally:
             if worker.proc is not None and worker.proc.poll() is None:
@@ -1072,27 +1132,26 @@ class RunnerTest(PgTestCase):
         self.assertIsNotNone(lease)
         agent = registry.get(self.db, "pubshutdown")
         worker = AgentWorker(runner, agent, lease)
-        vrai_popen = subprocess.Popen
+        publie: dict = {}
+        mort = self._surveille_mort(publie)
 
-        def popen_retarde(*args, **kwargs):
-            proc = vrai_popen(*args, **kwargs)
+        def shutdown_a_conclu(_proc):
             # shutdown a rendu le bail et arrêté le veilleur pendant la création
             worker.stopping.set()
             worker.watchdog_stop.set()
-            time.sleep(0.05)
-            return proc
 
         fakebin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakebin")
         env = {"AMEESH_BIN_DIR": fakebin, "AMEESH_TEST_SLEEP": "5",
                "AMEESH_TEST_LOG": self.turns_log}
-        debut = time.monotonic()
         try:
             with mock.patch.dict(os.environ, env, clear=False), \
-                    mock.patch("ameesh.runner.subprocess.Popen", side_effect=popen_retarde):
+                    self._popen_du_harnais(publie, shutdown_a_conclu):
                 ok = worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
-            ecoule = time.monotonic() - debut
             self.assertFalse(ok)
-            self.assertLess(ecoule, 2.0, "le harnais publié doit être tué, pas attendu")
+            self.assertIn("proc", publie, "le harnais doit avoir été lancé")
+            self.assertTrue(mort.wait(self.MORT_HARNAIS_DELAI),
+                            "le harnais publié doit être tué, pas attendu")
+            self.assertEqual(publie["proc"].returncode, -signal.SIGKILL)
             self.assertTrue(worker.lease_lost.is_set())
         finally:
             if worker.proc is not None and worker.proc.poll() is None:
