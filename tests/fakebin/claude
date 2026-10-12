@@ -4,7 +4,8 @@
 
 Émet le même flux JSONL que `claude -p --output-format stream-json`, journalise
 son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
-AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L105 :
+AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L223:
+AMEESH_TEST_CLAUDE_HELP (text printed by `--help`) ; L105 :
 AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée ;
 L217 : `parent`, l'outil du fil principal dont l'appel est un sous-agent).
 Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
@@ -38,6 +39,14 @@ def main() -> int:
     if args == ["--version"]:  # L120: read by the runner, not a turn
         print("9.9.9 (Claude Code, fake)")
         return 0
+    if args == ["--help"]:
+        # L223: the help read for the interactive permission mode, before any
+        # log (it is not a turn); AMEESH_TEST_CLAUDE_HELP simulates an older
+        # version
+        print(os.environ.get("AMEESH_TEST_CLAUDE_HELP", '  --permission-mode <mode>  '
+              '(choices: "acceptEdits", "auto", "bypassPermissions", "manual", '
+              '"dontAsk", "plan")'))
+        return 0
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
@@ -47,7 +56,7 @@ def main() -> int:
                     "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
                     "AMEESH_HOST", "AMEESH_SCHEMA", "AMEESH_TURN_MAIL_MAX",
-                    "AMEESH_TURN_ID",
+                    "AMEESH_TURN_ID", "AMEESH_HARNESS",
                     # L73 : dossier temporaire et caches gérés
                     "TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR", "AMEESH_CACHE_DIR",
                     "npm_config_cache", "npm_config_store_dir", "YARN_CACHE_FOLDER")},

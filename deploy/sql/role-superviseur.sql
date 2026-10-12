@@ -262,7 +262,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L73 : occupation du /tmp du système
         'tmp_path', 'tmp_fstype', 'tmp_size_bytes', 'tmp_used_bytes',
         -- L106 (0047) : alimentation de l'hôte
-        'on_ac', 'battery_percent'
+        'on_ac', 'battery_percent',
+        -- L159d (0061): shared host measure, numbers only
+        'mem_total_bytes', 'psi_cpu_some', 'psi_mem_some', 'psi_mem_full',
+        'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
+        'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
+        -- #246 (0067): btrfs allocation, numbers only
+        'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
@@ -291,7 +297,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
         'spend_key',
         -- L95 (0043) : raison d'une ligne écartée des sommes
-        'void_reason'
+        'void_reason',
+        -- L225 (0059) : raison d'un tour facturé au repli prudent
+        'price_fallback',
+        -- L225 (0059) : écritures de cache Claude du tour
+        'cache_write_tokens'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu

@@ -1,27 +1,27 @@
 ---
 type: Decision
-title: "Les agents ont une fiche dans le canon OKF ; leur état reste dans ameesh"
-description: "Déclaration de l'agent (parrain, rôle, capacités, harnais, budget, outils) dans le canon ; état d'exécution dans ameesh."
+title: "Agents have a card in the OKF canon; their state stays in ameesh"
+description: "Declaration of the agent (sponsor, role, capabilities, harness, budget, tools) in the canon; execution state in ameesh."
 status: stable
 tags: [agents, canon]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Aujourd'hui l'existence d'un agent tient à ses scripts de lancement et à des messages du board ; n'importe quel agent peut en lancer un autre.
+Today an agent's existence rests on its launch scripts and on board messages; any agent can launch another.
 
-# Décision
+# Decision
 
-- Chaque agent a une **fiche** dans le canon OKF (type `Agent`) : humain responsable, équipe, rôle et capacités (`read`, `report-drift`, `propose`, jamais `approve`), harnais et modèle, machine prévue, budget, outils autorisés, relecteurs.
-- La fiche ne change que par **PR revue**.
-- **L'état** (session, bail, machine courante, statut, dépense, courrier) reste dans ameesh.
-- Les **agents éphémères**, limités à la lecture et à la proposition, peuvent exister sans fiche ; ils ont quand même un humain responsable, **hérité de l'agent qui les a créés** et enregistré par ameesh à leur création (R14).
+- Each agent has a **card** in the OKF canon (type `Agent`): responsible human, team, role and capabilities (`read`, `report-drift`, `propose`, never `approve`), harness and model, intended machine, budget, allowed tools, reviewers.
+- The card changes only by **reviewed PR**.
+- **The state** (session, lease, current machine, status, spending, mail) stays in ameesh.
+- **Ephemeral agents**, limited to reading and proposing, may exist without a card; they still have a responsible human, **inherited from the agent that created them** and recorded by ameesh at their creation (R14).
 
-# Conséquences
+# Consequences
 
-- Personne ne crée un agent ni n'élargit ses droits sans revue.
-- Le registre des clés publiques des membres peut vivre dans le canon, modifié par PR revue.
+- Nobody creates an agent or widens its rights without review.
+- The registry of members' public keys can live in the canon, changed by reviewed PR.

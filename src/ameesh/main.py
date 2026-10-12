@@ -89,6 +89,7 @@
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
+  ameesh deps link|local|status|entries node_modules shared per lockfile (#248) ;
   ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
@@ -197,6 +198,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "deps":
+        # #248: node_modules shared per lockfile, without database
+        from . import deps
+        return deps.main(rest)
     if command == "projects":
         from . import projects
         return projects.main(rest)

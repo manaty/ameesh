@@ -33,7 +33,21 @@ READING_COLUMNS = (
     "id, host, extract(epoch from sampled_at)::float8 AS sampled_ts, "
     "mem_available_bytes, swap_used_bytes, load1, cpu_count, disk_free_bytes, "
     "disk_path, turns_in_progress, tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes, "
-    "on_ac, battery_percent"
+    "on_ac, battery_percent, "
+    # L159d (0061): shared host measure
+    "mem_total_bytes, psi_cpu_some, psi_mem_some, psi_mem_full, psi_io_some, "
+    "app_cpu, guest_cpu, cpu_window_s, guest_mem_bytes, "
+    "lendable_cpu, lendable_memory_bytes, lendable_disk_bytes, "
+    # #246 (0067): btrfs allocation
+    "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes"
+)
+
+#: L159d (and #246) columns written by `record`, in this order
+MEASURE_COLUMNS = (
+    "mem_total_bytes", "psi_cpu_some", "psi_mem_some", "psi_mem_full", "psi_io_some",
+    "app_cpu", "guest_cpu", "cpu_window_s", "guest_mem_bytes",
+    "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
+    "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
 )
 
 #: colonnes d'une ressource de tour
@@ -53,8 +67,9 @@ class Hosts(interface.HostResources):
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
                  tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
-                 on_ac, battery_percent)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 on_ac, battery_percent, """ + ", ".join(MEASURE_COLUMNS) + """)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, """
+            + ", ".join(["%s"] * len(MEASURE_COLUMNS)) + """)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
              reading.get("swap_used_bytes"), reading.get("load1"),
@@ -62,7 +77,8 @@ class Hosts(interface.HostResources):
              reading.get("disk_path"), reading.get("turns_in_progress"),
              reading.get("tmp_path"), reading.get("tmp_fstype"),
              reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes"),
-             reading.get("on_ac"), reading.get("battery_percent")),
+             reading.get("on_ac"), reading.get("battery_percent"),
+             *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
         # et la table ne doit pas grandir sans fin.
@@ -128,6 +144,31 @@ class Hosts(interface.HostResources):
             "extract(epoch from observed_at)::float8 AS observed_ts "
             "FROM harness_versions" + where + " ORDER BY harness, host", tuple(params))
 
+    def lend_basis(self, host, since_s, slot_s, percentile) -> dict:
+        rows = self.db.query(
+            """
+            WITH s AS (
+                SELECT sampled_at, app_cpu,
+                       mem_available_bytes + guest_mem_bytes AS free_mem
+                  FROM host_resources
+                 WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)
+            ), slots AS (
+                SELECT avg(app_cpu) AS cpu FROM s WHERE app_cpu IS NOT NULL
+                 GROUP BY floor(extract(epoch from sampled_at) / %s)
+            )
+            SELECT count(*)::int AS samples,
+                   coalesce(extract(epoch from
+                                max(sampled_at) FILTER (WHERE app_cpu IS NOT NULL)
+                                - min(sampled_at) FILTER (WHERE app_cpu IS NOT NULL)),
+                            0)::float8 AS span_s,
+                   min(free_mem)::bigint AS min_free_mem_bytes,
+                   (SELECT percentile_cont(%s) WITHIN GROUP (ORDER BY cpu)
+                      FROM slots)::float8 AS app_cpu_p95
+              FROM s
+            """, (host, float(since_s), float(slot_s), float(percentile)))
+        return rows[0] if rows else {"samples": 0, "span_s": 0.0,
+                                     "min_free_mem_bytes": None, "app_cpu_p95": None}
+
     def turns_in_progress(self, host) -> int:
         rows = self.db.query(
             "SELECT count(*)::int AS n FROM agent_registry"
@@ -179,6 +220,27 @@ class TurnResources(interface.TurnResources):
             (_array(containers), turn_id),
         )
 
+    def settle(self, turn_id) -> None:
+        self.db.query(
+            "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = %s AND status <> 'done' RETURNING id", (turn_id,))
+
+    def settle_many(self, turn_ids) -> int:
+        if not turn_ids:
+            return 0
+        return len(self.db.query(
+            "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status <> 'done' RETURNING id",
+            (_array(turn_ids),)))
+
+    def mark_orphan_many(self, turn_ids) -> int:
+        if not turn_ids:
+            return 0
+        return len(self.db.query(
+            "UPDATE turn_resources SET status = 'orphan', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status NOT IN ('done', 'orphan')"
+            " RETURNING id", (_array(turn_ids),)))
+
     def get(self, turn_id) -> dict | None:
         rows = self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources WHERE turn_id = %s",
@@ -201,6 +263,13 @@ class TurnResources(interface.TurnResources):
             "SELECT " + TURN_COLUMNS + " FROM turn_resources" + where +
             (" AND" if where else " WHERE") + " status = 'orphan'"
             " ORDER BY started_at DESC, id DESC LIMIT %s", tuple(params))
+
+    def orphans_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND status = 'orphan' AND started_at < to_timestamp(%s)"
+            "   AND id > %s ORDER BY id LIMIT %s",
+            (host, float(before_ts), int(after_id), int(limit)))
 
     def stale_running(self, older_than_s, host=None) -> list[dict]:
         where, params = "", [float(older_than_s)]

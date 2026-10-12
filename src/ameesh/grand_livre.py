@@ -124,10 +124,10 @@ def thread_created_ts(thread: str | None) -> float | None:
 # le plan de correction (pur : aucune écriture)
 # --------------------------------------------------------------------------
 
-def _price(prices: dict, harness: str, model: str) -> list:
-    if model and model in prices:
-        return list(prices[model])
-    return cost_mod.max_price_of(prices, harness)
+def _price(prices: dict, harness: str, model: str) -> list | None:
+    """Le tarif du modèle, sinon le majorant de sa famille, sinon le repli
+    prudent (maximum du barème) ; None sans aucun barème (L225)."""
+    return cost_mod.price_for(prices, harness, model)[0]
 
 
 def _usd(harness: str, tokens: list, triplet: list) -> float:
@@ -231,7 +231,12 @@ def plan(rows: Iterable[dict], *, prices: dict,
         if row["harness"] == "claude" and current is not None:
             fix(row, "modele", "modèle « inconnu » → %s (%s)" % (model, source), model=model)
             continue
-        usd = round(_usd(row["harness"], tokens, _price(prices, row["harness"], model)), 6)
+        triplet = _price(prices, row["harness"], model)
+        if triplet is None:
+            fix(row, "modele", "modèle « inconnu » → %s (%s), aucun barème : coût "
+                "inchangé" % (model, source), model=model)
+            continue
+        usd = round(_usd(row["harness"], tokens, triplet), 6)
         old = float(row.get("usd") or 0.0) if current is None else float(current)
         values = {"model": model}
         if abs(usd - old) >= 1e-6:
@@ -257,25 +262,40 @@ def plan(rows: Iterable[dict], *, prices: dict,
 
 
 def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) -> None:
-    """Claude : le premier relevé de la session vaut-il tout son cumul ?"""
+    """Claude : le premier relevé de la session vaut-il tout son cumul ?
+
+    Un tour Claude paie aussi ses écritures de cache (L225), que seules les
+    lignes depuis la migration 0059 gardent (`cache_write_tokens`). Sans elles,
+    rien ne distingue un cumul d'un tour qui a beaucoup écrit en cache : le
+    total est gardé (jamais ramené sous son coût réel). Avec elles, elles
+    comptent dans l'estimation au prix d'écriture le plus cher (×2, cache 1 h :
+    la durée n'est pas gardée), ce qui n'abaisse jamais un total juste."""
     cum = first.get("cum_usd")
     usd = float(first.get("usd") or 0.0)
     if cum is None or usd <= 0 or abs(usd - float(cum)) > 1e-6:
         return
+    if first.get("cache_write_tokens") is None:
+        return                          # L225 : écritures de cache inconnues
+    written = int(first["cache_write_tokens"] or 0)
     tokens = _tokens(first)
     model = first.get("model") or ""
-    if model in prices:
-        estimate = _usd("claude", tokens, prices[model])
-        how = "barème %s" % model
+    triplet = cost_mod.price_for(prices, "claude", model)[0]
+    if triplet is None:
+        return                          # L225 : aucun barème, pas d'estimation
+    writes = written * triplet[0] * cost_mod.CACHE_WRITE_1H / 1e6
+    known = cost_mod.known_price(prices, model)
+    if known:
+        estimate = _usd("claude", tokens, known) + writes
+        how = "barème %s, écritures de cache comprises" % model
     else:
         spent = sum(float(r.get("usd") or 0.0) for r in others)
         read = sum(int(r.get("input_tokens") or 0) + int(r.get("cached_input_tokens") or 0)
                    for r in others)
         if spent > 0 and read > 0:
-            estimate = (tokens[0] + tokens[1]) * spent / read
+            estimate = (tokens[0] + tokens[1]) * spent / read + writes
             how = "coût par jeton relu des %d autres tours de la session" % len(others)
         else:
-            estimate = _usd("claude", tokens, cost_mod.max_price_of(prices, "claude"))
+            estimate = _usd("claude", tokens, triplet) + writes
             how = "tarif le plus cher connu"
     if usd <= CUMUL_FACTOR * estimate or usd - estimate <= CUMUL_MIN_USD:
         return
@@ -303,7 +323,13 @@ def _codex_cumul(first: dict, prices: dict, fix, repriced: dict,
         model = first.get("model") or ""
         if model in UNKNOWN_MODELS and codex_model:
             model = codex_model(first["session"]) or ""
-        usd = round(_usd("codex", delta, _price(prices, "codex", model)), 6)
+        triplet = _price(prices, "codex", model)
+        if triplet is None:
+            fix(first, "cumul", "usage cumulé du fil repris compté pour un tour ; modèle %s "
+                "sans barème" % (model or "inconnu"),
+                void_reason="%s : usage du fil repris, aucun barème" % cost_mod.UNPRICED_REASON)
+            return
+        usd = round(_usd("codex", delta, triplet), 6)
         repriced[int(first["id"])] = delta
         fix(first, "cumul", "usage cumulé du fil repris (%s jetons d'entrée) compté pour un "
             "tour ; total d'avant le tour lu dans le journal du fil" % cumulative[0],
