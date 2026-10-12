@@ -437,6 +437,9 @@ def btrfs_allocation(path: str | None, *, sysfs: str | None = None, fs_info=None
 
 #: identifier of the current boot, new at every boot
 BOOT_ID = os.path.join(PROC, "sys", "kernel", "random", "boot_id")
+#: the boot clock as a shell reads it: seconds since the boot, suspend
+#: included (CLOCK_BOOTTIME), first field
+UPTIME = os.path.join(PROC, "uptime")
 
 
 def own_cgroup(path: str | None = None) -> str | None:
