@@ -63,6 +63,9 @@ CONTENUS = {
     "mesh_approvals_status": {"meta"},
     # L161c (0055) : sortie d'un test en échec
     "ci_test_failures": {"excerpt"},
+    # L232a (0371) : plans, preuves et détails de travail, sans secrets
+    "host_handoffs": {"plan", "evidence"},
+    "host_handoff_events": {"detail"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.
