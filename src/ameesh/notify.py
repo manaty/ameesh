@@ -92,7 +92,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked",
                  # L226a : un identifiant est en échec, ou expire bientôt
-                 "credential_failing", "credential_expiring")
+                 "credential_failing", "credential_expiring",
+                 # #330 : une clé owner vient d'être enregistrée ou remplacée
+                 "owner_key_registered")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -158,11 +160,12 @@ TYPE_LABELS = {
     "waiting_without_question": "lot waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
+    "owner_key_registered": "owner key registered",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing")
+                "credential_failing", "owner_key_registered")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.

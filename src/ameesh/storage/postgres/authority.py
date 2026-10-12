@@ -13,6 +13,9 @@ import json
 
 from .. import interface
 
+#: the registry row made by SQL on 2026-10-12 for the owner's key (#330)
+STOPGAP_NAME = "smichea"
+
 class Keys(interface.Keys):
 
     def info(self, agent) -> dict | None:
@@ -45,37 +48,53 @@ class Keys(interface.Keys):
         )
         return bool(rows)
 
-    def register_human(self, name, human, public_key, fingerprint, role) -> bool:
-        # the stopgap row of 2026-10-12 (0364): a registry row that only ever
-        # stood for this human's key leaves the registry
-        self.db.query(
-            """
-            DELETE FROM agent_registry
-             WHERE name = %s AND harness = 'none' AND mode = 'externe' AND turns = 0
-               AND responsible = %s AND lease_owner IS NULL
-            RETURNING name
-            """,
-            (name, human),
-        )
-        if self.db.query("SELECT 1 FROM agent_registry WHERE name = %s", (name,)):
-            return False
-        self.db.query(
-            """
-            INSERT INTO key_holders (name, human, public_key, public_key_fingerprint,
-                                     key_role, key_updated_at, key_revoked_at)
-            VALUES (%s, %s, %s, %s, %s, now(), NULL)
-            ON CONFLICT (name) DO UPDATE
-               SET human = excluded.human,
-                   public_key = excluded.public_key,
-                   public_key_fingerprint = excluded.public_key_fingerprint,
-                   key_role = excluded.key_role,
-                   key_updated_at = now(),
-                   key_revoked_at = NULL
-            RETURNING name
-            """,
-            (name, human, public_key, fingerprint, role),
-        )
-        return True
+    def register_human(self, name, human, public_key, fingerprint, role, *,
+                       replace=False) -> str:
+        with self.db.transaction() as tx:
+            # the stopgap row of 2026-10-12 (0364), exactly: it only ever
+            # stood for the owner's key
+            tx.execute(
+                """
+                DELETE FROM agent_registry
+                 WHERE name = %s AND name = %s AND responsible = %s
+                   AND harness = 'none' AND mode = 'externe' AND turns = 0
+                   AND session_id IS NULL AND lease_owner IS NULL AND canon_ref IS NULL
+                """,
+                (name, STOPGAP_NAME, "human:" + STOPGAP_NAME),
+            )
+            if tx.query("SELECT 1 FROM agent_registry WHERE name = %s", (name,)):
+                return "agent"
+            held = bool(tx.query("SELECT 1 FROM key_holders WHERE name = %s", (name,)))
+            if not replace:
+                if held:
+                    return "exists"
+                tx.execute(
+                    """
+                    INSERT INTO key_holders (name, human, public_key, public_key_fingerprint,
+                                             key_role, key_updated_at)
+                    VALUES (%s, %s, %s, %s, %s, now())
+                    """,
+                    (name, human, public_key, fingerprint, role),
+                )
+                return "created"
+            # the owner's own gesture: the guard of 0364 checks the role
+            tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+            tx.execute(
+                """
+                INSERT INTO key_holders (name, human, public_key, public_key_fingerprint,
+                                         key_role, key_updated_at, key_revoked_at)
+                VALUES (%s, %s, %s, %s, %s, now(), NULL)
+                ON CONFLICT (name) DO UPDATE
+                   SET human = excluded.human,
+                       public_key = excluded.public_key,
+                       public_key_fingerprint = excluded.public_key_fingerprint,
+                       key_role = excluded.key_role,
+                       key_updated_at = now(),
+                       key_revoked_at = NULL
+                """,
+                (name, human, public_key, fingerprint, role),
+            )
+            return "replaced" if held else "created"
 
     def revoke(self, agent) -> bool:
         held = self.db.query(

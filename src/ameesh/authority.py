@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass
 
 from . import signing, storage
-from .db import Db
+from .db import Db, DbError
 
 DOMAIN = "agent-mesh/v1"
 #: rôles de clé : seul 'owner' porte l'autorité du propriétaire
@@ -41,6 +41,8 @@ KEY_ROLES = ("owner", "agent")
 DEFAULT_KEY_ROLE = "agent"
 #: nom d'un détenteur de clé (même règle que agent_registry.name)
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# a refusal of the key_holders guard (0364), as psql reports it
+_GUARD_RE = re.compile(r"[^\n:]*(?:key|holder)[^\n]*own gesture[^\n]*")
 DEFAULT_TTL = 24 * 3600.0
 MAX_TTL = 30 * 24 * 3600.0
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -205,14 +207,21 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
 
 
 def register_human_key(db: Db, human: str, public: bytes, *,
-                       role: str = DEFAULT_KEY_ROLE) -> dict:
+                       role: str = DEFAULT_KEY_ROLE, replace: bool = False) -> dict:
     """Enregistre la clé PUBLIQUE d'un humain (#330) : `human` est
     `human:<id>` ou `<id>` ; la clé est rangée sous `<id>` dans `key_holders`,
     une identité qui ne détient qu'une clé — jamais un agent (ni exécutable,
     ni réveillable, ni dans un projet, une alerte ou une prise L165). C'est le
     nom que `decide --key` prend par défaut (`human:<id>` → `<id>`). Refusé si
     un agent porte ce nom : la clé du propriétaire ne s'attache jamais à
-    l'identité d'un agent."""
+    l'identité d'un agent.
+
+    Une clé existante n'est jamais écrasée (#326 r1) : seule une première clé
+    s'enregistre, et une première clé owner seulement s'il n'en existe aucune
+    (alerte `owner_key_registered`). Remplacer ou faire tourner une clé, même
+    révoquée, est le geste du propriétaire : `replace`, avec le rôle de base
+    du propriétaire — la base (0364) refuse tout autre rôle. `status` vaut
+    `created` ou `replaced`."""
     name = human.split(":", 1)[1] if human.startswith("human:") else human
     if len(public) != 32:
         raise AuthorityError("Ed25519 public key: 32 bytes expected")
@@ -221,13 +230,25 @@ def register_human_key(db: Db, human: str, public: bytes, *,
     if not _NAME_RE.match(name):
         raise AuthorityError("invalid name for a key holder: %r" % name)
     fingerprint = signing.fingerprint(public)
-    if not storage.of(db).keys.register_human(name, "human:" + name, b64(public),
-                                              fingerprint, role):
+    try:
+        status = storage.of(db).keys.register_human(
+            name, "human:" + name, b64(public), fingerprint, role, replace=replace)
+    except DbError as exc:
+        refused = _GUARD_RE.search(str(exc))
+        if not refused:
+            raise
+        raise AuthorityError(refused.group(0).strip()) from exc
+    if status == "agent":
         raise AuthorityError(
             "an agent is named %s: a human's key never sits on an agent's identity "
             "(choose another name, then decide … --as <name>)" % name)
+    if status == "exists":
+        raise AuthorityError(
+            "%s already holds a key: it is never overwritten; replacing or rotating it "
+            "is the owner's own gesture (key register --human %s --replace, with the "
+            "owner's database role)" % (name, name))
     return {"agent": name, "human": "human:" + name, "fingerprint": fingerprint,
-            "role": role}
+            "role": role, "status": status}
 
 
 def revoke_key(db: Db, agent: str) -> bool:

@@ -620,6 +620,22 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
 # clés
 # --------------------------------------------------------------------------
 
+def _note_owner_key(db: Db, result: dict) -> None:
+    """Une clé owner d'humain vient d'être enregistrée (#326 r1) : son chat
+    (`chat-<id>`, s'il existe) en reçoit la note, que le geste vienne du
+    propriétaire ou non ; `ameesh alerts` lève aussi `owner_key_registered`."""
+    chat = "chat-" + result["agent"]
+    if not storage.of(db).agents.get(chat):
+        return
+    mail.send(db, work.SYSTEM_SENDER, chat,
+              "An owner key was %s for %s: fingerprint %s. If this was not your "
+              "gesture, revoke it at once (ameesh key revoke %s) and register "
+              "yours with the owner's database role (key register --human %s "
+              "--replace)." % (result.get("status") or "registered", result["human"],
+                               result["fingerprint"], result["agent"], result["agent"]),
+              kind="event")
+
+
 def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -644,25 +660,32 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 print(USAGE_HINT % "key register: give an agent, or --human <id> "
                       "for a human's key (the owner's)", file=sys.stderr)
                 return 2
+            if args.replace and not args.human:
+                print(USAGE_HINT % "key register --replace: only with --human <id>",
+                      file=sys.stderr)
+                return 2
             public = signing.read_public(os.path.expanduser(args.public_key))
             try:
                 if args.human:
                     result = authority.register_human_key(
-                        db, args.human, public, role=args.role)
+                        db, args.human, public, role=args.role, replace=args.replace)
                 else:
                     result = authority.register_key(
                         db, args.agent, public, role=args.role, note=args.note)
             except authority.AuthorityError as exc:
                 print("refused: %s" % exc, file=sys.stderr)
                 return 1
-            print("key of %s registered: %s (role %s)%s" % (
-                result["agent"], result["fingerprint"], result["role"],
+            print("key of %s %s: %s (role %s)%s" % (
+                result["agent"], "replaced" if result.get("status") == "replaced"
+                else "registered", result["fingerprint"], result["role"],
                 " — %s, key holder only (no agent)" % result["human"]
                 if result.get("human") else ""))
             if result["role"] == "owner":
                 print("warning: this key carries the owner's authority for %s; "
                       "its private key must exist only with the owner."
                       % result["agent"])
+                if result.get("human"):
+                    _note_owner_key(db, result)
             return 0
         if args.key_command == "revoke":
             if not authority.revoke_key(db, args.agent):
@@ -1812,6 +1835,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_reg.add_argument("--role", choices=list(authority.KEY_ROLES), default=authority.DEFAULT_KEY_ROLE,
                        help="owner = owner's authority; agent = provenance only")
     p_reg.add_argument("--note", default=None)
+    p_reg.add_argument("--replace", action="store_true",
+                       help="with --human: replace or rotate the key, even revoked — the "
+                            "owner's own gesture, refused by the database outside the "
+                            "owner's database role (#326)")
     p_reg.set_defaults(func=cmd_key)
     p_kshow = key_sub.add_parser("show")
     p_kshow.add_argument("agent")

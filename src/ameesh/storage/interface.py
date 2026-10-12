@@ -815,12 +815,15 @@ class Keys(Domain):
 
     @abc.abstractmethod
     def register_human(self, name: str, human: str, public_key: str, fingerprint: str,
-                       role: str) -> bool:
+                       role: str, *, replace: bool = False) -> str:
         """Enregistre la clé d'un humain sous `name`, hors du registre des
-        agents (`key_holders`, #330) : crée ou met à jour le détenteur ; faux
-        si un agent porte déjà ce nom. La ligne de contournement du 12/10
-        (harnais none, mode externe, aucun tour, responsable cet humain)
-        quitte alors le registre."""
+        agents (`key_holders`, #330) : `created` ; `exists` si le détenteur
+        existe déjà (sans `replace`) ; `agent` si un agent porte ce nom.
+        `replace` (geste du propriétaire, #326 r1) remplace la clé, même
+        révoquée : `replaced` ; la base le refuse hors du rôle propriétaire.
+        Les règles sont celles de la base (0364) : une erreur de la base
+        remonte telle quelle. La ligne de contournement du 12/10 (`smichea`)
+        quitte le registre."""
 
     @abc.abstractmethod
     def revoke(self, agent: str) -> bool:

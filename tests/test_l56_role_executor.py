@@ -126,6 +126,35 @@ class RoleExecutorTest(PgTestCase):
             self.assertTrue("permission denied" in error or "must be owner" in error,
                             (sql, proc.stderr))
 
+    def test_host_cannot_replace_a_key(self):
+        """#326 r1: every agent shares this role; the owner's key is never
+        replaced by it, the owner's gesture setting notwithstanding."""
+        self.db.execute("INSERT INTO key_holders (name, human, public_key, key_role) "
+                        "VALUES ('l56-owner', 'human:l56-owner', 'k0', 'owner') "
+                        "ON CONFLICT (name) DO NOTHING")
+        for sql in ("BEGIN; SET LOCAL ameesh.owner_gesture = 'on'; "
+                    "UPDATE key_holders SET public_key = 'k1' WHERE name = 'l56-owner'; COMMIT",
+                    "SET ameesh.owner_gesture = 'on'; "
+                    "DELETE FROM key_holders WHERE name = 'l56-owner'",
+                    "SET ameesh.owner_gesture = 'on'; INSERT INTO key_holders "
+                    "(name, human, public_key, key_role) "
+                    "VALUES ('l56-other', 'human:l56-other', 'k2', 'owner')",
+                    "ALTER TABLE key_holders DISABLE TRIGGER key_holders_guard",
+                    "DROP TRIGGER key_holders_guard ON key_holders",
+                    "CREATE OR REPLACE FUNCTION key_holders_owner_gesture() RETURNS boolean "
+                    "LANGUAGE sql AS 'select true'"):
+            proc = self.as_host(sql)
+            self.assertNotEqual(proc.returncode, 0, sql)
+        self.assertEqual(self.db.query("SELECT name, public_key FROM key_holders "
+                                       "WHERE name LIKE 'l56-%'"),
+                         [{"name": "l56-owner", "public_key": "k0"}])
+        # an agent of that name is refused; a revocation is not
+        proc = self.as_host("INSERT INTO agent_registry (name) VALUES ('l56-owner')")
+        self.assertIn("holds a human's key", proc.stderr)
+        proc = self.as_host("UPDATE key_holders SET key_revoked_at = now() "
+                            "WHERE name = 'l56-owner'")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_public_schema_create_rolls_back(self):
         """PUBLIC schema CREATE makes the script roll back the new role."""
         q = db_mod.quote_ident
