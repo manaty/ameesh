@@ -54,7 +54,7 @@ class ReserveForfaitTest(_Comptes):
         with mock.patch.object(book, "gauges", return_value=[jauge]), \
                 mock.patch.object(book, "clock", return_value=self.now):
             raison = book.pace_exceeded("codex", accounts.RESERVE)
-        heure = time.strftime("%H:%M", time.localtime(self.now + 1800))
+        heure = cost.until_label(self.now + 1800, self.now)  # dated after 23:30
         self.assertTrue(raison.startswith(
             "pause (account (default), five_hour 96 %%) until %s; plan codex five_hour" % heure),
             raison)
@@ -90,7 +90,7 @@ class AffichageDeLaPauseTest(_Comptes):
         self.jauge("secondaire", 97)
         pause = self.choose()
         self.assertIsNone(pause.profile)
-        heure = time.strftime("%H:%M", time.localtime(self.now + 1800))
+        heure = cost.until_label(self.now + 1800, self.now)  # dated after 23:30
         self.assertTrue(pause.reason.startswith("pause (account "), pause.reason)
         self.assertIn(") until %s; all codex accounts at threshold" % heure, pause.reason)
         self.assertRegex(pause.reason, r"codex-300min (96|97) %")
