@@ -53,6 +53,10 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(env["AMEESH_DRAIN_SECONDS"], "120")
         self.assertTrue(env["HOME"].startswith("/srv/ameesh-guest/"))
         self.assertIn("--agents %i", u["ExecStart"][0])
+        # mesh-design #457 r5: a trace of git keeps the token redacted,
+        # whatever the secrets files set (UnsetEnvironment is applied last)
+        self.assertEqual(u["UnsetEnvironment"], ["GIT_TRACE_REDACT"])
+        self.assertNotIn("GIT_TRACE_REDACT", env)
 
     def test_guest_runner_hardening(self):
         u = unit("ameesh-guest-runner@.service")
