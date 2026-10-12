@@ -460,7 +460,9 @@ class PassTest(_Base):
         _commit_on(self.repo, "main", "shared.py",
                    "Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n", "main moves elsewhere")
         report = self.run_pass(repo=agents)
-        self.assertEqual([a["state"] for a in report["against_target"]], ["clean"])  # stale
+        # the radar, on the agents' stale origin/main, finds lot 1 clean
+        self.assertEqual([a["state"] for a in report["against_target"]
+                          if int(a["work_item"]) == 1], ["clean"])
         self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
         self.assertIn("stacked trial: conflict not covered on shared.py",
                       self.fake.queue_rows[1]["reason"])
@@ -572,7 +574,7 @@ class QueueDbTest(PgTestCase):
         self.assertIn("ejected", notes)
         shown = self.mesh("work", "show", str(a))
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertIn("file     : queued vers main, rang 2", shown.stdout)
+        self.assertIn("queue    : queued to main, rank 2", shown.stdout)
         listed = self.mesh("work", "queue", "show")
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn("queue of main:", listed.stdout)
