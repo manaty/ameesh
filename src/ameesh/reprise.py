@@ -705,6 +705,12 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     if live and row.get("status") == "stopped":
         raise RepriseError("%s est arrêté mais son bail vit encore (l'exécuteur ne l'a pas "
                            "encore rendu) : réessayez dans quelques secondes" % name)
+    if not live and row.get("status") != "stopped":
+        # #293: a runner keeps the lease of every agent it serves that is not
+        # stopped; none here means the runner is gone, and the queued
+        # instruction waits until it starts again
+        warn("no runner holds %s's lease on %s: the instruction waits until its runner "
+             "(ameesh-runner-agent@%s) starts again" % (name, row.get("host") or "?", name))
     decision = plan(cfg, db, row, fresh=fresh)
     for text in decision["warnings"]:
         warn(text)
@@ -759,7 +765,8 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
             "forgotten_session": decision["session"] if forget else None,
             "deterministic": decision["deterministic"], "why": decision["why"],
             "account": decision["previous"], "next_account": decision["next"],
-            "applied": applied, "notified": notified, "prompt_bytes": _octets(prompt)}
+            "applied": applied, "notified": notified, "prompt_bytes": _octets(prompt),
+            "runner_live": live}
 
 
 # --------------------------------------------------------------------------
