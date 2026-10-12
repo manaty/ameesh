@@ -142,6 +142,7 @@ TYPE_LABELS = {
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
     "tmp_orphan": "/tmp entry left by a turn",
+    "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "plan_underused": "underused plan",
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",

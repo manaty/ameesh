@@ -855,13 +855,58 @@ def _prune_empty_dirs(top: str) -> None:
                 pass
 
 
+def _git_root(path: str) -> str | None:
+    """#500: the work tree that `path` (a file found by the walk) proves:
+    a `.git` file whose `gitdir:` exists (a linked worktree, live or
+    registered), or the `HEAD` of a `.git` directory (a clone). None
+    otherwise, or when the gitdir is gone (a worktree already prunable)."""
+    name = os.path.basename(path)
+    parent = os.path.dirname(path)
+    if name == "HEAD" and os.path.basename(parent) == ".git":
+        return os.path.dirname(parent)
+    if name != ".git":
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            line = fh.readline(4096).strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = os.path.join(parent, line[len("gitdir:"):].strip())
+    return parent if os.path.isdir(gitdir) else None
+
+
+def _removable(path: str, uid: int | None, writable: dict) -> bool:
+    """#500: this pass can unlink `path`: owned by us (any owner when the
+    platform has no uid) and its directory writable (cached in `writable`)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if uid is not None and st.st_uid != uid:
+        return False
+    parent = os.path.dirname(path)
+    if parent not in writable:
+        writable[parent] = os.access(parent, os.W_OK | os.X_OK)
+    return writable[parent]
+
+
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
               min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False) -> dict:
     """Éviction du plus ancien (mtime) au plus récent, jusqu'au quota.
 
     Un fichier modifié depuis moins de `min_age` n'est jamais évincé (il est
     peut-être en écriture) : le quota peut donc rester dépassé, et c'est dit
-    (`over_quota`). Rend `{before, after, evicted, files, over_quota}`."""
+    (`over_quota`).
+
+    #500: only what this pass can remove counts toward the quota (owned by
+    us, directory writable, outside a git work tree); the rest is reported
+    (`unremovable`, `worktree_bytes` and `worktrees`). When the unremovable
+    part alone exceeds the quota, nothing is evicted (`blocked`): before,
+    root-owned leftovers kept the total over the quota and every turn end
+    emptied the agent's directory. Rend `{before, after, evicted, files,
+    over_quota, unremovable, worktree_bytes, worktrees, blocked}`."""
     now = time.time() if now is None else float(now)
     found = []
     for directory in directories:
@@ -869,11 +914,31 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             found.extend(_files(directory))
     before = sum(size for _p, size, _m in found)
     total, evicted, files = before, 0, 0
+    unremovable = worktree_bytes = 0
+    worktrees: list[str] = []
+    blocked = False
+    counted = before
     if before > quota:
         if not dry_run and not _managed(root):
             raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
-        for path, size, mtime in sorted(found, key=lambda item: item[2]):
-            if total <= quota:
+        roots = sorted({r for r in (_git_root(p) for p, _s, _m in found) if r})
+        worktrees = [r for r in roots
+                     if not any(r.startswith(o + "/") for o in roots if o != r)]
+        uid = os.geteuid() if hasattr(os, "geteuid") else None
+        writable: dict = {}
+        candidates = []
+        for item in found:
+            path = item[0]
+            if any(path.startswith(w + "/") for w in worktrees):
+                worktree_bytes += item[1]
+            elif not _removable(path, uid, writable):
+                unremovable += item[1]
+            else:
+                candidates.append(item)
+        counted = before - unremovable - worktree_bytes
+        blocked = unremovable > quota
+        for path, size, mtime in sorted(candidates, key=lambda item: item[2]):
+            if blocked or counted <= quota:
                 break
             if now - mtime < min_age:
                 continue
@@ -885,13 +950,44 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 except OSError:
                     continue
             total -= size
+            counted -= size
             evicted += size
             files += 1
-        if not dry_run:
+        if not dry_run and files:
             for directory in directories:
                 _prune_empty_dirs(directory)
     return {"before": before, "after": total, "evicted": evicted, "files": files,
-            "over_quota": total > quota}
+            "over_quota": counted > quota, "unremovable": unremovable,
+            "worktree_bytes": worktree_bytes, "worktrees": worktrees, "blocked": blocked}
+
+
+def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
+                     agent: str | None = None, lot: str | None = None) -> list[dict]:
+    """#500: the log lines of one `evict_lru` result: the eviction, the
+    quota held by files this pass cannot remove (`unremovable`, read by the
+    `tmp_unremovable` alert), and each git work tree left out (`signaled`)."""
+    q = resources_mod.fmt_value("q", quota)
+    out = []
+    data = {"unremovable_bytes": result["unremovable"],
+            "worktree_bytes": result["worktree_bytes"], "quota": quota}
+    if result["files"]:
+        out.append({"kind": kind, "action": "evicted", "path": path,
+                    "bytes": result["evicted"], "agent": agent, "lot": lot, "data": data,
+                    "detail": "quota %s: %d oldest file(s) evicted%s" % (
+                        q, result["files"],
+                        "; %s not removable by this pass" % resources_mod.fmt_value(
+                            "q", result["unremovable"]) if result["unremovable"] else "")})
+    if result["blocked"]:
+        out.append({"kind": kind, "action": "unremovable", "path": path,
+                    "bytes": result["unremovable"], "agent": agent, "lot": lot, "data": data,
+                    "detail": "quota %s exceeded by %s of files this pass cannot remove "
+                              "(other owner or read-only directory): nothing evicted"
+                              % (q, resources_mod.fmt_value("q", result["unremovable"]))})
+    for tree in result["worktrees"]:
+        out.append({"kind": kind, "action": "signaled", "path": tree, "agent": agent,
+                    "lot": lot, "data": {"worktree": tree, "quota": quota},
+                    "detail": "git work tree inside %s left out of the quota eviction" % path})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1637,14 +1733,9 @@ class Turn:
                 root = tmp_root(self.cfg, policy)
                 result = evict_lru([self.tmp], root, policy.tmp_quota,
                                    min_age=EVICT_MIN_AGE_S)
-                if result["files"]:
-                    self.entries.append({
-                        "kind": "tmp", "action": "evicted",
-                        "path": self.tmp,
-                        "bytes": result["evicted"], "agent": self.agent, "lot": lot,
-                        "detail": "quota %s: %d oldest file(s) evicted"
-                                  % (resources_mod.fmt_value("q", policy.tmp_quota),
-                                     result["files"])})
+                self.entries.extend(eviction_entries(
+                    result, kind="tmp", path=self.tmp, quota=policy.tmp_quota,
+                    agent=self.agent, lot=lot))
         finally:
             if self.lock is not None:      # L219: the turn is over
                 self.lock.release()
@@ -2273,12 +2364,16 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                  "detail": "%d file(s), quota %s" % (
                                      result["files"],
                                      resources_mod.fmt_value("q", policy.tmp_quota))})
-                    if not dry_run:
-                        entries.append({"kind": "tmp", "action": "evicted", "path": full,
-                                        "bytes": result["evicted"], "agent": agent,
-                                        "detail": "quota %s: %d file(s) evicted" % (
-                                            resources_mod.fmt_value("q", policy.tmp_quota),
-                                            result["files"])})
+                if result["blocked"]:
+                    skipped.append("tmp %s: quota held by %s this pass cannot remove, "
+                                   "nothing evicted" % (full, resources_mod.fmt_value(
+                                       "q", result["unremovable"])))
+                for tree in result["worktrees"]:
+                    skipped.append("tmp %s: git work tree %s left out of the eviction"
+                                   % (full, tree))
+                if not dry_run:
+                    entries.extend(eviction_entries(
+                        result, kind="tmp", path=full, quota=policy.tmp_quota, agent=agent))
             finally:
                 if lock is not None:
                     lock.close()
@@ -2299,7 +2394,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                 "detail": "quota %s: %d oldest file(s) evicted"
                                           % (resources_mod.fmt_value("q", policy.cache_quota),
                                              result["files"])})
-        if result["over_quota"]:
+        if result["blocked"]:
+            skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
+                           % resources_mod.fmt_value("q", result["unremovable"]))
+        elif result["over_quota"]:
             skipped.append("caches: quota still exceeded (files less than an hour old)")
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
     if policy.deps and registered is None:
