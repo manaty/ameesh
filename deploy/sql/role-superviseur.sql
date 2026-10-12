@@ -46,6 +46,10 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       authenticators.public_key, .credential_id
+--   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
+--     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
+--     reconnaîtrait un jeton fuité ; inutile à la supervision :
+--       credential_health.failing_fingerprint
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes
@@ -327,7 +331,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- (short cause and fix command), never a credential
     ('credential_health', ARRAY[
         'host', 'harness', 'account', 'state', 'reason', 'source', 'checked_at',
-        'failing_since', 'expires_at'
+        'failing_since', 'expires_at', 'last_failure_at', 'failures'
     ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu

@@ -28,6 +28,14 @@ create table if not exists credential_health (
     -- start of the current failure (kept while `failing` is reported again,
     -- cleared on `healthy`)
     failing_since timestamptz,
+    -- the LAST `failing` report, its credential's fingerprint (truncated
+    -- SHA-256 of the refresh token or key, never the credential; null when
+    -- unknown or not failing) and the count of `failing` reports: the
+    -- sentinel clears a failure only for another credential than the last
+    -- failure's, and only if no failure was counted since it read the row
+    last_failure_at timestamptz,
+    failing_fingerprint text,
+    failures      integer not null default 0,
     -- forecast expiry of the credential reported by the sentinel (L226a:
     -- gcloud = last interactive login + session length, Claude = expiresAt
     -- without refresh), null if unknown; overwritten on each report

@@ -279,6 +279,42 @@ class CredentialsStorageTest(_AuthBase):
         self.assertEqual(auth_failure.failing(self.db, self.cfg.host, "claude"), {})
 
 
+class CredentialsConditionalTest(_AuthBase):
+    """#210 codex r2 (b, c): last failure, fingerprint and conditional write."""
+
+    def test_failure_fields_and_conditional_write(self):
+        creds = storage.of(self.db).credentials
+        creds.report(self.cfg.host, "codex", "a", "failing", source="turn", fingerprint="f1")
+        row = self._health("codex")["a"]
+        self.assertEqual((row["failures"], row["failing_fingerprint"]), (1, "f1"))
+        self.assertIsNotNone(row["last_failure_ts"])
+        # the sentinel read the row (1 failure); a turn records another one
+        creds.report(self.cfg.host, "codex", "a", "failing", source="turn", fingerprint="f2")
+        done = creds.report(self.cfg.host, "codex", "a", "healthy", source="sentinel",
+                            fingerprint="f3", expect_failures=1)
+        self.assertEqual(done, {"skipped": True})
+        row = self._health("codex")["a"]
+        self.assertEqual((row["state"], row["failures"], row["failing_fingerprint"]),
+                         ("failing", 2, "f2"))
+        self.assertGreaterEqual(row["last_failure_ts"], row["failing_since_ts"])
+        # with the count it read, the write lands; a failure always lands
+        done = creds.report(self.cfg.host, "codex", "a", "healthy", source="sentinel",
+                            expect_failures=2)
+        self.assertEqual(done["previous"], "failing")
+        row = self._health("codex")["a"]
+        self.assertEqual((row["state"], row["failing_fingerprint"]), ("healthy", None))
+        self.assertIsNone(row["failing_since_ts"])
+        self.assertIsNotNone(row["last_failure_ts"])
+        # a missing row expected at 0 failures, but a turn inserted one
+        creds.report(self.cfg.host, "codex", "b", "failing", source="turn")
+        self.assertEqual(creds.report(self.cfg.host, "codex", "b", "healthy",
+                                      source="sentinel", expect_failures=0),
+                         {"skipped": True})
+        self.assertEqual(creds.report(self.cfg.host, "codex", "b", "failing",
+                                      source="sentinel", expect_failures=0)["state"],
+                         "failing")
+
+
 class ChooseTest(_AuthBase):
     """L30 `choose` restricted to healthy accounts."""
 

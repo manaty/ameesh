@@ -11,33 +11,47 @@ from .. import interface
 _ROW = ("select host, harness, account, state, reason, source,"
         " extract(epoch from checked_at)::float8 as checked_ts,"
         " extract(epoch from failing_since)::float8 as failing_since_ts,"
-        " extract(epoch from expires_at)::float8 as expires_ts"
+        " extract(epoch from expires_at)::float8 as expires_ts,"
+        " extract(epoch from last_failure_at)::float8 as last_failure_ts,"
+        " failing_fingerprint, failures"
         " from credential_health")
 
 
 class Credentials(interface.Credentials):
 
     def report(self, host, harness, account, state, *, reason="", source,
-               expires_at=None) -> dict:
+               expires_at=None, fingerprint=None, expect_failures=None) -> dict:
+        # a `failing` report always lands; any other only if no failure was
+        # counted since the caller read the row (`expect_failures`)
         rows = self.db.query(
             "with old as (select state from credential_health"
             "             where host = %s and harness = %s and account = %s)"
             " insert into credential_health"
             " (host, harness, account, state, reason, source, checked_at, failing_since,"
-            "  expires_at)"
+            "  expires_at, last_failure_at, failing_fingerprint, failures)"
             " values (%s, %s, %s, %s, %s, %s, now(),"
-            "         case when %s = 'failing' then now() end, to_timestamp(%s::float8))"
+            "         case when %s = 'failing' then now() end, to_timestamp(%s::float8),"
+            "         case when %s = 'failing' then now() end, %s,"
+            "         case when %s = 'failing' then 1 else 0 end)"
             " on conflict (host, harness, account) do update set"
             "   state = excluded.state, reason = excluded.reason,"
             "   source = excluded.source, checked_at = now(),"
             "   expires_at = excluded.expires_at,"
             "   failing_since = case when excluded.state <> 'failing' then null"
-            "     else coalesce(credential_health.failing_since, now()) end"
+            "     else coalesce(credential_health.failing_since, now()) end,"
+            "   last_failure_at = case when excluded.state = 'failing' then now()"
+            "     else credential_health.last_failure_at end,"
+            "   failing_fingerprint = excluded.failing_fingerprint,"
+            "   failures = credential_health.failures + excluded.failures"
+            " where excluded.state = 'failing' or %s::int is null"
+            "    or credential_health.failures = %s::int"
             " returning state, (select state from old) as previous",
             (host, harness, account or "", host, harness, account or "", state,
              reason or "", source, state,
-             None if expires_at is None else float(expires_at)))
-        return rows[0] if rows else {}
+             None if expires_at is None else float(expires_at),
+             state, fingerprint if state == "failing" else None, state,
+             expect_failures, expect_failures))
+        return rows[0] if rows else {"skipped": True}
 
     def health(self, host, harness) -> dict:
         rows = self.db.query(_ROW + " where host = %s and harness = %s order by account",

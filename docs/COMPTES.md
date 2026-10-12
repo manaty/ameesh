@@ -270,7 +270,13 @@ for the default credential of a harness without accounts. `state` is
 `healthy`, `failing` or `unknown`; `source` says who wrote it: the sentinel
 (`sentinel`, L226a), a failed turn (`turn`) or a human (`manual`).
 `failing_since` keeps the start of the failure, `expires_at` the forecast
-expiry the sentinel reports.
+expiry the sentinel reports. Each `failing` report also stamps
+`last_failure_at`, counts one more in `failures`, and keeps
+`failing_fingerprint`: a truncated SHA-256 of the credential then in place
+(refresh token of `.credentials.json` or `auth.json`, the key of an API-key
+account, the whole gcloud, gh or scw store), which tells two credentials
+apart without revealing either. The fingerprint is never in the supervisor
+contract.
 
 **End of turn.** A failed turn whose error, short answer (600 characters at
 most) or stderr tail (this turn's output only: `stderr.log` is appended to by
@@ -304,7 +310,13 @@ budget pause; once it lifts, an account still failing puts the
 
 **Recovery.** After the reconnection (`claude /login` in the account's
 folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
-and records it. Without it, declare it by hand:
+and records it — only if its probe is healthy AND the credential's
+fingerprint differs from the last failure's AND the store was written after
+that failure. Rewriting the same revoked token, or a failure recorded without
+a fingerprint, is no proof: the account stays `failing`. The sentinel's write
+is conditional on the `failures` count it read, so a failure a turn records
+during the probe is never overwritten. Without the sentinel, or in those
+cases, declare it by hand:
 
 ```sh
 ameesh accounts healthy claude secondaire   # declared account

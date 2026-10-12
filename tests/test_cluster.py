@@ -40,6 +40,8 @@ SIGNATURES = {
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
+    # #210: fingerprint of a refresh token or key
+    "credential_health": {"failing_fingerprint"},
 }
 #: contenus (texte libre) : refusés au rôle de base, seuls lisibles par le rôle
 #: « contenus » (role-superviseur-contenus.sql)

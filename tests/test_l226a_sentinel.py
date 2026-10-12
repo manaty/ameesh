@@ -182,15 +182,17 @@ class ReviewR1Test(unittest.TestCase):
     def test_p2_failure_cleared_only_by_a_fresh_login(self):
         # a turn found the Codex refresh token revoked at NOW - 600; the token
         # is still in auth.json (written before): the probe reads healthy
-        failing = {"a": {"state": "failing", "source": "turn",
-                         "failing_since_ts": NOW - 600, "checked_ts": NOW - 600}}
+        failing = {"a": {"state": "failing", "source": "turn", "failures": 1,
+                         "failing_since_ts": NOW - 600, "checked_ts": NOW - 600,
+                         "last_failure_ts": NOW - 600,
+                         "failing_fingerprint": sentinel._digest("x")}}
         stale = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "x"}},
                                                  mtime=NOW - 3600), NOW)
         self.assertEqual(stale.state, "healthy")
         rows, creds = self._check(failing, [stale])
         creds.report.assert_not_called()
         self.assertEqual(rows[0]["state"], "failing")
-        self.assertIn("no fresh login", rows[0]["kept"])
+        self.assertIn("no new credential since the last failure", rows[0]["kept"])
         self.assertIn("ameesh accounts healthy codex a", rows[0]["kept"])
         # a timeout (unknown) does not clear it either
         rows, creds = self._check(failing, [sentinel.Verdict("codex", "a", "unknown",
@@ -202,9 +204,103 @@ class ReviewR1Test(unittest.TestCase):
         rows, creds = self._check({"b": failing["a"]}, [fresh])
         creds.report.assert_called_once()
         self.assertEqual(creds.report.call_args[0][3], "healthy")
+        self.assertEqual(creds.report.call_args[1]["expect_failures"], 1)
         # a new failure, and a healthy credential that was not failing, are written
         rows, creds = self._check({}, [stale])
         creds.report.assert_called_once()
+
+    def _failing(self, token, last, since=None):
+        return {"state": "failing", "source": "turn", "failures": 2,
+                "failing_since_ts": since or last, "checked_ts": last,
+                "last_failure_ts": last, "failing_fingerprint": sentinel._digest(token)}
+
+    def test_r2_same_token_rewritten_is_no_proof(self):
+        # codex r2 (a): auth.json rewritten after the failure with the same
+        # revoked refresh token — a newer mtime proves nothing
+        same = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "x"}},
+                                                mtime=NOW - 60), NOW)
+        self.assertEqual(same.state, "healthy")
+        rows, creds = self._check({"a": self._failing("x", NOW - 600)}, [same])
+        creds.report.assert_not_called()
+        self.assertEqual(rows[0]["state"], "failing")
+        # a failure recorded without a fingerprint: no proof either
+        rows, creds = self._check({"a": dict(self._failing("x", NOW - 600),
+                                             failing_fingerprint=None)}, [same])
+        creds.report.assert_not_called()
+        # nor a healthy probe that cannot fingerprint the credential
+        rows, creds = self._check({"a": self._failing("x", NOW - 600)},
+                                  [sentinel.Verdict("codex", "a", "healthy", "ok",
+                                                    proof=NOW - 60)])
+        creds.report.assert_not_called()
+
+    def test_r2_compared_with_the_last_failure(self):
+        # codex r2 (b): failure at t100 (token A), login at t200 (token B),
+        # another authentication failure at t300 with token B: still failing
+        t100, t200, t300 = NOW - 900, NOW - 800, NOW - 700
+        relogged = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "B"}},
+                                                    mtime=t200), NOW)
+        rows, creds = self._check({"a": self._failing("B", t300, since=t100)}, [relogged])
+        creds.report.assert_not_called()
+        self.assertEqual(rows[0]["state"], "failing")
+        # a different token written before the last failure: not a login after it
+        rows, creds = self._check({"a": self._failing("A", t300, since=t100)}, [relogged])
+        creds.report.assert_not_called()
+        # a different token written after the last failure: cleared
+        fresh = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "C"}},
+                                                 mtime=NOW - 60, name="b"), NOW)
+        rows, creds = self._check({"b": self._failing("B", t300, since=t100)}, [fresh])
+        self.assertEqual(creds.report.call_args[0][3], "healthy")
+
+    def test_r2_clearing_write_is_conditional(self):
+        # codex r2 (c): a turn records a failure between the read and the
+        # write; the storage skips the conditional write, the row stays failing
+        fresh = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "y"}},
+                                                 mtime=NOW - 60), NOW)
+        cfg = SimpleNamespace(host="h1", accounts={}, credential_sentinel={})
+        creds = mock.Mock()
+        creds.health.return_value = {"a": self._failing("x", NOW - 600)}
+        creds.report.return_value = {"skipped": True}
+        with mock.patch.object(sentinel, "probe_all", return_value=[fresh]), \
+                mock.patch("ameesh.storage.of",
+                           return_value=SimpleNamespace(credentials=creds)):
+            rows = sentinel.check(cfg, object(), now=NOW)
+        self.assertEqual(creds.report.call_args[1]["expect_failures"], 2)
+        self.assertEqual(creds.report.call_args[1]["fingerprint"], sentinel._digest("y"))
+        self.assertEqual((rows[0]["state"], rows[0]["previous"]), ("failing", "failing"))
+        self.assertIn("recorded during the probe", rows[0]["kept"])
+        # a row absent at read time expects no failure at all
+        creds.health.return_value = {}
+        with mock.patch.object(sentinel, "probe_all", return_value=[fresh]), \
+                mock.patch("ameesh.storage.of",
+                           return_value=SimpleNamespace(credentials=creds)):
+            sentinel.check(cfg, object(), now=NOW)
+        self.assertEqual(creds.report.call_args[1]["expect_failures"], 0)
+
+    def test_r2_fingerprints_never_carry_the_secret(self):
+        claude = accounts.Profile("claude", "c", path=_claude_dir(
+            self.tmp, "c", refreshToken="sk-ant-ort01-secret"))
+        codex = self._codex({"tokens": {"refresh_token": "rt-secret"}}, name="d")
+        key = os.path.join(self.tmp, "k.key")
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write("sk-key")
+        keyed = accounts.Profile("claude", "k", kind="api_key_env", key_file=key)
+        env = {"DEEPSEEK_API_KEY_A": "dk"}
+        by_env = accounts.Profile("deepseek", "e", kind="api_key_env",
+                                  key_env="DEEPSEEK_API_KEY_A")
+        found = [sentinel.fingerprint("claude", claude),
+                 sentinel.fingerprint("codex", codex),
+                 sentinel.fingerprint("claude", keyed),
+                 sentinel.fingerprint("deepseek", by_env, env)]
+        self.assertEqual(found, [sentinel._digest("sk-ant-ort01-secret"),
+                                 sentinel._digest("rt-secret"), sentinel._digest("sk-key"),
+                                 sentinel._digest("dk")])
+        for value in found:
+            self.assertRegex(value, r"^[0-9a-f]{24}$")
+        # unknown harness, missing file: None
+        self.assertIsNone(sentinel.fingerprint("deepseek", accounts.Profile(
+            "deepseek", "x", path=self.tmp)))
+        self.assertIsNone(sentinel.fingerprint("claude", accounts.Profile(
+            "claude", "y", path=os.path.join(self.tmp, "absent"))))
 
     def test_p2_named_claude_probe_sheds_inherited_auth_variables(self):
         path = _claude_dir(self.tmp, "acct", refreshToken="x")

@@ -43,7 +43,7 @@ import uuid
 
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import budget as budget_mod, db as db_mod, fil, mail, registry, storage
+from . import budget as budget_mod, db as db_mod, fil, mail, registry, sentinel, storage
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -3374,9 +3374,12 @@ class AgentWorker(threading.Thread):
                 self.fast_failure = False
                 nom_harnais = self.agent.get("harness") or ""
                 account = auth_failure.account_name(compte)
+                # #210 : l'empreinte du jeton en place — la sentinelle ne lève
+                # l'échec que pour un autre jeton
                 self._avec_reprise("account health", auth_failure.report, self.db,
                                    self.cfg.host, nom_harnais, account, "failing",
-                                   reason=raison_auth, source="turn")
+                                   reason=raison_auth, source="turn",
+                                   fingerprint=sentinel.fingerprint(nom_harnais, compte))
                 if self._session_en_attente is not None:
                     self._avec_reprise("turn session", self._enregistre_session)
                 texte = auth_failure.status_text(nom_harnais, account)
