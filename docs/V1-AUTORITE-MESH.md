@@ -158,7 +158,9 @@ base64 of the 32-byte seed or key). Rules:
     turning it into an agent key, deleting its row. Revoking it stays free.
     The only exception is the stopgap row whose key a holder of that name
     holds as its owner key: that row may be deleted or have its key cleared,
-    but it never gets another key and never becomes an agent key (#326 r5).
+    but it never gets another key and never becomes an agent key (#326 r5,
+    r7). The name stays protected after cleanup: clearing the key does not
+    permit a later replacement.
     An `agent` key stays free;
   * no agent is created under a key holder's name or renamed to it, nor a
     key holder created under an agent's (triggers on both tables, #326 r3,
@@ -168,7 +170,11 @@ base64 of the 32-byte seed or key). Rules:
     agents' owner keys. Should a name still be both with two different live
     keys (a row that slipped past the triggers), `mesh_keys` gives it no key
     at all until the agent's key is revoked. Both triggers check the name
-    under a transaction lock on it (`pg_advisory_xact_lock`, #326 r5). An
+    under a transaction lock on it (`pg_advisory_xact_lock`, #326 r5, r7),
+    derived from the trigger table schema (`TG_TABLE_SCHEMA`) and the
+    normalized name. The key functions pin their `search_path` to the mesh
+    schema followed by `pg_temp`; the caller cannot change name locking or
+    table resolution with its own `search_path`. An
     insert still open in one table therefore holds back the other table's
     insert until it ends, and the check then sees it. The check only sees
     it at read committed, so any other isolation level is refused to every

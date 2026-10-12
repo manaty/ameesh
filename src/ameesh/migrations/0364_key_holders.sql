@@ -103,10 +103,10 @@ $$;
 -- It sees it only at read committed, where each statement reads what was
 -- committed when it starts: outside it, the snapshot predates the wait, and
 -- the check is refused to any role but the tables' owner.
-create or replace function key_name_lock(n text) returns void
+create or replace function key_name_lock(n text, table_schema text) returns void
 language plpgsql as $$
 begin
-    perform pg_advisory_xact_lock(hashtext('ameesh-key-name:' || current_schema() || ':' || n));
+    perform pg_advisory_xact_lock(hashtext('ameesh-key-name:' || table_schema || ':' || lower(n)));
     if current_setting('transaction_isolation') <> 'read committed'
             and not pg_has_role(current_user,
                                 (select relowner from pg_class where oid = 'key_holders'::regclass),
@@ -195,7 +195,7 @@ begin
         return coalesce(new, old);
     end if;
     if tg_op = 'INSERT' then
-        perform key_name_lock(new.name);
+        perform key_name_lock(new.name, TG_TABLE_SCHEMA);
         if exists (select 1 from agent_registry where name = new.name) then
             raise exception 'an agent is named %: a human''s key never sits on an agent''s identity (the owner''s own gesture)', new.name
                 using errcode = 'insufficient_privilege';
@@ -247,7 +247,7 @@ begin
     if tg_op = 'UPDATE' and new.name = old.name then
         return new;
     end if;
-    perform key_name_lock(new.name);
+    perform key_name_lock(new.name, TG_TABLE_SCHEMA);
     if exists (select 1 from key_holders where name = new.name) then
         raise exception '% holds a human''s key: no agent is created under that name, nor renamed to it', new.name
             using errcode = 'unique_violation';
@@ -274,6 +274,18 @@ language plpgsql as $$
 declare
     changed boolean;
 begin
+    -- #326 r7: the holder's NAME stays protected after the stopgap key is
+    -- cleared. A later UPDATE must not replace it or demote its role.
+    if tg_op <> 'DELETE' and not key_holders_owner_gesture()
+            and exists (select 1 from key_holders h
+                         where h.name = new.name and h.key_role = 'owner'
+                           and (new.key_role <> 'owner'
+                                or (new.public_key is not null
+                                    and new.public_key_fingerprint is distinct from h.public_key_fingerprint)
+                                or (new.public_key is null and new.public_key_fingerprint is not null))) then
+        raise exception '% holds a human''s key: an owner key holder name is only changed by the owner''s own gesture; the stopgap key may only be cleared', new.name
+            using errcode = 'insufficient_privilege';
+    end if;
     if tg_op <> 'INSERT' and old.key_role = 'owner' and old.public_key is not null
             and not key_holders_owner_gesture()
             and (tg_op = 'DELETE'
@@ -332,6 +344,30 @@ create trigger agent_registry_key_events
     after insert or delete or update of public_key, public_key_fingerprint, key_role,
                                         key_revoked_at, name on agent_registry
     for each row execute function key_events_log();
+
+-- #326 r7: resolve every key function in the tables' schema, irrespective
+-- of the caller's search_path. Both triggers pass TG_TABLE_SCHEMA to the
+-- shared name lock, so even pg_catalog-first callers take the same lock.
+do $pin_key_functions$
+declare
+    table_schema text;
+    fn record;
+begin
+    select n.nspname into table_schema
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace
+     where c.oid = 'key_holders'::regclass;
+    for fn in select p.oid::regprocedure as signature
+                from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+               where n.nspname = table_schema
+                 and p.proname in ('key_holders_owner_gesture', 'key_name_lock',
+                                   'key_events_guard', 'key_event_of', 'key_events_log',
+                                   'key_holders_guard', 'agent_registry_not_a_key_holder',
+                                   'agent_registry_key_guard') loop
+        execute format('ALTER FUNCTION %s SET search_path = %I, pg_temp',
+                       fn.signature, table_schema);
+    end loop;
+end
+$pin_key_functions$;
 
 -- the copy is this migration's own gesture: its role owns the tables, and
 -- the agent row of that name still exists (local to the migration's

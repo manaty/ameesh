@@ -162,6 +162,16 @@ class OwnerKeyTest(_Keys):
                         "public_key_fingerprint = NULL WHERE name = 'smichea'")
         info = authority.key_info(self.db, "smichea")
         self.assertEqual((info["holder"], info["public_key_fingerprint"]), ("human", copied))
+        # #326 r7: clearing the old value must not enable replacement later.
+        for sql in ("UPDATE agent_registry SET public_key = 'K', "
+                    "public_key_fingerprint = 'F', key_role = 'agent' WHERE name = 'smichea'",
+                    "UPDATE agent_registry SET public_key = 'K', "
+                    "public_key_fingerprint = 'F' WHERE name = 'smichea'",
+                    "UPDATE agent_registry SET key_role = 'agent' WHERE name = 'smichea'"):
+            with self.assertRaises(DbError, msg=sql) as ctx:
+                self.db.execute(sql)
+            self.assertIn("own gesture", str(ctx.exception))
+        self.assertEqual(authority.key_info(self.db, "smichea")["public_key_fingerprint"], copied)
 
     def test_stopgap_with_a_session_is_not_the_stopgap(self):
         registry.upsert(self.db, "smichea", harness="none", host=self.cfg.host)
@@ -413,7 +423,7 @@ class OwnerKeyGuardTest(_Keys):
         self.assertEqual([r["name"] for r in self.db.query(
             "SELECT name FROM key_holders WHERE key_role = 'owner'")], ["bootstrap"])
 
-    def _race(self, first_sql, second_sql):
+    def _race(self, first_sql, second_sql, *, second_search_path=None):
         """`first_sql` in a transaction left open while another connection
         runs `second_sql`; what became of the second."""
         opened = self.db.transaction()
@@ -425,6 +435,8 @@ class OwnerKeyGuardTest(_Keys):
         def second():
             try:
                 with other.transaction() as tx:
+                    if second_search_path is not None:
+                        tx.execute("SET LOCAL search_path TO " + second_search_path)
                     tx.execute(second_sql)
                 outcome["second"] = "committed"
             except DbError as exc:
@@ -462,6 +474,17 @@ class OwnerKeyGuardTest(_Keys):
         self.assertEqual(self.db.query("SELECT 1 FROM agent_registry WHERE name = 'dave'"), [])
         info = authority.key_info(self.db, "dave")
         self.assertEqual((info["holder"], info["key_role"]), ("human", "owner"))
+
+    def test_different_search_paths_still_serialize_names(self):
+        self.no_key_yet()
+        outcome = self._race(
+            "INSERT INTO agent_registry (name, public_key, public_key_fingerprint) "
+            "VALUES ('carol', 'ka', 'fa')",
+            "INSERT INTO key_holders (name, human, public_key, public_key_fingerprint, "
+            "key_role) VALUES ('carol', 'human:carol', 'ko', 'fo', 'owner')",
+            second_search_path='pg_catalog, "' + self.schema + '"')
+        self.assertIn("an agent is named carol", outcome)
+        self.assertEqual(self.db.query("SELECT name FROM key_holders WHERE name = 'carol'"), [])
 
     def test_taking_an_owner_key_away_never_reopens_the_bootstrap(self):
         # #326 r4 P1: an agent with an owner key, no owner key holder
