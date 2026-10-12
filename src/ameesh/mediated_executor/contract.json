@@ -286,6 +286,30 @@
      },
      "required": false,
      "default": null
+    },
+    {
+     "name": "harness",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "cwd",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -3676,7 +3700,7 @@
   }
  ],
  "refused": {
-  "interface_total": 354,
+  "interface_total": 359,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3712,7 +3736,8 @@
    "wakeups": "hors du sous-ensemble de l'exécuteur médié",
    "work": "hors du sous-ensemble de l'exécuteur médié",
    "watches": "CI watches: mesh server only",
-   "handoffs": "host handoff controller: mesh server only"
+   "handoffs": "host handoff controller: mesh server only",
+   "lot_sessions": "sessions put aside per lot and lot wakes (#408): runner of the mesh server only"
   },
   "operations": {
    "accounts": [
@@ -4076,6 +4101,13 @@
     "switch",
     "transition",
     "unfence"
+   ],
+   "lot_sessions": [
+    "actionable",
+    "listing",
+    "note_wake",
+    "purge",
+    "switch"
    ]
   }
  },
