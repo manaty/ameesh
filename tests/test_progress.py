@@ -214,10 +214,10 @@ class RenderTest(unittest.TestCase):
         text = progress.format_text(_snap(), width=40)
         for line in text.splitlines():
             self.assertLessEqual(len(line), 40, line)
-        self.assertIn("#7 en revue", text)
-        self.assertIn("blocages 1", text)
-        self.assertIn("JALONS : aucun déclaré au canon", text)
-        self.assertIn("a1 — travaille", text)
+        self.assertIn("#7 in review", text)
+        self.assertIn("blocks 1", text)
+        self.assertIn("MILESTONES: none declared in the canon", text)
+        self.assertIn("a1 — working", text)
 
     def test_html_autonome_et_echappe(self):
         html = progress.render_html(_snap())
@@ -226,8 +226,11 @@ class RenderTest(unittest.TestCase):
         # aucune ressource externe : ni src/href distants, ni import, ni CDN
         self.assertIsNone(re.search(r"(src|href)\s*=\s*[\"']?(https?:)?//", html, re.I))
         self.assertNotIn("@import", html)
-        self.assertNotIn("fetch(", html)
-        self.assertIn("default-src 'none'", html)
+        # L304 : le code de rafraîchissement existe, mais la page statique ne
+        # peut rien demander au réseau (aucun connect-src)
+        csp = re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', html).group(1)
+        self.assertTrue(csp.startswith("default-src 'none';"), csp)
+        self.assertNotIn("connect-src", csp)
         self.assertIn('name="viewport"', html)
         # les données embarquées se relisent à l'identique
         blob = re.search(r'<script type="application/json" id="data">(.*?)</script>',
@@ -376,7 +379,7 @@ class ProgressPgTest(PgTestCase):
         small = progress.snapshot(self.db, self.cfg, book=self._book(), max_lots=3)
         self.assertIn(new["id"], [x["id"] for x in small["lots"]])   # l'ouvert d'abord
         self.assertEqual(len(small["lots"]), 3)
-        self.assertIn("TRONQUÉ : 3 lots affichés sur 501", progress.format_text(small, 60))
+        self.assertIn("TRUNCATED: 3 of 501 lots shown", progress.format_text(small, 60))
 
     def test_approbation_non_perdue_dans_la_borne_des_actions(self):
         """Sonde codex3 B1 : 500 actions sans lot ne masquent pas
@@ -463,7 +466,7 @@ class ProgressPgTest(PgTestCase):
 
         bad = self.mesh("progress", "--since", "hier", env=env)
         self.assertEqual(bad.returncode, 2)
-        self.assertIn("--since illisible", bad.stderr)
+        self.assertIn("unreadable --since", bad.stderr)
 
 
 if __name__ == "__main__":

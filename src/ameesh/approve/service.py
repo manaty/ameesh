@@ -118,19 +118,19 @@ class ApproveService:
         try:
             action = self.source.get_action(action_id)
         except ActionSourceError as exc:
-            log.warning("source d'actions : %s", exc)
+            log.warning("action source: %s", exc)
             raise ApproveError(503, "action_source", str(exc)) from exc
         except DbError as exc:
-            log.warning("source d'actions injoignable : %s", type(exc).__name__)
-            raise ApproveError(503, "action_source", "source d'actions injoignable") from exc
+            log.warning("action source unreachable: %s", type(exc).__name__)
+            raise ApproveError(503, "action_source", "action source unreachable") from exc
         if action is None:
-            raise ApproveError(404, "unknown_action", "action inconnue : %s" % action_id)
+            raise ApproveError(404, "unknown_action", "unknown action: %s" % action_id)
         if action["action_id"] != action_id:
-            raise ApproveError(503, "action_source", "la source a rendu une autre action")
+            raise ApproveError(503, "action_source", "the source returned another action")
         stored = action.get("digest")
         if stored and not hmac.compare_digest(stored.encode(), action["computed_digest"].encode()):
             raise ApproveError(409, "digest_mismatch",
-                               "l'empreinte stockée de l'action ne correspond pas à son contenu")
+                               "the stored digest of the action does not match its content")
         return action
 
     @staticmethod
@@ -147,26 +147,26 @@ class ApproveService:
         `actions.retry` pour une approbation, `actions.replace` pour un doublon)."""
         state = action["state"]
         if action.get("replaced_by"):
-            raise ApproveError(409, "action_replaced", "action remplacée par %s : plus rien "
-                               "à approuver" % action["replaced_by"])
+            raise ApproveError(409, "action_replaced", "action replaced by %s: nothing left "
+                               "to approve" % action["replaced_by"])
         if assume_duplicate:
             if state not in duplicate.ASSUMABLE_STATES:
                 raise ApproveError(409, "action_state",
-                                   "action dans l'état %s : seule une action d'issue inconnue "
-                                   "(unknown) se remplace en assumant le doublon" % state)
+                                   "action in state %s: only an action with an unknown outcome "
+                                   "(unknown) is replaced by assuming the duplicate" % state)
             return
         if state not in REQUESTABLE_STATES:
             if later:
-                raise ApproveError(409, "action_state", "l'action est passée à l'état %s : "
-                                   "plus rien à approuver" % state)
-            raise ApproveError(409, "action_state", "action dans l'état %s : rien à approuver"
+                raise ApproveError(409, "action_state", "the action moved to state %s: "
+                                   "nothing left to approve" % state)
+            raise ApproveError(409, "action_state", "action in state %s: nothing to approve"
                                % state)
         if state == "unknown" and action.get("dedupe") not in (None, "guaranteed"):
             # nouvelle tentative impossible : l'effet a peut-être eu lieu
             raise ApproveError(409, "dedupe",
-                               "issue inconnue et déduplication non garantie par %s : aucune "
-                               "nouvelle tentative ; reconcile, puis décision qui assume le "
-                               "doublon (assume_duplicate)" % action["connector"])
+                               "unknown outcome and deduplication not guaranteed by %s: no "
+                               "new attempt; reconcile, then a decision that assumes the "
+                               "duplicate (assume_duplicate)" % action["connector"])
 
     def _credentials(self, approver: str, canon: str = "") -> list[str]:
         """Credentials WebAuthn actifs de l'approbateur, au niveau exigé,
@@ -175,7 +175,7 @@ class ApproveService:
             try:
                 rows = receipts.list_authenticators(self.db, approver=approver, canon=canon)
             except DbError as exc:
-                raise ApproveError(503, "registry", "registre de confiance injoignable") from exc
+                raise ApproveError(503, "registry", "trust registry unreachable") from exc
         return [row["credential_id"] for row in rows
                 if row["facade"] == "webauthn"
                 and (self.cfg.level != "eleve" or row["level"] == "eleve")]
@@ -188,41 +188,41 @@ class ApproveService:
     # ------------------------------------------------------------------
     def create_request(self, body) -> dict:
         if not isinstance(body, dict):
-            raise ApproveError(400, "format", "objet JSON attendu")
+            raise ApproveError(400, "format", "JSON object expected")
         missing = [name for name in REQUEST_FIELDS if name not in body]
         if missing:
-            raise ApproveError(400, "format", "champs manquants : %s" % ", ".join(missing))
+            raise ApproveError(400, "format", "missing fields: %s" % ", ".join(missing))
         ignored = sorted(set(body) - set(REQUEST_FIELDS) - set(REQUEST_OPTIONAL))
         if ignored:
             # résumé, texte, montant… fournis par le demandeur : ignorés (le
             # service rend son propre résumé depuis l'action)
-            log.info("demande : champs ignorés %s", ", ".join(
+            log.info("request: ignored fields %s", ", ".join(
                 re.sub(r"[^A-Za-z0-9_-]", "?", name)[:32] for name in ignored[:10]))
         action_id, approver, requested_by = (body["action_id"], body["approver"],
                                              body["requested_by"])
         if not isinstance(action_id, str) or not ACTION_ID_RE.fullmatch(action_id):
-            raise ApproveError(400, "format", "action_id : « act_ » + 26 caractères attendu")
+            raise ApproveError(400, "format", "action_id: \"act_\" + 26 characters expected")
         if not isinstance(approver, str) or not _HUMAN_RE.fullmatch(approver):
-            raise ApproveError(400, "format", "approver : « human:<id> » attendu")
+            raise ApproveError(400, "format", "approver: \"human:<id>\" expected")
         if not isinstance(requested_by, str) or not _MEMBER_RE.fullmatch(requested_by):
-            raise ApproveError(400, "format", "requested_by : « agent:<id> » ou « human:<id> »")
+            raise ApproveError(400, "format", "requested_by: \"agent:<id>\" or \"human:<id>\"")
         assume_duplicate = body.get("assume_duplicate", False)
         if not isinstance(assume_duplicate, bool):
-            raise ApproveError(400, "format", "assume_duplicate : booléen attendu")
+            raise ApproveError(400, "format", "assume_duplicate: boolean expected")
 
         action = self._action(action_id)
         self._check_state(action, assume_duplicate)
         if not self._credentials(approver, action.get("canon") or ""):
             raise ApproveError(409, "no_authenticator",
-                               "%s n'a aucun authentificateur WebAuthn actif au niveau %s "
-                               "dans le %s de l'action (enrôlement puis PR du canon)"
+                               "%s has no active WebAuthn authenticator at level %s "
+                               "in the %s of the action (enrollment, then canon PR)"
                                % (approver, self.cfg.level,
                                   receipts.canon_label(action.get("canon"))))
         summary = render.render_summary(action, approver, requested_by,
                                         assume_duplicate=assume_duplicate)
         if len(summary.encode("utf-8")) > render.MAX_SUMMARY:
             raise ApproveError(413, "summary_too_long",
-                               "action trop volumineuse pour être relue par un humain")
+                               "action too large to be reviewed by a human")
 
         now = int(self.clock())
         request = {
@@ -253,8 +253,8 @@ class ApproveService:
         }
         self.store.save_request(record, token)
         self.store.prune(now)
-        log.info("demande %s : %saction %s, approbateur %s, demandée par %s",
-                 request_id, "DOUBLON À ASSUMER de l'" if assume_duplicate else "",
+        log.info("request %s: %saction %s, approver %s, requested by %s",
+                 request_id, "DUPLICATE TO ASSUME of the " if assume_duplicate else "",
                  action_id, approver, requested_by)
         return {
             "request_id": request_id,
@@ -275,12 +275,12 @@ class ApproveService:
     def _live_record(self, token: str) -> dict:
         record = self.store.request_by_token(token)
         if record is None:
-            raise ApproveError(404, "unknown_link", "lien inconnu")
+            raise ApproveError(404, "unknown_link", "unknown link")
         if self.store.has_receipt(record["request_id"]):
-            raise ApproveError(410, "used", "ce lien a déjà servi")
+            raise ApproveError(410, "used", "this link has already been used")
         now = self.clock()
         if now >= record["link_exp"] or now >= record["request"]["exp"]:
-            raise ApproveError(410, "expired", "ce lien a expiré")
+            raise ApproveError(410, "expired", "this link has expired")
         return record
 
     def _check_unchanged(self, record: dict) -> dict:
@@ -291,7 +291,7 @@ class ApproveService:
         if not hmac.compare_digest(self._signed_digest(action, assume_duplicate).encode(),
                                    request["digest"].encode()):
             raise ApproveError(409, "action_changed",
-                               "l'action a changé depuis la demande : demande caduque")
+                               "the action changed since the request: request obsolete")
         self._check_state(action, assume_duplicate, later=True)
         return action
 
@@ -301,7 +301,7 @@ class ApproveService:
         request = record["request"]
         credentials = self._credentials(request["approver"], action.get("canon") or "")
         if not credentials:
-            raise ApproveError(409, "no_authenticator", "aucun authentificateur actif")
+            raise ApproveError(409, "no_authenticator", "no active authenticator")
         return {
             "request_id": record["request_id"],
             "request": request,
@@ -321,17 +321,17 @@ class ApproveService:
     # ------------------------------------------------------------------
     def submit(self, token: str, body) -> dict:
         if not isinstance(body, dict):
-            raise ApproveError(400, "format", "objet JSON attendu")
+            raise ApproveError(400, "format", "JSON object expected")
         keys = set(body)
         if not _ASSERTION_FIELDS <= keys or keys - _ASSERTION_FIELDS - _ASSERTION_OPTIONAL:
-            raise ApproveError(400, "format", "champs attendus : %s"
+            raise ApproveError(400, "format", "expected fields: %s"
                                % ", ".join(sorted(_ASSERTION_FIELDS)))
         decision = body["decision"]
         if decision not in receipts.DECISIONS:
-            raise ApproveError(400, "format", "decision : approve ou deny")
+            raise ApproveError(400, "format", "decision: approve or deny")
         for name in _ASSERTION_FIELDS - {"decision"}:
             if not isinstance(body[name], str) or not _B64U_RE.fullmatch(body[name]):
-                raise ApproveError(400, "format", "%s : base64url attendu" % name)
+                raise ApproveError(400, "format", "%s: base64url expected" % name)
 
         record = self._live_record(token)
         action = self._check_unchanged(record)
@@ -353,14 +353,14 @@ class ApproveService:
                     expected_digest=request["digest"], expected_action_id=request["action_id"],
                     expect_decision=decision, consume_by=None, now=self.clock())
             except DbError as exc:
-                raise ApproveError(503, "registry", "registre de confiance injoignable") from exc
+                raise ApproveError(503, "registry", "trust registry unreachable") from exc
         if not verdict.ok:
-            log.info("demande %s : assertion refusée [%s]", record["request_id"], verdict.code)
+            log.info("request %s: assertion refused [%s]", record["request_id"], verdict.code)
             raise ApproveError(403, verdict.code, verdict.reason)
         if not self.store.save_receipt_once(record["request_id"], receipt):
-            raise ApproveError(410, "used", "ce lien a déjà servi")
-        log.info("demande %s : reçu %s%s signé par %s", record["request_id"], decision,
-                 " (doublon assumé)" if record.get("assume_duplicate") is True
+            raise ApproveError(410, "used", "this link has already been used")
+        log.info("request %s: receipt %s%s signed by %s", record["request_id"], decision,
+                 " (duplicate assumed)" if record.get("assume_duplicate") is True
                  and decision == "approve" else "", verdict.approver)
         return {"request_id": record["request_id"], "decision": decision}
 
@@ -373,7 +373,7 @@ class ApproveService:
             return 200, raw
         record = self.store.get_request(request_id)
         if record is None:
-            raise ApproveError(404, "unknown_request", "demande inconnue")
+            raise ApproveError(404, "unknown_request", "unknown request")
         if self.clock() >= record["link_exp"]:
             return 410, {"status": "expired", "request_id": request_id}
         return 202, {"status": "pending", "request_id": request_id,
@@ -384,26 +384,26 @@ class ApproveService:
     # ------------------------------------------------------------------
     def create_enroll_link(self, approver: str, ttl: int | None = None) -> dict:
         if not isinstance(approver, str) or not _HUMAN_RE.fullmatch(approver):
-            raise ApproveError(400, "format", "approver : « human:<id> » attendu")
+            raise ApproveError(400, "format", "approver: \"human:<id>\" expected")
         ttl = int(ttl or self.cfg.enroll_ttl)
         if not 60 <= ttl <= 86400:
-            raise ApproveError(400, "format", "durée d'enrôlement entre 60 s et 24 h")
+            raise ApproveError(400, "format", "enrollment duration between 60 s and 24 h")
         now = int(self.clock())
         token = new_token()
         record = {"approver": approver, "challenge": _b64u(os.urandom(32)),
                   "created": now, "exp": now + ttl}
         self.store.save_enroll(record, token)
-        log.info("lien d'enrôlement créé pour %s", approver)
+        log.info("enrollment link created for %s", approver)
         return {"link": self._link("enroll", token), "exp": record["exp"], "approver": approver}
 
     def _live_enroll(self, token: str) -> dict:
         record = self.store.enroll_by_token(token)
         if record is None:
-            raise ApproveError(404, "unknown_link", "lien inconnu")
+            raise ApproveError(404, "unknown_link", "unknown link")
         if self.store.enroll_used(record):
-            raise ApproveError(410, "used", "ce lien a déjà servi")
+            raise ApproveError(410, "used", "this link has already been used")
         if self.clock() >= record["exp"]:
-            raise ApproveError(410, "expired", "ce lien a expiré")
+            raise ApproveError(410, "expired", "this link has expired")
         return record
 
     def enroll_view(self, token: str) -> dict:
@@ -426,10 +426,10 @@ class ApproveService:
 
     def enroll_submit(self, token: str, body, *, origin: str) -> dict:
         if not isinstance(body, dict):
-            raise ApproveError(400, "format", "objet JSON attendu")
+            raise ApproveError(400, "format", "JSON object expected")
         keys = set(body)
         if not _ENROLL_FIELDS <= keys or keys - _ENROLL_FIELDS - _ENROLL_OPTIONAL:
-            raise ApproveError(400, "format", "champs attendus : %s"
+            raise ApproveError(400, "format", "expected fields: %s"
                                % ", ".join(sorted(_ENROLL_FIELDS)))
         try:
             decoded = {name: receipts.b64u_decode(body[name], name) for name in _ENROLL_FIELDS}
@@ -444,14 +444,14 @@ class ApproveService:
                 challenge=receipts.b64u_decode(record["challenge"], "challenge"),
                 rp_id=self.cfg.rp_id, origins=self.cfg.origins)
         except enroll.EnrollError as exc:
-            log.info("enrôlement de %s refusé [%s]", record["approver"], exc.code)
+            log.info("enrollment of %s refused [%s]", record["approver"], exc.code)
             raise ApproveError(403, exc.code, str(exc)) from exc
         if not self.store.claim_enroll(record):
-            raise ApproveError(410, "used", "ce lien a déjà servi")
+            raise ApproveError(410, "used", "this link has already been used")
         name = enroll.write_proposal(self.cfg.proposals_path, approver=record["approver"],
                                      entry=entry, rp_id=self.cfg.rp_id, origin=origin,
                                      now=self.clock())
-        log.info("proposition d'authentificateur pour %s : %s", record["approver"], name)
+        log.info("authenticator proposal for %s: %s", record["approver"], name)
         return {"proposal": name, "credential_id": entry["credential_id"],
                 "key_fingerprint": entry["key_fingerprint"],
                 "backup_eligible": entry["backup_eligible"], "level": entry["level"]}
@@ -461,4 +461,4 @@ def load_json_body(raw: bytes):
     try:
         return jcs.loads(raw)
     except jcs.JcsError as exc:
-        raise ApproveError(400, "format", "JSON illisible") from exc
+        raise ApproveError(400, "format", "unreadable JSON") from exc

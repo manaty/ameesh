@@ -80,9 +80,9 @@ class Verdict:
 
     def short(self) -> str:
         if self.authority:
-            return "signé par le propriétaire"
+            return "signed by the owner"
         if self.ok:
-            return "signé par un agent"
+            return "signed by an agent"
         return self.reason
 
 
@@ -104,24 +104,24 @@ def parse_ttl(text: str | None, default: float = DEFAULT_TTL) -> float:
         return default
     match = _TTL_RE.match(text)
     if not match:
-        raise AuthorityError("échéance illisible : %r (attendu 30m, 48h, 7d ou des secondes)" % text)
+        raise AuthorityError("unreadable expiry: %r (expected 30m, 48h, 7d or seconds)" % text)
     value = float(match.group(1))
     unit = (match.group(2) or "s").lower()
     seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
     if seconds <= 0:
-        raise AuthorityError("échéance nulle ou négative")
+        raise AuthorityError("zero or negative expiry")
     if seconds > MAX_TTL:
-        raise AuthorityError("échéance trop lointaine (maximum %d jours)" % (MAX_TTL // 86400))
+        raise AuthorityError("expiry too far away (maximum %d days)" % (MAX_TTL // 86400))
     return seconds
 
 
 def parse_expiry(text: str | None) -> int:
     """Échéance absolue : « 2026-10-04 08:00 » (heure locale) → microsecondes epoch."""
     if not text:
-        raise AuthorityError("échéance absolue manquante")
+        raise AuthorityError("missing absolute expiry")
     match = _LOCAL_RE.match(text)
     if not match:
-        raise AuthorityError("échéance absolue illisible : %r (attendu 2026-10-04 08:00)" % text)
+        raise AuthorityError("unreadable absolute expiry: %r (expected 2026-10-04 08:00)" % text)
     moment = time.mktime(time.strptime(
         "%s %s:%s" % (match.group(1), match.group(2), match.group(3) or "00"), "%Y-%m-%d %H:%M:%S"))
     return int(moment * 1_000_000)
@@ -162,7 +162,7 @@ def unb64(text: str) -> bytes:
     try:
         return base64.b64decode(text, validate=True)
     except Exception as exc:
-        raise AuthorityError("base64 illisible : %s" % exc) from exc
+        raise AuthorityError("unreadable base64: %s" % exc) from exc
 
 
 # --------------------------------------------------------------------------
@@ -183,14 +183,14 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
     déléguer l'autorité du propriétaire : à ne faire qu'en connaissance de cause.
     """
     if len(public) != 32:
-        raise AuthorityError("clé publique Ed25519 : 32 octets attendus")
+        raise AuthorityError("Ed25519 public key: 32 bytes expected")
     if role not in KEY_ROLES:
-        raise AuthorityError("rôle de clé inconnu : %r (%s)" % (role, ", ".join(KEY_ROLES)))
+        raise AuthorityError("unknown key role: %r (%s)" % (role, ", ".join(KEY_ROLES)))
     fingerprint = signing.fingerprint(public)
     found = storage.of(db).keys.register(agent, b64(public), fingerprint, role, note)
     if not found:
         raise AuthorityError(
-            "agent %s inconnu du registre : déclarez-le avant d'enregistrer sa clé" % agent)
+            "agent %s not in the registry: declare it before registering its key" % agent)
     return {"agent": agent, "fingerprint": fingerprint, "role": role}
 
 
@@ -201,16 +201,16 @@ def revoke_key(db: Db, agent: str) -> bool:
 def _valid_key(db: Db, agent: str, expected_fingerprint: str | None) -> tuple[dict | None, Verdict]:
     info = key_info(db, agent)
     if not info or not info.get("public_key"):
-        return None, Verdict(False, "aucune clé publique enregistrée pour %s" % agent)
+        return None, Verdict(False, "no public key registered for %s" % agent)
     if info.get("key_revoked_ts"):
-        return None, Verdict(False, "clé de %s révoquée" % agent)
+        return None, Verdict(False, "key of %s revoked" % agent)
     fingerprint = info.get("public_key_fingerprint")
     role = info.get("key_role") or DEFAULT_KEY_ROLE
     if expected_fingerprint and fingerprint != expected_fingerprint:
         return None, Verdict(
-            False, "clé inconnue (empreinte %s, registre %s)"
+            False, "unknown key (fingerprint %s, registry %s)"
             % (expected_fingerprint[:12], (fingerprint or "?")[:12]), role=role)
-    return info, Verdict(True, "clé connue", fingerprint or "", role=role)
+    return info, Verdict(True, "known key", fingerprint or "", role=role)
 
 
 # --------------------------------------------------------------------------
@@ -222,9 +222,9 @@ def verify_message(db: Db, row: dict) -> Verdict:
     signature_text = row.get("signature")
     payload_text = row.get("signed_payload")
     if not signature_text:
-        return Verdict(False, "non signé")
+        return Verdict(False, "unsigned")
     if not payload_text:
-        return Verdict(False, "signature sans payload")
+        return Verdict(False, "signature without payload")
     sender = row.get("from") or row.get("sender") or ""
     info, verdict = _valid_key(db, sender, row.get("signature_key"))
     if not info:
@@ -240,24 +240,24 @@ def verify_message(db: Db, row: dict) -> Verdict:
         nonce=row.get("nonce") or "",
     ))
     if expected.decode("utf-8") != payload_text:
-        return Verdict(False, "la signature ne couvre pas ce contenu")
+        return Verdict(False, "the signature does not cover this content")
     public = unb64(info["public_key"])
     try:
         signature = unb64(signature_text)
     except AuthorityError as exc:
         return Verdict(False, str(exc))
     if not signing.verify(public, payload_text.encode("utf-8"), signature):
-        return Verdict(False, "signature Ed25519 invalide")
+        return Verdict(False, "invalid Ed25519 signature")
     if expires_ts and expires_ts < time.time():
         return Verdict(
-            False, "signature expirée (%s)" % time.strftime("%Y-%m-%d %H:%M", time.localtime(expires_ts)))
+            False, "signature expired (%s)" % time.strftime("%Y-%m-%d %H:%M", time.localtime(expires_ts)))
     role = info.get("key_role") or DEFAULT_KEY_ROLE
     fingerprint = info.get("public_key_fingerprint") or ""
     if role == "owner":
-        return Verdict(True, "autorité du propriétaire prouvée", fingerprint, expires_ts
+        return Verdict(True, "owner authority proven", fingerprint, expires_ts
                        if False else expires_ts, role)
     return Verdict(
-        True, "signature d'agent authentique (sans autorité propriétaire)",
+        True, "authentic agent signature (no owner authority)",
         fingerprint, expires_ts, role)
 
 
@@ -297,9 +297,9 @@ def build_approval(seed: bytes, *, approver: str, action: str, artifact_kind: st
                    artifact_hash: str, decision: str = "approved",
                    ttl: float = DEFAULT_TTL) -> dict:
     if not HASH_RE.match((artifact_hash or "").lower()):
-        raise AuthorityError("empreinte d'artefact attendue en sha256 hex (64 caractères)")
+        raise AuthorityError("artifact hash expected as sha256 hex (64 characters)")
     if decision not in ("approved", "rejected"):
-        raise AuthorityError("décision inconnue : %r" % decision)
+        raise AuthorityError("unknown decision: %r" % decision)
     backend = signing.backend()
     public = backend.public_from_seed(seed)
     ts_us = now_us()
@@ -337,12 +337,12 @@ def create_approval(db: Db, seed: bytes, *, approver: str, action: str, artifact
     info, verdict = _valid_key(db, approver, built["signature_key"])
     if not info:
         raise AuthorityError(
-            "%s — enregistrez la clé publique de %s avant de signer une approbation"
+            "%s — register the public key of %s before signing an approval"
             % (verdict.reason, approver))
     if info.get("key_role") != "owner":
         raise AuthorityError(
-            "la clé de %s a le rôle %r : une approbation exige une clé propriétaire "
-            "(« agent-mesh key register %s --public-key … --role owner »)"
+            "the key of %s has role %r: an approval requires an owner key "
+            "(\"agent-mesh key register %s --public-key … --role owner\")"
             % (approver, info.get("key_role") or DEFAULT_KEY_ROLE, approver))
     built["id"] = storage.of(db).approvals.create(
         approver=built["approver"], action=built["action"],
@@ -357,13 +357,13 @@ def create_approval(db: Db, seed: bytes, *, approver: str, action: str, artifact
 def verify_approval(db: Db, row: dict) -> Verdict:
     payload_text = row.get("signed_payload")
     if not payload_text or not row.get("signature"):
-        return Verdict(False, "approbation non signée")
+        return Verdict(False, "unsigned approval")
     info, verdict = _valid_key(db, row.get("approver") or "", row.get("signature_key"))
     if not info:
         return verdict
     if info.get("key_role") != "owner":
         return Verdict(
-            False, "clé de rôle %r : seule une clé propriétaire peut approuver"
+            False, "key with role %r: only an owner key can approve"
             % (info.get("key_role") or DEFAULT_KEY_ROLE),
             info.get("public_key_fingerprint") or "", 0.0,
             info.get("key_role") or DEFAULT_KEY_ROLE)
@@ -371,46 +371,46 @@ def verify_approval(db: Db, row: dict) -> Verdict:
     # Le payload est la référence : « agent-mesh/v1|approval|{json canonique} ».
     parts = payload_text.split("|", 2)
     if len(parts) != 3 or parts[0] != DOMAIN or parts[1] != "approval":
-        return Verdict(False, "payload d'approbation illisible")
+        return Verdict(False, "unreadable approval payload")
     try:
         stored = json.loads(parts[2])
     except ValueError:
-        return Verdict(False, "payload d'approbation illisible")
+        return Verdict(False, "unreadable approval payload")
     for key in ("approver", "action", "artifact_kind", "artifact_hash", "decision", "nonce"):
         if str(stored.get(key, "")) != str(row.get(key) or ""):
-            return Verdict(False, "le payload signé ne correspond pas à l'approbation (%s)" % key)
+            return Verdict(False, "the signed payload does not match the approval (%s)" % key)
 
     public = unb64(info["public_key"])
     if not signing.verify(public, payload_text.encode("utf-8"), unb64(row["signature"])):
-        return Verdict(False, "signature Ed25519 invalide")
+        return Verdict(False, "invalid Ed25519 signature")
     if row.get("consumed_ts") or row.get("consumed_at"):
-        return Verdict(False, "approbation déjà consommée")
+        return Verdict(False, "approval already consumed")
 
     # L'échéance et l'horodatage de la ligne doivent être EXACTEMENT ceux qui
     # ont été signés : modifier expires_at en base ne ressuscite pas un reçu.
     if "expires" in stored and row.get("expires_ts") is not None:
         if _us(row["expires_ts"]) != int(stored["expires"]):
-            return Verdict(False, "l'échéance signée ne correspond pas à la ligne "
-                                  "(expires_at modifié)")
+            return Verdict(False, "the signed expiry does not match the row "
+                                  "(expires_at modified)")
     if "ts" in stored and row.get("created_ts") is not None:
         if _us(row["created_ts"]) != int(stored["ts"]):
-            return Verdict(False, "l'horodatage signé ne correspond pas à la ligne "
-                                  "(created_at modifié)")
+            return Verdict(False, "the signed timestamp does not match the row "
+                                  "(created_at modified)")
     expiry_state = nonce_state(db, row.get("approver") or "", row.get("nonce") or "")
     if expiry_state is not None:
-        return Verdict(False, "nonce déjà consommé (%s)" % expiry_state,
+        return Verdict(False, "nonce already consumed (%s)" % expiry_state,
                        info.get("public_key_fingerprint") or "")
 
     expires_ts = row.get("expires_ts")
     if expires_ts is None:
         # On ne sait pas la dater : on refuse (une approbation sans échéance
         # n'est pas une décision bornée).
-        return Verdict(False, "échéance inconnue")
+        return Verdict(False, "unknown expiry")
     if float(expires_ts) < time.time():
-        return Verdict(False, "approbation expirée")
+        return Verdict(False, "approval expired")
     if row.get("unexpired") is False:
-        return Verdict(False, "approbation expirée")
-    return Verdict(True, "approbation valide", info.get("public_key_fingerprint") or "",
+        return Verdict(False, "approval expired")
+    return Verdict(True, "valid approval", info.get("public_key_fingerprint") or "",
                    float(expires_ts))
 
 
@@ -424,16 +424,16 @@ def find_approval(db: Db, action: str, artifact_hash: str, *, decision: str = "a
                   consume_by: str | None = None) -> tuple[dict | None, Verdict]:
     """La dernière approbation valide pour (action, hash), consommée si demandé."""
     rows = storage.of(db).approvals.candidates(action, artifact_hash, decision)
-    last = Verdict(False, "aucune approbation pour %s %s" % (action, artifact_hash[:12]))
+    last = Verdict(False, "no approval for %s %s" % (action, artifact_hash[:12]))
     for row in rows:
         if row.get("consumed_ts"):
-            last = Verdict(False, "approbation #%s déjà consommée" % row["id"])
+            last = Verdict(False, "approval #%s already consumed" % row["id"])
             continue
         verdict = verify_approval(db, row)
         if verdict.ok:
             if consume_by:
                 if not consume_approval(db, int(row["id"]), consume_by):
-                    last = Verdict(False, "approbation #%s consommée par un autre" % row["id"])
+                    last = Verdict(False, "approval #%s consumed by someone else" % row["id"])
                     continue
                 row["consumed_by"] = consume_by
                 row["consumed_ts"] = time.time()
@@ -449,7 +449,7 @@ def nonce_state(db: Db, approver: str, nonce: str) -> str | None:
     row = storage.of(db).nonces.state(approver, nonce)
     if row is None:
         return None
-    return "par %s le %s" % (
+    return "by %s on %s" % (
         row.get("consumed_by") or "?",
         time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("consumed_ts") or 0)))
 

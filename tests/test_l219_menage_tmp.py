@@ -94,7 +94,7 @@ class OrphanTmpTest(PgTestCase):
         _age(legacy, 23 * HOUR)
         report = self._pass()
         self.assertTrue(os.path.isdir(legacy))
-        self.assertTrue(any("sans propriétaire" in s for s in report["skipped"]))
+        self.assertTrue(any("no owner" in s for s in report["skipped"]))
         self._pass(later=25 * HOUR)
         self.assertFalse(os.path.exists(legacy))
 
@@ -115,14 +115,14 @@ class OrphanTmpTest(PgTestCase):
         _age(gone, 24 * HOUR)
         report = self._pass(agents_in_turn={"parti"})
         self.assertTrue(os.path.isdir(gone))
-        self.assertTrue(any("en tour" in s for s in report["skipped"]))
+        self.assertTrue(any("in turn" in s for s in report["skipped"]))
 
     def test_own_orphan_deleted_only_once_idle(self):
         gone = self._tmp(self.mine, "parti")
         _write(os.path.join(gone, "sortie.txt"))
         report = self._pass()
         self.assertTrue(os.path.isdir(gone))                 # written just now
-        self.assertTrue(any("actif il y a" in s for s in report["skipped"]))
+        self.assertTrue(any("ago (less than" in s for s in report["skipped"]))
         report = self._pass(later=3 * HOUR)
         self.assertFalse(os.path.exists(gone))
         self.assertFalse(os.path.exists(menage.owner_file(
@@ -172,7 +172,7 @@ class OrphanTmpTest(PgTestCase):
         _age(mine, 3 * HOUR)
         report = self._pass(later=3 * HOUR)
         self.assertTrue(os.path.isdir(mine))
-        self.assertTrue(any("verrou" in s for s in report["skipped"]))
+        self.assertTrue(any("lock" in s for s in report["skipped"]))
         turn.end(lot=None, turn_id="t")
         _age(mine, 3 * HOUR)
         self._pass(later=3 * HOUR)
@@ -202,7 +202,7 @@ class OrphanTmpTest(PgTestCase):
         os.unlink(os.path.join(deep, "efface"))         # `b` changed now
         report = self._pass()
         self.assertTrue(os.path.isdir(gone))
-        self.assertTrue(any("actif il y a" in s for s in report["skipped"]))
+        self.assertTrue(any("ago (less than" in s for s in report["skipped"]))
 
     def test_resumed_turn_refreshes_activity(self):
         # point 5: a resumed session writes nothing at first
@@ -241,7 +241,7 @@ class OrphanTmpTest(PgTestCase):
             # the fallback directory is locked too
             report = self._pass(later=3 * HOUR)
             self.assertTrue(os.path.isdir(other))
-            self.assertTrue(any("verrou" in s for s in report["skipped"]))
+            self.assertTrue(any("lock" in s for s in report["skipped"]))
         finally:
             turn.end(lot=None, turn_id="t")
         self._pass(later=3 * HOUR)                       # used once: deleted once idle
@@ -257,7 +257,7 @@ class OrphanTmpTest(PgTestCase):
             _write(os.path.join(env["TMPDIR"], "f"))
             report = self._pass(later=3 * HOUR)
             self.assertTrue(os.path.isdir(env["TMPDIR"]))
-            self.assertTrue(any("verrou" in s for s in report["skipped"]))
+            self.assertTrue(any("lock" in s for s in report["skipped"]))
         finally:
             for hold in holds:
                 hold.release()
@@ -289,7 +289,7 @@ class OrphanTmpTest(PgTestCase):
         _age(gone, 3 * HOUR)
         report = self._pass()
         self.assertTrue(os.path.isdir(gone))
-        self.assertTrue(any("actif il y a" in s for s in report["skipped"]))
+        self.assertTrue(any("ago (less than" in s for s in report["skipped"]))
 
     def test_adopted_directory_is_never_emptied(self):
         # point 5: found without owner file (another mesh's, older version)

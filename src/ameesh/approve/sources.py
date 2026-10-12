@@ -47,18 +47,18 @@ class ActionSource(Protocol):
 
 def _text(value, name: str) -> str:
     if not isinstance(value, str) or not value:
-        raise ActionSourceError("action : %s doit être un texte non vide" % name)
+        raise ActionSourceError("action: %s must be a non-empty string" % name)
     return value
 
 
 def normalize_action(raw: dict) -> dict:
     """Valide et normalise une action lue (types stricts, empreinte calculable)."""
     if not isinstance(raw, dict):
-        raise ActionSourceError("action : objet attendu")
+        raise ActionSourceError("action: object expected")
     action = {}
     action["action_id"] = _text(raw.get("action_id"), "action_id")
     if not ACTION_ID_RE.fullmatch(action["action_id"]):
-        raise ActionSourceError("action : action_id invalide")
+        raise ActionSourceError("action: invalid action_id")
     for name in ("project", "connector", "operation", "target"):
         action[name] = _text(raw.get(name), name)
     args = raw.get("args")
@@ -66,31 +66,31 @@ def normalize_action(raw: dict) -> dict:
         try:
             args = json.loads(args)
         except ValueError as exc:
-            raise ActionSourceError("action : args illisibles") from exc
+            raise ActionSourceError("action: unreadable args") from exc
     if not isinstance(args, dict):
-        raise ActionSourceError("action : args doit être un objet JSON")
+        raise ActionSourceError("action: args must be a JSON object")
     action["args"] = args
     amount = raw.get("amount")
     if isinstance(amount, float) and amount.is_integer():
         amount = int(amount)
     if amount is not None and (type(amount) is not int or amount < 0):
-        raise ActionSourceError("action : montant entier positif (unités mineures) attendu")
+        raise ActionSourceError("action: positive integer amount (minor units) expected")
     action["amount"] = amount
     currency = raw.get("currency")
     if currency is not None and (not isinstance(currency, str)
                                  or not re.fullmatch(r"[A-Z]{3}", currency)):
-        raise ActionSourceError("action : devise ISO 4217 attendue")
+        raise ActionSourceError("action: ISO 4217 currency expected")
     action["currency"] = currency
     if "policy_version" not in raw:
-        raise ActionSourceError("action : policy_version absente (elle fait partie de "
-                                "l'empreinte, spec §7.1)")
+        raise ActionSourceError("action: policy_version missing (it is part of "
+                                "the digest, spec §7.1)")
     policy_version = raw["policy_version"]
     if isinstance(policy_version, float) and policy_version.is_integer():
         policy_version = int(policy_version)
     action["policy_version"] = policy_version
     action_class = raw.get("class", raw.get("action_class"))
     if action_class not in receipts.ACTION_CLASSES:
-        raise ActionSourceError("action : classe inconnue %r" % (action_class,))
+        raise ActionSourceError("action: unknown class %r" % (action_class,))
     action["class"] = action_class
     action["state"] = _text(raw.get("state"), "state")
     for name in ("proposed_by", "work_item", "digest", "dedupe", "replaces", "replaced_by"):
@@ -100,13 +100,13 @@ def normalize_action(raw: dict) -> dict:
     # L44 (0031) : le canon de l'action borne les authentificateurs admis
     canon = raw.get("canon")
     if canon is not None and not isinstance(canon, str):
-        raise ActionSourceError("action : canon doit être un texte")
+        raise ActionSourceError("action: canon must be a string")
     action["canon"] = canon or ""
     try:
         action["computed_digest"] = receipts.action_digest(
             {name: action[name] for name in receipts.ACTION_DIGEST_FIELDS})
     except receipts.ReceiptError as exc:
-        raise ActionSourceError("action : empreinte impossible : %s" % exc) from exc
+        raise ActionSourceError("action: cannot compute digest: %s" % exc) from exc
     return action
 
 
@@ -155,20 +155,20 @@ class DbActionSource:
                 columns = self.columns()
             except DbError as exc:
                 # le texte de l'erreur SQL n'est pas rendu (il peut finir sur une page)
-                raise ActionSourceError("source d'actions injoignable (%s)"
+                raise ActionSourceError("action source unreachable (%s)"
                                         % type(exc).__name__) from exc
         if not columns:
             raise ActionSourceError(
-                "table %r absente : la porte des actions (lot L5, migration 0010) n'est pas "
-                "migrée dans ce schéma ; ameesh-approve ne peut pas lire l'action lui-même"
+                "table %r missing: the actions gate (lot L5, migration 0010) is not "
+                "migrated in this schema; ameesh-approve cannot read the action itself"
                 % self.table)
         missing = [name for name in self.REQUIRED if name not in columns]
         if "class" not in columns and "action_class" not in columns:
             missing.append("class")
         if missing:
             raise ActionSourceError(
-                "table %r incompatible : colonnes manquantes %s (l'empreinte de la spec §7.1 "
-                "les exige)" % (self.table, missing))
+                "table %r incompatible: missing columns %s (the spec §7.1 digest "
+                "requires them)" % (self.table, missing))
 
     def get_action(self, action_id: str) -> dict | None:
         if not isinstance(action_id, str) or not ACTION_ID_RE.fullmatch(action_id):
@@ -180,10 +180,10 @@ class DbActionSource:
                 wanted = [name for name in self.READ if name in present]
                 rows = storage.of(self.db).action_source.rows(self.table, action_id, wanted)
             except DbError as exc:
-                raise ActionSourceError("lecture de l'action impossible (%s)"
+                raise ActionSourceError("cannot read the action (%s)"
                                         % type(exc).__name__) from exc
         if not rows:
             return None
         if len(rows) > 1:
-            raise ActionSourceError("action %s en double dans %r" % (action_id, self.table))
+            raise ActionSourceError("action %s duplicated in %r" % (action_id, self.table))
         return normalize_action(dict(rows[0]))

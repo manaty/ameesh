@@ -1,484 +1,471 @@
 ---
 type: Study
-title: "Étude — radar de conflits entre lots, résolutions préparées avant la fusion, code écrit pour s'ajouter"
-description: "Mesure des reprises de fusion du 10/10 (ameesh et Nexlink), ce que git permet déjà (merge-tree, rerere, file de fusion, pilote syntaxique, fragments), comparaison avec un suivi plus fin (bloc, symbole, CRDT, Pijul, jj), conception retenue pour ameesh et lots L160a–L160h estimés."
+title: "Study — conflict radar between lots, resolutions prepared before the merge, code written to be additive"
+description: "Measurement of the merge rework of 10/10 (ameesh and Nexlink), what git already allows (merge-tree, rerere, merge queue, syntactic driver, fragments), comparison with finer-grained tracking (block, symbol, CRDT, Pijul, jj), design chosen for ameesh and estimated lots L160a–L160h."
 status: draft
 tags: [fusion, conflits, git, rerere, merge-tree, file-de-fusion, conventions, radar]
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-11T04:15:00+02:00" }
 stale_after: 2027-01-11
 sources:
-  - { resource: "../../ORCHESTRATEUR.md", title: "Consigne des orchestrateurs (branche du lot, fusion sans PR, migrations réservées)" }
-  - { resource: "https://github.com/manaty/ameesh/pulls?q=is%3Apr+is%3Amerged", title: "PR fusionnées (L118, L125), qui remplacent le journal de la conception" }
-  - { resource: "../decisions/0018-vitesse-des-agents.md", title: "Décision 0018 (vitesse des agents, revue proportionnée)" }
+  - { resource: "../../ORCHESTRATEUR.md", title: "Orchestrator prompt (lot branch, merge without PR, reserved migrations)" }
+  - { resource: "https://github.com/manaty/ameesh/pulls?q=is%3Apr+is%3Amerged", title: "Merged PRs (L118, L125), which replace the design log" }
+  - { resource: "../decisions/0018-vitesse-des-agents.md", title: "Decision 0018 (agent speed, proportionate review)" }
   - { resource: "https://git-scm.com/docs/git-merge-tree", title: "git merge-tree --write-tree" }
   - { resource: "https://git-scm.com/docs/git-rerere", title: "git rerere" }
-  - { resource: "https://git-scm.com/docs/rerere", title: "rerere, normalisation des conflits (documentation technique)" }
-  - { resource: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue", title: "GitHub, file de fusion" }
-  - { resource: "https://mergiraf.org/", title: "Mergiraf, pilote de fusion syntaxique" }
-  - { resource: "https://docs.jj-vcs.dev/latest/conflicts/", title: "Jujutsu, conflits de première classe" }
-  - { resource: "https://pijul.org/manual/theory.html", title: "Pijul, théorie des patchs" }
+  - { resource: "https://git-scm.com/docs/rerere", title: "rerere, conflict normalisation (technical documentation)" }
+  - { resource: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue", title: "GitHub, merge queue" }
+  - { resource: "https://mergiraf.org/", title: "Mergiraf, syntactic merge driver" }
+  - { resource: "https://docs.jj-vcs.dev/latest/conflicts/", title: "Jujutsu, first-class conflicts" }
+  - { resource: "https://pijul.org/manual/theory.html", title: "Pijul, theory of patches" }
 ---
 
-# Contexte
+# Context
 
-**Idée du propriétaire (11/10, 03:25)**, reprise telle quelle : « quand un agent
-travaille sur sa branche de lot, un des problèmes de fusion est qu'on ne connaît
-pas par avance l'ordre des fusions et les conflits potentiels à résoudre. Les
-ajouts de fichiers ne sont jamais un problème (cela peut peut-être influencer la
-façon dont on code) ; on pourrait imaginer que les agents modifiant un fichier
-notifient les agents en écoute sur ce fichier, de sorte que les autres agents
-puissent préparer plusieurs versions de leur modif avec ou sans la version de
-l'autre agent. Ça suppose sans doute un système un peu différent de git, mais au
-moment de la fusion on aurait déjà toutes les résolutions de conflit prêtes. »
-Un système plus fin que le fichier.
+**Owner's idea (11/10, 03:25)**, quoted as is: "when an agent works on its lot
+branch, one of the merge problems is that we don't know in advance the order of
+the merges and the potential conflicts to resolve. Adding files is never a
+problem (this may perhaps influence the way we code); we could imagine that
+agents modifying a file notify the agents listening on that file, so that the
+other agents can prepare several versions of their change with or without the
+other agent's version. This probably assumes a system somewhat different from
+git, but at merge time we would already have all the conflict resolutions
+ready." A system finer-grained than the file.
 
-**Constat de la nuit du 10/10** : les fusions de lots ameesh ont presque toutes
-demandé une reprise (`docs/design/log.md` en tête de chaque PR,
-`deploy/sql/role-superviseur.sql`, `ITEM_COLUMNS` de
-`storage/postgres/work.py`, `storage/postgres/projects.py`, numéros de
-migration 0048 à 0053 en collision). Côté Nexlink, l'orchestrateur sérialise les
-fusions à la main, par des messages « feu de fusion ».
+**Observation from the night of 10/10**: almost all ameesh lot merges needed
+rework (`docs/design/log.md` at the top of every PR,
+`deploy/sql/role-superviseur.sql`, `ITEM_COLUMNS` in
+`storage/postgres/work.py`, `storage/postgres/projects.py`, migration numbers
+0048 to 0053 colliding). On the Nexlink side, the orchestrator serialises merges
+by hand, through "merge go-ahead" ("feu de fusion") messages.
 
-# Mesures
+# Measurements
 
-## Méthode
+## Method
 
-Tout en lecture seule : clones miroirs des deux dépôts dans un dossier jetable,
-base du mesh en transaction `read_only`, PR et exécutions de CI par `gh`.
+All read-only: mirror clones of both repositories in a throwaway folder, the
+mesh database in a `read_only` transaction, PRs and CI runs through `gh`.
 
-* **Fusions rejouées** : chaque commit de fusion à deux parents est refait par
-  `git merge-tree --write-tree` ; un code de sortie 1 dit qu'il a fallu résoudre
-  un conflit, et la liste des fichiers suit. Avec `merge.conflictStyle=diff3`,
-  chaque bloc en conflit est classé : **ajout** (la base est vide : les deux
-  côtés ont inséré au même endroit) ou **modification**.
-* **Reflogs des worktrees** (un par agent) : « commit (merge) » est une fusion
-  arrêtée sur conflit puis validée à la main ; « rebase (continue) » est une
-  étape de rebase arrêtée puis reprise. Les rebases sont invisibles dans
-  l'historique : seuls les reflogs les montrent. Les agents de la VM n'y
-  figurent pas (autres clones).
-* **Courrier** : messages de l'équipe Nexlink, classés par expression
-  régulière (feu de fusion, develop frais, refetch, sans forcer, rebase,
-  conflit, merge-tree…) ; délais entre le feu de l'orchestrateur et l'arrivée
-  sur develop, appariés par l'étiquette du lot dans le titre du commit de
-  fusion.
+* **Replayed merges**: each two-parent merge commit is redone with
+  `git merge-tree --write-tree`; an exit code of 1 says a conflict had to be
+  resolved, and the list of files follows. With `merge.conflictStyle=diff3`,
+  each conflicting block is classified: **addition** (the base is empty: both
+  sides inserted at the same place) or **modification**.
+* **Worktree reflogs** (one per agent): "commit (merge)" is a merge stopped on
+  a conflict and then committed by hand; "rebase (continue)" is a rebase step
+  stopped and then resumed. Rebases are invisible in the history: only the
+  reflogs show them. The VM's agents are not included (other clones).
+* **Mail**: messages of the Nexlink team, classified by regular expression
+  (feu de fusion, develop frais, refetch, sans forcer, rebase, conflit,
+  merge-tree…); delays between the orchestrator's go-ahead and arrival on
+  develop, matched through the lot label in the merge commit title.
 
-## ameesh, nuit du 10/10 (20 h → 3 h 20)
+## ameesh, night of 10/10 (20:00 → 03:20)
 
-* **22 PR fusionnées**, dont 4 de version. Sur les **18 PR de lots, correctifs
-  et consignes**, **11 ont demandé au moins une résolution à la main** et 2
-  autres des rattrapages de `main` sans conflit (L63 : 2, L119 : 3). Seules
-  les PR ouvertes et fusionnées en 15 min au plus y ont échappé. Délai entre
-  ouverture et fusion : médiane 20 min.
-* **19 résolutions à la main** en 7 h 20 : 10 fusions de `main` arrêtées (dont 3
-  sur la branche d'intégration de la voie B) et 9 étapes de rebase reprises, dans
-  11 des 13 worktrees qui ont fusionné ou rebasé.
-* Fichiers en conflit dans ces 10 fusions : `docs/design/log.md` **8 fois sur
-  10** ; `docs/EXPLOITATION.md`, `exploitation.py`, `notify.py` 4 fois ;
-  `storage/interface.py`, `backend.py` 2 fois ; une fois
+* **22 merged PRs**, 4 of them releases. Of the **18 lot, fix and prompt PRs**,
+  **11 needed at least one resolution by hand** and 2 others catch-ups with
+  `main` without conflict (L63: 2, L119: 3). Only the PRs opened and merged
+  within 15 min escaped it. Delay between opening and merge: median 20 min.
+* **19 resolutions by hand** in 7 h 20: 10 stopped merges of `main` (3 of them
+  on the track B integration branch) and 9 resumed rebase steps, in 11 of the
+  13 worktrees that merged or rebased.
+* Conflicting files in these 10 merges: `docs/design/log.md` **8 times out of
+  10**; `docs/EXPLOITATION.md`, `exploitation.py`, `notify.py` 4 times;
+  `storage/interface.py`, `backend.py` 2 times; once
   `role-superviseur.sql`, `storage/postgres/work.py` (`ITEM_COLUMNS`),
-  `storage/postgres/projects.py`, `cli.py`, `mesh_cli.py`, l'index des
-  décisions, la référence de la CLI, la liste des modules « pilote psql », le
-  numéro de version (`pyproject.toml`, `__init__.py` et son test) et six
-  autres. 77 blocs en conflit, dont **35 ajouts au même endroit (45 %)** ; 4
-  fusions sur 10 n'avaient que des ajouts.
-* Sur tout l'historique public (depuis le 05/10) : 27 fusions en conflit sur 51,
-  181 blocs, **92 ajouts (51 %)** ; les 12 blocs de `log.md` sont tous des ajouts.
-* **Migrations** : le 10/10, le numéro 0048 a été pris par quatre lots et il y
-  a eu 12 renumérotations, dont 9 pour les trois migrations de la voie B
-  (trois fois chacune, jusqu'à 0051, 0052, 0053). Git n'y voit **aucun
-  conflit** (noms de fichiers différents) : seul `migrations.discover`
-  (« version de migration en double ») ou un test le révèle, après coup.
-* La résolution textuelle est rapide (un rebase arrêté dure 30 s en médiane) :
-  le coût est ailleurs, dans le tour d'agent qu'elle ouvre, la CI relancée
-  (3,6 min en médiane, 36 commits testés pour 22 PR) et l'attente des lots
-  suivants.
-* `rerere` est **déjà actif** sur le poste (configuration globale,
-  `rerere.autoUpdate`) : 153 conflits enregistrés pour ameesh (142 résolus),
-  dont 111 les 10 et 11/10, et 343 pour Nexlink. Il ne sert qu'après coup, et
-  seulement sur le poste.
+  `storage/postgres/projects.py`, `cli.py`, `mesh_cli.py`, the decisions
+  index, the CLI reference, the list of "psql driver" modules, the version
+  number (`pyproject.toml`, `__init__.py` and its test) and six others. 77
+  conflicting blocks, of which **35 additions at the same place (45%)**; 4
+  merges out of 10 had only additions.
+* Over the whole public history (since 05/10): 27 conflicting merges out of 51,
+  181 blocks, **92 additions (51%)**; the 12 blocks of `log.md` are all additions.
+* **Migrations**: on 10/10, number 0048 was taken by four lots and there were
+  12 renumberings, 9 of them for the three track B migrations (three times
+  each, up to 0051, 0052, 0053). Git sees **no conflict** there (different file
+  names): only `migrations.discover` ("version de migration en double",
+  duplicate migration version) or a test reveals it, after the fact.
+* Textual resolution is fast (a stopped rebase lasts 30 s at the median): the
+  cost lies elsewhere, in the agent turn it opens, the rerun CI (3.6 min at the
+  median, 36 commits tested for 22 PRs) and the wait of the following lots.
+* `rerere` is **already active** on the workstation (global configuration,
+  `rerere.autoUpdate`): 153 recorded conflicts for ameesh (142 resolved), 111
+  of them on 10 and 11/10, and 343 for Nexlink. It only helps after the fact,
+  and only on the workstation.
 
-## Nexlink, journée du 10/10 (12 h → 4 h)
+## Nexlink, day of 10/10 (12:00 → 04:00)
 
-* **develop** a reçu 275 commits de premier parent (classés par leur titre) :
-  **75 fusions de lots**, **29 fusions de rattrapage** (develop a bougé pendant
-  la fusion d'un autre : « intègre develop avant le push »), 129 notices et
-  rapports de revue, 18 commits de réservation de numéros de migration, 24
-  autres.
-* Conflits textuels rares : 20 fusions validées à la main et 4 étapes de rebase
-  reprises dans les reflogs de 74 worktrees ; 10 fusions en conflit au
-  rejeu, dont 5 sur le registre des réservations de migrations. Sur 15 jours :
-  6 % des fusions dans develop et 10 % des fusions de develop dans une branche,
-  **53 % des blocs sont des ajouts** au même endroit ; fichiers chauds : les
-  trois fichiers de traduction JSON, le registre des réservations, le journal de
-  connaissances, la feuille de route, les fiches de suivi des chantiers. Les
-  agents font déjà des **fusions d'essai** par `merge-tree` avant de fusionner,
-  à la main.
-* **Le coût est la sérialisation** :
-  * entre le premier feu de l'orchestrateur et l'arrivée sur develop :
-    **médiane 39 min, 3e quartile 76 min, maximum 3 h 08** (33 fusions
-    appariées) ; entre le dernier GO de revue et la fusion : 8 min en médiane,
-    à peu près la durée d'une fusion quand le lot est en tête ;
-  * file tenue à la main : « feu donné, position 7 de la file » ;
-  * de 19 h à 23 h, **382 messages sur 1 345 (28 %)** parlent de fusion ;
-    l'orchestrateur en écrit 76 sur 332 ; « feu de fusion » apparaît
-    littéralement dans 35 messages de la journée.
+* **develop** received 275 first-parent commits (classified by title):
+  **75 lot merges**, **29 catch-up merges** (develop moved during another's
+  merge: "merge develop before the push"), 129 notices and review reports, 18
+  migration number reservation commits, 24 others.
+* Textual conflicts are rare: 20 merges committed by hand and 4 resumed rebase
+  steps in the reflogs of 74 worktrees; 10 conflicting merges on replay, 5 of
+  them on the migration reservations registry. Over 15 days: 6% of merges into
+  develop and 10% of merges of develop into a branch, **53% of blocks are
+  additions** at the same place; hot files: the three JSON translation files,
+  the reservations registry, the knowledge log, the roadmap, the project
+  tracking cards. The agents already do **trial merges** with `merge-tree`
+  before merging, by hand.
+* **The cost is serialisation**:
+  * between the orchestrator's first go-ahead and arrival on develop:
+    **median 39 min, 3rd quartile 76 min, maximum 3 h 08** (33 matched
+    merges); between the last review GO and the merge: 8 min at the median,
+    roughly the duration of a merge when the lot is at the head;
+  * queue kept by hand: "go-ahead given, position 7 in the queue";
+  * from 19:00 to 23:00, **382 messages out of 1,345 (28%)** are about merging;
+    the orchestrator writes 76 of 332; "feu de fusion" appears literally in 35
+    messages of the day.
 
-## Ce qu'un radar aurait vu
+## What a radar would have seen
 
-Fusions d'essai entre branches actives, mesurées sur l'état présent :
+Trial merges between active branches, measured on the present state:
 
-| | Branches | Paires | Paires qui touchent un même fichier | Paires en conflit | En conflit avec la cible | Passage complet |
+| | Branches | Pairs | Pairs touching a same file | Conflicting pairs | Conflicting with the target | Full pass |
 |---|---|---|---|---|---|---|
-| Nexlink (poussées depuis le 10/10 12 h) | 62 | 1 891 | 43 (2,3 %) | 31 | 12 | 9 s |
-| ameesh (21 PR ouvertes, surtout la pile v2) | 21 | 210 | 112 (53 %) | 72 | 16 | 3 s |
+| Nexlink (pushed since 10/10 12:00) | 62 | 1,891 | 43 (2.3%) | 31 | 12 | 9 s |
+| ameesh (21 open PRs, mostly the v2 stack) | 21 | 210 | 112 (53%) | 72 | 16 | 3 s |
 
-Une fusion d'essai coûte 0,02 à 0,07 s par paire. Chez Nexlink, les paires qui
-se recouvrent sont rares : un radar préviendrait peu, et à bon escient. Chez
-ameesh, presque tout se recouvre à cause d'une poignée de fichiers centraux
-(`EXPLOITATION.md` 69 paires, `main.py` 57) : il faut **d'abord** changer ces
-fichiers, sinon le radar crie sans cesse.
+A trial merge costs 0.02 to 0.07 s per pair. At Nexlink, overlapping pairs are
+rare: a radar would warn seldom, and rightly. At ameesh, almost everything
+overlaps because of a handful of central files (`EXPLOITATION.md` 69 pairs,
+`main.py` 57): these files must be changed **first**, otherwise the radar
+shouts constantly.
 
-# 1. Ce que git permet déjà
+# 1. What git already allows
 
-## Fusions d'essai sans worktree
+## Trial merges without a worktree
 
-`git merge-tree --write-tree A B` (git ≥ 2.38, `--merge-base` ≥ 2.40) calcule
-la fusion sans index ni dossier : il rend l'arbre fusionné, la liste des
-fichiers en conflit et sort en 1 s'il y en a. Il n'écrit que des objets ; avec
-`GIT_OBJECT_DIRECTORY` pointé sur un dossier jetable et le dépôt en
-`GIT_ALTERNATE_OBJECT_DIRECTORIES`, il n'écrit **rien** dans le dépôt des agents
-(vérifié). La granularité est déjà **le bloc** : deux lots qui modifient des
-fonctions différentes d'un même fichier ne sont pas en conflit. Limite : il ne
-voit que les conflits textuels ; deux migrations 0048, une fonction supprimée
-d'un côté et appelée de l'autre passent.
+`git merge-tree --write-tree A B` (git ≥ 2.38, `--merge-base` ≥ 2.40) computes
+the merge without an index or a folder: it returns the merged tree, the list of
+conflicting files and exits with 1 if there are any. It only writes objects;
+with `GIT_OBJECT_DIRECTORY` pointed at a throwaway folder and the repository in
+`GIT_ALTERNATE_OBJECT_DIRECTORIES`, it writes **nothing** in the agents'
+repository (verified). The granularity is already **the block**: two lots that
+modify different functions of a same file are not in conflict. Limit: it only
+sees textual conflicts; two 0048 migrations, or a function deleted on one side
+and called on the other, go through.
 
-**Verdict** : la brique du radar.
+**Verdict**: the building block of the radar.
 
-## Résolutions enregistrées et rejouées (`rerere`)
+## Recorded and replayed resolutions (`rerere`)
 
-`rerere` note chaque conflit résolu (côtés en conflit et résultat) et rejoue la
-résolution quand le même conflit revient. Le conflit est identifié par ses deux
-côtés **rangés dans un ordre fixe** : la même résolution sert que A fusionne
-avant B ou l'inverse. C'est exactement « avec ou sans la version de l'autre »
-pour une paire de lots. Le cache `rr-cache` est dans le dossier commun du
-dépôt, donc partagé par toutes les worktrees d'un hôte.
+`rerere` records each resolved conflict (conflicting sides and result) and
+replays the resolution when the same conflict comes back. The conflict is
+identified by its two sides **sorted in a fixed order**: the same resolution
+works whether A merges before B or the reverse. This is exactly "with or
+without the other's version" for a pair of lots. The `rr-cache` is in the
+repository's common folder, hence shared by all the worktrees of a host.
 
-Limites : il n'apprend qu'**après** une résolution ; il ne passe pas d'un hôte
-à l'autre ; si un troisième lot a changé les mêmes lignes, le conflit est
-nouveau ; il peut rejouer une résolution devenue fausse sans rien dire
-(`autoUpdate`), d'où les portes sur l'arbre fusionné ; ses entrées expirent
-(`gc.rerereResolved`, 60 jours).
+Limits: it only learns **after** a resolution; it does not move from one host
+to another; if a third lot changed the same lines, the conflict is new; it can
+silently replay a resolution that has become wrong (`autoUpdate`), hence the
+gates on the merged tree; its entries expire (`gc.rerereResolved`, 60 days).
 
-Partage entre agents, deux façons :
+Sharing between agents, two ways:
 
-* copier les fichiers de `rr-cache` dans une ref dédiée : format interne de git,
-  fragile ;
-* **partager des commits de résolution** : l'agent fusionne la branche de
-  l'autre dans une branche jetable issue de la sienne, résout, valide ; ce
-  commit R(A, B) est poussé sous une ref dédiée. N'importe quel hôte en
-  réapprend la résolution avec `rerere-train.sh` (livré avec git, `contrib/`),
-  qui rejoue des fusions pour remplir le cache. Un commit est natif, poussable
-  sur GitHub, relisible et testable.
+* copy the `rr-cache` files into a dedicated ref: git's internal format,
+  fragile;
+* **share resolution commits**: the agent merges the other's branch into a
+  throwaway branch made from its own, resolves, commits; this commit R(A, B) is
+  pushed under a dedicated ref. Any host relearns the resolution with
+  `rerere-train.sh` (shipped with git, `contrib/`), which replays merges to fill
+  the cache. A commit is native, pushable to GitHub, reviewable and testable.
 
-**Verdict** : retenu, par commits de résolution.
+**Verdict**: chosen, through resolution commits.
 
-## File de fusion avec empilement testé
+## Merge queue with stacked testing
 
-Une file range les lots prêts et teste chacun fusionné **sur la cible plus les
-lots qui le précèdent** (« merge train ») ; un lot qui casse sort de la file
-sans bloquer les autres. GitHub la propose (`merge_group`) pour les dépôts
-publics d'organisation, donc ameesh, et pour les dépôts privés seulement en
-GitHub Enterprise Cloud : pas Nexlink, au forfait gratuit, qui fusionne en
-local de toute façon. Équivalents : trains de GitLab, Zuul, Mergify. Une file ne
-résout aucun conflit : elle retire le lot.
+A queue lines up the ready lots and tests each one merged **onto the target
+plus the lots ahead of it** ("merge train"); a lot that breaks leaves the queue
+without blocking the others. GitHub offers it (`merge_group`) for public
+organisation repositories, hence ameesh, and for private repositories only on
+GitHub Enterprise Cloud: not Nexlink, on the free plan, which merges locally
+anyway. Equivalents: GitLab trains, Zuul, Mergify. A queue resolves no
+conflict: it removes the lot.
 
-**Verdict** : principe retenu ; la file est tenue par ameesh, la même pour une
-équipe à PR et pour une équipe qui fusionne en local.
+**Verdict**: principle chosen; the queue is kept by ameesh, the same for a
+PR-based team and for a team that merges locally.
 
-## Pilote de fusion syntaxique
+## Syntactic merge driver
 
-Mergiraf fusionne par arbre syntaxique (tree-sitter) : deux ajouts dans un
-ensemble dont l'ordre ne compte pas (imports, membres d'une classe, clés d'un
-objet JSON, selon ce que déclare chaque langage) ne sont plus en conflit. Il
-comprend Python, TypeScript, JSON, YAML et TOML, mais ni SQL ni Markdown, et
-rien à l'intérieur d'une chaîne (`ITEM_COLUMNS` est une chaîne SQL). Il
-s'installe comme pilote git :
+Mergiraf merges by syntax tree (tree-sitter): two additions in a set whose
+order does not matter (imports, class members, keys of a JSON object, according
+to what each language declares) are no longer in conflict. It understands
+Python, TypeScript, JSON, YAML and TOML, but neither SQL nor Markdown, and
+nothing inside a string (`ITEM_COLUMNS` is an SQL string). It installs as a git
+driver:
 
 ```
 git config merge.mergiraf.driver "mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L"
 echo '*.py merge=mergiraf' >> .gitattributes
 ```
 
-Ce qu'il ne sait pas fusionner reste en conflit, comme avant. GitHub ne lance
-aucun pilote externe : il ne vaut que pour les fusions faites en local, ce qui
-est le cas des reprises. Le pilote `union` intégré à git garde les deux côtés
-d'un fichier fait de lignes indépendantes, au risque de les entremêler.
-`merge.conflictStyle=zdiff3` montre la base dans les marqueurs et aide l'agent
-qui résout.
+What it cannot merge stays in conflict, as before. GitHub runs no external
+driver: it only applies to merges done locally, which is the case for rework.
+The `union` driver built into git keeps both sides of a file made of
+independent lines, at the risk of interleaving them.
+`merge.conflictStyle=zdiff3` shows the base in the markers and helps the agent
+that resolves.
 
-**Verdict** : pilote à mesurer sur les 103 fusions en conflit rejouées avant
-de l'adopter ; jamais pour SQL ni Markdown.
+**Verdict**: driver to be measured on the 103 replayed conflicting merges
+before adopting it; never for SQL or Markdown.
 
-## Fragments plutôt que fichiers centraux
+## Fragments rather than central files
 
-C'est l'intuition du propriétaire : un fichier ajouté n'entre jamais en conflit.
-Un journal fait d'un fragment par lot, assemblé à la lecture (comme
-towncrier, changesets ou reno), un index généré depuis l'en-tête des fiches, un
-registre par dossier rempli par découverte, un numéro réservé à l'avance
-suppriment la classe de conflit au lieu de la résoudre. Ils couvrent les
-fichiers les plus chauds des deux dépôts : `log.md`, l'index des décisions, les
-fichiers de traduction, le registre des réservations, le journal de
-connaissances. Deux réserves : deux lots qui créent le **même chemin** sont en
-conflit, et deux numéros égaux dans deux fichiers différents passent sans
-conflit ; il faut une sonde. Et réorganiser un fichier central entre en conflit
-avec toutes les branches ouvertes : à faire file vide, annoncé.
+This is the owner's intuition: an added file never conflicts. A log made of
+one fragment per lot, assembled on read (like towncrier, changesets or reno),
+an index generated from the cards' header, a per-folder registry filled by
+discovery, a number reserved in advance remove the conflict class instead of
+resolving it. They cover the hottest files of both repositories: `log.md`, the
+decisions index, the translation files, the reservations registry, the
+knowledge log. Two caveats: two lots that create the **same path** are in
+conflict, and two equal numbers in two different files go through without a
+conflict; a probe is needed. And reorganising a central file conflicts with
+all open branches: to be done with an empty queue, announced.
 
-**Verdict** : le gain le plus sûr ; à faire en premier.
+**Verdict**: the safest gain; to be done first.
 
-## Ce qu'ameesh sait déjà
+## What ameesh already knows
 
-* Un lot porte sa branche, sa cible et le dernier commit vu en avance
+* A lot carries its branch, its target and the last commit seen ahead
   (`branch`, `branch_target`, `branch_head`, L118, migration 0050).
-* L'exécuteur de chaque hôte relève toutes les 5 min les branches des lots de
-  ses agents (`plan_git.sync_branches`, `AMEESH_BRANCH_SWEEP_INTERVAL`) dans le
-  dossier de travail de l'assigné, et constate la fusion par le contenu
-  (ancêtre, patch-id, squash, ligne `ameesh-work:`).
-* Le courrier se rattache à un lot (`--lot`) ; un message passif (`ack`, `cc`,
-  `broadcast`) ne réveille personne et se lit au tour suivant (L125) ; un
-  `event` réveille au plus une fois par fenêtre de 120 s.
-* Il manque : les fichiers touchés par lot, les paires qui se recouvrent, l'ordre
-  de fusion, les résolutions.
+* Each host's runner sweeps every 5 min the lot branches of its agents
+  (`plan_git.sync_branches`, `AMEESH_BRANCH_SWEEP_INTERVAL`) in the assignee's
+  working folder, and detects the merge by content (ancestor, patch-id, squash,
+  `ameesh-work:` line).
+* Mail attaches to a lot (`--lot`); a passive message (`ack`, `cc`,
+  `broadcast`) wakes no one and is read at the next turn (L125); an `event`
+  wakes at most once per 120 s window.
+* Missing: the files touched per lot, the overlapping pairs, the merge order,
+  the resolutions.
 
-# 2. Un suivi plus fin que git ?
+# 2. Tracking finer than git?
 
-| Approche | Gain réel | Coût | GitHub et PR |
+| Approach | Real gain | Cost | GitHub and PRs |
 |---|---|---|---|
-| Écoute **par fichier** | Prévient tôt | Bruit : 53 % des paires ameesh se recouvrent | Indifférent |
-| **Au bloc** (fusions d'essai) | Le conflit réel, rien de plus | Faible : 9 s par passage | Compatible |
-| **Au symbole** (pilote syntaxique) | Les ajouts dans une même liste ou classe ne sont plus des conflits | Un binaire par hôte, limité à certains langages | Compatible en local |
-| **CRDT** | Pas de marqueurs : deux insertions concurrentes sont rangées d'office | Le code peut être faux sans que rien le dise ; journal d'opérations à tenir ; fait pour la co-édition en direct, pas pour des branches de plusieurs heures | Incompatible |
-| **Pijul** | Patchs qui commutent : une résolution s'applique dans n'importe quel ordre, l'idée du propriétaire en natif | Autre système, autre hébergement, outils, harnais et CI à refaire | Incompatible |
-| **Jujutsu (jj)** | Conflits de première classe : un rebase ne s'arrête jamais, la résolution suit les descendants ; utile pour les piles de lots | Stocké dans git et poussé sur GitHub, mais un commit en conflit ne doit pas être poussé ; les harnais parlent git ; ne prévient personne | Compatible |
+| Listening **per file** | Warns early | Noise: 53% of ameesh pairs overlap | Indifferent |
+| **Per block** (trial merges) | The real conflict, nothing more | Low: 9 s per pass | Compatible |
+| **Per symbol** (syntactic driver) | Additions in a same list or class are no longer conflicts | One binary per host, limited to certain languages | Compatible locally |
+| **CRDT** | No markers: two concurrent insertions are ordered automatically | The code can be wrong without anything saying so; an operation log to keep; made for live co-editing, not for branches lasting several hours | Incompatible |
+| **Pijul** | Commuting patches: a resolution applies in any order, the owner's idea natively | Another system, another hosting, tools, harnesses and CI to redo | Incompatible |
+| **Jujutsu (jj)** | First-class conflicts: a rebase never stops, the resolution follows the descendants; useful for lot stacks | Stored in git and pushed to GitHub, but a conflicted commit must not be pushed; the harnesses speak git; warns no one | Compatible |
 
-La granularité utile est **le bloc**, et git la donne déjà par les fusions
-d'essai. Le symbole n'apporte que la fusion automatique des ajouts, qu'un pilote
-syntaxique ou une convention donnent aussi. Aucun système ne supprime les
-conflits **sémantiques** : seules les portes sur l'arbre fusionné, dans l'ordre
-de fusion, les attrapent. Changer d'outil coûterait la compatibilité avec
-GitHub, les PR et les harnais, pour un gain que git et ameesh peuvent donner.
-jj reste à essayer plus tard pour les longues piles de lots (pile v2).
+The useful granularity is **the block**, and git already provides it through
+trial merges. The symbol only adds automatic merging of additions, which a
+syntactic driver or a convention also provide. No system removes **semantic**
+conflicts: only the gates on the merged tree, in merge order, catch them.
+Changing tools would cost compatibility with GitHub, PRs and the harnesses, for
+a gain that git and ameesh can provide. jj remains to be tried later for long
+lot stacks (v2 stack).
 
-# 3. Conception retenue
+# 3. Chosen design
 
-Quatre pièces, dans l'ordre où elles rapportent : conventions additives,
-radar, résolutions préparées, file et fusion par ameesh.
+Four pieces, in the order in which they pay off: additive conventions, radar,
+prepared resolutions, queue and merge by ameesh.
 
 ## 3.1 Radar
 
-* **Où** : l'exécuteur de l'hôte désigné du projet (réglage `radar.projects`,
-  comme `github.projects`), juste après le relevé des branches. Il travaille
-  dans un **clone privé** du projet (`--shared`, objets du dépôt en
-  alternates : ni copie, ni écriture dans le dépôt des agents), avec ses propres
-  refs, son propre `rr-cache` et des worktrees jetables. Il lit les branches
-  locales du dépôt commun de l'hôte, qui sont celles de toutes les worktrees, et
-  `origin` pour les agents des autres hôtes. Règle proposée (question 3) : ces
-  agents poussent leur branche de lot à chaque fin de tour qui a créé un
-  commit ; le radar ne voit que ce qui est commité.
-* **Quand** : à chaque passage du relevé (5 min), et seulement pour ce qui a
-  changé : une paire n'est recalculée que si l'une de ses deux pointes ou la
-  cible a bougé (cache par triplet de commits). Un passage complet coûte 9 s sur
-  le plus gros projet.
-* **Quoi**, pour les lots ouverts qui ont une branche :
-  1. les fichiers touchés depuis la base commune avec la cible ;
-  2. les paires qui touchent un même fichier, seules soumises à
-     `merge-tree` (un conflit d'une paire), plus chaque lot contre la cible ;
-  3. des **sondes** pour ce que git ne voit pas, déclarées par projet : numéros
-     de migration en double (ameesh `src/ameesh/migrations/NNNN_`, Nexlink son
-     dossier de migrations), même chemin créé deux fois, numéro réservé par un
-     autre lot ;
-  4. le résultat en base (paire, commits, fichiers, blocs, état `clean`,
-     `overlap`, `conflict`, `prepared`, `stale`), migration réservée au début du
-     lot.
-* **Écoute** : implicite, chaque lot écoute les fichiers de son propre diff ;
-  pas d'abonnement à tenir. En option, `ameesh work watch <lot> <chemin>`
-  déclare un fichier qu'on va toucher, pour être prévenu avant d'avoir commité
-  (fichier central, numéro de migration).
-* **À qui et comment**, sans réveil inutile (L125) :
-  * aux deux assignés de la paire, par un courrier **lié au lot** (`--lot`),
-    passif (nouvelle clé `radar` dans les clés passives) : lu au tour suivant,
-    jamais de tour ouvert pour lui ; aussi dans le fil du lot et `ameesh work
-    show` ;
-  * seulement sur **changement d'état** (nouveau conflit, résolution périmée,
-    autre lot fusionné), une fois par paire et par couple de commits ;
-  * un réveil (courrier ordinaire, regroupé 90 s) seulement quand le conflit
-    **bloque** : l'autre lot est fusionné ou en tête de file et la résolution
-    n'est pas prête ; jamais `--urgent` ;
-  * l'orchestrateur ne reçoit pas de courrier par paire : une ligne dans
-    `ameesh projects` (« conflits prévus : n, préparés : p ») et l'alerte
-    `merge_blocked` quand la tête de file attend une résolution depuis 30 min ;
-  * jamais d'humain, sauf par cette alerte.
+* **Where**: the runner of the project's designated host (setting
+  `radar.projects`, like `github.projects`), right after the branch sweep. It
+  works in a **private clone** of the project (`--shared`, repository objects
+  as alternates: neither copy nor writing in the agents' repository), with its
+  own refs, its own `rr-cache` and throwaway worktrees. It reads the local
+  branches of the host's common repository, which are those of all the
+  worktrees, and `origin` for the agents of other hosts. Proposed rule
+  (question 3): these agents push their lot branch at the end of every turn
+  that created a commit; the radar only sees what is committed.
+* **When**: at each sweep pass (5 min), and only for what changed: a pair is
+  only recomputed if one of its two tips or the target moved (cache per triplet
+  of commits). A full pass costs 9 s on the largest project.
+* **What**, for open lots that have a branch:
+  1. the files touched since the merge base with the target;
+  2. the pairs touching a same file, the only ones submitted to `merge-tree`
+     (one conflict per pair), plus each lot against the target;
+  3. **probes** for what git does not see, declared per project: duplicate
+     migration numbers (ameesh `src/ameesh/migrations/NNNN_`, Nexlink its
+     migrations folder), same path created twice, number reserved by another
+     lot;
+  4. the result in the database (pair, commits, files, blocks, state `clean`,
+     `overlap`, `conflict`, `prepared`, `stale`), migration reserved at the
+     start of the lot.
+* **Listening**: implicit, each lot listens to the files of its own diff; no
+  subscription to maintain. Optionally, `ameesh work watch <lot> <chemin>`
+  declares a file one is about to touch, to be warned before having committed
+  (central file, migration number).
+* **To whom and how**, without needless wake-ups (L125):
+  * to the two assignees of the pair, by mail **linked to the lot** (`--lot`),
+    passive (new `radar` key among the passive keys): read at the next turn,
+    never a turn opened for it; also in the lot's thread and `ameesh work
+    show`;
+  * only on **state change** (new conflict, stale resolution, other lot
+    merged), once per pair and per pair of commits;
+  * a wake-up (ordinary mail, grouped over 90 s) only when the conflict
+    **blocks**: the other lot is merged or at the head of the queue and the
+    resolution is not ready; never `--urgent`;
+  * the orchestrator receives no per-pair mail: one line in `ameesh projects`
+    ("conflits prévus : n, préparés : p", conflicts expected: n, prepared: p)
+    and the `merge_blocked` alert when the head of the queue has been waiting
+    for a resolution for 30 min;
+  * never a human, except through this alert.
 
-## 3.2 Résolution préparée par l'agent concerné
+## 3.2 Resolution prepared by the agent concerned
 
-* **Qui** : pour chaque paire en conflit, un seul **résolveur**, celui des deux
-  lots qui fusionnera en second dans l'ordre prévu (3.3) ; à défaut, celui
-  dont le diff est le plus petit dans les fichiers en conflit. Le radar le dit
-  dans son courrier.
-* **Comment** : `ameesh work resolve <lot> --with <autre lot>` ouvre une
-  worktree jetable issue de la branche du lot, y fusionne la branche de l'autre
-  et laisse l'agent résoudre ; à la validation, le commit de résolution
-  (trailer `ameesh-resolution: <lot> <autre>`) est poussé sous une ref dédiée
-  (`refs/ameesh/resolutions/<lot>/<autre>`, ou une branche
-  `ameesh/resolve/<lot>-<autre>` si l'hébergeur refuse les refs hors
-  `refs/heads`) et enregistré en base. La branche du lot ne change pas : elle
-  reste la version **sans** l'autre, le commit de résolution est la version
-  **avec**.
-* **Validité** : le radar rejoue la fusion de la paire dans son clone, cache
-  amorcé par `rerere-train.sh` sur les commits de résolution ; si tout le
-  conflit est rejoué, la paire est `prepared`. Une nouvelle poussée qui change
-  les blocs en conflit la rend `stale`, et le résolveur est prévenu (passif).
-  Un rebase ne la périme pas tant que les blocs en conflit restent les mêmes :
-  `rerere` reconnaît le contenu, pas les commits.
-* **Quand** : au fil du travail, au tour suivant, pas au moment de la fusion :
-  l'agent connaît encore son code, et personne n'attend.
+* **Who**: for each conflicting pair, a single **resolver**, the one of the two
+  lots that will merge second in the planned order (3.3); failing that, the one
+  whose diff is smallest in the conflicting files. The radar says so in its
+  mail.
+* **How**: `ameesh work resolve <lot> --with <autre lot>` opens a throwaway
+  worktree from the lot's branch, merges the other's branch into it and lets
+  the agent resolve; on commit, the resolution commit (trailer
+  `ameesh-resolution: <lot> <autre>`) is pushed under a dedicated ref
+  (`refs/ameesh/resolutions/<lot>/<autre>`, or a branch
+  `ameesh/resolve/<lot>-<autre>` if the hosting service refuses refs outside
+  `refs/heads`) and recorded in the database. The lot's branch does not change:
+  it remains the version **without** the other, the resolution commit is the
+  version **with** it.
+* **Validity**: the radar replays the pair's merge in its clone, cache primed
+  by `rerere-train.sh` on the resolution commits; if the whole conflict is
+  replayed, the pair is `prepared`. A new push that changes the conflicting
+  blocks makes it `stale`, and the resolver is warned (passive). A rebase does
+  not make it stale as long as the conflicting blocks stay the same: `rerere`
+  recognises the content, not the commits.
+* **When**: as work goes on, at the next turn, not at merge time: the agent
+  still knows its code, and no one is waiting.
 
-## 3.3 Ordre de fusion choisi par ameesh
+## 3.3 Merge order chosen by ameesh
 
-* Une file par cible (dépôt et branche), en base. Un lot y entre quand il est
-  prêt : gel, GO de revue, CI verte, accord du propriétaire si la règle
-  l'exige ; par `ameesh work queue add <lot>` de l'orchestrateur, ce qui
-  remplace le « feu de fusion ». Un lot en file est gelé : son agent n'y pousse
-  plus sans l'en retirer.
-* **Ordre** : priorité d'abord (règle « fusionner d'abord ce qui débloque le
-  propriétaire »), puis les lots sans conflit, puis ceux dont les conflits sont
-  préparés, enfin l'arrivée. Un lot dont un conflit avec un lot qui le précède
-  n'est pas préparé recule d'un rang, et son résolveur est réveillé : le
-  conflit est devenu bloquant.
-* **Essai empilé** : avant chaque fusion, la cible plus les lots qui précèdent
-  plus celui-ci, résolutions rejouées ; un conflit non couvert sort le lot de la
-  file au lieu de bloquer les suivants.
+* One queue per target (repository and branch), in the database. A lot enters
+  it when it is ready: freeze, review GO, green CI, owner's approval if the
+  rule requires it; through `ameesh work queue add <lot>` by the orchestrator,
+  which replaces the "merge go-ahead". A queued lot is frozen: its agent no
+  longer pushes to it without removing it from the queue.
+* **Order**: priority first (rule "merge first what unblocks the owner"), then
+  lots without conflicts, then those whose conflicts are prepared, finally
+  arrival. A lot with an unprepared conflict with a lot ahead of it moves back
+  one rank, and its resolver is woken up: the conflict has become blocking.
+* **Stacked trial**: before each merge, the target plus the lots ahead plus
+  this one, resolutions replayed; an uncovered conflict removes the lot from
+  the queue instead of blocking the following ones.
 
-## 3.4 Fusion qui rejoue les résolutions
+## 3.4 Merge that replays the resolutions
 
-`ameesh work land <lot>`, lancé par l'exécuteur (pas par un tour d'agent) pour
-la tête de file :
+`ameesh work land <lot>`, launched by the runner (not by an agent turn) for the
+head of the queue:
 
-1. **verrou par cible** : une seule fusion à la fois, ce qui supprime les
-   fusions de rattrapage (29 chez Nexlink le 10/10) ;
-2. dans le clone du radar : `fetch`, worktree jetable sur la cible fraîche,
-   cache amorcé par les commits de résolution de ce lot ;
-3. fusion : `git merge --no-ff` du gel avec la ligne `ameesh-work: <id>`
-   (équipe qui fusionne en local), ou fusion de la cible dans la branche de la
-   PR (équipe à PR) ; `rerere` rejoue ; s'il reste un conflit, arrêt, le lot
-   sort de la file et son agent est réveillé ;
-4. **portes du projet** sur l'arbre fusionné (commande déclarée par projet :
-   tests ciblés, suites SQL, compilation) ; échec : même traitement ;
-5. poussée sans forcer ; PR : fusion par l'API une fois la CI verte ;
-6. notice dans le fil du lot (résolutions rejouées, auteurs, portes), lot fermé
-   par le relevé (L118), radar recalculé pour la file, lot suivant.
+1. **lock per target**: a single merge at a time, which removes catch-up
+   merges (29 at Nexlink on 10/10);
+2. in the radar's clone: `fetch`, throwaway worktree on the fresh target,
+   cache primed by this lot's resolution commits;
+3. merge: `git merge --no-ff` of the freeze with the `ameesh-work: <id>` line
+   (team that merges locally), or merge of the target into the PR branch
+   (PR-based team); `rerere` replays; if a conflict remains, stop, the lot
+   leaves the queue and its agent is woken up;
+4. **project gates** on the merged tree (command declared per project:
+   targeted tests, SQL suites, compilation); failure: same treatment;
+5. push without forcing; PR: merge through the API once CI is green;
+6. notice in the lot's thread (replayed resolutions, authors, gates), lot
+   closed by the sweep (L118), radar recomputed for the queue, next lot.
 
-Une fusion préparée ne demande ainsi **aucun tour d'agent**. Les gestes en
-production et les étiquettes de version restent hors de la file : ils suivent
-les règles de livraison d'ORCHESTRATEUR.md.
+A prepared merge thus requires **no agent turn**. Production operations and
+release tags stay outside the queue: they follow the delivery rules of
+ORCHESTRATEUR.md.
 
-## 3.5 Conventions « additives » à imposer dans les consignes
+## 3.5 "Additive" conventions to impose in the prompts
 
-Pour ameesh (CONTRIBUTING.md, consignes des agents) et pour Nexlink (sa
-consigne d'équipe) :
+For ameesh (CONTRIBUTING.md, agent prompts) and for Nexlink (its team
+prompt):
 
-1. **Ajouter un fichier plutôt que modifier un fichier partagé** : un module,
-   un test, une page de documentation par sujet.
-2. **Journaux en fragments** : un fichier par lot
-   (`docs/design/log.d/2026-10-11-l160.md`), assemblé par un script vérifié en
-   CI ; on n'écrit plus en tête de `log.md`. De même pour le journal de connaissances et la feuille
-   de route de Nexlink.
-   *Décision du propriétaire du 11/10 (lot L160a) : pas de fragments pour
-   ameesh, le journal tenu à la main `docs/design/log.md` est supprimé ;
-   l'historique, ce sont git et les descriptions des PR fusionnées.*
-3. **Index générés** depuis l'en-tête des fiches (index des décisions, des
-   études), jamais tenus à la main.
-4. **Listes** : un élément par ligne, virgule finale, rangées par ordre
-   alphabétique ou dans le groupe du sujet, jamais plusieurs éléments sur une
-   ligne (`ITEM_COLUMNS`, colonnes accordées par `role-superviseur.sql`).
-5. **Registres par découverte** : une alerte, une commande, une sonde se
-   déclarent dans leur propre module, pas dans une liste centrale (`main.py`,
-   `mesh_cli.py`, `exploitation.py`, `notify.py`).
-6. **Fichiers SQL de contrat découpés** par table ou par lot, assemblés dans
-   l'ordre ; traductions découpées par espace de noms (un fichier par
-   fonctionnalité et par langue).
-7. **Numéros réservés auprès d'ameesh** au début du lot (`ameesh work reserve
-   migration`, compteur en base, rattaché au lot), jamais « le suivant » ni un
-   commit de réservation sur la branche commune ; la sonde du radar vérifie.
-8. **Pas de remise en forme hors sujet** : déplacer ou reformater du code
-   partagé est un lot à part, annoncé par le radar et fusionné file vide.
-9. **Commiter et pousser souvent** : le radar ne voit que les commits.
+1. **Add a file rather than modify a shared file**: one module, one test, one
+   documentation page per topic.
+2. **Logs as fragments**: one file per lot
+   (`docs/design/log.d/2026-10-11-l160.md`), assembled by a script checked in
+   CI; no more writing at the top of `log.md`. Likewise for Nexlink's knowledge
+   log and roadmap.
+   *Owner's decision of 11/10 (lot L160a): no fragments for ameesh, the
+   hand-kept log `docs/design/log.md` is deleted; the history is git and the
+   descriptions of merged PRs.*
+3. **Generated indexes** from the cards' header (decisions index, studies
+   index), never kept by hand.
+4. **Lists**: one element per line, trailing comma, sorted alphabetically or
+   within the topic's group, never several elements on one line
+   (`ITEM_COLUMNS`, columns granted by `role-superviseur.sql`).
+5. **Registries by discovery**: an alert, a command, a probe are declared in
+   their own module, not in a central list (`main.py`, `mesh_cli.py`,
+   `exploitation.py`, `notify.py`).
+6. **Contract SQL files split** by table or by lot, assembled in order;
+   translations split by namespace (one file per feature and per language).
+7. **Numbers reserved with ameesh** at the start of the lot (`ameesh work
+   reserve migration`, counter in the database, attached to the lot), never
+   "the next one" nor a reservation commit on the shared branch; the radar's
+   probe checks.
+8. **No off-topic reformatting**: moving or reformatting shared code is a
+   separate lot, announced by the radar and merged with an empty queue.
+9. **Commit and push often**: the radar only sees commits.
 
-# 4. Lots de mise en œuvre
+# 4. Implementation lots
 
-Lettres plutôt que numéros, pour ne pas prendre de numéros que d'autres lots
-réservent (précédent : L31b, L73b). Migrations : réservées au début du lot qui
-en a besoin (règle 5 des orchestrateurs). Les durées sont du travail d'agent,
-revue comprise ; les dates supposent un agent ameesh disponible.
+Letters rather than numbers, so as not to take numbers that other lots reserve
+(precedent: L31b, L73b). Migrations: reserved at the start of the lot that
+needs them (orchestrators' rule 5). Durations are agent work, review included;
+the dates assume an available ameesh agent.
 
-| Lot | Contenu | Dépend de | Durée estimée | Date proposée |
+| Lot | Content | Depends on | Estimated duration | Proposed date |
 |---|---|---|---|---|
-| **L160a** — conventions et fragments ameesh | journal en fragments (`log.d/`, assemblage, contrôle CI), index des décisions et des études générés, `ITEM_COLUMNS` et listes une entrée par ligne, `merge.conflictStyle=zdiff3` posé par `ameesh doctor`, conventions dans CONTRIBUTING.md et les consignes ; fait file vide | — | 3 h | 12/10 |
-| **L160b** — radar en observation | clone privé par projet (objets partagés), passage après le relevé des branches, fichiers par lot, paires, `merge-tree`, sonde des migrations, table des paires (1 migration), `ameesh work radar`, ligne dans `ameesh projects` ; aucun courrier pendant 24 h, pour calibrer | — | 5 h | 12/10 |
-| **L160c** — courrier du radar | clé passive `radar` (L125), courrier lié au lot sur changement d'état, réveil seulement quand le conflit bloque, fil du lot, `work show`, `work watch` | L160b | 2 h | 13/10 |
-| **L160d** — résolutions préparées | `ameesh work resolve`, commits de résolution sous `refs/ameesh/resolutions/`, amorçage par `rerere-train.sh`, états `prepared` et `stale`, choix du résolveur | L160b | 5 h | 13/10 |
-| **L160e** — file et fusion par ameesh | file par cible (1 migration), ordre, essai empilé, `ameesh work queue`, `ameesh work land` (verrou, rejeu, portes déclarées, poussée sans forcer, PR par l'API), alerte `merge_blocked`, ORCHESTRATEUR.md sans « feu de fusion » | L160d | 6 h | 14/10 |
-| **L160f** — Nexlink | conventions dans sa consigne, traductions et registre des réservations découpés, journal en fragments, portes déclarées, file ameesh à la place du feu de fusion ; pilote une journée | L160e, accord de l'orchestrateur Nexlink | 4 h et 1 jour de pilote | 15/10 |
-| **L160g** — pilote syntaxique | mergiraf rejoué sur les 103 fusions en conflit mesurées ; adoption par langage (Python, TypeScript, JSON) seulement si aucune résolution fausse | — | 2 h | 13/10 |
-| **L160h** — mesure du gain | scripts de mesure de cette étude dans `scripts/` (rejeu, reflogs, courrier), rapport à J+7 | L160e | 1 h | 19/10 |
+| **L160a** — ameesh conventions and fragments | log as fragments (`log.d/`, assembly, CI check), generated decisions and studies indexes, `ITEM_COLUMNS` and lists one entry per line, `merge.conflictStyle=zdiff3` set by `ameesh doctor`, conventions in CONTRIBUTING.md and the prompts; done with an empty queue | — | 3 h | 12/10 |
+| **L160b** — radar in observation mode | private clone per project (shared objects), pass after the branch sweep, files per lot, pairs, `merge-tree`, migrations probe, pairs table (1 migration), `ameesh work radar`, line in `ameesh projects`; no mail for 24 h, to calibrate | — | 5 h | 12/10 |
+| **L160c** — radar mail | passive `radar` key (L125), mail linked to the lot on state change, wake-up only when the conflict blocks, lot thread, `work show`, `work watch` | L160b | 2 h | 13/10 |
+| **L160d** — prepared resolutions | `ameesh work resolve`, resolution commits under `refs/ameesh/resolutions/`, priming by `rerere-train.sh`, `prepared` and `stale` states, choice of the resolver | L160b | 5 h | 13/10 |
+| **L160e** — queue and merge by ameesh | queue per target (1 migration), order, stacked trial, `ameesh work queue`, `ameesh work land` (lock, replay, declared gates, push without forcing, PR through the API), `merge_blocked` alert, ORCHESTRATEUR.md without "merge go-ahead" | L160d | 6 h | 14/10 |
+| **L160f** — Nexlink | conventions in its prompt, translations and reservations registry split, log as fragments, declared gates, ameesh queue instead of the merge go-ahead; one-day pilot | L160e, approval of the Nexlink orchestrator | 4 h and 1 pilot day | 15/10 |
+| **L160g** — syntactic driver | mergiraf replayed on the 103 measured conflicting merges; adoption per language (Python, TypeScript, JSON) only if no wrong resolution | — | 2 h | 13/10 |
+| **L160h** — gain measurement | this study's measurement scripts in `scripts/` (replay, reflogs, mail), report at D+7 | L160e | 1 h | 19/10 |
 
-Total : 28 h de travail d'agent et une journée de pilote. Ordre conseillé :
-L160a et L160b le même jour, puis L160c, L160d et L160g, puis L160e, puis
-L160f ; L160h une semaine après.
+Total: 28 h of agent work and one pilot day. Recommended order: L160a and
+L160b on the same day, then L160c, L160d and L160g, then L160e, then L160f;
+L160h one week later.
 
-## Gain attendu
+## Expected gain
 
-Base : les mesures ci-dessus, refaites par L160h avec les mêmes scripts.
+Baseline: the measurements above, redone by L160h with the same scripts.
 
-| Mesure | Avant (10/10) | Après L160a | Après L160e (L160f pour Nexlink) |
+| Measure | Before (10/10) | After L160a | After L160e (L160f for Nexlink) |
 |---|---|---|---|
-| ameesh : PR qui demandent une résolution à la main au moment de la fusion | 11 sur 18 | environ 7 (−40 % : les fusions qui n'avaient que des ajouts disparaissent, 4 sur 10 cette nuit-là, 9 sur 27 depuis le 05/10) | 2 au plus (conflits non préparés) |
-| ameesh : résolutions à la main sur une nuit de ce type | 19 | environ 11 | 3 au plus au moment de la fusion ; les autres préparées au fil du travail |
-| Nexlink : fusions de rattrapage | 29 en 16 h | inchangé | 0 (verrou par cible) |
-| Nexlink : délai du feu à develop | médiane 39 min, 3e quartile 76 min | inchangé | médiane 10 min, 3e quartile 25 min (portes et poussée) |
-| Nexlink : messages sur la fusion | 382 sur 1 345 en 4 h (28 %) | inchangé | moins de 150 (restent les rapports de revue) |
-| Nexlink : messages de fusion de l'orchestrateur | 76 en 4 h | inchangé | moins de 10 (entrée en file, exceptions) |
-| Coût du radar | — | — | moins de 10 s de calcul toutes les 5 min sur le plus gros projet |
+| ameesh: PRs needing a resolution by hand at merge time | 11 out of 18 | about 7 (−40%: merges that had only additions disappear, 4 out of 10 that night, 9 out of 27 since 05/10) | 2 at most (unprepared conflicts) |
+| ameesh: resolutions by hand over a night of this kind | 19 | about 11 | 3 at most at merge time; the others prepared as work goes on |
+| Nexlink: catch-up merges | 29 in 16 h | unchanged | 0 (lock per target) |
+| Nexlink: delay from go-ahead to develop | median 39 min, 3rd quartile 76 min | unchanged | median 10 min, 3rd quartile 25 min (gates and push) |
+| Nexlink: messages about merging | 382 out of 1,345 in 4 h (28%) | unchanged | fewer than 150 (review reports remain) |
+| Nexlink: orchestrator's merge messages | 76 in 4 h | unchanged | fewer than 10 (queue entry, exceptions) |
+| Radar cost | — | — | less than 10 s of computation every 5 min on the largest project |
 
-Hypothèses : la moitié des blocs en conflit sont des ajouts, et les
-conventions les suppriment au lieu de les résoudre ; les conflits restants sont
-préparés au tour suivant de leur résolveur, avant que l'autre lot fusionne, dans
-neuf cas sur dix ; la fusion d'un lot en tête de file prend le temps de ses
-portes (8 min mesurées). Les conflits sémantiques ne baissent pas ; ils
-continuent d'être pris par les portes sur l'arbre fusionné, désormais dans
-l'ordre réel de fusion.
+Assumptions: half of the conflicting blocks are additions, and the conventions
+remove them instead of resolving them; the remaining conflicts are prepared at
+their resolver's next turn, before the other lot merges, in nine cases out of
+ten; merging a lot at the head of the queue takes the time of its gates (8 min
+measured). Semantic conflicts do not decrease; they keep being caught by the
+gates on the merged tree, now in the actual merge order.
 
-## Garde-fous
+## Safeguards
 
-* Une résolution rejouée peut être fausse : portes du projet sur l'arbre
-  fusionné à chaque fusion, résolution attribuée à son auteur dans la notice,
-  commit relisible.
-* Le radar ne fusionne jamais rien : il calcule dans son clone et prévient.
-* Une équipe qui n'a pas déclaré ses portes garde sa fusion à la main : la file
-  ordonne, l'agent fusionne.
-* Une fusion à la main reste possible en urgence (humain, orchestrateur) : elle
-  passe, et le radar recalcule la file.
-* Le dépôt public ameesh ne reçoit en refs de résolution que du code déjà
-  public par les branches des PR.
+* A replayed resolution can be wrong: project gates on the merged tree at each
+  merge, resolution attributed to its author in the notice, reviewable commit.
+* The radar never merges anything: it computes in its clone and warns.
+* A team that has not declared its gates keeps merging by hand: the queue
+  orders, the agent merges.
+* A merge by hand remains possible in an emergency (human, orchestrator): it
+  goes through, and the radar recomputes the queue.
+* The public ameesh repository only receives, as resolution refs, code already
+  made public by the PR branches.
 
-# Questions au propriétaire
+# Questions for the owner
 
-1. ameesh garde-t-il la fusion par squash de GitHub ? La fusion par ameesh
-   intègre alors `main` dans la branche de la PR avant de la fusionner par
-   l'API. La file de GitHub, disponible pour ce dépôt public, n'est pas
-   nécessaire tant que la CI dure moins de 5 min.
-2. Nexlink confie-t-il l'exécution de ses fusions à ameesh (portes lancées par
-   l'exécuteur, pas par un agent) ? Sans cela, L160f se limite à l'ordre et aux
-   résolutions préparées.
-3. Les agents des autres hôtes poussent-ils leur branche de lot à chaque fin de
-   tour qui a créé un commit ? Sans cela, le radar ne voit leur travail qu'au
-   gel.
+1. Does ameesh keep GitHub's squash merge? Merging by ameesh then integrates
+   `main` into the PR branch before merging it through the API. GitHub's
+   queue, available for this public repository, is not needed as long as CI
+   takes less than 5 min.
+2. Does Nexlink entrust the execution of its merges to ameesh (gates launched
+   by the runner, not by an agent)? Without that, L160f is limited to the order
+   and the prepared resolutions.
+3. Do the agents of other hosts push their lot branch at the end of every turn
+   that created a commit? Without that, the radar only sees their work at
+   freeze.

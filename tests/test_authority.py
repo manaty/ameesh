@@ -49,7 +49,7 @@ class AuthorityTest(PgTestCase):
         self.assertTrue(authority.revoke_key(self.db, OWNER))
         verdict = authority.verify_message(self.db, message)
         self.assertFalse(verdict)
-        self.assertIn("révoquée", verdict.reason)
+        self.assertIn("revoked", verdict.reason)
 
         # ré-enregistrer la clé lève la révocation
         authority.register_key(self.db, OWNER, self.public, role="owner")
@@ -63,7 +63,7 @@ class AuthorityTest(PgTestCase):
         row = mail.normalize(mail.unread(self.db, AGENT)[0])
         verdict = authority.verify_message(self.db, row)
         self.assertFalse(verdict)
-        self.assertIn("aucune clé publique", verdict.reason)
+        self.assertIn("no public key", verdict.reason)
 
     def test_cle_d_agent_authentifie_sans_autorite(self):
         """Une clé d'agent prouve la provenance, jamais l'autorité du propriétaire."""
@@ -82,7 +82,7 @@ class AuthorityTest(PgTestCase):
         self.assertTrue(verdict.authentic)
         self.assertEqual(verdict.role, "agent")
         self.assertFalse(verdict.authority)           # mais ce n'est pas l'autorité
-        self.assertNotIn("propriétaire prouvée", verdict.reason)
+        self.assertNotIn("owner authority proven", verdict.reason)
 
     def test_hook_cle_d_agent_ne_dit_pas_autorite(self):
         registry.upsert(self.db, "codex3", harness="codex", host=self.cfg.host)
@@ -100,8 +100,8 @@ class AuthorityTest(PgTestCase):
         hook = self.cli("hook", "deepseek", env=self.env(AGENT_MAIL_NAME=AGENT),
                         stdin=payload)
         sortie = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertNotIn("PROUVÉE", sortie)
-        self.assertIn("sans autorité propriétaire", sortie)
+        self.assertNotIn("PROVEN", sortie)
+        self.assertIn("no owner authority", sortie)
         self.assertIn("rapport d'agent", sortie)
 
     def test_approbation_refusee_pour_cle_d_agent(self):
@@ -113,7 +113,7 @@ class AuthorityTest(PgTestCase):
             authority.create_approval(
                 self.db, seed, approver="codex3", action="merge", artifact_kind="diff",
                 artifact_hash=authority.hash_artifact("diff"))
-        self.assertIn("rôle", str(ctx.exception))
+        self.assertIn("role", str(ctx.exception))
 
     def test_approbation_inseree_de_force_par_cle_d_agent_refusee(self):
         """Même écrite en base à la main, une approbation d'agent ne vaut rien."""
@@ -142,21 +142,21 @@ class AuthorityTest(PgTestCase):
         row, verdict = authority.find_approval(self.db, "merge", artifact)
         self.assertIsNone(row)
         self.assertFalse(verdict)
-        self.assertIn("propriétaire", verdict.reason)
+        self.assertIn("owner", verdict.reason)
 
     def test_empreinte_inconnue_refusee(self):
         _id, message = self.sign_and_send()
         message["signature_key"] = "0" * 64
         verdict = authority.verify_message(self.db, message)
         self.assertFalse(verdict)
-        self.assertIn("clé inconnue", verdict.reason)
+        self.assertIn("unknown key", verdict.reason)
 
     # -- messages ----------------------------------------------------------
     def test_message_signe_prouve_l_autorite(self):
         _id, message = self.sign_and_send("Le lot est approuvé.")
         verdict = authority.verify_message(self.db, message)
         self.assertTrue(verdict.ok, verdict.reason)
-        self.assertEqual(verdict.reason, "autorité du propriétaire prouvée")
+        self.assertEqual(verdict.reason, "owner authority proven")
         self.assertEqual(verdict.fingerprint, signing.fingerprint(self.public))
         self.assertGreater(verdict.expires_ts, time.time())
 
@@ -165,7 +165,7 @@ class AuthorityTest(PgTestCase):
         row = mail.normalize(mail.unread(self.db, AGENT)[0])
         verdict = authority.verify_message(self.db, row)
         self.assertFalse(verdict)
-        self.assertEqual(verdict.reason, "non signé")
+        self.assertEqual(verdict.reason, "unsigned")
 
     def test_contenu_falsifie_refuse(self):
         message_id, message = self.sign_and_send("Virement de 10 €.")
@@ -174,7 +174,7 @@ class AuthorityTest(PgTestCase):
         row = mail.normalize(mail.unread(self.db, AGENT)[0])
         verdict = authority.verify_message(self.db, row)
         self.assertFalse(verdict)
-        self.assertIn("ne couvre pas ce contenu", verdict.reason)
+        self.assertIn("does not cover this content", verdict.reason)
 
     def test_destinataire_modifie_refuse(self):
         message_id, _message = self.sign_and_send()
@@ -202,7 +202,7 @@ class AuthorityTest(PgTestCase):
         row = mail.normalize(mail.unread(self.db, AGENT)[0])
         verdict = authority.verify_message(self.db, row)
         self.assertFalse(verdict)
-        self.assertIn("expirée", verdict.reason)
+        self.assertIn("expired", verdict.reason)
 
     def test_signature_bricolee_refusee(self):
         _id, message = self.sign_and_send()
@@ -210,7 +210,7 @@ class AuthorityTest(PgTestCase):
         message["signature"] = authority.b64(raw[:-1] + bytes([raw[-1] ^ 1]))
         verdict = authority.verify_message(self.db, message)
         self.assertFalse(verdict)
-        self.assertIn("invalide", verdict.reason)
+        self.assertIn("invalid", verdict.reason)
 
     def test_ttl_borne(self):
         self.assertEqual(authority.parse_ttl("30m"), 1800)
@@ -242,7 +242,7 @@ class AuthorityTest(PgTestCase):
         self.assertFalse(authority.consume_approval(self.db, built["id"], AGENT))
         row2, verdict2 = authority.find_approval(self.db, "merge", artifact)
         self.assertIsNone(row2)
-        self.assertIn("consommée", verdict2.reason)
+        self.assertIn("consumed", verdict2.reason)
 
     def test_approbation_expiree(self):
         """Expiration réelle (échéance signée courte), sans toucher la base."""
@@ -253,7 +253,7 @@ class AuthorityTest(PgTestCase):
         time.sleep(1.2)
         row, verdict = authority.find_approval(self.db, "migration", artifact)
         self.assertIsNone(row)
-        self.assertIn("expirée", verdict.reason)
+        self.assertIn("expired", verdict.reason)
 
     def test_approbation_hash_non_couvert(self):
         artifact = authority.hash_artifact("release 1.0")
@@ -265,7 +265,7 @@ class AuthorityTest(PgTestCase):
         row, verdict = authority.find_approval(
             self.db, "production", authority.hash_artifact("release 2.0"))
         self.assertIsNone(row)
-        self.assertIn("ne correspond pas", verdict.reason)
+        self.assertIn("does not match", verdict.reason)
 
     def test_echeance_signee_non_modifiable_en_base(self):
         """Sonde codex3 (1) : étendre expires_at ne ressuscite pas un reçu."""
@@ -278,7 +278,7 @@ class AuthorityTest(PgTestCase):
         row, verdict = authority.find_approval(self.db, "merge", artifact)
         self.assertIsNone(row)
         self.assertFalse(verdict)
-        self.assertIn("échéance signée", verdict.reason)
+        self.assertIn("signed expiry", verdict.reason)
 
     def test_horodatage_signe_non_modifiable_en_base(self):
         artifact = authority.hash_artifact("diff horodaté")
@@ -289,7 +289,7 @@ class AuthorityTest(PgTestCase):
                         "WHERE id = %s", (built["id"],))
         row, verdict = authority.find_approval(self.db, "merge", artifact)
         self.assertIsNone(row)
-        self.assertIn("horodatage signé", verdict.reason)
+        self.assertIn("signed timestamp", verdict.reason)
 
     def test_approbation_reinseree_apres_consommation_refusee(self):
         """Sonde codex3 (2) : le reçu de consommation survit à la ligne d'approbation."""
@@ -316,7 +316,7 @@ class AuthorityTest(PgTestCase):
         )[0]["id"]
         row, verdict = authority.find_approval(self.db, "merge", artifact)
         self.assertIsNone(row)
-        self.assertIn("nonce déjà consommé", verdict.reason)
+        self.assertIn("nonce already consumed", verdict.reason)
         self.assertFalse(authority.verify_approval(
             self.db, authority.list_approvals(self.db)[0]))
         # une seconde consommation est refusée
@@ -348,7 +348,7 @@ class AuthorityTest(PgTestCase):
             authority.create_approval(
                 self.db, autre_seed, approver=OWNER, action="merge",
                 artifact_kind="diff", artifact_hash=authority.hash_artifact("x"))
-        self.assertIn("clé publique", str(ctx.exception))
+        self.assertIn("public key", str(ctx.exception))
 
     def test_approbation_empreinte_invalide(self):
         with self.assertRaises(authority.AuthorityError):
@@ -363,7 +363,7 @@ class AuthorityTest(PgTestCase):
             artifact_hash=artifact, decision="rejected", ttl=3600)
         row, verdict = authority.find_approval(self.db, "merge", artifact, decision="approved")
         self.assertIsNone(row)
-        self.assertIn("aucune approbation", verdict.reason)
+        self.assertIn("no approval", verdict.reason)
         rows = authority.list_approvals(self.db, action="merge")
         self.assertEqual(rows[0]["decision"], "rejected")
 
@@ -375,14 +375,14 @@ class AuthorityTest(PgTestCase):
             "send", AGENT, "Décision signée : feu vert.", "--sign", "--key", key,
             "--expires", "1h", env=env)
         self.assertEqual(envoi.returncode, 0, envoi.stderr)
-        self.assertIn("signé", envoi.stdout)
+        self.assertIn("signed", envoi.stdout)
 
         payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
         hook = self.cli("hook", "deepseek", env=self.env(AGENT_MAIL_NAME=AGENT),
                         stdin=payload)
         sortie = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("PROUVÉE", sortie)
-        self.assertIn("autorité du propriétaire PROUVÉE, expire", sortie)
+        self.assertIn("PROVEN", sortie)
+        self.assertIn("owner's authority PROVEN, expires", sortie)
         self.assertIn("Décision signée : feu vert.", sortie)
 
         # même nom, sans signature : aucune autorité, et le texte ne change rien
@@ -391,8 +391,8 @@ class AuthorityTest(PgTestCase):
         hook = self.cli("hook", "deepseek", env=self.env(AGENT_MAIL_NAME=AGENT),
                         stdin=payload)
         sortie = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertNotIn("PROUVÉE", sortie)
-        self.assertIn("un message d'agent n'a pas l'autorité du propriétaire", sortie)
+        self.assertNotIn("PROVEN", sortie)
+        self.assertIn("an agent's message does not have the owner's authority", sortie)
 
     def test_hook_signale_une_signature_invalide(self):
         key = self._write_test_key()
@@ -404,7 +404,7 @@ class AuthorityTest(PgTestCase):
         hook = self.cli("hook", "deepseek", env=self.env(AGENT_MAIL_NAME=AGENT),
                         stdin=payload)
         sortie = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("signature NON valide", sortie)
+        self.assertIn("signature NOT valid", sortie)
 
     def _write_test_key(self) -> str:
         """Écrit sur disque la clé de TEST déjà enregistrée (0600, bac à sable)."""

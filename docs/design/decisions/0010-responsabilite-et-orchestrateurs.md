@@ -1,27 +1,27 @@
 ---
 type: Decision
-title: "Responsabilité humaine, projets vivants, orchestrateurs multiples"
-description: "Tout agent a un humain responsable ; un projet peut se scinder ; un humain peut avoir plusieurs orchestrateurs et un projet plusieurs humains. mesh-design devient l'orchestrateur d'ameesh."
+title: "Human responsibility, living projects, multiple orchestrators"
+description: "Every agent has a responsible human; a project can split; a human can have several orchestrators and a project several humans. mesh-design becomes the ameesh orchestrator."
 status: stable
 tags: [organisation, orchestrateur, projets]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Le propriétaire travaillait avec l'orchestrateur de Nexlink, puis directement avec la session mesh-design ; le projet ameesh a été séparé de Nexlink et mesh-design en est devenu l'orchestrateur.
+The owner was working with the Nexlink orchestrator, then directly with the mesh-design session; the ameesh project was separated from Nexlink and mesh-design became its orchestrator.
 
-# Décision
+# Decision
 
-- **Un orchestrateur est toujours sous la responsabilité d'un humain** : c'est fondamental, et vaut pour tout agent.
-- **mesh-design est l'orchestrateur du projet indépendant ameesh** ; l'orchestrateur Nexlink reste celui de Nexlink.
-- Le modèle doit permettre **plusieurs orchestrateurs par humain responsable** et **plusieurs humains travaillant en simultané sur un projet**.
+- **An orchestrator is always under the responsibility of a human**: this is fundamental, and holds for every agent.
+- **mesh-design is the orchestrator of the independent ameesh project**; the Nexlink orchestrator remains that of Nexlink.
+- The model must allow **several orchestrators per responsible human** and **several humans working simultaneously on a project**.
 
-# Conséquences
+# Consequences
 
-- R14 responsabilité humaine ; R15 projets vivants (création, scission avec filiation, dépendances, agents partagés) ; R16 décisions enregistrées dans le canon sans relais ; R17 une file des décisions en attente par humain, tous projets confondus.
-- Les décisions contraires de deux humains habilités remontent au rôle d'arbitre de la fédération ; un agent ne tranche jamais.
-- Agents partagés entre projets (codex3) : allocation par règle déclarée dans le canon, sinon par l'humain responsable.
+- R14 human responsibility; R15 living projects (creation, split with lineage, dependencies, shared agents); R16 decisions recorded in the canon without relay; R17 one queue of pending decisions per human, across all projects.
+- Conflicting decisions from two authorised humans go up to the federation's arbiter role; an agent never decides between them.
+- Agents shared between projects (codex3): allocation by a rule declared in the canon, otherwise by the responsible human.

@@ -9,8 +9,11 @@ réimporté comme état — au plus signalé comme **proposition**.
 `ameesh work sync-github --repo R` (lecture seule de GitHub)
     lit les PR fusionnées (`gh pr list --state merged`) et ferme les lots
     qu'elles référencent : branche `lot/<id>` ou `lot/<id>-…` (identifiant
-    de fiche ; la plus longue correspondance l'emporte), ou ligne
-    `ameesh-lot: <id>` dans le corps. Une ligne `ameesh-work: <n>` désigne un
+    de fiche ; la plus longue correspondance l'emporte ; L118b : sans fiche
+    de ce nom, un `<id>` numérique est le lot de ce numéro), ou ligne
+    `ameesh-lot: <id>` dans le corps. Une ligne `ameesh-work-partial: <n>`
+    (L118b) retire le lot n : la PR n'en livre qu'une partie. Une ligne
+    `ameesh-work: <n>` désigne un
     lot précis (`work_items`) : la PR ne ferme alors que ceux-là ; L126 : un
     mot-clé de fermeture de GitHub (« Closes #12 ») désigne de même le lot
     dont l'issue est #12 (son `issue_ref`). Seuls les
@@ -72,12 +75,14 @@ from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
 from .connectors.git_merge import resolve_gh
-from .plan_git import WORK_TRAILER_RE
+from .plan_git import WORK_TRAILER_RE, partial_lots, short_branch
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$")
 _LOT_LINE_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-lot[ \t]*:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$")
 #: une ligne `ameesh-work: <n>` (même forme dans un commit de fusion : `plan_git`)
 _WORK_LINE_RE = WORK_TRAILER_RE
+#: L118b : une branche de PR `lot/<id>` ou `lot/<id>-…` (id numérique d'un lot)
+LOT_HEAD_RE = re.compile(r"^lot/([1-9][0-9]{0,17})(?:-|$)")
 _MARKER_RE = re.compile(r"<!-- ameesh:package=([A-Za-z0-9][A-Za-z0-9._-]*)(?: d=([0-9a-f.]*))? -->")
 
 #: labels d'état d'une issue de lot
@@ -100,7 +105,7 @@ class GithubError(RuntimeError):
 
 def check_repo(repo: str) -> str:
     if not _REPO_RE.fullmatch(repo or ""):
-        raise GithubError("dépôt « owner/repo » attendu, pas %r" % (repo,))
+        raise GithubError("repository \"owner/repo\" expected, not %r" % (repo,))
     return repo
 
 
@@ -118,7 +123,7 @@ class Gh:
         try:
             self.path = resolve_gh(gh, self.env)
         except ConnectorError as exc:
-            raise GithubError(str(exc).replace("git-merge : ", "")) from exc
+            raise GithubError(re.sub(r"^git-merge ?: ", "", str(exc))) from exc
         self.timeout = float(timeout)
 
     def run(self, argv: list[str], stdin: str | None = None) -> tuple[int, str, str]:
@@ -126,7 +131,7 @@ class Gh:
             proc = subprocess.run([self.path, *argv], input=stdin, capture_output=True,
                                   text=True, timeout=self.timeout, env=self.env)
         except subprocess.TimeoutExpired:
-            return 124, "", "délai dépassé (%ss)" % self.timeout
+            return 124, "", "timed out (%ss)" % self.timeout
         except OSError as exc:
             return 127, "", str(exc)
         return proc.returncode, proc.stdout, proc.stderr
@@ -135,7 +140,7 @@ class Gh:
 def _call(gh, argv: list[str], stdin: str | None = None) -> str:
     code, out, err = gh.run(argv, stdin)
     if code != 0:
-        raise GithubError("gh %s : code %d : %s" % (
+        raise GithubError("gh %s: exit code %d: %s" % (
             " ".join(argv[:3]), code, " ".join((err or out or "—").split())[:300]))
     return out
 
@@ -145,7 +150,7 @@ def _json(gh, argv: list[str], stdin: str | None = None):
     try:
         return json.loads(out) if out.strip() else None
     except ValueError as exc:
-        raise GithubError("gh %s : réponse illisible" % " ".join(argv[:3])) from exc
+        raise GithubError("gh %s: unreadable response" % " ".join(argv[:3])) from exc
 
 
 def _lines(gh, argv: list[str]) -> list[dict]:
@@ -157,7 +162,7 @@ def _lines(gh, argv: list[str]) -> list[dict]:
             try:
                 rows.append(json.loads(line))
             except ValueError as exc:
-                raise GithubError("gh %s : ligne illisible" % " ".join(argv[:3])) from exc
+                raise GithubError("gh %s: unreadable line" % " ".join(argv[:3])) from exc
     return rows
 
 
@@ -229,9 +234,10 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     """Ferme les lots dont la PR est fusionnée. Rend le compte rendu."""
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
-                     "--json", "number,headRefName,body,state,mergeCommit,mergedBy,mergedAt,url"])
+                     "--json", "number,headRefName,isCrossRepository,body,state,mergeCommit,mergedBy,"
+                     "mergedAt,url"])
     if not isinstance(prs, list):
-        raise GithubError("gh pr list : liste attendue")
+        raise GithubError("gh pr list: list expected")
     st = storage.of(db)
     idents = [p["id"] for p in st.packages.all() if p.get("kind") in work_mod.LINKABLE_KINDS]
     results: list[dict] = []
@@ -254,25 +260,38 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
             explicit = sorted(set(explicit) | {lot for issue in closes
                                                for lot in by_issue.get(issue.casefold(), ())})
         packages = packages_of_pr(pr, idents)
+        if not explicit and not packages:
+            # L118b : `lot/<id>-…` sans fiche de ce nom désigne le lot <id>
+            # #312 r1 : seulement une branche du dépôt même (pas d'un fork),
+            # et la branche enregistrée du lot s'il en porte une
+            head = LOT_HEAD_RE.match(pr.get("headRefName") or "")
+            if head and pr.get("isCrossRepository") is False:
+                item = work_mod.get(db, int(head.group(1)))
+                if item is None or not item.get("branch") \
+                        or short_branch(item["branch"]) == pr["headRefName"]:
+                    explicit = [int(head.group(1))]
         if explicit:
             targets = [(i, None) for i in explicit]
         else:
             targets = [(int(item["id"]), pid) for pid in packages
                        for item in st.work.by_package(pid)]
+        # L118b : une PR qui ne livre qu'une partie d'un lot ne le ferme pas
+        partial = partial_lots(pr.get("body"))
+        targets = [(i, pid) for i, pid in targets if i not in partial]
         for item_id, pid in targets:
             item = work_mod.get(db, item_id)
             entry = {"pr": ref, "work_item": item_id, "package": pid or (item or {}).get(
                 "package_id"), "sha": sha or None, "merged_by": login}
             if item is None:
-                entry.update(result="unknown", detail="lot #%d introuvable" % item_id)
+                entry.update(result="unknown", detail="work item #%d not found" % item_id)
             elif merged_ts is not None and item.get("created_ts") \
                     and float(item["created_ts"]) > merged_ts:
-                entry.update(result="later", detail="lot créé après la fusion : non fermé")
+                entry.update(result="later", detail="work item created after the merge: not closed")
             elif dry_run:
                 state = item["state"]
                 entry.update(result=("already" if state in work_mod.MERGED_STATES else
                                      "refused" if state == "closed" else "would-merge"),
-                             detail="%s (essai)" % state)
+                             detail="%s (dry run)" % state)
             else:
                 done = work_mod.close_merged(
                     db, item_id, sha=sha or "", actor="github:%s" % login if login else "github",
@@ -311,7 +330,7 @@ def _fields(title: str, body: str, labels: Iterable, state: str, marker_re=None)
 
 
 _FIELD_NAMES = ("title", "body", "labels", "state")
-_FIELD_FR = {"title": "titre", "body": "corps", "labels": "labels ameesh", "state": "état"}
+_FIELD_FR = {"title": "title", "body": "body", "labels": "ameesh labels", "state": "state"}
 
 
 def _stamp(fields: dict) -> str:
@@ -363,9 +382,9 @@ def lot_state(items: list[dict]) -> tuple[str | None, str]:
     return "intake", "open"
 
 
-_HEADER = ("_Vue projetée par ameesh : la source est le canon (fiche ci-dessous) et "
-           "l'état d'ameesh. Une modification faite ici n'est pas reprise ; elle est "
-           "signalée comme proposition — portez-la au canon par une PR._")
+_HEADER = ("_View projected by ameesh: the source is the canon (package below) and "
+           "the state of ameesh. A change made here is not imported; it is "
+           "reported as a proposal: carry it to the canon through a PR._")
 
 
 @dataclass
@@ -398,13 +417,14 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
         epic = plan_mod.epic_of(pid, by_id)
         body = "\n".join([
             _HEADER, "",
-            "- Fiche : %s" % fiche_link(p.get("canon_ref"), canon_url),
-            "- Epic : %s" % ("`%s`" % epic if epic else "—"),
-            "- Responsable : %s" % (p.get("responsible") or "—"),
-            "- État ameesh : %s%s" % (
-                label or "fermé (abandonné)",
-                " — lots %s" % ", ".join("#%s %s" % (i["id"], i["state"]) for i in lots)
-                if lots else " — aucun lot ouvert"),
+            "- Package: %s" % fiche_link(p.get("canon_ref"), canon_url),
+            "- Epic: %s" % ("`%s`" % epic if epic else "—"),
+            "- Owner: %s" % (p.get("responsible") or "—"),
+            "- ameesh state: %s%s" % (
+                label or "closed (abandoned)",
+                "; work items %s" % ", ".join("#%s %s" % (i["id"], i["state"])
+                                              for i in lots)
+                if lots else "; no open work item"),
         ])
         out.append(Desired(
             ident=pid, kind="lot", title="[%s] %s" % (pid, p.get("title") or pid), body=body,
@@ -418,12 +438,12 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
         done = e["lots_total"] and e["lots_merged"] == e["lots_total"] - e["lots_abandoned"]
         body = "\n".join([
             _HEADER, "",
-            "- Fiche : %s" % fiche_link(p.get("canon_ref"), canon_url),
-            "- Jalon : %s" % ("`%s`" % e["milestone"] if e["milestone"] else "—"),
-            "- Responsable : %s" % (p.get("responsible") or "—"),
-            "- Progression : %d/%d lots fusionnés%s" % (
+            "- Package: %s" % fiche_link(p.get("canon_ref"), canon_url),
+            "- Milestone: %s" % ("`%s`" % e["milestone"] if e["milestone"] else "—"),
+            "- Owner: %s" % (p.get("responsible") or "—"),
+            "- Progress: %d/%d work items merged%s" % (
                 e["lots_merged"], e["lots_total"] - e["lots_abandoned"],
-                " (%d abandonné(s))" % e["lots_abandoned"] if e["lots_abandoned"] else ""),
+                " (%d abandoned)" % e["lots_abandoned"] if e["lots_abandoned"] else ""),
         ])
         out.append(Desired(
             ident=pid, kind="epic", title="[%s] %s" % (pid, p.get("title") or pid), body=body,
@@ -435,9 +455,9 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
 
 
 def _with_tasks(view: Desired, numbers: dict) -> str:
-    lines = [view.body, "", "Lots :"]
+    lines = [view.body, "", "Work items:"]
     for lot, merged in view.tasks:
-        ref = "#%s" % numbers[lot] if lot in numbers else "`%s` (issue à créer)" % lot
+        ref = "#%s" % numbers[lot] if lot in numbers else "`%s` (issue to create)" % lot
         lines.append("- [%s] %s" % ("x" if merged else " ", ref))
     return "\n".join(lines)
 
@@ -457,7 +477,7 @@ class _Repo:
         key = name.split(":", 1)[1] if ":" in name else ""
         _json(self.gh, ["api", "-X", "POST", "repos/%s/labels" % self.repo, "--input", "-"],
               json.dumps({"name": name, "color": LABEL_COLORS.get(key, "ededed"),
-                          "description": description or "projection ameesh (L29)"}))
+                          "description": description or "ameesh projection (L29)"}))
 
     def info(self) -> dict | None:
         """Le dépôt (`gh api repos/R`), ou None s'il est illisible (L126)."""
@@ -568,7 +588,7 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
         found[ident] = dict(issue, _recorded=match.group(2))
         if ident not in present:
             report["orphans"].append({"package": ident, "number": issue.get("number"),
-                                      "detail": "fiche absente du plan : issue laissée telle quelle"})
+                                      "detail": "package missing from the plan: issue left as is"})
 
     numbers: dict[str, int] = {}
     ids: dict[str, int] = {}
@@ -585,8 +605,8 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
                 report["proposals"].append({
                     "package": view.ident, "number": issue.get("number"),
                     "fields": edited,
-                    "detail": "modifié dans GitHub (%s) : proposition à porter au canon ; "
-                              "la vue est réécrite depuis ameesh"
+                    "detail": "edited in GitHub (%s): proposal to carry to the canon; "
+                              "the view is rewritten from ameesh"
                               % ", ".join(_FIELD_FR[k] for k in edited)})
             want = _fields(view.title, body, view.labels, view.state)
             have = _fields(issue.get("title"), issue.get("body"), issue.get("labels"),
@@ -655,8 +675,8 @@ def project_github(db, gh, repo: str, *, dry_run: bool = False,
                 if not dry_run:
                     gh_repo.remove_sub_issue(number, int(sub["id"]))
     if api is None and epic_views:
-        report["notes"] += ["API sub-issues non sondée (essai sans epic projeté) : sous-issues "
-                           "ou liste de tâches décidées à la première projection réelle"]
+        report["notes"] += ["sub-issues API not probed (dry run without a projected epic): "
+                           "sub-issues or task list decided at the first real projection"]
     report["sub_issues_api"] = api
     return report
 
@@ -702,13 +722,13 @@ _MENTION_RE = re.compile(r"(?<![\w`@])@(?=[A-Za-z0-9])")
 LOT_TERMINAL = ("merged", "promoted", "closed")
 LOT_TYPES = ("bug", "evolution", "improvement")
 PRIORITY_LABELS = {1: "p1", 2: "p2", 3: "p3"}
-_TYPE_FR = {"bug": "bug", "evolution": "évolution", "improvement": "amélioration"}
-_PRIORITY_FR = {1: "priorité haute", 2: "priorité normale", 3: "priorité basse"}
-_STATE_FR = {"intake": "à faire", "build": "en cours", "qa": "en relecture",
-             "merged": "fusionné", "promoted": "livré", "blocked": "bloqué",
-             "waiting_human": "attend un humain", "closed": "fermé"}
-_LOT_FIELD_FR = {"title": "titre", "body": "corps", "labels": "étiquettes ameesh",
-                 "state": "état"}
+_TYPE_FR = {"bug": "bug", "evolution": "evolution", "improvement": "improvement"}
+_PRIORITY_FR = {1: "high priority", 2: "normal priority", 3: "low priority"}
+_STATE_FR = {"intake": "to do", "build": "in progress", "qa": "in review",
+             "merged": "merged", "promoted": "delivered", "blocked": "blocked",
+             "waiting_human": "waiting for a human", "closed": "closed"}
+_LOT_FIELD_FR = {"title": "title", "body": "body", "labels": "ameesh labels",
+                 "state": "state"}
 
 
 class SettingsError(GithubError):
@@ -745,44 +765,44 @@ def parse_settings(raw) -> Settings:
     if raw is None or raw == {}:
         return Settings()
     if not isinstance(raw, dict):
-        raise SettingsError("`github` : objet JSON attendu")
+        raise SettingsError("`github`: JSON object expected")
     unknown = sorted(set(map(str, raw)) - set(SETTINGS_KEYS))
     if unknown:
-        raise SettingsError("`github` : clé(s) inconnue(s) %s (admises : %s)"
+        raise SettingsError("`github`: unknown key(s) %s (allowed: %s)"
                             % (", ".join(unknown), ", ".join(SETTINGS_KEYS)))
     declared = raw.get("projects")
     declared = {} if declared is None else declared
     if not isinstance(declared, dict):
-        raise SettingsError("`github.projects` : objet {\"projet\": \"owner/repo\"} attendu")
+        raise SettingsError("`github.projects`: object {\"project\": \"owner/repo\"} expected")
     projects: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`github.projects.%s`" % name
         if not name:
-            raise SettingsError("`github.projects` : nom de projet vide")
+            raise SettingsError("`github.projects`: empty project name")
         if any(other.casefold() == name.casefold() for other in projects):
-            raise SettingsError("%s : projet déclaré deux fois (sans casse)" % where)
+            raise SettingsError("%s: project declared twice (case-insensitive)" % where)
         if isinstance(value, dict):
             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
             if extra:
-                raise SettingsError("%s : clé(s) inconnue(s) %s (admise : %s)"
+                raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
             value = value.get("repo")
         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
-            raise SettingsError("%s : dépôt « owner/repo » attendu, pas %r" % (where, value))
+            raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
         projects[name] = value.strip()
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
-        raise SettingsError("`github.host` : nom d'hôte attendu")
+        raise SettingsError("`github.host`: host name expected")
     interval = raw.get("interval", DEFAULT_INTERVAL)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) \
             or interval < MIN_INTERVAL:
-        raise SettingsError("`github.interval` : un nombre de secondes, au moins %d"
+        raise SettingsError("`github.interval`: a number of seconds, at least %d"
                             % MIN_INTERVAL)
     terms = raw.get("exclude_terms")
     terms = [] if terms is None else terms
     if not isinstance(terms, list) or not all(isinstance(t, str) and t.strip() for t in terms):
-        raise SettingsError("`github.exclude_terms` : liste de termes non vides attendue")
+        raise SettingsError("`github.exclude_terms`: list of non-empty terms expected")
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval),
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)))
@@ -797,21 +817,21 @@ def settings_of(cfg) -> Settings:
 
 #: motifs de secret : jamais publiés, quel que soit le dépôt
 SECRET_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
-    ("jeton GitHub", r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
-    ("clé d'API", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}"),
-    ("clé AWS", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    ("clé Scaleway", r"\bSCW[0-9A-Z]{17}\b"),
-    ("clé Google", r"\bAIza[0-9A-Za-z_-]{35}"),
-    ("jeton Slack", r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
-    ("jeton npm ou PyPI", r"\bnpm_[A-Za-z0-9]{36}\b|\bpypi-[A-Za-z0-9_-]{40,}"),
+    ("GitHub token", r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+    ("API key", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}"),
+    ("AWS key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("Scaleway key", r"\bSCW[0-9A-Z]{17}\b"),
+    ("Google key", r"\bAIza[0-9A-Za-z_-]{35}"),
+    ("Slack token", r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    ("npm or PyPI token", r"\bnpm_[A-Za-z0-9]{36}\b|\bpypi-[A-Za-z0-9_-]{40,}"),
     ("webhook", r"(?i)hooks\.slack\.com/services/[A-Za-z0-9/_-]+"
                 r"|discord(?:app)?\.com/api/webhooks/[A-Za-z0-9/_-]+"),
-    ("clé privée", r"-----BEGIN [A-Z0-9 -]*PRIVATE KEY"),
-    ("jeton JWT", r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
-    ("identifiants dans une URL", r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"),
-    ("jeton d'autorisation", r"(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]{20,}"
+    ("private key", r"-----BEGIN [A-Z0-9 -]*PRIVATE KEY"),
+    ("JWT token", r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ("credentials in a URL", r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"),
+    ("authorization token", r"(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]{20,}"
                              r"|\bauthorization[ \t]*:[ \t]*(?:basic|token)[ \t]+\S{8,}"),
-    ("secret en clair", r"(?i)(?<![a-z0-9])(?:password|passwd|pwd|mot[ _-]de[ _-]passe"
+    ("plaintext secret", r"(?i)(?<![a-z0-9])(?:password|passwd|pwd|mot[ _-]de[ _-]passe"
                         r"|secret|token|jeton|api[_-]?key|access[_-]?key|private[_-]?key"
                         r"|client[_-]?secret)[\"']?[ \t]*[:=][ \t]*[\"']?"
                         r"(?=[^\s\"']*[0-9])(?=[^\s\"']*[A-Za-z])[^\s\"']{12,}"),
@@ -820,20 +840,20 @@ SECRET_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
 #: ce qu'un dépôt PUBLIC ne reçoit jamais, en plus des secrets et des termes
 #: exclus : adresses, chemins locaux, identifiants de compte, noms d'hôte
 PUBLIC_PATTERNS = tuple((label, re.compile(rx)) for label, rx in (
-    ("adresse IP", r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+    ("IP address", r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
                    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\w.])"),
-    ("adresse IP", r"(?i)(?<![\w:])(?:(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}"
+    ("IP address", r"(?i)(?<![\w:])(?:(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}"
                    r"|[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?"
                    r"|::[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)(?![\w:])"),
-    ("adresse électronique", r"(?i)(?<![\w.%+-])[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*"
+    ("email address", r"(?i)(?<![\w.%+-])[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*"
                              r"\.[a-z]{2,}\b"),
-    ("chemin local", r"(?<![\w.~/-])~[\w.-]*/[\w.~/-]*"
+    ("local path", r"(?<![\w.~/-])~[\w.-]*/[\w.~/-]*"
                      r"|(?<![\w.:/-])/(?:home|Users|root|tmp|var|etc|srv|opt|mnt|media|run"
                      r"|usr|private|Volumes|data|proc|sys|dev|nix|snap)/[\w.~/-]*"
                      r"|(?<!\w)[A-Za-z]:\\\S+"),
-    ("identifiant de compte", r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}"
+    ("account identifier", r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}"
                               r"-[0-9a-f]{12}\b|\borg-[A-Za-z0-9]{20,}\b|\bacct_[A-Za-z0-9]{8,}"),
-    ("nom d'hôte", r"(?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:local|lan|internal|intranet|intra"
+    ("host name", r"(?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:local|lan|internal|intranet|intra"
                    r"|corp|home|localdomain|private)\b"),
 ))
 _URL_HOST_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://(?:[^\s/@]*@)?([^\s/:?#\[\]]+)")
@@ -866,20 +886,20 @@ class Guard:
 
         for label, rx in SECRET_PATTERNS:
             if rx.search(text):
-                add("motif de secret (%s)" % label)
+                add("secret pattern (%s)" % label)
         if any(_term_re(term).search(text) for term in self.exclude_terms):
-            add("terme exclu par l'organisation")
+            add("term excluded by the organization")
         if not public:
             return found
         for label, rx in PUBLIC_PATTERNS:
             if rx.search(text):
                 add(label)
         if any(_term_re(name).search(text) for name in self.host_names):
-            add("nom d'hôte")
+            add("host name")
         for match in _URL_HOST_RE.finditer(text):
             host = match.group(1).casefold().rstrip(".")
             if not any(host == ok or host.endswith("." + ok) for ok in self.url_hosts):
-                add("nom d'hôte")
+                add("host name")
                 break
         return found
 
@@ -1011,23 +1031,23 @@ class LotView:
 def _assignee_text(item: dict, public: bool, guard: Guard) -> str:
     who = (item.get("assignee") or "").strip()
     if not who:
-        return "non assigné"
+        return "unassigned"
     if who.startswith(work_mod.HUMAN_PREFIX):
-        return "assigné à un humain" if public else "assigné à `%s`" % who
+        return "assigned to a human" if public else "assigned to `%s`" % who
     if guard.problems(who, public=public):
-        return "assigné à un agent"
-    return "assigné à `%s`" % who
+        return "assigned to an agent"
+    return "assigned to `%s`" % who
 
 
 def _lot_head(item: dict, *, public: bool, guard: Guard, project: str,
               minimal: bool = False) -> list[str]:
-    parts = ["**Lot ameesh n° %d**" % int(item["id"]),
-             _TYPE_FR.get(item.get("type"), item.get("type") or "lot")]
+    parts = ["**ameesh work item %d**" % int(item["id"]),
+             _TYPE_FR.get(item.get("type"), item.get("type") or "work item")]
     priority = _priority(item)
     if priority:
         parts.append(_PRIORITY_FR[priority])
     if minimal:
-        parts.append("assigné" if item.get("assignee") else "non assigné")
+        parts.append("assigned" if item.get("assignee") else "unassigned")
     else:
         parts.append(_assignee_text(item, public, guard))
     lines = [" · ".join(parts)]
@@ -1035,11 +1055,11 @@ def _lot_head(item: dict, *, public: bool, guard: Guard, project: str,
     if planning:
         lines.append(planning)
     if not public and not minimal:
-        extra = ["projet `%s`" % project] if project else []
+        extra = ["project `%s`" % project] if project else []
         if (item.get("workstream") or "").strip():
-            extra.append("chantier `%s`" % item["workstream"].strip())
+            extra.append("workspace `%s`" % item["workstream"].strip())
         if item.get("package_id"):
-            extra.append("fiche du plan `%s`" % item["package_id"])
+            extra.append("plan package `%s`" % item["package_id"])
         if extra:
             text = " · ".join(extra)
             lines.append(text[0].upper() + text[1:])
@@ -1047,10 +1067,10 @@ def _lot_head(item: dict, *, public: bool, guard: Guard, project: str,
 
 
 def _day_fr(day: str | None) -> str | None:
-    """« 2026-10-12 » → « 12/10/2026 »."""
+    """« 2026-10-12 » → « 2026-10-12 » (le jour ISO, lisible en anglais)."""
     text = str(day or "")[:10]
     parts = text.split("-")
-    return "%s/%s/%s" % (parts[2], parts[1], parts[0]) if len(parts) == 3 else None
+    return "-".join(parts) if len(parts) == 3 else None
 
 
 def _plan_line(item: dict) -> str | None:
@@ -1062,19 +1082,19 @@ def _plan_line(item: dict) -> str | None:
 
     minutes = item.get("estimate_minutes")
     dates = [(label, _day_fr(item.get(key))) for label, key in (
-        ("début", "planned_start"), ("fin", "planned_end"),
-        ("livraison", "planned_delivery"))]
+        ("start", "planned_start"), ("end", "planned_end"),
+        ("delivery", "planned_delivery"))]
     dates = [(label, day) for label, day in dates if day]
     if not minutes and not dates:
         return None
-    parts = ["Durée estimée %s" % estimates.label(minutes) if minutes
-             else "Durée non estimée"]
+    parts = ["Estimated duration %s" % estimates.label(minutes) if minutes
+             else "Duration not estimated"]
     if dates:
-        parts.append("prévu : " + ", ".join("%s %s" % pair for pair in dates))
+        parts.append("planned: " + ", ".join("%s %s" % pair for pair in dates))
     if item.get("merged_ts") is not None and item.get("state") in work_mod.MERGED_STATES:
         v = estimates.view(item, merged_ts=item.get("merged_ts"))
         if v.get("actual_minutes") is not None:
-            text = "réel %s" % estimates.label(v["actual_minutes"])
+            text = "actual %s" % estimates.label(v["actual_minutes"])
             if v.get("gap_minutes") is not None:
                 text += " (%s%s, %s)" % ("+" if v["gap_minutes"] >= 0 else "−",
                                         estimates.label(abs(v["gap_minutes"])),
@@ -1085,10 +1105,10 @@ def _plan_line(item: dict) -> str | None:
 
 def _lot_footer(item: dict) -> str:
     n = int(item["id"])
-    return ("---\n_Issue tenue par ameesh à partir du lot n° %d : son titre, son état et ses "
-            "étiquettes `ameesh:…` suivent le lot ; une modification faite ici n'est pas "
-            "reprise dans ameesh. Une PR qui livre ce lot porte `ameesh-work: %d` et "
-            "`Closes #<numéro de cette issue>`._" % (n, n))
+    return ("---\n_Issue maintained by ameesh from work item %d: its title, state and "
+            "`ameesh:…` labels follow the work item; a change made here is not "
+            "imported into ameesh. A PR that delivers this work item carries "
+            "`ameesh-work: %d` and `Closes #<number of this issue>`._" % (n, n))
 
 
 def _compose(item: dict, *, public: bool, guard: Guard,
@@ -1104,7 +1124,7 @@ def _compose(item: dict, *, public: bool, guard: Guard,
         if summary:
             reasons = guard.problems(summary, public=True)
             if reasons:
-                withheld.append({"field": "résumé public", "reasons": reasons})
+                withheld.append({"field": "public summary", "reasons": reasons})
             else:
                 middle.append(_quiet(summary))
     else:
@@ -1112,9 +1132,9 @@ def _compose(item: dict, *, public: bool, guard: Guard,
         if text:
             reasons = guard.problems(text, public=False)
             if reasons:
-                withheld.append({"field": "corps", "reasons": reasons})
-                middle.append("_Le corps du lot n'est pas publié ici (%s) : voir `ameesh work "
-                              "show %d`._" % (", ".join(reasons), n))
+                withheld.append({"field": "body", "reasons": reasons})
+                middle.append("_The work item body is not published here (%s): see `ameesh "
+                              "work show %d`._" % (", ".join(reasons), n))
             else:
                 middle.append(_quiet(_cut(text, BODY_MAX)))
 
@@ -1126,7 +1146,7 @@ def _compose(item: dict, *, public: bool, guard: Guard,
     if not reasons:
         return body, withheld
     # un nom de l'en-tête (assigné, projet, chantier, fiche) ne passe pas
-    withheld.append({"field": "en-tête", "reasons": reasons})
+    withheld.append({"field": "header", "reasons": reasons})
     minimal = _lot_head(item, public=public, guard=guard, project=project, minimal=True)
     for parts in (middle, []):
         body = join(minimal, parts)
@@ -1143,19 +1163,19 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of) -> str | None:
         pr = _ref_parts(item.get("pr_ref"))
         where = ""
         if pr and pr[0].casefold() == repo.casefold():
-            where = " par la PR #%d" % pr[1]
+            where = " by PR #%d" % pr[1]
         elif pr and not public:
-            where = " par la PR %s#%d" % pr
-        return "Lot n° %d fusionné%s : issue fermée par ameesh." % (n, where)
+            where = " by PR %s#%d" % pr
+        return "Work item %d merged%s: issue closed by ameesh." % (n, where)
     if state == "promoted":
-        return "Lot n° %d livré : issue fermée par ameesh." % n
+        return "Work item %d delivered: issue closed by ameesh." % n
     if state == "closed":
         other = item.get("superseded_by")
         if item.get("close_reason") == "superseded" and other:
             number = issue_of(int(other))
-            return ("Lot n° %d remplacé par le lot n° %d%s : issue fermée par ameesh."
+            return ("Work item %d superseded by work item %d%s: issue closed by ameesh."
                     % (n, int(other), " (#%d)" % number if number else ""))
-        return "Lot n° %d abandonné : issue fermée par ameesh." % n
+        return "Work item %d abandoned: issue closed by ameesh." % n
     return None
 
 
@@ -1163,7 +1183,7 @@ def lot_view(item: dict, *, public: bool, guard: Guard, project: str, repo: str,
              issue_of=lambda _lot: None) -> LotView:
     """L'issue voulue pour le lot `item` dans `repo` (public ou privé)."""
     title = _cut(" ".join(str(item.get("title") or "").split()), TITLE_MAX) \
-        or "Lot n° %d" % int(item["id"])
+        or "Work item %d" % int(item["id"])
     refused = guard.problems(title, public=public)
     body, withheld = _compose(item, public=public, guard=guard, project=project)
     if body is None:
@@ -1173,7 +1193,7 @@ def lot_view(item: dict, *, public: bool, guard: Guard, project: str, repo: str,
     state, reason = lot_issue_state(item)
     closing = _closing(item, repo=repo, public=public, issue_of=issue_of)
     if closing and guard.problems(closing, public=public):
-        closing = "Lot n° %d terminé : issue fermée par ameesh." % int(item["id"])
+        closing = "Work item %d finished: issue closed by ameesh." % int(item["id"])
     return LotView(item_id=int(item["id"]), title=title, body=body, labels=lot_labels(item),
                    state=state, state_reason=reason, closing=closing,
                    refused=refused, withheld=withheld)
@@ -1224,13 +1244,13 @@ def _three_way(view: LotView, issue: dict) -> tuple[dict, list, list, list]:
 def _label_description(name: str) -> str:
     key = name.split(":", 1)[1] if ":" in name else ""
     if key in _STATE_FR:
-        return "lot ameesh : %s" % _STATE_FR[key]
+        return "ameesh work item: %s" % _STATE_FR[key]
     if key in _TYPE_FR:
-        return "lot ameesh : %s" % _TYPE_FR[key]
+        return "ameesh work item: %s" % _TYPE_FR[key]
     for priority, label in PRIORITY_LABELS.items():
         if key == label:
-            return "lot ameesh : %s" % _PRIORITY_FR[priority]
-    return "issue tenue par ameesh"
+            return "ameesh work item: %s" % _PRIORITY_FR[priority]
+    return "issue maintained by ameesh"
 
 
 def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
@@ -1250,7 +1270,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
     check_repo(repo)
     project = (project or "").strip()
     if not project:
-        raise GithubError("projet vide : --app <projet>")
+        raise GithubError("empty project: --app <project>")
     settings = settings or Settings()
     st = storage.of(db)
     feed = list(st.work.issue_feed(FEED_LIMIT) if feed is None else feed)
@@ -1276,7 +1296,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         if item is None:
             report["orphans"].append({
                 "work_item": lot_id, "numbers": [int(i["number"]) for i in markers[lot_id]],
-                "detail": "lot inconnu de ce mesh : issue laissée telle quelle"})
+                "detail": "work item unknown to this mesh: issue left as is"})
             continue
         lots[lot_id] = item
     elsewhere = {r.casefold() for r in settings.projects.values()} - {repo.casefold()}
@@ -1332,7 +1352,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                  "labels": view.labels, "action": "unchanged", "changes": []}
         report["issues"].append(entry)
         if view.refused:
-            report["refused"].append({"work_item": lot_id, "field": "titre",
+            report["refused"].append({"work_item": lot_id, "field": "title",
                                       "reasons": view.refused,
                                       "number": int(issue["number"]) if issue else None,
                                       "title_digest": _digest(item.get("title") or "")})
@@ -1379,7 +1399,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         closing = "state" in write and view.state == "closed" \
             and (issue.get("state") or "").lower() == "open"
         entry["action"] = "close" if closing else "update"
-        entry["changes"] = [_LOT_FIELD_FR[k] for k in write] or ["empreintes"]
+        entry["changes"] = [_LOT_FIELD_FR[k] for k in write] or ["digests"]
         plans.append({"entry": entry, "item": item, "payload": payload,
                       "labels": view.labels if "labels" in write else [],
                       "comment": view.closing if closing else None})
@@ -1414,7 +1434,7 @@ def _execute(db, st, gh_repo: "_Repo", report: dict, plan: dict) -> None:
         if entry["action"] == "create":
             created = gh_repo.create(plan["payload"])
             if not created.get("number"):
-                raise GithubError("création sans numéro rendu")
+                raise GithubError("created without a returned number")
             entry["number"] = int(created["number"])
             _remember_ref(db, st, gh_repo, report, plan["item"], entry["number"], created=True)
             return
@@ -1445,8 +1465,8 @@ def _remember_ref(db, st, gh_repo: "_Repo", report: dict, item: dict, number: in
         if created:
             report["issue_refs"].append({
                 "work_item": lot_id, "issue_ref": current, "result": "kept",
-                "detail": "issue_ref existante gardée ; l'issue %s se retrouve par son "
-                          "marqueur" % ref})
+                "detail": "existing issue_ref kept; issue %s is found by its "
+                          "marker" % ref})
         return
     try:
         done = st.work.set_issue_ref(lot_id, ref, current=current)
@@ -1464,10 +1484,11 @@ def _remember_ref(db, st, gh_repo: "_Repo", report: dict, item: dict, number: in
         try:
             gh_repo.update(int(number), {
                 "state": "closed", "state_reason": "not_planned",
-                "body": (_DUPLICATE_MARKER % lot_id) + "\n_Doublon de #%d, qui suit le lot "
-                        "n° %d._" % (other[1], lot_id)})
-            gh_repo.comment(int(number), "Doublon de #%d, créée en même temps pour le même "
-                                         "lot : fermée par ameesh." % other[1])
+                "body": (_DUPLICATE_MARKER % lot_id) + "\n_Duplicate of #%d, which tracks "
+                        "work item %d._" % (other[1], lot_id)})
+            gh_repo.comment(int(number), "Duplicate of #%d, created at the same time for "
+                                         "the same work item: closed by ameesh."
+                                         % other[1])
         except GithubError as exc:
             report["errors"].append({"work_item": lot_id, "number": int(number),
                                      "action": "duplicate", "detail": _one_line(exc)})
@@ -1477,7 +1498,7 @@ def _remember_ref(db, st, gh_repo: "_Repo", report: dict, item: dict, number: in
         return
     report["issue_refs"].append({"work_item": lot_id, "issue_ref": fresh or None,
                                  "result": "changed",
-                                 "detail": "issue_ref modifiée entre-temps : gardée"})
+                                 "detail": "issue_ref changed in the meantime: kept"})
 
 
 def _tally_lots(report: dict) -> dict:
@@ -1523,19 +1544,19 @@ class Projector:
             settings = settings_of(self.cfg)
         except SettingsError as exc:
             self._once(("settings", str(exc)),
-                       "issues GitHub : configuration invalide, projection coupée : %s" % exc)
+                       "GitHub issues: invalid configuration, projection stopped: %s" % exc)
             return []
         if not settings.projects:
             return []
         here = getattr(self.cfg, "host", None)
         if not settings.host:
-            self._once("no-host", "issues GitHub : aucun hôte désigné (`github.host`) : pas de "
-                                  "projection automatique ; `ameesh work project-github --app "
-                                  "<projet>` reste possible")
+            self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
+                                  "automatic projection; `ameesh work project-github --app "
+                                  "<project>` remains possible")
             return []
         if settings.host != here:
             self._once(("elsewhere", settings.host),
-                       "issues GitHub : la projection est menée par l'hôte %s, pas %s"
+                       "GitHub issues: the projection is run by host %s, not %s"
                        % (settings.host, here))
             return []
         reports: list[dict] = []
@@ -1566,7 +1587,7 @@ class Projector:
             except Exception as exc:  # noqa: BLE001 - GitHub, gh, base : jamais fatal
                 self.backoff[name] = now + settings.interval
                 self._once(("error", name, _one_line(exc)),
-                           "issues GitHub %s (%s) : échec, nouvel essai dans %d s : %s"
+                           "GitHub issues %s (%s): failed, retrying in %d s: %s"
                            % (name, repo, int(settings.interval), _one_line(exc)))
                 continue
             self.last[name] = now
@@ -1582,13 +1603,13 @@ class Projector:
         counts = report["counts"]
         dry = report["dry_run"]
         parts = ["%d %s" % (counts[key], label) for key, label in (
-            ("created", "à créer" if dry else "créée(s)"),
-            ("updated", "à mettre à jour" if dry else "mise(s) à jour"),
-            ("closed", "à fermer" if dry else "fermée(s)"),
-            ("deferred", "reportée(s) au passage suivant"),
-            ("errors", "en erreur")) if counts.get(key)]
+            ("created", "to create" if dry else "created"),
+            ("updated", "to update" if dry else "updated"),
+            ("closed", "to close" if dry else "closed"),
+            ("deferred", "deferred to the next pass"),
+            ("errors", "in error")) if counts.get(key)]
         if parts:
-            line = "issues GitHub %s : %s%s" % (where, ", ".join(parts), " [essai]" if dry else "")
+            line = "GitHub issues %s: %s%s" % (where, ", ".join(parts), " [dry run]" if dry else "")
             if dry:
                 self._once(("dry", line), line)
             else:
@@ -1596,26 +1617,27 @@ class Projector:
         for row in report["refused"]:
             self.skip.add((row["work_item"], row["title_digest"]))
             self._once(("refused", row["work_item"], row["title_digest"], tuple(row["reasons"])),
-                       "issues GitHub %s : lot %d, %s refusé (%s) : %s ; corrigez le titre du "
-                       "lot" % (where, row["work_item"], row["field"], ", ".join(row["reasons"]),
-                                "titre de #%d gardé tel quel" % row["number"] if row["number"]
-                                else "non publié"))
+                       "GitHub issues %s: work item %d, %s refused (%s): %s; fix the work item "
+                       "title" % (where, row["work_item"], row["field"],
+                                  ", ".join(row["reasons"]),
+                                  "title of #%d kept as is" % row["number"] if row["number"]
+                                  else "not published"))
         for row in report["withheld"]:
             self._once(("withheld", row["work_item"], row["field"], tuple(row["reasons"])),
-                       "issues GitHub %s : lot %d — %s non publié (%s)"
+                       "GitHub issues %s: work item %d, %s not published (%s)"
                        % (where, row["work_item"], row["field"], ", ".join(row["reasons"])))
         for row in report["human_edits"]:
             if row["kept"]:
                 self._once(("human", report["repo"], row["number"], tuple(row["kept"])),
-                           "issues GitHub %s : #%d (lot %d) modifiée dans GitHub (%s) : "
-                           "gardée telle quelle, non reprise dans ameesh"
+                           "GitHub issues %s: #%d (work item %d) edited in GitHub (%s): "
+                           "kept as is, not imported into ameesh"
                            % (where, row["number"], row["work_item"], ", ".join(row["kept"])))
         for row in report["errors"]:
             self._once(("write", report["repo"], row["work_item"], row["detail"]),
-                       "issues GitHub %s : lot %d, %s en échec : %s"
+                       "GitHub issues %s: work item %d, %s failed: %s"
                        % (where, row["work_item"], row["action"], row["detail"]))
         for row in report["duplicates"]:
             self._once(("dup", report["repo"], row["number"]),
-                       "issues GitHub %s : #%d doublon de #%d (lot %d)%s"
+                       "GitHub issues %s: #%d duplicate of #%d (work item %d)%s"
                        % (where, row["number"], row["kept"], row["work_item"],
-                          " : fermée" if row.get("closed") else " : laissée telle quelle"))
+                          ": closed" if row.get("closed") else ": left as is"))

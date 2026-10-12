@@ -8,6 +8,8 @@
 # Installation :
 #   install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' \
 #     deploy/systemd/ameesh-agents.slice ~/.config/systemd/user/
+#   install -D -m 0644 'deploy/systemd/ameesh-runner-agent@.service.d/cargo-target.conf' \
+#     ~/.config/systemd/user/ameesh-runner-agent@.service.d/cargo-target.conf   # #248
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ameesh-runner-agent@<agent>
 #   journalctl --user -u ameesh-runner-agent@<agent> -f

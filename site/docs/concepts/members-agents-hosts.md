@@ -45,6 +45,22 @@ human `Member` is **not claimable**. When a canon is configured,
 **No agent approves.** A card with `approve` in `capabilities` is a blocking
 error: authority belongs to humans, and is proven by a receipt.
 
+**Capabilities.** Known values (anything else raises the warning
+`agent-capability-unknown`):
+
+| capability | allows |
+|---|---|
+| `read` | read the canon, the threads and the repositories |
+| `report-drift` | report a gap between the canon and reality |
+| `propose` | propose a change (branch, PR, action proposal) |
+| `integrate` | assemble others' work: rebase PRs, resolve conflicts, build an integration or release branch; never merges into the base branch |
+| `merge` | merge an approved PR into the base branch once its required reviews and CI are green |
+| `release` | tag, publish and deploy a release once the owner's go is recorded, following the release procedure |
+
+None of them carries a decision: `merge` and `release` *execute* an approval
+already given by a human (approved review, recorded go). They never replace
+it. An ephemeral agent still gets only `read` and `propose`.
+
 ## `Host`: a machine or a cluster
 
 ```yaml
@@ -65,6 +81,7 @@ policy:
     min_disk_free: 2GiB
     min_battery_percent: 25             # on battery: no new turn below (laptop host)
     stop_battery_percent: 10            # on battery: clean stop below
+    max_cpu_pressure: 20%               # CPU pressure (PSI some, 60 s): no new turn above
   work_roots: {acme-web: /srv/acme/acme-web}   # working directory per team (v1.3.0)
   work_root: /srv                               # default: work_root/<team>
   work_dirs: {ouvrier: /srv/acme/ouvrier}       # per agent, wins over the above (v1.3.1)
@@ -78,7 +95,12 @@ the `{agent}` template (`/srv/acme/acme-web-{agent}`: one worktree per agent).
 See [Runner and leases](runner-and-leases.md#working-directory) for the
 transitional fallback and what the runner does when the directory is missing,
 and [host resources](runner-and-leases.md#host-resources-and-back-pressure) for
-`policy.resources`.
+`policy.resources`. A host that lends its unused capacity to agents declares
+its offer in `policy.lend` (CPUs, memory and disk at most, windows, the
+application's thresholds at which agents give way); `canon check` validates
+it, and an unreadable offer lends nothing. The contract shared with the
+device runners is
+[docs/GARDE-DE-CAPACITE.md](https://github.com/manaty/ameesh/blob/main/docs/GARDE-DE-CAPACITE.md).
 
 ## `Placement`: which agent may run where
 

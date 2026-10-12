@@ -1,34 +1,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Correction tracée des lignes fausses du grand livre `turn_costs` (lot L95).
+"""Traced correction of wrong rows in the `turn_costs` ledger (lot L95).
 
-  ameesh cost correct [--since 30d] [--json]     essai : rien n'est écrit
-  ameesh cost correct --apply [--since 30d]       applique, en une transaction
+  ameesh cost correct [--since 30d] [--json]     dry run: nothing is written
+  ameesh cost correct --apply [--since 30d]       apply, in one transaction
 
-Trois défauts d'avant L60 et L71, constatés le 2026-10-10 :
+Three defects from before L60 and L71, found on 2026-10-10:
 
-* **coût cumulé d'une session reprise** : le premier tour d'une session
-  reprise sans repère connu valait toute l'histoire de la session (Claude
-  `total_cost_usd`, Codex usage cumulé du fil) — 67 $ pour un tour de
-  1 500 jetons de sortie. Claude : le coût du tour est ré-estimé par ses
-  jetons (barème du modèle s'il est connu, sinon coût par jeton relu des
-  autres tours de la même session). Codex : le total du fil avant le tour se
-  lit dans son journal de session (`rollout-…-<fil>.jsonl`) quand il est sur
-  cette machine ; sinon, la ligne est écartée (coût du tour inconnu) ;
-* **modèle « inconnu »** : facturé au tarif le plus cher de la famille alors
-  que le harnais lançait son modèle par défaut (L60). Le tour est re-facturé
-  au modèle par défaut du descripteur du harnais ; pour Codex, au modèle lu
-  dans le journal du fil ;
-* **doublons** : la réparation du marqueur comptable réécrivait la ligne d'un
-  tour (avant la clé `spend_key` de L60). Mêmes agent, session, tour, coût et
-  jetons, à moins de dix minutes d'écart : les suivantes sont écartées.
+* **cumulative cost of a resumed session**: the first turn of a session
+  resumed without a known baseline carried the whole session history (Claude
+  `total_cost_usd`, Codex cumulative thread usage) — $67 for a turn of
+  1,500 output tokens. Claude: the turn cost is re-estimated from its
+  tokens (the model's price if known, otherwise the cost per read token of
+  the other turns of the same session). Codex: the thread total before the
+  turn is read from its session log (`rollout-…-<thread>.jsonl`) when it is
+  on this machine; otherwise the row is voided (turn cost unknown);
+* **"unknown" model**: billed at the most expensive price of the family
+  while the harness ran its default model (L60). The turn is re-billed at
+  the default model of the harness descriptor; for Codex, at the model read
+  from the thread log;
+* **duplicates**: repairing the accounting marker rewrote a turn's row
+  (before the `spend_key` of L60). Same agent, session, turn, cost and
+  tokens, less than ten minutes apart: the later ones are voided.
 
-Rien n'est supprimé (migration 0043) : une ligne écartée garde tout et porte
-`void_reason` (les sommes l'ignorent) ; chaque correction copie d'abord la
-ligne entière dans `turn_cost_corrections`. Une ligne déjà écartée n'est plus
-touchée, et une passe rejouée ne retrouve rien à corriger : les lignes
-corrigées ne remplissent plus les conditions.
+Nothing is deleted (migration 0043): a voided row keeps everything and carries
+`void_reason` (sums ignore it); each correction first copies the whole row
+into `turn_cost_corrections`. An already voided row is not touched again, and
+a replayed pass finds nothing to correct: corrected rows no longer meet the
+conditions.
 
-Le mode par défaut est l'**essai** : lecture seule, il dit ce qui serait fait.
+The default mode is a **dry run**: read-only, it says what would be done.
 """
 from __future__ import annotations
 
@@ -124,10 +124,10 @@ def thread_created_ts(thread: str | None) -> float | None:
 # le plan de correction (pur : aucune écriture)
 # --------------------------------------------------------------------------
 
-def _price(prices: dict, harness: str, model: str) -> list:
-    if model and model in prices:
-        return list(prices[model])
-    return cost_mod.max_price_of(prices, harness)
+def _price(prices: dict, harness: str, model: str) -> list | None:
+    """Le tarif du modèle, sinon le majorant de sa famille, sinon le repli
+    prudent (maximum du barème) ; None sans aucun barème (L225)."""
+    return cost_mod.price_for(prices, harness, model)[0]
 
 
 def _usd(harness: str, tokens: list, triplet: list) -> float:
@@ -189,9 +189,9 @@ def plan(rows: Iterable[dict], *, prices: dict,
         for row in group[1:]:
             if float(row["recorded_ts"]) - float(first["recorded_ts"]) <= DUP_WINDOW_S:
                 voided.add(int(row["id"]))
-                fix(row, "doublon", "doublon de la ligne #%d (marqueur comptable rejoué, "
-                    "avant la clé spend_key de L60)" % int(first["id"]),
-                    void_reason="doublon de #%d" % int(first["id"]))
+                fix(row, "doublon", "duplicate of row #%d (accounting marker replayed, "
+                    "before the spend_key of L60)" % int(first["id"]),
+                    void_reason="duplicate of #%d" % int(first["id"]))
             else:
                 first = row
     live = [r for r in rows if int(r["id"]) not in voided]
@@ -219,26 +219,31 @@ def plan(rows: Iterable[dict], *, prices: dict,
         source = ""
         if row["harness"] == "codex" and codex_model and row.get("session"):
             model = codex_model(row["session"]) or ""
-            source = "lu dans le journal du fil Codex, sinon sa configuration"
+            source = "read from the Codex thread log, otherwise its configuration"
         if not model:
             model = default_model_of(row["harness"]) or ""
-            source = "modèle par défaut du descripteur %s, lancé faute de réglage" % (
+            source = "default model of the %s descriptor, launched when none was set" % (
                 row["harness"])
         if not model:
             continue
         tokens = repriced.get(int(row["id"]), _tokens(row))
         current = fixes.get(int(row["id"]), {}).get("set", {}).get("usd")
         if row["harness"] == "claude" and current is not None:
-            fix(row, "modele", "modèle « inconnu » → %s (%s)" % (model, source), model=model)
+            fix(row, "modele", "\"unknown\" model → %s (%s)" % (model, source), model=model)
             continue
-        usd = round(_usd(row["harness"], tokens, _price(prices, row["harness"], model)), 6)
+        triplet = _price(prices, row["harness"], model)
+        if triplet is None:
+            fix(row, "modele", "\"unknown\" model → %s (%s), no price list: cost "
+                "unchanged" % (model, source), model=model)
+            continue
+        usd = round(_usd(row["harness"], tokens, triplet), 6)
         old = float(row.get("usd") or 0.0) if current is None else float(current)
         values = {"model": model}
         if abs(usd - old) >= 1e-6:
             values["usd"] = usd
-        fix(row, "modele", ("modèle « inconnu » facturé au plus cher de la famille → %s (%s)"
-                            if "usd" in values else "modèle « inconnu » → %s (%s), coût "
-                            "inchangé") % (model, source), **values)
+        fix(row, "modele", ("\"unknown\" model billed at the family's highest price → %s (%s)"
+                            if "usd" in values else "\"unknown\" model → %s (%s), cost "
+                            "unchanged") % (model, source), **values)
 
     out = []
     for ident in sorted(fixes):
@@ -251,36 +256,51 @@ def plan(rows: Iterable[dict], *, prices: dict,
                  "void": "void_reason" in entry["set"]}
         out.append({"id": ident, "agent": entry["agent"], "harness": entry["harness"],
                     "session": entry["session"], "kind": "+".join(entry["kinds"]),
-                    "reason": " ; ".join(entry["reasons"]), "set": entry["set"],
+                    "reason": "; ".join(entry["reasons"]), "set": entry["set"],
                     "before": before, "after": after})
     return out
 
 
 def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) -> None:
-    """Claude : le premier relevé de la session vaut-il tout son cumul ?"""
+    """Claude : le premier relevé de la session vaut-il tout son cumul ?
+
+    Un tour Claude paie aussi ses écritures de cache (L225), que seules les
+    lignes depuis la migration 0059 gardent (`cache_write_tokens`). Sans elles,
+    rien ne distingue un cumul d'un tour qui a beaucoup écrit en cache : le
+    total est gardé (jamais ramené sous son coût réel). Avec elles, elles
+    comptent dans l'estimation au prix d'écriture le plus cher (×2, cache 1 h :
+    la durée n'est pas gardée), ce qui n'abaisse jamais un total juste."""
     cum = first.get("cum_usd")
     usd = float(first.get("usd") or 0.0)
     if cum is None or usd <= 0 or abs(usd - float(cum)) > 1e-6:
         return
+    if first.get("cache_write_tokens") is None:
+        return                          # L225 : écritures de cache inconnues
+    written = int(first["cache_write_tokens"] or 0)
     tokens = _tokens(first)
     model = first.get("model") or ""
-    if model in prices:
-        estimate = _usd("claude", tokens, prices[model])
-        how = "barème %s" % model
+    triplet = cost_mod.price_for(prices, "claude", model)[0]
+    if triplet is None:
+        return                          # L225 : aucun barème, pas d'estimation
+    writes = written * triplet[0] * cost_mod.CACHE_WRITE_1H / 1e6
+    known = cost_mod.known_price(prices, model)
+    if known:
+        estimate = _usd("claude", tokens, known) + writes
+        how = "%s price, cache writes included" % model
     else:
         spent = sum(float(r.get("usd") or 0.0) for r in others)
         read = sum(int(r.get("input_tokens") or 0) + int(r.get("cached_input_tokens") or 0)
                    for r in others)
         if spent > 0 and read > 0:
-            estimate = (tokens[0] + tokens[1]) * spent / read
-            how = "coût par jeton relu des %d autres tours de la session" % len(others)
+            estimate = (tokens[0] + tokens[1]) * spent / read + writes
+            how = "cost per read token of the session's %d other turns" % len(others)
         else:
-            estimate = _usd("claude", tokens, cost_mod.max_price_of(prices, "claude"))
-            how = "tarif le plus cher connu"
+            estimate = _usd("claude", tokens, triplet) + writes
+            how = "highest known price"
     if usd <= CUMUL_FACTOR * estimate or usd - estimate <= CUMUL_MIN_USD:
         return
-    fix(first, "cumul", "coût cumulé de la session reprise (%.2f $) compté pour un tour ; "
-        "ré-estimé par ses jetons (%s)" % (usd, how), usd=round(estimate, 6))
+    fix(first, "cumul", "cumulative cost of the resumed session ($%.2f) counted for one turn; "
+        "re-estimated from its tokens (%s)" % (usd, how), usd=round(estimate, 6))
 
 
 def _codex_cumul(first: dict, prices: dict, fix, repriced: dict,
@@ -303,20 +323,26 @@ def _codex_cumul(first: dict, prices: dict, fix, repriced: dict,
         model = first.get("model") or ""
         if model in UNKNOWN_MODELS and codex_model:
             model = codex_model(first["session"]) or ""
-        usd = round(_usd("codex", delta, _price(prices, "codex", model)), 6)
+        triplet = _price(prices, "codex", model)
+        if triplet is None:
+            fix(first, "cumul", "cumulative usage of the resumed session counted for one "
+                "turn; model %s has no price list" % (model or "unknown"),
+                void_reason="%s : usage du fil repris, aucun barème" % cost_mod.UNPRICED_REASON)
+            return
+        usd = round(_usd("codex", delta, triplet), 6)
         repriced[int(first["id"])] = delta
-        fix(first, "cumul", "usage cumulé du fil repris (%s jetons d'entrée) compté pour un "
-            "tour ; total d'avant le tour lu dans le journal du fil" % cumulative[0],
+        fix(first, "cumul", "cumulative usage of the resumed thread (%s input tokens) counted "
+            "for one turn; pre-turn total read from the thread log" % cumulative[0],
             usd=usd, input_tokens=delta[0], cached_input_tokens=delta[1],
             output_tokens=delta[2])
         return
     created = thread_created_ts(first["session"])
     if created is None or float(first["recorded_ts"]) - created < CODEX_RESUME_AGE_S:
         return
-    fix(first, "cumul", "usage cumulé d'un fil repris (créé %.0f h avant) compté pour un "
-        "tour ; journal du fil absent de cette machine : coût du tour inconnu, ligne "
-        "écartée" % ((float(first["recorded_ts"]) - created) / 3600.0),
-        void_reason="cumul d'un fil Codex repris, coût du tour inconnu")
+    fix(first, "cumul", "cumulative usage of a resumed thread (created %.0f h earlier) counted "
+        "for one turn; thread log not on this machine: turn cost unknown, row "
+        "voided" % ((float(first["recorded_ts"]) - created) / 3600.0),
+        void_reason="cumulative usage of a resumed Codex thread, turn cost unknown")
 
 
 # --------------------------------------------------------------------------
@@ -349,14 +375,14 @@ def summarize(corrections: list[dict]) -> dict:
 def format_text(corrections: list[dict], applied: int | None) -> str:
     lines = []
     for c in corrections:
-        after = ("écartée" if c["after"]["void"] else "%.4f $" % c["after"]["usd"])
+        after = ("voided" if c["after"]["void"] else "%.4f $" % c["after"]["usd"])
         lines.append("#%-6d %-14s %-9s %-14s %10.4f $ → %s" % (
             c["id"], c["agent"], c["harness"], c["kind"], c["before"]["usd"], after))
         lines.append("        ↳ %s" % c["reason"])
     total = summarize(corrections)
     lines.append("")
-    lines.append("%-14s %-9s %6s %8s %12s %12s" % ("agent", "harnais", "lignes", "écartées",
-                                                    "avant ($)", "après ($)"))
+    lines.append("%-14s %-9s %6s %8s %12s %12s" % ("agent", "harness", "rows", "voided",
+                                                    "before ($)", "after ($)"))
     for a in total["agents"]:
         lines.append("%-14s %-9s %6d %8d %12.4f %12.4f" % (
             a["agent"], a["harness"], a["rows"], a["voided"], a["usd_before"], a["usd_after"]))
@@ -364,10 +390,10 @@ def format_text(corrections: list[dict], applied: int | None) -> str:
         "total", "", total["rows"], total["voided"], total["usd_before"], total["usd_after"]))
     lines.append("")
     if applied is None:
-        lines.append("ESSAI : rien n'a été écrit. Relancer avec --apply pour corriger "
-                     "(copie de chaque ligne dans turn_cost_corrections, aucune suppression).")
+        lines.append("DRY RUN: nothing was written. Run again with --apply to correct "
+                     "(each row copied into turn_cost_corrections, nothing deleted).")
     else:
-        lines.append("%d ligne(s) corrigée(s) ; copies dans turn_cost_corrections." % applied)
+        lines.append("%d row(s) corrected; copies in turn_cost_corrections." % applied)
     return "\n".join(lines)
 
 
@@ -394,8 +420,8 @@ def run(db, *, apply: bool = False, since_ts: float | None = None,
                           "set": c["set"]} for c in corrections])
     except db_mod.DbError as exc:
         if "turn_cost_corrections" in str(exc) or "void_reason" in str(exc):
-            raise CorrectionError("la migration 0043 n'est pas passée : lancer "
-                                  "`ameesh migrate` d'abord") from None
+            raise CorrectionError("migration 0043 has not been applied: run "
+                                  "`ameesh migrate` first") from None
         raise
     return corrections, done
 
@@ -408,18 +434,18 @@ def parse_since(text: str | None, now: float) -> float | None:
         return None
     match = _SINCE_RE.match(text)
     if not match:
-        raise CorrectionError("--since illisible : %r (30d, 48h)" % text)
+        raise CorrectionError("unreadable --since: %r (30d, 48h)" % text)
     unit = 3600.0 if match.group(2).lower() == "h" else 86400.0
     return now - float(match.group(1)) * unit
 
 
 def add_parser(cost_sub, func) -> None:
     p = cost_sub.add_parser(
-        "correct", help="corrige les lignes fausses du grand livre (essai par défaut)",
+        "correct", help="correct wrong ledger rows (dry run by default)",
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--apply", action="store_true",
-                   help="écrit les corrections (sinon : essai, lecture seule)")
-    p.add_argument("--since", default=None, help="seulement les lignes récentes (30d, 48h)")
+                   help="write the corrections (otherwise: dry run, read-only)")
+    p.add_argument("--since", default=None, help="only recent rows (30d, 48h)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=func)
 
@@ -438,13 +464,13 @@ def main(cfg, args) -> int:
         finally:
             db.close()
     except CorrectionError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 2
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     if getattr(args, "json", False):
         print(json.dumps({"schema": "ameesh-ledger-corrections/1",
@@ -462,5 +488,5 @@ def _codex_homes(cfg) -> list:
 
 
 if __name__ == "__main__":
-    print("usage : ameesh cost correct [--apply] [--since 30d] [--json]", file=sys.stderr)
+    print("usage: ameesh cost correct [--apply] [--since 30d] [--json]", file=sys.stderr)
     sys.exit(2)

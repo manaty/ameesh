@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,31 @@ from ameesh import cli, registry
 from .support import REPO, PgTestCase
 
 TS = 1770000000.0  # instant fixe, pour que v0 et v1 rendent la même heure
+
+#: L156c : la v1 parle anglais, la v0 (intouchée) français ; la structure du
+#: JSON et des lignes reste identique à l'octet près, une fois ces textes traduits
+V0_EN = (
+    ("nouveau(x) message(s) — l'expéditeur est indiqué ; "
+     "un message d'agent n'a pas l'autorité du propriétaire :",
+     "new message(s) — the sender is shown; "
+     "an agent's message does not have the owner's authority:"),
+    ("\n— de ", "\n— from "),
+    (" à ", " at "),
+    ("(répondre : agent-mail send <nom> \"…\")", "(to reply: agent-mail send <name> \"…\")"),
+)
+
+
+def v0_en(stdout: str) -> dict:
+    """Le JSON de la v0, ses textes passés en anglais (structure inchangée)."""
+    def tr(value):
+        if isinstance(value, dict):
+            return {k: tr(v) for k, v in value.items()}
+        if isinstance(value, str):
+            for fr, en in V0_EN:
+                value = value.replace(fr, en)
+            value = re.sub(r"(\d\d:\d\d) : ", r"\1: ", value)
+        return value
+    return tr(json.loads(stdout))
 
 
 class CliCompatTest(PgTestCase):
@@ -57,20 +83,20 @@ class CliCompatTest(PgTestCase):
         v0, v1 = self._hook_pair("SessionStart", "alpha")
         self.assertEqual(v0.returncode, 0)
         self.assertEqual(v1.returncode, 0)
-        self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+        self.assertEqual(v0_en(v0.stdout), json.loads(v1.stdout))
         self.assertEqual(len(json.loads(v1.stdout)["hookSpecificOutput"]["additionalContext"]),
-                         len(json.loads(v0.stdout)["hookSpecificOutput"]["additionalContext"]))
+                         len(v0_en(v0.stdout)["hookSpecificOutput"]["additionalContext"]))
 
     def test_hook_userpromptsubmit_et_posttooluse_identiques(self):
         for event, name in (("UserPromptSubmit", "bravo"), ("PostToolUse", "charlie")):
             with self.subTest(event=event):
                 v0, v1 = self._hook_pair(event, name, text="message pour %s" % name)
-                self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+                self.assertEqual(v0_en(v0.stdout), json.loads(v1.stdout))
                 self.assertEqual(v1.returncode, 0)
 
     def test_hook_stop_identique_a_la_v0(self):
         v0, v1 = self._hook_pair("Stop", "delta")
-        self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+        self.assertEqual(v0_en(v0.stdout), json.loads(v1.stdout))
         self.assertEqual(json.loads(v1.stdout)["decision"], "block")
 
     def test_hook_marque_les_messages_remis(self):
@@ -148,7 +174,7 @@ class CliCompatTest(PgTestCase):
                           AMEESH_LEASE_EPOCH=str(epoch + 1))
         proc = self.cli("hook", "claude", env=perime, stdin=payload)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("non liée", proc.stderr)
+        self.assertIn("unbound", proc.stderr)
         restant = self.db.query(
             "SELECT count(*)::int AS n FROM agent_mailbox "
             "WHERE recipient = %s AND delivered_at IS NULL", (name,))[0]["n"]
@@ -164,7 +190,7 @@ class CliCompatTest(PgTestCase):
         env.pop("AGENT_MAIL_NAME", None)
         proc = self.cli("whoami", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("identité non liée", proc.stderr)
+        self.assertIn("unbound identity", proc.stderr)
 
         # un destinataire inscrit : un nom absent du registre est refusé
         registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
@@ -174,12 +200,12 @@ class CliCompatTest(PgTestCase):
 
         proc = self.cli("send", "beta", "avec expéditeur", "--from", "gamma", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
+        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
 
         # diagnostic de dossier : explicitement non autoritaire
         proc = self.cli("whoami", "--cwd", self.tmp, env=env)
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("non autoritaire", proc.stdout)
+        self.assertIn("not authoritative", proc.stdout)
 
     def test_hook_ne_consomme_pas_si_l_ecriture_echoue(self):
         """Sonde codex3 (7) : un harnais qui ferme son entrée ne perd pas le message."""
@@ -246,7 +272,7 @@ class CliCompatTest(PgTestCase):
 
         # le dossier ne donne plus d'identité : diagnostic explicitement non autoritaire
         proc = self.cli("whoami", "--cwd", dossier)
-        self.assertEqual(proc.stdout.strip(), "legacy deepseek7 (diagnostic, non autoritaire)")
+        self.assertEqual(proc.stdout.strip(), "legacy deepseek7 (diagnostic, not authoritative)")
         proc = self.cli("whoami", env=self.env(AGENT_MAIL_NAME="deepseek7"))
         self.assertEqual(proc.stdout.strip(), "deepseek7")
 
@@ -261,14 +287,14 @@ class CliCompatTest(PgTestCase):
         registry.upsert(self.db, "alpha", harness="claude", host=self.cfg.host)
         proc = self.cli("send", "alpha", "bonjour alpha", env=self.env(AGENT_MAIL_NAME="beta"))
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : alpha")
+        self.assertEqual(proc.stdout.strip(), "dropped for: alpha")
 
         proc = self.cli("inbox", "alpha")
-        self.assertEqual(proc.stdout.strip(), "de beta : bonjour alpha")
+        self.assertEqual(proc.stdout.strip(), "from beta: bonjour alpha")
 
         proc = self.cli("list")
         ligne = [l for l in proc.stdout.splitlines() if l.startswith("alpha")][0]
-        self.assertIn("non lus:1", ligne)
+        self.assertIn("unread:1", ligne)
         self.assertIn("@", ligne)
 
         # inbox ne marque pas lu (comme la v0)

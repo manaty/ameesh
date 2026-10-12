@@ -101,7 +101,7 @@ def _as_bool(value, default: bool | None, name: str) -> bool | None:
         return True
     if text in ("0", "false", "no", "non", "off"):
         return False
-    raise SystemExit("%s invalide : %r (attendu 1/0, true/false)" % (name, value))
+    raise SystemExit("%s: invalid value %r (expected 1/0, true/false)" % (name, value))
 
 
 def hostname() -> str:
@@ -124,18 +124,18 @@ def _canon_entry(raw, where: str) -> CanonEntry:
         raw = {"path": raw}
     if not isinstance(raw, dict) or not isinstance(raw.get("path"), str) \
             or not raw["path"].strip():
-        raise SystemExit("%s : entrée de `canons` invalide %r (attendu un chemin ou "
+        raise SystemExit("%s: invalid `canons` entry %r (expected a path or "
                          "{\"path\", \"ref\", \"untrusted\"})" % (where, raw))
     unknown = sorted(set(raw) - {"path", "ref", "untrusted"})
     if unknown:
-        raise SystemExit("%s : clé(s) inconnue(s) dans `canons` : %s"
+        raise SystemExit("%s: unknown key(s) in `canons`: %s"
                          % (where, ", ".join(unknown)))
     ref = raw.get("ref") or ""
     if not isinstance(ref, str):
-        raise SystemExit("%s : `ref` de canon invalide %r" % (where, ref))
+        raise SystemExit("%s: invalid canon `ref` %r" % (where, ref))
     return CanonEntry(path=_expand(raw["path"].strip()), ref=ref.strip(),
                       untrusted=bool(_as_bool(raw.get("untrusted"), False,
-                                              "%s : untrusted" % where)))
+                                              "%s: untrusted" % where)))
 
 
 @dataclass(frozen=True)
@@ -159,6 +159,9 @@ class Config:
     #: au-delà, une requête est annulée par le serveur (0 = pas de limite).
     #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
     statement_timeout_ms: float = 30000.0
+    #: L304 : session en lecture seule (`default_transaction_read_only`) ;
+    #: jamais lu de l'environnement, posé par `ameesh progress --serve`
+    read_only: bool = False
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
@@ -191,6 +194,10 @@ class Config:
     #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
     #: c'est la seule autorisation. Vide = personne.
     interrupt_senders: tuple[str, ...] = ()
+    #: L242b : agents critiques déclarés (en plus des rôles orchestrateur,
+    #: conception et auditeur du canon) : jamais en pause budget tant qu'un
+    #: compte a de la marge (voir docs/COMPTES.md § 7)
+    critical_agents: tuple[str, ...] = ()
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
@@ -328,6 +335,14 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: Off-device session backup; storage credentials come from the environment.
+    session_backup: dict = field(default_factory=dict)
+    #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
+    #: quarter of the CPUs, at least 1
+    max_heavy_suites: int = 0
+    #: L226a: the `credential_sentinel` key of the host configuration
+    #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
+    credential_sentinel: dict = field(default_factory=dict)
     #: issues GitHub des lots (L126) : la clé `github` du fichier de
     #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
     #: `host` : hôte désigné pour la projection automatique, `interval`,
@@ -392,9 +407,9 @@ def load(env: dict | None = None) -> Config:
             with open(cfg_path, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, ValueError) as exc:  # config cassée : on le dit, on continue
-            raise SystemExit("config illisible %s : %s" % (cfg_path, exc))
+            raise SystemExit("unreadable config %s: %s" % (cfg_path, exc))
         if not isinstance(raw, dict):
-            raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
+            raise SystemExit("unreadable config %s: JSON object expected" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
         known.discard("budget_explicit")  # calculé, jamais lu tel quel
@@ -471,6 +486,10 @@ def load(env: dict | None = None) -> Config:
         interrupt_senders=_as_names(
             pick("AMEESH_INTERRUPT_SENDERS", "AGENT_MESH_INTERRUPT_SENDERS")
         ) or cfg.interrupt_senders,
+        critical_agents=_as_names(pick("AMEESH_CRITICAL_AGENTS")) or tuple(
+            n.strip() for n in (cfg.critical_agents.split(",")
+                                if isinstance(cfg.critical_agents, str)
+                                else cfg.critical_agents or ()) if str(n).strip()),
         session_max_tokens=_as_float(
             pick("AMEESH_SESSION_MAX_TOKENS", "AGENT_MESH_SESSION_MAX_TOKENS"),
             cfg.session_max_tokens),
@@ -537,9 +556,9 @@ def load(env: dict | None = None) -> Config:
     if canons_env:
         paths = [_expand(p.strip()) for p in str(canons_env).split(":") if p.strip()]
         if single_env and paths and _expand(str(single_env)) != paths[0]:
-            raise SystemExit("AMEESH_CANON (%s) et AMEESH_CANONS (premier : %s) se "
-                             "contredisent : le premier de AMEESH_CANONS est le canon par "
-                             "défaut" % (single_env, paths[0]))
+            raise SystemExit("AMEESH_CANON (%s) and AMEESH_CANONS (first: %s) "
+                             "conflict: the first of AMEESH_CANONS is the default "
+                             "canon" % (single_env, paths[0]))
         cfg = replace(cfg, canon=paths[0] if paths else "", canon_ref="",
                       canon_untrusted=bool(env_untrusted),
                       extra_canons=tuple(CanonEntry(p, "", bool(env_untrusted))
@@ -568,27 +587,27 @@ def load(env: dict | None = None) -> Config:
                              or "").strip().lower(),
     )
     if cfg.canon_ref.startswith("-"):
-        raise SystemExit("AMEESH_CANON_REF invalide : %r" % cfg.canon_ref)
+        raise SystemExit("invalid AMEESH_CANON_REF: %r" % cfg.canon_ref)
     seen_paths: set[str] = set()
     for entry in cfg.canon_entries:
         if entry.ref.startswith("-"):
-            raise SystemExit("ref de canon invalide : %r (%s)" % (entry.ref, entry.path))
+            raise SystemExit("invalid canon ref: %r (%s)" % (entry.ref, entry.path))
         if entry.path in seen_paths:
-            raise SystemExit("canon configuré deux fois : %s" % entry.path)
+            raise SystemExit("canon configured twice: %s" % entry.path)
         seen_paths.add(entry.path)
     if not SCHEMA_RE.match(cfg.schema):
-        raise SystemExit("AGENT_MESH_SCHEMA invalide : %r" % cfg.schema)
+        raise SystemExit("invalid AGENT_MESH_SCHEMA: %r" % cfg.schema)
     if cfg.session_policy not in SESSION_POLICIES:
-        raise SystemExit("AMEESH_SESSION_POLICY invalide : %r (%s)"
+        raise SystemExit("invalid AMEESH_SESSION_POLICY: %r (%s)"
                          % (cfg.session_policy, " | ".join(SESSION_POLICIES)))
     if not isinstance(cfg.harness_bins, dict) or not all(
             isinstance(k, str) and isinstance(v, str) and v.strip()
             for k, v in cfg.harness_bins.items()):
-        raise SystemExit("config illisible : `harness_bins` attend {harnais: chemin}")
+        raise SystemExit("unreadable config: `harness_bins` expects {harness: path}")
     if cfg.driver not in ("auto", "psycopg", "psql"):
-        raise SystemExit("AGENT_MESH_DRIVER invalide : %r" % cfg.driver)
+        raise SystemExit("invalid AGENT_MESH_DRIVER: %r" % cfg.driver)
     if cfg.backend not in ("auto", "pg", "file"):
-        raise SystemExit("AGENT_MESH_BACKEND invalide : %r" % cfg.backend)
+        raise SystemExit("invalid AGENT_MESH_BACKEND: %r" % cfg.backend)
     return cfg
 
 
@@ -599,11 +618,11 @@ def _canons_from_file(raw: dict, where: str) -> dict:
     `canon_untrusted`) ; `canon` et `canons` à la fois : erreur claire."""
     items = raw.get("canons")
     if not isinstance(items, list):
-        raise SystemExit("%s : `canons` doit être une liste" % where)
+        raise SystemExit("%s: `canons` must be a list" % where)
     if any(raw.get(k) not in (None, "") for k in ("canon", "canon_ref")) \
             or raw.get("canon_untrusted") is not None:
-        raise SystemExit("%s : `canon`/`canon_ref`/`canon_untrusted` et `canons` à la fois "
-                         "— le premier élément de `canons` est le canon par défaut" % where)
+        raise SystemExit("%s: `canon`/`canon_ref`/`canon_untrusted` and `canons` both set "
+                         "(the first item of `canons` is the default canon)" % where)
     entries = [_canon_entry(item, where) for item in items]
     if not entries:
         return {"canon": "", "canon_ref": "", "canon_untrusted": False, "extra_canons": ()}

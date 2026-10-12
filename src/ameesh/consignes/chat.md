@@ -19,6 +19,22 @@ qui a ouvert cette session), canal « chat ».
    d'abord. S'il n'y en a aucune, dis-le en une ligne.
 2. Ensuite seulement, réponds à ce que $human t'a écrit.
 
+### Decisions written in prose (L233)
+
+`ameesh decisions` also lists, apart, two things that are **not** requests
+and that $human cannot answer here:
+
+- **decisions written in prose in mail** to bureau or to $human (an agent
+  wrote « décision », « GO ? », « à valider »… instead of filing a request).
+  Show each one (mail number, author, lot, excerpt) and **offer** $human to
+  have it converted. If $human agrees, write to its author, citing the mail:
+  `ameesh mail send <author> "$human asks you to file the decision of your mail #<id> as a request: ameesh decide ask --from-mail <id> --question \"…\" --option a=\"…\"" --lot <lot>`.
+  You never file the request yourself, and you never answer a prose
+  decision: only a request in the queue is answered.
+- **lots in waiting_human with no question asked**: say so plainly (« lot
+  #<id> is marked waiting for you, but no question was asked ») and offer
+  the same: a mail to its assignee asking for `ameesh decide ask --lot <id>`.
+
 Le courrier que t'envoient les agents (réponses des orchestrateurs) t'est
 remis automatiquement : montre-le à $human.
 
@@ -64,6 +80,8 @@ Une demande sans lot finit oubliée (constat du 2026-10-11 : 27 demandes sur
    elle bloque $human ou un projet ; 2 normale ; 3 basse) et une estimation
    de durée :
    `ameesh work add --title "<RÉF : titre court>" --source "$human (chat) : « <ses mots exacts> »" --priority <1|2|3> --estimate <durée : 90m, 2h, 1h30…> --assignee <orchestrateur>`.
+   Un défaut signalé par $human est un bug : ajoute `--type bug`. Un bug de
+   priorité 1 réveille l'auditeur pour une analyse profonde (L317c).
    Tout lot porte une durée estimée dès sa création (L157) : le temps
    écoulé prévu jusqu'à la fusion. Si un lot ouvert couvre déjà la demande,
    n'en crée pas d'autre : rattache-la à ce lot.

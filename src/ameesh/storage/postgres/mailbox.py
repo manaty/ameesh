@@ -77,6 +77,12 @@ PASSIVE_SQL = (
 
 class Mailbox(interface.Mailbox):
 
+    def lock_recipient(self, recipient):
+        rows = self.db.query(
+            "SELECT name, chantier FROM agent_registry WHERE name = %s FOR SHARE",
+            (recipient,))
+        return rows[0] if rows else None
+
     def send(self, sender, recipient, body, *, host, kind, payload, work_item_id,
              signature, signature_key, signed_payload, nonce, created_us,
              expires_us) -> dict:

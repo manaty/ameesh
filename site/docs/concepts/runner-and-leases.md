@@ -142,6 +142,14 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
   alert). When mains power returns, the runner claims its agents again by
   itself. Agents meant to be always available belong on a server.
 
+- **CPU pressure and lendable capacity** (L159d): the reading includes the
+  host's pressure stall information (PSI, 60 s averages), the CPU and memory
+  of the guest (the agents' slice) and of the application (everything else),
+  and the capacity the host could lend, computed on the application's
+  consumption over 7 days. `max_cpu_pressure` (no default) holds new turns
+  above that CPU PSI. `ameesh hosts` shows them; relocation ranks a lending
+  host by its lendable memory.
+
 ## Host not ready
 
 A harness binary or interpreter that cannot be found (a user unit started

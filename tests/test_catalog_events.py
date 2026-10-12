@@ -75,7 +75,7 @@ class EventsTest(unittest.TestCase):
         decision = reconcile([ActiveModel("openai", "a", "openai"), ActiveModel("openai", "b", "openai")], result("a"))
         events = events_for(decision, result("a"))
         self.assertEqual(len(events), 1)
-        self.assertIn("1 modèle(s) retiré(s)", events[0].body)
+        self.assertIn("1 model(s) retired", events[0].body)
         self.assertEqual(events[0].payload["retired"], ["b"])
 
     def test_un_retrait_massif_refuse_se_dit_et_se_marque_urgent(self):
@@ -83,8 +83,8 @@ class EventsTest(unittest.TestCase):
         decision = reconcile(state, result("a"))
         events = events_for(decision, result("a"))
         self.assertEqual(len(events), 1)
-        self.assertIn("retrait massif REFUSÉ", events[0].body)
-        self.assertIn("un humain doit trancher", events[0].body)
+        self.assertIn("mass withdrawal REFUSED", events[0].body)
+        self.assertIn("a human must decide", events[0].body)
         self.assertTrue(events[0].payload["urgent"])
         self.assertEqual(len(events[0].payload["refused"]), 3)
 
@@ -97,7 +97,7 @@ class EventsTest(unittest.TestCase):
         decision = reconcile([ActiveModel("openai", "a", "openai")], result("a", "b"))
         events = events_for(decision, result("a", "b"), appeared=("b",))
         self.assertEqual(len(events), 1)
-        self.assertIn("nouveau(x) modèle(s)", events[0].body)
+        self.assertIn("new model(s)", events[0].body)
         self.assertEqual(events[0].payload["new"], ["b"])
 
 
@@ -120,7 +120,7 @@ class RecordTest(unittest.TestCase):
         self.assertEqual([row["model_id"] for row in store.retired], ["b"])
         self.assertEqual(decision.refused_reason, "")
         self.assertEqual(len(sent), 1)
-        self.assertIn("retiré", sent[0][0])
+        self.assertIn("retired", sent[0][0])
 
     def test_un_bareme_ne_ressuscite_pas_un_modele_retire_ni_ne_vole_la_source(self):
         # B2 : une source LOCALE met à jour les prix, elle ne rend pas un modèle
@@ -171,7 +171,7 @@ class RecordTest(unittest.TestCase):
         sent: list[tuple[str, dict]] = []
         record(store, priced, emit=lambda body, payload: sent.append((body, payload)))
         self.assertEqual(len(sent), 1)
-        self.assertIn("prix modifié", sent[0][0])
+        self.assertIn("price(s) changed", sent[0][0])
         self.assertEqual(sent[0][1]["repriced"], ["a"])
 
     def test_un_prix_en_cache_qui_change_est_un_evenement(self):

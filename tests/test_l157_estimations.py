@@ -51,8 +51,8 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(estimates.compact(45), "45m")
         self.assertEqual(estimates.compact(90), "1h30")
         self.assertEqual(estimates.compact(120), "2h")
-        self.assertEqual(estimates.compact(3 * 1440), "3j")
-        self.assertEqual(estimates.ratio_text(1.333), "×1,33")
+        self.assertEqual(estimates.compact(3 * 1440), "3d")
+        self.assertEqual(estimates.ratio_text(1.333), "×1.33")
         self.assertEqual(estimates.ratio_text(2.0), "×2")
 
 
@@ -62,14 +62,14 @@ class ViewTest(unittest.TestCase):
         v = estimates.view({"estimate_minutes": 120, "state": "intake"}, now=NOW)
         self.assertEqual((v["minutes"], v["actual_minutes"], v["elapsed_minutes"], v["ratio"]),
                          (120, None, None, None))
-        self.assertEqual(v["label"], "estimé 2 h")
+        self.assertEqual(v["label"], "estimated 2 h")
         self.assertEqual(estimates.cell(v), "2h")
 
     def test_en_cours_et_depasse(self):
         item = {"estimate_minutes": 60, "started_ts": NOW - 5400, "state": "build"}
         v = estimates.view(item, now=NOW)
         self.assertEqual((v["elapsed_minutes"], v["ratio"], v["overrun"]), (90.0, 1.5, True))
-        self.assertEqual(v["label"], "estimé 1 h · en cours depuis 1 h 30 (DÉPASSÉ, ×1,5)")
+        self.assertEqual(v["label"], "estimated 1 h · in progress for 1 h 30 (OVERRUN, ×1.5)")
         self.assertEqual(estimates.cell(v), "1h30/1h!")
         v = estimates.view(dict(item, started_ts=NOW - 1800), now=NOW)
         self.assertFalse(v["overrun"])
@@ -81,17 +81,17 @@ class ViewTest(unittest.TestCase):
         self.assertEqual((v["actual_minutes"], v["gap_minutes"], v["ratio"]),
                          (160.0, 40.0, 1.333))
         self.assertIsNone(v["elapsed_minutes"])
-        self.assertEqual(v["label"], "estimé 2 h · réel 2 h 40 (+40 min, ×1,33)")
+        self.assertEqual(v["label"], "estimated 2 h · actual 2 h 40 (+40 min, ×1.33)")
         plus_vite = estimates.view(dict(item, started_ts=NOW - 3600), merged_ts=NOW)
-        self.assertEqual(plus_vite["label"], "estimé 2 h · réel 1 h (−1 h, ×0,5)")
+        self.assertEqual(plus_vite["label"], "estimated 2 h · actual 1 h (−1 h, ×0.5)")
 
     def test_sans_estimation_ou_sans_debut(self):
         v = estimates.view({"started_ts": NOW - 600, "state": "build"}, now=NOW)
-        self.assertEqual(v["label"], "sans estimation · en cours depuis 10 min")
+        self.assertEqual(v["label"], "no estimate · in progress for 10 min")
         self.assertEqual(estimates.cell(v), "10m/?")
         self.assertEqual(estimates.cell(estimates.view({"state": "intake"})), "—")
         v = estimates.view({"estimate_minutes": 30, "state": "merged"}, merged_ts=NOW)
-        self.assertEqual(v["label"], "estimé 30 min · réel inconnu (début non mesuré)")
+        self.assertEqual(v["label"], "estimated 30 min · actual unknown (start not measured)")
 
 
 def _row(i, type_, by, est, actual, *, late=False, started=True, revisions=1):
@@ -132,11 +132,11 @@ class ReportTest(unittest.TestCase):
         tardives = {g["key"]: g for g in rep["late"]}
         self.assertEqual(tardives["tardive"]["median"], 10.0)
         text = estimates.format_report(rep)
-        for attendu in ("PAR TYPE DE LOT", "PAR AUTEUR D'ESTIMATION", "1 estimé(s) après le "
-                        "début", "1 livré(s) sans estimation", "1 sans début mesuré",
-                        "1 lot(s) ré-estimé(s)", "×1,25"):
+        for attendu in ("BY LOT TYPE", "BY ESTIMATE AUTHOR", "1 estimated after the "
+                        "start", "1 delivered without an estimate", "1 without a measured start",
+                        "1 lot(s) re-estimated", "×1.25"):
             self.assertIn(attendu, text)
-        self.assertIn("rien à comparer", estimates.format_report(estimates.build([])))
+        self.assertIn("nothing to compare", estimates.format_report(estimates.build([])))
 
 
 class IssueHeaderTest(unittest.TestCase):
@@ -152,16 +152,16 @@ class IssueHeaderTest(unittest.TestCase):
                 "estimate_minutes": 120, "estimate_source": "conception", "estimate_by": "w1",
                 "planned_start": "2026-10-12", "planned_delivery": "2026-10-15"}
         body = self.view(item).body
-        self.assertIn("Durée estimée 2 h · prévu : début 12/10/2026, livraison 15/10/2026",
+        self.assertIn("Estimated duration 2 h · planned: start 2026-10-12, delivery 2026-10-15",
                       body)
         self.assertNotIn("conception", body)       # la source n'est pas publiée
-        self.assertNotIn("réel", body)
+        self.assertNotIn("actual", body)
         done = dict(item, state="merged", started_ts=NOW - 9600, merged_ts=NOW)
-        self.assertIn("réel 2 h 40 (+40 min, ×1,33)", self.view(done).body)
+        self.assertIn("2 h 40 (+40 min, ×1.33)", self.view(done).body)
         # ni estimation ni date : l'en-tête ne change pas (aucune réécriture d'issue)
         bare = {"id": 13, "title": "x", "type": "bug", "state": "build"}
         self.assertIsNone(plan_github._plan_line(bare))
-        self.assertNotIn("Durée", self.view(bare, public=False).body)
+        self.assertNotIn("Duration", self.view(bare, public=False).body)
 
 
 class VersionOnlyTest(unittest.TestCase):
@@ -210,29 +210,29 @@ class EstimatesPgTest(PgTestCase):
     def test_creation_gardee_agent_refuse_humain_averti(self):
         proc = self.mesh("work", "add", "--title", "sans estimation", "--actor", "orch")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("estimation obligatoire", proc.stderr)
+        self.assertIn("estimate required", proc.stderr)
         self.assertIn("--estimate 2h", proc.stderr)
         self.assertEqual(work.list_items(self.db), [])
         proc = self.mesh("work", "add", "--title", "estimé", "--actor", "orch",
                          "--estimate", "1h30", "--estimate-source", "conception")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("estimé 1 h 30", proc.stdout)
+        self.assertIn("estimated 1 h 30", proc.stdout)
         item = work.list_items(self.db)[0]
         self.assertEqual((item["estimate_minutes"], item["estimate_source"],
                           item["estimate_by"]), (90, "conception", "orch"))
         self.assertIsNotNone(item["estimate_ts"])
         hist = storage.of(self.db).work.estimates(item["id"])
         self.assertEqual([(h["minutes"], h["estimated_by"]) for h in hist], [(90, "orch")])
-        self.assertIn("estimation : 1 h 30", work.events(self.db, item["id"])[0]["note"])
+        self.assertIn("estimate: 1 h 30", work.events(self.db, item["id"])[0]["note"])
         # un humain : avertissement, pas refus
         proc = self.mesh("work", "add", "--title", "par un humain", "--actor", "human:o")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot sans durée estimée", proc.stderr)
+        self.assertIn("lot without an estimated duration", proc.stderr)
         self.assertIn("ameesh work plan", proc.stderr)
         # une estimation illisible est refusée avant toute création
         proc = self.mesh("work", "add", "--title", "x", "--estimate", "bientôt")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("estimation illisible", proc.stderr)
+        self.assertIn("unreadable estimate", proc.stderr)
         self.assertEqual(len(work.list_items(self.db)), 2)
 
     def test_plan_estimate_et_revision(self):
@@ -240,7 +240,7 @@ class EstimatesPgTest(PgTestCase):
         proc = self.mesh("work", "plan", str(lot["id"]), "--estimate", "2h", "--source",
                          "conversation", "--actor", "orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("estimé 2 h", proc.stdout)
+        self.assertIn("estimated 2 h", proc.stdout)
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["estimate_minutes"], item["estimate_source"]),
                          (120, "conversation"))
@@ -258,7 +258,7 @@ class EstimatesPgTest(PgTestCase):
         # sur une fiche : refusé ; lot livré : estimation figée
         proc = self.mesh("work", "plan", "fiche-x", "--estimate", "2h")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("se pose sur une tâche", proc.stderr)
+        self.assertIn("applies to a task", proc.stderr)
         work.move(self.db, lot["id"], "build")
         work.merged(self.db, lot["id"], sha="abcdef1")
         with self.assertRaises(estimates.EstimateError):
@@ -279,7 +279,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(estimates.mark_started(self.db, "dev1", [b["id"]]), [])
         self.assertIsNotNone(work.get(self.db, b["id"])["started_ts"])
         self.assertIsNone(work.get(self.db, c["id"])["started_ts"])
-        self.assertIn("début mesuré : premier tour de dev1",
+        self.assertIn("start measured: first turn of dev1",
                       work.events(self.db, b["id"])[0]["note"])
 
     def _deliver(self, lot_id, *, started_min_ago, merged_min_ago=0, estimated_before=True):
@@ -317,7 +317,7 @@ class EstimatesPgTest(PgTestCase):
 
         proc = self.mesh("work", "show", str(a["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("durée    : estimé 2 h · réel 2 h 40 (+40 min, ×1,33)", proc.stdout)
+        self.assertIn("estimated 2 h · actual 2 h 40 (+40 min, ×1.33)", proc.stdout)
         proc = self.mesh("work", "show", str(a["id"]), "--json")
         shown = json.loads(proc.stdout)
         self.assertEqual((shown["estimate"]["minutes"], shown["estimate"]["actual_minutes"]),
@@ -336,7 +336,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(everything["excluded"]["no_estimate"], 1)
         proc = self.mesh("work", "estimates", "--app", "p")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("PAR AUTEUR D'ESTIMATION", proc.stdout)
+        self.assertIn("BY ESTIMATE AUTHOR", proc.stdout)
 
     def test_projects_colonne_duree(self):
         lot = work.add(self.db, title="Vue", assignee="dev1", estimate="1h")
@@ -349,7 +349,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(agent["lot_estimate"]["minutes"], 60)
         self.assertTrue(agent["lot_estimate"]["overrun"])
         text = projects.format_text(view, 120)
-        self.assertIn("DURÉE", text)
+        self.assertIn("DURATION", text)
         self.assertIn("1h30/1h!", text)
 
     def test_mail_new_lot(self):
@@ -357,18 +357,18 @@ class EstimatesPgTest(PgTestCase):
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",
                         "Sans durée", env=env)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("message non déposé", proc.stderr)
-        self.assertIn("estimation obligatoire", proc.stderr)
+        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("estimate required", proc.stderr)
         self.assertEqual(work.list_items(self.db), [])
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",
-                        "Avec durée", "--estimate", "45m", env=env)
+                        "Avec durée", "--estimate", "45m", "--app", "p", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         item = work.list_items(self.db)[0]
         self.assertEqual((item["title"], item["estimate_minutes"], item["estimate_by"]),
                          ("Avec durée", 45, "orch"))
         proc = self.cli("send", "dev1", "x", "--from", "orch", "--estimate", "45m", env=env)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("--estimate accompagne --new-lot", proc.stderr)
+        self.assertIn("--estimate goes with --new-lot", proc.stderr)
 
 
 if __name__ == "__main__":
