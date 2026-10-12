@@ -181,8 +181,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'turn_max_seconds', 'turn_mail_max',
         -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
         'turn_grace_seconds',
-        -- L165b (0384) : réveil sur lot actionnable, on/off (un réglage)
-        'lot_wake',
+        -- L165b (0384) : réveil sur lot actionnable, on/off (un réglage) ;
+        -- harnais, dossier et id de la session dont ils notent l'ouverture
+        -- (même nature que harness, cwd, session_id)
+        'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
