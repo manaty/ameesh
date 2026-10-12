@@ -463,7 +463,7 @@ class AnnouncedModelTest(PgTestCase):
         self.assertTrue(self._tour(self.worker, env))
         ligne = self._ligne()
         self.assertEqual(ligne["model"], "deepseek-flash")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.27, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 0.30, places=6)
 
     def test_annonce_non_persistee_suspend_et_ce_worker_repare_au_bon_tarif(self):
         """Si la base refuse l'annonce, les tours se suspendent (fail-closed) et la
@@ -510,7 +510,7 @@ class AnnouncedModelTest(PgTestCase):
         self._worker().budget_ok()
         ligne = self._ligne()
         self.assertEqual(ligne["model"], "deepseek-flash")
-        self.assertAlmostEqual(float(ligne["usd"]), 0.27, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 0.30, places=6)
 
     def test_flux_illisible_ou_absent_ne_change_pas_le_modele_et_ne_plante_pas(self):
         env = self._flux_pro()
@@ -552,7 +552,7 @@ class AnnouncedModelTest(PgTestCase):
         self.assertTrue(self._tour(self.worker, sans_annonce))
         ligne = self._ligne()
         self.assertEqual(ligne["model"], "deepseek-flash")  # le lancement, pas le tour d'avant
-        self.assertAlmostEqual(float(ligne["usd"]), 0.27, places=6)
+        self.assertAlmostEqual(float(ligne["usd"]), 0.30, places=6)
 
 
 if __name__ == "__main__":
