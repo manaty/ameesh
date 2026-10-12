@@ -2047,6 +2047,17 @@ class HostResources(Domain):
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
 
     @abc.abstractmethod
+    def record_harness_version(self, host: str, harness: str, *, path: str | None,
+                               version: str | None, raw: str | None) -> None:
+        """L120: the last version read of `harness` on `host` (one row per
+        pair, replaced)."""
+
+    @abc.abstractmethod
+    def harness_versions(self, host: str | None = None) -> list[dict]:
+        """L120: the versions read, by harness then host: `host`, `harness`,
+        `path`, `version`, `raw`, `observed_ts` (epoch seconds)."""
+
+    @abc.abstractmethod
     def lend_basis(self, host: str, since_s: float, slot_s: float,
                    percentile: float) -> dict:
         """L159d: history behind the lendable capacity, over the last

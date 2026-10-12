@@ -36,6 +36,9 @@ def _compte() -> dict:
 
 def main() -> int:
     args = sys.argv[1:]
+    if args == ["--version"]:  # L120: read by the runner, not a turn
+        print("9.9.9 (Claude Code, fake)")
+        return 0
     if args == ["--help"]:
         # L223: the help read for the interactive permission mode, before any
         # log (it is not a turn); AMEESH_TEST_CLAUDE_HELP simulates an older

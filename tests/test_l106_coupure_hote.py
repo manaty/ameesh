@@ -917,6 +917,7 @@ class CoupureTest(PgTestCase):
         self.assertIn("harnais    : deepseek [dsh1] → %s" % os.path.join(FAKEBIN, "dsh"),
                       proc.stdout)
         self.assertIn("interpréteur python3", proc.stdout)
+        self.assertIn("version 9.9.9", proc.stdout)  # L120
         proc = self.cli("doctor", "--harness",
                         env=self.env(AMEESH_DSH_BIN=os.path.join(self.tmp, "absent")))
         self.assertEqual(proc.returncode, 1)
