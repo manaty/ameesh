@@ -163,6 +163,29 @@ class InstallPilotTest(unittest.TestCase):
         self.assertNotIn("userdel", out)
         self.assertNotIn("rm -rf /opt/ameesh/venv", out)
 
+    def test_owner_runbook_commands_run(self):
+        # PILOT-ameesh-agents-1.md: each of its script commands, dry run
+        import re
+        import shlex
+        with open(os.path.join(GUEST, "PILOT-ameesh-agents-1.md"), encoding="utf-8") as fh:
+            text = re.sub(r"\\\n\s*", "", fh.read())
+        commands = []
+        for line in text.splitlines():
+            m = re.search(r"sudo deploy/guest/install-pilot\.sh([^`#|]*)", line)
+            if m:
+                commands.append(shlex.split(m.group(1)))
+        self.assertGreaterEqual(len(commands), 8)
+        for args in commands:
+            args = [a for a in args if a != "--dry-run"]
+            if "--host" not in args:
+                args = ["--host", "vm-test", *args]   # --enable takes the rest
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", *args],
+                                 capture_output=True, text=True)
+            if "--check" in args:   # read only: it fails here, nothing being installed
+                self.assertNotIn("install-pilot.sh:", res.stderr, args)
+            else:
+                self.assertEqual(res.returncode, 0, (args, res.stderr))
+
 
 def reading(ts, **over):
     row = {"sampled_ts": float(ts), "mem_available_bytes": 8 * GIB, "swap_used_bytes": 0,
