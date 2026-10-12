@@ -7,6 +7,7 @@ locally: real git, real processes, no network, no database.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -857,6 +858,67 @@ class ShellTest(OffloadBase):
         # the shell's own identity is recorded and recognised as alive
         me = {"shell_pid": os.getpid(), "shell_start": offload_shell._proc_identity(os.getpid())}
         self.assertTrue(offload_shell._shell_alive(me))
+
+    def _pidfd_job(self, other) -> tuple[dict, str, str]:
+        name = "20200101-000000-abcdef"
+        job_dir = os.path.join(self.vm, "jobs", name)
+        os.makedirs(job_dir)
+        with open(os.path.join(job_dir, "meta.json"), "w") as fh:
+            json.dump({"job": name, "state": "running", "shell_pid": other.pid,
+                       "shell_start": offload_shell._proc_identity(other.pid)}, fh)
+        return offload_shell.load_config(self.config_path), name, job_dir
+
+    def test_cancel_signals_through_a_pidfd(self):
+        # #312: the identity check and the signal were two steps; a PID
+        # reused in between got the SIGTERM. The pidfd opened before the
+        # check holds the original shell: here it has died, and the process
+        # now at its PID (identity matching) is never signalled
+        try:
+            probe = os.pidfd_open(os.getpid())
+        except (AttributeError, OSError) as exc:
+            if isinstance(exc, OSError) and exc.errno != errno.ENOSYS:
+                raise
+            self.skipTest("no pidfd on this kernel or Python")
+        os.close(probe)
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        gone = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(gone.wait)
+        self.addCleanup(gone.kill)
+        pidfd = os.pidfd_open(gone.pid)
+        gone.kill()
+        gone.wait()
+        cfg, name, job_dir = self._pidfd_job(other)
+        with mock.patch.object(offload_shell.os, "pidfd_open", return_value=pidfd), \
+                mock.patch.object(sys, "stdout", new=mock.Mock()):
+            self.assertEqual(offload_shell.cmd_cancel(cfg, [name]), 0)
+        time.sleep(0.2)
+        self.assertIsNone(other.poll())  # not signalled
+        self.assertTrue(os.path.exists(os.path.join(job_dir, "cancel")))
+
+    def test_cancel_without_pidfd(self):
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        cfg, name, _job_dir = self._pidfd_job(other)
+        # a pidfd that cannot be opened for another reason: an error, no
+        # signal by PID (r1: EPERM, EMFILE fell back to os.kill)
+        for code in (errno.EPERM, errno.EMFILE):
+            with mock.patch.object(offload_shell.os, "pidfd_open", create=True,
+                                   side_effect=OSError(code, os.strerror(code))), \
+                    mock.patch.object(sys, "stdout", new=mock.Mock()):
+                with self.assertRaises(OSError):
+                    offload_shell.cmd_cancel(cfg, [name])
+        time.sleep(0.2)
+        self.assertIsNone(other.poll())
+        # without pidfd support (ENOSYS), the checked PID is still signalled
+        with mock.patch.object(offload_shell.os, "pidfd_open", create=True,
+                               side_effect=OSError(errno.ENOSYS, "ENOSYS")), \
+                mock.patch.object(offload_shell.signal, "pidfd_send_signal", create=True), \
+                mock.patch.object(sys, "stdout", new=mock.Mock()):
+            offload_shell.cmd_cancel(cfg, [name])
+        self.assertEqual(other.wait(timeout=5), -signal.SIGTERM)
 
     def test_emit_survives_a_closed_session(self):
         class Gone:

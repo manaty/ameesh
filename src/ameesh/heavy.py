@@ -54,6 +54,36 @@ WAIT_LOG_S = 60.0
 RELAYED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 #: seconds the command's process group has after SIGTERM, then after SIGKILL
 GROUP_GRACE_S = 10.0
+#: #453: duration cap of a heavy command (seconds; `AMEESH_HEAVY_MAX_S`,
+#: `heavy_max_seconds` of the configuration, `--max-duration`); 0 = none
+DEFAULT_MAX_S = 3600.0
+#: #453: exit code of a command stopped by the duration cap (as `timeout`)
+CAPPED_EXIT = 124
+
+
+def parse_duration(text) -> float:
+    """`90`, `90s`, `45m`, `2h` -> seconds; ValueError otherwise."""
+    raw = str(text).strip().lower()
+    factor = {"s": 1.0, "m": 60.0, "h": 3600.0}.get(raw[-1:], None)
+    value = float(raw[:-1] if factor else raw) * (factor or 1.0)
+    if value != value or value < 0 or value == float("inf"):
+        raise ValueError(text)
+    return value
+
+
+def max_duration(cfg, requested=None) -> float:
+    """#453: the cap of this command: `--max-duration`, else
+    `AMEESH_HEAVY_MAX_S`, else `heavy_max_seconds` of the configuration,
+    else `DEFAULT_MAX_S`. Unreadable: the default."""
+    for raw in (requested, os.environ.get("AMEESH_HEAVY_MAX_S"),
+                getattr(cfg, "heavy_max_seconds", None)):
+        if raw is None or raw == "":
+            continue
+        try:
+            return parse_duration(raw)
+        except ValueError:
+            continue
+    return DEFAULT_MAX_S
 
 
 def limit(cfg) -> int:
@@ -367,10 +397,17 @@ def _foreground_tty() -> int | None:
     return None
 
 
-def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
+def run(cfg, argv: list, *, nice: int = DEFAULT_NICE, max_s: float | None = None) -> int:
     """Runs `argv` holding a heavy slot; its exit code (127 if not found,
-    128 + n if killed by signal n)."""
+    128 + n if killed by signal n, `CAPPED_EXIT` if stopped by the duration
+    cap `max_s`, #453: SIGTERM to its group with a message, SIGKILL after
+    `GROUP_GRACE_S`)."""
+    import threading
+
     command = shlex.join(argv)
+    cap = max_duration(cfg) if max_s is None else float(max_s)
+    capped = threading.Event()
+    timers: list = []
     held = acquire(cfg, command=command,
                    log=lambda text: print(text, file=sys.stderr, flush=True))
     slot, fh = held
@@ -415,6 +452,27 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         _note_child(fh, child.pid)
         for signum in pending:
             relay(signum, None)
+        if cap > 0:
+            leader = child.pid
+
+            def over() -> None:
+                capped.set()
+                print("ameesh heavy: duration cap reached (%s): command stopped "
+                      "(SIGTERM, then SIGKILL after %ds). Run a narrower suite, or raise "
+                      "the cap: ameesh heavy --max-duration <90m|2h|0> -- …"
+                      % (_human(cap), int(GROUP_GRACE_S)), file=sys.stderr, flush=True)
+                _killpg(leader, signal.SIGCONT)      # a stopped group gets the signal too
+                _killpg(leader, signal.SIGTERM)
+                later = threading.Timer(GROUP_GRACE_S,
+                                        lambda: _killpg(leader, signal.SIGKILL))
+                later.daemon = True
+                timers.append(later)
+                later.start()
+
+            timer = threading.Timer(cap, over)
+            timer.daemon = True
+            timers.append(timer)
+            timer.start()
         if tree and _tree_read(child.pid) is not None:
             code = _wait_unreaped(child, tty)
             drained = _drain_tree(child.pid)
@@ -426,8 +484,12 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         if not drained:
             print("ameesh heavy: processes of the command (group %d) survive SIGKILL; "
                   "slot released" % child.pid, file=sys.stderr)
+        if capped.is_set():
+            return CAPPED_EXIT
         return code if code >= 0 else 128 - code
     finally:
+        for timer in timers:
+            timer.cancel()
         if tty is not None:
             # L131d: the terminal is taken back only from the command's group
             # (or kept): stopped, sent to the background and left to exit, the
@@ -475,9 +537,25 @@ def cmd_heavy(cfg, args) -> int:
     if argv[:1] == ["--"]:
         argv = argv[1:]
     if not argv:
-        print("usage: ameesh heavy [--nice N] -- <command> [args…]", file=sys.stderr)
+        print("usage: ameesh heavy [--nice N] [--max-duration 90m] -- <command> [args…]", file=sys.stderr)
         return 2
-    return run(cfg, argv, nice=args.nice)
+    if args.max_duration is not None:
+        try:
+            parse_duration(args.max_duration)
+        except ValueError:
+            print("ameesh heavy: invalid --max-duration %r (e.g. 90m, 2h, 0 = no cap)"
+                  % args.max_duration, file=sys.stderr)
+            return 2
+    return run(cfg, argv, nice=args.nice, max_s=max_duration(cfg, args.max_duration))
+
+
+def _human(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds % 3600 == 0:
+        return "%d h" % (seconds // 3600)
+    if seconds % 60 == 0:
+        return "%d min" % (seconds // 60)
+    return "%d s" % seconds
 
 
 def add_parser(sub) -> None:
@@ -487,5 +565,9 @@ def add_parser(sub) -> None:
     p.add_argument("--json", action="store_true")
     p.add_argument("--nice", type=int, default=DEFAULT_NICE,
                    help="niceness of the command (default %d, 0: unchanged)" % DEFAULT_NICE)
+    p.add_argument("--max-duration", default=None,
+                   help="duration cap (90m, 2h; 0: none); default AMEESH_HEAVY_MAX_S, "
+                        "then heavy_max_seconds of the configuration, then %d min (#453)"
+                        % int(DEFAULT_MAX_S // 60))
     p.add_argument("command", nargs="...", help="-- then the command")
     p.set_defaults(func=cmd_heavy)

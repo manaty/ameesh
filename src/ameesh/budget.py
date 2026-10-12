@@ -70,6 +70,9 @@ def source_label(source: str) -> str:
 DEFAULT_TTL = 15.0
 #: préfixe du statut d'un agent en pause budget (`runner.budget_ok`)
 PAUSE_PREFIX = "budget : "
+#: L242b (5) : après `PAUSE_PREFIX`, la pause d'un agent critique (posée par
+#: l'exécuteur, seul à savoir qui l'est) — alerte urgente `critical_budget_pause`
+CRITICAL_MARK = "critical agent: "
 
 
 class BudgetError(RuntimeError):
@@ -266,6 +269,10 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         paid = cost_mod.paid_harnesses_of()
         spend["paid_harnesses"] = list(paid)
         spend["1h_usd"] = round(book.spent("all", 3600, harnesses=paid), 6)
+        # L242b : ce que la garde compte contre le plafond horaire (baisse
+        # réelle des soldes, l'estimation corrigée entre deux relevés)
+        spend["1h_counted_usd"] = round(book.paid_hour(paid), 6)
+        spend["noncritical_hourly_share"] = getattr(cfg, "noncritical_hourly_share", 1.0)
         spend["24h_usd"] = round(book.spent("all", 86400, harnesses=paid), 6)
         for agent in sorted(limits.agents):
             spend["agents"][agent] = {
@@ -328,6 +335,13 @@ def format_status(data: dict) -> str:
         out.append("pay-per-token spend (%s): 1 h %s · 24 h %s" % (
             ", ".join(sp["paid_harnesses"] or []) or "no harness",
             _fmt_usd(sp["1h_usd"]), _fmt_usd(sp["24h_usd"])))
+        if sp.get("1h_counted_usd") is not None:
+            share = sp.get("noncritical_hourly_share")
+            out.append("hourly cap counts %s (real balance drop; the estimate between two "
+                       "readings)%s" % (
+                           _fmt_usd(sp["1h_counted_usd"]),
+                           "; non-critical agents stop at %.0f%% of it" % (share * 100)
+                           if share is not None and share < 1 else ""))
     if data["paused"]:
         out.append("paused for budget:")
         for p in data["paused"]:

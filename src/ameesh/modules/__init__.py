@@ -81,3 +81,17 @@ def main(argv):
         return 1
     finally:
         db.close()
+
+
+def audit(db):
+    """Collect findings only from installed modules active in the database."""
+    from .storage import ModuleStore
+    store = ModuleStore(db)
+    registry = installed()
+    out = []
+    for entry in store.active():
+        module = registry.get(entry["module"])
+        hook = getattr(module, "audit", None)
+        if hook is not None:
+            out.extend(hook(store, entry["project"]))
+    return out

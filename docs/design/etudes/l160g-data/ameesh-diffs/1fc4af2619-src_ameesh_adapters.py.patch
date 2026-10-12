@@ -1,0 +1,20 @@
+# merge 1fc4af26192b341ab372402fe4e6954d5ccf2aad src/ameesh/adapters.py (resolved)
+# --- mergiraf  +++ committed
+diff --git a/bb99e1dac802d2f716d696350c045de921165dde b/bde594dd7d9f830b62068ababccd90627543feca
+index bb99e1d..bde594d 100644
+--- a/bb99e1dac802d2f716d696350c045de921165dde
++++ b/bde594dd7d9f830b62068ababccd90627543feca
+@@ -86,13 +86,6 @@ ATTACH_RESUME_PROMPT = (
+     "cours, puis continue ton lot. Si tu attendais une décision humaine, dis-le "
+     "par agent-mail send à ton responsable et arrête-toi."
+ )
+-#: L105 : tour suivant un tour clos par un plafond (contexte, durée) — le
+-#: travail en cours reprend là où il s'est arrêté
+-SUITE_PROMPT = (
+-    "Suite : ton tour précédent a été clos par l'exécuteur à un point sûr (%s). "
+-    "Reprends le travail en cours là où il s'est arrêté, sans refaire ce qui est "
+-    "fait. Avance par étapes courtes et rends la main dès qu'une étape est stable."
+-)
+ IDLE_PROMPT = (
+     "Reprise : si ton lot n'est ni gelé ni fusionné, continue-le ; sinon prends "
+     "la suite de ton affectation (board, workstream). Si tu n'as rien à faire, "

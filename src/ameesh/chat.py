@@ -6,7 +6,7 @@
         conversation agent of the human who launches it: decision requests
         from every project, their answers (`ameesh decide`), their other
         requests forwarded to the orchestrators;
-  ameesh chat --consigne     prints the chat instructions (text versioned in the repository);
+  ameesh chat --instruction  prints the chat instructions (text versioned in the repository);
   ameesh chat --dry-run      says what would be launched, without launching or writing anything.
 
 Unlike `ameesh attach`, the chat NEVER takes another agent's session or
@@ -45,6 +45,7 @@ import time
 from . import config as config_mod
 from . import platform
 from .config import NAME_RE, Config
+from .deprecated import DeprecatedAlias
 
 #: préfixe du nom d'un agent de conversation (`chat-<humain>`)
 CHAT_PREFIX = "chat-"
@@ -70,11 +71,15 @@ def default_name(user: str) -> str:
     return (CHAT_PREFIX + clean)[:64]
 
 
-def consigne(human: str, name: str) -> str:
+def instruction(human: str, name: str) -> str:
     """La consigne du chat, pour cet humain et ce nom d'agent."""
     with open(CONSIGNE_PATH, encoding="utf-8") as fh:
         text = fh.read()
     return string.Template(text).safe_substitute(human=human, agent=name)
+
+
+#: L148 (stage 2c): old spelling kept for the callers not yet renamed.
+consigne = instruction
 
 
 # --------------------------------------------------------------------------
@@ -180,15 +185,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="conversation agent name (default chat-<user>)")
     parser.add_argument("--cwd", default=None,
                         help="session directory (default: a neutral directory under the state dir)")
-    parser.add_argument("--consigne", action="store_true",
+    parser.add_argument("--instruction", dest="consigne", action="store_true",
                         help="print the chat instructions and exit")
+    parser.add_argument("--consigne", dest="consigne", action=DeprecatedAlias, nargs=0,
+                        canonical="--instruction", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would be launched; launch nothing, write nothing")
     return parser
 
 
 def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
-    """`ameesh chat` (sans `--consigne`) : contrôles, inscription, lancement."""
+    """`ameesh chat` (sans `--instruction`) : contrôles, inscription, lancement."""
     from . import account_turn, adapters, decisions, storage
     from . import db as db_mod
     if os.environ.get(decisions.CHAT_ENV):
@@ -224,7 +232,7 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
         # L233: decisions written in prose in mail, to offer converting them
         prose = [p for p in decisions.prose_decisions(db)
                  if p["recipient"] in decisions.PROSE_RECIPIENTS + (human, decisions.OWNER_ANY)]
-        prompt = consigne(human, name)
+        prompt = instruction(human, name)
         pid = os.getpid()
         env = chat_env(cfg, name, pid)
         env.update(adapter.env())
@@ -285,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         # relue aussi DANS la session (contexte résumé) : le nom de ce chat
         from .decisions import CHAT_ENV, current_human, unix_user
         name = args.name or os.environ.get(CHAT_ENV) or default_name(unix_user())
-        print(consigne(current_human(), name))
+        print(instruction(current_human(), name))
         return 0
     from . import db as db_mod
     try:

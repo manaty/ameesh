@@ -76,6 +76,8 @@ TASK_CHARS = 140
 LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
 AGENT_STATES = ("working", "idle", "paused", "stopped")
+#: `budget.PAUSE_PREFIX` (sans importer budget ici)
+BUDGET_PAUSE_PREFIX = "budget : "
 
 _FR_LOT = {"active": "active", "review": "in review", "blocked": "blocked",
            "approved": "approved", "merged": "merged", "closed": "closed"}
@@ -137,8 +139,8 @@ def parse_since(text: str | None, now: float) -> float:
 # lots
 # --------------------------------------------------------------------------
 
-def _jalons_de_lot(item: dict, events: Iterable[dict], actions: Iterable[dict],
-                   declared: Iterable[dict] | None = None) -> dict:
+def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
+                          declared: Iterable[dict] | None = None) -> dict:
     """Les jalons d'un lot : requested / frozen / verdict / merged.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
@@ -260,14 +262,19 @@ def lot_state(work_state: str, jalons: dict) -> str:
     return "active"
 
 
-def _jalons_declares(st, ids: list[int]) -> dict:
+def _declared_milestones(st, ids: list[int]) -> dict:
     """Les jalons de ces lots dans la table de L10 (`work_item_milestones`),
-    par lot ; `_jalons_de_lot` les préfère à la déduction dès qu'un gel ou un
+    par lot ; `_work_item_milestones` les préfère à la déduction dès qu'un gel ou un
     verdict y est déclaré."""
     out: dict = {}
     for row in st.lot_milestones(ids):
         out.setdefault(int(row["work_item_id"]), []).append(row)
     return out
+
+
+#: L148 (stage 2c): old spellings kept for the callers not yet renamed.
+_jalons_de_lot = _work_item_milestones
+_jalons_declares = _declared_milestones
 
 
 def _round(ts):
@@ -280,9 +287,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
               planned_wait: dict | None = None,
+              dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
               agent_externals: dict[str, str | None] | None = None) -> dict:
-    jalons = _jalons_de_lot(item, events, actions, declared)
+    jalons = _work_item_milestones(item, events, actions, declared)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
@@ -328,6 +336,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "stale": None if planned_wait else
                  stagnation.stale(item.get("state") or "", last, now, stale_after),
         "planned_wait": planned_wait,
+        "dependencies": dependencies or [],
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
         # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
@@ -360,6 +369,11 @@ def build_action(row: dict) -> dict:
 def agent_state(row: dict) -> str:
     """travaille | repos | pause | arrêt, depuis le statut et le bail."""
     status = row.get("status") or ""
+    # L242b (4) : une pause budget se lit « paused », quel que soit le statut
+    # (jamais « stopped » faute de bail pendant la pause)
+    if status not in ("stopped", "dead") \
+            and (row.get("status_text") or "").startswith(BUDGET_PAUSE_PREFIX):
+        return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
     if status == "blocked":
@@ -619,19 +633,23 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     by_item: dict = {}
     for row in st.lot_actions(ids):
         by_item.setdefault(int(row["work_item"]), []).append(row)
-    declared = _jalons_declares(st, ids)
+    declared = _declared_milestones(st, ids)
     package_rows = st.packages()
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
     states, externals = stagnation.availability_of(st.agents(None))
     from . import planned_waits
-    holds = planned_waits.read(db, items, now=now, packages=packages)
+    from . import work_dependencies
+    dependencies = work_dependencies.grouped(db, ids)
+    holds = planned_waits.read(db, items, now=now, packages=packages,
+                              dependencies=[e for edges in dependencies.values() for e in edges])
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])), agent_states=states,
                       planned_wait=holds.get(int(item["id"])),
+                      dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
     package_items = st.package_items()
@@ -816,6 +834,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
         if extra:
             line(" · ".join(extra), "    ")
+        if lot.get("planned_wait"):
+            from .work_dependencies import wait_label
+            line(wait_label(lot["planned_wait"]), "    ")
         if lot.get("waiting_for"):
             line("waiting for: %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):

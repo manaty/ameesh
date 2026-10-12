@@ -42,6 +42,12 @@ SIGNATURES = {
     "key_holders": {"public_key"},     # #330
     "mesh_keys": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
+    # exécuteurs médiés (voie B, 0062 et 0063)
+    "executor_tokens": {"token_sha256"},
+    "executor_invitations": {"code_sha256"},
+    "executor_assertion_jti": {"jti"},
+    "executors": {"public_key", "device_attestation"},
+    "exec_idempotency": {"response"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }
@@ -65,6 +71,10 @@ CONTENUS = {
     "mesh_approvals_status": {"meta"},
     # L161c (0055) : sortie d'un test en échec
     "ci_test_failures": {"excerpt"},
+    # L232a (0371) : plans, preuves et détails de travail, sans secrets
+    "host_handoffs": {"plan", "evidence"},
+    "host_handoff_events": {"detail"},
+    "host_lifecycle_agents": {"missing"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.

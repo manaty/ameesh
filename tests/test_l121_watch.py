@@ -266,6 +266,29 @@ class WatchTest(PgTestCase):
             watch.send(self.here, self.db, "w121", mail_send=self.failing)
         self.assertIsNone(storage.of(self.db).watches.list("w121")[0]["last_sent_ts"])
 
+    def test_nothing_fails_a_firing_after_its_message_is_committed(self):
+        # codex #303 r3 (lot #360): the registry becomes unreachable once the
+        # instruction is committed; the firing still succeeds (a failure would
+        # make the timer retry and send it twice)
+        from ameesh import registry
+        self.enable()
+        real = registry.get
+
+        def instructions() -> int:
+            return len([m for m in storage.of(self.db).mailbox.unread("w121", 500)
+                        if m["sender"] == "veille"])
+        before = instructions()
+
+        def down_after_delivery(db, name):
+            if instructions() > before:
+                raise db_mod.Unavailable("registry down")
+            return real(db, name)
+        with mock.patch.object(watch.registry, "get", side_effect=down_after_delivery), \
+                mock.patch.object(watch.fil, "record"):
+            self.assertEqual(watch.send(self.here, self.db, "w121"),
+                             "instruction sent to w121")
+        self.assertEqual(instructions(), before + 1)
+
     def test_a_failed_firing_drops_no_message(self):
         # codex r2 (#303): the message is dropped in the watch's transaction;
         # if the end of the firing fails, it goes with it (no second copy at

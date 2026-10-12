@@ -208,7 +208,11 @@ independent lines, at the risk of interleaving them.
 that resolves.
 
 **Verdict**: driver to be measured on the 103 replayed conflicting merges
-before adopting it; never for SQL or Markdown.
+before adopting it; never for SQL or Markdown. **Measured (L160g, 12/10)**:
+not adopted, for any language. Replayed on 115 conflicting merges, mergiraf
+fully resolves 16, but 13 of its results are wrong (4 do not compile, one
+leaves conflict markers in a file reported as merged); see
+[the L160g pilot](l160g-mergiraf-pilot.md).
 
 ## Fragments rather than central files
 

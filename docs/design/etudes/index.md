@@ -11,6 +11,7 @@
 * [Persona and harness](persona-et-harnais.md) - Identity, prompts and memory of a persona across Claude Code, Codex, dsh and ACP; neutral interim memory; proposed lots.
 * [Orchestration and liveness](orchestration-et-vivacite.md) - A stopped external orchestrator that blocks a project: agent mode, retained assignment, adoption and resumption, pushed alerts, deadline-based delegation, hook isolation; proposed lots L36–L41.
 * [Multiple canons](plusieurs-canons.md) - What breaks when two canons share a host, the federation model, interim for Acme; lots L42–L45.
+* [Mediated executor](executeur-mediee.md) - Executor without database access: remote storage, server fencing, P-256 enrollment, host availability and model relay; L107–L115.
 * [Resident agent](agent-resident.md) - The human talks to the agent instead of taking it: tests of the harnesses (stream-json, app-server, ACP), resident process under a lease, inputs and authority, shared conversation, rotation, costs; decision 0035 accepted, lots L75–L83.
 * [Embeddable interface](ui-integrable.md) - Human actors and screens; v1 API (read, actions, SSE over LISTEN/NOTIFY, OpenAPI); web components; Electron and Nexlink page; OIDC and roles, approval by passkey; link with Nexlink Compute; lots L84–L93.
 * [macOS and Windows portability](portabilite-mac-windows.md) - What breaks or stops protecting outside Linux, Rust set aside for now, an `ameesh.plateforme` layer that refuses when a guarantee is missing; lots L63–L69.
@@ -18,3 +19,4 @@
 * [ameesh v2: personas, servers, roles and identity](ameesh-v2.md) - Architecture options and delivery plan, with the 2026-10-11 lot triage and current PR statuses.
 * [Autonomous host provisioning](l232-autonomous-host-provisioning.md) - L232: recoverable agent moves between lots, SSH code and systemd delivery, mesh-store API secrets, per-host OAuth browser approvals, reserved owner decisions and four dated implementation lots.
 * [Real trial of Hermes with DeepSeek](l153-hermes-deepseek-trial.md) - L153: Hermes Agent and dsh on deepseek-flash, same two tasks, two runs each: tie on fidelity and cost, dsh slightly faster, Hermes about 1.3 GB per host and not wired into ameesh; stay on dsh, Hermes kept as an ACP fallback.
+* [mergiraf pilot](l160g-mergiraf-pilot.md) - L160g: the syntactic merge driver replayed on 115 conflicting merges of ameesh and Nexlink: 16 fully resolved, 13 wrong results (duplicated additions, lost changes, code that does not compile, markers left in); not adopted, for any language.

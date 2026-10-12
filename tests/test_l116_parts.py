@@ -24,16 +24,16 @@ class RepartitionTest(unittest.TestCase):
         self.assertIn("test_l116_parts", mods)
         for pilote in ("psql", "psycopg"):
             for n in (1, 4, 6):
-                pesees, _ = parts.poids(mods, pilote)
-                decoupe = parts.repartir(pesees, n)
+                pesees, _ = parts.weight(mods, pilote)
+                decoupe = parts.split(pesees, n)
                 self.assertEqual(len(decoupe), n)
                 tous = [m for part in decoupe for m in part]
                 self.assertEqual(sorted(tous), mods, f"{pilote} en {n} parts")
 
     def test_deterministe_et_equilibre(self):
         pesees = {"a": 10.0, "b": 7.0, "c": 5.0, "d": 4.0, "e": 3.0, "f": 1.0}
-        decoupe = parts.repartir(pesees, 2)
-        self.assertEqual(decoupe, parts.repartir(dict(reversed(pesees.items())), 2))
+        decoupe = parts.split(pesees, 2)
+        self.assertEqual(decoupe, parts.split(dict(reversed(pesees.items())), 2))
         charges = sorted(sum(pesees[m] for m in p) for p in decoupe)
         self.assertEqual(charges, [15.0, 15.0])
 
@@ -43,19 +43,19 @@ class RepartitionTest(unittest.TestCase):
             (dossier / "test_mesure.py").write_text("def test_a(): pass\ndef test_b(): pass\n")
             (dossier / "test_neuf.py").write_text("".join(f"def test_{i}(): pass\n" for i in range(6)))
             table = {"psql": {"test_mesure": 4.0}}
-            pesees, repli = parts.poids(["test_mesure", "test_neuf"], "psql", table, dossier)
+            pesees, repli = parts.weight(["test_mesure", "test_neuf"], "psql", table, dossier)
         self.assertEqual(repli, ["test_neuf"])
         self.assertEqual(pesees, {"test_mesure": 4.0, "test_neuf": 12.0})  # 6 tests × 2 s
 
     def test_liste_pilote_connue(self):
         mods = parts.modules()
-        liste = parts.lire_liste(REPO / "tests" / "parts" / "pilote-psql.txt", mods)
+        liste = parts.read_list(REPO / "tests" / "parts" / "pilote-psql.txt", mods)
         self.assertIn("test_migrations", liste)
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             f.write("# commentaire\ntest_migrations\ntest_qui_n_existe_pas\n")
         try:
             with self.assertRaises(SystemExit):
-                parts.lire_liste(f.name, mods)
+                parts.read_list(f.name, mods)
         finally:
             pathlib.Path(f.name).unlink()
 
@@ -68,13 +68,13 @@ class RepartitionTest(unittest.TestCase):
                 f.write(contenu)
             try:
                 with self.assertRaises(SystemExit):
-                    parts.lire_liste(f.name, mods)
+                    parts.read_list(f.name, mods)
             finally:
                 pathlib.Path(f.name).unlink()
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             f.write("# en-tête\ntest_catalog_store  # raison\ntest_migrations  # raison\n")
         try:
-            self.assertEqual(parts.lire_liste(f.name, mods), ["test_catalog_store", "test_migrations"])
+            self.assertEqual(parts.read_list(f.name, mods), ["test_catalog_store", "test_migrations"])
         finally:
             pathlib.Path(f.name).unlink()
 

@@ -70,7 +70,7 @@ AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
                "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
-               "cost", "permissions", "acp", "accounts", "install", "resident")
+               "cost", "permissions", "acp", "accounts", "install", "resident", "backup")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
 #: interactive session, `ameesh attach` and `ameesh chat`)
 INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
@@ -80,6 +80,8 @@ PERMISSION_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 #: whatever the descriptor declares (codex r4, #182: a descriptor omitting
 #: `explicit_only` must not make them a default nor a fallback)
 ALWAYS_EXPLICIT_PERMISSION_MODES = ("bypassPermissions",)
+#: Known off-device session backup descriptor keys (L53).
+BACKUP_KEYS = ("session_files",)
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
 ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials", "key_env")
 #: clés connues au premier niveau du manifeste
@@ -169,6 +171,8 @@ class HarnessDescriptor:
     permissions: Mapping[str, Any] = field(default_factory=dict)
     acp: Mapping[str, Any] = field(default_factory=dict)
     accounts: Mapping[str, str] = field(default_factory=dict)
+    #: Session file patterns relative to the account home; empty disables backup.
+    session_files: tuple[str, ...] = ()
     #: L75: normalized `ameesh.resident` block ({} = one turn per event)
     resident: Mapping[str, Any] = field(default_factory=dict)
 
@@ -806,6 +810,26 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                                         "option id expected", path))
     if "install" in ameesh:
         _check_shape(ameesh.get("install"), "install", findings, path)
+    backup = ameesh.get("backup")
+    if backup is not None:
+        if not isinstance(backup, dict):
+            findings.append(Finding("harness-backup-invalid", ERROR,
+                                    "`ameesh.backup`: expected an object", path))
+        else:
+            for key in backup:
+                if key not in BACKUP_KEYS:
+                    findings.append(Finding("harness-key-unknown", WARNING,
+                                            "`ameesh.backup.%s`: unknown key (ignored)" % key,
+                                            path))
+            files = backup.get("session_files")
+            if files is not None and not (
+                    isinstance(files, list) and files
+                    and all(isinstance(f, str) and "{session}" in f and not f.startswith("/")
+                            and ".." not in f.split("/") for f in files)):
+                findings.append(Finding(
+                    "harness-backup-invalid", ERROR,
+                    "`ameesh.backup.session_files`: expected nonempty patterns relative to "
+                    "the account home, each with `{session}` and no `..`", path))
     accounts = ameesh.get("accounts")
     if accounts is not None:
         if not isinstance(accounts, dict):
@@ -1089,6 +1113,10 @@ def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
         accounts={k: str(v) for k, v in (ameesh.get("accounts") or {}).items()
                   if isinstance(k, str) and isinstance(v, str)}
         if isinstance(ameesh.get("accounts"), dict) else {},
+        session_files=tuple(
+            f for f in ((ameesh.get("backup") or {}).get("session_files") or [])
+            if isinstance(f, str))
+        if isinstance(ameesh.get("backup"), dict) else (),
         resident=_resident(ameesh),
     )
 

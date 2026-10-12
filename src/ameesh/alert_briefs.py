@@ -20,7 +20,8 @@ from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
-                 "waiting_without_question")
+                 "waiting_without_question", "module_deviation",
+                 "critical_budget_pause", "idle_actionable_lot")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -29,12 +30,14 @@ AUDITOR_ROLES = ("auditeur", "auditor")
 AUDITOR_NAME = "auditeur"
 
 
-def auditors(listing: list, canons=None) -> list:
+def auditors(listing: list, canons=None, *, explicit_only=False) -> list:
     """Les auditeurs du registre : l'agent `auditeur`, et ceux dont la fiche
-    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`)."""
+    Agent du canon porte `roles: [auditeur]` (ou `auditor`, `role:`).
+    `explicit_only` exige ce rôle, sans autorisation implicite par le nom."""
     names = {row["name"] for row in listing}
     found = sous_utilisation.role_orchestrators(canons or [], AUDITOR_ROLES)
-    found.add(AUDITOR_NAME)
+    if not explicit_only:
+        found.add(AUDITOR_NAME)
     return sorted(n for n in found if n in names)
 
 
@@ -108,6 +111,34 @@ def _waiting_without_question(alert: dict) -> str:
                 lot, " « %s »" % title if title else "", lot, lot))
 
 
+def _idle_actionable_lot(alert: dict) -> str:
+    """#408 (règle 3) : à l'auditeur seul, qui relance (niveau 1)."""
+    lot = int(alert["lot"])
+    who = alert.get("agent") or "?"
+    title = alert.get("title")
+    if alert.get("runner_live"):
+        nudge = ("agent-mail send %s \"…\" --lot %d (what is expected on the lot, or "
+                 "ask it to record why it cannot advance: ameesh work note %d \"hold: "
+                 "<reason>\")" % (who, lot, lot))
+    else:
+        nudge = "ameesh resume %s (its runner is not live), then agent-mail send %s " \
+                "\"…\" --lot %d" % (who, who, lot)
+    return ("Idle with an actionable lot: %s holds #%d%s (%s), and %d wake(s) of its runner "
+            "left the lot unchanged. Expected action, level 1 (reversible), not just naming "
+            "it: nudge it now: %s; if it cannot take the lot, reassign it: ameesh work "
+            "assign %d <agent>. Never twice within an hour for the same agent." % (
+                who, lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
+                int(alert.get("wakes") or 0), nudge, lot))
+
+
+def _critical_budget_pause(alert: dict) -> str:
+    """L242b (5) : aux orchestrateurs de l'équipe et aux auditeurs (urgent)."""
+    return ("Critical agent paused on budget: %s. Expected action: check the accounts "
+            "(ameesh accounts list) and the mesh caps (ameesh budget); free an account or "
+            "raise a cap with the owner, or hand its urgent work to another agent."
+            % (alert.get("detail") or "?"))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
     des lots ouverts sans agent, l'écart est le sien (L165b, niveau 1)."""
@@ -122,20 +153,36 @@ def _for_auditor(alert: dict) -> str:
 
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
-           auditor_names=()) -> dict:
+           auditor_names=(), *, orchestrator_names=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
     l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
-    l'estimateur lui-même s'il est un agent du registre. Auditeurs : toujours. Un agent à la fois orchestrateur et auditeur
-    reçoit le texte d'orchestrateur."""
+    l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
+    rôle explicite et projet, sans repli. Auditeurs : toujours pour les autres
+    types. Un agent à la fois orchestrateur et auditeur reçoit un seul texte."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
     by_name = {row["name"]: row for row in listing}
     orchestras = list(alert.get("orchestrators") or ())
-    if kind == "idle_capacity":
+    if kind == "module_deviation":
+        text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
+        project = alert.get("project")
+        if not project:
+            return {}
+        out = {o: text for o in orchestras
+               if o in orchestrator_names and o in by_name
+               and by_name[o].get("chantier") == project}
+        for name in auditor_names or ():
+            if name in by_name and by_name[name].get("chantier") in (None, "", project):
+                out.setdefault(name, text)
+        return out
+    elif kind == "idle_actionable_lot":
+        out = {}
+        audit_text = _idle_actionable_lot(alert)
+    elif kind == "idle_capacity":
         out = sous_utilisation.orchestrator_briefs(alert, listing, lot_titles)
         audit_text = _for_auditor(alert)
     else:
@@ -148,6 +195,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "waiting_without_question":
             text = _waiting_without_question(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+        elif kind == "critical_budget_pause":
+            text = _critical_budget_pause(alert)
+            teams = {_team(by_name, alert.get("agent"))} - {""}
         else:
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
@@ -158,6 +208,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         audit_text = text
     for name in auditor_names or ():
         out.setdefault(name, audit_text)
+    if kind == "critical_budget_pause":
+        out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     return out
 
 

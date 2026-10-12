@@ -63,7 +63,9 @@ try:  # facultatif : jamais requis
 except Exception:  # pragma: no cover - dépend de l'environnement
     _yaml = None
 
-PROFILE_TYPES = ("Agent", "Host", "Placement", "Member", "WorkPackage")
+#: `Persona` (L51, 0029/0032) replaces `Agent`; both card types remain
+#: readable during the transition.
+PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage")
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -122,6 +124,17 @@ INFO = "info"
 #: ameesh à un ou plusieurs dossiers du bundle : `ameesh: {scope: ameesh}`
 SCOPE_KEY = "ameesh"
 SCOPE_FIELDS = ("scope", "projects")
+#: L243 (#468) : clé du nommage par défaut des nouveaux agents, admise au
+#: PREMIER niveau de `extensions.ameesh` seulement — le canon, c'est
+#: l'organisation ; l'entrée d'un membre n'a pas de nommage propre.
+NAMING_KEY = "naming"
+#: L243 (#468) : un segment de nom est en minuscules, 2 à 6 caractères.
+#: `\Z` (et non `$`) : `$` accepte une fin de ligne, donc `"mty\n"` passerait
+#: et engendrerait un nom invalide.
+NAMING_SEGMENT_RE = re.compile(r"^[a-z0-9]{2,6}\Z")
+#: L243 (#468) : le numéro de séquence, deux chiffres puis trois après 99.
+NAMING_SEQ_RE = re.compile(r"^[0-9]{2,}\Z")
+NAMING_FIELDS = ("org", "projects", "roles")
 
 
 class CanonError(ValueError):
@@ -750,6 +763,11 @@ class Member:
     roles: list[str] | None
     authenticators: list | None
     fiche: Fiche
+    #: L51 (0032 §2, 0033 §7): humans who can act in their place
+    #: (`deputies`) and receive escalations (`superiors`);
+    #: references use `human:<id>`.
+    deputies: list[str] | None = None
+    superiors: list[str] | None = None
 
 
 @dataclass
@@ -773,6 +791,27 @@ class Agent:
     #: fiche ; seul renseignement lu par la règle de visibilité (jamais un
     #: secret, jamais un droit).
     memory_repository: str | None = None
+    #: L51 (0029 §1): admitted harnesses in preference order (`Persona` card);
+    #: `harness` defaults to the first when omitted from the card.
+    harnesses: list[str] | None = None
+    #: L51 (0032): roles held by the persona, as declared (the role model
+    #: belongs to lot L58).
+    roles: list[str] | None = None
+    #: L243 (#435): the projects the agent works on, as declared
+    #: (`projects:`), the first one being its primary project; `team` is then
+    #: that first project.
+    projects: list[str] | None = None
+
+    @property
+    def is_persona(self) -> bool:
+        return self.fiche.type == "Persona"
+
+    @property
+    def effective_projects(self) -> list[str]:
+        """L243: `projects:` when declared, else `[team]`, else []."""
+        if self.projects is not None:
+            return list(self.projects)
+        return [self.team] if self.team else []
 
 
 @dataclass
@@ -801,6 +840,12 @@ class HostPolicy:
     #: tmpfs_alert, redirect, xdg_cache, worktrees, orphan_min_size}` validé
     #: par `ameesh.menage.parse_policy` ; None = valeurs par défaut.
     housekeeping: dict | None = None
+    #: hôte volatil (L112) : appareil prêté qui peut disparaître à tout
+    #: moment (VM Compute) ; son bail est court, 90 s par défaut
+    volatile: bool = False
+    #: durée du bail des agents de cet hôte (secondes, L112) ; None = 90 s
+    #: pour un hôte volatil, sinon la configuration de l'exécuteur
+    lease_ttl: float | None = None
     #: offer of a lending host (L159a, docs/GARDE-DE-CAPACITE.md): `{cpu_max,
     #: memory_max, disk_max, …}` validated by `ameesh.capacity_guard.parse_lend`
     #: (sizes in bytes); None = the host lends nothing (absent or unreadable).
@@ -900,6 +945,13 @@ class Host:
     #: sont eux qui doivent avoir accès au dépôt de mémoire d'une persona pour
     #: qu'elle tourne ici.
     admins: list[str] | None = None
+    #: humains qui ont l'ACCÈS PHYSIQUE à la machine (L110, 0029), distincts
+    #: des `admins` : un enfant qui utilise le portable prêté ne l'administre
+    #: pas, mais peut tout lire dans la VM. Ils comptent dans `H(hôte)` comme
+    #: le responsable et les admins. Absent : aucun occupant au-delà du
+    #: responsable et des admins — seules les personas lisibles par eux
+    #: partent sur la machine (défaut sûr : rien n'est supposé de plus).
+    occupants: list[str] | None = None
 
 
 @dataclass
@@ -999,6 +1051,14 @@ class Canon:
     scope_unread: set = field(default_factory=set)
     #: fiches du profil ignorées hors du périmètre, par membre (information)
     out_of_scope: dict = field(default_factory=dict)
+    #: L243 (#468) : nommage par défaut des nouveaux agents
+    #: (`extensions.ameesh.naming`) ; None = aucune convention déclarée.
+    naming: "Naming | None" = None
+    #: L243 (#468) : révision DEMANDÉE au chargement (`--ref`, `ref` de
+    #: l'entrée `canons`, branche du manifeste). Renseignée même quand le canon
+    #: n'a pas pu être lu : le refus d'un canon illisible doit nommer la ref à
+    #: récupérer (codex r3, #452).
+    rev: str = ""
 
     # -- accès ---------------------------------------------------------------
     @property
@@ -1111,14 +1171,16 @@ class Canon:
             "readable": self.readable,
             "untrusted": self.untrusted,
             "sources": [s.to_dict() for s in self.sources],
-            "members": [dict(title=m.title, roles=m.roles, **fiche(m.fiche))
+            "members": [dict(title=m.title, roles=m.roles, deputies=m.deputies,
+                             superiors=m.superiors, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
-                           admins=h.admins,
+                           admins=h.admins, occupants=h.occupants,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
-            "agents": [dict(title=a.title, responsible=a.responsible, team=a.team,
+            "agents": [dict(title=a.title, type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
+                            harnesses=a.harnesses, roles=a.roles, projects=a.projects,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
@@ -1135,7 +1197,8 @@ class Canon:
                               status=w.status, **fiche(w.fiche))
                          for w in self.packages],
             "federation": {"id": (self.federation or {}).get("id"),
-                           "roles": self.roles, "review_policies": self.review_policies},
+                           "roles": self.roles, "review_policies": self.review_policies,
+                           "naming": self.naming.to_dict() if self.naming else None},
             # L43 (0031) : périmètre ameesh par membre, fiches ignorées hors périmètre
             "ameesh_scope": {member: list(dirs) for member, dirs in sorted(self.scopes.items())},
             "ameesh_scope_unread": sorted(self.scope_unread),
@@ -1527,6 +1590,254 @@ def in_scope(relpath: str, scope: Iterable[str] | None) -> bool:
     return any(s == "" or rel == s or rel.startswith(s + "/") for s in scope)
 
 
+class NamingError(ValueError):
+    """Nom par défaut impossible : configuration absente, rôle ou projet sans
+    segment, ou forme demandée incohérente (L243, #468)."""
+
+
+@dataclass(frozen=True)
+class Naming:
+    """L243 (#468) : segments du nom par défaut `<org>-<repo>-<role>-<seq>`.
+
+    `org` : segment de l'organisation ; `projects` : nom de projet/dépôt →
+    segment (un projet absent est réduit à ses 6 premiers caractères) ;
+    `roles` : rôle → segment (un rôle absent est REFUSÉ : un nom ne se
+    devine pas). Les segments sont en minuscules `[a-z0-9]{2,6}`."""
+
+    org: str
+    projects: dict = field(default_factory=dict)
+    roles: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {"org": self.org, "projects": dict(self.projects),
+                "roles": dict(self.roles)}
+
+    def segment(self, project: str) -> str | None:
+        """Segment que CE nommage donne à `project`, sans refus.
+
+        Le nom court déclaré, sinon la troncature à 6 caractères si c'est un
+        segment, sinon None. Sert à décrire les dépôts d'un AUTRE canon avec
+        SES segments (codex r2, #452) : comparer les noms de dépôts ferait
+        rater `otherrepo: catalo` face à `catalogue`, ou refuser à tort
+        `catalogapi: capi`."""
+        declared = self.projects.get(project)
+        if declared:
+            return declared
+        short = str(project)[:6]
+        return short if NAMING_SEGMENT_RE.match(short) else None
+
+    def project_segment(self, project: str,
+                        known: Mapping[str, str] | None = None) -> str:
+        """Segment d'un projet : le nom court déclaré, sinon le nom tronqué à 6.
+
+        Un segment déjà porté par un AUTRE dépôt connu est refusé (deux dépôts
+        ne partagent jamais un segment) — que ce segment soit DÉCLARÉ ou
+        tronqué (codex r3, #452) : `catalogue: catalo` ici et `otherrepo: catalo`
+        ailleurs ne peuvent pas coexister. `known` : les dépôts connus du mesh
+        (fiches, demande, `naming.projects` des autres canons) et le segment que
+        LEUR nommage leur donne — un mapping dépôt → segment. On compare les
+        segments engendrés, jamais les noms de dépôts (codex r2, #452) : le
+        canon B peut déclarer `otherrepo: catalo` (même segment que
+        `catalogue`, refusé) ou `catalogapi: capi` (aucun rapport)."""
+        declared = self.projects.get(project)
+        segment = declared or str(project)[:6]
+        if not NAMING_SEGMENT_RE.match(segment):
+            raise NamingError(
+                "project %r has no usable short name (%r): declare "
+                "naming.projects.%s in the federation" % (project, segment, project))
+        existing = (known or {}).get(project)
+        if existing is not None and existing != segment:
+            raise NamingError(
+                "project %r has several short names in the mesh (%r here, %r "
+                "elsewhere): one repo keeps the same segment in every canon"
+                % (project, segment, existing))
+        others = dict(known or {})
+        for key, value in self.projects.items():
+            others.setdefault(str(key), value)
+        others.pop(project, None)
+        clash = sorted(key for key, value in others.items() if value == segment)
+        if clash:
+            if declared:
+                raise NamingError(
+                    "project %r: the short name %r is already the segment of %s: "
+                    "two repos never share a segment, declare another "
+                    "naming.projects.%s"
+                    % (project, segment, ", ".join(clash), project))
+            raise NamingError(
+                "project %r: the 6-character name %r is already the segment of %s: "
+                "declare naming.projects.%s in the federation"
+                % (project, segment, ", ".join(clash), project))
+        return segment
+
+    def role_segment(self, role: str) -> str:
+        declared = self.roles.get(role)
+        if not declared:
+            known = ", ".join(sorted(self.roles)) or "none"
+            raise NamingError(
+                "role %r has no short name in naming.roles (known: %s)" % (role, known))
+        return declared
+
+    def prefix(self, role: str, projects: Iterable[str],
+               known: Mapping[str, str] | None = None) -> str:
+        """Préfixe du nom : `<org>-<repo>-<role>-` (un projet) ou
+        `<org>-<role>-` (plusieurs : le segment de dépôt disparaît)."""
+        projects = list(projects)
+        if not projects:
+            raise NamingError("at least one project is required to name an agent")
+        if len(set(projects)) != len(projects):
+            raise NamingError("duplicate project in the name request: %s"
+                              % ", ".join(projects))
+        parts = [self.org]
+        if len(projects) == 1:
+            parts.append(self.project_segment(projects[0], known))
+        parts.append(self.role_segment(role))
+        return "-".join(parts) + "-"
+
+    def next_name(self, role: str, projects: Iterable[str], taken: Iterable[str],
+                  known: Mapping[str, str] | None = None) -> str:
+        """Premier numéro libre pour ce préfixe, sur deux chiffres (`01`).
+
+        `taken` : tous les noms déjà pris (fiches, registre — agents arrêtés
+        compris — et alias de #423) : un numéro déjà attribué n'est jamais
+        réutilisé tant que le nom reste réservé. `known` : les dépôts connus
+        hors `naming.projects` et le segment que leur nommage leur donne
+        (mapping dépôt → segment), pour refuser une troncature ambiguë."""
+        prefix = self.prefix(role, projects, known)
+        used = set()
+        for name in taken:
+            if not isinstance(name, str) or not name.startswith(prefix):
+                continue
+            rest = name[len(prefix):]
+            if NAMING_SEQ_RE.match(rest):
+                used.add(int(rest))
+        number = 1
+        while number in used:
+            number += 1
+        return prefix + ("%02d" % number if number < 100 else str(number))
+
+    def conforms(self, title: str) -> bool:
+        """Le titre suit-il la convention (forme et segments connus) ?"""
+        parts = str(title).split("-")
+        if len(parts) not in (3, 4) or parts[0] != self.org:
+            return False
+        if not NAMING_SEQ_RE.match(parts[-1]):
+            return False
+        if parts[-2] not in set(self.roles.values()):
+            return False
+        return all(NAMING_SEGMENT_RE.match(part) for part in parts[1:-1])
+
+    def describe(self) -> str:
+        return "<org>-<repo>-<role>-<seq> (org: %s)" % self.org
+
+    def example(self) -> str:
+        return "%s-<repo>-<role>-01" % self.org
+
+
+def parse_naming(value: Any) -> tuple[Naming | None, str | None]:
+    """(config, problème) d'un `extensions.ameesh.naming` (L243, #468).
+
+    `org` est obligatoire ; `projects` et `roles` sont des mappings nom →
+    segment, facultatifs. Un segment hors grammaire est refusé à la lecture."""
+    if not isinstance(value, dict):
+        return None, "mapping expected (`naming: {org: …, projects: {…}, roles: {…}}`)"
+    unknown = sorted(set(map(str, value)) - set(NAMING_FIELDS))
+    if unknown:
+        return None, "unknown key(s): %s (expected %s)" % (
+            ", ".join(unknown), ", ".join(NAMING_FIELDS))
+    org = value.get("org")
+    if not isinstance(org, str) or not NAMING_SEGMENT_RE.match(org):
+        return None, "`org` missing or not a segment (2-6 characters, [a-z0-9]): %r" % (org,)
+    out: dict[str, dict] = {"projects": {}, "roles": {}}
+    for name in ("projects", "roles"):
+        raw = value.get(name)
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            return None, "`%s`: mapping expected (name: segment)" % name
+        for key, segment in raw.items():
+            if not isinstance(key, str) or not key.strip():
+                return None, "`%s`: empty name" % name
+            if not isinstance(segment, str) or not NAMING_SEGMENT_RE.match(segment):
+                return None, "`%s.%s`: %r is not a segment (2-6 characters, [a-z0-9])" % (
+                    name, key, segment)
+            out[name][key] = segment
+        if name == "projects":
+            # deux dépôts ne partagent jamais un segment : des noms identiques
+            # à un numéro près ne diraient plus sur quel dépôt travaille l'agent.
+            seen: dict[str, str] = {}
+            for key, segment in out[name].items():
+                if segment in seen:
+                    return None, ("`projects`: %s and %s share the segment %r: "
+                                  "declare a distinct short name for one of them"
+                                  % (seen[segment], key, segment))
+                seen[segment] = key
+    return Naming(org=org, projects=out["projects"], roles=out["roles"]), None
+
+
+def _segment_of(naming: "Naming | None", project: str) -> str | None:
+    """Segment d'un dépôt sous un nommage (sans nommage : la troncature à 6)."""
+    if naming is not None:
+        return naming.segment(project)
+    short = str(project)[:6]
+    return short if NAMING_SEGMENT_RE.match(short) else None
+
+
+def known_projects(canons: Iterable, requested: Iterable[str] = (),
+                   naming: "Naming | None" = None) -> dict:
+    """Dépôts connus du mesh et le segment qu'ils portent (L243, #468).
+
+    Un mapping dépôt → segment, chacun calculé par le nommage qui le
+    GOUVERNE : `naming` (celui qui engendre le nom) pour la demande, le
+    nommage de chaque canon pour ses `naming.projects` et les `projects:` de
+    ses fiches (`team` sinon). `Naming.project_segment` compare ces segments —
+    jamais les noms de dépôts, qui peuvent se ressembler sans collision
+    (`catalogue` / `catalogapi`) ou se distinguer avec le même segment
+    (`catalogue` / `otherrepo: catalo`) : codex r2, #452.
+
+    TOUS les segments d'un dépôt sont collectés : si deux canons lui donnent
+    deux noms courts (`otherrepo: other` chez B, `otherrepo: catalo` chez C),
+    garder le premier ferait dépendre le verdict de l'ordre des canons et
+    masquerait le conflit de C — on refuse, en parcourant les dépôts et les
+    segments TRIÉS pour que le verdict ne dépende pas de l'ordre (codex r3,
+    #452)."""
+    #: dépôt → {segment : {sources}} : tous les segments vus, pour refuser une
+    #: divergence au lieu de garder le premier (`setdefault`).
+    collected: dict[str, dict[str, set]] = {}
+
+    def note(project, segment, source: str) -> None:
+        if not isinstance(project, str) or not segment:
+            return
+        collected.setdefault(project, {}).setdefault(segment, set()).add(source)
+
+    for project in requested:
+        note(project, _segment_of(naming, project), "the request")
+    for canon in canons:
+        canon_naming = getattr(canon, "naming", None)
+        label = "canon %s" % (canon.id or canon.root)
+        if canon_naming is not None:
+            for key, segment in canon_naming.projects.items():
+                note(key, segment, label)
+        for agent in getattr(canon, "agents", ()) or ():
+            for project in agent.effective_projects:
+                note(project, _segment_of(canon_naming, project),
+                     "%s (card %s)" % (label, agent.title))
+    known: dict[str, str] = {}
+    for project in sorted(collected):
+        segments = collected[project]
+        if len(segments) > 1:
+            raise NamingError(
+                "project %r has several short names in the mesh: %s — one repo keeps "
+                "the same segment in every canon (otherwise a collision depends on "
+                "the canon order): align `naming.projects.%s`"
+                % (project,
+                   ", ".join("%r (from %s)" % (segment,
+                                               ", ".join(sorted(segments[segment])))
+                             for segment in sorted(segments)),
+                   project))
+        known[project] = next(iter(segments))
+    return known
+
+
 def _profile_type(content: bytes | None) -> str | None:
     """Type du profil ameesh déclaré dans le frontmatter, sans le valider
     (compte des fiches ignorées hors périmètre, L43) ; None sinon."""
@@ -1556,7 +1867,7 @@ class _Loader:
         self.allow_untrusted = untrusted
         self.fetch = fetch
         self.use_pyyaml = use_pyyaml
-        self.canon = Canon(root=self.root, is_default=default)
+        self.canon = Canon(root=self.root, is_default=default, rev=ref)
         _identify(self.canon, None)     # repli tant que le manifeste n'est pas lu
         self.fetched: set[str] = set()
         self.findings = self.canon.load_findings
@@ -1699,6 +2010,7 @@ class _Loader:
             return self.canon
         explicit = bool(self.ref)
         rev = self.ref or self._bootstrap_rev()
+        self.canon.rev = rev
         root = self._source("canon", self.root, rev, explicit)
         if root is None:
             return self.canon
@@ -1716,6 +2028,7 @@ class _Loader:
                     and "%s/%s" % (DEFAULT_REMOTE, branch) != root.rev):
                 # la branche canonique est celle du manifeste
                 rev = "%s/%s" % (DEFAULT_REMOTE, branch)
+                self.canon.rev = rev
                 self.findings[:] = [f for f in self.findings
                                     if f.code not in ("canon-local-divergence",
                                                       "canon-worktree-dirty")]
@@ -1731,6 +2044,7 @@ class _Loader:
         if manifest is not None:
             self._members(manifest, root)
             self._scopes(manifest, root)
+            self._naming(manifest, root)
         self.canon.readable = True
         self._read_fiches()
         if self.canon.untrusted:
@@ -1878,7 +2192,10 @@ class _Loader:
                          "of %s not read" % (label, SCOPE_KEY, member), **where)
                 self.canon.scope_unread.add(member)
                 continue
-            for unknown in sorted(set(map(str, raw)) - set(SCOPE_FIELDS)):
+            allowed = set(SCOPE_FIELDS)
+            if member == root.member:
+                allowed.add(NAMING_KEY)     # L243 (#468) : le nommage est à la racine
+            for unknown in sorted(set(map(str, raw)) - allowed):
                 self.add("ameesh-key-unknown", WARNING,
                          "`%s.%s`: unknown key (ignored)" % (label, unknown), **where)
             scope, problem = parse_scope(raw.get("scope"))
@@ -1890,6 +2207,26 @@ class _Loader:
                 continue
             if scope is not None:
                 self.canon.scopes[member] = scope
+
+    def _naming(self, manifest: dict, root: Source) -> None:
+        """L243 (#468) : `extensions.ameesh.naming` au premier niveau de la
+        fédération — le canon, c'est l'organisation. Illisible : erreur, aucun
+        nom par défaut n'est produit (un nom ne se devine pas)."""
+        ext = (manifest.get("extensions") or {}) if isinstance(manifest, dict) else {}
+        ext = ext.get(SCOPE_KEY) if isinstance(ext, dict) else None
+        if not isinstance(ext, dict):
+            return
+        raw = ext.get(NAMING_KEY)
+        if NAMING_KEY not in ext:           # absent : aucune convention
+            return
+        naming, problem = parse_naming(raw)  # `naming:` explicite (null) : invalide
+        if problem:
+            self.add("naming-invalid", ERROR,
+                     "`extensions.%s.%s`: %s — no default agent name is generated"
+                     % (SCOPE_KEY, NAMING_KEY, problem),
+                     member=root.member, path="federation.yaml")
+            return
+        self.canon.naming = naming
 
     def _scope_missing(self, source: Source, present: Iterable[str]) -> bool:
         """Un dossier du périmètre absent de la source : erreur, membre non lu."""
@@ -2057,7 +2394,9 @@ class _Loader:
         self.canon.members.append(Member(
             title=fiche.title, roles=roles,
             authenticators=authenticators if isinstance(authenticators, list) else None,
-            fiche=fiche))
+            fiche=fiche,
+            deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
+            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
 
     def _build_agent(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": fiche.title}
@@ -2091,13 +2430,33 @@ class _Loader:
                          "`memory`: mapping expected (ignored)", **where, **subject)
             else:
                 memory_repository = _text(memory.get("repository"))
+        harnesses = self._list(fiche, "harnesses", where, "agent-harnesses-invalid", **subject)
+        harness = _text(fiche.data.get("harness")) or (harnesses[0] if harnesses else None)
+        # L243 (#435): `projects:` wins over `team:`, which becomes its first;
+        # a list only — `projects: a, b` is one string, never two projects
+        if fiche.data.get("projects") is not None \
+                and not isinstance(fiche.data.get("projects"), list):
+            self.add("agent-projects-invalid", ERROR,
+                     "`projects`: list expected (`projects: [a, b]`), not %r"
+                     % (fiche.data.get("projects"),), **where, **subject)
+            projects = None
+        else:
+            projects = self._list(fiche, "projects", where, "agent-projects-invalid",
+                                  **subject)
+        if projects is not None and not all(projects):
+            self.add("agent-projects-invalid", ERROR, "`projects`: empty project name",
+                     **where, **subject)
+            projects = [p for p in projects if p]
+        team = _text(fiche.data.get("team"))
+        if projects is not None:
+            team = projects[0] if projects else None
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
-            team=_text(fiche.data.get("team")),
+            team=team,
             capabilities=self._list(fiche, "capabilities", where, "agent-capabilities-invalid",
                                     **subject),
-            harness=_text(fiche.data.get("harness")),
+            harness=harness,
             model=_text(fiche.data.get("model")),
             provider=_text(fiche.data.get("provider")),
             credential_mode=_text(fiche.data.get("credential_mode")),
@@ -2107,7 +2466,14 @@ class _Loader:
             priority=0 if priority is None else priority,
             memory_repository=memory_repository,
             fiche=fiche,
+            harnesses=harnesses,
+            roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
+            projects=projects,
         ))
+
+    def _build_persona(self, fiche: Fiche, where: dict) -> None:
+        """L51: read a `Persona` card like an `Agent` card (0029, 0032)."""
+        self._build_agent(fiche, where)
 
     def _build_host(self, fiche: Fiche, where: dict) -> None:
         subject = {"host": fiche.title}
@@ -2140,6 +2506,23 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.max_agents`: positive integer expected", **where, **subject)
                     policy.max_agents = 0
+            # L112 : hôte volatil et durée de son bail
+            if raw.get("volatile") is not None:
+                if isinstance(raw["volatile"], bool):
+                    policy.volatile = raw["volatile"]
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.volatile` : booléen attendu", **where, **subject)
+                    policy.volatile = True  # prudence : bail court
+            if raw.get("lease_ttl") is not None:
+                value = raw["lease_ttl"]
+                if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                        and 10 <= value <= 3600:
+                    policy.lease_ttl = float(value)
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.lease_ttl` : nombre de secondes entre 10 et 3600 "
+                             "attendu", **where, **subject)
             # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
             # validée ici ; une clé illisible est une erreur (fail closed sur le
             # seuil, qui retombe alors sur sa valeur par défaut prudente).
@@ -2206,9 +2589,11 @@ class _Loader:
                     setattr(policy, key, kept)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
+        occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
-                                     policy=policy, tags=tags, admins=admins, fiche=fiche))
+                                     policy=policy, tags=tags, admins=admins,
+                                     occupants=occupants, fiche=fiche))
 
     def _host_resources(self, raw, where: dict, subject: dict) -> dict | None:
         """Seuils `policy.resources` validés, ou None si rien n'est déclaré.
@@ -2566,8 +2951,37 @@ def from_config_all(cfg, *, fetch: bool = False) -> list[Canon]:
 # Validation (§4.3)
 # ==========================================================================
 
-def validate(canon: Canon) -> list[Finding]:
-    """Constats de lecture + constats du profil. Une erreur est bloquante."""
+def _relationship_cycles(graph):
+    """Directed back-edge cycles, without recursion on untrusted member chains."""
+    done = set()
+    for start in graph:
+        if start in done:
+            continue
+        path = [start]
+        positions = {start: 0}
+        stack = [(start, iter(graph[start]))]
+        while stack:
+            node, edges = stack[-1]
+            target = next(edges, None)
+            if target is None:
+                stack.pop()
+                path.pop()
+                positions.pop(node)
+                done.add(node)
+            elif target in positions:
+                yield path[positions[target]:] + [target]
+            elif target not in done:
+                positions[target] = len(path)
+                path.append(target)
+                stack.append((target, iter(graph.get(target, ()))))
+
+
+def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[Finding]:
+    """Constats de lecture + constats du profil. Une erreur est bloquante.
+
+    `known_projects` (L243) : les projets connus hors du canon (`github.projects`
+    de l'hôte, `app` des lots) ; None, sans base : `agent-project-unknown`
+    n'est pas vérifié."""
     findings: list[Finding] = list(canon.load_findings)
     untrusted = canon.untrusted
 
@@ -2609,12 +3023,24 @@ def validate(canon: Canon) -> list[Finding]:
     # inconnu est une ERREUR : l'agent ne serait réclamable nulle part, et le
     # silence ferait croire à un harnais supporté.
     known_harnesses = set(harnesses.known_ids())
+    known = None if known_projects is None else (
+        set(known_projects) | {p.team for p in canon.packages if p.team})
     for agent in canon.agents:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
             add("agent-title-invalid", ERROR,
                 "agent name %r outside the registry grammar" % agent.title, f)
             continue
+        if canon.naming is not None and not canon.naming.conforms(agent.title):
+            # L243 (#468) : on ne dit rien des noms existants (ils seront
+            # renommés par #423) ; seul un titre qui TENTE la convention
+            # (préfixe de l'organisation) et la rate est signalé.
+            if str(agent.title).startswith(canon.naming.org + "-"):
+                add("agent-name-convention", WARNING,
+                    "agent %s does not follow the naming convention %s: a new agent "
+                    "is named %s (existing names are not renamed here: see #423)"
+                    % (agent.title, canon.naming.describe(), canon.naming.example()),
+                    f, agent=agent.title)
         if not agent.responsible:
             add("agent-responsible-missing", ERROR,
                 "agent %s without `responsible` (R14: every agent has a responsible human)"
@@ -2644,6 +3070,70 @@ def validate(canon: Canon) -> list[Finding]:
                 "harness %r of %s has no known descriptor (%s)"
                 % (agent.harness, agent.title, ", ".join(sorted(known_harnesses)) or "none"),
                 f, agent=agent.title)
+        for name in agent.harnesses or []:
+            if name != agent.harness and name not in known_harnesses:
+                add("agent-harness-unknown", ERROR,
+                    "harness %r (`harnesses`) of %s has no known descriptor" % (name, agent.title),
+                    f, agent=agent.title)
+        if agent.harnesses and agent.harness and agent.harness not in agent.harnesses:
+            add("agent-harness-outside-list", WARNING,
+                "`harness` %r of %s is absent from `harnesses` (%s)"
+                % (agent.harness, agent.title, ", ".join(agent.harnesses)),
+                f, agent=agent.title)
+        # L243 (#435): one truth per card — `team`, when kept beside
+        # `projects`, is its first project
+        if agent.projects is not None:
+            twice = sorted({p for p in agent.projects if agent.projects.count(p) > 1})
+            if twice:
+                add("agent-project-duplicate", ERROR,
+                    "`projects` of %s lists %s more than once" % (agent.title, ", ".join(twice)),
+                    f, agent=agent.title)
+            team = _text(f.data.get("team"))
+            if team is not None and team != agent.team:
+                add("agent-team-mismatch", ERROR,
+                    "`team` %r of %s is not its primary project (first of `projects`: %s)"
+                    % (team, agent.title, agent.team or "none"), f, agent=agent.title)
+            if known is not None:
+                unknown = [p for p in dict.fromkeys(agent.projects) if p not in known]
+                if unknown:
+                    add("agent-project-unknown", WARNING,
+                        "unknown projects for %s: %s (neither a work package's team, "
+                        "`github.projects` nor a lot's project)"
+                        % (agent.title, ", ".join(unknown)), f, agent=agent.title)
+
+    # -- human deputies and superiors (L51, 0032 §2, 0033 §7) --------------------
+    for member in canon.members:
+        for key, values in (("deputies", member.deputies), ("superiors", member.superiors)):
+            for ref in values or []:
+                resolved = canon.resolve_human(ref)
+                if resolved is None:
+                    add("member-%s-unresolved" % key, ERROR,
+                        "%s %r of %s does not resolve to a human Member (expected "
+                        "human:<id> of a unique Member card)" % (key, ref, member.title),
+                        member.fiche)
+                elif resolved == "human:%s" % member.title:
+                    add("member-%s-self" % key, ERROR,
+                        "%s of %s: a human cannot be their own %s"
+                        % (key, member.title, "deputy" if key == "deputies" else "superior"),
+                        member.fiche)
+
+    members_by_ref = {}
+    for member in canon.members:
+        ref = canon.resolve_human("human:%s" % member.title)
+        if ref is not None:
+            members_by_ref[ref] = member
+    for key in ("deputies", "superiors"):
+        graph = {}
+        for ref, member in members_by_ref.items():
+            graph[ref] = []
+            for target in getattr(member, key) or []:
+                resolved = canon.resolve_human(target)
+                if resolved in members_by_ref and resolved != ref:
+                    graph[ref].append(resolved)
+        for cycle in _relationship_cycles(graph):
+            add("member-%s-cycle" % key, ERROR,
+                "cycle in human %s: %s" % (key, " → ".join(cycle)),
+                members_by_ref[cycle[0]].fiche)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:
@@ -2654,6 +3144,13 @@ def validate(canon: Canon) -> list[Finding]:
             add("host-responsible-unresolved", ERROR,
                 "responsible %r of host %s does not resolve to a human Member"
                 % (host.responsible, host.title), host.fiche, host=host.title)
+        for ref in host.occupants or []:
+            # L110 (0029) : un occupant qui ne résout pas rend la règle de
+            # visibilité illisible pour cet hôte (refus) ; autant le dire ici
+            if canon.resolve_human(ref) is None:
+                add("host-occupant-unresolved", ERROR,
+                    "occupant %r de l'hôte %s ne résout pas vers un Member humain"
+                    % (ref, host.title), host.fiche, host=host.title)
         for name in host.policy.harnesses or []:
             if name not in known_harnesses:
                 add("host-harness-unknown", ERROR,

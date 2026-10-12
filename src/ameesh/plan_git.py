@@ -812,10 +812,12 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # quand le corps est illisible (hôte sans gh) : seule la preuve
             # implicite attend de savoir ; une fusion partielle retient toujours
             proven = bool(found and found["merged"] and row.get("branch"))
-            if partial and partial[0]["sha"] != row.get("partial_merge") and not dry_run:
+            if partial and partial[0]["sha"] != row.get("partial_merge"):
                 # #346 r2 : l'instant où le relevé voit la fusion partielle
-                # pour la première fois, à l'horloge de la base
-                st.work.set_partial_seen(lot, partial[0]["sha"])
+                # pour la première fois, à l'horloge de la base ; #403 : le
+                # dry-run juge comme le vrai relevé, sans écrire
+                if not dry_run:
+                    st.work.set_partial_seen(lot, partial[0]["sha"])
                 row = dict(row, partial_merge=partial[0]["sha"], partial_seen_ts=None)
             if partial and found and found["merged"] and found["tip"] \
                     and _moved_past(repo, row.get("branch_head"), row.get("branch_head_ts"),

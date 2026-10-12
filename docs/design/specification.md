@@ -118,6 +118,8 @@ type: Agent
 title: deepseek7                 # nom de l'agent (grammaire du registre)
 responsible: human:smichea       # REQUIS (R14)
 team: ameesh                     # équipe ou projet
+projects: [ameesh, nexlink]      # facultatif (L243) : le premier est le projet
+                                 # principal, et `team`, gardé, doit le valoir
 capabilities: [read, report-drift, propose]   # `approve` interdit (R8)
 harness: deepseek                # claude | codex | deepseek | …
 model: deepseek-…                # facultatif
@@ -132,6 +134,23 @@ memory:                          # dépôt de mémoire de la persona (L31, 0029)
   repository: "git@forge.example:equipe/persona-deepseek7.git"
 ```
 
+**`type: Persona`** (L51, [0029](decisions/0029-persona-et-session.md),
+[0032](decisions/0032-persona-roles-and-sessions.md)) replaces `Agent`, which
+remains readable during the transition (same keys and validation; declaring
+one name as both `Agent` and `Persona` is a duplicate). Additional fields:
+
+```yaml
+type: Persona
+title: migration-checker        # role name (convention of 2026-10-08)
+responsible: human:smichea
+harnesses: [deepseek, claude]    # admitted harnesses in preference order;
+                               # `harness` defaults to the first if omitted
+roles: [reviewer, domain-expert] # held roles (0033 §8 foundation and canon roles)
+```
+
+A `harness` outside `harnesses` produces a warning (`agent-harness-outside-list`);
+a listed harness without a descriptor is an error (`agent-harness-unknown`).
+
 **`type: Host`**
 
 ```yaml
@@ -140,6 +159,7 @@ title: pc-smichea
 responsible: human:smichea       # REQUIS
 tags: [perso, prod]              # étiquettes visées par les admissions (L31)
 admins: [human:alice]            # administrateurs : règle de visibilité (L31)
+occupants: [human:anna]          # accès physique sans administrer (L110) ; absent = aucun
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
@@ -211,6 +231,15 @@ sur les canons connus.
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
+`deputies:` and `superiors:` (L51, 0032 §2, 0033 §7): lists of `human:<id>`
+references in the same canon. Deputies can act in the responsible human's
+place under their own identities; superiors receive escalations. Unresolved
+or self references are errors (`member-deputies-unresolved`,
+`member-superiors-self`…). Cycles are rejected separately in each relationship
+graph (`member-deputies-cycle`, `member-superiors-cycle`), including indirect
+cycles. `canon show --json` preserves these relationships, and each agent's
+card type, roles and harness preference list. These cards declare the relationships; authorisation
+enforcement belongs to subsequent v2 work.
 
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
 
@@ -293,8 +322,8 @@ d'admission qui ne correspond à aucun hôte (`admission-tag-unknown`), clé de
 fichier, explication), sur le modèle du validateur OKF Federation.
 
 **Règle de visibilité** (0029, L31) : une persona ne tourne sur un hôte que si
-son responsable et les `admins` de l'hôte ont accès au dépôt de mémoire de la
-persona (`memory.repository`) ; sans dépôt déclaré, la règle est sans objet.
+son responsable, les `admins` et les `occupants` de l'hôte ont accès au dépôt
+de mémoire de la persona (`memory.repository`) ; sans dépôt déclaré, la règle est sans objet.
 La vérification est faite par `canon sync` (API de la forge sur l'hôte DÉCLARÉ,
 `gh api --hostname`, repli copie d'essai ; `AMEESH_FORGE_HOSTS` pour les forges
 prises en charge), mise en cache peu de temps **pour un contexte donné** (dépôt
@@ -307,8 +336,10 @@ revérification, un contexte illisible est un refus) et repliée dans
 `ameesh canon sync` (et le démarrage de l'exécuteur) met à jour, pour chaque
 agent admis sur l'hôte courant, les colonnes **déclaratives** du registre
 (`harness`, `host`, `cwd`, `admitted_hosts`, `admitted_tags`, `priority`,
-`memory_repository`, `model`, `budget`, `responsible`, `team`,
-`credential_mode`, `canon_ref` = chemin + SHA du fichier). Il ne touche jamais
+`memory_repository`, `model`, `budget`, `responsible`, `team`, `projects`,
+`credential_mode`, `canon_ref` = chemin + SHA du fichier). `projects` (L243,
+0388) est la liste de la fiche, sinon `[team]`, sinon une liste vide ; `team`
+en est le premier. Il ne touche jamais
 aux colonnes d'**état** (bail, session, statut, dépense, consigne). Le `cwd`
 vient de la politique de l'hôte (`work_dirs`, `work_roots`, `work_root`, §4.2),
 avec le repli transitoire sur le `cwd` d'une ancienne admission ; ce repli, ou

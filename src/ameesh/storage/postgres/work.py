@@ -11,7 +11,10 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 from __future__ import annotations
 
 import json
+import random
+import time
 
+from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
 
@@ -20,7 +23,7 @@ ITEM_COLUMNS = """
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
-    branch, branch_target, branch_head, migration,
+    branch, branch_target, branch_head, migration, migration_repo,
     extract(epoch from branch_head_at)::float8 as branch_head_ts,
     partial_merge, extract(epoch from partial_seen_at)::float8 as partial_seen_ts,
     estimate_minutes, estimate_source, estimate_by, change_size,
@@ -34,6 +37,14 @@ ITEM_COLUMNS = """
 """
 
 #: L160d (0057): a prepared conflict resolution
+QUEUE_COLUMNS = """
+    q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
+    q.queued_by, q.source,
+    extract(epoch from q.queued_at)::float8 as queued_ts,
+    extract(epoch from q.updated_at)::float8 as updated_ts,
+    w.title, w.priority, w.state as item_state, w.branch, w.assignee
+"""
+
 RESOLUTION_COLUMNS = """
     work_item_id, other_item_id, commit_sha, lot_tip, other_tip, ref, files, created_by,
     extract(epoch from created_at)::float8 as created_ts
@@ -51,6 +62,19 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: #443, #478 : réservation automatique du prochain numéro libre — un budget
+#: de temps (et non plus un nombre d'essais) et une attente plein jitter
+#: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
+#: 20 réservations simultanées se départagent sans épuiser les essais ;
+#: épuisé, `ReservationContention` (WorkError lisible).
+_RESERVE_BUDGET_S = 30.0
+_RESERVE_WAIT_BASE_S = 0.005
+_RESERVE_WAIT_MAX_S = 0.5
+#: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
+MIGRATION_INDEX = "work_items_migration_repo_idx"
+#: L233b : une reprise sur pause budget à la fois pour tout le mesh
+_HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
+                 "hashtextextended(current_schema() || ':budget_handoff', 0))")
 
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
@@ -250,22 +274,51 @@ class WorkItems(interface.WorkItems):
         ligne de journal part dans la même transaction. L40 : la délégation
         en cours est effacée (issue `annulee` au registre)."""
         with self.db.transaction() as tx:
-            rows = tx.query(
-                "UPDATE work_items SET assignee = %%s, updated_at = now(),"
-                "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-                " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
-                "   AND state NOT IN ('merged', 'promoted', 'closed')"
-                " RETURNING %s" % ITEM_COLUMNS,
-                (assignee, int(item_id), current))
-            if not rows:
+            return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+
+    def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
+        """`assign` dans la transaction ouverte ; `state` : celui exigé."""
+        rows = self.db.query(
+            "UPDATE work_items SET assignee = %%s, updated_at = now(),"
+            "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+            " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
+            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+            "   AND (%%s::text IS NULL OR state = %%s)"
+            " RETURNING %s" % ITEM_COLUMNS,
+            (assignee, int(item_id), current, state, state))
+        if not rows:
+            return None
+        self.db.query(
+            "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
+            "       resolved_by = %s"
+            " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
+            (actor or "", int(item_id)))
+        self._event(int(item_id), rows[0]["state"], note, actor)
+        return rows[0]
+
+    def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
+                window_s, max_per_window, note, actor) -> dict | None:
+        """L233b : toutes les conditions relues sous le verrou, dans la
+        transaction qui écrit (codex r1, #409) : deux `notify` sur deux hôtes
+        ne dépassent ni le plafond ni ne donnent deux lots au même preneur ;
+        un agent sorti de pause entre le contrôle git et l'écriture garde son
+        lot (sa ligne reste verrouillée jusqu'au commit)."""
+        with self.db.transaction() as tx:
+            tx.query(_HANDOFF_LOCK)
+            taken = tx.query(
+                "SELECT count(*)::bigint AS n FROM work_item_events"
+                " WHERE created_at > now() - make_interval(secs => %s)"
+                "   AND starts_with(note, %s)", (float(window_s), note_prefix))
+            if int(taken[0]["n"]) >= int(max_per_window):
                 return None
-            tx.query(
-                "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
-                "       resolved_by = %s"
-                " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
-                (actor or "", int(item_id)))
-            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
-            return rows[0]
+            if tx.query("SELECT 1 FROM work_items WHERE assignee = %%s"
+                        "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
+                return None
+            if not tx.query("SELECT 1 FROM agent_registry WHERE name = %s"
+                            "   AND status = 'blocked' AND starts_with(status_text, %s)"
+                            " FOR SHARE", (current, paused_prefix)):
+                return None
+            return WorkItems(tx)._reassign(item_id, assignee, current, state, note, actor)
 
     # -- délégation à échéance (L40, 0030 point 5) ---------------------------
     def delegate(self, item_id, delegate, *, current, delegated_by, within_s, note,
@@ -576,33 +629,66 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- numéro de migration réservé (L122) ----------------------------------
-    def reserve_migration(self, item_id, number, floor, *, note, actor,
+    def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
-        ouvert, avec une ligne de journal. Sans `number` : le prochain libre,
-        au moins `floor`, calculé sous verrou consultatif (deux réservations
-        simultanées ne lisent pas le même maximum) ; l'index unique
-        `work_items_migration_idx` reste le dernier garde-fou."""
-        with self.db.transaction() as tx:
-            tx.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
-                     ("ameesh_migration_reservation:",))
-            if number is None and not release:
-                top = tx.query("SELECT coalesce(max(migration), 0) AS top FROM work_items")
-                number = max(int(floor), int(top[0]["top"]) + 1)
-            rows = tx.query(
-                "UPDATE work_items SET migration = %%s, updated_at = now()"
-                " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
-                " RETURNING %s" % ITEM_COLUMNS,
-                (None if release else int(number), int(item_id)))
-            if not rows:
-                return None
-            WorkItems(tx)._event(int(item_id), rows[0]["state"],
-                                 note % {"number": int(number or 0)}, actor)
-            return rows[0]
+        ouvert dans le dépôt `repo`, avec une ligne de journal. Sans
+        `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
+        dans l'UPDATE même ; l'index unique `work_items_migration_repo_idx`
+        tranche entre deux réservations simultanées : la perdante attend un
+        délai plein jitter croissant, borné au budget restant, et recalcule
+        (nouvelle transaction) ; épuisé, `ReservationContention` — jamais la
+        DbError de l'index (#478). Seule la violation d'unicité de cet index
+        réessaie : une autre erreur qui le nomme remonte telle quelle
+        (codex #478 r1). Un `number` explicite déjà pris lève la DbError de
+        l'index, sans réessai."""
+        if release:
+            value, params = "NULL", ()
+        elif number is None:
+            value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
+                     "               WHERE migration_repo = %s))")
+            params = (int(floor), repo)
+        else:
+            value, params = "%s", (int(number),)
+        deadline = time.monotonic() + _RESERVE_BUDGET_S
+        wait = _RESERVE_WAIT_BASE_S
+        while True:
+            try:
+                with self.db.transaction() as tx:
+                    rows = tx.query(
+                        "UPDATE work_items SET migration = %s, migration_repo = %%s,"
+                        "       updated_at = now()"
+                        " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+                        " RETURNING %s" % (value, ITEM_COLUMNS),
+                        params + (None if release else repo, int(item_id)))
+                    if not rows:
+                        return None
+                    WorkItems(tx)._event(int(item_id), rows[0]["state"],
+                                         note % {"number": int(rows[0]["migration"] or 0)},
+                                         actor)
+                    return rows[0]
+            except DbError as exc:
+                if (number is not None or release
+                        or not is_unique_violation(exc, MIGRATION_INDEX)):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise interface.ReservationContention(
+                        "reservation contention, retry") from exc
+                # plein jitter (codex #478 r1) : uniform(0, min(plafond,
+                # base·2^n)) — les perdantes se répartissent au lieu de
+                # retenter ensemble — borné au budget restant pour n'entamer
+                # aucune transaction après l'échéance
+                time.sleep(random.uniform(0.0, min(wait, remaining)))
+                wait = min(wait * 2, _RESERVE_WAIT_MAX_S)
+                if time.monotonic() >= deadline:
+                    raise interface.ReservationContention(
+                        "reservation contention, retry") from exc
 
-    def migration_holder(self, number) -> dict | None:
+    def migration_holder(self, number, repo) -> dict | None:
         rows = self.db.query(
-            "SELECT id, title, state FROM work_items WHERE migration = %s", (int(number),))
+            "SELECT id, title, state FROM work_items WHERE migration = %s"
+            " AND migration_repo = %s", (int(number), repo))
         return rows[0] if rows else None
 
     # -- prepared conflict resolutions (L160d, 0057) ---------------------------
@@ -641,6 +727,68 @@ class WorkItems(interface.WorkItems):
             "    OR other_item_id IN (SELECT jsonb_array_elements_text(%%s::jsonb)::bigint)"
             " ORDER BY created_at DESC, work_item_id, other_item_id"
             % RESOLUTION_COLUMNS, (ids, ids))
+
+    # -- merge queue (L160e, 0058) ---------------------------------------------
+    def _queue_row(self, db, item_id) -> dict | None:
+        rows = db.query("SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"
+                        " WHERE q.work_item_id = %%s" % QUEUE_COLUMNS, (int(item_id),))
+        return rows[0] if rows else None
+
+    def queue_add(self, item_id, *, target, frozen_sha, note, actor,
+                  source="") -> dict | None:
+        with self.db.transaction() as tx:
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s"
+                           " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
+            if not lot:
+                return None
+            tx.execute(
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source)"
+                " VALUES (%s, %s, %s, %s, %s)"
+                " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
+                "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
+                "   source = excluded.source,"
+                "   landing_sha = NULL,"
+                "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
+                "   updated_at = now()",
+                (int(item_id), target, frozen_sha, actor or "", source or ""))
+            WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            return self._queue_row(tx, item_id)
+
+    def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
+                     note="", actor="", clear_rank=False) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE merge_queue SET state = coalesce(%s, state),"
+                "   rank = CASE WHEN %s THEN NULL ELSE coalesce(%s, rank) END,"
+                "   landing_sha = CASE WHEN %s IN ('queued', 'ejected') THEN NULL"
+                "                      ELSE coalesce(%s, landing_sha) END,"
+                "   reason = coalesce(%s, reason), updated_at = now()"
+                " WHERE work_item_id = %s RETURNING work_item_id",
+                (state, state == "ejected" or bool(clear_rank), rank, state or "", landing_sha, reason,
+                 int(item_id)))
+            if not rows:
+                return None
+            if note:
+                lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
+                WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            return self._queue_row(tx, item_id)
+
+    def queue_remove(self, item_id, *, note, actor) -> bool:
+        with self.db.transaction() as tx:
+            rows = tx.query("DELETE FROM merge_queue WHERE work_item_id = %s"
+                            " RETURNING work_item_id", (int(item_id),))
+            if not rows:
+                return False
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
+            WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            return True
+
+    def queue(self, target=None) -> list[dict]:
+        return self.db.query(
+            "SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"
+            " WHERE (%%s::text IS NULL OR q.target = %%s)"
+            " ORDER BY q.target, q.rank NULLS LAST, q.queued_at, q.work_item_id"
+            % QUEUE_COLUMNS, (target, target))
 
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible
@@ -777,20 +925,21 @@ class WorkItems(interface.WorkItems):
     # -- file d'amélioration (L119, décision 0037) ------------------------------
     def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
                     team, required_capabilities, package_id, package_parent, note,
-                    actor) -> dict:
+                    actor, app="") -> dict:
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
                 INSERT INTO work_items
                     (type, source, title, body, state, expected_value, value_score,
-                     priority, team, required_capabilities, package_id, package_parent)
+                     priority, team, required_capabilities, package_id, package_parent,
+                     app)
                 VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s, %s::text[],
-                        %s, %s)
+                        %s, %s, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", ITEM_COLUMNS),
                 (source, title, body, expected_value, int(value_score), int(priority), team,
                  _catalog._text_array(required_capabilities) if required_capabilities else None,
-                 package_id, package_parent))
+                 package_id, package_parent, app or ""))
             item = rows[0]
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
@@ -835,6 +984,55 @@ class WorkItems(interface.WorkItems):
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
             " LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+
+    def assignment_events(self, item_id, prefixes) -> list[dict]:
+        return self.db.query(
+            """
+            (SELECT id, work_item_id, state, note, actor,
+                    extract(epoch from created_at)::float8 as created_ts
+               FROM work_item_events e
+              WHERE work_item_id = %s
+                AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(%s::jsonb) p
+                             WHERE starts_with(e.note, p))
+              ORDER BY id DESC LIMIT 1)
+            UNION ALL
+            (SELECT id, work_item_id, state, note, actor,
+                    extract(epoch from created_at)::float8 as created_ts
+               FROM work_item_events
+              WHERE work_item_id = %s
+              ORDER BY id LIMIT 1)
+            ORDER BY id DESC
+            """,
+            (int(item_id), json.dumps(list(prefixes)), int(item_id)),
+        )
+
+    def handoff_lots(self, assignee, limit) -> list[dict]:
+        return self.db.query(
+            "SELECT w.*, k.team AS package_team,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       EXISTS (SELECT 1 FROM agent_mailbox b"
+            "                WHERE b.delivered_at IS NULL AND b.kind = 'request'"
+            "                  AND (b.payload -> 'decision') IS NOT NULL"
+            "                  AND btrim(b.work_item_id) = w.id::text) AS pending_decision,"
+            "       EXISTS (SELECT 1 FROM commitments c"
+            "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
+            "                  AND c.status IN ('proposed', 'open')) AS decision_milestone,"
+            "       (SELECT extract(epoch from max(m.at))::float8 FROM work_item_milestones m"
+            "         WHERE m.work_item_id = w.id AND m.kind = 'frozen') AS frozen_ts"
+            "  FROM (SELECT %s,"
+            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+            "          FROM work_items"
+            "         WHERE assignee = %%s AND state IN ('intake', 'build')"
+            "           AND type <> 'improvement') w"
+            "  LEFT JOIN work_packages k ON k.id = w.package_id"
+            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
+            "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
+            "          w.created_ts, w.id"
+            " LIMIT %%s" % ITEM_COLUMNS, (assignee, int(limit)))
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def issue_feed(self, limit) -> list[dict]:
