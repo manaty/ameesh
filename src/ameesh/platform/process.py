@@ -385,6 +385,42 @@ def command_line(pid: int) -> str:
         return ""
 
 
+def tcp_sockets_to(port: int, proc: str | None = None) -> set[str]:
+    """#453 : inodes des sockets TCP de l'hôte connectées au port distant
+    `port` (Linux, `/proc/net/tcp{,6}`) ; vide ailleurs."""
+    proc = PROC if proc is None else proc
+    out: set[str] = set()
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(os.path.join(proc, "net", name), encoding="ascii") as fh:
+                next(fh, None)
+                for row in fh:
+                    fields = row.split()
+                    if len(fields) > 9 and int(fields[2].rsplit(":", 1)[1], 16) == port:
+                        out.add(fields[9])
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def socket_inodes(pid: int, proc: str | None = None) -> set[str] | None:
+    """#453 : inodes des sockets ouvertes par `pid` ; None si illisible."""
+    fds = os.path.join(PROC if proc is None else proc, str(int(pid)), "fd")
+    try:
+        entries = os.listdir(fds)
+    except OSError:
+        return None
+    out: set[str] = set()
+    for fd in entries:
+        try:
+            link = os.readlink(os.path.join(fds, fd))
+        except OSError:
+            continue
+        if link.startswith("socket:[") and link.endswith("]"):
+            out.add(link[8:-1])
+    return out
+
+
 def become_subreaper() -> bool:
     """Ce processus adopte ses descendants orphelins (Linux,
     `PR_SET_CHILD_SUBREAPER`) au lieu de les laisser à systemd ou à init :

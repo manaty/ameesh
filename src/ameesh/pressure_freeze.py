@@ -109,42 +109,23 @@ def db_port(cfg) -> int:
     return 5432
 
 
-def _db_sockets(port: int, proc: str = "/proc") -> set[str]:
-    """Inodes of the host's TCP sockets connected to `port` (Linux)."""
-    out: set[str] = set()
-    for name in ("tcp", "tcp6"):
-        try:
-            with open(os.path.join(proc, "net", name), encoding="ascii") as fh:
-                next(fh, None)
-                for row in fh:
-                    fields = row.split()
-                    if len(fields) > 9 and int(fields[2].rsplit(":", 1)[1], 16) == port:
-                        out.add(fields[9])
-        except (OSError, ValueError, IndexError):
-            continue
-    return out
+def _db_sockets(port: int, proc: str | None = None) -> set[str]:
+    """Inodes of the host's TCP sockets connected to `port`."""
+    try:
+        return platform.tcp_sockets_to(port, proc=proc)
+    except Exception:
+        return set()
 
 
-def holds_db(pid: int, name: str, inodes: set[str], proc: str = "/proc") -> bool:
+def holds_db(pid: int, name: str, inodes: set[str], proc: str | None = None) -> bool:
     """Does the process talk to the mesh database (a client by name, or a TCP
     socket to its port)? Unreadable: it is spared (False only when sure)."""
     if (name or "") in DB_CLIENTS:
         return True
     if not inodes:
         return False
-    fds = os.path.join(proc, str(pid), "fd")
-    try:
-        entries = os.listdir(fds)
-    except OSError:
-        return True
-    for fd in entries:
-        try:
-            link = os.readlink(os.path.join(fds, fd))
-        except OSError:
-            continue
-        if link.startswith("socket:[") and link[8:-1] in inodes:
-            return True
-    return False
+    mine = platform.socket_inodes(pid, proc=proc)
+    return True if mine is None else bool(mine & inodes)
 
 
 def _shell(name: str) -> bool:
