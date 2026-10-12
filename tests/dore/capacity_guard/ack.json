@@ -1,0 +1,107 @@
+{
+ "schema": "ameesh-capacity-golden/1",
+ "family": "ack",
+ "valid": [
+  {
+   "why": "available, nothing in a turn",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 7,
+    "state": "available",
+    "in_turn": [],
+    "held": [],
+    "drained": false,
+    "ts": 1791640000.12
+   }
+  },
+  {
+   "why": "draining, one agent still in its turn",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "state": "draining",
+    "in_turn": [
+     "inge-front"
+    ],
+    "held": [
+     "inge-front"
+    ],
+    "drained": false,
+    "ts": 1791640001.12
+   }
+  },
+  {
+   "why": "drained",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "state": "draining",
+    "in_turn": [],
+    "held": [],
+    "drained": true,
+    "ts": 1791640040.12
+   }
+  }
+ ],
+ "invalid": [
+  {
+   "why": "the former device reader's shape (agents_in_turn), refused both ways",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "drained": true,
+    "agents_in_turn": 0
+   }
+  },
+  {
+   "why": "closed: no extra key",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "state": "draining",
+    "in_turn": [],
+    "held": [],
+    "drained": true,
+    "ts": 1791640040.12,
+    "extra": 1
+   }
+  },
+  {
+   "why": "drained is a boolean",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "state": "draining",
+    "in_turn": [],
+    "held": [],
+    "drained": "yes",
+    "ts": 1791640040.12
+   }
+  },
+  {
+   "why": "ts required",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "state": "draining",
+    "in_turn": [],
+    "held": [],
+    "drained": true
+   }
+  },
+  {
+   "why": "in_turn lists agent names",
+   "doc": {
+    "schema": "ameesh-host-ack/1",
+    "seq": 8,
+    "state": "draining",
+    "in_turn": [
+     1
+    ],
+    "held": [],
+    "drained": true,
+    "ts": 1791640040.12
+   }
+  }
+ ]
+}

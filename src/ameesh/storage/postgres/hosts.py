@@ -37,14 +37,17 @@ READING_COLUMNS = (
     # L159d (0061): shared host measure
     "mem_total_bytes, psi_cpu_some, psi_mem_some, psi_mem_full, psi_io_some, "
     "app_cpu, guest_cpu, cpu_window_s, guest_mem_bytes, "
-    "lendable_cpu, lendable_memory_bytes, lendable_disk_bytes"
+    "lendable_cpu, lendable_memory_bytes, lendable_disk_bytes, "
+    # #246 (0067): btrfs allocation
+    "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes"
 )
 
-#: L159d columns written by `record`, in this order
+#: L159d (and #246) columns written by `record`, in this order
 MEASURE_COLUMNS = (
     "mem_total_bytes", "psi_cpu_some", "psi_mem_some", "psi_mem_full", "psi_io_some",
     "app_cpu", "guest_cpu", "cpu_window_s", "guest_mem_bytes",
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
+    "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
 )
 
 #: colonnes d'une ressource de tour
