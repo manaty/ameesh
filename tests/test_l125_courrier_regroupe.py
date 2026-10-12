@@ -65,16 +65,16 @@ class AccuseDeReceptionTest(unittest.TestCase):
         self.assertEqual(mail.passive_reason(_ligne()), "")
         self.assertEqual(mail.passive_reason(_ligne(payload='{"ack": true}')), "ack")
         self.assertEqual(mail.passive_label(_ligne("event", {"cc": "dev"})),
-                         "copie d'un message à dev")
+                         "copy of a message to dev")
         self.assertEqual(mail.passive_label(_ligne("event", {"cc": "x y"})),
-                         "copie d'un message à ?")
+                         "copy of a message to ?")
         rendu = mail.prompt_for(None, [_ligne("event", {"cc": "dev"}),
                                        _ligne(payload={"ack": True}),
                                        _ligne(payload={"broadcast": True}),
                                        _ligne(payload={"urgent": True}),
                                        _ligne("event")], kind="mail")[0]
-        for nature in ("(copie d'un message à dev)", "(accusé de réception)",
-                       "(diffusion à tous)", "(urgent)", "(événement)"):
+        for nature in ("(copy of a message to dev)", "(acknowledgement)",
+                       "(broadcast to all)", "(urgent)", "(event)"):
             self.assertIn(nature, rendu)
         self.assertTrue(mail.is_human(_ligne(payload={"human": True})))
         self.assertFalse(mail.is_human(_ligne()))
@@ -237,8 +237,8 @@ class CourrierPassifTest(_Base):
         spec = worker.pick()
         self.assertEqual(spec["kind"], "mail")
         self.assertEqual(sorted(spec["ids"]), sorted(ids))
-        for nature in ("(accusé de réception)", "(copie d'un message à dev2)",
-                       "(diffusion à tous)"):
+        for nature in ("(acknowledgement)", "(copy of a message to dev2)",
+                       "(broadcast to all)"):
             self.assertIn(nature, spec["prompt"])
 
     def test_le_message_du_passe_avant_le_passif_quand_la_consigne_est_pleine(self):
@@ -301,10 +301,10 @@ class EnvoiTest(_Base):
             registry.upsert(self.db, name, harness="claude")
         proc = self._envoi("orch", "Bien reçu, merci !")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("accusé de réception", proc.stdout)
+        self.assertIn("acknowledgement", proc.stdout)
         self.assertTrue(self._payload("orch").get("ack"))
         proc = self._envoi("orch", "ok")  # une réponse, peut-être un feu vert
-        self.assertEqual(proc.stdout.strip(), "déposé pour : orch")
+        self.assertEqual(proc.stdout.strip(), "dropped for: orch")
         self.assertEqual(self._payload("orch"), {})
         proc = self._envoi("orch", "J'ai lu ta note sur le lot 12", "--ack")
         self.assertTrue(self._payload("orch").get("ack"))
@@ -320,7 +320,7 @@ class EnvoiTest(_Base):
             registry.upsert(self.db, name, harness="claude")
         proc = self._envoi("dev2", "prends le lot 14", "--cc", "orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("copie sans réveil pour : orch", proc.stdout)
+        self.assertIn("copy without wake-up for: orch", proc.stdout)
         principal = mail.unread(self.db, "dev2")[-1]
         self.assertEqual(mail.passive_reason(principal), "")
         [copie] = mail.unread(self.db, "orch")
@@ -333,7 +333,7 @@ class EnvoiTest(_Base):
         avant = len(mail.unread(self.db, "dev2"))
         proc = self._envoi("dev2", "x", "--cc", "inconnu")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("agent inconnu", proc.stderr)
+        self.assertIn("unknown agent", proc.stderr)
         self.assertEqual(len(mail.unread(self.db, "dev2")), avant)
         proc = self._envoi("dev2,orch", "x")
         self.assertEqual(proc.returncode, 2)
@@ -345,7 +345,7 @@ class EnvoiTest(_Base):
             registry.upsert(self.db, name, harness="claude")
         proc = self._envoi("all", "Revue à 15 h", sender="orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("annonce", proc.stdout)
+        self.assertIn("announcement", proc.stdout)
         for name in ("dev1", "dev2"):
             self.assertEqual(mail.passive_reason(mail.unread(self.db, name)[-1]), "broadcast")
         proc = self._envoi("all", "Arrêtez de pousser sur main", "--urgent", sender="orch")
@@ -377,14 +377,14 @@ class HookTest(_Base):
         # pendant le tour, le hook le remet, avec sa nature
         sortie = json.loads(self._hook(worker, "PostToolUse"))
         texte = sortie["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("(copie d'un message à dev2) : dev2 : prends le lot 14", texte)
+        self.assertIn("(copy of a message to dev2): dev2 : prends le lot 14", texte)
         # un message ordinaire relance le Stop, comme avant
         mail.send(self.db, "dev2", "orch-k", "le lot 14 est fini")
         self.assertEqual(json.loads(self._hook(worker, "Stop"))["decision"], "block")
 
     def test_rendu_v0_inchange_pour_un_message_ordinaire(self):
         texte = cli.render([{"from": "dev1", "ts": 0, "text": "bonjour"}])
-        self.assertIn("— de dev1 à %s : bonjour" % time.strftime(
+        self.assertIn("— from dev1 at %s: bonjour" % time.strftime(
             "%H:%M", time.localtime(0)), texte)
 
 
@@ -409,7 +409,7 @@ class TurnChurnTest(_Base):
         self.assertEqual([(a["agent"], a["value"], a["turns"]) for a in alertes],
                          [("orch", 13, 15)])
         self.assertEqual(alertes[0]["threshold"], exploitation.DEFAULT_TURN_CHURN)
-        self.assertIn("13 tour(s) de moins de 120s", alertes[0]["detail"])
+        self.assertIn("13 turn(s) shorter than 120s", alertes[0]["detail"])
         # seuils réglables ; 0 = désactivée
         self.assertFalse([a for a in exploitation.alerts(self.cfg, self.db, turn_churn=14)
                           if a["type"] == "turn_churn"])
@@ -432,13 +432,13 @@ class AmeeshSetTest(_Base):
         _runner, worker = self._worker("orch-s")
         proc = self.mesh("set", "orch-s", "mail_batch=2m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("regroupement=120s", proc.stdout)
+        self.assertIn("mail_batch=120s", proc.stdout)
         self.assertEqual(worker.mail_batch(), 120.0)
         proc = self.mesh("set", "orch-s", "mail_batch=0")
-        self.assertIn("regroupement=immédiat", proc.stdout)
+        self.assertIn("mail_batch=immediate", proc.stdout)
         self.assertEqual(worker.mail_batch(), 0.0)
         proc = self.mesh("set", "orch-s", "mail_batch=")
-        self.assertIn("regroupement=immédiat (défaut)", proc.stdout)  # banc : 0
+        self.assertIn("mail_batch=immediate (default)", proc.stdout)  # banc : 0
         self.assertEqual(worker.mail_batch(), worker.runner.mail_batch)
         self.assertEqual(self.mesh("set", "orch-s", "mail_batch=bientot").returncode, 2)
 

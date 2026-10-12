@@ -75,8 +75,8 @@ class DrainageTest(PgTestCase):
         registry.set_pending_prompt(self.db, "draine", "consigne d'après")
         sortie, _ = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 0, sortie)
-        self.assertIn("drainage", sortie)
-        self.assertIn("drainage terminé", sortie)
+        self.assertIn("draining", sortie)
+        self.assertIn("draining finished", sortie)
         row = registry.get(self.db, "draine")
         self.assertEqual(int(row["turns"]), 1, sortie)  # le tour a abouti
         self.assertEqual(row["status"], "idle")
@@ -90,7 +90,7 @@ class DrainageTest(PgTestCase):
         sortie, _ = proc.communicate(timeout=60)
         self.assertLess(time.monotonic() - debut, 30, sortie)
         self.assertEqual(proc.returncode, 0, sortie)
-        self.assertIn("borne", sortie)
+        self.assertIn("limit reached", sortie)
         # tour arrêté (comme avant le drainage) : sa consigne repart en attente
         self.assertEqual(registry.get(self.db, "borne")["pending_prompt"], "consigne du tour")
 
@@ -120,8 +120,8 @@ class DrainageTest(PgTestCase):
         sortie, _ = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertGreater(time.monotonic() - debut, 1.0, sortie)
-        self.assertIn("drainage terminé", sortie)
-        self.assertRegex(sortie, r"travail de fond du tour \w+ : terminé")
+        self.assertIn("draining finished", sortie)
+        self.assertRegex(sortie, r"background work of turn \w+: finished")
 
 
 if __name__ == "__main__":

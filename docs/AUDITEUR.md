@@ -23,10 +23,13 @@ qu'il ne fait jamais, et comment il en rend compte.
 * le courrier « Analyse profonde » d'`ameesh`, chaque nuit, ou une demande du
   propriétaire : analyse profonde ;
 * le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
-  traiter (L132) : « Lot stagnant : … », « Forfait sous-employé : … »,
-  « Capacité au repos : … », et leur « Relance » 6 h plus tard si l'alerte
-  dure. La commande citée est le geste de l'orchestrateur ; l'auditeur vérifie
-  au passage court suivant qu'il a été fait, et sinon le nomme dans son
+  traiter (L132) : « Stale lot: … », « Underused plan: … »,
+  « Idle capacity: … », et leur « Reminder, alert still active … » 6 h plus
+  tard si l'alerte dure (avant la CLI en anglais de L156c : « Lot stagnant »,
+  « Forfait sous-employé », « Capacité au repos », « Relance »). La commande
+  citée est le geste de l'orchestrateur ; l'auditeur vérifie au passage court
+  suivant qu'il a été fait, et sinon le nomme dans son
+
   rapport (une relance reçue veut dire que rien n'a bougé en 6 h) ;
 * le courrier « Déploiement … », envoyé par l'unité de redémarrage qu'il a
   lancée hors de son tour (voir « Déployer ») ;
@@ -346,7 +349,8 @@ par lui-même (une lecture, pas un sous-agent) :
 # exécuteurs d'un poste (unités utilisateur) et ameesh notify
 journalctl --user -u 'ameesh-runner-agent@*' -u ameesh-notify --since '-24h' \
   --no-pager -o short-iso \
-  | grep -E 'rotation|harnais arrêté|SIGKILL|hôte non prêt|bail perdu|orpheline|pression|échec|arrêté'
+  | grep -E 'rotation|harnais arrêté|harness stopped|SIGKILL|hôte non prêt|host not ready|bail perdu|lease lost|orphelin|orphan|pression|pressure|échec|fail|arrêté|stopped'
+
 # exécuteurs d'un serveur du mesh (unités système), par l'accès que l'hôte donne
 journalctl -u 'ameesh-runner@*' --since '-24h' --no-pager -o short-iso
 

@@ -53,7 +53,7 @@ AGENT_COLUMNS = """
 def check_name(name: str) -> str:
     """Nom d'agent sûr (NAME_RE) : seul un nom contrôlé entre dans un littéral."""
     if not NAME_RE.match(name or ""):
-        raise ValueError("nom d'agent invalide : %r" % (name,))
+        raise ValueError("invalid agent name: %r" % (name,))
     return name
 
 
@@ -68,7 +68,7 @@ def name_list(names: Sequence[str]) -> str:
 
 def _alias(alias: str) -> str:
     if not _ALIAS_RE.match(alias or ""):
-        raise ValueError("alias SQL invalide : %r" % (alias,))
+        raise ValueError("invalid SQL alias: %r" % (alias,))
     return alias
 
 
@@ -577,7 +577,7 @@ class Leases(interface.Leases):
     def reap(self, host) -> list[dict]:
         sql = """
             UPDATE agent_registry
-               SET status = 'dead', status_text = 'bail expiré', stop_reason = 'bail_expire',
+               SET status = 'dead', status_text = 'lease expired', stop_reason = 'bail_expire',
                    updated_at = now()
              WHERE status = 'running' AND lease_expires_at < clock_timestamp()
         """
@@ -751,7 +751,7 @@ class Leases(interface.Leases):
                SET pending_prompt = NULL,
                    current_prompt = verrou.pending_prompt,
                    status = 'running',
-                   status_text = 'tour en cours',
+                   status_text = 'turn in progress',
                    updated_at = now()
               FROM verrou
              WHERE r.name = verrou.name

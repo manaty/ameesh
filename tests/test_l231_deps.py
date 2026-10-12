@@ -997,7 +997,7 @@ class MenageWiringTests(_Base):
         parsed, problems, unknown = menage.parse_policy({"deps": False, "deps_idle": "12h"})
         self.assertEqual((parsed, problems, unknown),
                          ({"deps": False, "deps_idle": 12 * 3600.0}, [], []))
-        self.assertEqual(menage.parse_policy({"deps": "yes"})[1], ["`deps` : booléen attendu"])
+        self.assertEqual(menage.parse_policy({"deps": "yes"})[1], ["`deps`: boolean expected"])
         self.assertTrue(menage.Policy().deps)
 
     def test_turn_env_puts_the_npm_wrapper_first(self):

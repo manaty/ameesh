@@ -79,7 +79,7 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(beta["agents"][0]["reason"], "manuel — arrêté à la main")
         self.assertEqual({(l["id"], l["why"]) for l in beta["lots_without_agent"]},
                          {(8, "stopped"), (9, "unassigned")})
-        self.assertIn("aucun agent actif pour 2 lot(s) ouvert(s)", beta["warnings"])
+        self.assertIn("no active agent for 2 open lot(s)", beta["warnings"])
 
         delta = by["delta"]                              # projet de la fiche du plan
         self.assertEqual(delta["lots_without_agent"][0]["why"], "unknown")
@@ -88,19 +88,19 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(view["projects"][-1]["name"], "gamma")
 
         text = projects.format_text(view, 100)
-        self.assertIn("alpha — 2 agent(s) : 1 au travail, 1 en pause", text)
+        self.assertIn("alpha — 2 agent(s) : 1 working, 1 paused", text)
         self.assertIn("#7 Lot sept (+1)", text)
-        self.assertIn("raison : budget horaire", text)
-        self.assertIn("sans agent : #9 intake — Lot neuf (non assigné)", text)
-        self.assertIn("assigné à b1, arrêté", text)
-        self.assertIn("! aucun agent actif pour 2 lot(s) ouvert(s)", text)
-        self.assertIn("à l'arrêt (sans agent actif ni lot ouvert) : gamma (c1)", text)
+        self.assertIn("reason: budget horaire", text)
+        self.assertIn("no agent: #9 intake — Lot neuf (unassigned)", text)
+        self.assertIn("assigned to b1, stopped", text)
+        self.assertIn("! no active agent for 2 open lot(s)", text)
+        self.assertIn("dormant (no active agent, no open lot): gamma (c1)", text)
         self.assertIn("gamma — 1 agent(s)", projects.format_text(view, 100, show_inactive=True))
 
         # terminal étroit : deux lignes par agent, rien ne dépasse
         narrow = projects.format_text(view, 40, show_inactive=True)
         self.assertTrue(all(len(l) <= 40 for l in narrow.splitlines()), narrow)
-        self.assertIn("a1 — au travail 5m · forfait ·", narrow)
+        self.assertIn("a1 — working 5m · plan ·", narrow)
         self.assertIn("    #7 Lot sept (+1)", narrow)
 
         only = projects.build(board, now=NOW, project="beta", paid_harnesses=())
@@ -130,9 +130,9 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(view["projects"][0]["name"], None)
         self.assertEqual(view["truncated"], {"lots": {"shown": 1, "total": 9, "limit": 1}})
         text = projects.format_text(view, 100)
-        self.assertIn("(sans projet) — 1 agent(s)", text)
-        self.assertIn("tour : tour messages", text)
-        self.assertIn("TRONQUÉ : 1 lots ouverts lus sur 9", text)
+        self.assertIn("(no project) — 1 agent(s)", text)
+        self.assertIn("turn: tour messages", text)
+        self.assertIn("TRUNCATED: read 1 of 9 open lots", text)
 
 
 class ProjectsPgTest(PgTestCase):
@@ -226,9 +226,9 @@ class ProjectsPgTest(PgTestCase):
 
         out = self.mesh("projects")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("alpha — 2 agent(s) : 1 au travail, 1 au repos", out.stdout)
+        self.assertIn("alpha — 2 agent(s) : 1 working, 1 idle", out.stdout)
         self.assertIn("Lot libre", out.stdout)
-        self.assertIn("non assigné", out.stdout)
+        self.assertIn("unassigned", out.stdout)
 
         out = self.mesh("projects", "--project", "beta")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -238,8 +238,8 @@ class ProjectsPgTest(PgTestCase):
         out = self.mesh("list")
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = out.stdout.splitlines()
-        self.assertTrue(lines[0].startswith("NOM"))
-        self.assertIn("PROJET", lines[0])
+        self.assertTrue(lines[0].startswith("NAME"))
+        self.assertIn("PROJECT", lines[0])
         names = [l.split()[0] for l in lines[1:4]]
         projs = [l.split()[1] for l in lines[1:4]]
         self.assertEqual(projs, ["alpha", "alpha", "beta"])
@@ -251,7 +251,7 @@ class ProjectsPgTest(PgTestCase):
         # `ameesh progress` : la vue en tête (texte, JSON, page)
         out = self.mesh("progress")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertLess(out.stdout.index("PROJETS (2 en cours)"), out.stdout.index("LOTS ("))
+        self.assertLess(out.stdout.index("PROJECTS (2 active)"), out.stdout.index("LOTS ("))
         snap = json.loads(self.mesh("progress", "--json").stdout)
         self.assertEqual([p["name"] for p in snap["projects"]], ["alpha", "beta"])
         snap = json.loads(self.mesh("progress", "--json", "--project", "beta").stdout)
@@ -271,8 +271,8 @@ class ProjectsPgTest(PgTestCase):
         snap = progress.snapshot(self.db, self.cfg, book=book)
         self.assertEqual({p["name"] for p in snap["projects"]}, {"alpha", "beta"})
         text = progress.format_text(snap, 100)
-        self.assertIn("PROJETS (2 en cours)", text)
-        self.assertIn("sans agent : #", text)
+        self.assertIn("PROJECTS (2 active)", text)
+        self.assertIn("no agent: #", text)
 
 
 if __name__ == "__main__":

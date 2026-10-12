@@ -153,16 +153,41 @@ class Window:
         from zoneinfo import ZoneInfo
         return ZoneInfo(self.tz)
 
-    def _span(self, day_start: dt.datetime) -> tuple[dt.datetime, dt.datetime] | None:
+    @staticmethod
+    def _instant(wall: dt.datetime) -> float:
+        """The instant of a wall time: its first occurrence when repeated
+        (DST in autumn); when skipped (DST in spring), the start of the gap:
+        a bound in the gap never lands on a later hour (codex #276 r1)."""
+        wall = wall.replace(fold=0)
+        ts = wall.timestamp()
+        if dt.datetime.fromtimestamp(ts, wall.tzinfo).replace(tzinfo=None) \
+                == wall.replace(tzinfo=None):
+            return ts
+        # skipped: the gap lies between the instants of both offsets; the
+        # first second carrying the later offset starts it
+        low, high = sorted((ts, wall.replace(fold=1).timestamp()))
+        offset = dt.datetime.fromtimestamp(high, wall.tzinfo).utcoffset()
+        low, high = math.floor(low), math.ceil(high)
+        while high - low > 1:
+            mid = (low + high) // 2
+            if dt.datetime.fromtimestamp(mid, wall.tzinfo).utcoffset() == offset:
+                high = mid
+            else:
+                low = mid
+        return float(high)
+
+    def _span(self, day_start: dt.datetime) -> tuple[float, float] | None:
+        """The window opened on this day, as instants: empty when its whole
+        time range is skipped (DST in spring)."""
         if DAYS[day_start.weekday()] not in self.days:
             return None
         if self.start_min is None:
-            return day_start, day_start + dt.timedelta(days=1)
+            return self._instant(day_start), self._instant(day_start + dt.timedelta(days=1))
         start = day_start + dt.timedelta(minutes=self.start_min)
         end = day_start + dt.timedelta(minutes=self.end_min)
         if end <= start:
             end += dt.timedelta(days=1)
-        return start, end
+        return self._instant(start), self._instant(end)
 
     def end_if_open(self, now: float) -> float | None:
         """The end of the window if it is open at `now` (epoch), else None."""
@@ -170,14 +195,19 @@ class Window:
         today = at.replace(hour=0, minute=0, second=0, microsecond=0)
         for day in (today - dt.timedelta(days=1), today):
             span = self._span(day)
-            if span and span[0] <= at < span[1]:
+            # the instants are compared, never the wall times (same zone:
+            # Python ignores `fold`): a repeated hour (DST) is in the window
+            # once, at its first occurrence (codex #211 r7), a skipped one
+            # never (`_instant`)
+            if span and span[0] <= now < span[1]:
+                if self.start_min is not None:
+                    return span[1]
                 # whole days chain: a window open on consecutive days ends
                 # at the end of the last one
-                end = span[1]
-                while self.start_min is None and DAYS[end.weekday()] in self.days \
-                        and end - at < dt.timedelta(days=7):
+                end = day + dt.timedelta(days=1)
+                while DAYS[end.weekday()] in self.days and end - at < dt.timedelta(days=7):
                     end += dt.timedelta(days=1)
-                return end.timestamp()
+                return self._instant(end)
         return None
 
 
@@ -766,7 +796,16 @@ SLICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]*\.slice")
 #: a guard never touches the freeze of another slice
 FREEZE_UNIT = "ameesh-guard-freeze"
 FREEZE_BACKSTOP_S = 30
-FREEZE_SCRIPT = ('systemctl freeze "$0" && sleep "$1"; '
+#: `$1`: the episode's bound on the boot clock (`host.UPTIME` reads it), so
+#: no delay in starting the service lengthens the freeze (L159e5); the
+#: clock is read again every second: a suspend (counted by the boot clock,
+#: not by `sleep` nor RuntimeMaxSec=) never holds it past the bound (codex
+#: #276 r1). `$2`: the seconds left, when there is no boot clock. An
+#: unreadable clock ends the wait
+FREEZE_SCRIPT = ('systemctl freeze "$0" && { if [ -n "$1" ]; then '
+                 'while awk -v d="$1" \'{exit !($1 < d)}\' ' + host.UPTIME + '; '
+                 'do sleep 1; done; '
+                 'else sleep "$2"; fi; }; '
                  'until systemctl thaw "$0"; do sleep 2; done')
 
 
@@ -859,6 +898,10 @@ class Enforcer:
         #: the freeze episode: its since_ts, the boot, and its bound on the
         #: boot clock, kept across retries and restarts (codex #237 r5)
         self.episode: dict | None = None
+        #: writes a new episode before its freeze is dispatched (the guard
+        #: sets it: a crash before the state is published keeps the bound);
+        #: False when not written: no freeze is dispatched
+        self.persist: Callable[[dict], bool] = lambda episode: True
         #: the agent units a stop found running, to start again (L159e4):
         #: {units: {unit: systemd's monotonic clock once stopped}, boot_id,
         #: manual, low_since}; published as `guard.stopped`
@@ -952,17 +995,25 @@ class Enforcer:
 
     def _seconds_left(self, until: float, since: float | None) -> int | None:
         """Whole seconds the freeze may still last: on the boot clock, from
-        the episode's bound when this episode already started a freeze (a
-        retry, a restart), else from `until` (at most `FREEZE_MAX_S`)."""
+        the episode's bound when this boot already has one (a retry, a
+        restart: the episode ends only when the guard leaves level 2, never
+        with a `since_ts` a wall clock moved back changed, codex #237 r6),
+        else from `until` (at most `FREEZE_MAX_S`). A new episode is
+        persisted (`persist`) before any freeze is dispatched: None when it
+        could not be (codex #276 r1: a restart would bound it anew)."""
         boot, now = self.boot_id(), self.boottime()
         episode = self.episode
         if boot is None or now is None:
             left = min(FREEZE_MAX_S, until - self.clock())
-        elif episode and episode["since_ts"] == since and episode["boot_id"] == boot:
+        elif episode and episode["boot_id"] == boot:
             left = episode["boot_deadline"] - now
         else:
             left = min(FREEZE_MAX_S, until - self.clock())
             self.episode = {"since_ts": since, "boot_id": boot, "boot_deadline": now + left}
+            if not self.persist(dict(self.episode)):
+                self.episode = None
+                self.log("freeze refused: episode not written")
+                return None
         return int(left) if left >= 1 else None
 
     def freeze(self, on: bool, until: float | None = None,
@@ -984,15 +1035,24 @@ class Enforcer:
                 return True
             self.log("slice %s no longer frozen: freeze started again" % self.cfg.slice)
             self.freeze_done = False
-        seconds = None if until is None or self.refused else self._seconds_left(until, since)
-        if seconds is None:
-            self.log("freeze refused: %s" % (self.refused or "bound past"))
+        if until is None or self.refused:
+            self.log("freeze refused: %s" % (self.refused or "no bound"))
             self.freeze(False)
             return False
         # a service left by a failed attempt or an earlier guard: stopped
-        # (it thaws), forgotten, then started anew for what is left
+        # (it thaws), forgotten, then started anew for what is left, counted
+        # after this cleanup (codex #237 r6: slow calls lengthened it)
         self._quiet("stop", self.freeze_unit)
         self._quiet("reset-failed", self.freeze_unit)
+        seconds = self._seconds_left(until, since)
+        if seconds is None:
+            # an episode not written is already reported
+            if self.episode is not None or self.boot_id() is None:
+                self.log("freeze refused: bound past")
+            self.freeze(False)
+            return False
+        bound = self.episode["boot_deadline"] if self.episode \
+            and self.episode["boot_id"] == self.boot_id() else None
         # started: possibly in force even if systemd-run does not return
         self.frozen = True
         started = self._command([
@@ -1000,7 +1060,10 @@ class Enforcer:
             "--collect", "--quiet",
             "--property=RuntimeMaxSec=%d" % (seconds + FREEZE_BACKSTOP_S),
             "--property=ExecStopPost=systemctl thaw %s" % self.cfg.slice,
-            "/bin/sh", "-c", FREEZE_SCRIPT, self.cfg.slice, str(seconds)])
+            "/bin/sh", "-c", FREEZE_SCRIPT, self.cfg.slice,
+            # rounded down: never past the bound
+            "" if bound is None else "%.3f" % (math.floor(bound * 1000) / 1000),
+            str(seconds)])
         self.freeze_done = started and self._confirmed()
         return self.freeze_done
 
@@ -1150,6 +1213,8 @@ class Enforcer:
             if self.freeze(True, freeze.get("until_ts"), freeze.get("since_ts")):
                 enforced.add("freeze")
         else:
+            # out of level 2: the episode is over, the next freeze is new
+            self.episode = None
             self.freeze(False)
         return sorted(enforced)
 
@@ -1226,6 +1291,14 @@ class Guard:
             # erases the source of the `guard_restart` alert (codex #288 r1)
             self.enforcer.restarted = resources.restart_record(
                 previous["guard"].get("restart"))
+        if self.enforcer is not None:
+            self.enforcer.persist = self._persist_episode
+            saved = (previous.get("guard") or {}).get("decision") \
+                if isinstance(previous.get("guard"), dict) else None
+            if isinstance(saved, dict) and saved.get("level") != 2:
+                # an episode left by a guard killed as it left level 2: over
+                self.enforcer.episode = None
+        self.published = previous
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
         # so do the level, the freeze bound and the drain deadline
@@ -1234,6 +1307,25 @@ class Guard:
         self.written_ts = 0.0
         self.last_key = None
         self.written_decision = None
+
+    def _persist_episode(self, episode: dict) -> bool:
+        """A new freeze episode, written into the last published state before
+        its freeze is dispatched: a guard killed before publishing the new
+        state takes the bound back (codex #237 r6). Nothing published yet: a
+        record of the episode alone (no schema: a guest reads no state).
+        False when the write failed: the freeze is not dispatched."""
+        record = dict(self.published) if isinstance(self.published, dict) else {}
+        # with the decision that freezes: a restart takes both back
+        record["guard"] = dict(record.get("guard") or {}, freeze=episode,
+                               decision=dict(dataclasses.asdict(self.decision),
+                                             drain_seq=self.drain_seq))
+        try:
+            write_state(self.cfg.state_path, record)
+        except OSError as exc:
+            print("ameesh guard: %s: %s" % (self.cfg.state_path, exc), file=sys.stderr)
+            return False
+        self.published = record
+        return True
 
     def stop(self) -> None:
         """Leaving: thaw the guest; the caps stay (slice properties)."""
@@ -1291,6 +1383,7 @@ class Guard:
         if key != self.last_key or due or decision != self.written_decision:
             write_state(self.cfg.state_path, state)
             self.written_ts, self.written_decision = now, decision
+            self.published = state
         self.last_key, self.state = key, state
         return state
 

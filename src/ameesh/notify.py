@@ -1,51 +1,49 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Alertes poussées à l'humain responsable (lot L38, décision 0030 point 4).
+"""Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N] [--take-paid]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
-        suit les alertes d'exploitation (`ameesh alerts --follow`, mêmes
-        seuils, mêmes clés de dédoublonnage) et envoie chaque alerte levée
-        et chaque résolution à l'humain responsable, sur ses canaux.
-        L119 (0037) : à chaque passage, la prise automatique confie un
-        élément de la file d'amélioration aux agents au repos
-        (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
-        L165 : avant la file, un agent au repos depuis `--take-lot-idle`
-        (défaut 15 min) prend le lot non assigné le plus prioritaire de son
-        équipe et l'orchestrateur en est prévenu ; `--take-lot-idle 0` la
-        coupe.
-        L126 : sur l'hôte que désigne la clé `github` de la configuration,
-        chaque passage tient aussi les issues GitHub des lots
-        (`ameesh.plan_github.Projector`) et relève la CI en cours : chaque
-        test en échec part au courrier de l'agent du lot (L161c,
+        follows the operations alerts (`ameesh alerts --follow`, same
+        thresholds, same dedupe keys) and sends each raised alert and each
+        resolution to the responsible human, on their channels.
+        L119 (0037): on each pass, auto-take gives an item of the
+        improvement backlog to idle agents (`ameesh.backlog.auto_take`);
+        `--take-idle 0` turns it off.
+        L165: before the backlog, an agent idle for `--take-lot-idle`
+        (default 15 min) takes the highest-priority unassigned lot of its
+        team and the orchestrator is told; `--take-lot-idle 0` turns it
+        off.
+        L126: on the host named by the `github` config key, each pass also
+        maintains the GitHub issues of the lots
+        (`ameesh.plan_github.Projector`) and polls the running CI: each
+        failing test is mailed to the lot's agent (L161c,
         `ameesh.ci.Watcher`).
   ameesh notify --test human:<id> [--json]
-        envoie un message de test sur chacun des canaux de cet humain.
+        sends a test message on each of this human's channels.
 
-Les alertes restaient TIRÉES (`ameesh alerts`) : rien ne prévenait un humain
-qu'un orchestrateur s'était arrêté avec du courrier (constat du 2026-10-07).
-Ce service les POUSSE, comme le demande la décision 0014 (« alertes à
-l'humain responsable concerné »).
+Alerts used to be PULLED only (`ameesh alerts`): nothing told a human that
+an orchestrator had stopped with mail (seen on 2026-10-07). This service
+PUSHES them, as decision 0014 requires ("alerts to the responsible human").
 
-Destinataire (premier trouvé) : le champ `responsible` de l'alerte, sinon le
-responsable de l'agent (`agent_registry.responsible`), sinon celui du paquet
-de travail du lot (en remontant les parents), sinon celui de la fiche Host
-de l'hôte (canon), sinon `notify.default_human`. Une alerte sans destinataire
-est journalisée, jamais perdue en silence.
+Recipient (first found): the alert's `responsible` field, else the agent's
+responsible (`agent_registry.responsible`), else that of the lot's work
+package (walking up the parents), else that of the host's Host record
+(canon), else `notify.default_human`. An alert with no recipient is logged,
+never silently lost.
 
-Configuration : la clé `notify` du fichier de configuration de l'HÔTE
-(jamais le canon) ; les secrets (jeton ntfy, webhook Slack) viennent d'une
-variable d'environnement ou d'un fichier 0600 que la configuration NOMME —
-une valeur secrète écrite dans la configuration est refusée. Voir
-docs/EXPLOITATION.md, « Alertes poussées — ameesh notify ».
+Configuration: the `notify` key of the HOST config file (never the canon);
+secrets (ntfy token, Slack webhook) come from an environment variable or a
+0600 file that the config NAMES — a secret value written in the config is
+refused. See docs/EXPLOITATION.md, "Alertes poussées — ameesh notify".
 
-Fiabilité : l'état d'envoi est gardé dans `<état>/notify/state.json` (une
-alerte qui dure n'est pas renvoyée après un redémarrage, une alerte résolue
-pendant l'arrêt l'est à la reprise) ; débit limité par humain (au-delà, un
-résumé) ; un canal en échec n'empêche pas les autres et il est retenté aux
-passages suivants, un nombre borné de fois.
+Reliability: the delivery state is kept in `<state>/notify/state.json` (a
+lasting alert is not resent after a restart; an alert resolved while
+stopped is sent on restart); rate limited per human (beyond that, a
+summary); a failing channel does not block the others and is retried on
+later passes, a bounded number of times.
 """
 from __future__ import annotations
 
@@ -92,7 +90,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L225 : des tours sans tarif au barème échappent à la dépense
                  "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
-                 "auth_blocked")
+                 "auth_blocked",
+                 # L226a : un identifiant est en échec, ou expire bientôt
+                 "credential_failing", "credential_expiring")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -116,41 +116,43 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
-    "stopped_with_mail": "agent arrêté avec du courrier",
-    "orphan_lot": "lot orphelin",
-    "dead_runner": "exécuteur mort",
-    "idle_with_mail": "agent au repos avec du courrier",
-    "delegation_expired": "délégation échue",
-    "engagement_overdue": "engagement ou date prévue dépassé",
-    "long_turn": "tour long",
-    "session_too_big": "session trop grosse",
-    "stale_lot": "lot stagnant",
-    "host_pressure": "hôte sous pression",
-    "orphan_resource": "ressource orpheline",
-    "tmpfs_full": "tmpfs presque plein",
-    "worktree_kept": "worktree gardé en fin de lot",
-    "tmp_orphan": "entrée de /tmp apparue pendant un tour",
-    "plan_underused": "forfait sous-employé",
-    "idle_capacity": "capacité au repos",
-    "orchestrator_held": "orchestrateur tenu par une session",
-    "host_underused": "hôte sous-employé",
-    "balance_low": "solde bas",
-    "host_not_ready": "hôte non prêt",
-    "auth_blocked": "authentification en échec",
-    "host_power_low": "batterie faible de l'hôte",
-    "backlog_empty": "file d'amélioration vide",
-    "mail_undeliverable": "courrier en souffrance",
-    "decision_pending": "décision attendue",
-    "decision_overdue": "décision sans réponse à l'échéance",
+    "stopped_with_mail": "agent stopped with mail",
+    "orphan_lot": "orphan lot",
+    "dead_runner": "dead runner",
+    "idle_with_mail": "agent idle with mail",
+    "delegation_expired": "delegation expired",
+    "engagement_overdue": "commitment or due date passed",
+    "long_turn": "long turn",
+    "session_too_big": "session too big",
+    "stale_lot": "stale lot",
+    "host_pressure": "host under pressure",
+    "orphan_resource": "orphan resource",
+    "tmpfs_full": "tmpfs almost full",
+    "worktree_kept": "worktree kept at end of lot",
+    "tmp_orphan": "/tmp entry left by a turn",
+    "plan_underused": "underused plan",
+    "idle_capacity": "idle capacity",
+    "orchestrator_held": "orchestrator held by a session",
+    "host_underused": "host underused",
+    "balance_low": "low balance",
+    "host_not_ready": "host not ready",
+    "auth_blocked": "authentication failing",
+    "credential_failing": "credential failing",
+    "credential_expiring": "credential expiring soon",
+    "host_power_low": "host battery low",
+    "backlog_empty": "improvement backlog empty",
+    "mail_undeliverable": "undeliverable mail",
+    "decision_pending": "decision pending",
+    "decision_overdue": "decision unanswered by its deadline",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
-    "turn_churn": "tours courts en rafale",
+    "turn_churn": "bursts of short turns",
     # L157b : adressée aux agents (alert_briefs) ; pas poussée aux humains par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
-    "estimate_bias": "biais d'estimation",
-    "ci_main_red": "CI rouge sur main",
-    "host_disk_low": "disque btrfs presque plein",
-    "turn_unpriced": "tour sans tarif au barème",
+    "estimate_bias": "estimate bias",
+    "ci_main_red": "CI red on main",
+    "host_disk_low": "btrfs disk almost full",
+    "turn_unpriced": "turn without a known price",
     # L233: briefed to the assignee and the orchestrators (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
     "waiting_without_question": "lot waiting for the owner with no question asked",
@@ -159,7 +161,8 @@ TYPE_LABELS = {
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
-                "mail_undeliverable", "ci_main_red", "auth_blocked")
+                "mail_undeliverable", "ci_main_red", "auth_blocked",
+                "credential_failing")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -237,8 +240,8 @@ def _find_secret(options: dict, where: str) -> None:
     for key, value in options.items():
         if str(key).lower() in SECRET_KEYS:
             raise NotifyConfigError(
-                "secret en clair refusé dans la configuration (%s.%s) : nommez une variable "
-                "d'environnement (`token_env`, `webhook_env`) ou un fichier 0600 "
+                "plaintext secret refused in the configuration (%s.%s): name an environment "
+                "variable (`token_env`, `webhook_env`) or a 0600 file "
                 "(`token_file`, `webhook_file`)" % (where, key))
         if isinstance(value, dict):
             _find_secret(value, "%s.%s" % (where, key))
@@ -251,7 +254,7 @@ def check_url(url: str, what: str) -> str:
         return url
     if parts.scheme == "http" and (parts.hostname or "") in _LOOPBACK:
         return url
-    raise NotifyConfigError("%s : URL https attendue (http seulement sur la boucle locale)"
+    raise NotifyConfigError("%s: https URL expected (http only on loopback)"
                             % what)
 
 
@@ -259,32 +262,32 @@ def _channel(name: str, raw) -> Channel:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
-        raise NotifyConfigError("notify.channels.%s : objet attendu" % name)
+        raise NotifyConfigError("notify.channels.%s: object expected" % name)
     _find_secret(raw, "notify.channels.%s" % name)
     kind = str(raw.get("type") or name)
     if kind not in CHANNEL_KINDS:
-        raise NotifyConfigError("notify.channels.%s : type %r inconnu (%s)"
+        raise NotifyConfigError("notify.channels.%s: unknown type %r (%s)"
                                 % (name, kind, " | ".join(CHANNEL_KINDS)))
     unknown = sorted(set(raw) - set(CHANNEL_OPTIONS[kind]))
     if kind == "slack" and "url" in raw:
         raise NotifyConfigError(
-            "notify.channels.%s.url : l'URL d'un webhook Slack est un secret ; nommez la "
-            "variable qui la porte (`webhook_env`, défaut %s) ou un fichier 0600 "
+            "notify.channels.%s.url: a Slack webhook URL is a secret; name the variable "
+            "that holds it (`webhook_env`, default %s) or a 0600 file "
             "(`webhook_file`)" % (name, DEFAULT_SLACK_ENV))
     if unknown:
-        raise NotifyConfigError("notify.channels.%s : option(s) inconnue(s) %s"
+        raise NotifyConfigError("notify.channels.%s: unknown option(s) %s"
                                 % (name, ", ".join(unknown)))
     options = dict(raw)
     if kind == "ntfy":
         if not raw.get("url") or not raw.get("topic"):
-            raise NotifyConfigError("notify.channels.%s : `url` et `topic` sont requis" % name)
+            raise NotifyConfigError("notify.channels.%s: `url` and `topic` are required" % name)
         check_url(str(raw["url"]), "notify.channels.%s.url" % name)
         if not _TOPIC_RE.match(str(raw["topic"])):
-            raise NotifyConfigError("notify.channels.%s.topic invalide : %r"
+            raise NotifyConfigError("notify.channels.%s.topic invalid: %r"
                                     % (name, raw["topic"]))
     for key in ("token_env", "webhook_env"):
         if key in raw and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(raw[key] or "")):
-            raise NotifyConfigError("notify.channels.%s.%s : nom de variable invalide"
+            raise NotifyConfigError("notify.channels.%s.%s: invalid variable name"
                                     % (name, key))
     for key in ("token_file", "webhook_file"):
         if key in raw:
@@ -298,9 +301,9 @@ def _positive(value, what: str) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
-        raise NotifyConfigError("%s : nombre attendu" % what) from None
+        raise NotifyConfigError("%s: number expected" % what) from None
     if number < 0:
-        raise NotifyConfigError("%s : nombre positif attendu" % what)
+        raise NotifyConfigError("%s: positive number expected" % what)
     return number
 
 
@@ -308,7 +311,7 @@ def _names(value, what: str) -> tuple:
     if isinstance(value, str):
         value = [v.strip() for v in value.split(",") if v.strip()]
     if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
-        raise NotifyConfigError("%s : liste de noms attendue" % what)
+        raise NotifyConfigError("%s: list of names expected" % what)
     return tuple(value)
 
 
@@ -317,33 +320,33 @@ def parse_config(raw) -> NotifyConfig:
     if raw in (None, {}, ""):
         return NotifyConfig()
     if not isinstance(raw, dict):
-        raise NotifyConfigError("notify : objet JSON attendu")
+        raise NotifyConfigError("notify: JSON object expected")
     unknown = sorted(set(raw) - set(TOP_KEYS))
     if unknown:
-        raise NotifyConfigError("notify : clé(s) inconnue(s) %s" % ", ".join(unknown))
+        raise NotifyConfigError("notify: unknown key(s) %s" % ", ".join(unknown))
     default_human = None
     if raw.get("default_human"):
         default_human = normalize_human(raw["default_human"])
         if default_human is None:
-            raise NotifyConfigError("notify.default_human : `human:<id>` attendu")
+            raise NotifyConfigError("notify.default_human: `human:<id>` expected")
     types = DEFAULT_TYPES
     if "types" in raw:
         types = _names(raw["types"], "notify.types")
         bad = [t for t in types if not _TYPE_RE.match(t)]
         if bad:
-            raise NotifyConfigError("notify.types : type(s) illisible(s) %s" % ", ".join(bad))
+            raise NotifyConfigError("notify.types: unreadable type(s) %s" % ", ".join(bad))
     channels_raw = raw.get("channels") or {}
     if not isinstance(channels_raw, dict):
-        raise NotifyConfigError("notify.channels : objet attendu")
+        raise NotifyConfigError("notify.channels: object expected")
     channels = {name: _channel(name, spec) for name, spec in channels_raw.items()}
     routes_raw = raw.get("routes") or {}
     if not isinstance(routes_raw, dict):
-        raise NotifyConfigError("notify.routes : objet {\"human:<id>\": [canaux]} attendu")
+        raise NotifyConfigError("notify.routes: object {\"human:<id>\": [channels]} expected")
     routes = {}
     for who, names in routes_raw.items():
         human = normalize_human(who)
         if human is None or not str(who).startswith("human:"):
-            raise NotifyConfigError("notify.routes : clé %r, `human:<id>` attendu" % who)
+            raise NotifyConfigError("notify.routes: key %r, `human:<id>` expected" % who)
         routes[human] = _names(names, "notify.routes.%s" % who)
     default = _names(raw.get("default") or [], "notify.default")
     # un canal nommé par son type (desktop, slack) n'a pas besoin d'être déclaré
@@ -354,10 +357,10 @@ def parse_config(raw) -> NotifyConfig:
             if name in ("desktop", "slack"):
                 channels[name] = _channel(name, {})
             elif name == "ntfy":
-                raise NotifyConfigError("canal ntfy utilisé sans déclaration : "
+                raise NotifyConfigError("ntfy channel used without declaration: "
                                         "notify.channels.ntfy = {\"url\": …, \"topic\": …}")
             else:
-                raise NotifyConfigError("canal %r utilisé dans les routes mais non déclaré "
+                raise NotifyConfigError("channel %r used in routes but not declared "
                                         "(notify.channels)" % name)
     rate = int(_positive(raw.get("rate_per_minute", DEFAULT_RATE_PER_MINUTE),
                          "notify.rate_per_minute"))
@@ -406,7 +409,7 @@ def duration(seconds) -> str:
         return "%d min" % (s // 60)
     if s < 86400:
         return "%d h %02d" % (s // 3600, (s % 3600) // 60)
-    return "%d j %d h" % (s // 86400, (s % 86400) // 3600)
+    return "%d d %d h" % (s // 86400, (s % 86400) // 3600)
 
 
 def _account(alert: dict) -> str | None:
@@ -418,33 +421,33 @@ def _account(alert: dict) -> str | None:
     if alert.get("gauge") is None and alert.get("account") is None:
         return None
     return "%s/%s" % (_clean(alert.get("harness") or "?", 32),
-                      _clean(alert.get("account") or "défaut", 64))
+                      _clean(alert.get("account") or "default", 64))
 
 
 def _subject(alert: dict) -> str:
     parts = []
     if _account(alert):
-        parts.append("compte %s" % _account(alert))
+        parts.append("account %s" % _account(alert))
         if alert.get("gauge"):
-            parts.append("fenêtre %s" % _clean(alert["gauge"], 32))
+            parts.append("window %s" % _clean(alert["gauge"], 32))
     if alert.get("agent"):
         parts.append("agent %s" % _clean(alert["agent"], 64))
     if alert.get("decision") is not None:
-        parts.append("décision #%s" % alert["decision"])
+        parts.append("decision #%s" % alert["decision"])
     if alert.get("lot") is not None:
         lot = "lot #%s" % alert["lot"]
         if alert.get("title"):
-            lot += " « %s »" % _clean(alert["title"], 80)
+            lot += ' "%s"' % _clean(alert["title"], 80)
         parts.append(lot)
     if alert.get("host"):
-        parts.append("hôte %s" % _clean(alert["host"], 64))
+        parts.append("host %s" % _clean(alert["host"], 64))
     return " · ".join(parts) or "mesh"
 
 
 def _readable(title: str, body: str, detail_line: str | None) -> tuple:
     """R12 : même règle que les fils ; un détail illisible est retiré, pas envoyé."""
     if fil.unreadable_reason("%s\n%s" % (title, body)) and detail_line:
-        body = body.replace(detail_line, "(détail retiré : texte illisible)")
+        body = body.replace(detail_line, "(detail removed: unreadable text)")
     return title, body
 
 
@@ -465,23 +468,23 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
         "lot #%s" % alert["lot"] if alert.get("lot") is not None else "")
     suffix = " (%s)" % _clean(who, 64) if who else ""
     if event == "resolved":
-        title = "ameesh : résolue — %s%s" % (label, suffix)
+        title = "ameesh: resolved — %s%s" % (label, suffix)
         lines = ["[%s] %s" % (kind, subject)]
         if start is not None:
-            lines.append("résolue après %s (levée le %s)" % (duration(now - start),
-                                                             local_time(start)))
+            lines.append("resolved after %s (raised on %s)" % (duration(now - start),
+                                                               local_time(start)))
         else:
-            lines.append("résolue")
+            lines.append("resolved")
         return Message(title, "\n".join(lines), low=True)
-    title = "ameesh : %s%s" % (label, suffix)
+    title = "ameesh: %s%s" % (label, suffix)
     detail = _clean(alert.get("detail"))
     lines = ["[%s] %s" % (kind, subject)]
     if detail:
         lines.append(detail)
     if since is not None:
-        lines.append("depuis le %s (%s)" % (local_time(since), duration(now - float(since))))
+        lines.append("since %s (%s)" % (local_time(since), duration(now - float(since))))
     elif raised_ts:
-        lines.append("constatée le %s" % local_time(raised_ts))
+        lines.append("observed on %s" % local_time(raised_ts))
     title, body = _readable(title, "\n".join(lines), detail)
     # L94, L106 : une alerte peut se dire urgente elle-même (`balance_low`
     # sous 12 h, `host_power_low` au seuil d'arrêt), au-delà des types
@@ -494,25 +497,25 @@ def render_summary(bucket: dict, host: str) -> Message:
     total = sum(raised.values()) + int(bucket.get("resolved") or 0)
     parts = []
     if raised:
-        parts.append("levées : " + ", ".join(
+        parts.append("raised: " + ", ".join(
             "%d %s" % (n, kind) for kind, n in sorted(raised.items())))
     if bucket.get("resolved"):
-        parts.append("résolues : %d" % int(bucket["resolved"]))
-    title = "ameesh : %d alerte(s) non détaillée(s) (limite de débit)" % total
+        parts.append("resolved: %d" % int(bucket["resolved"]))
+    title = "ameesh: %d alert(s) not detailed (rate limit)" % total
     # L94 : la sous-utilisation a sa ligne dans le résumé
     underuse = sum(n for kind, n in raised.items() if kind in sous_utilisation.UNDERUSE_TYPES)
     if underuse:
-        parts.append("sous-utilisation : %d (%s)" % (underuse, ", ".join(
+        parts.append("underuse: %d (%s)" % (underuse, ", ".join(
             "%d %s" % (n, TYPE_LABELS.get(kind, kind)) for kind, n in sorted(raised.items())
             if kind in sous_utilisation.UNDERUSE_TYPES)))
-    body = "%s\nvoir `ameesh alerts` sur l'hôte %s" % (" ; ".join(parts) or "—", host)
+    body = "%s\nsee `ameesh alerts` on host %s" % ("; ".join(parts) or "—", host)
     return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised))
 
 
 def render_test(human: str, channel: Channel, host: str) -> Message:
-    return Message("ameesh : message de test",
-                   "Canal %s (%s) de %s, depuis l'hôte %s : les alertes d'exploitation "
-                   "vous parviendront ici." % (channel.name, channel.kind, human, host))
+    return Message("ameesh: test message",
+                   "Channel %s (%s) of %s, from host %s: operations alerts will "
+                   "reach you here." % (channel.name, channel.kind, human, host))
 
 
 # --------------------------------------------------------------------------
@@ -523,24 +526,24 @@ def _secret_file(path: str, what: str) -> str:
     try:
         st = os.stat(path)
     except OSError as exc:
-        raise ChannelError("%s : fichier %s illisible (%s)" % (what, path, exc.strerror),
+        raise ChannelError("%s: file %s unreadable (%s)" % (what, path, exc.strerror),
                            permanent=True) from None
     if st.st_mode & 0o077:
-        raise ChannelError("%s : le fichier %s est lisible par d'autres (mode %o) : "
+        raise ChannelError("%s: file %s is readable by others (mode %o): "
                            "chmod 600" % (what, path, st.st_mode & 0o777), permanent=True)
     if hasattr(os, "getuid") and st.st_uid != os.getuid():
-        raise ChannelError("%s : le fichier %s n'appartient pas à cet utilisateur"
+        raise ChannelError("%s: file %s is not owned by this user"
                            % (what, path), permanent=True)
     with open(path, encoding="utf-8") as fh:
         value = fh.read().strip()
     if not value:
-        raise ChannelError("%s : fichier %s vide" % (what, path), permanent=True)
+        raise ChannelError("%s: file %s is empty" % (what, path), permanent=True)
     return value
 
 
 def _secret(channel: Channel, env: dict, env_key: str, file_key: str,
             default_env: str | None, required: bool) -> str | None:
-    what = "canal %s" % channel.name
+    what = "channel %s" % channel.name
     if channel.options.get(file_key):
         return _secret_file(channel.options[file_key], what)
     var = channel.options.get(env_key) or default_env
@@ -548,13 +551,13 @@ def _secret(channel: Channel, env: dict, env_key: str, file_key: str,
         return None
     value = (env.get(var) or "").strip()
     if not value and (required or channel.options.get(env_key)):
-        raise ChannelError("%s : variable d'environnement %s vide ou absente" % (what, var),
+        raise ChannelError("%s: environment variable %s empty or missing" % (what, var),
                            permanent=True)
     return value or None
 
 
 #: L46 : message fixe quand l'URL est un secret (webhook Slack)
-SECRET_URL_INVALID = "URL du webhook invalide"
+SECRET_URL_INVALID = "invalid webhook URL"
 
 
 def check_secret_value(value: str, what: str) -> str:
@@ -563,8 +566,8 @@ def check_secret_value(value: str, what: str) -> str:
     (`EnvironmentFile` de systemd ne les retire pas). Le message ne contient
     JAMAIS la valeur."""
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
-        raise ChannelError("%s invalide : espace ou caractère de contrôle (commentaire en "
-                           "fin de ligne dans notify.env ?) — valeur non affichée" % what,
+        raise ChannelError("%s invalid: whitespace or control character (end-of-line "
+                           "comment in notify.env?) — value not shown" % what,
                            permanent=True)
     return value
 
@@ -632,17 +635,17 @@ def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: boo
         finally:
             exc.close()
         raise ChannelError("HTTP %d%s%s" % (exc.code, where,
-                                           " : %s" % extrait if extrait else "")) from None
+                                           ": %s" % extrait if extrait else "")) from None
     except urllib.error.URLError as exc:
-        raise ChannelError("injoignable%s : %s" % (where, clean(exc.reason))) from None
+        raise ChannelError("unreachable%s: %s" % (where, clean(exc.reason))) from None
     except (http.client.InvalidURL, ValueError) as exc:
         # L46 : http.client.InvalidURL (espace, caractère de contrôle) cite le
         # chemin de l'URL — le secret d'un webhook : message fixe
         if not show_url:
             raise ChannelError(SECRET_URL_INVALID, permanent=True) from None
-        raise ChannelError("échec d'envoi%s : %s" % (where, clean(exc))) from None
+        raise ChannelError("send failed%s: %s" % (where, clean(exc))) from None
     except (OSError, http.client.HTTPException) as exc:
-        raise ChannelError("échec d'envoi%s : %s" % (where, clean(exc))) from None
+        raise ChannelError("send failed%s: %s" % (where, clean(exc))) from None
 
 
 def _header(value: str) -> str:
@@ -683,8 +686,8 @@ class Sender:
         binary = notify_send_bin(self.env)
         if not binary:
             raise ChannelError(
-                "notify-send introuvable sur cet hôte (paquet libnotify) : le canal "
-                "`desktop` ne peut rien afficher ; installez-le ou retirez `desktop` des "
+                "notify-send not found on this host (libnotify package): the `desktop` "
+                "channel cannot show anything; install it or remove `desktop` from the "
                 "routes", permanent=True)
         urgency = "critical" if message.urgent else ("low" if message.low else "normal")
         try:
@@ -693,12 +696,12 @@ class Sender:
                  message.title, message.body],
                 capture_output=True, text=True, timeout=timeout, env=self.env)
         except subprocess.TimeoutExpired:
-            raise ChannelError("notify-send n'a pas répondu en %ds" % timeout) from None
+            raise ChannelError("notify-send did not answer within %ds" % timeout) from None
         except OSError as exc:
-            raise ChannelError("notify-send : %s" % exc.strerror) from None
+            raise ChannelError("notify-send: %s" % exc.strerror) from None
         if proc.returncode != 0:
-            raise ChannelError("notify-send a échoué (code %d) : %s" % (
-                proc.returncode, _clean(proc.stderr, 160) or "sans message"))
+            raise ChannelError("notify-send failed (code %d): %s" % (
+                proc.returncode, _clean(proc.stderr, 160) or "no message"))
 
     def _ntfy(self, channel: Channel, message: Message, timeout: float) -> None:
         url = "%s/%s" % (str(channel.options["url"]).rstrip("/"), channel.options["topic"])
@@ -711,7 +714,7 @@ class Sender:
         if token:
             # L46 : un jeton avec espace ou retour à la ligne ferait citer
             # l'en-tête (donc le jeton) par http.client
-            check_secret_value(token, "canal %s : jeton ntfy" % channel.name)
+            check_secret_value(token, "channel %s: ntfy token" % channel.name)
             headers["Authorization"] = "Bearer %s" % token
         _post(url, message.body.encode("utf-8"), headers, timeout, show_url=True,
               secrets=(token,) if token else ())
@@ -720,11 +723,11 @@ class Sender:
         url = _secret(channel, self.env, "webhook_env", "webhook_file",
                       DEFAULT_SLACK_ENV, True)
         # L46 : refusée à la lecture, sans jamais citer l'URL (un secret)
-        check_secret_value(url, "canal %s : %s" % (channel.name, SECRET_URL_INVALID))
+        check_secret_value(url, "channel %s: %s" % (channel.name, SECRET_URL_INVALID))
         try:
-            check_url(url, "webhook Slack")
+            check_url(url, "Slack webhook")
         except NotifyConfigError as exc:
-            raise ChannelError("canal %s : %s" % (channel.name, exc), permanent=True) from None
+            raise ChannelError("channel %s: %s" % (channel.name, exc), permanent=True) from None
         payload = {"text": "*%s*\n%s" % (message.title, message.body)}
         _post(url, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
               {"Content-Type": "application/json; charset=utf-8"}, timeout,
@@ -836,7 +839,7 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
-            raise ValueError("schéma inattendu")
+            raise ValueError("unexpected schema")
     except FileNotFoundError:
         return empty_state()
     except (OSError, ValueError) as exc:
@@ -846,10 +849,10 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
                 raise OSError
             os.replace(path, aside)
         except OSError:
-            aside = "(non déplacé)"
+            aside = "(not moved)"
         if log:
-            log("état d'envoi illisible (%s) : mis de côté sous %s, on repart d'un état "
-                "vide" % (exc, aside))
+            log("unreadable delivery state (%s): set aside as %s, starting from an empty "
+                "state" % (exc, aside))
         return empty_state()
     state = empty_state()
     state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
@@ -925,7 +928,7 @@ _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "
 # --------------------------------------------------------------------------
 
 def _stderr_log(text: str) -> None:
-    print("ameesh notify : %s" % text, file=sys.stderr, flush=True)
+    print("ameesh notify: %s" % text, file=sys.stderr, flush=True)
 
 
 class Notifier:
@@ -967,7 +970,7 @@ class Notifier:
                 continue
             entry = active.pop(key)
             if entry["alert"].get("type") not in self.ncfg.types:
-                self.log("[%s] retiré de notify.types : oubliée sans résolution"
+                self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
             self._resolved(key, entry, now)
@@ -1072,7 +1075,7 @@ class Notifier:
                     self.cfg, dry_run=self.dry_run, log=self.log, clock=self.clock)
             self._projector.tick(db, now)
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
-            self.log("issues GitHub : passage en échec (%s)" % _clean(exc, 200))
+            self.log("GitHub issues: pass failed (%s)" % _clean(exc, 200))
 
     # -- échecs de CI au courrier de l'agent du lot (L161c) ----------------------
     def _ci_failures(self, db) -> None:
@@ -1088,7 +1091,7 @@ class Notifier:
             for record in self._ci_watcher.tick(db):
                 self.log(ci.describe(record))
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
-            self.log("CI : relevé en échec (%s)" % _clean(exc, 200))
+            self.log("CI: poll failed (%s)" % _clean(exc, 200))
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:
@@ -1099,7 +1102,7 @@ class Notifier:
         except db_mod.DbError:
             raise
         except Exception as exc:     # la prise ne fait jamais tomber les alertes
-            self.log("prise automatique en échec : %s" % _clean(exc, 200))
+            self.log("auto-take failed: %s" % _clean(exc, 200))
             return
         for take in taken:
             item = take["item"]
@@ -1117,8 +1120,8 @@ class Notifier:
         human, source = router.resolve(alert)
         if human is None:
             if first:
-                self.log("alerte SANS DESTINATAIRE [%s] %s : ni `responsible`, ni "
-                         "responsable d'agent, de lot ou d'hôte, ni notify.default_human — "
+                self.log("alert WITHOUT RECIPIENT [%s] %s: no `responsible`, no "
+                         "agent, lot or host responsible, no notify.default_human — "
                          "%s" % (alert.get("type"), _subject(alert), alert.get("detail")))
                 self._record("raised", entry, "sans_destinataire", {})
             entry["status"] = "sans_destinataire"
@@ -1127,8 +1130,8 @@ class Notifier:
         entry.update(human=human, source=source)
         if not channels:
             if entry["status"] != "sans_canal":
-                self.log("aucun canal pour %s (notify.routes, notify.default) : alerte [%s] "
-                         "%s journalisée seulement" % (human, alert.get("type"),
+                self.log("no channel for %s (notify.routes, notify.default): alert [%s] "
+                         "%s only logged" % (human, alert.get("type"),
                                                        _subject(alert)))
                 self._record("raised", entry, "sans_canal", {})
             entry["status"] = "sans_canal"
@@ -1165,12 +1168,12 @@ class Notifier:
                         titles[int(lot)] = item.get("title") or ""
                 briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
         except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
-            self.log("courrier aux orchestrateurs non préparé (%s)" % exc)
+            self.log("mail to orchestrators not prepared (%s)" % exc)
             return
         from . import mail, work
         for orch, text in sorted(briefs.items()):
             if self.dry_run:
-                self.log("[%s] courrier à l'orchestrateur %s (essai) : %s"
+                self.log("[%s] mail to orchestrator %s (dry run): %s"
                          % (alert.get("type"), orch, text))
                 continue
             try:
@@ -1181,10 +1184,10 @@ class Notifier:
                     payload.update(recipient=alert.get("agent"), reason=alert.get("reason"),
                                    count=alert.get("value"))
                 mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event", payload=payload)
-                self.log("[%s] courrier déposé pour l'orchestrateur %s"
+                self.log("[%s] mail delivered to orchestrator %s"
                          % (alert.get("type"), orch))
             except Exception as exc:  # noqa: BLE001
-                self.log("[%s] courrier à l'orchestrateur %s non déposé (%s)"
+                self.log("[%s] mail to orchestrator %s not delivered (%s)"
                          % (alert.get("type"), orch, exc))
 
     # -- agents qui peuvent agir (L132) ---------------------------------------
@@ -1219,7 +1222,7 @@ class Notifier:
                 canons = []
             auditors = alert_briefs.auditors(listing, canons)
         except Exception as exc:  # noqa: BLE001
-            self.log("courrier aux agents non préparé (%s)" % exc)
+            self.log("mail to agents not prepared (%s)" % exc)
             return
         for key, alert, entry in due:
             kind = alert.get("type")
@@ -1231,7 +1234,7 @@ class Notifier:
                         titles[int(lot)] = item.get("title") or ""
                 briefs = alert_briefs.briefs(alert, listing, titles, auditors)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
-                self.log("[%s] courrier aux agents non préparé (%s)" % (kind, exc))
+                self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 continue
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
@@ -1247,15 +1250,15 @@ class Notifier:
             # son activité (stagnation) et effacerait l'alerte qu'il signale
             for name, text in sorted(briefs.items()):
                 if self.dry_run:
-                    self.log("[%s] courrier à %s (essai) : %s" % (kind, name, text))
+                    self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
                 try:
                     mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
                               payload=payload)
-                    self.log("[%s] %s déposé pour %s" % (
-                        kind, "relance" if entry is not None else "courrier", name))
+                    self.log("[%s] %s delivered to %s" % (
+                        kind, "reminder" if entry is not None else "mail", name))
                 except Exception as exc:  # noqa: BLE001
-                    self.log("[%s] courrier à %s non déposé (%s)" % (kind, name, exc))
+                    self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
             if entry is None:
                 sent[key] = {"type": kind, "sent_ts": now, "reminded": False,
                              "to": sorted(briefs)}
@@ -1271,8 +1274,8 @@ class Notifier:
             self._record("resolved", entry, "sans_envoi", {})
             return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
-            self.log("alerte résolue [%s] %s (jamais envoyée : %s)" % (
-                alert.get("type"), _subject(alert), status.replace("_", " ")))
+            self.log("alert resolved [%s] %s (never sent: %s)" % (
+                alert.get("type"), _subject(alert), _DELIVERY_LABELS.get(status, status)))
             self._record("resolved", entry, status, {})
             return
         if status == "resumee":
@@ -1280,7 +1283,7 @@ class Notifier:
             return
         delivered = [name for name, st in entry["channels"].items() if st.get("ok")]
         if not delivered:
-            self.log("alerte [%s] %s résolue avant tout envoi réussi : rien n'est envoyé"
+            self.log("alert [%s] %s resolved before any successful send: nothing is sent"
                      % (alert.get("type"), _subject(alert)))
             self._record("resolved", entry, "abandonnee", {})
             return
@@ -1312,7 +1315,7 @@ class Notifier:
             st = entry["channels"][name]
             channel = self.ncfg.channels.get(name)
             if channel is None:          # canal retiré de la configuration
-                st.update(attempts=self.ncfg.max_attempts, error="canal retiré")
+                st.update(attempts=self.ncfg.max_attempts, error="channel removed")
                 continue
             ok, error = self._send(channel, message)
             st["attempts"] = st.get("attempts", 0) + 1
@@ -1323,13 +1326,13 @@ class Notifier:
             if error.permanent:
                 st["attempts"] = self.ncfg.max_attempts
             st["error"] = str(error)
-            results[name] = "échec : %s" % error
+            results[name] = "failed: %s" % error
             last = st["attempts"] >= self.ncfg.max_attempts
-            self.log("[%s] %s → %s, canal %s : %s%s" % (
+            self.log("[%s] %s → %s, channel %s: %s%s" % (
                 entry["alert"].get("type"), _subject(entry["alert"]), entry.get("human"),
                 name, error,
-                " — ABANDON (%d essai(s))" % st["attempts"] if last
-                else " — retenté au prochain passage (%d/%d)"
+                " — GIVING UP (%d attempt(s))" % st["attempts"] if last
+                else " — retried on next pass (%d/%d)"
                 % (st["attempts"], self.ncfg.max_attempts)))
         if results:
             delivery = ("a_blanc" if self.dry_run else
@@ -1343,7 +1346,7 @@ class Notifier:
         except ChannelError as exc:
             return False, exc
         except Exception as exc:   # un canal ne fait jamais tomber les autres
-            return False, ChannelError("erreur inattendue : %s"
+            return False, ChannelError("unexpected error: %s"
                                        % _clean(_scrub(exc, channel_secrets(
                                            channel, getattr(self.sender, "env", None))),
                                            160))
@@ -1371,7 +1374,7 @@ class Notifier:
                 continue
             channels = self.ncfg.channels_for(human)
             if not channels:
-                self.log("résumé de débit pour %s perdu : plus aucun canal" % human)
+                self.log("rate summary for %s lost: no channel left" % human)
                 del self.state["summary"][human]
                 continue
             message = render_summary(bucket, self.cfg.host)
@@ -1380,16 +1383,16 @@ class Notifier:
                 sent, error = self._send(channel, message)
                 ok = ok or sent
                 results[channel.name] = ("a_blanc" if self.dry_run else "ok") if sent \
-                    else "échec : %s" % error
+                    else "failed: %s" % error
                 if not sent:
-                    self.log("résumé de débit → %s, canal %s : %s" % (human, channel.name,
-                                                                      error))
+                    self.log("rate summary → %s, channel %s: %s" % (human, channel.name,
+                                                                    error))
             self.state["rate"].setdefault(human, []).append(now)
             entry = {"alert": {"type": "summary"}, "human": human, "source": "debit"}
             bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
             if ok or bucket["attempts"] >= self.ncfg.max_attempts:
                 if not ok:
-                    self.log("résumé de débit → %s : ABANDON après %d essai(s)"
+                    self.log("rate summary → %s: GIVING UP after %d attempt(s)"
                              % (human, bucket["attempts"]))
                 del self.state["summary"][human]
                 self.state["last_summary"][human] = now
@@ -1423,7 +1426,7 @@ def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
         except ChannelError as exc:
             out.append((channel.name, str(exc)))
         except Exception as exc:
-            out.append((channel.name, "erreur inattendue : %s" % _clean(_scrub(
+            out.append((channel.name, "unexpected error: %s" % _clean(_scrub(
                 exc, channel_secrets(channel, getattr(sender, "env", None))), 160)))
     return out
 
@@ -1432,15 +1435,24 @@ def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
 # entrée
 # --------------------------------------------------------------------------
 
+#: display labels of the stored/emitted `delivery` and `status` values
+_DELIVERY_LABELS = {"a_blanc": "dry run", "envoyee": "sent", "echec": "failed",
+                    "sans_destinataire": "no recipient", "sans_canal": "no channel",
+                    "resumee": "summarized", "abandonnee": "abandoned",
+                    "sans_envoi": "not sent", "prise": "taken", "nouvelle": "new",
+                    "envoi": "sending"}
+
+
 def _format(record: dict) -> str:
     who = record.get("human") or "—"
     what = "[%s] %s" % (record.get("type"), _subject(record))
-    event = {"raised": "levée", "resolved": "résolue", "summary": "résumé",
-             "auto_take": "prise automatique"}.get(
+    event = {"raised": "raised", "resolved": "resolved", "summary": "summary",
+             "auto_take": "auto-take"}.get(
         record["event"], record["event"])
     channels = ", ".join("%s %s" % (k, v) for k, v in sorted(record["channels"].items()))
-    line = "%s %s → %s : %s%s" % (event, what, who, record["delivery"].replace("_", " "),
-                                  " (%s)" % channels if channels else "")
+    delivery = record["delivery"]
+    line = "%s %s → %s: %s%s" % (event, what, who, _DELIVERY_LABELS.get(
+        delivery, delivery.replace("_", " ")), " (%s)" % channels if channels else "")
     if record.get("delivery") == "a_blanc" and record.get("title"):
         line += "\n    %s\n    %s" % (record["title"], record["text"].replace("\n", "\n    "))
     return line
@@ -1476,45 +1488,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh notify", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--once", action="store_true",
-                        help="un seul passage, puis sortie")
+                        help="a single pass, then exit")
     parser.add_argument("--dry-run", action="store_true",
-                        help="imprime ce qui serait envoyé, n'envoie rien, n'écrit pas l'état")
+                        help="print what would be sent; send nothing, write no state")
     parser.add_argument("--json", action="store_true",
-                        help="un objet JSON par envoi (schéma ameesh-notify/1)")
+                        help="one JSON object per send (schema ameesh-notify/1)")
     parser.add_argument("--interval", type=float, default=None,
-                        help="secondes entre deux passages (défaut : notify.interval, "
-                             "AMEESH_NOTIFY_INTERVAL, sinon 30)")
+                        help="seconds between two passes (default: notify.interval, "
+                             "AMEESH_NOTIFY_INTERVAL, else 30)")
     parser.add_argument("--test", metavar="human:ID", default=None,
-                        help="envoie un message de test sur chacun des canaux de cet humain")
+                        help="send a test message on each of this human's channels")
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
     from . import backlog
     parser.add_argument("--take-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_IDLE",
                                                         backlog.DEFAULT_TAKE_IDLE_S),
-                        help="prise automatique : agent réveillable au repos sans lot depuis "
-                             "S secondes (défaut 1800 ; 0 coupe la prise)")
+                        help="auto-take: wakeable agent idle with no lot for S seconds "
+                             "(default 1800; 0 turns auto-take off)")
     parser.add_argument("--take-max-per-hour", type=int,
                         default=int(exploitation._env_float(
                             "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
-                        help="prises automatiques au plus par heure glissante, pour tout le "
-                             "mesh (défaut 2)")
+                        help="maximum auto-takes per rolling hour, for the whole mesh "
+                             "(default 2)")
     parser.add_argument("--take-paid", action="store_true",
                         default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
-                        help="autoriser la prise par des agents payés au token (après les "
-                             "agents au forfait ; jamais pendant balance_low)")
+                        help="allow auto-take by pay-per-token agents (after plan agents; "
+                             "never during balance_low)")
     # L165 : prise d'un lot non assigné de l'équipe, avant la file
     parser.add_argument("--take-lot-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
                                                         backlog.DEFAULT_LOT_IDLE_S),
-                        help="un agent réveillable au repos sans lot depuis S secondes prend "
-                             "le lot non assigné le plus prioritaire de son équipe (défaut "
-                             "900 ; 0 coupe cette prise)")
+                        help="a wakeable agent idle with no lot for S seconds takes the "
+                             "highest-priority unassigned lot of its team (default 900; 0 "
+                             "turns this off)")
     parser.add_argument("--take-lot-max-per-hour", type=int,
                         default=int(exploitation._env_float(
                             "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
-                        help="lots de l'équipe pris au plus par heure glissante, pour tout le "
-                             "mesh (défaut 6)")
+                        help="maximum team lots taken per rolling hour, for the whole mesh "
+                             "(default 6)")
     return parser
 
 
@@ -1547,10 +1559,10 @@ def _interval(args, ncfg: NotifyConfig) -> float:
 def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
     human = normalize_human(args.test)
     if human is None or not str(args.test).startswith("human:"):
-        print("ameesh notify --test : `human:<id>` attendu", file=sys.stderr)
+        print("ameesh notify --test: `human:<id>` expected", file=sys.stderr)
         return 2
     if not ncfg.channels_for(human):
-        print("ameesh notify --test : aucun canal pour %s (notify.routes, notify.default)"
+        print("ameesh notify --test: no channel for %s (notify.routes, notify.default)"
               % human, file=sys.stderr)
         return 2
     results = send_test(ncfg, human, cfg.host)
@@ -1560,21 +1572,21 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
                               "channel": name, "ok": error is None, "error": error},
                              ensure_ascii=False, sort_keys=True))
         else:
-            print("%s → %s : %s" % (name, human, "envoyé" if error is None
-                                    else "ÉCHEC : %s" % error))
+            print("%s → %s: %s" % (name, human, "sent" if error is None
+                                   else "FAILED: %s" % error))
     return 0 if all(error is None for _, error in results) else 1
 
 
 def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     if not ncfg.configured:
-        _stderr_log("aucun canal configuré (clé `notify` de la configuration de l'hôte : "
-                    "routes, default) : les alertes seront journalisées, pas envoyées")
+        _stderr_log("no channel configured (`notify` key of the host configuration: "
+                    "routes, default): alerts will be logged, not sent")
     path = state_path(cfg)
     lock = None
     if not args.dry_run:
         lock = _Lock(path + ".lock")
         if not lock.acquire():
-            print("ameesh notify : un autre `ameesh notify` tient déjà %s.lock" % path,
+            print("ameesh notify: another `ameesh notify` already holds %s.lock" % path,
                   file=sys.stderr)
             return 1
     state = load_state(path, log=_stderr_log, move_aside=not args.dry_run)
@@ -1604,7 +1616,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             except db_mod.DbError as exc:
                 if args.once:
                     raise
-                _stderr_log("base indisponible (%s) : nouvel essai dans %ds" % (exc, interval))
+                _stderr_log("database unavailable (%s): retrying in %ds" % (exc, interval))
                 if db is not None:
                     try:
                         db.close()
@@ -1630,20 +1642,20 @@ def main(argv: list | None = None) -> int:
     try:
         ncfg = parse_config(cfg.notify)
     except NotifyConfigError as exc:
-        print("ameesh notify : configuration invalide : %s" % exc, file=sys.stderr)
+        print("ameesh notify: invalid configuration: %s" % exc, file=sys.stderr)
         return 2
     if args.test:
         return cmd_test(cfg, ncfg, args)
     try:
         return cmd_notify(cfg, ncfg, args)
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

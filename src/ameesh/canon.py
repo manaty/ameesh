@@ -175,11 +175,11 @@ if _yaml is not None:
             key = loader.construct_object(key_node, deep=deep)
             try:
                 if key in seen:
-                    raise YamlError("ligne %d : clé en double %r"
+                    raise YamlError("line %d: duplicate key %r"
                                     % (key_node.start_mark.line + 1, key))
                 seen.add(key)
             except TypeError:
-                raise YamlError("ligne %d : clé non scalaire" % (key_node.start_mark.line + 1))
+                raise YamlError("line %d: non-scalar key" % (key_node.start_mark.line + 1))
         return loader.construct_mapping(node, deep=deep)
 
     _StrictLoader.add_constructor(
@@ -193,14 +193,14 @@ def load_yaml(text: str, *, use_pyyaml: bool | None = None) -> Any:
     try:
         if use_pyyaml:
             if _yaml is None:
-                raise YamlError("PyYAML indisponible")
+                raise YamlError("PyYAML unavailable")
             try:
                 return _normalize(_yaml.load(text, Loader=_StrictLoader))  # noqa: S506 (SafeLoader)
             except _yaml.YAMLError as exc:
                 raise YamlError(" ".join(str(exc).split())) from exc
         return _MiniYaml(text).parse()
     except RecursionError as exc:
-        raise YamlError("imbrication trop profonde") from exc
+        raise YamlError("nesting too deep") from exc
 
 
 _INT_RE = re.compile(r"^[-+]?(0|[1-9][0-9]*)$")
@@ -229,7 +229,7 @@ def _plain(text: str) -> Any:
     if _FLOAT_RE.match(text):
         return float(text)
     if text.startswith(("!", "%", "@", "`")):
-        raise YamlError("valeur non prise en charge : %r" % text[:40])
+        raise YamlError("unsupported value: %r" % text[:40])
     return text
 
 
@@ -330,12 +330,12 @@ def _quoted(text: str, i: int) -> tuple[str, int]:
                     out.append(chr(int(digits, 16)))
                     i += 2 + width
                     continue
-            raise YamlError("échappement inconnu : \\%s" % nxt)
+            raise YamlError("unknown escape: \\%s" % nxt)
         if c == '"':
             return "".join(out), i + 1
         out.append(c)
         i += 1
-    raise _Incomplete("chaîne non terminée")
+    raise _Incomplete("unterminated string")
 
 
 class _Flow:
@@ -350,7 +350,7 @@ class _Flow:
         value = self.value()
         self.ws()
         if self.i != len(self.s):
-            raise YamlError("contenu après une collection en ligne : %r" % self.s[self.i:][:40])
+            raise YamlError("content after a flow collection: %r" % self.s[self.i:][:40])
         return value
 
     def ws(self) -> None:
@@ -359,7 +359,7 @@ class _Flow:
 
     def peek(self) -> str:
         if self.i >= len(self.s):
-            raise _Incomplete("collection en ligne non terminée")
+            raise _Incomplete("unterminated flow collection")
         return self.s[self.i]
 
     def value(self, key: bool = False) -> Any:
@@ -375,7 +375,7 @@ class _Flow:
         if c == "*":
             match = re.match(r"\*([^\s\[\]{},]+)", self.s[self.i:])
             if not match or match.group(1) not in self.anchors:
-                raise YamlError("alias inconnu")
+                raise YamlError("unknown alias")
             self.i += match.end()
             return self.anchors[match.group(1)]
         start = self.i
@@ -386,7 +386,7 @@ class _Flow:
             if key and c == ":" and (self.i + 1 == len(self.s) or self.s[self.i + 1] in " \t,}"):
                 break
             if c == "#" and self.s[self.i - 1:self.i] in (" ", "\t"):
-                raise YamlError("commentaire dans une collection en ligne")
+                raise YamlError("comment inside a flow collection")
             self.i += 1
         text = self.s[start:self.i].strip()
         return text if key else _plain(text)
@@ -405,7 +405,7 @@ class _Flow:
             if c == ",":
                 self.i += 1
             elif c != "]":
-                raise YamlError("« , » ou « ] » attendu dans une liste en ligne")
+                raise YamlError("\",\" or \"]\" expected in a flow list")
 
     def map(self) -> dict:
         self.i += 1
@@ -417,7 +417,7 @@ class _Flow:
                 return out
             key = self.value(key=True)
             if not isinstance(key, str):
-                raise YamlError("clé non scalaire dans un mapping en ligne")
+                raise YamlError("non-scalar key in a flow mapping")
             self.ws()
             value = None
             if self.peek() == ":":
@@ -426,14 +426,14 @@ class _Flow:
                 if self.peek() not in ",}":
                     value = self.value()
             if key in out:
-                raise YamlError("clé en double %r" % key)
+                raise YamlError("duplicate key %r" % key)
             out[key] = value
             self.ws()
             c = self.peek()
             if c == ",":
                 self.i += 1
             elif c != "}":
-                raise YamlError("« , » ou « } » attendu dans un mapping en ligne")
+                raise YamlError("\",\" or \"}\" expected in a flow mapping")
 
 
 @dataclass
@@ -455,13 +455,13 @@ class _MiniYaml:
             stripped = raw.lstrip(" ")
             indent = len(raw) - len(stripped)
             if stripped.startswith("\t") and stripped.strip():
-                raise YamlError("ligne %d : tabulation dans l'indentation" % no)
+                raise YamlError("line %d: tab in indentation" % no)
             content = _strip_comment(stripped).rstrip()
             if indent == 0 and content in ("---", "..."):
                 if self.lines and any(line.text for line in self.lines):
                     if content == "...":
                         break
-                    raise YamlError("ligne %d : plusieurs documents" % no)
+                    raise YamlError("line %d: multiple documents" % no)
                 continue
             self.lines.append(_Line(no, indent, content, raw))
 
@@ -472,7 +472,7 @@ class _MiniYaml:
         value, i = self._node(i)
         i = self._skip(i)
         if i < len(self.lines):
-            raise YamlError("ligne %d : contenu inattendu" % self.lines[i].no)
+            raise YamlError("line %d: unexpected content" % self.lines[i].no)
         return value
 
     def _skip(self, i: int) -> int:
@@ -498,7 +498,7 @@ class _MiniYaml:
             if line.indent < indent or (line.indent == indent and not _is_item(line.text)):
                 break
             if line.indent > indent:
-                raise YamlError("ligne %d : indentation inattendue" % line.no)
+                raise YamlError("line %d: unexpected indentation" % line.no)
             rest = line.text[1:].lstrip(" ")
             anchor = None
             match = _ANCHOR_RE.match(rest)
@@ -531,23 +531,23 @@ class _MiniYaml:
             if line.indent < indent:
                 break
             if line.indent > indent:
-                raise YamlError("ligne %d : indentation inattendue" % line.no)
+                raise YamlError("line %d: unexpected indentation" % line.no)
             if _is_item(line.text):
-                raise YamlError("ligne %d : élément de liste inattendu" % line.no)
+                raise YamlError("line %d: unexpected list item" % line.no)
             pair = _split_key(line.text)
             if pair is None:
-                raise YamlError("ligne %d : « clé: valeur » attendu" % line.no)
+                raise YamlError("line %d: \"key: value\" expected" % line.no)
             raw_key, rest = pair
             if raw_key and raw_key[0] in "'\"":
                 key, end = _quoted(raw_key, 0)
                 if raw_key[end:].strip():
-                    raise YamlError("ligne %d : clé illisible" % line.no)
+                    raise YamlError("line %d: unreadable key" % line.no)
             else:
                 key = raw_key
             if not key:
-                raise YamlError("ligne %d : clé vide" % line.no)
+                raise YamlError("line %d: empty key" % line.no)
             if key in out:
-                raise YamlError("ligne %d : clé en double %r" % (line.no, key))
+                raise YamlError("line %d: duplicate key %r" % (line.no, key))
             anchor = None
             match = _ANCHOR_RE.match(rest)
             if match:
@@ -583,21 +583,21 @@ class _MiniYaml:
                     while j < len(self.lines) and not self.lines[j].text:
                         j += 1
                     if j >= len(self.lines) or self.lines[j].indent <= parent:
-                        raise YamlError("ligne %d : collection en ligne non terminée" % line.no)
+                        raise YamlError("line %d: unterminated flow collection" % line.no)
                     text = text + " " + self.lines[j].text
         if text[0] in "'\"":
             try:
                 value, end = _quoted(text, 0)
             except _Incomplete:
-                raise YamlError("ligne %d : chaîne sur plusieurs lignes non prise en charge"
+                raise YamlError("line %d: multi-line string not supported"
                                 % line.no)
             if text[end:].strip():
-                raise YamlError("ligne %d : contenu après une chaîne" % line.no)
+                raise YamlError("line %d: content after a string" % line.no)
             return value, i + 1
         if text[0] == "*":
             name = text[1:].strip()
             if name not in self.anchors:
-                raise YamlError("ligne %d : alias inconnu %r" % (line.no, name))
+                raise YamlError("line %d: unknown alias %r" % (line.no, name))
             return self.anchors[name], i + 1
         # scalaire simple, éventuellement replié sur les lignes suivantes
         parts = [text]
@@ -610,7 +610,7 @@ class _MiniYaml:
             if nxt.indent <= parent:
                 break
             if _split_key(nxt.text) is not None or _is_item(nxt.text):
-                raise YamlError("ligne %d : structure inattendue après un scalaire" % nxt.no)
+                raise YamlError("line %d: unexpected structure after a scalar" % nxt.no)
             parts.append(nxt.text)
             j += 1
         if len(parts) > 1:
@@ -666,7 +666,7 @@ def split_frontmatter(text: str) -> str | None:
     for idx in range(1, len(lines)):
         if lines[idx].rstrip("\r \t") in ("---", "..."):
             return "\n".join(line.rstrip("\r") for line in lines[1:idx])
-    raise YamlError("frontmatter non fermé (ou plus grand que %d Kio)" % (FRONTMATTER_MAX // 1024))
+    raise YamlError("unclosed frontmatter (or larger than %d KiB)" % (FRONTMATTER_MAX // 1024))
 
 
 _TYPED_RE = re.compile(r"^type:\s*[\"']?(%s)[\"']?\s*(#.*)?$" % "|".join(PROFILE_TYPES), re.M)
@@ -724,7 +724,7 @@ class Source:
     def describe(self) -> str:
         if self.mode == "git":
             return "%s @ %s (%s)" % (self.member, self.commit[:12], self.rev)
-        return "%s : fichiers de travail NON APPROUVÉS (%s)" % (self.member, self.directory)
+        return "%s: working files NOT APPROVED (%s)" % (self.member, self.directory)
 
     def to_dict(self) -> dict:
         return {"member": self.member, "directory": self.directory, "mode": self.mode,
@@ -850,13 +850,13 @@ def work_template_problem(path: str) -> str | None:
     Chemin vide, gabarit inconnu (`{projet}`, `{}`) ou accolade orpheline :
     une faute de frappe ne doit pas devenir un dossier littéral `…/{agnet}`."""
     if not isinstance(path, str) or not path.strip():
-        return "chemin vide"
+        return "empty path"
     unknown = [m for m in _WORK_TEMPLATE_RE.findall(path) if m not in WORK_TEMPLATE_FIELDS]
     if unknown:
-        return "gabarit inconnu %s (seul {agent} est admis)" % ", ".join(
+        return "unknown template %s (only {agent} is allowed)" % ", ".join(
             "{%s}" % u for u in unknown)
     if "{" in _WORK_TEMPLATE_RE.sub("", path) or "}" in _WORK_TEMPLATE_RE.sub("", path):
-        return "accolade orpheline"
+        return "unmatched brace"
     return None
 
 
@@ -1034,7 +1034,7 @@ class Canon:
     def label(self) -> str:
         """Nom lisible du canon : identifiant et racine."""
         return "%s (%s%s)" % (self.id or "?", self.root,
-                              ", par défaut" if self.is_default else "")
+                              ", default" if self.is_default else "")
 
     @property
     def untrusted(self) -> bool:
@@ -1097,7 +1097,7 @@ class Canon:
         return "human:%s" % ident
 
     def source_label(self) -> str:
-        return "; ".join(source.describe() for source in self.sources) or "aucune source lue"
+        return "; ".join(source.describe() for source in self.sources) or "no source read"
 
     def to_dict(self) -> dict:
         def fiche(f: Fiche) -> dict:
@@ -1174,10 +1174,10 @@ def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[s
     host_name = _get(host, "title") or _get(host, "name") or "?"
     mode = _get(placement, "credential_mode") or _get(agent, "credential_mode")
     checks = (
-        ("harnesses", "harnais", _get(agent, "harness"), False),
-        ("providers", "fournisseur", _get(agent, "provider"), False),
-        ("models", "modèle", _get(agent, "model"), True),
-        ("credential_modes", "mode d'identifiants", mode, False),
+        ("harnesses", "harness", _get(agent, "harness"), False),
+        ("providers", "provider", _get(agent, "provider"), False),
+        ("models", "model", _get(agent, "model"), True),
+        ("credential_modes", "credential mode", mode, False),
     )
     out: list[str] = []
     for key, label, value, pattern in checks:
@@ -1192,9 +1192,9 @@ def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[s
                 any(fnmatch.fnmatchcase(text, a) for a in allowed) if pattern
                 else text in allowed):
             continue
-        out.append("%s %s non admis par l'hôte %s (admis : %s)" % (
-            label, text if text is not None else "non déclaré", host_name,
-            ", ".join(allowed) or "aucun"))
+        out.append("%s %s not allowed by host %s (allowed: %s)" % (
+            label, text if text is not None else "undeclared", host_name,
+            ", ".join(allowed) or "none"))
     return out
 
 
@@ -1233,14 +1233,14 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         return subprocess.run(cmd, cwd=repo, input=stdin, capture_output=True,
                               env=_git_env(), timeout=timeout, check=False)
     except FileNotFoundError as exc:
-        raise GitError("git introuvable") from exc
+        raise GitError("git not found") from exc
     except subprocess.TimeoutExpired as exc:
-        raise GitError("git %s : délai dépassé" % args[0]) from exc
+        raise GitError("git %s: timed out" % args[0]) from exc
     except OSError as exc:
         # Dossier du dépôt inaccessible (permission refusée, n'est plus un
         # dossier…) : le canon est illisible, jamais une exception qui
         # empêcherait « canon sync » d’enregistrer l’état fermé.
-        raise GitError("git %s : %s" % (args[0], exc.strerror or exc)) from exc
+        raise GitError("git %s: %s" % (args[0], exc.strerror or exc)) from exc
 
 
 def _git_out(repo: str, *args: str) -> str | None:
@@ -1277,7 +1277,7 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
         # référence *inconnue* n'a pas de diff : c'est une erreur, jamais [].
         verified = git_commit(repo, ref)
         if verified is None:
-            raise GitError("référence git inconnue : %s" % ref)
+            raise GitError("unknown git reference: %s" % ref)
         proc = _git(repo, "merge-base", verified, "HEAD")
         if proc.returncode == 0 and proc.stdout.strip():
             base = proc.stdout.decode("utf-8", "replace").strip()
@@ -1285,7 +1285,7 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
             base = verified
     proc = _git(repo, "diff", "--name-status", "-z", "--find-renames", base)
     if proc.returncode != 0:
-        raise GitError("git diff %s : %s" % (base, _git_message(proc)))
+        raise GitError("git diff %s: %s" % (base, _git_message(proc)))
     fields = proc.stdout.decode("utf-8", "replace").split("\0")
     index = 0
     while index < len(fields):
@@ -1305,7 +1305,7 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
             index += 2
     proc = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
     if proc.returncode != 0:
-        raise GitError("git ls-files : %s" % _git_message(proc))
+        raise GitError("git ls-files: %s" % _git_message(proc))
     paths.update(name for name in proc.stdout.decode("utf-8", "replace").split("\0") if name)
     return sorted(paths)
 
@@ -1351,7 +1351,7 @@ def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
         args += ["--", prefix]
     proc = _git(repo, *args)
     if proc.returncode != 0:
-        raise GitError("git ls-tree : %s" % proc.stderr.decode("utf-8", "replace").strip())
+        raise GitError("git ls-tree: %s" % proc.stderr.decode("utf-8", "replace").strip())
     out = []
     for entry in proc.stdout.split(b"\0"):
         if not entry:
@@ -1370,7 +1370,7 @@ def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
         return {}
     proc = _git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode())
     if proc.returncode != 0:
-        raise GitError("git cat-file : %s" % proc.stderr.decode("utf-8", "replace").strip())
+        raise GitError("git cat-file: %s" % proc.stderr.decode("utf-8", "replace").strip())
     data = proc.stdout
     out: dict[str, bytes] = {}
     pos = 0
@@ -1385,7 +1385,7 @@ def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
             out[sha] = data[pos:pos + size]
             pos += size + 1
     except (ValueError, UnicodeDecodeError) as exc:
-        raise GitError("git cat-file : sortie illisible (%s)" % exc) from exc
+        raise GitError("git cat-file: unreadable output (%s)" % exc) from exc
     return out
 
 
@@ -1500,19 +1500,19 @@ def parse_scope(value: Any) -> tuple[list[str] | None, str | None]:
         return None, None
     items = [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not items:
-        return None, "dossier ou liste non vide de dossiers attendue"
+        return None, "directory or non-empty list of directories expected"
     out: list[str] = []
     for item in items:
         if not isinstance(item, str) or not item.strip():
-            return None, "dossier vide"
+            return None, "empty directory"
         text = item.strip().replace("\\", "/")
         norm = posixpath.normpath(text)
         if text.startswith("/") or norm == ".." or norm.startswith("../"):
-            return None, "%r : dossier relatif au bundle attendu (ni absolu, ni `..`)" % item
+            return None, "%r: directory relative to the bundle expected (neither absolute nor `..`)" % item
         if any(ch in norm for ch in "*?[]{}"):
-            return None, "%r : motif non admis (un dossier, pas un motif)" % item
+            return None, "%r: pattern not allowed (a directory, not a pattern)" % item
         if norm != "." and any(part.startswith(".") for part in norm.split("/")):
-            return None, "%r : dossier caché (jamais lu)" % item
+            return None, "%r: hidden directory (never read)" % item
         norm = "" if norm == "." else norm
         if norm not in out:
             out.append(norm)
@@ -1572,14 +1572,14 @@ class _Loader:
             error = git_fetch(repo, _remote_of(repo, rev))
             if error:
                 self.add("canon-fetch-failed", WARNING,
-                         "git fetch a échoué (%s) : lecture de la dernière révision connue"
+                         "git fetch failed (%s): reading the last known revision"
                          % error.splitlines()[0][:200], member=member)
         commit = git_commit(repo, rev)
         if not commit:
             self.add("canon-ref-missing", ERROR,
-                     "révision canonique %s introuvable dans %s (git fetch ? %s)"
+                     "canonical revision %s not found in %s (git fetch? %s)"
                      % (rev, repo, "AMEESH_CANON_REF" if explicit
-                        else "ou AMEESH_CANON_REF pour une autre branche"),
+                        else "or AMEESH_CANON_REF for another branch"),
                      member=member)
             return None
         prefix = os.path.relpath(os.path.realpath(directory), repo)
@@ -1594,26 +1594,26 @@ class _Loader:
         head = git_commit(source.repo, "HEAD")
         if head and head != source.commit:
             self.add("canon-local-divergence", WARNING,
-                     "le clone local (HEAD %s) diffère de %s (%s) : seul %s est lu"
+                     "the local clone (HEAD %s) differs from %s (%s): only %s is read"
                      % (head[:12], source.rev, source.commit[:12], source.commit[:12]),
                      member=source.member, path=source.prefix)
         args = ["status", "--porcelain", "--untracked-files=normal", "--", source.prefix or "."]
         proc = _git(source.repo, *args)
         if proc.returncode == 0 and proc.stdout.strip():
             self.add("canon-worktree-dirty", WARNING,
-                     "modifications locales non commitées sous %s : ignorées (seul %s est lu)"
+                     "uncommitted local changes under %s: ignored (only %s is read)"
                      % (source.prefix or ".", source.commit[:12]),
                      member=source.member, path=source.prefix)
 
     def _fs_source(self, member: str, directory: str) -> Source | None:
         if not self.allow_untrusted:
             self.add("canon-untrusted-refused", ERROR,
-                     "%s n'est pas un dépôt git : canon non approuvé, refusé "
-                     "(AMEESH_CANON_UNTRUSTED=1 pour les tests et prototypes)" % directory,
+                     "%s is not a git repository: canon not approved, refused "
+                     "(AMEESH_CANON_UNTRUSTED=1 for tests and prototypes)" % directory,
                      member=member)
             return None
         self.add("canon-untrusted", WARNING,
-                 "%s lu depuis les fichiers de travail : canon NON APPROUVÉ "
+                 "%s read from working files: canon NOT APPROVED "
                  "(AMEESH_CANON_UNTRUSTED=1)" % directory, member=member)
         return Source(member=member, directory=directory, mode="untrusted")
 
@@ -1646,8 +1646,8 @@ class _Loader:
         actual = _git_out(source.repo, "remote", "get-url", "--", remote) or ""
         if _norm_url(actual) != _norm_url(declared):
             self.add("member-repository-mismatch", WARNING,
-                     "le dépôt %s de %s (%s) n'est pas celui du manifeste (%s)"
-                     % (remote, source.member, actual or "absent", declared),
+                     "remote %s of %s (%s) is not the one in the manifest (%s)"
+                     % (remote, source.member, actual or "missing", declared),
                      member=source.member)
 
     def _read_manifest(self, source: Source) -> bytes | None:
@@ -1664,12 +1664,12 @@ class _Loader:
         try:
             manifest = load_yaml(raw.decode("utf-8"), use_pyyaml=self.use_pyyaml)
         except (UnicodeDecodeError, YamlError) as exc:
-            self.add("federation-invalid", ERROR, "federation.yaml illisible : %s" % exc,
+            self.add("federation-invalid", ERROR, "unreadable federation.yaml: %s" % exc,
                      member=member, path="federation.yaml")
             return None
         if not isinstance(manifest, dict) or not isinstance(manifest.get("members", []), list):
             self.add("federation-invalid", ERROR,
-                     "federation.yaml : mapping avec une liste `members` attendu",
+                     "federation.yaml: mapping with a `members` list expected",
                      member=member, path="federation.yaml")
             return None
         return manifest
@@ -1686,7 +1686,7 @@ class _Loader:
             error = git_fetch(repo, DEFAULT_REMOTE)
             if error:
                 self.add("canon-fetch-failed", WARNING,
-                         "git fetch a échoué (%s) : lecture de la dernière révision connue"
+                         "git fetch failed (%s): reading the last known revision"
                          % error.splitlines()[0][:200], member="canon")
         for rev in (default, "%s/HEAD" % DEFAULT_REMOTE):
             if git_commit(repo, rev):
@@ -1695,7 +1695,7 @@ class _Loader:
 
     def load(self) -> Canon:
         if not os.path.isdir(self.root):
-            self.add("canon-missing", ERROR, "racine du canon introuvable : %s" % self.root)
+            self.add("canon-missing", ERROR, "canon root not found: %s" % self.root)
             return self.canon
         explicit = bool(self.ref)
         rev = self.ref or self._bootstrap_rev()
@@ -1758,20 +1758,20 @@ class _Loader:
         anchor = (root.repo, root.rev, root.commit) if root.mode == "git" else None
         for entry in manifest["members"]:
             if not isinstance(entry, dict) or not entry.get("id"):
-                self.add("federation-invalid", ERROR, "membre sans `id` dans federation.yaml",
+                self.add("federation-invalid", ERROR, "member without `id` in federation.yaml",
                          member=root.member, path="federation.yaml")
                 continue
             member = str(entry["id"])
             if member in seen:
                 if member != root.member:
-                    self.add("federation-invalid", ERROR, "membre %s en double" % member,
+                    self.add("federation-invalid", ERROR, "duplicate member %s" % member,
                              member=root.member, path="federation.yaml")
                 continue
             seen.add(member)
             hint = entry.get("workspace_path")
             if not hint:
                 self.add("member-absent", WARNING,
-                         "membre %s sans workspace_path : non lu" % member, member=member)
+                         "member %s without workspace_path: not read" % member, member=member)
                 continue
             bundle = str(entry.get("bundle") or ".")
             checkout = os.path.join(workspace, str(hint))
@@ -1779,12 +1779,12 @@ class _Loader:
             if (not _relative_ok(str(hint)) or not _relative_ok(bundle)
                     or not _within(workspace, checkout) or not _within(checkout, directory)):
                 self.add("member-path-escape", ERROR,
-                         "membre %s : chemin hors du dossier de travail (%s/%s)"
+                         "member %s: path outside the workspace directory (%s/%s)"
                          % (member, hint, bundle), member=member)
                 continue
             if not os.path.isdir(directory):
                 self.add("member-absent", WARNING,
-                         "membre %s absent localement (%s) : non lu" % (member, directory),
+                         "member %s missing locally (%s): not read" % (member, directory),
                          member=member)
                 continue
             if os.path.realpath(directory) == os.path.realpath(self.root):
@@ -1815,8 +1815,8 @@ class _Loader:
             label = "extensions.%s" % SCOPE_KEY
             if not isinstance(ext, dict):
                 self.add("ameesh-scope-invalid", ERROR,
-                         "`%s` : mapping attendu (`%s: {scope: <dossier>}`) — fiches ameesh "
-                         "de %s non lues" % (label, label, root.member),
+                         "`%s`: mapping expected (`%s: {scope: <dir>}`) — ameesh cards "
+                         "of %s not read" % (label, label, root.member),
                          member=root.member, path="federation.yaml")
                 self.canon.scope_unread.add(root.member)
                 ext = {}
@@ -1826,7 +1826,7 @@ class _Loader:
             members = ext.get("members")
             if members is not None and not isinstance(members, dict):
                 self.add("ameesh-scope-invalid", ERROR,
-                         "`%s.members` : mapping attendu (`<id>: {scope: …}`)" % label,
+                         "`%s.members`: mapping expected (`<id>: {scope: …}`)" % label,
                          member=root.member, path="federation.yaml")
                 members = {}
             known = {str(e.get("id")) for e in manifest["members"] if isinstance(e, dict)}
@@ -1834,20 +1834,20 @@ class _Loader:
                 member = str(member)
                 if member == root.member:
                     self.add("ameesh-scope-ignored-key", WARNING,
-                             "`%s.members.%s` ignoré : le périmètre du bundle racine se "
-                             "déclare dans `%s.scope`" % (label, member, label),
+                             "`%s.members.%s` ignored: the root bundle's scope is "
+                             "declared in `%s.scope`" % (label, member, label),
                              member=root.member, path="federation.yaml")
                     continue
                 if member not in known:
                     self.add("ameesh-key-unknown", WARNING,
-                             "`%s.members.%s` : membre absent de `members` (ignoré)"
+                             "`%s.members.%s`: member missing from `members` (ignored)"
                              % (label, member), member=root.member, path="federation.yaml")
                     continue
                 declared.append((member, raw, "%s.members.%s" % (label, member)))
         if SCOPE_KEY in manifest:
             self.add("ameesh-scope-legacy", WARNING,
-                     "`%s:` au premier niveau de federation.yaml n'est pas conforme au schéma "
-                     "OKF Federation : écrire `extensions: {%s: {scope: …}}`"
+                     "top-level `%s:` in federation.yaml does not conform to the "
+                     "OKF Federation schema: write `extensions: {%s: {scope: …}}`"
                      % (SCOPE_KEY, SCOPE_KEY), member=root.member, path="federation.yaml")
             if ext is None:
                 declared.append((root.member, manifest.get(SCOPE_KEY), SCOPE_KEY))
@@ -1857,12 +1857,12 @@ class _Loader:
             member = str(entry["id"])
             if member == root.member:
                 self.add("ameesh-scope-ignored-key", WARNING,
-                         "`members[%s].%s` ignoré : le périmètre du bundle racine se déclare "
-                         "dans `extensions.%s.scope`" % (member, SCOPE_KEY, SCOPE_KEY),
+                         "`members[%s].%s` ignored: the root bundle's scope is declared "
+                         "in `extensions.%s.scope`" % (member, SCOPE_KEY, SCOPE_KEY),
                          member=root.member, path="federation.yaml")
                 continue
             self.add("ameesh-scope-legacy", WARNING,
-                     "`members[%s].%s` n'est pas conforme au schéma OKF Federation : écrire "
+                     "`members[%s].%s` does not conform to the OKF Federation schema: write "
                      "`extensions.%s.members.%s.scope`" % (member, SCOPE_KEY, SCOPE_KEY, member),
                      member=root.member, path="federation.yaml")
             if ext is None or member not in ((ext or {}).get("members") or {}):
@@ -1874,17 +1874,17 @@ class _Loader:
                 continue
             if not isinstance(raw, dict):
                 self.add("ameesh-scope-invalid", ERROR,
-                         "`%s` : mapping attendu (`%s: {scope: <dossier>}`) — fiches ameesh "
-                         "de %s non lues" % (label, SCOPE_KEY, member), **where)
+                         "`%s`: mapping expected (`%s: {scope: <dir>}`) — ameesh cards "
+                         "of %s not read" % (label, SCOPE_KEY, member), **where)
                 self.canon.scope_unread.add(member)
                 continue
             for unknown in sorted(set(map(str, raw)) - set(SCOPE_FIELDS)):
                 self.add("ameesh-key-unknown", WARNING,
-                         "`%s.%s` : clé inconnue (ignorée)" % (label, unknown), **where)
+                         "`%s.%s`: unknown key (ignored)" % (label, unknown), **where)
             scope, problem = parse_scope(raw.get("scope"))
             if problem:
                 self.add("ameesh-scope-invalid", ERROR,
-                         "`%s.scope` : %s — fiches ameesh de %s non lues"
+                         "`%s.scope`: %s — ameesh cards of %s not read"
                          % (label, problem, member), **where)
                 self.canon.scope_unread.add(member)
                 continue
@@ -1902,7 +1902,7 @@ class _Loader:
         if not missing:
             return False
         self.add("ameesh-scope-missing", ERROR,
-                 "périmètre ameesh %s absent de %s : fiches ameesh de %s non lues"
+                 "ameesh scope %s missing from %s: ameesh cards of %s not read"
                  % (", ".join(missing), source.describe(), source.member),
                  member=source.member, path=source.prefix)
         self.canon.scope_unread.add(source.member)
@@ -1921,8 +1921,8 @@ class _Loader:
             listed = _git_list(source.repo, source.commit, source.prefix)
             if not listed:
                 self.add("canon-bundle-missing", ERROR,
-                         "%s absent de %s (%s) : rien à lire" % (
-                             source.prefix or "le bundle", source.rev, source.commit[:12]),
+                         "%s missing from %s (%s): nothing to read" % (
+                             source.prefix or "the bundle", source.rev, source.commit[:12]),
                          member=source.member, path=source.prefix)
             rels = [(path, path[len(source.prefix) + 1:] if source.prefix else path, sha)
                     for path, sha in listed]
@@ -1966,7 +1966,7 @@ class _Loader:
             try:
                 files = self._files(source)
             except (GitError, OSError) as exc:
-                self.add("canon-git-error", ERROR, "lecture de %s : %s" % (source.member, exc),
+                self.add("canon-git-error", ERROR, "reading %s: %s" % (source.member, exc),
                          member=source.member)
                 continue
             scope = self.canon.scopes.get(source.member)
@@ -1983,8 +1983,8 @@ class _Loader:
             if ignored:
                 self.canon.out_of_scope[source.member] = len(ignored)
                 self.add("ameesh-scope-ignored", INFO,
-                         "%d fiche(s) typée(s) Agent/Host/Placement/Member/WorkPackage hors du "
-                         "périmètre ameesh (%s) ignorée(s), p. ex. %s"
+                         "%d typed Agent/Host/Placement/Member/WorkPackage card(s) outside the "
+                         "ameesh scope (%s) ignored, e.g. %s"
                          % (len(ignored), ", ".join(s or "." for s in scope),
                             ", ".join(ignored[:3])),
                          member=source.member, path=source.prefix)
@@ -1992,7 +1992,7 @@ class _Loader:
     def _fiche(self, source: Source, path: str, content: bytes | None, version: str) -> None:
         where = {"member": source.member, "path": path}
         if content is None:
-            self.add("canon-git-error", ERROR, "objet git illisible", **where)
+            self.add("canon-git-error", ERROR, "unreadable git object", **where)
             return
         head = content[:FRONTMATTER_MAX]
         try:
@@ -2001,7 +2001,7 @@ class _Loader:
             text = head.decode("utf-8", "replace")
             typed = bool(_TYPED_RE.search(text))
             self.add("frontmatter-invalid", ERROR if typed else WARNING,
-                     "fichier non UTF-8", **where)
+                     "file is not UTF-8", **where)
             return
         try:
             block = split_frontmatter(text)
@@ -2014,8 +2014,8 @@ class _Loader:
             subject = ({"package": _package_stem(path)}
                        if typed and typed.group(1) == "WorkPackage" else {})
             self.add("frontmatter-invalid", ERROR if typed else WARNING,
-                     "frontmatter illisible : %s%s" % (
-                         exc, "" if typed else " (type inconnu : fiche ignorée)"),
+                     "unreadable frontmatter: %s%s" % (
+                         exc, "" if typed else " (unknown type: card ignored)"),
                      **where, **subject)
             return
         if not isinstance(data, dict):
@@ -2032,7 +2032,7 @@ class _Loader:
                       untrusted=source.mode != "git")
         if not title and kind != "Placement":
             subject = {"package": _package_stem(path)} if kind == "WorkPackage" else {}
-            self.add("fiche-title-missing", ERROR, "fiche %s sans `title`" % kind, **where,
+            self.add("fiche-title-missing", ERROR, "%s card without `title`" % kind, **where,
                      **subject)
             return
         build = getattr(self, "_build_" + kind.lower())
@@ -2048,7 +2048,7 @@ class _Loader:
         if isinstance(value, list) and all(isinstance(v, (str, int, float))
                                            and not isinstance(v, bool) for v in value):
             return [str(v).strip() for v in value]
-        self.add(code, ERROR, "`%s` : liste de textes attendue" % key, **where, **subject)
+        self.add(code, ERROR, "`%s`: list of strings expected" % key, **where, **subject)
         return None
 
     def _build_member(self, fiche: Fiche, where: dict) -> None:
@@ -2069,7 +2069,7 @@ class _Loader:
                     raise ValueError
             except (TypeError, ValueError):
                 self.add("agent-budget-invalid", WARNING,
-                         "budget_usd_per_day illisible : %r (ignoré)" % (budget,), **where,
+                         "unreadable budget_usd_per_day: %r (ignored)" % (budget,), **where,
                          **subject)
                 budget = None
         priority = fiche.data.get("priority")
@@ -2080,7 +2080,7 @@ class _Loader:
                     raise ValueError
             except (TypeError, ValueError):
                 self.add("agent-priority-invalid", WARNING,
-                         "priority illisible : %r (0 par défaut)" % (priority,), **where,
+                         "unreadable priority: %r (default 0)" % (priority,), **where,
                          **subject)
                 priority = None
         memory = fiche.data.get("memory")
@@ -2088,7 +2088,7 @@ class _Loader:
         if memory is not None:
             if not isinstance(memory, dict):
                 self.add("agent-memory-invalid", WARNING,
-                         "`memory` : mapping attendu (ignoré)", **where, **subject)
+                         "`memory`: mapping expected (ignored)", **where, **subject)
             else:
                 memory_repository = _text(memory.get("repository"))
         self.canon.agents.append(Agent(
@@ -2114,7 +2114,7 @@ class _Loader:
         raw = fiche.data.get("policy")
         policy = HostPolicy()
         if raw is not None and not isinstance(raw, dict):
-            self.add("host-policy-invalid", ERROR, "`policy` : mapping attendu", **where,
+            self.add("host-policy-invalid", ERROR, "`policy`: mapping expected", **where,
                      **subject)
             # politique illisible : rien n'est admis (fail closed)
             policy = HostPolicy(harnesses=[], providers=[], credential_modes=[])
@@ -2128,7 +2128,7 @@ class _Loader:
                 if not isinstance(value, list) or not all(isinstance(v, (str, int, float))
                                                           for v in value):
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.%s` : liste de textes attendue" % key, **where, **subject)
+                             "`policy.%s`: list of strings expected" % key, **where, **subject)
                     value = []
                 setattr(policy, key, [str(v).strip() for v in value])
             if raw.get("max_agents") is not None:
@@ -2138,7 +2138,7 @@ class _Loader:
                         raise ValueError
                 except (TypeError, ValueError):
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.max_agents` : entier positif attendu", **where, **subject)
+                             "`policy.max_agents`: positive integer expected", **where, **subject)
                     policy.max_agents = 0
             # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
             # validée ici ; une clé illisible est une erreur (fail closed sur le
@@ -2152,10 +2152,10 @@ class _Loader:
                 parsed, problems, unknown = menage_mod.parse_policy(raw["housekeeping"])
                 for problem in problems:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.housekeeping` : %s" % problem, **where, **subject)
+                             "`policy.housekeeping`: %s" % problem, **where, **subject)
                 for key in unknown:
                     self.add("host-housekeeping-unknown", WARNING,
-                             "`policy.housekeeping.%s` : clé inconnue (ignorée)" % key,
+                             "`policy.housekeeping.%s`: unknown key (ignored)" % key,
                              **where, **subject)
                 policy.housekeeping = parsed or None
             # L159a: the offer of a lending host; unreadable, it is dropped
@@ -2180,25 +2180,25 @@ class _Loader:
                 problem = work_template_problem(raw.get("work_root"))
                 if problem:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.work_root` : %s" % problem, **where, **subject)
+                             "`policy.work_root`: %s" % problem, **where, **subject)
                 else:
                     policy.work_root = str(raw["work_root"]).strip()
-            for key, label in (("work_roots", "projet"), ("work_dirs", "agent")):
+            for key, label in (("work_roots", "project"), ("work_dirs", "agent")):
                 mapping = raw.get(key)
                 if mapping is None:
                     continue
                 if not isinstance(mapping, dict) or not mapping:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.%s` : mapping {%s: chemin} attendu" % (key, label),
+                             "`policy.%s`: mapping {%s: path} expected" % (key, label),
                              **where, **subject)
                     continue
                 kept: dict = {}
                 for k, v in mapping.items():
-                    problem = ("clé vide" if not isinstance(k, str) or not k.strip()
+                    problem = ("empty key" if not isinstance(k, str) or not k.strip()
                                else work_template_problem(v))
                     if problem:
                         self.add("host-policy-invalid", ERROR,
-                                 "`policy.%s.%s` : %s" % (key, k, problem),
+                                 "`policy.%s.%s`: %s" % (key, k, problem),
                                  **where, **subject)
                         continue
                     kept[k.strip()] = v.strip()
@@ -2220,7 +2220,7 @@ class _Loader:
 
         if not isinstance(raw, dict):
             self.add("host-policy-invalid", ERROR,
-                     "`policy.resources` : mapping attendu", **where, **subject)
+                     "`policy.resources`: mapping expected", **where, **subject)
             return None
         parsed: dict = {}
         for key in resources_mod.THRESHOLD_KEYS:
@@ -2232,7 +2232,7 @@ class _Loader:
                 number = resources_mod.finite_float(value)
                 if number is None or number < 0:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.max_load` : nombre positif fini attendu",
+                             "`policy.resources.max_load`: finite positive number expected",
                              **where, **subject)
                     continue
                 parsed[key] = number
@@ -2240,7 +2240,7 @@ class _Loader:
                 part = resources_mod.parse_fraction(value)
                 if part is None:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.%s` : part attendue (0 < x <= 1, ou « 80%% »)"
+                             "`policy.resources.%s`: fraction expected (0 < x <= 1, or \"80%%\")"
                              % key, **where, **subject)
                     continue
                 parsed[key] = part
@@ -2249,7 +2249,7 @@ class _Loader:
                 percent = resources_mod.parse_percent(value)
                 if percent is None:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.%s` : pourcentage de 0 à 100 attendu"
+                             "`policy.resources.%s`: percentage from 0 to 100 expected"
                              % key, **where, **subject)
                     continue
                 parsed[key] = percent
@@ -2257,7 +2257,7 @@ class _Loader:
                 octets = resources_mod.parse_bytes(value)
                 if octets is None:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.%s` : taille en octets attendue (ex. 1GiB)"
+                             "`policy.resources.%s`: size in bytes expected (e.g. 1GiB)"
                              % key, **where, **subject)
                     continue
                 parsed[key] = octets
@@ -2270,7 +2270,7 @@ class _Loader:
                 octets = resources_mod.parse_bytes(value)
                 if not octets:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.agent_memory_max` : taille attendue (ex. 6G)",
+                             "`policy.resources.agent_memory_max`: size expected (e.g. 6G)",
                              **where, **subject)
                     continue
                 parsed[key] = octets
@@ -2281,14 +2281,14 @@ class _Loader:
                         for agent, size in value.items()}
             if not isinstance(value, dict) or not all(caps.values()):
                 self.add("host-policy-invalid", ERROR,
-                         "`policy.resources.agent_memory_max_by_agent` : mapping "
-                         "{agent: taille} attendu (ex. mesh-design: 8G)", **where, **subject)
+                         "`policy.resources.agent_memory_max_by_agent`: mapping "
+                         "{agent: size} expected (e.g. mesh-design: 8G)", **where, **subject)
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
                               - set(resources_mod.AGENT_MEMORY_KEYS)):
             self.add("host-resources-unknown", WARNING,
-                     "`policy.resources.%s` : clé inconnue (ignorée)" % unknown,
+                     "`policy.resources.%s`: unknown key (ignored)" % unknown,
                      **where, **subject)
         return parsed or None
 
@@ -2341,7 +2341,7 @@ class _Loader:
             return _dt.date.fromisoformat(text).isoformat()
         except ValueError:
             self.add("package-date-invalid", WARNING,
-                     "`%s` : date illisible %r (attendu AAAA-MM-JJ) — ignorée" % (key, value),
+                     "`%s`: unreadable date %r (expected YYYY-MM-DD) — ignored" % (key, value),
                      **where, **subject)
             return None
 
@@ -2408,10 +2408,10 @@ def note_identity(canon: Canon) -> None:
     code = "canon-id-invalid" if raw not in (None, "") else "canon-id-missing"
     canon.load_findings.append(Finding(
         code, WARNING,
-        "%s : identifié par le nom de son dossier, « %s » (déclarer `id` dans "
+        "%s: identified by its directory name, \"%s\" (declare `id` in "
         "federation.yaml%s)" % (
             canon.root, canon.id,
-            " : %r hors de la grammaire [A-Za-z0-9._-]" % (raw,) if raw not in (None, "")
+            ": %r outside the grammar [A-Za-z0-9._-]" % (raw,) if raw not in (None, "")
             else ""),
         path="federation.yaml", untrusted=canon.untrusted))
 
@@ -2449,13 +2449,13 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
     try:
         return loader.load()
     except GitError as exc:
-        loader.add("canon-git-error", ERROR, "lecture du canon : %s" % exc)
+        loader.add("canon-git-error", ERROR, "reading the canon: %s" % exc)
         loader.canon.readable = False
         return loader.canon
     except OSError as exc:
         # Lecture refusée ou impossible (permissions, fichier disparu) : même
         # traitement fail-closed qu'une erreur git.
-        loader.add("canon-io-error", ERROR, "lecture du canon : %s" % (exc.strerror or exc))
+        loader.add("canon-io-error", ERROR, "reading the canon: %s" % (exc.strerror or exc))
         loader.canon.readable = False
         return loader.canon
 
@@ -2488,8 +2488,8 @@ def from_config(cfg, *, root: str | None = None, fetch: bool = False,
     else:
         path = root or cfg.canon
         if not path:
-            raise CanonError("aucun canon configuré : posez AMEESH_CANON (ou `canon` dans la "
-                             "configuration), ou passez --canon DOSSIER")
+            raise CanonError("no canon configured: set AMEESH_CANON (or `canon` in the "
+                             "configuration), or pass --canon DIR")
         canon = load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch)
     if len(entries) > 1:
         note_identity(canon)
@@ -2503,9 +2503,9 @@ def check_identities(canons: list[Canon]) -> None:
         other = seen.get(canon.id)
         if other is not None:
             raise CanonError(
-                "configuration : deux canons ont l'identifiant « %s » (%s et %s) — "
-                "l'`id` de federation.yaml (sinon le nom du dossier) doit être unique "
-                "parmi les canons de l'hôte" % (canon.id, other.root, canon.root))
+                "configuration: two canons have the identifier \"%s\" (%s and %s) — "
+                "the federation.yaml `id` (otherwise the directory name) must be unique "
+                "among the host's canons" % (canon.id, other.root, canon.root))
         seen[canon.id] = canon
 
 
@@ -2554,8 +2554,8 @@ def from_config_all(cfg, *, fetch: bool = False) -> list[Canon]:
     d'abord. Identifiants en double : CanonError (aucun canon rendu)."""
     entries = configured(cfg)
     if not entries:
-        raise CanonError("aucun canon configuré : posez AMEESH_CANON ou AMEESH_CANONS (ou "
-                         "`canon` / `canons` dans la configuration)")
+        raise CanonError("no canon configured: set AMEESH_CANON or AMEESH_CANONS (or "
+                         "`canon` / `canons` in the configuration)")
     canons = [from_config(cfg, fetch=fetch)]
     canons += [from_config(cfg, entry=entry, fetch=fetch) for entry in entries[1:]]
     check_identities(canons)
@@ -2591,7 +2591,7 @@ def validate(canon: Canon) -> list[Finding]:
             if len(group) > 1:
                 for item in group:
                     add("%s-duplicate" % kind, ERROR,
-                        "%s %s déclaré %d fois (%s)" % (
+                        "%s %s declared %d times (%s)" % (
                             kind, title, len(group),
                             ", ".join("%s:%s" % (g.fiche.member, g.fiche.path) for g in group)),
                         item.fiche, **({subject: title} if subject else {}))
@@ -2600,7 +2600,7 @@ def validate(canon: Canon) -> list[Finding]:
     for member in canon.members:
         if member.title in agent_names:
             add("member-agent-clash", ERROR,
-                "le membre humain %s porte le nom d'un agent : responsable ambigu"
+                "human member %s has the name of an agent: ambiguous responsible"
                 % member.title, member.fiche, agent=member.title)
 
     # -- agents ------------------------------------------------------------------
@@ -2613,52 +2613,52 @@ def validate(canon: Canon) -> list[Finding]:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
             add("agent-title-invalid", ERROR,
-                "nom d'agent %r hors de la grammaire du registre" % agent.title, f)
+                "agent name %r outside the registry grammar" % agent.title, f)
             continue
         if not agent.responsible:
             add("agent-responsible-missing", ERROR,
-                "agent %s sans `responsible` (R14 : tout agent a un humain responsable)"
+                "agent %s without `responsible` (R14: every agent has a responsible human)"
                 % agent.title, f, agent=agent.title)
         elif canon.resolve_human(agent.responsible) is None:
             add("agent-responsible-unresolved", ERROR,
-                "responsable %r de %s ne résout pas vers un Member humain (attendu "
-                "human:<id> d'une fiche Member unique)" % (agent.responsible, agent.title),
+                "responsible %r of %s does not resolve to a human Member (expected "
+                "human:<id> of a unique Member card)" % (agent.responsible, agent.title),
                 f, agent=agent.title)
         caps = agent.capabilities or []
         forbidden = [c for c in caps if c.strip().lower() in FORBIDDEN_CAPABILITIES]
         if forbidden:
             add("agent-approve-capability", ERROR,
-                "agent %s avec la capacité `approve` : réservée aux humains (R8)"
+                "agent %s with the `approve` capability: reserved for humans (R8)"
                 % agent.title, f, agent=agent.title)
         unknown = [c for c in caps if c not in KNOWN_CAPABILITIES and c not in forbidden]
         if unknown:
             add("agent-capability-unknown", WARNING,
-                "capacités inconnues pour %s : %s" % (agent.title, ", ".join(unknown)),
+                "unknown capabilities for %s: %s" % (agent.title, ", ".join(unknown)),
                 f, agent=agent.title)
         if not agent.harness:
             add("agent-harness-missing", WARNING,
-                "agent %s sans `harness` : aucun harnais ne sera lancé" % agent.title,
+                "agent %s without `harness`: no harness will be started" % agent.title,
                 f, agent=agent.title)
         elif agent.harness not in known_harnesses:
             add("agent-harness-unknown", ERROR,
-                "harnais %r de %s sans descripteur connu (%s)"
-                % (agent.harness, agent.title, ", ".join(sorted(known_harnesses)) or "aucun"),
+                "harness %r of %s has no known descriptor (%s)"
+                % (agent.harness, agent.title, ", ".join(sorted(known_harnesses)) or "none"),
                 f, agent=agent.title)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:
         if not host.responsible:
             add("host-responsible-missing", ERROR,
-                "hôte %s sans `responsible`" % host.title, host.fiche, host=host.title)
+                "host %s without `responsible`" % host.title, host.fiche, host=host.title)
         elif canon.resolve_human(host.responsible) is None:
             add("host-responsible-unresolved", ERROR,
-                "responsable %r de l'hôte %s ne résout pas vers un Member humain"
+                "responsible %r of host %s does not resolve to a human Member"
                 % (host.responsible, host.title), host.fiche, host=host.title)
         for name in host.policy.harnesses or []:
             if name not in known_harnesses:
                 add("host-harness-unknown", ERROR,
-                    "politique de l'hôte %s : harnais %r sans descripteur connu (%s)"
-                    % (host.title, name, ", ".join(sorted(known_harnesses)) or "aucun"),
+                    "policy of host %s: harness %r has no known descriptor (%s)"
+                    % (host.title, name, ", ".join(sorted(known_harnesses)) or "none"),
                     host.fiche, host=host.title)
 
     # -- admissions (ex-placements, L31/0029) --------------------------------------------
@@ -2670,29 +2670,29 @@ def validate(canon: Canon) -> list[Finding]:
     for placement in canon.placements:
         f = placement.fiche
         if not placement.agent:
-            add("placement-incomplete", ERROR, "admission sans `agent`", f)
+            add("placement-incomplete", ERROR, "admission without `agent`", f)
             continue
         if not placement.host_names() and not placement.tags():
             add("placement-incomplete", ERROR,
-                "admission de %s sans `hosts` ni `host_tags`" % placement.agent, f,
+                "admission of %s without `hosts` or `host_tags`" % placement.agent, f,
                 agent=placement.agent)
             continue
         by_agent[placement.agent].append(placement)
         if placement.agent not in agent_names:
             add("placement-agent-unknown", ERROR,
-                "admission vers un agent inconnu : %s" % placement.agent, f,
+                "admission for an unknown agent: %s" % placement.agent, f,
                 agent=placement.agent)
         cibles = set(placement.host_names())
         for tag in placement.tags():
             if tag not in known_tags:
                 add("admission-tag-unknown", WARNING,
-                    "admission de %s : étiquette `%s` ne correspond à aucun hôte"
+                    "admission of %s: tag `%s` matches no host"
                     % (placement.agent, tag), f, agent=placement.agent)
             cibles |= {h.title for h in canon.hosts if tag in (h.tags or [])}
         for name in sorted(cibles):
             if name not in host_names:
                 add("placement-host-unknown", ERROR,
-                    "admission de %s vers un hôte inconnu : %s" % (placement.agent, name),
+                    "admission of %s to an unknown host: %s" % (placement.agent, name),
                     f, agent=placement.agent)
                 continue
             by_host[name][id(placement)] = placement
@@ -2701,26 +2701,26 @@ def validate(canon: Canon) -> list[Finding]:
             if agent is not None and host is not None:
                 for reason in placement_violations(agent, host, placement):
                     add("placement-policy-violation", ERROR,
-                        "%s sur %s : %s" % (agent.title, host.title, reason), f,
+                        "%s on %s: %s" % (agent.title, host.title, reason), f,
                         agent=agent.title)
                 _check_work_dir(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
             for placement in group:
                 add("placement-duplicate", ERROR,
-                    "agent %s admis %d fois (%s)" % (
+                    "agent %s admitted %d times (%s)" % (
                         name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
     for host in canon.hosts:
         for name in sorted(host.policy.work_dirs or {}):
             if name not in agent_names:
                 add("host-work-dir-agent-unknown", WARNING,
-                    "politique de l'hôte %s : `work_dirs.%s` ne nomme aucun agent du canon"
+                    "policy of host %s: `work_dirs.%s` names no agent of the canon"
                     % (host.title, name), host.fiche, host=host.title)
         limit = host.policy.max_agents
         if limit is not None and len(by_host.get(host.title, {})) > limit:
             add("host-max-agents", ERROR,
-                "hôte %s : %d admissions pour max_agents = %d"
+                "host %s: %d admissions for max_agents = %d"
                 % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
@@ -2745,11 +2745,11 @@ def validate(canon: Canon) -> list[Finding]:
     # -- avertissements -----------------------------------------------------------------
     for agent in canon.agents:
         if agent.title not in by_agent:
-            add("agent-unplaced", WARNING, "agent %s sans placement" % agent.title,
+            add("agent-unplaced", WARNING, "agent %s without placement" % agent.title,
                 agent.fiche, agent=agent.title)
     for host in canon.hosts:
         if host.title not in by_host:
-            add("host-unplaced", WARNING, "hôte %s sans placement" % host.title,
+            add("host-unplaced", WARNING, "host %s without placement" % host.title,
                 host.fiche, host=host.title)
     return findings
 
@@ -2768,19 +2768,19 @@ def _check_work_dir(add, agent: Agent, host: Host, placement: Placement) -> None
     where = placement.fiche
     if found and placement.cwd:
         add("admission-cwd-ignored", WARNING,
-            "`cwd` %r de l'admission de %s ignoré sur %s : la politique de l'hôte donne "
+            "`cwd` %r of the admission of %s ignored on %s: the host policy gives "
             "%s" % (placement.cwd, agent.title, host.title, found), where,
             agent=agent.title)
     elif placement.cwd:
         add("admission-cwd-inherited", WARNING,
-            "%s sur %s : cwd hérité de la fiche Placement (%s), repli transitoire — à "
-            "migrer vers `policy.work_dirs` / `work_roots` de l'hôte (repli retiré au "
-            "plus tard en v1.5.0)" % (agent.title, host.title, placement.cwd), where,
+            "%s on %s: cwd inherited from the Placement card (%s), transitional fallback — "
+            "migrate to the host's `policy.work_dirs` / `work_roots` (fallback removed "
+            "in v1.5.0 at the latest)" % (agent.title, host.title, placement.cwd), where,
             agent=agent.title)
     elif not found:
         add("host-work-dir-missing", WARNING,
-            "%s sur %s : aucun dossier de travail — déclarer `policy.work_dirs`, "
-            "`work_roots` ou `work_root` dans la fiche de l'hôte" % (agent.title, host.title),
+            "%s on %s: no working directory — declare `policy.work_dirs`, "
+            "`work_roots` or `work_root` in the host card" % (agent.title, host.title),
             host.fiche, agent=agent.title, host=host.title)
 
 
@@ -2795,7 +2795,7 @@ def _validate_packages(canon: Canon, add) -> None:
         if len(group) > 1:
             for package in group:
                 add("package-duplicate", ERROR,
-                    "WorkPackage %s déclaré %d fois (%s)" % (
+                    "WorkPackage %s declared %d times (%s)" % (
                         ident, len(group),
                         ", ".join("%s:%s" % (g.fiche.member, g.fiche.path) for g in group)),
                     package.fiche, package=ident)
@@ -2803,38 +2803,38 @@ def _validate_packages(canon: Canon, add) -> None:
         f, ident = package.fiche, package.id
         if not PACKAGE_ID_RE.match(ident):
             add("package-id-invalid", ERROR,
-                "identifiant de WorkPackage %r invalide (lettres, chiffres, . _ -, 64 "
-                "caractères au plus)" % ident, f, package=ident)
+                "invalid WorkPackage identifier %r (letters, digits, . _ -, 64 "
+                "characters at most)" % ident, f, package=ident)
         if package.kind not in PACKAGE_KINDS:
             add("package-kind-invalid", ERROR,
-                "WorkPackage %s : `kind` %r (attendu : %s)"
+                "WorkPackage %s: `kind` %r (expected: %s)"
                 % (ident, package.kind, " | ".join(PACKAGE_KINDS)), f, package=ident)
         if not package.responsible:
             add("package-responsible-missing", ERROR,
-                "WorkPackage %s sans `responsible` (un humain répond de chaque élément "
-                "du plan)" % ident, f, package=ident)
+                "WorkPackage %s without `responsible` (a human is accountable for every item "
+                "of the plan)" % ident, f, package=ident)
         elif canon.resolve_human(package.responsible) is None:
             add("package-responsible-unresolved", ERROR,
-                "responsable %r de %s ne résout pas vers un Member humain"
+                "responsible %r of %s does not resolve to a human Member"
                 % (package.responsible, ident), f, package=ident)
         if package.parent:
             parents = by_id.get(package.parent) or []
             if not parents:
                 add("package-parent-unknown", ERROR,
-                    "WorkPackage %s : parent inconnu %r" % (ident, package.parent), f,
+                    "WorkPackage %s: unknown parent %r" % (ident, package.parent), f,
                     package=ident)
             elif package.kind in PACKAGE_KINDS and len(parents) == 1:
                 allowed = PACKAGE_PARENTS[package.kind]
                 if parents[0].kind not in allowed:
                     add("package-kind-incoherent", ERROR,
-                        "WorkPackage %s (%s) sous %s (%s) : %s" % (
+                        "WorkPackage %s (%s) under %s (%s): %s" % (
                             ident, package.kind, package.parent, parents[0].kind,
-                            "un %s se place sous %s" % (package.kind, " ou ".join(allowed))
-                            if allowed else "un jalon n'a pas de parent"),
+                            "a %s goes under %s" % (package.kind, " or ".join(allowed))
+                            if allowed else "a milestone has no parent"),
                         f, package=ident)
         elif package.kind == "lot":
             add("package-lot-orphan", WARNING,
-                "lot %s sans parent (un lot se place sous un epic ou un jalon)" % ident,
+                "lot %s without parent (a lot goes under an epic or a milestone)" % ident,
                 f, package=ident)
     # cycles : suivre les parents depuis chaque fiche
     reported: set[str] = set()
@@ -2848,7 +2848,7 @@ def _validate_packages(canon: Canon, add) -> None:
         if current and current == package.id and package.id not in reported:
             reported.update(seen)
             add("package-cycle", ERROR,
-                "cycle dans le plan : %s" % " → ".join(seen + [current]), package.fiche,
+                "cycle in the plan: %s" % " → ".join(seen + [current]), package.fiche,
                 package=package.id)
 
 

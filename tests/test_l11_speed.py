@@ -227,7 +227,7 @@ class RotationTest(PgTestCase):
                 # le tour suivant, en session neuve, ouvre sur le résumé
                 self.assertTrue(worker.run_turn(
                     {"kind": "prompt", "prompt": "deuxième tour", "ids": []}))
-            self.assertIn("Reprise de session après rotation",
+            self.assertIn("Session resumed after rotation",
                           " ".join(self.turns()[-1]["argv"]))
         finally:
             worker.watchdog_stop.set()

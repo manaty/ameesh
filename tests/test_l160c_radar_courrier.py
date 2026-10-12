@@ -66,7 +66,7 @@ class SendMailTest(unittest.TestCase):
             self.assertEqual(mail.passive_reason({"payload": one["payload"]}), "radar")
         pair = [s for s in sent if s["payload"]["radar"]["key"] == "pair:1-2"]
         self.assertEqual(sorted(s["work_item_id"] for s in pair), ["1", "2"])
-        self.assertIn("#2 « b » (lot/2-b, a2)", [s for s in pair if s["to"] == "a1"][0]["body"])
+        self.assertIn('#2 "b" (lot/2-b, a2)', [s for s in pair if s["to"] == "a1"][0]["body"])
         # passage suivant, rien de nouveau : aucun courrier
         self.assertEqual(self.run_once(ASSIGNED)[0], [])
 
@@ -90,8 +90,8 @@ class SendMailTest(unittest.TestCase):
         self.assertEqual(payload["radar_blocking"]["pr"], 77)
         self.assertEqual(mail.passive_reason({"payload": payload}), "")
         self.assertFalse(payload.get("urgent"))
-        self.assertIn("PR #77 est verte", sent[0]["body"])
-        self.assertIn("#2 y est entré", sent[0]["body"])
+        self.assertIn("PR #77 is green", sent[0]["body"])
+        self.assertIn("#2 landed there", sent[0]["body"])
         self.assertEqual(self.run_once(lots)[0], [])
 
     def test_green_at_first_sight_wakes_directly(self):
@@ -128,7 +128,7 @@ class HelpersTest(unittest.TestCase):
     def test_passive_key(self):
         self.assertEqual(mail.passive_reason({"payload": {"radar": {"key": "k"}}}), "radar")
         self.assertEqual(mail.passive_label({"payload": {"radar": {"key": "k"}}}),
-                         "radar de conflits")
+                         "conflict radar")
         self.assertEqual(mail.passive_reason({"payload": {"radar_blocking": {"k": 1}}}), "")
         self.assertEqual(mail.passive_reason(
             {"payload": {"radar": {"k": 1}, "urgent": True}}), "")

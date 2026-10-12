@@ -221,11 +221,11 @@ class Profile:
     def describe(self) -> str:
         """Ce qu'on peut afficher : le type et l'emplacement, jamais la clé."""
         if self.kind == "api_key_env":
-            source = ("fichier %s" % self.key_file) if self.key_file else (
-                "variable %s" % self.key_env if self.key_env else "variable héritée")
-            return "clé d'API → %s (%s)" % (
+            source = ("file %s" % self.key_file) if self.key_file else (
+                "variable %s" % self.key_env if self.key_env else "inherited variable")
+            return "API key → %s (%s)" % (
                 self.env or default_key_env_of(self.harness) or "?", source)
-        return "dossier %s" % (self.path or "par défaut")
+        return "dir %s" % (self.path or "default")
 
 
 # --------------------------------------------------------------------------
@@ -246,41 +246,41 @@ def parse(raw) -> dict[str, list[Profile]]:
     if raw in (None, "", {}):
         return {}
     if not isinstance(raw, dict):
-        raise AccountError("`accounts` doit être un objet {harnais: [profils]}")
+        raise AccountError("`accounts` must be an object {harness: [profiles]}")
     out: dict[str, list[Profile]] = {}
     for harness, items in raw.items():
         if harness not in harnesses.known_ids():
-            raise AccountError("harnais inconnu dans `accounts` : %r (descripteurs connus : %s)"
-                               % (harness, ", ".join(harnesses.known_ids()) or "aucun"))
+            raise AccountError("unknown harness in `accounts`: %r (known descriptors: %s)"
+                               % (harness, ", ".join(harnesses.known_ids()) or "none"))
         if not isinstance(items, list) or not items:
-            raise AccountError("`accounts.%s` doit être une liste non vide" % harness)
+            raise AccountError("`accounts.%s` must be a non-empty list" % harness)
         seen: set[str] = set()
         profiles: list[Profile] = []
         for item in items:
             if not isinstance(item, dict):
-                raise AccountError("`accounts.%s` : profil non objet" % harness)
+                raise AccountError("`accounts.%s`: profile is not an object" % harness)
             name = str(item.get("name") or "")
             if not NAME_RE.match(name):
-                raise AccountError("`accounts.%s` : nom de compte invalide %r" % (harness, name))
+                raise AccountError("`accounts.%s`: invalid account name %r" % (harness, name))
             if name in seen:
-                raise AccountError("`accounts.%s` : compte en double %r" % (harness, name))
+                raise AccountError("`accounts.%s`: duplicate account %r" % (harness, name))
             seen.add(name)
             kind = str(item.get("type") or "config_dir")
             if kind not in TYPES:
-                raise AccountError("compte %s/%s : type %r inconnu (%s)"
+                raise AccountError("account %s/%s: unknown type %r (%s)"
                                    % (harness, name, kind, ", ".join(TYPES)))
             try:
                 hourly = float(item.get("hourly_usd") or 0.0)
             except (TypeError, ValueError):
-                raise AccountError("compte %s/%s : hourly_usd illisible" % (harness, name))
+                raise AccountError("account %s/%s: unreadable hourly_usd" % (harness, name))
             if hourly < 0 or hourly != hourly:
-                raise AccountError("compte %s/%s : hourly_usd négatif" % (harness, name))
+                raise AccountError("account %s/%s: negative hourly_usd" % (harness, name))
             min_balance = item.get("min_balance")
             if min_balance is not None:
                 try:
                     min_balance = float(min_balance)
                 except (TypeError, ValueError):
-                    raise AccountError("compte %s/%s : min_balance illisible" % (harness, name))
+                    raise AccountError("account %s/%s: unreadable min_balance" % (harness, name))
             caps = {}
             for key in ("cap", "overage_cap", "short_window_cap"):
                 value = item.get(key)
@@ -309,21 +309,21 @@ def parse(raw) -> dict[str, list[Profile]]:
             env = str(item.get("env") or "")
             if kind == "config_dir":
                 if key_env or key_file:
-                    raise AccountError("compte %s/%s : key_env/key_file réservés à api_key_env"
+                    raise AccountError("account %s/%s: key_env/key_file are for api_key_env only"
                                        % (harness, name))
                 if path and not os.path.isabs(os.path.expanduser(path)):
-                    raise AccountError("compte %s/%s : chemin absolu attendu" % (harness, name))
+                    raise AccountError("account %s/%s: absolute path expected" % (harness, name))
             else:
                 if path:
-                    raise AccountError("compte %s/%s : path réservé à config_dir"
+                    raise AccountError("account %s/%s: path is for config_dir only"
                                        % (harness, name))
                 if bool(key_env) == bool(key_file):
-                    raise AccountError("compte %s/%s : un seul de key_env ou key_file"
+                    raise AccountError("account %s/%s: exactly one of key_env or key_file"
                                        % (harness, name))
                 if not (env or default_key_env_of(harness)):
-                    raise AccountError("compte %s/%s : variable `env` attendue" % (harness, name))
+                    raise AccountError("account %s/%s: `env` variable expected" % (harness, name))
                 if key_file and not os.path.isabs(os.path.expanduser(key_file)):
-                    raise AccountError("compte %s/%s : chemin absolu attendu" % (harness, name))
+                    raise AccountError("account %s/%s: absolute path expected" % (harness, name))
             profiles.append(Profile(
                 harness=harness, name=name, kind=kind,
                 path=_expand(path) if path else "",
@@ -380,33 +380,33 @@ def check(profile: Profile, environ=None) -> list[str]:
         try:
             info = os.stat(profile.path)
         except OSError:
-            return ["dossier absent : %s" % profile.path]
+            return ["missing directory: %s" % profile.path]
         if not stat.S_ISDIR(info.st_mode):
-            return ["pas un dossier : %s" % profile.path]
+            return ["not a directory: %s" % profile.path]
         if uid is not None and info.st_uid != uid:
-            problems.append("dossier d'un autre utilisateur")
+            problems.append("directory owned by another user")
         if info.st_mode & 0o077:
-            problems.append("dossier non privé (%o, attendu 700)" % (info.st_mode & 0o777))
+            problems.append("directory not private (%o, expected 700)" % (info.st_mode & 0o777))
         cred = credentials_of(profile.harness)
         if cred and profile.check_credentials and not platform.is_macos():
             if not os.path.isfile(os.path.join(profile.path, cred)):
-                problems.append("identifiants absents (%s) : connexion humaine à faire" % cred)
+                problems.append("credentials missing (%s): a human must log in" % cred)
         return problems
     if profile.key_file:
         try:
             info = os.lstat(profile.key_file)
         except OSError:
-            return ["fichier de clé absent : %s" % profile.key_file]
+            return ["missing key file: %s" % profile.key_file]
         if not stat.S_ISREG(info.st_mode):
-            return ["fichier de clé non ordinaire : %s" % profile.key_file]
+            return ["key file is not a regular file: %s" % profile.key_file]
         if uid is not None and info.st_uid != uid:
-            problems.append("fichier de clé d'un autre utilisateur")
+            problems.append("key file owned by another user")
         if info.st_mode & 0o177:
-            problems.append("fichier de clé trop ouvert (%o, attendu 600)"
+            problems.append("key file too permissive (%o, expected 600)"
                             % (info.st_mode & 0o777))
         return problems
     if not environ.get(profile.key_env):
-        problems.append("variable de clé absente : %s" % profile.key_env)
+        problems.append("missing key variable: %s" % profile.key_env)
     return problems
 
 
@@ -476,7 +476,7 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     environ = os.environ if environ is None else environ
     problems = check(profile, environ)
     if problems:
-        raise AccountError("compte %s/%s inutilisable : %s"
+        raise AccountError("account %s/%s unusable: %s"
                            % (profile.harness, profile.name, "; ".join(problems)))
     variable = config_env_of(profile.harness)
     if profile.kind == "config_dir":
@@ -489,12 +489,12 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
             with open(profile.key_file, encoding="utf-8") as fh:
                 key = fh.read().strip()
         except OSError as exc:
-            raise AccountError("compte %s/%s : fichier de clé illisible (%s)"
+            raise AccountError("account %s/%s: unreadable key file (%s)"
                                % (profile.harness, profile.name, exc.strerror))
     else:
         key = str(environ.get(profile.key_env) or "").strip()
     if not key:
-        raise AccountError("compte %s/%s : clé vide" % (profile.harness, profile.name))
+        raise AccountError("account %s/%s: empty key" % (profile.harness, profile.name))
     env[profile.env] = key
 
 
@@ -637,7 +637,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     result = Evaluation(profile)
     result.problems = check(profile, environ)
     if result.problems:
-        result.reason = "profil inutilisable : %s" % "; ".join(result.problems)
+        result.reason = "unusable profile: %s" % "; ".join(result.problems)
         return result
     result.gauges = gauges_of(book, profile, items)
     if result.gauges and record:
@@ -669,8 +669,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
                                                     result.limits[depasses[0].key])
         if label == "pace cap":
-            result.reason = ("forfait %s %s : %.0f%% utilisé pour %.0f%% de la fenêtre écoulée "
-                             "(plafond de rythme %.0f%%)" % (
+            result.reason = ("plan %s %s: %.0f%% used with %.0f%% of the window elapsed "
+                             "(pace cap %.0f%%)" % (
                                  profile.harness, gauge.key, gauge.used * 100,
                                  gauge.elapsed(now) * 100, cap * 100))
         else:
@@ -682,14 +682,14 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if profile.hourly_usd > 0 and book.db is not None:
         spent = book.spent("all", 3600, account=profile.name, harnesses=[profile.harness])
         if spent >= profile.hourly_usd:
-            result.reason = ("plafond horaire du compte : %.2f $ sur 60 min (plafond %.2f $)"
+            result.reason = ("account hourly cap: %.2f $ over 60 min (cap %.2f $)"
                              % (spent, profile.hourly_usd))
             result.until = now + 3600.0
             return result
     if profile.min_balance is not None and book.db is not None:
         solde = latest_balance(book.db, profile)
         if solde is not None and float(solde["total"]) <= profile.min_balance:
-            result.reason = ("solde du compte : %.4f %s (seuil %.4f)"
+            result.reason = ("account balance: %.4f %s (threshold %.4f)"
                              % (float(solde["total"]), solde["currency"], profile.min_balance))
             result.until = None  # éligible dès qu'un relevé montre le solde rechargé
     return result
@@ -725,7 +725,7 @@ class Choice:
 
 
 def _label(evaluations: dict) -> str:
-    return " ; ".join("%s : %s" % (name, ev.reason) for name, ev in evaluations.items())
+    return "; ".join("%s: %s" % (name, ev.reason) for name, ev in evaluations.items())
 
 
 def duration(seconds: float) -> str:
@@ -737,7 +737,7 @@ def duration(seconds: float) -> str:
     if hours < 24:
         return "%d h %02d" % (hours, minutes) if minutes else "%d h" % hours
     days, hours = divmod(hours, 24)
-    return "%d j %d h" % (days, hours) if hours else "%d j" % days
+    return "%d d %d h" % (days, hours) if hours else "%d d" % days
 
 
 def expiry(gauges, now: float) -> tuple | None:
@@ -784,16 +784,16 @@ def explain(result: Evaluation, now: float) -> str:
     utilisé (rythme 55 %) », « sans relevé : 0 % utilisé »."""
     _ratio, gauge = lag(result.gauges, now, result.limits)
     if gauge is None:
-        return "sans relevé : 0 % utilisé"
+        return "no reading: 0% used"
     if all(g.reset_passed(now) for g in result.gauges):
-        return "relevé échu (fenêtre remise à zéro) : 0 % utilisé"
+        return "stale reading (window reset): 0% used"
     cap, label = result.limits.get(gauge.key) or (gauge.pace_cap(now), "pace cap")
-    bound = ("rythme %.0f %%" % (cap * 100)) if label == "pace cap" \
-        else "%s %.0f %%" % (label, cap * 100)
+    bound = ("pace %.0f%%" % (cap * 100)) if label == "pace cap" \
+        else "%s %.0f%%" % (label, cap * 100)
     if not gauge.resets_at:
-        return "%s %.0f %% utilisé (jauge non datée, %s)" % (
+        return "%s %.0f%% used (undated gauge, %s)" % (
             gauge.key, gauge.used_at(now) * 100, bound)
-    return "%s %.0f %% utilisé (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
+    return "%s %.0f%% used (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
 def rank(items: list[Profile], evaluations: dict, now: float, *,
@@ -830,9 +830,9 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
         why = "%s, first in the failover order (priority %d)" % (
             explain(evaluations[first.name], now), priority(first))
     else:
-        why = "%s, le plus en retard sur son rythme" % explain(evaluations[first.name], now)
+        why = "%s, furthest behind its pace" % explain(evaluations[first.name], now)
     if len(ranked) > 1:
-        why += " ; avant : %s" % ", ".join(
+        why += "; ahead of: %s" % ", ".join(
             "%s %s" % (p.name, explain(evaluations[p.name], now)) for p in ranked[1:])
     return why
 
@@ -881,7 +881,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     if active_name not in names:
         # compte retiré de la configuration : retour au primaire, journalisé
         store.switch(host, harness, expected=active_name, to=items[0].name, kind="config",
-                     reason="compte %r retiré de la configuration" % active_name,
+                     reason="account %r removed from the configuration" % active_name,
                      agent=agent)
         row = store.active(host, harness) or {"account": items[0].name, "forced": False}
         active_name = row.get("account") if row.get("account") in names else items[0].name
@@ -897,8 +897,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         current = ev(profile)
         if current.ok or (not paced and current.unpaced_ok):
             return Choice(profile, profile, forced=True,
-                          why="forcé (ameesh accounts use)")
-        return Choice(None, profile, reason="compte %s forcé (ameesh accounts use) : %s"
+                          why="forced (ameesh accounts use)")
+        return Choice(None, profile, reason="account %s forced (ameesh accounts use): %s"
                       % (profile.name, current.reason), forced=True)
 
     if row.get("forced"):
@@ -912,16 +912,23 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 and (ev(p).ok if paced else ev(p).unpaced_ok)]
         if not free:
             return held
-        if not simulate:
-            store.set_auto(host, harness, reason="compte forcé %s au seuil (%s) ; %s libre"
-                           % (active.name, cache[active.name].reason, free[0].name))
+        if not simulate and not store.set_auto(
+                host, harness, expected=active.name,
+                reason="forced account %s at threshold (%s); %s free"
+                % (active.name, cache[active.name].reason, free[0].name)):
+            # #295: the row changed since it was read — a human forced another
+            # account meanwhile: that force holds (never lifted in the same turn)
+            row = store.active(host, harness) or {}
+            now_forced = by_name(items, row.get("account"))
+            if row.get("forced") and now_forced is not None:
+                return forced(now_forced)
 
     # 2. continuité : la session garde son compte tant qu'il est sous son seuil
     # (les autres comptes ne sont alors pas relus : rien à choisir)
     own = by_name(items, session_account) if session_account else None
     if own is not None and own in candidates and ev(own).ok:
         return Choice(own, active, kept=True,
-                      why="continuité : la session reste sur %s, sous son seuil" % own.name)
+                      why="continuity: the session stays on %s, under its threshold" % own.name)
     for profile in items:
         ev(profile)
     # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
@@ -939,20 +946,20 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             # l'exécuteur tient l'agent en `auth_blocked` et l'alerte part
             stuck = active if active in blocked else blocked[0]
             return Choice(stuck, active, auth_blocked=True,
-                          why="aucun compte %s sain : %s" % (
-                              harness, " ; ".join("%s : %s" % (p.name, sick[p.name].get(
-                                  "reason") or "authentification en échec")
+                          why="no healthy %s account: %s" % (
+                              harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
+                                  "reason") or "authentication failing")
                                   for p in items if p.name in sick)))
-        return Choice(None, active, reason="tous les comptes %s au seuil — %s"
+        return Choice(None, active, reason="all %s accounts at threshold — %s"
                       % (harness, _label(cache)))
     target = ranked[0]
     why = reason_of(ranked, cache, now)
     left = own if own is not None else (active if target.name != active.name else None)
     if left is not None and left.name in sick:
-        why = "%s en échec d'authentification (%s) ; %s" % (
+        why = "%s authentication failing (%s); %s" % (
             left.name, sick[left.name].get("reason") or "?", why)
     elif left is not None and not cache[left.name].ok:
-        why = "%s au seuil (%s) ; %s" % (left.name, cache[left.name].reason, why)
+        why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
     if target.name == active.name:
         return Choice(target, active, why=why)
     switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
@@ -996,16 +1003,16 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
     """Force le compte `name` (forçage manuel, journalisé `manuel`)."""
     profile = by_name(items, name)
     if profile is None:
-        raise AccountError("compte inconnu pour %s : %r (connus : %s)"
+        raise AccountError("unknown account for %s: %r (known: %s)"
                            % (harness, name, ", ".join(p.name for p in items)))
     problems = check(profile)
     if problems:
-        raise AccountError("compte %s/%s inutilisable : %s"
+        raise AccountError("account %s/%s unusable: %s"
                            % (harness, name, "; ".join(problems)))
     store = storage.of(db).accounts
     store.init_active(host, harness, items[0].name)
     changed = store.switch(host, harness, expected=None, to=name, kind="manuel",
-                           reason="forçage manuel par %s" % by, agent=None, forced=True)
+                           reason="manual override by %s" % by, agent=None, forced=True)
     if changed:
         store.release(host, harness, name)
     return changed
@@ -1014,7 +1021,7 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
 def automatic(db, host: str, harness: str, *, by: str) -> bool:
     """Rend la main à l'automate (journalisé `auto`)."""
     return storage.of(db).accounts.set_auto(host, harness,
-                                            reason="retour en automatique par %s" % by)
+                                            reason="back to automatic by %s" % by)
 
 
 # --------------------------------------------------------------------------
@@ -1110,22 +1117,22 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
     for row in rows:
         row["next"] = row["account"] == target and row["ok"]
         if row["next"]:
-            row["why"] = ("forcé (ameesh accounts use)" if forced
+            row["why"] = ("forced (ameesh accounts use)" if forced
                           else reason_of(ranked, evaluations, now))
 
 
 def format_rows(rows: list[dict]) -> str:
     """Le tableau des comptes (texte)."""
     if not rows:
-        return "aucun compte déclaré (clé `accounts` de la configuration de l'hôte)"
-    lines = ["%-9s %-14s %-7s %-8s %s" % ("harnais", "compte", "actif", "état", "jauges")]
+        return "no account declared (`accounts` key of the host configuration)"
+    lines = ["%-9s %-14s %-7s %-8s %s" % ("harness", "account", "active", "state", "gauges")]
     for row in rows:
-        actif = ("forcé" if row["forced"] else "oui") if row["active"] else ""
-        etat = "ok" if row["ok"] else "seuil" if not row["problems"] else "invalide"
+        actif = ("forced" if row["forced"] else "yes") if row["active"] else ""
+        etat = "ok" if row["ok"] else "limit" if not row["problems"] else "invalid"
         gauges = ", ".join(
-            "%s %.0f%% (rythme %.0f%%%s)" % (
+            "%s %.0f%% (pace %.0f%%%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
-                ", remise à zéro passée, dernier relevé %.0f%%"
+                ", reset passed, last reading %.0f%%"
                 % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
@@ -1133,16 +1140,16 @@ def format_rows(rows: list[dict]) -> str:
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
         if row.get("losses"):
-            lines.append("%-9s %-14s %-7s %-8s ↳ perdu à la remise à zéro si rien ne change : %s"
+            lines.append("%-9s %-14s %-7s %-8s ↳ lost at reset if nothing changes: %s"
                          % ("", "", "", "", ", ".join(
-                             "%s %.0f %% dans %s" % (l["key"], l["lost"] * 100,
+                             "%s %.0f%% in %s" % (l["key"], l["lost"] * 100,
                                                      duration(l["in_s"]))
                              for l in row["losses"])))
         if row.get("next"):
-            lines.append("%-9s %-14s %-7s %-8s ↳ prochain choix pour une nouvelle session : %s"
+            lines.append("%-9s %-14s %-7s %-8s ↳ next choice for a new session: %s"
                          % ("", "", "", "", row.get("why") or "—"))
         if row.get("hold_until") and float(row["hold_until"]) > time.time():
-            lines.append("%-9s %-14s %-7s %-8s ↳ retenu jusqu'à %s" % (
+            lines.append("%-9s %-14s %-7s %-8s ↳ held until %s" % (
                 "", "", "", "", time.strftime("%Y-%m-%d %H:%M",
                                               time.localtime(float(row["hold_until"])))))
     return "\n".join(lines)

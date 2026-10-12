@@ -74,9 +74,9 @@ class RepartitionTest(_Base):
         self.assertEqual(choice.profile.name, "secondaire")
         self.assertEqual(choice.switched["from"], "primaire")
         self.assertEqual(choice.why,
-                         "sans relevé : 0 % utilisé, le plus en retard sur son rythme ; "
-                         "avant : tertiaire sans relevé : 0 % utilisé, primaire "
-                         "codex-10080min 35 % utilisé (rythme 55 %)")
+                         "no reading: 0% used, furthest behind its pace; "
+                         "ahead of: tertiaire no reading: 0% used, primaire "
+                         "codex-10080min 35% used (pace 55%)")
         # la bascule en base porte la même raison
         self.assertEqual(self.db.query("SELECT reason FROM account_switches")[0]["reason"],
                          choice.why)
@@ -84,8 +84,8 @@ class RepartitionTest(_Base):
         cfg = mock.Mock(host=self.cfg.host, accounts={"codex": self.declared})
         rows = accounts.report(cfg, self.db, self._book(), now=now, record=False)
         self.assertEqual([r["account"] for r in rows if r["next"]], ["secondaire"])
-        self.assertIn("↳ prochain choix pour une nouvelle session : sans relevé : 0 % "
-                      "utilisé, le plus en retard sur son rythme ; avant : tertiaire",
+        self.assertIn("↳ next choice for a new session: no reading: 0% "
+                      "used, furthest behind its pace; ahead of: tertiaire",
                       accounts.format_rows(rows))
 
     def test_spread_over_successive_new_sessions(self):
@@ -130,7 +130,7 @@ class RepartitionTest(_Base):
         _codex_weekly(items[2].path, 60, now + 0.55 * WEEK)
         choice = self._choose(items, now)
         self.assertIsNone(choice.profile)
-        self.assertIn("tous les comptes codex au seuil", choice.reason)
+        self.assertIn("all codex accounts at threshold", choice.reason)
 
     def test_forcing_wins_over_lag(self):
         items = self._items()
@@ -144,7 +144,7 @@ class RepartitionTest(_Base):
         cfg = mock.Mock(host=self.cfg.host, accounts={"codex": self.declared})
         rows = accounts.report(cfg, self.db, self._book(), now=now, record=False)
         self.assertEqual([(r["account"], r["why"]) for r in rows if r["next"]],
-                         [("primaire", "forcé (ameesh accounts use)")])
+                         [("primaire", "forced (ameesh accounts use)")])
         self.assertTrue(accounts.automatic(self.db, self.cfg.host, "codex", by="human:test"))
         self.assertEqual(self._choose(items, now).profile.name, "secondaire")
 
@@ -165,7 +165,7 @@ class RepartitionTest(_Base):
         choice = self._choose(items, now, session_account="primaire")
         self.assertEqual(choice.profile.name, "secondaire")
         self.assertFalse(choice.kept)
-        self.assertIn("primaire au seuil", choice.why)
+        self.assertIn("primaire at threshold", choice.why)
 
     def test_tie_broken_by_expiry_then_declared_order(self):
         """Même retard : l'échéance la plus proche (règle 0034 du matin), puis
@@ -179,8 +179,8 @@ class RepartitionTest(_Base):
         _codex_rollout(items[2].path, 30, now + 1.75 * HOUR)
         choice = self._choose(items, now)
         self.assertEqual(choice.profile.name, "secondaire")       # échéance, puis ordre
-        self.assertIn("avant : tertiaire codex-300min 30 % utilisé (rythme 75 %), "
-                      "primaire codex-300min 20 % utilisé (rythme 50 %)", choice.why)
+        self.assertIn("ahead of: tertiaire codex-300min 30% used (pace 75%), "
+                      "primaire codex-300min 20% used (pace 50%)", choice.why)
 
 
 class RangSansBaseTest(unittest.TestCase):
@@ -208,16 +208,16 @@ class RangSansBaseTest(unittest.TestCase):
         self.assertEqual([p.name for p in accounts.rank(items, evaluations, now)],
                          ["secondaire", "tertiaire", "primaire"])
         self.assertEqual(accounts.reason_of(accounts.rank(items, evaluations, now), evaluations, now),
-                         "sans relevé : 0 % utilisé, le plus en retard sur son rythme ; "
-                         "avant : tertiaire sans relevé : 0 % utilisé, primaire seven_day "
-                         "35 % utilisé (rythme 55 %)")
+                         "no reading: 0% used, furthest behind its pace; "
+                         "ahead of: tertiaire no reading: 0% used, primaire seven_day "
+                         "35% used (pace 55%)")
 
     def test_expired_reading_counts_as_zero(self):
         now = 1_800_000_000.0
         expired = [cost.Gauge("claude", "seven_day", 0.80, now - 60, WEEK)]
         self.assertEqual(accounts.lag(expired, now)[0], 0.0)
         self.assertEqual(accounts.explain(self._ev("x", expired), now),
-                         "relevé échu (fenêtre remise à zéro) : 0 % utilisé")
+                         "stale reading (window reset): 0% used")
 
 
 if __name__ == "__main__":

@@ -153,7 +153,7 @@ class JournalParCanonTest(_Authentificateurs):
         git(self.b, "fetch", "-q", "origin")
         done = self.sync_b(bootstrap_ref="").authenticators
         self.assertEqual(done.status, canon_sync.AUTH_REFUSED)
-        self.assertIn("ne descend pas", done.reason)
+        self.assertIn("does not descend", done.reason)
         self.declare(self.a, alice=[self.alice, self.alice2])
         self.assertSynced(self.sync_a(bootstrap_ref=""))
         states = {s["canon"]: s["auth_status"] for s in canon_sync.states(self.db, HOST)}
@@ -434,7 +434,7 @@ class ConfianceParCanonTest(_Authentificateurs):
         self.runner_pass(cfg)
         self.assertEqual(self.auth_states(), {"": "ok", ID_B: "skipped"})
         self.assertEqual({k[0] for k in self.live()}, {""})
-        self.assertIn("NON APPROUVÉ", canon_sync.state(self.db, HOST, ID_B)["auth_diagnostic"])
+        self.assertIn("NOT APPROVED", canon_sync.state(self.db, HOST, ID_B)["auth_diagnostic"])
         # le même canon, approuvé (git, `ref` configurée) : synchronisé
         self.assertTrue(self.runner_pass(self.cfg2()))
         self.assertEqual(self.auth_states(), {"": "ok", ID_B: "ok"})

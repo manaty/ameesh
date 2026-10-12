@@ -70,7 +70,7 @@ class MigrationsTest(PgTestCase):
         try:
             with self.assertRaises(db_mod.DbError) as ctx:
                 migrations.pending(self.db)
-            self.assertIn("immuable", str(ctx.exception))
+            self.assertIn("immutable", str(ctx.exception))
         finally:
             self.db.execute(
                 "UPDATE schema_migrations SET checksum = %s WHERE version = 1", (connue,)
@@ -86,11 +86,11 @@ class MigrationsTest(PgTestCase):
         try:
             out = self.cli("migrate", "--dry-run")
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertIn("%s : additive" % last.label, out.stdout)
+            self.assertIn("%s: additive" % last.label, out.stdout)
             self.assertNotIn(last.version, migrations.applied(self.db))
             out = self.mesh("migrate", "--additive-only")
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertIn("%s appliquée" % last.label, out.stdout)
+            self.assertIn("%s applied" % last.label, out.stdout)
         finally:
             migrations.migrate(self.db)
         self.assertIn(last.version, migrations.applied(self.db))
@@ -118,7 +118,7 @@ class MigrationsTest(PgTestCase):
                     fh.write("select 1;\n")
             with self.assertRaises(db_mod.DbError) as ctx:
                 migrations.discover(directory)
-            self.assertIn("double", str(ctx.exception))
+            self.assertIn("duplicate", str(ctx.exception))
 
     def test_schema_neuf_cree_par_migrate(self):
         """Un schéma de test n'existe pas encore : migrate le crée et l'isole."""
@@ -230,7 +230,7 @@ class MigrationsTest(PgTestCase):
             )
             row, verdict = authority.find_approval(db, "merge", artifact)
             self.assertIsNone(row, "le reçu réinséré ne doit pas être reconsommable")
-            self.assertIn("nonce déjà consommé", verdict.reason)
+            self.assertIn("nonce already consumed", verdict.reason)
         finally:
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)

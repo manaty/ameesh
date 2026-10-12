@@ -101,4 +101,4 @@ class OrphanDbTest(PgTestCase):
                    if a["type"] == "orphan_resource"]
         self.assertEqual(len(alertes), 1)
         self.assertEqual(alertes[0]["resource_status"], "running")
-        self.assertIn("aucun exécuteur", alertes[0]["detail"])
+        self.assertIn("no runner closed it", alertes[0]["detail"])

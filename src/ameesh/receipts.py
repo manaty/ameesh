@@ -205,35 +205,35 @@ def b64u_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(bytes(data)).rstrip(b"=").decode("ascii")
 
 
-def b64u_decode(text, what: str = "valeur") -> bytes:
+def b64u_decode(text, what: str = "value") -> bytes:
     """base64url sans remplissage, canonique (un seul texte par valeur)."""
     if not isinstance(text, str) or not _B64U_RE.fullmatch(text) or len(text) % 4 == 1:
-        raise ReceiptError("%s : base64url sans remplissage attendu" % what)
+        raise ReceiptError("%s: unpadded base64url expected" % what)
     try:
         data = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
     except (binascii.Error, ValueError) as exc:
-        raise ReceiptError("%s : base64url illisible" % what) from exc
+        raise ReceiptError("%s: unreadable base64url" % what) from exc
     if b64u_encode(data) != text:
-        raise ReceiptError("%s : base64url non canonique" % what)
+        raise ReceiptError("%s: non-canonical base64url" % what)
     return data
 
 
 def _b64_lenient(text, what: str) -> bytes:
     """Clé lue dans le canon : base64 ou base64url, remplissage facultatif."""
     if not isinstance(text, str) or not text.strip():
-        raise ReceiptError("%s : texte base64 attendu" % what)
+        raise ReceiptError("%s: base64 text expected" % what)
     cleaned = "".join(text.split()).rstrip("=").replace("+", "-").replace("/", "_")
     if not _B64U_RE.fullmatch(cleaned) or len(cleaned) % 4 == 1:
-        raise ReceiptError("%s : base64 illisible" % what)
+        raise ReceiptError("%s: unreadable base64" % what)
     try:
         return base64.urlsafe_b64decode(cleaned + "=" * (-len(cleaned) % 4))
     except (binascii.Error, ValueError) as exc:
-        raise ReceiptError("%s : base64 illisible" % what) from exc
+        raise ReceiptError("%s: unreadable base64" % what) from exc
 
 
 def _int(value, what: str) -> int:
     if type(value) is not int or abs(value) > jcs.MAX_SAFE_INTEGER:
-        raise ReceiptError("%s : entier attendu (intervalle sûr)" % what)
+        raise ReceiptError("%s: integer expected (safe range)" % what)
     return value
 
 
@@ -250,7 +250,7 @@ def challenge(request: dict) -> bytes:
     try:
         return hashlib.sha256(APPROVAL_DOMAIN + jcs.canonicalize(request)).digest()
     except jcs.JcsError as exc:
-        raise ReceiptError("demande non canonisable : %s" % exc) from exc
+        raise ReceiptError("request cannot be canonicalized: %s" % exc) from exc
 
 
 def action_digest(fields: dict | None = None, **kwargs) -> str:
@@ -265,17 +265,17 @@ def action_digest(fields: dict | None = None, **kwargs) -> str:
     missing = set(ACTION_DIGEST_FIELDS) - set(data)
     extra = set(data) - set(ACTION_DIGEST_FIELDS)
     if missing or extra:
-        raise ReceiptError("empreinte d'action : champs manquants %s, en trop %s"
+        raise ReceiptError("action digest: missing fields %s, extra %s"
                            % (sorted(missing), sorted(extra)))
     if not isinstance(data["args"], dict):
-        raise ReceiptError("empreinte d'action : args doit être un objet JSON")
+        raise ReceiptError("action digest: args must be a JSON object")
     if data["amount"] is not None:
         if _int(data["amount"], "amount") < 0:
-            raise ReceiptError("empreinte d'action : montant négatif")
+            raise ReceiptError("action digest: negative amount")
     try:
         canonical = jcs.canonicalize(data)
     except jcs.JcsError as exc:
-        raise ReceiptError("empreinte d'action : %s" % exc) from exc
+        raise ReceiptError("action digest: %s" % exc) from exc
     return "sha256:" + hashlib.sha256(ACTION_DOMAIN + canonical).hexdigest()
 
 
@@ -314,16 +314,16 @@ class Policy:
         object.__setattr__(self, "allow_facades", frozenset(self.allow_facades or ()))
         unknown = self.allow_facades - set(FACADES)
         if unknown:
-            raise ReceiptError("façades inconnues dans la politique : %s" % sorted(unknown))
+            raise ReceiptError("unknown facades in the policy: %s" % sorted(unknown))
         if self.level not in LEVELS:
-            raise ReceiptError("niveau inconnu : %r (%s)" % (self.level, ", ".join(LEVELS)))
+            raise ReceiptError("unknown level: %r (%s)" % (self.level, ", ".join(LEVELS)))
         if self.canon_commit and not _COMMIT_RE.fullmatch(self.canon_commit):
-            raise ReceiptError("canon_commit : SHA de commit en hexadécimal attendu")
+            raise ReceiptError("canon_commit: hexadecimal commit SHA expected")
         if self.canon is None:
             object.__setattr__(self, "canon", "")
         if not isinstance(self.canon, str) or self.canon != self.canon.strip():
-            raise ReceiptError("canon : identifiant de canon (texte) attendu, '' = canon "
-                               "par défaut")
+            raise ReceiptError("canon: canon identifier (text) expected, '' = default "
+                               "canon")
 
 
 @dataclass(frozen=True)
@@ -364,7 +364,7 @@ class ReceiptVerdict:
 
     def short(self) -> str:
         if self.ok:
-            return "reçu valide : %s par %s (%s)" % (self.decision, self.approver, self.facade)
+            return "receipt valid: %s by %s (%s)" % (self.decision, self.approver, self.facade)
         return self.reason
 
     def as_dict(self) -> dict:
@@ -391,10 +391,10 @@ class Receipt:
 
 def _check_standing(standing, iat: int) -> None:
     if not isinstance(standing, dict):
-        raise ReceiptError("standing : objet attendu")
+        raise ReceiptError("standing: object expected")
     keys = set(standing)
     if keys != _STANDING_KEYS:
-        raise ReceiptError("standing : champs manquants %s, en trop %s"
+        raise ReceiptError("standing: missing fields %s, extra %s"
                            % (sorted(_STANDING_KEYS - keys), sorted(keys - _STANDING_KEYS)))
     if not isinstance(standing["connector"], str) or not _IDENT_RE.fullmatch(standing["connector"]):
         raise ReceiptError("standing.connector invalide")
@@ -402,52 +402,52 @@ def _check_standing(standing, iat: int) -> None:
     if (not isinstance(operations, list) or not operations or len(operations) > 64
             or any(not isinstance(op, str) or not _IDENT_RE.fullmatch(op) for op in operations)
             or len(set(operations)) != len(operations)):
-        raise ReceiptError("standing.operations : liste non vide d'opérations distinctes attendue")
+        raise ReceiptError("standing.operations: non-empty list of distinct operations expected")
     if standing["class"] not in ACTION_CLASSES:
-        raise ReceiptError("standing.class inconnue : %r" % (standing["class"],))
+        raise ReceiptError("standing.class unknown: %r" % (standing["class"],))
     if _int(standing["max_amount"], "standing.max_amount") < 0:
-        raise ReceiptError("standing.max_amount négatif")
+        raise ReceiptError("standing.max_amount is negative")
     currency = standing["currency"]
     if currency is not None and (not isinstance(currency, str) or not _CURRENCY_RE.fullmatch(currency)):
-        raise ReceiptError("standing.currency : code ISO 4217 (3 majuscules) ou null attendu")
+        raise ReceiptError("standing.currency: ISO 4217 code (3 capitals) or null expected")
     if standing["max_amount"] > 0 and currency is None:
-        raise ReceiptError("standing : un plafond non nul exige une devise")
+        raise ReceiptError("standing: a non-zero cap requires a currency")
     if _int(standing["until"], "standing.until") <= iat:
-        raise ReceiptError("standing.until doit suivre iat")
+        raise ReceiptError("standing.until must be after iat")
 
 
 def check_request(request) -> str:
     """Valide la forme d'une demande ; renvoie sa nature (`action` | `standing`)."""
     if not isinstance(request, dict):
-        raise ReceiptError("request : objet attendu")
+        raise ReceiptError("request: object expected")
     keys = set(request)
     kind = "standing" if "standing" in keys else "action"
     expected = _STANDING_FIELDS if kind == "standing" else _ACTION_FIELDS
     if keys != expected:
-        raise ReceiptError("request (%s) : champs manquants %s, en trop %s"
+        raise ReceiptError("request (%s): missing fields %s, extra %s"
                            % (kind, sorted(expected - keys), sorted(keys - expected)))
     if type(request["v"]) is not int or request["v"] != REQUEST_VERSION:
-        raise ReceiptError("request.v : %d attendu" % REQUEST_VERSION)
+        raise ReceiptError("request.v: %d expected" % REQUEST_VERSION)
     if not isinstance(request["approver"], str) or not _HUMAN_RE.fullmatch(request["approver"]):
-        raise ReceiptError("request.approver : « human:<id> » attendu (un agent n'approuve jamais)")
+        raise ReceiptError("request.approver: \"human:<id>\" expected (an agent never approves)")
     if request["decision"] not in DECISIONS:
-        raise ReceiptError("request.decision : approve ou deny")
+        raise ReceiptError("request.decision: approve or deny")
     if not isinstance(request["summary_digest"], str) or not _DIGEST_RE.fullmatch(request["summary_digest"]):
-        raise ReceiptError("request.summary_digest : « sha256:<hex> » attendu")
+        raise ReceiptError("request.summary_digest: \"sha256:<hex>\" expected")
     if not isinstance(request["requested_by"], str) or not _MEMBER_RE.fullmatch(request["requested_by"]):
-        raise ReceiptError("request.requested_by : « agent:<id> » ou « human:<id> » attendu")
+        raise ReceiptError("request.requested_by: \"agent:<id>\" or \"human:<id>\" expected")
     nonce = b64u_decode(request["nonce"], "request.nonce")
     if not 16 <= len(nonce) <= 64:
-        raise ReceiptError("request.nonce : au moins 128 bits (16 à 64 octets)")
+        raise ReceiptError("request.nonce: at least 128 bits (16 to 64 bytes)")
     iat = _int(request["iat"], "request.iat")
     exp = _int(request["exp"], "request.exp")
     if exp <= iat:
-        raise ReceiptError("request.exp doit suivre iat")
+        raise ReceiptError("request.exp must be after iat")
     if kind == "action":
         if not isinstance(request["action_id"], str) or not _ACTION_ID_RE.fullmatch(request["action_id"]):
-            raise ReceiptError("request.action_id : « act_ » + 26 caractères attendu")
+            raise ReceiptError("request.action_id: \"act_\" + 26 characters expected")
         if not isinstance(request["digest"], str) or not _DIGEST_RE.fullmatch(request["digest"]):
-            raise ReceiptError("request.digest : « sha256:<hex> » attendu")
+            raise ReceiptError("request.digest: \"sha256:<hex>\" expected")
     else:
         _check_standing(request["standing"], iat)
     return kind
@@ -459,34 +459,34 @@ def parse_receipt(data) -> Receipt:
         try:
             data = jcs.loads(data)
         except jcs.JcsError as exc:
-            raise ReceiptError("reçu illisible : %s" % exc) from exc
+            raise ReceiptError("unreadable receipt: %s" % exc) from exc
     if not isinstance(data, dict):
-        raise ReceiptError("reçu : objet JSON attendu")
+        raise ReceiptError("receipt: JSON object expected")
     keys = set(data)
     if keys != _RECEIPT_FIELDS:
-        raise ReceiptError("reçu : champs manquants %s, en trop %s"
+        raise ReceiptError("receipt: missing fields %s, extra %s"
                            % (sorted(_RECEIPT_FIELDS - keys), sorted(keys - _RECEIPT_FIELDS)))
     if data["v"] != RECEIPT_VERSION:
-        raise ReceiptError("reçu : version %r attendue" % RECEIPT_VERSION)
+        raise ReceiptError("receipt: version %r expected" % RECEIPT_VERSION)
     facade = data["facade"]
     if facade not in FACADES:
-        raise ReceiptError("reçu : façade inconnue %r" % (facade,))
+        raise ReceiptError("receipt: unknown facade %r" % (facade,))
     credential_id = data["credential_id"]
     if not isinstance(credential_id, str) or not _CREDENTIAL_RE.fullmatch(credential_id):
-        raise ReceiptError("reçu : credential_id invalide")
+        raise ReceiptError("receipt: invalid credential_id")
     kind = check_request(data["request"])
     proof = data["proof"]
     if not isinstance(proof, dict):
-        raise ReceiptError("reçu : proof doit être un objet")
+        raise ReceiptError("receipt: proof must be an object")
     required, optional = _PROOF_FIELDS[facade]
     keys = set(proof)
     if not required <= keys or keys - required - optional:
-        raise ReceiptError("proof (%s) : champs attendus %s" % (facade, sorted(required | optional)))
+        raise ReceiptError("proof (%s): expected fields %s" % (facade, sorted(required | optional)))
     proof_bytes = {name: b64u_decode(proof[name], "proof.%s" % name) for name in sorted(keys)}
     try:
         jcs.dumps(data)  # tout le reçu doit être du JSON canonisable (il est archivé en JCS)
     except jcs.JcsError as exc:
-        raise ReceiptError("reçu non canonisable : %s" % exc) from exc
+        raise ReceiptError("receipt cannot be canonicalized: %s" % exc) from exc
     return Receipt(
         document=data, request=data["request"], kind=kind, facade=facade,
         credential_id=credential_id, proof=proof, proof_bytes=proof_bytes,
@@ -512,18 +512,18 @@ def parse_public_key(facade: str, blob: bytes) -> cose.PublicKey:
         if facade == "ed25519":
             key = cose.ed25519_key(blob) if len(blob) == 32 else cose.parse_cose_key(blob)
             if key.alg != "EdDSA":
-                raise ReceiptError("façade ed25519 : clé Ed25519 attendue")
+                raise ReceiptError("ed25519 facade: Ed25519 key expected")
             return key
         if facade == "device-es256":
             if (len(blob) == 65 and blob[0] == 0x04) or (len(blob) == 33 and blob[0] in (2, 3)):
                 return cose.es256_key(p256.decode_point(blob))
             key = cose.parse_cose_key(blob)
             if key.alg != "ES256":
-                raise ReceiptError("façade device-es256 : clé ES256 attendue")
+                raise ReceiptError("device-es256 facade: ES256 key expected")
             return key
     except (cose.CborError, p256.P256Error) as exc:
-        raise ReceiptError("clé publique %s invalide : %s" % (facade, exc)) from exc
-    raise ReceiptError("façade inconnue : %r" % (facade,))
+        raise ReceiptError("invalid %s public key: %s" % (facade, exc)) from exc
+    raise ReceiptError("unknown facade: %r" % (facade,))
 
 
 # --------------------------------------------------------------------------
@@ -541,7 +541,7 @@ def list_authenticators(db: Db, *, approver: str | None = None,
 
 def canon_label(canon: str | None) -> str:
     """Nom lisible d'un canon du registre ('' : le canon par défaut)."""
-    return "canon %s" % canon if canon else "canon par défaut"
+    return "canon %s" % canon if canon else "default canon"
 
 
 def mismatched_authenticators(db: Db, expected, *, include_revoked: bool = False) -> list[dict]:
@@ -554,7 +554,7 @@ def mismatched_authenticators(db: Db, expected, *, include_revoked: bool = False
     rows = list_authenticators(db, include_revoked=include_revoked)
     if isinstance(expected, str):
         if not _COMMIT_RE.fullmatch(expected):
-            raise ReceiptError("commit attendu : SHA hexadécimal (40 ou 64 caractères)")
+            raise ReceiptError("commit expected: hexadecimal SHA (40 or 64 characters)")
         return [row for row in rows if not (row.get("canon_ref") or "").endswith("@" + expected)]
     mapping = dict(expected)
     out = []
@@ -575,15 +575,15 @@ def _find_authenticator(db: Db, approver: str, facade: str, credential_id: str,
                  and row["facade"] == facade and row["credential_id"] == credential_id
                  and row.get("revoked_ts") is None]
     foreign = (None, CANON, (
-        "authentificateur %s/%s de %s déclaré par le %s, pas par le %s de l'objet "
-        "approuvé : un authentificateur ne vaut que pour son canon"
+        "authenticator %s/%s of %s declared by the %s, not by the %s of the approved "
+        "object: an authenticator is only valid for its own canon"
         % (facade, credential_id[:16], approver,
            canon_label(elsewhere[0].get("canon")), canon_label(canon)))) if elsewhere else None
     if not rows:
         if foreign:
             return foreign
         return None, UNKNOWN_APPROVER, (
-            "approbateur %s inconnu du registre de confiance du %s (aucun authentificateur)"
+            "approver %s unknown to the trust registry of the %s (no authenticator)"
             % (approver, canon_label(canon)))
     matching = [row for row in rows
                 if row["facade"] == facade and row["credential_id"] == credential_id]
@@ -591,16 +591,16 @@ def _find_authenticator(db: Db, approver: str, facade: str, credential_id: str,
     if live:
         return live[0], "", ""
     if matching:
-        return None, REVOKED, "authentificateur %s/%s de %s révoqué" % (
+        return None, REVOKED, "authenticator %s/%s of %s revoked" % (
             facade, credential_id[:16], approver)
     if foreign:
         return foreign
     other = storage.of(db).authenticators.active_holders(facade, credential_id, canon)
     if other:
         return None, FOREIGN_AUTHENTICATOR, (
-            "le credential %s/%s n'est pas enrôlé pour %s (il appartient à un autre approbateur)"
+            "credential %s/%s is not enrolled for %s (it belongs to another approver)"
             % (facade, credential_id[:16], approver))
-    return None, UNKNOWN_AUTHENTICATOR, "aucun authentificateur %s/%s enrôlé pour %s" % (
+    return None, UNKNOWN_AUTHENTICATOR, "no authenticator %s/%s enrolled for %s" % (
         facade, credential_id[:16], approver)
 
 
@@ -611,7 +611,7 @@ def _find_authenticator(db: Db, approver: str, facade: str, credential_id: str,
 def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
                      enrolled_level: str) -> tuple[str, str, dict]:
     if not policy.rp_id or not policy.origins:
-        return POLICY, "politique WebAuthn incomplète : rp_id et origines autorisées requis", {}
+        return POLICY, "incomplete WebAuthn policy: rp_id and allowed origins required", {}
     auth_data = parsed.proof_bytes["authenticatorData"]
     client_json = parsed.proof_bytes["clientDataJSON"]
     signature = parsed.proof_bytes["signature"]
@@ -619,28 +619,28 @@ def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
     try:
         client = jcs.loads(client_json)
     except jcs.JcsError as exc:
-        return CLIENT_DATA, "clientDataJSON illisible : %s" % exc, {}
+        return CLIENT_DATA, "unreadable clientDataJSON: %s" % exc, {}
     if not isinstance(client, dict):
-        return CLIENT_DATA, "clientDataJSON : objet attendu", {}
+        return CLIENT_DATA, "clientDataJSON: object expected", {}
     if client.get("type") != "webauthn.get":
-        return CLIENT_TYPE, "clientDataJSON.type %r : « webauthn.get » attendu" % (
+        return CLIENT_TYPE, "clientDataJSON.type %r: \"webauthn.get\" expected" % (
             client.get("type"),), {}
     try:
         signed_challenge = b64u_decode(client.get("challenge"), "clientDataJSON.challenge")
     except ReceiptError as exc:
         return CHALLENGE, str(exc), {}
     if not hmac.compare_digest(signed_challenge, parsed.challenge):
-        return CHALLENGE, "le challenge signé n'est pas celui de cette demande", {}
+        return CHALLENGE, "the signed challenge is not the one of this request", {}
     origin = client.get("origin")
     if not isinstance(origin, str) or origin not in policy.origins:
-        return ORIGIN, "origine %r non autorisée" % (origin,), {}
+        return ORIGIN, "origin %r not allowed" % (origin,), {}
     if "crossOrigin" in client and client["crossOrigin"] is not False:
-        return CROSS_ORIGIN, "clientDataJSON.crossOrigin doit être faux ou absent", {}
+        return CROSS_ORIGIN, "clientDataJSON.crossOrigin must be false or absent", {}
     if "topOrigin" in client:
-        return CROSS_ORIGIN, "clientDataJSON.topOrigin présent : contexte inter-origines refusé", {}
+        return CROSS_ORIGIN, "clientDataJSON.topOrigin present: cross-origin context rejected", {}
 
     if len(auth_data) < 37:
-        return AUTH_DATA, "authenticatorData trop court", {}
+        return AUTH_DATA, "authenticatorData too short", {}
     flags = auth_data[32]
     info = {
         "up": bool(flags & FLAG_UP), "uv": bool(flags & FLAG_UV),
@@ -649,26 +649,26 @@ def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
     }
     expected_rp = hashlib.sha256(policy.rp_id.encode("utf-8")).digest()
     if not hmac.compare_digest(auth_data[:32], expected_rp):
-        return RP_ID, "rpIdHash différent de SHA-256(%s)" % policy.rp_id, info
+        return RP_ID, "rpIdHash differs from SHA-256(%s)" % policy.rp_id, info
     if flags & FLAG_AT:
-        return AUTH_DATA, "données d'attestation dans une assertion (AT=1)", info
+        return AUTH_DATA, "attestation data in an assertion (AT=1)", info
     if info["bs"] and not info["be"]:
-        return AUTH_DATA, "drapeaux incohérents : BS=1 sans BE", info
+        return AUTH_DATA, "inconsistent flags: BS=1 without BE", info
     if flags & FLAG_ED:
         try:
             extensions, _end = cose.decode(auth_data, 37)
         except cose.CborError as exc:
-            return AUTH_DATA, "extensions illisibles : %s" % exc, info
+            return AUTH_DATA, "unreadable extensions: %s" % exc, info
         if not isinstance(extensions, dict):
-            return AUTH_DATA, "extensions : table CBOR attendue", info
+            return AUTH_DATA, "extensions: CBOR map expected", info
     elif len(auth_data) != 37:
-        return AUTH_DATA, "authenticatorData : octets en trop", info
+        return AUTH_DATA, "authenticatorData: trailing bytes", info
     if not info["up"]:
-        return USER_PRESENCE, "présence de l'utilisateur non attestée (UP=0)", info
+        return USER_PRESENCE, "user presence not attested (UP=0)", info
     if not info["uv"]:
-        return USER_VERIFICATION, "utilisateur non vérifié (UV=0)", info
+        return USER_VERIFICATION, "user not verified (UV=0)", info
     if info["be"] and (policy.level == "eleve" or enrolled_level == "eleve"):
-        return BACKUP, "credential synchronisable (BE=1) refusé au niveau élevé", info
+        return BACKUP, "syncable credential (BE=1) rejected at high level", info
     signed = auth_data + hashlib.sha256(client_json).digest()
     if not key.verify(signed, signature):
         return SIGNATURE, "signature %s invalide" % key.alg, info
@@ -701,40 +701,40 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
 
     # 1. façade, nature, liaison
     if parsed.facade not in policy.allow_facades:
-        return refuse(FACADE, "façade %s non admise pour cette autorité (admises : %s)"
-                      % (parsed.facade, ", ".join(sorted(policy.allow_facades)) or "aucune"))
+        return refuse(FACADE, "facade %s not accepted for this authority (accepted: %s)"
+                      % (parsed.facade, ", ".join(sorted(policy.allow_facades)) or "none"))
     if kind is not None and parsed.kind != kind:
-        return refuse(KIND, "reçu de nature %s, %s attendu" % (parsed.kind, kind))
+        return refuse(KIND, "receipt of kind %s, %s expected" % (parsed.kind, kind))
     if parsed.kind == "standing" and consume_by:
-        return refuse(KIND, "un reçu standing se consomme en enregistrant le grant "
-                            "(register_standing), pas ici")
+        return refuse(KIND, "a standing receipt is consumed by registering the grant "
+                            "(register_standing), not here")
     if consume_by and (expected_digest is None or expected_action_id is None):
-        return refuse(UNBOUND, "consommer un reçu exige l'empreinte et l'action_id attendus "
-                               "(sinon il autoriserait n'importe quelle action)")
+        return refuse(UNBOUND, "consuming a receipt requires the expected digest and action_id "
+                               "(otherwise it would authorize any action)")
     if expected_action_id is not None and request.get("action_id") != expected_action_id:
-        return refuse(ACTION_MISMATCH, "le reçu porte sur %s, pas sur %s"
-                      % (request.get("action_id") or "un grant", expected_action_id))
+        return refuse(ACTION_MISMATCH, "the receipt is for %s, not for %s"
+                      % (request.get("action_id") or "a grant", expected_action_id))
     if expected_digest is not None and not _same(expected_digest, request.get("digest") or ""):
-        return refuse(DIGEST_MISMATCH, "l'empreinte approuvée n'est pas celle de l'action")
+        return refuse(DIGEST_MISMATCH, "the approved digest is not the action's digest")
     if expect_decision is not None and request["decision"] != expect_decision:
-        return refuse(DECISION, "décision %s, %s attendue" % (request["decision"], expect_decision))
+        return refuse(DECISION, "decision %s, %s expected" % (request["decision"], expect_decision))
 
     # 2. temps
     iat, exp = request["iat"], request["exp"]
     if exp <= moment:
-        return refuse(EXPIRED, "reçu expiré (%s)" % time.strftime(
+        return refuse(EXPIRED, "receipt expired (%s)" % time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime(exp)))
     if iat > moment + policy.clock_skew:
-        return refuse(NOT_YET, "iat dans le futur (au-delà de %d s de tolérance)" % policy.clock_skew)
+        return refuse(NOT_YET, "iat in the future (beyond %d s of tolerance)" % policy.clock_skew)
     if exp - iat > policy.max_ttl:
-        return refuse(TTL, "durée de validité trop longue (%d s, maximum %d s)"
+        return refuse(TTL, "validity period too long (%d s, maximum %d s)"
                       % (exp - iat, policy.max_ttl))
     if parsed.kind == "standing":
         until = request["standing"]["until"]
         if until <= moment:
-            return refuse(EXPIRED, "grant échu (until dépassé)")
+            return refuse(EXPIRED, "grant expired (until passed)")
         if until - iat > policy.max_standing:
-            return refuse(TTL, "grant trop long (%d s, maximum %d s)"
+            return refuse(TTL, "grant too long (%d s, maximum %d s)"
                           % (until - iat, policy.max_standing))
 
     # 3. registre de confiance — L44 (0031) : celui du canon de l'objet approuvé
@@ -744,13 +744,13 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         return refuse(code, reason)
     ctx.update(authenticator_id=int(row["id"]), level=row["level"])
     if policy.level == "eleve" and row["level"] != "eleve":
-        return refuse(LEVEL, "authentificateur de niveau %s, niveau élevé exigé" % row["level"])
+        return refuse(LEVEL, "authenticator of level %s, high level required" % row["level"])
     if policy.canon_commit and not (row.get("canon_ref") or "").endswith("@" + policy.canon_commit):
-        return refuse(CANON, "authentificateur hors du canon attendu (%s)" % row.get("canon_ref"))
+        return refuse(CANON, "authenticator not from the expected canon (%s)" % row.get("canon_ref"))
     try:
-        key = parse_public_key(parsed.facade, b64u_decode(row["public_key"], "clé enregistrée"))
+        key = parse_public_key(parsed.facade, b64u_decode(row["public_key"], "stored key"))
     except ReceiptError as exc:
-        return refuse(KEY, "clé enregistrée inutilisable : %s" % exc)
+        return refuse(KEY, "stored key unusable: %s" % exc)
 
     # 4. preuve
     if parsed.facade == "webauthn":
@@ -775,15 +775,15 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         if not consumed:
             state = authority.nonce_state(db, approver, nonce)
             if state:
-                return refuse(REPLAY, "nonce déjà consommé (%s)" % state)
-            return refuse(REVOKED, "authentificateur révoqué pendant la vérification")
+                return refuse(REPLAY, "nonce already consumed (%s)" % state)
+            return refuse(REVOKED, "authenticator revoked during verification")
         ctx["consumed"] = True
     else:
         state = authority.nonce_state(db, approver, nonce)
         if state:
-            return refuse(REPLAY, "nonce déjà consommé (%s)" % state)
+            return refuse(REPLAY, "nonce already consumed (%s)" % state)
 
-    return ReceiptVerdict(True, OK, "reçu valide : %s par %s (%s)" % (
+    return ReceiptVerdict(True, OK, "receipt valid: %s by %s (%s)" % (
         request["decision"], approver, parsed.facade), **ctx), parsed
 
 
@@ -882,18 +882,18 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
         state = authority.nonce_state(db, verdict.approver, verdict.nonce)
         if state:
             return dataclasses.replace(verdict, ok=False, code=REPLAY,
-                                       reason="nonce déjà consommé (%s)" % state), None
+                                       reason="nonce already consumed (%s)" % state), None
         return dataclasses.replace(verdict, ok=False, code=REVOKED,
-                                   reason="authentificateur révoqué pendant l'enregistrement"), None
+                                   reason="authenticator revoked during registration"), None
     return dataclasses.replace(verdict, consumed=True,
-                               reason="grant #%d enregistré" % int(grant_id)), int(grant_id)
+                               reason="grant #%d registered" % int(grant_id)), int(grant_id)
 
 
 def _amount(value) -> int:
     if value is None:
         return 0
-    if _int(value, "montant") < 0:
-        raise ReceiptError("montant négatif")
+    if _int(value, "amount") < 0:
+        raise ReceiptError("negative amount")
     return value
 
 
@@ -946,8 +946,8 @@ def standing_release(db: Db, reservation_id: int, *, outcome: str = "failed",
     si elle était déjà libérée ou inconnue.
     """
     if outcome != "failed":
-        raise ReceiptError("une réservation n'est libérée que sur un échec certain "
-                           "(failed), pas sur %r" % (outcome,))
+        raise ReceiptError("a reservation is only released on a certain failure "
+                           "(failed), not on %r" % (outcome,))
     released = storage.of(db).grants.release(reservation_id, reason)
     return dict(released) if released is not None else None
 
@@ -1009,7 +1009,7 @@ def _normalize_level(value) -> str:
     aliases = {"standard": "standard", "eleve": "eleve", "élevé": "eleve", "elevé": "eleve",
                "high": "eleve"}
     if text not in aliases:
-        raise ReceiptError("niveau inconnu : %r (standard, eleve)" % (value,))
+        raise ReceiptError("unknown level: %r (standard, eleve)" % (value,))
     return aliases[text]
 
 
@@ -1018,7 +1018,7 @@ def _normalize_aaguid(value) -> str | None:
         return None
     text = str(value).strip().lower().replace("-", "")
     if not _AAGUID_RE.fullmatch(text):
-        raise ReceiptError("aaguid illisible : %r" % (value,))
+        raise ReceiptError("unreadable aaguid: %r" % (value,))
     return "%s-%s-%s-%s-%s" % (text[:8], text[8:12], text[12:16], text[16:20], text[20:])
 
 
@@ -1151,22 +1151,22 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
     """
     if not isinstance(lock, RegistryLock):
         raise RegistryLockError(
-            "écriture du registre des authentificateurs refusée : jeton du verrou attendu "
-            "(canon_sync.sync_authenticators) — rien n'est modifié")
+            "authenticator registry write refused: lock token expected "
+            "(canon_sync.sync_authenticators) — nothing changed")
     db = lock.db
     try:
         held = registry_lock_held(db)
     except DbError as exc:              # psql : session de la transaction déjà close
         raise RegistryLockError(
-            "écriture du registre des authentificateurs refusée : verrou du registre "
-            "invérifiable (%s) — rien n'est modifié" % exc) from exc
+            "authenticator registry write refused: registry lock "
+            "cannot be checked (%s) — nothing changed" % exc) from exc
     if not held:
         raise RegistryLockError(
-            "écriture du registre des authentificateurs refusée : la session ne détient "
-            "pas le verrou du registre (transaction close, ou verrou pris hors "
-            "transaction) — rien n'est modifié")
+            "authenticator registry write refused: the session does not hold "
+            "the registry lock (transaction closed, or lock taken outside a "
+            "transaction) — nothing changed")
     if not isinstance(members, list):
-        raise ReceiptError("members : liste de membres attendue (rien n'est modifié)")
+        raise ReceiptError("members: list of members expected (nothing changed)")
     errors: list[str] = []
     desired: dict[tuple[str, str], dict] = {}
     protected: set[tuple[str, str]] = set()
@@ -1179,7 +1179,7 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
     for index, member in enumerate(members):
         title = member.get("title") if isinstance(member, dict) else None
         if not isinstance(title, str) or not re.fullmatch(_NAME, title):
-            errors.append("membre #%d : titre invalide %r" % (index, title))
+            errors.append("member #%d: invalid title %r" % (index, title))
             unreadable = True
             continue
         approver = "human:" + title
@@ -1189,7 +1189,7 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
             member_refs.setdefault(approver, member_ref)
         entries = member.get("authenticators")
         if not isinstance(entries, list):
-            errors.append("%s : authenticators doit être une liste (%s)" % (
+            errors.append("%s: authenticators must be a list (%s)" % (
                 approver, "absent" if "authenticators" not in member
                 else type(entries).__name__))
             frozen.add(approver)
@@ -1197,26 +1197,26 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
         records: dict[tuple[str, str], dict] = {}
         invalid = False
         for position, entry in enumerate(entries):
-            where = "%s, authentificateur #%d" % (approver, position)
+            where = "%s, authenticator #%d" % (approver, position)
             if not isinstance(entry, dict):
-                errors.append("%s : objet attendu" % where)
+                errors.append("%s: object expected" % where)
                 invalid = True
                 continue
             facade = entry.get("facade")
             credential_id = entry.get("credential_id")
             if facade not in FACADES or not isinstance(credential_id, str) \
                     or not _CREDENTIAL_RE.fullmatch(credential_id):
-                errors.append("%s : façade ou credential_id invalide" % where)
+                errors.append("%s: invalid facade or credential_id" % where)
                 invalid = True
                 continue
             identity = (facade, credential_id)
             claimed[identity] = claimed.get(identity, 0) + 1
             try:
                 if identity in records:
-                    raise ReceiptError("déclaré deux fois dans la liste")
+                    raise ReceiptError("declared twice in the list")
                 canon_ref = entry.get("canon_ref") or member.get("canon_ref")
                 if not isinstance(canon_ref, str) or not _CANON_REF_RE.fullmatch(canon_ref):
-                    raise ReceiptError("sans référence de commit du canon (chemin@SHA)")
+                    raise ReceiptError("no canon commit reference (path@SHA)")
                 raw = _b64_lenient(entry.get("public_key"), "public_key")
                 parse_public_key(facade, raw)
                 record = {
@@ -1229,7 +1229,7 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
                     "canon": canon,
                 }
             except ReceiptError as exc:
-                errors.append("%s (%s) : %s" % (where, _label(approver, *identity), exc))
+                errors.append("%s (%s): %s" % (where, _label(approver, *identity), exc))
                 protected.add(identity)
                 invalid = True
                 continue
@@ -1241,7 +1241,7 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
 
     for identity, count in claimed.items():
         if count > 1:
-            errors.append("%s/%s déclaré %d fois dans le canon : refusé"
+            errors.append("%s/%s declared %d times in the canon: rejected"
                           % (identity[0], identity[1], count))
             desired.pop(identity, None)
             protected.add(identity)
@@ -1249,8 +1249,8 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
     for identity in [i for i, r in desired.items() if r["approver"] in frozen]:
         desired.pop(identity)
     if unreadable:
-        errors.append("entrée de membre illisible : aucune révocation pour absence du canon "
-                      "pendant cette synchronisation")
+        errors.append("unreadable member entry: no revocation for absence from the canon "
+                      "during this sync")
 
     result = {"added": [], "updated": [], "revoked": [], "unchanged": 0,
               "frozen": sorted(frozen), "errors": errors}
@@ -1291,5 +1291,5 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
         if added:
             result["added"].append(label)
         else:
-            errors.append("%s : une ligne active concurrente existe déjà" % label)
+            errors.append("%s: a concurrent active row already exists" % label)
     return result
