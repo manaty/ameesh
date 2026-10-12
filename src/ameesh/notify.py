@@ -92,7 +92,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked",
                  # L226a : un identifiant est en échec, ou expire bientôt
-                 "credential_failing", "credential_expiring",
+                 "credential_failing", "credential_expiring", "module_deviation",
                  # L317c : analyse profonde demandée, sans rapport dans les 30 min
                  "deep_analysis_overdue")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
@@ -161,6 +161,8 @@ TYPE_LABELS = {
     "waiting_without_question": "lot waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
+
+    "module_deviation": "module procedure deviation",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
@@ -804,6 +806,15 @@ class Router:
 
     def resolve(self, alert: dict) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
+        if alert.get("type") == "module_deviation":
+            # A project procedure finding belongs to the lot, even when its
+            # assignee (or their host/responsible human) belongs elsewhere.
+            for source, value in (("lot", self.lot_responsible(alert.get("lot"))),
+                                  ("defaut", self.ncfg.default_human)):
+                human = normalize_human(value)
+                if human:
+                    return human, source
+            return None, None
         agent = alert.get("agent")
         steps = (
             ("alerte", lambda: alert.get("responsible")),
@@ -917,7 +928,8 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
-_KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
+_KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
+         "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
          "provider", "currency", "urgent",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
@@ -968,6 +980,13 @@ class Notifier:
         wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
+        # Persisted deliveries from an older routing policy must not retry or
+        # resolve to an assignee's human after a project's owner is selected.
+        for entry in list(active.values()) + list(self.state["resolved"].values()):
+            if entry["alert"].get("type") == "module_deviation":
+                human, source = router.resolve(entry["alert"])
+                if human != entry.get("human"):
+                    entry.update(human=human, source=source, status="nouvelle", channels={})
         for key in list(active):
             if key in wanted:
                 continue
@@ -1000,7 +1019,7 @@ class Notifier:
             else:
                 if alert.get("type") == "orphan_lot" and alert.get("grouped"):
                     entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
-                if entry["status"] in ("sans_destinataire", "sans_canal"):
+                if entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
                     # un responsable (ou une route) a pu apparaître depuis
                     self._raise(entry, router, now)
                 else:
@@ -1217,13 +1236,16 @@ class Notifier:
             return
         from . import mail, work
         try:
-            listing = list(router.agents().values())
+            listing = storage.of(db).operations.listing()
             from . import canon as canon_mod
             try:
                 canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
-            except Exception:  # noqa: BLE001 - sans canon : l'agent `auditeur` seul
+            except Exception:  # noqa: BLE001 - aucun auditeur explicite sans canon
                 canons = []
             auditors = alert_briefs.auditors(listing, canons)
+            module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
+            from . import sous_utilisation
+            module_orchestrators = sous_utilisation.role_orchestrators(canons)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
@@ -1235,7 +1257,10 @@ class Notifier:
                     item = storage.of(db).work.get(int(lot))
                     if item:
                         titles[int(lot)] = item.get("title") or ""
-                briefs = alert_briefs.briefs(alert, listing, titles, auditors)
+                briefs = alert_briefs.briefs(
+                    alert, listing, titles,
+                    module_auditors if kind == "module_deviation" else auditors,
+                    orchestrator_names=module_orchestrators)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 continue
@@ -1245,28 +1270,66 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
-            for field_ in ("lot", "agents", "lots", "harness", "account", "gauge",
+            for field_ in ("module", "rule", "project", "declaration_id", "subject",
+                           "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):
                 if alert.get(field_) is not None:
                     payload[field_] = alert[field_]
             # pas de `work_item_id` : un message lié au lot compterait comme
             # son activité (stagnation) et effacerait l'alerte qu'il signale
+            delivered = []
             for name, text in sorted(briefs.items()):
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
                 try:
-                    mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
-                              payload=payload)
+                    if kind == "module_deviation":
+                        if not self._send_module_brief(db, alert, name, text, payload):
+                            continue
+                    else:
+                        mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
+                                  payload=payload)
+                    delivered.append(name)
                     self.log("[%s] %s delivered to %s" % (
                         kind, "reminder" if entry is not None else "mail", name))
                 except Exception as exc:  # noqa: BLE001
                     self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
+            if kind == "module_deviation" and not delivered:
+                continue
             if entry is None:
                 sent[key] = {"type": kind, "sent_ts": now, "reminded": False,
-                             "to": sorted(briefs)}
+                             "to": delivered if kind == "module_deviation" else sorted(briefs)}
             else:
                 entry["reminded"] = True
+
+    def _send_module_brief(self, db, alert, name, text, payload):
+        """Reauthorize under a recipient row lock, held through mailbox commit.
+
+        Canon roles are reread after the lock, not reused from collection or
+        preparation. Thread recording happens only after commit and explicitly
+        in the finding's project, independently of the recipient's team.
+        """
+        from . import canon, fil, mail, sous_utilisation, work
+        project = alert.get("project")
+        if not project:
+            return False
+        with db.transaction() as tx:
+            row = storage.of(tx).mailbox.lock_recipient(name)
+            if row is None:
+                return False
+            canons = canon.load_configured(self.cfg) if self.cfg.canon else []
+            orchestrators = sous_utilisation.role_orchestrators(canons)
+            auditors = sous_utilisation.role_orchestrators(canons, alert_briefs.AUDITOR_ROLES)
+            authorized = (name in orchestrators and row.get("chantier") == project
+                          and name in (alert.get("orchestrators") or ())) \
+                or (name in auditors and row.get("chantier") in (None, "", project))
+            if not authorized:
+                return False
+            message_id = mail.send(tx, work.SYSTEM_SENDER, name, text, kind="event",
+                                   payload=payload, thread=False)
+        fil.record(self.cfg, db, sender=work.SYSTEM_SENDER, recipients=[name], text=text,
+                   project=project, mailbox_ids=[message_id], meta={"kind": "event"})
+        return True
 
     # -- résolution -----------------------------------------------------------
     def _resolved(self, key: str, entry: dict, now: float) -> None:

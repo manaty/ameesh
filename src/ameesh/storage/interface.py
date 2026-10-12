@@ -690,6 +690,14 @@ class Mailbox(Domain):
     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
 
     @abc.abstractmethod
+    def lock_recipient(self, recipient: str) -> dict | None:
+        """Lock the registry recipient against reassignment/deletion until commit.
+
+        Call within a transaction, recheck authorization, then deposit there.
+        Returns name and chantier; missing recipients are not authorized.
+        """
+
+    @abc.abstractmethod
     def send(self, sender: str, recipient: str, body: str, *, host: str | None,
              kind: str, payload: dict | None, work_item_id: str | None,
              signature: str | None, signature_key: str | None,

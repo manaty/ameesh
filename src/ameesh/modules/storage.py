@@ -73,3 +73,30 @@ class ModuleStore:
             "RETURNING id, work_item_id, module, kind, subject, payload, actor, binding_id",
             (int(item_id), module, kind, subject, json.dumps(payload), actor, binding_id))
         return rows[0]
+
+    def active(self):
+        """Active installed names; tolerate a database predating modules."""
+        rows = self.db.query("SELECT to_regclass('project_modules') AS relation")
+        if not rows or not rows[0].get("relation"):
+            return []
+        return self.db.query("SELECT project, module FROM project_modules ORDER BY project, module")
+
+    def audit_evidence(self, project, module, types, subject_kind, evidence_kind):
+        """Read current declarations and matching evidence in one snapshot."""
+        return self.db.query(
+            "SELECT w.id, w.title, w.type, w.state, w.assignee, "
+            "extract(epoch from w.created_at)::float8 AS created_ts, "
+            "d.id AS declaration_id, d.subject, "
+            "extract(epoch from d.at)::float8 AS declaration_ts, "
+            "EXISTS (SELECT 1 FROM work_module_milestones e "
+            "WHERE e.work_item_id = w.id AND e.module = p.module "
+            "AND e.kind = %s AND e.binding_id = d.id AND e.subject = d.subject) AS proved "
+            "FROM work_items w JOIN project_modules p "
+            "ON p.project = coalesce(nullif(w.app, ''), w.workstream, '') "
+            "LEFT JOIN LATERAL (SELECT id, subject, at FROM work_module_milestones "
+            "WHERE work_item_id = w.id AND module = p.module AND kind = %s "
+            "ORDER BY id DESC LIMIT 1) d ON true "
+            "WHERE p.project = %s AND p.module = %s "
+            "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
+            "AND w.state <> 'closed' ORDER BY w.id",
+            (evidence_kind, subject_kind, project, module, json.dumps(list(types))))
