@@ -209,7 +209,11 @@ else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
       sleep 15
     fi
   done
+  if [ "${#non_verifiees[@]}" -gt 0 ]; then
+    etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
 }
+
 controler_agents() {
   local noms p ligne heure attendu echec=0
   noms=$(agents_du_registre) || return 1
