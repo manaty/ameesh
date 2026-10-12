@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from . import containers as containers_mod
 from . import platform, storage
-from .platform.signals import ProcessHandle, CLEANUP_SIGNAL_LOCK
+from .platform.signals import ProcessHandle, CLEANUP_SIGNAL_LOCK, PidfdWaitUnavailable
 from .mediated_executor.contract import NotSupportedRemotely
 
 #: noms de processus tenus pour des shells (tâche de fond d'un harnais)
@@ -216,6 +216,7 @@ class Tracker:
     #: zombies adoptés hors des tours suivis (démons détachés) : moissonnés
     STRAYS_EVERY_S = 60.0
     UNKNOWN_ZOMBIES_WARN = 32
+    CLEANUP_SECTION_S = 2.0
     #: fin de tour : délai laissé aux processus qui se ferment avec le
     #: harnais (serveurs MCP) avant de parler de travail de fond
     SETTLE_S = 2.0
@@ -558,51 +559,79 @@ class Tracker:
                      % (entry.agent, exc))
             return None
 
+    def _cleanup_remaining(self, entry: Entry, deadline: float) -> float:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            entry.unverified = True
+            return 0.0
+        return remaining
+
     def _signal_handles(self, entry: Entry, signum: int) -> None:
         foreign = self._foreign_groups(entry)
         for handle in entry.handles.values():
-            was_stopped, delivered = True, False
+            was_stopped, delivered, note = True, False, None
             try:
                 with CLEANUP_SIGNAL_LOCK:
+                    deadline = time.perf_counter() + self.CLEANUP_SECTION_S
                     if not handle.live():
                         continue
                     location = handle.location()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
                     if foreign is None or location is None or any(g in foreign for g in location):
                         entry.unverified = True
-                        self.log("[%s] background pid %s: ownership changed or unknown; no signal"
-                                 % (entry.agent, handle.pid))
+                        note = "ownership changed or unknown; no signal"
                         continue
                     state = handle.state()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
                     if state is None:
                         entry.unverified |= bool(handle.live())
                         continue
+                    # A self-stop after this read remains a job-control race.
                     was_stopped = state in ("T", "t")
-                    if not handle.freeze():
+                    remaining = self._cleanup_remaining(entry, deadline)
+                    if not remaining:
+                        continue
+                    if not handle.freeze(timeout=min(.5, remaining)):
                         entry.unverified |= bool(handle.live())
-                        self.log("[%s] background pid %s: stop not confirmed; no termination signal"
-                                 % (entry.agent, handle.pid))
+                        note = "stop not confirmed; no termination signal"
+                        continue
+                    if not self._cleanup_remaining(entry, deadline):
                         continue
                 # Registry I/O must not delay suite-cap TERM/CONT. It may
                 # resume this target here; the final local check refuses it.
                 current_foreign = self._foreign_groups(entry)
                 # Later registry ownership changes remain a residual race.
                 with CLEANUP_SIGNAL_LOCK:
+                    deadline = time.perf_counter() + self.CLEANUP_SECTION_S
                     location = handle.location()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
                     if current_foreign is None or location is None or any(
                             g in current_foreign for g in location):
                         entry.unverified = True
-                        self.log("[%s] background pid %s: ownership changed while stopping; no termination signal"
-                                 % (entry.agent, handle.pid))
+                        note = "ownership changed while stopping; no termination signal"
                         continue
-                    if handle.state() not in ("T", "t"):
+                    state = handle.state()
+                    if not self._cleanup_remaining(entry, deadline):
+                        continue
+                    if state not in ("T", "t"):
                         entry.unverified |= bool(handle.live())
                         continue
                     delivered = handle.send(signum)
+                    self._cleanup_remaining(entry, deadline)
             finally:
                 with CLEANUP_SIGNAL_LOCK:
-                    # Preserve stops that existed before cleanup.
+                    deadline = time.perf_counter() + self.CLEANUP_SECTION_S
+                    # Preserve stops seen before cleanup; release our own stop.
                     if not was_stopped and (signum != signal.SIGKILL or not delivered) and handle.live():
-                        handle.send(signal.SIGCONT)
+                        if self._cleanup_remaining(entry, deadline):
+                            handle.send(signal.SIGCONT)
+                    self._cleanup_remaining(entry, deadline)
+                # Logging can block on I/O too: keep it outside the shared lock.
+                if note is not None:
+                    self.log("[%s] background pid %s: %s" % (entry.agent, handle.pid, note))
 
     def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
         for p in table:
@@ -760,15 +789,21 @@ class Tracker:
                 retained = False
         if retained:
             return self._reap_observed(job.pid, job.start)
-        # Only attributed jobs may use this degraded fallback. The identity
-        # read narrows reuse races; it cannot reserve PID/wait ownership.
+        return self._reap_identity(job.pid, job.start)
+
+    @staticmethod
+    def _reap_identity(pid: int, start) -> int | None:
+        # Only attributed jobs/observations may use this degraded fallback.
+        # The identity read cannot reserve PID/wait ownership.
+        if start is None:
+            return None
         try:
-            current_start = platform.start_time(job.pid)
+            current_start = platform.start_time(pid)
         except (platform.NotAvailable, OSError):
             return None
-        if current_start != job.start:
+        if current_start != start:
             return None
-        return platform.reap(job.pid)
+        return platform.reap(pid)
 
     def _reap_observed(self, pid: int, start) -> int | None:
         with self.observed_lock:
@@ -777,7 +812,10 @@ class Tracker:
             handle = self.observed_handles.get(pid)
             if handle is None:
                 return None
-            code = handle.reap()
+            try:
+                code = handle.reap()
+            except PidfdWaitUnavailable:
+                code = self._reap_identity(pid, start)
             if code is not None:
                 handle.close()
             return code
@@ -800,11 +838,15 @@ class Tracker:
                 if known.get(p["pid"]) != p.get("start") or p.get("start") is None:
                     unknown.append(p["pid"])
                     continue
-                self._reap_observed(p["pid"], p.get("start"))
+                if self._reap_observed(p["pid"], p.get("start")) is None:
+                    unknown.append(p["pid"])
         self.unknown_zombies = len(unknown)
         if len(unknown) >= self.UNKNOWN_ZOMBIES_WARN and not self._zombies_warned:
-            self.log("background alert: %s unattributed zombie children (PIDs %s); wait statuses preserved"
-                     % (len(unknown), ",".join(map(str, sorted(unknown)))))
+            listed = ",".join(map(str, sorted(unknown)[:20]))
+            if len(unknown) > 20:
+                listed += " … et %s autres" % (len(unknown) - 20)
+            self.log("background alert: %s unknown or unreaped zombie children (PIDs %s); wait statuses preserved"
+                     % (len(unknown), listed))
         self._zombies_warned = len(unknown) >= self.UNKNOWN_ZOMBIES_WARN
         current = {p["pid"]: p.get("start") for p in table}
         with self.observed_lock:

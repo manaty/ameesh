@@ -119,7 +119,9 @@ class OwnershipRaceTest(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("alert", notes[0])
         self.assertIn("900000", notes[0])
-        self.assertIn("900031", notes[0])
+        self.assertIn("900019", notes[0])
+        self.assertNotIn("900020", notes[0])
+        self.assertIn("… et 12 autres", notes[0])
 
     def test_observed_descendant_uses_retained_pidfd(self):
         tracker = self.tracker()

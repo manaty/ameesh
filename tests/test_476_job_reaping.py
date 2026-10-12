@@ -170,7 +170,7 @@ class JobReapingTest(unittest.TestCase):
             attempted.set()
             cap._term(item, [])
         worker = threading.Thread(target=cap_thread)
-        def freeze():
+        def freeze(timeout):
             worker.start()
             self.assertTrue(attempted.wait(2))
             self.assertFalse(signalled.wait(.1))

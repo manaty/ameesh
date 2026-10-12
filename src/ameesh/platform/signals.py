@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import errno
 import select
 import signal
 import time
@@ -15,7 +16,14 @@ from .process import start_time, _stat_fields
 CLEANUP_SIGNAL_LOCK = threading.RLock()
 
 
+class PidfdWaitUnavailable(RuntimeError):
+    """Kernel/API cannot wait on pidfds; caller must guard any PID fallback."""
+
+
 class ProcessHandle:
+    # Linux 5.3 can open pidfds but cannot yet use waitid(P_PIDFD).
+    _wait_supported: bool | None = None
+
     def __init__(self, pid: int, fd: int):
         self.pid, self.fd = pid, fd
 
@@ -75,12 +83,21 @@ class ProcessHandle:
 
     def reap(self) -> int | None:
         """Consume only this retained child's exit, never a reused numeric PID."""
-        if self.fd is None or not hasattr(os, "P_PIDFD"):
+        if self.fd is None:
             return None
+        if ProcessHandle._wait_supported is False or not hasattr(os, "P_PIDFD"):
+            ProcessHandle._wait_supported = False
+            raise PidfdWaitUnavailable("waitid(P_PIDFD) unavailable")
         try:
             info = os.waitid(os.P_PIDFD, self.fd, os.WEXITED | os.WNOHANG)
-        except (ChildProcessError, OSError):
+        except ChildProcessError:
             return None
+        except OSError as exc:
+            if exc.errno in (errno.ENOSYS, errno.EINVAL):
+                ProcessHandle._wait_supported = False
+                raise PidfdWaitUnavailable("waitid(P_PIDFD) unsupported") from exc
+            return None
+        ProcessHandle._wait_supported = True
         if info is None:
             return None
         return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
