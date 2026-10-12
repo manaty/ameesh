@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "Study — real trial of Hermes Agent with DeepSeek, compared with dsh (L153)"
-description: "Hermes Agent (Nous Research) and dsh, both on deepseek-flash, run the same two tasks in identical clones of this repository on ameesh-agents-1, two runs each. They come out even on fidelity (8/8 correct, near-identical diffs), on cost (about 0.03 USD a run) and on speed (dsh slightly faster). Hermes is heavier to install (about 1.3 GB, its own pinned runtimes) and has no event stream that ameesh already reads. Recommendation: stay on dsh; keep Hermes as an option through its ACP server if dsh is ever dropped."
+description: "Hermes Agent and dsh, both on deepseek-flash, run the same two tasks in identical clones of this repository on ameesh-agents-1, two runs each. They come out even on fidelity (8/8 correct, near-identical diffs), on cost (about 0.03 USD a run) and on speed (dsh slightly faster). Hermes is heavier to install (about 1.3 GB, its own pinned runtimes) and has no event stream that ameesh already reads. Recommendation: stay on dsh; keep Hermes as an option through its ACP server if dsh is ever dropped."
 status: draft
 tags: [harnais, deepseek, dsh, hermes, cout, essai]
 generated: { by: "ameesh-dev6/claude-opus-5-5", at: "2026-10-12T10:47:00Z" }
@@ -90,7 +90,14 @@ test), well under the cap.
 
 * **Installation is heavy and messes with the host.**
   * **The official installer** (`curl … install.sh | bash`) writes to
-    `~/.hermes` and adds `~/.local/bin` to `~/.bashrc`.
+    `~/.hermes` and adds `~/.local/bin` to `~/.bashrc`. It was not run for
+    this trial: Hermes was installed by the route below, with `HERMES_HOME`
+    in the temporary folder. Check on ameesh-agents-1 after the trial
+    (2026-10-12, about 11:25Z): `~/.bashrc` is byte-identical to
+    `/etc/skel/.bashrc` (`diff` empty, same SHA-256), has no `hermes` or
+    `.local/bin` line, and its change time (`stat -c %z`, 2026-10-11
+    01:59Z, same instant as `~/.profile`) predates the trial; `~/.hermes`
+    and `~/.local/bin/hermes` do not exist. Nothing needed restoring.
   * **pip fails:** the package refuses to build as a wheel ("Building wheels
     or sdists for hermes-agent is not supported").
   * **What worked:** a clone, then `uv sync --frozen --no-dev` into a venv,
