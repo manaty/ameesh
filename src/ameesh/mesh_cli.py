@@ -1153,7 +1153,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import identity, work_projects
             binding = identity.resolve_binding(cfg, db)
             creator = binding.name if binding.ok else args.actor
-            args.app = work_projects.creation_project(cfg, db, creator, args.app)
+            if args.new_project and args.app is None:
+                raise work.WorkError("--new-project goes with --app <project>")
+            args.app = work_projects.creation_project(cfg, db, creator, args.app,
+                                                      new_project=args.new_project)
+            # #506: read before the lot exists (it makes its project known)
+            introduced = (work_projects.introduction(cfg, db, args.app, creator)
+                          if args.new_project and args.app else "")
             minutes = estimates.parse(args.estimate) if args.estimate else None
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
@@ -1164,7 +1170,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
-                estimate=minutes, estimate_source=args.estimate_source, size=args.size)
+                estimate=minutes, estimate_source=args.estimate_source, size=args.size,
+                note=introduced)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -2104,6 +2111,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--source", default="")
     pw_add.add_argument("--app", default=None,
                         help="project; default: the creating agent's registry or own canon")
+    pw_add.add_argument("--new-project", action="store_true",
+                        help="#506: accept an --app project nobody declares yet "
+                             "(journaled on the lot); refused otherwise")
     pw_add.add_argument("--body", default=None)
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)

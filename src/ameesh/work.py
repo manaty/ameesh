@@ -193,6 +193,7 @@ def add(
     estimate=None,
     estimate_source: str | None = None,
     size: str | None = None,
+    note: str = "",
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -207,7 +208,9 @@ def add(
     posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
     un agent » est appliquée par les points d'entrée (`estimates.check`).
     L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
-    clé de la table de référence des durées."""
+    clé de la table de référence des durées.
+    #506: `note` is appended to the creation event (a project introduced
+    with --new-project)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -234,7 +237,8 @@ def add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
         budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
-        + ("; estimate: %s" % span(minutes * 60) if minutes else ""),
+        + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+        + ("; %s" % note if note else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
