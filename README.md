@@ -56,6 +56,7 @@ ameesh budget [set --per-hour X --per-day Y [--agent A] | unset …]  # mesh-wid
 
 Operating agents (L26: session per lot, enriched `list --json`, alerts,
 restart, balances — schemas): [`docs/EXPLOITATION.md`](docs/EXPLOITATION.md).
+Durable host handoffs and adapter recovery: [`docs/HOST-HANDOFFS.md`](docs/HOST-HANDOFFS.md).
 
 Demo — the whole scenario of the end-to-end test (`tests/test_bout_en_bout.py`),
 commented, on a temporary database that is dropped afterwards (fictitious

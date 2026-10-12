@@ -85,6 +85,19 @@ class PrimaireAuDelaDuPlafondTest(_Comptes):
         self.assertEqual(critique.profile.name, "primaire")
         self.assertIn("beyond its 50% cap", critique.why)
 
+    def test_retour_d_emprunt_avec_la_marge_meme_au_dela_de_50(self):
+        # #389 r2 : la marge du retour tient aussi sur le compte par défaut
+        # au-delà de son plafond de 50 % (plafond de rythme 90 %, 80 % avec elle)
+        self.jauge("primaire", 85)
+        self.jauge("secondaire", 96)
+        self.assertEqual(self.choose(critical=True).profile.name, "primaire")
+        retour = self.choose(critical=True, margin=True)
+        self.assertIsNone(retour.profile)
+        self.jauge("primaire", 60)
+        retour = self.choose(critical=True, margin=True)
+        self.assertEqual(retour.profile.name, "primaire")
+        self.assertIn("beyond its 50% cap", retour.why)
+
     def test_plafond_explicite_tenu(self):
         self.items = accounts.parse({"codex": [{"name": "primaire", "cap": 0.5},
                                                self.secondaire]})["codex"]
