@@ -249,6 +249,24 @@ avec ou sans PR : fusion directe, avance rapide, squash. La cible par défaut
 est celle du dépôt (`git config ameesh.target develop` dans le clone si
 l'équipe n'intègre pas sur la branche par défaut), ou `--target`.
 
+**Branche `lot/<id>-…`** (L118b). Un lot sans branche déclarée prend pour
+branche son unique `lot/<id>` ou `lot/<id>-<sujet>`, locale ou `origin/`.
+Elle est posée sur le lot dès que le relevé la voit en avance sur sa cible.
+La fusion GitHub de cette branche (« Merge pull request #N from
+owner/lot/<id>-… ») ou une fusion locale (« Merge branch 'lot/<id>-…' »)
+ferme le lot, même après la suppression de la branche. Le relevé lit alors le
+corps de la PR (`gh`). Une PR qui ne livre qu'une partie d'un lot parapluie
+(#139) porte dans sa description :
+
+```
+ameesh-work-partial: <numéro du lot>
+```
+
+Le lot reste ouvert jusqu'à la fusion d'une PR qui ne porte pas cette
+ligne. Si le corps est illisible (`gh` absent ou non connecté), un lot sans
+branche déclarée reste ouvert. Une branche déclarée et prouvée fusionnée
+ferme le lot comme avant. `ameesh work sync-github` suit les mêmes règles.
+
 ## Fusion sans PR ni branche déclarée
 
 Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,
