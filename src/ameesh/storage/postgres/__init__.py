@@ -23,6 +23,7 @@ from .costs import TurnCosts
 from .conversations import Conversations
 from .credentials import Credentials
 from .grants import Grants
+from .handoffs import Handoffs
 from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
 from .menage import Housekeeping
@@ -78,6 +79,7 @@ class PostgresStorage(interface.Storage):
         self.decisions = Decisions(db)
         self.roadmap = Roadmap(db)
         self.operations = Operations(db)
+        self.handoffs = Handoffs(db)
         self.hosts = Hosts(db)
         self.turn_resources = TurnResources(db)
         self.visibility = Visibility(db)

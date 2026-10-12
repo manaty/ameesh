@@ -224,8 +224,8 @@ class PauseTest(_MoveCase):
 
 
 class RunnerRelocationTest(_MoveCase):
-    def test_executeur_se_deplace_puis_un_autre_hote_reprend(self):
-        self._prepare()                     # pas de bail : l'exécuteur le prendra
+    def test_executeur_garde_source_sans_handoff_prepare(self):
+        self._prepare()
         self.releve("atelier", 0)
         self.releve("banc", 8 * 1024 ** 3)
         env = self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
@@ -233,13 +233,8 @@ class RunnerRelocationTest(_MoveCase):
         proc = self.runner("--once", "--agents", "ouvrier", env=env)
         self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
         row = registry.get(self.db, "ouvrier")
-        self.assertEqual(row["host"], "banc")
-        self.assertIn("Resuming after a move", row["pending_prompt"])
-        # l'exécuteur de l'hôte d'arrivée réclame et fait le tour
-        env_b = self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
-                         AMEESH_HOST="banc")
-        proc = self.runner("--once", "--agents", "ouvrier", env=env_b)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        tours = self.turns()
-        self.assertTrue(tours, proc.stdout)
-        self.assertEqual(tours[-1]["harness"], "deepseek")
+        self.assertEqual(row["host"], "atelier")
+        self.assertEqual(row["session_id"], "sess-1")
+        self.assertIn("consigne en attente", row["pending_prompt"])
+        self.assertIsNone(storage.of(self.db).handoffs.active("ouvrier"))
+        self.assertFalse(self.turns(), proc.stdout)

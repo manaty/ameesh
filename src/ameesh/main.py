@@ -13,6 +13,7 @@
         explicit binding of an external session to an agent (L41, 0030);
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
+  ameesh activity <persona> [--since 24h] [--json]   persona activity log (L59);
   ameesh attach <agent> [--wait] [--ttl S]
         an interactive session on the agent's lease, same session (C9);
   ameesh list | show          observability (host, lease, unread, budget, key);
@@ -50,6 +51,9 @@
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
+  ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
+        the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
+        docs/api/openapi-v1.json);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -87,15 +91,19 @@
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
+  ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh approve-check [--url U] [--json]
         RP ID/origin agreement between ameesh-approve and this verifier;
   ameesh import-v0 | export-v0          switch from/to the v0 file mailbox;
   ameesh migrate | doctor     schema and diagnostics;
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh module <name> …              installed project module commands;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
+        reserved host move at a lot boundary, durable journal (L232a);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
@@ -104,6 +112,7 @@
         | status [<job>] | cancel <job>
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
         same output and exit code, local fallback;
+  ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
 
 The human approval service (spec §9) is a separate command,
@@ -122,7 +131,7 @@ import sys
 MESH_COMMANDS = (
     "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
-    "review-class",
+    "review-class", "handoff",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
@@ -213,6 +222,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "attach":
         from . import runner
         return runner.attach_main(rest)
+    if command == "activity":
+        from . import activity
+        return activity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)
@@ -223,13 +235,24 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "projects":
         from . import projects
         return projects.main(rest)
+    if command == "serve":
+        # L84: read API, local mode
+        from . import serve
+        return serve.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap
         return roadmap.main(rest)
+    if command == "memory":
+        from . import persona_memory
+        return persona_memory.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "sessions":
+        # L52 (0032 §2): current and past persona sessions.
+        from . import persona_sessions
+        return persona_sessions.main(rest)
     if command == "watch":
         # L121: the watch of an agent (timer + versioned instruction)
         from . import watch
@@ -242,6 +265,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions
         return decisions.main(rest)
+    if command == "session":
+        from . import session_backup
+        return session_backup.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat

@@ -27,6 +27,12 @@ qu'il ne fait jamais, et comment il en rend compte.
   est retirée (module IT, L317a) : analyse profonde ciblée sur ce lot, premier
   rapport dans les 30 min (voir « Sur un bug de priorité 1 ou une release
   retirée ») ;
+* le courrier `event` urgent « Critical agent paused on budget: … »
+  d'`ameesh` (L242b) : un agent critique est en pause budget. Passage court
+  centré sur ce point : quel compte, jusqu'à quand (`ameesh accounts list`,
+  `ameesh budget --json`) ; le geste revient à l'orchestrateur ou à l'humain
+  (libérer un compte, relever un plafond, confier le travail urgent à un
+  autre agent). S'il le fait lui-même, c'est au niveau 3 : il propose ;
 * le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
   traiter (L132) : « Stale lot: … », « Underused plan: … »,
   « Idle capacity: … », et leur « Reminder, alert still active … » 6 h plus
@@ -64,7 +70,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot ouvert |
+| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot ouvert ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
 | 4 | Dépense et solde | `ameesh budget --json`, `ameesh cost balance`, `ameesh cost gauges` | dépense réelle au-dessus de l'estimation, plafond proche, `balance_low` |
