@@ -499,6 +499,9 @@ restée 4 h fusionnée sans être déployée :
    consigne de veille ne se contente jamais d'interdire « tout déploiement »
    sans le préparer. Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
+   The watch of an orchestrator is set with `ameesh watch enable --agent
+   <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
+   carries these rules and changes only through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :
