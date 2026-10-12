@@ -672,6 +672,12 @@ class AgentWorker(threading.Thread):
 
     @staticmethod
     def _signal_group(pgid: int | None, proc: subprocess.Popen, sig: int) -> None:
+        signal_group = getattr(proc, "signal_group", None)
+        if signal_group is not None:
+            # L76 : le chef d'un résident — son groupe tant qu'il est à nous
+            if pgid is None or not signal_group(sig):   # le harnais seul
+                proc.send_signal(sig)
+            return
         if pgid is not None:
             try:
                 os.killpg(pgid, sig)
@@ -752,6 +758,13 @@ class AgentWorker(threading.Thread):
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     pass
+            return
+        if hasattr(proc, "reap"):
+            # L76 : le chef d'un résident, jamais moissonné ailleurs — son
+            # groupe tué tant que son numéro est à nous, puis lui moissonné
+            if proc.reap() is None:
+                log_async("[%s] resident leader still alive after SIGKILL (kernel state?)"
+                          % self.name)
             return
         if not self._group_alive(pgid) and proc.poll() is not None:
             # Groupe mort **et** enfant direct moissonné : rien à faire. Si le
@@ -3009,8 +3022,10 @@ class AgentWorker(threading.Thread):
         """Lance le harnais résident comme un harnais de tour : sous le verrou
         de lancement, compté parmi les harnais, publié tout de suite (un arrêt
         pendant la poignée de main le trouve)."""
+        from . import resident
         with self.runner.launch_lock:
-            proc = subprocess.Popen(argv, **kwargs)
+            # jamais moissonné hors de l'arrêt de son groupe (codex r2, #417)
+            proc = resident.spawn_leader(argv, **kwargs)
             self.runner.harness_pids.add(proc.pid)
         with self.lock:
             self.proc = proc

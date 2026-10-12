@@ -178,6 +178,100 @@ def _number(value: Any) -> int:
     return 0
 
 
+class LeaderPopen(subprocess.Popen):
+    """The leader of a resident harness group, never reaped outside the kill
+    path (codex r2, #417): `poll()` and `wait()` see its exit without reaping
+    it (`waitid` with WNOWAIT), so its zombie keeps its pid — the group's
+    number — from being reused; `returncode` stays None until `reap()`,
+    which kills the group first. Elsewhere (no WNOWAIT): a plain Popen."""
+
+    _exit: int | None = None
+
+    def __init__(self, *args, **kwargs):
+        #: a group signal and the reap never cross: a signal goes only while
+        #: the leader is unreaped, the reap only once the group is killed
+        self._reap_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def _peek(self) -> int | None:
+        """The exit code once the leader has exited, without reaping it."""
+        if self.returncode is not None:
+            return self.returncode
+        if self._exit is not None:
+            return self._exit
+        try:
+            info = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            # reaped behind our back: its number may be reused, never signal it
+            self.returncode = self._exit if self._exit is not None else -1
+            return self.returncode
+        if info is None:
+            return None
+        killed = info.si_code in (os.CLD_KILLED, os.CLD_DUMPED)
+        self._exit = -info.si_status if killed else info.si_status
+        return self._exit
+
+    def poll(self):
+        return self._peek()
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            code = self._peek()
+            if code is not None:
+                return code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.01)
+
+    def send_signal(self, sig) -> None:
+        with self._reap_lock:
+            if self.returncode is None:     # unreaped: the pid is still ours
+                os.kill(self.pid, sig)
+
+    def signal_group(self, sig) -> bool:
+        """`sig` to the leader's group, only while its number is ours."""
+        with self._reap_lock:
+            if self.returncode is not None:
+                return False
+            try:
+                os.killpg(self.pid, sig)
+                return True
+            except OSError:
+                return False
+
+    def reap(self, timeout: float = 2.0) -> int | None:
+        """SIGKILL to the whole group, then the leader is reaped. A leader
+        still not dead after `timeout` stays unreaped (its number with it)."""
+        with self._reap_lock:
+            if self.returncode is not None:
+                return self.returncode
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    pid, status = os.waitpid(self.pid, os.WNOHANG)
+                except ChildProcessError:
+                    self.returncode = self._exit if self._exit is not None else -1
+                    return self.returncode
+                if pid:
+                    self.returncode = os.waitstatus_to_exitcode(status)
+                    return self.returncode
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.01)
+
+
+def spawn_leader(*args, **kwargs) -> subprocess.Popen:
+    """`LeaderPopen` where the system can wait without reaping, else Popen."""
+    if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+        return LeaderPopen(*args, **kwargs)
+    return subprocess.Popen(*args, **kwargs)
+
+
 def _kill_group(proc: subprocess.Popen, grace: float, *, close_input: bool = True) -> None:
     """Close standard input (unless a writer may still use it), then SIGTERM
     and SIGKILL to the harness group."""
@@ -200,7 +294,9 @@ def _kill_group(proc: subprocess.Popen, grace: float, *, close_input: bool = Tru
             break
         except subprocess.TimeoutExpired:
             continue
-    if proc.poll() is not None:
+    if isinstance(proc, LeaderPopen):
+        proc.reap()     # the group killed while its number is ours, then reaped
+    elif proc.poll() is not None:
         # the leader is gone; what it left in the group goes too
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -253,7 +349,7 @@ class ResidentDriver:
         self.init_timeout = max(init_timeout, 0.1)
         #: L76: starts the harness (`subprocess.Popen` by default); the runner
         #: passes its own, under its launch lock
-        self.spawn = spawn or subprocess.Popen
+        self.spawn = spawn or spawn_leader
         #: cumulative session cost before this process (resumed session)
         self.cost_base = cost_base if cost_base is not None else (None if session else 0.0)
         self.last_activity = time.monotonic()
@@ -402,7 +498,7 @@ class ResidentDriver:
         if self.proc is None:
             raise ResidentError("resident harness not started")
         if self.proc.poll() is not None:
-            raise ResidentError("resident harness exited (code %s)" % self.proc.returncode)
+            raise ResidentError("resident harness exited (code %s)" % self.proc.poll())
 
     def _reset_turn(self) -> None:
         self._final = ""

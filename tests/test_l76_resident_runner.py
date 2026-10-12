@@ -23,14 +23,64 @@ from .test_l75_resident import claude_doc
 
 
 def _group_gone(pgid: int, timeout: float = 5.0) -> bool:
+    """No live member left in the group (the resident's leader may stay a
+    zombie until it is reaped: its number is then still reserved)."""
+    from ameesh import platform
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
+        if not [p for p in platform.process_table() if p["pgid"] == pgid and not p["zombie"]]:
             return True
         time.sleep(0.05)
     return False
+
+
+def _state(pid: int) -> str:
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return ""
+
+
+@unittest.skipUnless(os.path.isdir("/proc/self") and hasattr(os, "WNOWAIT"), "Linux")
+class LeaderPopenTest(unittest.TestCase):
+    """codex r2 (#417): the leader is reaped only after its group is killed."""
+
+    def _leader(self, code: str):
+        proc = resident.spawn_leader([sys.executable, "-c", code], start_new_session=True)
+        self.assertIsInstance(proc, resident.LeaderPopen)
+        self.addCleanup(proc.reap)
+        return proc
+
+    def test_exit_seen_without_reaping(self):
+        proc = self._leader("import sys; sys.exit(3)")
+        self.assertEqual(proc.wait(5), 3)
+        self.assertEqual(proc.poll(), 3)
+        self.assertIsNone(proc.returncode)            # not reaped
+        self.assertEqual(_state(proc.pid), "Z")        # its number stays reserved
+        self.assertEqual(proc.reap(), 3)
+        self.assertEqual(_state(proc.pid), "")
+
+    def test_reap_kills_the_group_first(self):
+        proc = self._leader("import subprocess, sys, time; "
+                            "subprocess.Popen([sys.executable, '-c', 'import time; "
+                            "time.sleep(30)']); time.sleep(30)")
+        time.sleep(0.5)
+        self.assertEqual(proc.reap(), -signal.SIGKILL)
+        self.assertTrue(_group_gone(proc.pid))
+
+    def test_no_signal_once_reaped(self):
+        proc = self._leader("pass")
+        proc.wait(5)
+        proc.reap()
+        with mock.patch.object(os, "killpg") as killpg, mock.patch.object(os, "kill") as kill:
+            self.assertFalse(proc.signal_group(signal.SIGKILL))
+            proc.send_signal(signal.SIGKILL)
+            rp = resident_runner.ResidentProcess(mock.Mock(proc=proc, pgid=proc.pid),
+                                                 key=(), life_id="x")
+            rp.kill_now()
+        killpg.assert_not_called()
+        kill.assert_not_called()
 
 
 class TurnFileTest(unittest.TestCase):
@@ -232,20 +282,17 @@ class ResidentRunnerTest(PgTestCase):
         fil.join(10)
         self.assertIsNone(worker.resident)
 
-    def test_kill_now_never_signals_a_reused_group(self):
-        import subprocess
-        etranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                                    start_new_session=True)
-        self.addCleanup(lambda: (etranger.kill(), etranger.wait()))
-        reaped = mock.Mock(returncode=0, pid=etranger.pid)
-        driver = mock.Mock(proc=reaped, pgid=etranger.pid)
-        resident_runner.ResidentProcess(driver, key=(), life_id="x").kill_now()
-        time.sleep(0.2)
-        self.assertIsNone(etranger.poll())        # leader reaped, pid reused: untouched
-        vivant = mock.Mock(returncode=None, pid=etranger.pid)
-        driver = mock.Mock(proc=vivant, pgid=etranger.pid)
-        resident_runner.ResidentProcess(driver, key=(), life_id="y").kill_now()
-        self.assertEqual(etranger.wait(5), -signal.SIGKILL)
+    def test_kill_now_kills_an_idle_group(self):
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self.assertIsInstance(rp.proc, resident.LeaderPopen)
+        rp.kill_now()
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertIsNone(rp.proc.returncode)       # still unreaped: number reserved
+        worker._close_resident("test")
+        self.assertIsNotNone(rp.proc.returncode)
+        self.assertEqual(_state(rp.pgid), "")
 
     def test_a_changed_turn_environment_restarts(self):
         _runner, worker = self._worker()

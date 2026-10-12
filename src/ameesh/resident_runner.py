@@ -220,26 +220,22 @@ class ResidentProcess:
     def kill_now(self) -> None:
         """SIGKILL to the whole group, nothing written before (lost lease).
 
-        Never a reused group (codex r1, #417): while the leader is not reaped
-        (`returncode` None), its pid — the group's number — cannot be given
-        to another process. Once reaped, a process that carries that pid
-        means the number was reused, so nothing of ours is left in it (a
-        number still used as a group id is never reallocated): no signal."""
-        proc, pgid = self.proc, self.pgid
-        if proc is None or not pgid:
+        Never a reused group (codex r1 and r2, #417): the leader is a
+        `resident.LeaderPopen`, reaped only after its group is killed, under
+        the same lock as this signal — while unreaped, its pid (the group's
+        number) cannot be given to another process."""
+        proc = self.proc
+        if proc is None:
             return
-        if proc.returncode is not None:
+        signal_group = getattr(proc, "signal_group", None)
+        if signal_group is not None:
+            signal_group(signal.SIGKILL)
+        elif proc.returncode is None and self.pgid:
+            # a plain Popen (no WNOWAIT on this system): best effort
             try:
-                os.kill(pgid, 0)
-                return                  # reused pid: not our group
-            except ProcessLookupError:
-                pass                    # free: only our survivors carry it
-            except PermissionError:
-                return                  # another user's process: not ours
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except OSError:
-            pass
+                os.killpg(self.pgid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def close(self, grace: float) -> None:
         try:
