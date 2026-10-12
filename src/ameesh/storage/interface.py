@@ -1066,6 +1066,11 @@ class WorkItems(Domain):
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod
+    def events_noted(self, prefix: str, since_ts: float) -> list[dict]:
+        """L317c : les lignes de journal, tous lots, dont la note commence par
+        `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
+
+    @abc.abstractmethod
     def milestones(self, item_id: int, limit: int) -> list[dict]:
         """Les jalons d'un lot (0013), du plus récent au plus ancien."""
 

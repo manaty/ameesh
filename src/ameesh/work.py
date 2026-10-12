@@ -192,7 +192,9 @@ def add(
     L118 : `branch` (et `branch_target`) nomment la branche du lot, dont la
     fusion le fermera (`plan_git.sync_branches`). L130 : `priority` (1 haute,
     2 normale, 3 basse, comme la file d'amélioration), pour enregistrer une
-    demande d'humain avec sa priorité.
+    demande d'humain avec sa priorité. L317c : un bug de priorité 1 ouvert par
+    un humain ou son chat demande une analyse profonde à l'auditeur
+    (`deep_analysis.on_lot_created`, rendu sous la clé `deep_analysis`).
 
     L157 : `estimate` (« 2h », « 90m », ou des minutes) est la durée estimée,
     posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
@@ -218,7 +220,7 @@ def add(
         raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
-    return storage.of(db).work.add(
+    item = storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
         budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
@@ -229,6 +231,13 @@ def add(
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
         if minutes else None, change_size=size or None)
+    # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
+    # l'auditeur pour une analyse profonde, tout de suite
+    from . import deep_analysis
+    analysis = deep_analysis.on_lot_created(db, item, actor=actor, cfg=cfg)
+    if analysis is not None:
+        item["deep_analysis"] = analysis
+    return item
 
 
 # --------------------------------------------------------------------------

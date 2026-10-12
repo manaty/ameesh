@@ -449,6 +449,19 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
+    def events_noted(self, prefix, since_ts) -> list[dict]:
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return self.db.query(
+            """
+            SELECT id, work_item_id, state, note, actor,
+                   extract(epoch from created_at)::float8 as created_ts
+              FROM work_item_events
+             WHERE note LIKE %s AND created_at >= to_timestamp(%s)
+             ORDER BY id
+            """,
+            (pattern, float(since_ts)),
+        )
+
     def milestones(self, item_id, limit) -> list[dict]:
         return self.db.query(
             """

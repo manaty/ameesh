@@ -22,6 +22,11 @@ qu'il ne fait jamais, et comment il en rend compte.
   l'alerte ;
 * le courrier « Analyse profonde » d'`ameesh`, chaque nuit, ou une demande du
   propriétaire : analyse profonde ;
+* le courrier `event` urgent « Deep analysis requested (L317c): … » d'`ameesh`,
+  dès qu'un humain ou son chat ouvre un bug de priorité 1, ou qu'une release
+  est retirée (module IT, L317a) : analyse profonde ciblée sur ce lot, premier
+  rapport dans les 30 min (voir « Sur un bug de priorité 1 ou une release
+  retirée ») ;
 * le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
   traiter (L132) : « Lot stagnant : … », « Forfait sous-employé : … »,
   « Capacité au repos : … », et leur « Relance » 6 h plus tard si l'alerte
@@ -196,13 +201,20 @@ en lecture seule, puis les correctifs.
   déploiement, une attente de plus d'une heure sur un chemin critique, une
   alerte urgente qu'un passage court n'a pas résolue. La période va de la
   dernière situation normale à maintenant ;
+* sur un bug de priorité 1 ouvert par un humain ou son chat, ou une release
+  retirée : tout de suite, au courrier « Deep analysis requested » (voir
+  ci-dessous) ;
 * à la demande du propriétaire.
 
 Une seule analyse à la fois, et au plus deux analyses après incident par jour
 en plus de celle de la nuit : au-delà, il note l'incident, et l'analyse de la
-nuit le reprend. Avant de lancer les sous-agents, il lit `ameesh hosts --json` :
+nuit le reprend. Les analyses demandées par `ameesh` sur un bug de priorité 1
+ou une release retirée n'entrent pas dans cette limite : elles passent avant
+les autres. Avant de lancer les sous-agents, il lit `ameesh hosts --json` :
 sous pression de l'hôte, les angles passent l'un après l'autre ; sous pression
-critique, l'analyse attend le passage suivant.
+critique, l'analyse attend le passage suivant (une analyse demandée par
+`ameesh` rend quand même son premier rapport dans les 30 min, sans
+sous-agent).
 
 ### Déroulé
 
@@ -223,6 +235,38 @@ critique, l'analyse attend le passage suivant.
    pendant l'analyse (requête 9, ou `ameesh fil show ameesh --last 50`) : tant
    que le hook de courrier remet des messages aux sous-agents (bug noté dans
    l'amendement de 0036), un message a pu atterrir chez l'un d'eux.
+
+### Sur un bug de priorité 1 ou une release retirée
+
+Demande du propriétaire du 2026-10-12 (L317c, après la Nexlink desktop 0.2.9
+livrée cassée). `ameesh` écrit la demande au journal du lot (« deep analysis
+requested (<déclencheur>): … ») et l'envoie en courrier `event` urgent, qui le
+réveille sans attendre son passage suivant. Deux déclencheurs :
+
+* `bug_p1` : un lot de type `bug` et de priorité 1 créé par un humain
+  (`--actor human:<id>`, ou un humain connu) ou par son chat (`chat-<humain>`).
+  Un lot créé par un agent, même pour le compte d'un humain, ne le déclenche
+  pas : l'orchestrateur qui en juge l'urgence demande l'analyse lui-même ;
+* `release_withdrawn` : une release retirée, apporté par le module IT (L317a)
+  par `deep_analysis.request(db, <lot>, "release_withdrawn", actor=…)`.
+
+L'analyse est celle de ce chapitre, limitée au défaut du lot. Elle remonte la
+chaîne et l'écrit sur le lot :
+
+1. **le lot qui a livré le défaut** : commit et PR (`git log -S`, `git blame`,
+   `gh pr view`) ;
+2. **la revue qui l'a laissé passer** : verdict et relecteur (jalon `verdict`
+   de `ameesh work show <lot> --json`, commentaires de la PR) ;
+3. **la barrière qui manquait** : test, CI, vérification à l'exécution réelle,
+   relecture, règle de procédure ;
+4. **un lot de suivi par barrière manquante**, qui cite le lot du défaut.
+
+**Premier rapport dans les 30 min, mesuré** : une note du lot qui commence par
+« Deep analysis: » (`ameesh work note <lot> "Deep analysis: …"`), même
+partielle (ce qui est établi, ce qui reste à établir). `ameesh work show <lot>`
+affiche le délai (ligne `analysis`) ; sans rapport au-delà de 30 min, l'alerte
+`deep_analysis_overdue` part au responsable humain. Les notes suivantes
+complètent la chaîne ; la dernière nomme les lots de suivi.
 
 ### Consigne d'un sous-agent
 
