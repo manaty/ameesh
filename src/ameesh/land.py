@@ -111,7 +111,7 @@ def _shell(command: str, path: str, timeout: float) -> str | None:
 
 def _regenerate(path: str, generated, touched, *, timeout: float = GATE_TIMEOUT_S) -> dict:
     """L160g (#473): regenerates, on the merged tree in `path`, each
-    generated file in `touched` (in conflict, or changed by the lot), stages
+    generated file in `touched`, stages
     it, then runs its check: `{ok, files, file, output}`."""
     from . import resolutions
     done = []
@@ -120,8 +120,14 @@ def _regenerate(path: str, generated, touched, *, timeout: float = GATE_TIMEOUT_
             continue
         failed = _shell(item.regen, path, timeout)
         if failed is None:
-            resolutions._check(resolutions._run(path, "add", "-A", "--", item.path), "add")
-            failed = _shell(item.check, path, timeout) if item.check else None
+            staged = resolutions._run(path, "add", "-A", "--", item.path)
+            if staged.returncode != 0:
+                failed = "cannot stage generated output: %s" % resolutions._err(staged)
+            else:
+                failed = _shell(item.check, path, timeout) if item.check else None
+                if failed is None and resolutions._run(
+                        path, "diff", "--exit-code", "--", item.path).returncode != 0:
+                    failed = "generated check changed the staged output"
         if failed is not None:
             return {"ok": False, "files": done, "file": item.path, "output": failed}
         done.append(item.path)
@@ -134,17 +140,12 @@ def merge(replayer, base: str, row: dict, rows: list[dict], *, generated=()) -> 
     at HEAD: `{state: clean|replayed|conflict|generated, files, sha,
     regenerated}`. `generated` (L160g, `radar.Generated`): those files are
     never taken from a merge nor from rerere — regenerated on the merged
-    tree when in conflict or changed by the lot, then checked (`generated`:
+    tree for every merge, including input-only changes, then checked (`generated`:
     the regeneration or its check failed, `output`)."""
     from . import resolutions
     path, run = replayer.path, resolutions._run
     lot = int(row["work_item_id"])
     paths = {g.path for g in generated}
-    lot_side = set()
-    if paths:
-        fork = run(path, "merge-base", base, row["frozen_sha"])
-        lot_side = set(changed(path, resolutions._text(fork).strip(), row["frozen_sha"])
-                       or ()) if fork.returncode == 0 else set(paths)
     commits = [r["commit_sha"] for r in rows
                if lot in (int(r["work_item_id"]), int(r["other_item_id"]))]
     missing = set(replayer.prime(commits)) if commits else set()
@@ -154,12 +155,15 @@ def merge(replayer, base: str, row: dict, rows: list[dict], *, generated=()) -> 
     for sha in commits:
         if sha in trained and sha not in missing:
             shutil.copytree(replayer._store(sha), replayer._rr_cache(), dirs_exist_ok=True)
-    proc = run(path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+    proc = run(path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                "merge", "--no-ff", "--no-commit", "--quiet", row["frozen_sha"])
     state, files, regenerated = "clean", [], []
     try:
         if proc.returncode != 0:
             files = resolutions.unmerged(path)
+            resolutions.exclude_generated(path, files, paths)
+            resolutions._check(run(path, "-c", "rerere.enabled=true", "-c",
+                                   "rerere.autoUpdate=false", "rerere"), "rerere")
             others = [f for f in files if f not in paths]
             remaining = [f for f in resolutions.rerere_remaining(path) if f not in paths] \
                 if others else []
@@ -171,7 +175,7 @@ def merge(replayer, base: str, row: dict, rows: list[dict], *, generated=()) -> 
             if others:
                 resolutions._check(run(path, "add", "--", *others), "add")
                 state = "replayed"
-        touched = (set(files) | lot_side) & paths
+        touched = paths
         if touched:
             made = _regenerate(path, generated, touched)
             if not made["ok"]:

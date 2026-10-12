@@ -143,6 +143,20 @@ def rerere_remaining(cwd: str) -> list[str]:
         else unmerged(cwd)
 
 
+def exclude_generated(cwd: str, files, generated) -> None:
+    """Remove generated conflicts from the index before invoking rerere.
+
+    The target version is only a placeholder; land regenerates it before
+    committing. For a deletion on the target side there is no placeholder.
+    """
+    for path in sorted(set(files) & set(generated)):
+        ours = _run(cwd, "checkout", "--ours", "--", path)
+        if ours.returncode == 0:
+            _check(_run(cwd, "add", "--", path), "add")
+        else:
+            _check(_run(cwd, "rm", "-f", "--", path), "rm")
+
+
 def with_markers(cwd: str, paths) -> list[str]:
     """Those of `paths` that still hold a conflict marker."""
     out = []
@@ -727,7 +741,7 @@ class Replayer:
             shutil.copytree(self._store(commit), self._rr_cache())
         try:
             _check(_run(self.path, "checkout", "-q", "-f", "--detach", a), "checkout")
-            merge = _run(self.path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+            merge = _run(self.path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                          "merge", "--no-ff", "--no-commit", "--quiet", b)
             if merge.returncode == 0:
                 return {"state": "clean", "files": [], "remaining": []}
@@ -735,9 +749,12 @@ class Replayer:
             if not files:
                 return {"state": "error", "files": [], "remaining": [],
                         "error": _err(merge)[:300]}
+            exclude_generated(self.path, files, generated)
+            _check(_run(self.path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                        "rerere"), "rerere")
             remaining = [f for f in rerere_remaining(self.path) if f not in generated]
             if export is not None:
-                export(self.path, sorted(set(files) - set(remaining)))
+                export(self.path, sorted(set(files) - set(remaining) - set(generated)))
             return {"state": "stale" if remaining else "prepared", "files": files,
                     "remaining": remaining}
         finally:
@@ -787,7 +804,7 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
         if replayer is None or row["commit_sha"] in missing:
             resolution["replay"] = "unavailable"
             continue
-        key = (p["tips"][0], p["tips"][1], row["commit_sha"])
+        key = (p["tips"][0], p["tips"][1], row["commit_sha"], tuple(sorted(generated)))
         if key not in replays:
             try:
                 replays[key] = replayer.replay(*p["tips"], row["commit_sha"],

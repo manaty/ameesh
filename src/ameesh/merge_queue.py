@@ -198,7 +198,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     row = work.get(db, lot)
     if row is None:
         raise QueueError("lot #%d not found" % lot)
-    target = row.get("branch_target") or plan_git.default_target(repo)
+    target = row.get("branch_target") or getattr(project, "target", "") or plan_git.default_target(repo)
     glob = radar.protected_target(project, target)
     if glob:
         # L160g (#473): main, release branches and tags stay an orchestrator's gesture
@@ -272,6 +272,8 @@ def _required_ci(project, sha: str, commit_ci=None) -> None:
     if runs["failed"]:
         raise QueueError("the CI on the frozen commit %s is red (%s)"
                          % (sha[:12], ", ".join(runs["failed"])))
+    if not runs.get("green"):
+        raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
@@ -731,13 +733,19 @@ def show_lines(rows: list[dict]) -> list[str]:
 def radar_project(cfg, repo: str):
     """The radar project (`radar.projects`) of the repository `repo`, if any:
     its private clone receives the fetches of `readiness`."""
-    from . import radar
+    from . import radar, migrations
     try:
-        projects = radar.settings_of(cfg).projects.values()
-    except radar.SettingsError:
-        return None
+        projects = list(radar.settings_of(cfg).projects.values())
+    except radar.SettingsError as exc:
+        raise QueueError("cannot read repository landing conditions: %s" % exc) from exc
     real = os.path.realpath(repo)
-    return next((p for p in projects if os.path.realpath(p.repo) == real), None)
+    exact = [p for p in projects if os.path.realpath(p.repo) == real]
+    slug = migrations.origin_repo(repo)
+    matching = exact or [p for p in projects if slug and migrations.repo_key(
+        p.github or migrations.origin_repo(p.repo)) == slug]
+    if len(matching) > 1:
+        raise QueueError("multiple radar projects match this repository; landing conditions are ambiguous")
+    return matching[0] if matching else None
 
 
 def run(cfg, db, args) -> int:

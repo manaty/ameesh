@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import types
 
 from ameesh import land, merge_queue, plan_github, radar, resolutions
 
@@ -17,6 +18,7 @@ from .test_l160b_radar import _git
 from .test_l160e2_land import _Land
 
 import unittest
+from unittest import mock
 
 NEXLINK = {"repo": "/srv/nexlink", "target": "develop", "land": "local",
            "gates": ["backend/scripts/check-rollbacks.sh",
@@ -56,11 +58,29 @@ class SettingsTest(unittest.TestCase):
         with self.assertRaises(radar.SettingsError):
             radar.parse_settings({"projects": {"p": dict(NEXLINK, gates=[])}})
 
+    def test_clone_alias_cannot_bypass_repository_conditions(self):
+        cfg = types.SimpleNamespace(radar={"projects": {"n": NEXLINK}})
+        with mock.patch("ameesh.migrations.origin_repo", return_value="acme/product"):
+            cfg.radar["projects"]["n"] = dict(NEXLINK, github="acme/product")
+            project = merge_queue.radar_project(cfg, "/another/worktree")
+        self.assertTrue(project.ci_required)
+        self.assertIn("main", project.protected)
+
+    def test_invalid_or_ambiguous_settings_refuse_queue_conditions(self):
+        cfg = types.SimpleNamespace(radar={"projects": {"n": dict(NEXLINK, ci_required="yes")}})
+        with self.assertRaises(merge_queue.QueueError):
+            merge_queue.radar_project(cfg, "/another/worktree")
+        cfg.radar = {"projects": {n: dict(NEXLINK, repo="/" + n, github="acme/product")
+                                  for n in ("first", "second")}}
+        with mock.patch("ameesh.migrations.origin_repo", return_value="acme/product"):
+            with self.assertRaisesRegex(merge_queue.QueueError, "ambiguous"):
+                merge_queue.radar_project(cfg, "/another/worktree")
+
 
 class ProtectedTest(unittest.TestCase):
     def test_globs(self):
         project = radar.parse_settings({"projects": {"n": NEXLINK}}).projects["n"]
-        for target in ("main", "origin/main", "desktop-v1.4", "nexlink-releases",
+        for target in ("main", "origin/main", "refs/heads/main", "desktop-v1.4", "nexlink-releases",
                        "nexlink-releases/2026-10", "refs/tags/v0.2.11"):
             self.assertIsNotNone(radar.protected_target(project, target), target)
         for target in ("develop", "origin/develop", "feature/main"):
@@ -90,6 +110,21 @@ class ProtectedQueueTest(_Land):
         self.assertIn("protected target", self.fake.queue_rows[4]["reason"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
 
+    def test_configured_default_is_checked_before_repository_default(self):
+        self.ready(4)
+        self.fake.lots[4]["branch_target"] = None
+        self.project = dataclasses.replace(self.project, target="develop", protected=("main",))
+        clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+        row = merge_queue.enter(None, 4, repo=self.repo, ci=None, project=self.project, clone=clone)
+        self.assertEqual(row["target"], "develop")
+
+    def test_explicit_protected_target_overrides_configured_default(self):
+        self.ready(4)
+        self.fake.lots[4]["branch_target"] = "refs/heads/main"
+        self.project = dataclasses.replace(self.project, target="develop", protected=("main",))
+        with self.assertRaisesRegex(merge_queue.QueueError, "protected target"):
+            merge_queue.enter(None, 4, repo=self.repo, ci=None, project=self.project)
+
 
 class _Gh:
     """`gh run list` answering `rows` (or failing)."""
@@ -104,7 +139,7 @@ class _Gh:
 
 def _run(name, status="completed", conclusion="success", at="2026-10-12T20:00:00Z"):
     return {"workflowName": name, "name": name, "status": status, "conclusion": conclusion,
-            "createdAt": at}
+            "createdAt": at, "headSha": "a" * 40}
 
 
 class CommitCiTest(unittest.TestCase):
@@ -138,6 +173,13 @@ class CommitCiTest(unittest.TestCase):
         self.addCleanup(os.rmdir, bare)
         with self.assertRaises(plan_github.GithubError):       # no GitHub repository
             radar.commit_ci(radar.Project("n", bare, ci_required=True), "a" * 40, gh=_Gh())
+
+    def test_truncated_malformed_or_wrong_sha_cannot_certify_ci(self):
+        for rows in ([_run("ci")] * 100, ["bad run"],
+                     [dict(_run("ci"), headSha="b" * 40)]):
+            with self.subTest(rows=rows[:1]):
+                with self.assertRaises(plan_github.GithubError):
+                    radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))
 
 
 class GatesForTest(unittest.TestCase):
@@ -222,6 +264,57 @@ class GeneratedLandTest(_Land):
         out = self.land(4)
         self.assertEqual(out["result"], "landed", out)
         self.assertEqual(_git(self.origin, "show", "main:other.py"), "gen")
+
+    def test_input_only_change_regenerates_an_untouched_output(self):
+        self.project = dataclasses.replace(self.project, generated=(radar.Generated(
+            "output.txt", "cp other.py output.txt", "cmp other.py output.txt"),))
+        self.queued(4)
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "show", "main:output.txt"),
+                         _git(self.origin, "show", "main:other.py"))
+
+    def test_input_only_change_with_failed_generator_does_not_move_target(self):
+        self.project = dataclasses.replace(self.project, generated=(radar.Generated(
+            "output.txt", "echo generator failed; exit 7", "test -f output.txt"),))
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("generator failed", out["output"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_check_cannot_change_the_committed_output(self):
+        self.generate(check="printf 'different\\n' > other.py")
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("changed the staged output", out["output"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_generated_conflict_is_absent_when_rerere_runs(self):
+        self.queued(4)
+        _git(self.repo, "checkout", "-q", "main")
+        with open(os.path.join(self.repo, "other.py"), "w") as fh:
+            fh.write("target version\n")
+        _git(self.repo, "commit", "-qam", "target changed")
+        _git(self.repo, "push", "-q", "origin", "main")
+        self.generate()
+        original = resolutions._run
+        seen = []
+
+        def watch(path, *args, **kwargs):
+            if args[-1] == "rerere":
+                conflicts = original(path, "diff", "--name-only", "--diff-filter=U")
+                seen.append(resolutions._text(conflicts))
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(resolutions, "_run", side_effect=watch):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertTrue(seen)
+        self.assertTrue(all("other.py" not in paths for paths in seen), seen)
 
     def test_conflict_on_it_is_regenerated_not_ejected(self):
         self.queued(4)

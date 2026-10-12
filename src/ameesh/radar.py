@@ -71,7 +71,7 @@ LEASE_NAMESPACES = ("refs/ameesh/", "refs/heads/ameesh-land/")
 LAND_MODES = ("off", "local", "pr")
 MERGE_METHODS = ("merge", "squash", "rebase")
 #: une migration numérotée : `NNNN_nom.sql`
-MIGRATION_RE = re.compile(r"^([0-9]{4})_[^/]+$")
+MIGRATION_RE = re.compile(r"^([0-9]{3,4})_[^/]+\.sql$")
 #: paires gardées au plus dans le cache d'un exécuteur
 MAX_CACHE = 20000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -207,14 +207,23 @@ def parse_settings(raw) -> Settings:
             else:
                 always.append(run.strip())
         generated = []
-        for item in value.get("generated") or ():
+        declared_generated = value.get("generated", ())
+        if not isinstance(declared_generated, (list, tuple)):
+            raise SettingsError("%s.generated: a list of generated files expected" % where)
+        for item in declared_generated:
             if not isinstance(item, dict) or set(item) - {"path", "regen", "check"} \
                     or not all(isinstance(item.get(k), str) and item[k].strip()
-                               for k in ("path", "regen")) \
+                               for k in ("path", "regen", "check")) \
                     or not isinstance(item.get("check", ""), str):
                 raise SettingsError("%s.generated: [{\"path\": file, \"regen\": command, "
                                     "\"check\": command}] expected" % where)
-            generated.append(Generated(item["path"].strip().strip("/"), item["regen"].strip(),
+            generated_path = item["path"].strip()
+            if generated_path.startswith("/") or any(
+                    part in ("", ".", "..") for part in generated_path.split("/")):
+                raise SettingsError("%s.generated: path must be relative to the repository" % where)
+            if any(g.path == generated_path for g in generated):
+                raise SettingsError("%s.generated: duplicate path %s" % (where, item["path"]))
+            generated.append(Generated(generated_path, item["regen"].strip(),
                                        (item.get("check") or "").strip()))
         ci_required = value.get("ci_required", False)
         if not isinstance(ci_required, bool):
@@ -290,6 +299,8 @@ def protected_target(project, target: str) -> str | None:
     if not target or not getattr(project, "protected", ()):
         return None
     branch = target.split("/", 1)[1] if target.startswith("origin/") else target
+    if branch.startswith("refs/heads/"):
+        branch = branch[len("refs/heads/"):]
     names = {target, branch, branch if branch.startswith("refs/") else "refs/heads/" + branch}
     for glob in project.protected:
         if any(fnmatch.fnmatchcase(name, glob) for name in names):
@@ -511,6 +522,8 @@ def _states(report: dict) -> dict:
         out["target:%d" % one["work_item"]] = one["state"]
     for dup in report.get("migrations") or ():
         out["migration:%s:%s" % (dup["target"], dup["number"])] = "duplicate"
+    for one in report.get("unreserved_migrations") or ():
+        out["unreserved:%s:%s" % (one["work_item"], one["path"])] = "unreserved"
     return out
 
 
@@ -532,7 +545,8 @@ def summary(report: dict) -> dict:
             "stale": sum(1 for p in pairs if p["state"] == "stale"),
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
-            "migration_duplicates": len(report.get("migrations") or ())}
+            "migration_duplicates": len(report.get("migrations") or ()),
+            "unreserved_migrations": len(report.get("unreserved_migrations") or ())}
 
 
 def read_snapshot(cfg, project: str) -> dict | None:
@@ -578,6 +592,11 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
         try:
             report = scan(project.repo, lots, default_target=project.target or None,
                           migrations=project.migrations, cache=cache)
+            from .migration_reservations import probe
+            if project.migrations and not github_slug(project):
+                report["reservation_error"] = "migration reservations need a GitHub repository identity"
+            else:
+                report["unreserved_migrations"] = probe(db, project, report.get("branches") or [])
             error = None
         except (GitError, plan_git.MergeProbeError, OSError) as exc:
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
@@ -724,9 +743,13 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     gh = gh or plan_github.Gh()
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowName,name,status,conclusion,createdAt"]) or []
-    if not isinstance(rows, list):
+                                  "workflowName,name,status,conclusion,createdAt,headSha"]) or []
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
+    if len(rows) >= 100:
+        raise plan_github.GithubError("gh run list: result may be truncated; cannot certify frozen CI")
+    if any(r.get("headSha") != sha for r in rows):
+        raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
     latest: dict = {}
     for run in sorted((r for r in rows if isinstance(r, dict)),
                       key=lambda r: r.get("createdAt") or "", reverse=True):
@@ -779,6 +802,11 @@ def conflicts_of(report: dict) -> dict:
             "kind": "migration", "lots": sorted({h["work_item"] for h in dup["lots"]}),
             "files": [h["path"] for h in dup["lots"]], "target": dup["target"],
             "number": dup["number"], "in_target": dup["in_target"]}
+    for one in report.get("unreserved_migrations") or ():
+        out["unreserved:%s:%s" % (one["work_item"], one["path"])] = {
+            "kind": "unreserved", "lots": [one["work_item"]], "files": [one["path"]],
+            "target": one["target"], "number": one["number"], "repo": one["repo"],
+            "holder": one.get("holder")}
     return out
 
 
@@ -838,6 +866,12 @@ def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
                 "if your PR is green and still blocked."
                 % (head, mine.get("branch") or "?", conflict["target"],
                    _files(conflict["files"]), conflict["target"]))
+    if conflict["kind"] == "unreserved":
+        return ("%s: SQL migration %s has no reservation for this lot in %s. "
+                "Reserve it with `ameesh work migration %d %s` before freezing. %s"
+                % (head, _files(conflict["files"]), conflict["repo"], lot,
+                   conflict["number"], "Already held by lot #%s; choose a new number."
+                   % conflict["holder"] if conflict.get("holder") else ""))
     others = [_who(branches, n) for n in conflict["lots"] if n != lot]
     return ("%s: migration number %s is duplicated (%s)%s%s. Take the first free "
             "number of %s and tell the other lot."
@@ -974,6 +1008,8 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
         out.append("  error: %s" % report["error"])
     if report.get("resolution_error"):
         out.append("  resolutions: %s" % report["resolution_error"])
+    if report.get("reservation_error"):
+        out.append("  reservations: %s" % report["reservation_error"])
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
@@ -1003,6 +1039,10 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                                      for h in dup["lots"]),
             "; already in %s: %s" % (dup["target"], dup["in_target"])
             if dup["in_target"] else ""))
+    for one in report.get("unreserved_migrations") or ():
+        out.append("  unreserved migration %s: %s (%s, %s)%s" % (
+            one["number"], _lot(one["work_item"]), one["repo"], one["path"],
+            "; held by #%s" % one["holder"] if one.get("holder") else ""))
     queue = report.get("queue") or {}
     if queue.get("error"):
         out.append("  file : %s" % queue["error"])
