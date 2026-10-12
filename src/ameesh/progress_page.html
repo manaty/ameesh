@@ -396,7 +396,8 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   }
   function partialScope() { return S.p && MODE !== "served" && D.project !== S.p; }
   function learnProjects() {
-    var seen = {};
+    // sans prototype : un projet « __proto__ » ou « constructor » reste dans le sélecteur
+    var seen = Object.create(null);
     KNOWN.concat((D.overview || []).map(function (c) { return c.project; }))
       .concat((D.lots || []).map(function (l) { return l.project; }))
       .concat(D.project ? [D.project] : []).concat(S.p ? [S.p] : [])
@@ -1171,6 +1172,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       head.appendChild(el("span", "chip st-late", l.open ? "⚠ " + l.days + " d late"
         : "delivered " + l.days + " d late"));
     }
+    function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }
     function planBars(p, real, ended) {
       var ps = dayTs(p.start), pe = dayTs(p.end), pd = dayTs(p.delivery);
       var parts = [];
@@ -1266,8 +1268,9 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     }).forEach(function (g) {
       var open = g.rows.filter(function (x) { return !ENDED[x.state]; });
       var shown = G.done ? g.rows : open;
-      // une epic planifiée garde son groupe (ses dates) même si ses tâches finies sont masquées
-      if (!shown.length && g.rows.length && !(g.epic && g.epic.planned)) return;
+      // une epic planifiée garde son groupe (ses dates) même si ses tâches finies sont masquées ;
+      // « planned » toujours présent, il faut au moins une date non nulle
+      if (!shown.length && g.rows.length && !(g.epic && hasPlan(g.epic.planned))) return;
       var nLate = g.rows.filter(function (x) { return x.late && x.late.open; }).length;
       var nBlocked = g.rows.filter(function (x) { return x.state === "bloquee"; }).length;
       var nDone = g.rows.filter(function (x) { return x.state === "livree"; }).length;

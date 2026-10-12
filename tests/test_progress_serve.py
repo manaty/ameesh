@@ -249,7 +249,12 @@ class PageBuilderTest(unittest.TestCase):
         # r2 : une epic planifiée garde son groupe quand ses tâches finies sont
         # masquées ; pas de prototype (epic « constructor ») ; pas de « livré »
         # vert pour un groupe sans tâche
-        self.assertIn("if (!shown.length && g.rows.length && !(g.epic && g.epic.planned)) return;", html)
+        self.assertIn("if (!shown.length && g.rows.length && !(g.epic && hasPlan(g.epic.planned))) return;", html)
+        # lot #396 : « planned » est toujours là, toutes dates nulles l'epic
+        # n'est pas planifiée ; un projet « __proto__ » reste dans le sélecteur
+        self.assertIn("function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }", html)
+        self.assertIn("var seen = Object.create(null);", html)
+        self.assertNotIn("var seen = {};", html)
         self.assertIn("var hasTask = Object.create(null);", html)
         self.assertIn('open.length || !g.rows.length ? "" : " done"', html)
         self.assertIn("f = addDays(midnight(Math.min.apply(null, mts)), -1);", html)
