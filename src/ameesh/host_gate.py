@@ -73,9 +73,14 @@ MAX_STATE_BYTES = 65536
 
 
 def _number(value: Any) -> bool:
-    """A finite number (`json` reads `NaN` and `Infinity`; a bool is no number)."""
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+    """A finite number (`json` reads `NaN` and `Infinity`; a bool is no number;
+    an integer too large for a float, `10**400`, is none either)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -298,7 +303,8 @@ class FileGate:
                 raise ValueError("state too large")
             state = parse_state(json.loads(data.decode("utf-8")), now=self._clock(),
                                 lending=self.lending)
-        except (ValueError, TypeError, UnicodeDecodeError) as exc:
+        except (ValueError, TypeError, UnicodeDecodeError, ArithmeticError) as exc:
+            # ArithmeticError: a huge JSON integer overflowing a float check
             return self._note_error("unreadable state (%s)" % exc)
         self._last_seq = state.seq
         if self._last_error:
