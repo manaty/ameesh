@@ -1,161 +1,161 @@
 ---
 type: Study
-title: "Étude — isoler un compte et ses sessions, par harnais (comptes multiples)"
-description: "Comment Claude Code, Codex et DeepSeek Harness rangent identifiants et sessions, et si une session peut être reprise sous un autre compte ; base du lot L30."
+title: "Study — isolating an account and its sessions, per harness (multiple accounts)"
+description: "How Claude Code, Codex and DeepSeek Harness store credentials and sessions, and whether a session can be resumed under another account; basis of lot L30."
 status: stable
 tags: [comptes, forfaits, sessions, budgets]
 generated: { by: "codex3-l30/claude-opus-5-5", at: "2026-10-05T10:30:00+02:00" }
 stale_after: 2027-01-05
 sources:
-  - { resource: "decisions/0027-bascule-automatique-entre-comptes.md", title: "Décision 0027" }
-  - { resource: "decisions/0019-budgets-et-routage.md", title: "Décision 0019 (garde de rythme)" }
-  - { resource: "decisions/0025-une-session-par-lot.md", title: "Décision 0025 (sessions, résumé de reprise)" }
+  - { resource: "decisions/0027-bascule-automatique-entre-comptes.md", title: "Decision 0027" }
+  - { resource: "decisions/0019-budgets-et-routage.md", title: "Decision 0019 (pace guard)" }
+  - { resource: "decisions/0025-une-session-par-lot.md", title: "Decision 0025 (sessions, resume summary)" }
 ---
 
 # Question
 
-Pour basculer un harnais d'un compte à un autre **entre deux tours**
-([0027](../decisions/0027-bascule-automatique-entre-comptes.md)), il faut
-savoir, pour chaque harnais :
+To switch a harness from one account to another **between two turns**
+([0027](../decisions/0027-bascule-automatique-entre-comptes.md)), we need
+to know, for each harness:
 
-1. comment un compte est sélectionné (variable d'environnement, dossier) ;
-2. où vivent les identifiants et où vivent les sessions ;
-3. si une session ouverte sous le compte A peut être reprise sous le compte B.
+1. how an account is selected (environment variable, folder);
+2. where the credentials live and where the sessions live;
+3. whether a session opened under account A can be resumed under account B.
 
-# Méthode
+# Method
 
-Sans aucun appel payant ni connexion à un compte :
+Without any paid call or login to an account:
 
-* `--help` des trois harnais et documentation installée (paquets de
-  DeepSeek Harness) ;
-* lecture des chaînes du binaire (Claude Code, Codex) pour les noms de
-  fichiers et de variables ;
-* **inventaire** des dossiers de configuration existants d'un poste de
-  travail : noms et droits des fichiers seulement, jamais leur contenu
-  (aucun fichier d'identifiants ouvert) ;
-* une expérience **hors ligne** avec Claude Code : `HOME` et
-  `CLAUDE_CONFIG_DIR` pointant vers des dossiers vides du bac à sable, aucune
-  variable de clé, une session factice (deux lignes JSON inventées) — le
-  harnais s'arrête à « Not logged in » avant tout appel réseau facturable.
+* `--help` of the three harnesses and installed documentation (packages of
+  DeepSeek Harness);
+* reading the binary's strings (Claude Code, Codex) for file and
+  variable names;
+* **inventory** of the existing configuration folders of a work
+  station: file names and permissions only, never their content
+  (no credentials file opened);
+* an **offline** experiment with Claude Code: `HOME` and
+  `CLAUDE_CONFIG_DIR` pointing to empty sandbox folders, no
+  key variable, a dummy session (two invented JSON lines) — the
+  harness stops at "Not logged in" before any billable network call.
 
-Versions observées : Claude Code 2.1.x, Codex CLI 0.159.x,
+Versions observed: Claude Code 2.1.x, Codex CLI 0.159.x,
 DeepSeek Harness (`@deepseek-ai/dsh`) 0.1.5.
 
 # Claude Code
 
-**Sélection du compte : `CLAUDE_CONFIG_DIR`.** Sans elle, le dossier de
-configuration est `~/.claude` et le fichier global `~/.claude.json` est à la
-racine du dossier personnel ; avec elle, **tout** est sous le dossier
-désigné, y compris `.claude.json`. Le chemin doit être absolu.
+**Account selection: `CLAUDE_CONFIG_DIR`.** Without it, the configuration
+folder is `~/.claude` and the global file `~/.claude.json` is at the
+root of the home folder; with it, **everything** is under the designated
+folder, including `.claude.json`. The path must be absolute.
 
-| Élément | Emplacement |
+| Item | Location |
 |---|---|
-| identifiants (Linux) | `<dossier>/.credentials.json`, 0600 (macOS : trousseau, clé dérivée du dossier) |
-| configuration globale | `<dossier>/.claude.json` (ou `~/.claude.json` par défaut) |
-| réglages, hooks | `<dossier>/settings.json` |
+| credentials (Linux) | `<dossier>/.credentials.json`, 0600 (macOS: keychain, key derived from the folder) |
+| global configuration | `<dossier>/.claude.json` (or `~/.claude.json` by default) |
+| settings, hooks | `<dossier>/settings.json` |
 | sessions | `<dossier>/projects/<chemin du dossier de travail encodé>/<session>.jsonl` |
-| état divers | `sessions/`, `file-history/`, `todos/`, `shell-snapshots/`, `history.jsonl` |
+| miscellaneous state | `sessions/`, `file-history/`, `todos/`, `shell-snapshots/`, `history.jsonl` |
 
-**Expérience de reprise** (hors ligne, voir Méthode) :
+**Resume experiment** (offline, see Method):
 
-| Cas | Résultat |
+| Case | Result |
 |---|---|
-| `--resume S` sous un dossier B vide | « No conversation found with session ID » |
-| session S dans `A/projects`, lancée sous B | « No conversation found » : les sessions sont par dossier |
-| idem, `B/projects` → lien symbolique vers `A/projects` | session **trouvée** (`system/init` émis avec l'id S), puis « Not logged in » (B n'a pas d'identifiants) |
-| sous A | session trouvée |
+| `--resume S` under an empty folder B | "No conversation found with session ID" |
+| session S in `A/projects`, launched under B | "No conversation found": sessions are per folder |
+| same, `B/projects` → symbolic link to `A/projects` | session **found** (`system/init` emitted with id S), then "Not logged in" (B has no credentials) |
+| under A | session found |
 
-**Conclusion.** Le compte et les sessions sont séparables : les identifiants
-sont un fichier à part, la session un fichier de `projects/`. Une session est
-**reprenable sous un autre compte** si les deux dossiers de configuration
-**partagent `projects/`** (lien symbolique). Le prompt de cache du fournisseur
-est perdu au changement de compte (le premier tour relit tout le contexte),
-mais la conversation continue.
+**Conclusion.** The account and the sessions are separable: the credentials
+are a separate file, the session a file in `projects/`. A session is
+**resumable under another account** if the two configuration folders
+**share `projects/`** (symbolic link). The provider's prompt cache
+is lost on the account change (the first turn rereads the whole context),
+but the conversation continues.
 
-À savoir pour un dossier secondaire : les hooks (`settings.json`) et la
-configuration (`.claude.json`) sont propres au dossier ; un dossier neuf n'a
-pas les hooks agent-mail. Les relier (lien symbolique vers le `settings.json`
-du primaire) ou les copier fait partie de la préparation.
+Worth knowing for a secondary folder: the hooks (`settings.json`) and the
+configuration (`.claude.json`) are specific to the folder; a new folder does not have
+the agent-mail hooks. Linking them (symbolic link to the primary's `settings.json`)
+or copying them is part of the preparation.
 
-**Jauges.** Le forfait se lit dans le flux `stream-json` du tour
-(`rate_limit_event`), pas dans un fichier du dossier : ameesh les attribue au
-compte par un **marqueur** écrit dans le flux de l'agent avant chaque tour.
+**Gauges.** The plan is read from the turn's `stream-json` stream
+(`rate_limit_event`), not from a file in the folder: ameesh attributes them to the
+account through a **marker** written into the agent's stream before each turn.
 
 # Codex
 
-**Sélection du compte : `CODEX_HOME`** (défaut `~/.codex`). La base d'état
-SQLite peut être déplacée à part (`CODEX_SQLITE_HOME`, ou `sqlite_home` dans
-la configuration).
+**Account selection: `CODEX_HOME`** (default `~/.codex`). The SQLite state
+database can be moved separately (`CODEX_SQLITE_HOME`, or `sqlite_home` in
+the configuration).
 
-| Élément | Emplacement |
+| Item | Location |
 |---|---|
-| identifiants | `<CODEX_HOME>/auth.json`, 0600 (ou le trousseau si `cli_auth_credentials_store` le demande) |
+| credentials | `<CODEX_HOME>/auth.json`, 0600 (or the keychain if `cli_auth_credentials_store` requests it) |
 | configuration | `<CODEX_HOME>/config.toml`, `hooks.json` |
-| sessions | `<CODEX_HOME>/sessions/AAAA/MM/JJ/rollout-…-<id>.jsonl` + index (`session_index.jsonl`) + bases SQLite (`state_*.sqlite`, `thread_history_*.sqlite`) |
-| jauges | `rate_limits` (primaire, secondaire) des événements `token_count` des journaux de session |
+| sessions | `<CODEX_HOME>/sessions/AAAA/MM/JJ/rollout-…-<id>.jsonl` + index (`session_index.jsonl`) + SQLite databases (`state_*.sqlite`, `thread_history_*.sqlite`) |
+| gauges | `rate_limits` (primary, secondary) of the `token_count` events in the session logs |
 
-L'en-tête de chaque session (`session_meta`) porte **l'identifiant du compte
-créateur** (`creator_account_id`, `creator_user_id`), repris dans la table
-des fils de la base d'état. Une reprise par `codex exec resume <id>` cherche
-le fil dans l'index, la base et les journaux du `CODEX_HOME` courant.
+The header of each session (`session_meta`) carries **the identifier of the
+creating account** (`creator_account_id`, `creator_user_id`), copied into the threads
+table of the state database. A resume via `codex exec resume <id>` looks for
+the thread in the index, the database and the logs of the current `CODEX_HOME`.
 
-**Conclusion.** Partager les sessions entre deux `CODEX_HOME` demanderait de
-partager aussi la base d'état SQLite entre deux processus de comptes
-différents (risque de corruption, comportement non documenté), pour une
-session explicitement rattachée à son compte créateur ; et les jauges, qui
-vivent dans ces mêmes journaux, ne seraient plus attribuables à un compte.
-Non vérifiable sans appel payant. **Retenu : pas de continuité ; rotation
-avec résumé de reprise** (le résumé est produit sous l'ancien compte, qui
-seul peut reprendre la session ; mécanisme L11).
+**Conclusion.** Sharing sessions between two `CODEX_HOME` would also require
+sharing the SQLite state database between two processes of different
+accounts (risk of corruption, undocumented behaviour), for a
+session explicitly tied to its creating account; and the gauges, which
+live in those same logs, would no longer be attributable to one account.
+Not verifiable without a paid call. **Chosen: no continuity; rotation
+with resume summary** (the summary is produced under the old account, which
+alone can resume the session; mechanism L11).
 
 # DeepSeek Harness
 
-**Compte = clé d'API**, lue dans cet ordre : environnement du lancement
-(`DEEPSEEK_API_KEY`), fichier d'identifiants du harnais
-(`$DSH_HOME/.credentials.yaml`, 0600), `.env` du projet, `.env` du dossier du
-harnais. La variable d'environnement gagne.
+**Account = API key**, read in this order: launch environment
+(`DEEPSEEK_API_KEY`), the harness's credentials file
+(`$DSH_HOME/.credentials.yaml`, 0600), the project's `.env`, the `.env` of the
+harness folder. The environment variable wins.
 
-| Élément | Emplacement |
+| Item | Location |
 |---|---|
-| dossier du harnais | `DSH_HOME` (défaut `~/.dsh`) |
+| harness folder | `DSH_HOME` (default `~/.dsh`) |
 | sessions | `$DSH_HOME/sessions` |
-| profils | `$DSH_HOME/profiles/<nom>` |
+| profiles | `$DSH_HOME/profiles/<nom>` |
 
-**Conclusion.** Changer de clé par `DEEPSEEK_API_KEY` ne touche ni au dossier
-ni aux sessions : **la même session est reprise** sous l'autre clé. (Les
-fichiers téléversés au fournisseur sont indexés par clé : ils seraient
-renvoyés, sans incidence sur la conversation.) Pas de jauge de forfait : le
-seuil d'un compte payé au token est un **plafond** (dépense de l'heure,
-attribuée au compte) ou un **solde** (relevé par compte).
+**Conclusion.** Changing the key via `DEEPSEEK_API_KEY` touches neither the folder
+nor the sessions: **the same session is resumed** under the other key. (Files
+uploaded to the provider are indexed per key: they would be
+re-sent, with no impact on the conversation.) No plan gauge: the
+threshold of a pay-per-token account is a **cap** (spend for the hour,
+attributed to the account) or a **balance** (read per account).
 
-# Synthèse
+# Summary
 
-| Harnais | Sélection | Identifiants | Sessions | Reprise sous un autre compte |
+| Harness | Selection | Credentials | Sessions | Resume under another account |
 |---|---|---|---|---|
-| Claude Code | `CLAUDE_CONFIG_DIR` | `.credentials.json` du dossier | `projects/` du dossier | **oui**, si `projects/` est partagé (lien) ; sinon rotation avec résumé |
-| Codex | `CODEX_HOME` | `auth.json` du dossier | `sessions/` + base SQLite du dossier, rattachées au compte | **non** : rotation avec résumé |
-| DeepSeek Harness | `DEEPSEEK_API_KEY` | clé d'API | `$DSH_HOME/sessions`, indépendant de la clé | **oui** (même `DSH_HOME`) |
+| Claude Code | `CLAUDE_CONFIG_DIR` | the folder's `.credentials.json` | the folder's `projects/` | **yes**, if `projects/` is shared (link); otherwise rotation with summary |
+| Codex | `CODEX_HOME` | the folder's `auth.json` | the folder's `sessions/` + SQLite database, tied to the account | **no**: rotation with summary |
+| DeepSeek Harness | `DEEPSEEK_API_KEY` | API key | `$DSH_HOME/sessions`, independent of the key | **yes** (same `DSH_HOME`) |
 
-# Conséquences pour ameesh (L30)
+# Consequences for ameesh (L30)
 
-* Profils de compte **par hôte** (configuration de l'hôte, clé `accounts`) :
-  `config_dir` (dossier, 0700, identifiants présents — présence seulement) ou
-  `api_key_env` (variable ou fichier de clé 0600).
-* La décision de continuité est mécanique : même stockage de sessions (chemin
-  résolu) → reprise ; sinon rotation avec résumé, et le fil le dit.
-* Les gestes de connexion restent humains : `CLAUDE_CONFIG_DIR=<dossier> claude`
-  puis `/login` ; `CODEX_HOME=<dossier> codex login`. Voir
-  [la page d'exploitation](../../COMPTES.md).
-* Le respect des conditions d'utilisation de chaque fournisseur pour l'usage
-  de plusieurs comptes reste de la responsabilité de l'équipe (0027).
+* Account profiles **per host** (host configuration, key `accounts`):
+  `config_dir` (folder, 0700, credentials present — presence only) or
+  `api_key_env` (variable or key file 0600).
+* The continuity decision is mechanical: same session storage (resolved
+  path) → resume; otherwise rotation with summary, and the thread says so.
+* Login steps remain human: `CLAUDE_CONFIG_DIR=<dossier> claude`
+  then `/login`; `CODEX_HOME=<dossier> codex login`. See
+  [the operations page](../../COMPTES.md).
+* Compliance with each provider's terms of use regarding the use
+  of several accounts remains the team's responsibility (0027).
 
-# Amendement (0034, L74)
+# Amendment (0034, L74)
 
-La bascule au seuil et le retour au primaire (0027 §2–3) sont remplacés par
-un choix par échéance : les comptes forment un réservoir, une session garde
-son compte tant qu'il est sous son seuil, et une nouvelle session (ou une
-rotation) va au compte dont la capacité inutilisée expire le plus tôt —
-amendé le 2026-10-10 (L117) : au compte le plus en retard sur son rythme,
-l'échéance ne servant plus qu'à départager. Le
-tableau de continuité ci-dessus reste la règle de reprise ou de résumé quand
-une session change de compte. Voir [la page d'exploitation](../../COMPTES.md).
+Switching at the threshold and returning to the primary (0027 §2–3) are replaced by
+a choice by expiry: the accounts form a pool, a session keeps
+its account as long as it is under its threshold, and a new session (or a
+rotation) goes to the account whose unused capacity expires the earliest —
+amended on 2026-10-10 (L117): to the account furthest behind its pace,
+the expiry now serving only as a tie-breaker. The
+continuity table above remains the rule for resume or summary when
+a session changes account. See [the operations page](../../COMPTES.md).

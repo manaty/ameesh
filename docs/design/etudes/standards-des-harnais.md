@@ -1,7 +1,7 @@
 ---
 type: Study
-title: "Étude — standards des outils d'agents (MCP, skills, plugins, ACP)"
-description: "État des standards en octobre 2026, support par harnais, communication entrante, connecteurs existants, porte d'approbation ameesh-gate."
+title: "Study — agent tooling standards (MCP, skills, plugins, ACP)"
+description: "State of the standards in October 2026, support per harness, inbound communication, existing connectors, ameesh-gate approval gate."
 status: draft
 tags: [mcp, acp, skills, plugins, gouvernance]
 generated: { by: "mesh-design-etude/claude-opus-5-5", at: "2026-10-04T00:10:00+02:00" }
@@ -13,110 +13,111 @@ sources:
   - { resource: "https://agentclientprotocol.com/overview/agents", title: "ACP" }
   - { resource: "https://code.claude.com/docs/en/channels", title: "Claude Code channels" }
   - { resource: "https://github.com/deepseek-ai/deepseek-harness", title: "DeepSeek Harness" }
-  - { resource: "https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps", title: "Slack : limites hors Marketplace" }
+  - { resource: "https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps", title: "Slack: non-Marketplace limits" }
   - { resource: "https://github.com/agentgateway/agentgateway", title: "agentgateway" }
-  - { resource: "https://www.ietf.org/ietf-ftp/internet-drafts/draft-farley-acta-signed-receipts-01.xml", title: "Brouillon IETF de reçus signés" }
+  - { resource: "https://www.ietf.org/ietf-ftp/internet-drafts/draft-farley-acta-signed-receipts-01.xml", title: "IETF draft on signed receipts" }
 ---
 
 # Conclusion
 
-Tout le **sortant** passe par **MCP**, que tous les harnais parlent. Aucun
-standard ne couvre l'**entrant** de façon portable. ameesh possède donc le
-**réveil des agents** et la **porte d'approbation**, exprimés avec les standards
-existants, sans nouveau format de connecteur.
+All **outbound** goes through **MCP**, which every harness speaks. No
+standard covers **inbound** in a portable way. ameesh therefore owns
+**agent wake-up** and the **approval gate**, expressed with existing
+standards, without a new connector format.
 
-# Standards (octobre 2026)
+# Standards (October 2026)
 
-- **MCP 2026-07-28** (AAIF / Linux Foundation) : révision très cassante —
-  sans état, plus de requêtes serveur → client (motif MRTR), `subscriptions/listen`,
-  extension **Tasks**, OAuth par CIMD. Il faudra servir 2025-11-25 et 2026-07-28.
-- **Agent Skills** (SKILL.md) : standard ouvert lancé par Anthropic.
-- **ACP** : Zed et JetBrains. **A2A** v1.0 : AAIF. **AGENTS.md** : AAIF.
-- **Plugins** : format propre à chaque harnais, contenu commun (skills + config
-  MCP + hooks).
+- **MCP 2026-07-28** (AAIF / Linux Foundation): a heavily breaking revision —
+  stateless, no more server → client requests (MRTR pattern), `subscriptions/listen`,
+  **Tasks** extension, OAuth via CIMD. Both 2025-11-25 and 2026-07-28 will need to be served.
+- **Agent Skills** (SKILL.md): open standard launched by Anthropic.
+- **ACP**: Zed and JetBrains. **A2A** v1.0: AAIF. **AGENTS.md**: AAIF.
+- **Plugins**: format specific to each harness, common content (skills + MCP
+  config + hooks).
 
-# Support par harnais
+# Support per harness
 
-| Harnais | MCP | Skills | Hooks bloquants | Pilotage headless |
+| Harness | MCP | Skills | Blocking hooks | Headless driving |
 |---|---|---|---|---|
-| Claude Code | local/distant, OAuth | oui | PreToolUse (allow/deny/ask/**defer**), PermissionRequest | `-p --resume`, stream-json |
-| Codex CLI | local/distant, OAuth+CIMD | oui | PreToolUse (outils MCP compris) | `exec resume` ; **app-server** (`turn/start`, `turn/steer`) |
-| DeepSeek Harness | stdio + HTTP (OAuth non documenté) | oui | réutilise les `hooks.json` de Claude/Codex | **ACP natif** ; SDK `--session-id` |
-| Gemini CLI | oui | oui | BeforeTool | `-p` ; ACP natif |
-| goose, OpenHands | oui | partiel | non vérifié | ACP natif |
+| Claude Code | local/remote, OAuth | yes | PreToolUse (allow/deny/ask/**defer**), PermissionRequest | `-p --resume`, stream-json |
+| Codex CLI | local/remote, OAuth+CIMD | yes | PreToolUse (MCP tools included) | `exec resume`; **app-server** (`turn/start`, `turn/steer`) |
+| DeepSeek Harness | stdio + HTTP (OAuth undocumented) | yes | reuses Claude/Codex `hooks.json` | **native ACP**; SDK `--session-id` |
+| Gemini CLI | yes | yes | BeforeTool | `-p`; native ACP |
+| goose, OpenHands | yes | partial | not verified | native ACP |
 
-# Décrire un harnais : standards existants
+# Describing a harness: existing standards
 
-- **Registre ACP** (RFD terminée, registre stabilisé en mars 2026) : chaque agent
-  publie un manifeste `agent.json` (id, nom, version, version du schéma,
-  description, dépôt, licence, capacités = méthodes ACP, options
-  d'authentification, distribution) dans un dépôt de registre agrégé en
-  catalogue. C'est la base retenue pour les descripteurs de harnais d'ameesh
-  (lot L16), étendue par des clés propres à ameesh pour ce que l'ACP ne décrit
-  pas (pilotage sans interface et reprise de session hors ACP, jauges et coût,
+- **ACP registry** (RFD completed, registry stabilised in March 2026): each agent
+  publishes an `agent.json` manifest (id, name, version, schema version,
+  description, repository, licence, capabilities = ACP methods, authentication
+  options, distribution) in a registry repository aggregated into a
+  catalogue. This is the chosen basis for ameesh's harness descriptors
+  (lot L16), extended with ameesh-specific keys for what ACP does not describe
+  (driving without an interface and session resumption outside ACP, gauges and cost,
   hooks, permissions).
-- **Agent Card A2A** (`/.well-known/agent.json`, A2A v1.0) : décrit un agent
-  **distant** (identité, compétences, points d'accès) — utile si un membre
-  agent d'ameesh est exposé à d'autres systèmes, pas pour un harnais local.
-- **Registre MCP** (`server.json`) : décrit des serveurs d'outils, pas des
-  harnais ; utile pour le catalogue des connecteurs.
+- **A2A Agent Card** (`/.well-known/agent.json`, A2A v1.0): describes a
+  **remote** agent (identity, skills, endpoints) — useful if an ameesh agent
+  member is exposed to other systems, not for a local harness.
+- **MCP registry** (`server.json`): describes tool servers, not
+  harnesses; useful for the connector catalogue.
 
-# Entrant
+# Inbound
 
-Les « channels » de Claude Code existent (preview, propres à Claude, liste
-blanche, pas avec MCP 2026-07-28). Le **runner d'ameesh** reçoit l'événement
-(Slack Events/Socket Mode, bot Teams, push Gmail, IMAP IDLE, Matrix, Nexlink),
-l'inscrit dans le fil et **réveille l'agent** : Claude par `-p --resume`, Codex
-par l'app-server, **les autres par ACP**. L'agent lit et répond via un serveur
-MCP « **ameesh-fil** ».
+Claude Code "channels" exist (preview, Claude-specific, allow
+list, not with MCP 2026-07-28). The **ameesh runner** receives the event
+(Slack Events/Socket Mode, Teams bot, Gmail push, IMAP IDLE, Matrix, Nexlink),
+records it in the thread and **wakes the agent**: Claude via `-p --resume`, Codex
+via the app-server, **the others via ACP**. The agent reads and replies through an
+"**ameesh-fil**" MCP server.
 
-# Connecteurs existants
+# Existing connectors
 
-| Système | Serveur MCP | Statut |
+| System | MCP server | Status |
 |---|---|---|
-| Slack | officiel `mcp.slack.com/mcp` | GA février 2026 ; apps internes ou Marketplace |
-| Teams, Outlook | Work IQ (Microsoft) | preview, licence M365 Copilot |
-| Gmail, Google Chat | officiels Google | Developer Preview |
+| Slack | official `mcp.slack.com/mcp` | GA February 2026; internal or Marketplace apps |
+| Teams, Outlook | Work IQ (Microsoft) | preview, M365 Copilot licence |
+| Gmail, Google Chat | official Google | Developer Preview |
 | GitHub | `github/github-mcp-server` (MIT) | stable |
-| Forgejo | `goern/forgejo-mcp` | communautaire |
-| IMAP/SMTP | aucun officiel | **à créer** |
+| Forgejo | `goern/forgejo-mcp` | community |
+| IMAP/SMTP | no official one | **to create** |
 
-# Gouvernance : ameesh-gate
+# Governance: ameesh-gate
 
-Les passerelles MCP open source (agentgateway, IBM ContextForge, Docker MCP
-Gateway, Microsoft MCP Gateway) filtrent et journalisent mais **aucune ne gère
-une approbation humaine signée liée à l'action**. ameesh doit être ou embarquer
-la porte : elle seule détient les identifiants métier, donc la règle « pas
-d'action irréversible sans reçu signé » vaut quel que soit le harnais.
+Open source MCP gateways (agentgateway, IBM ContextForge, Docker MCP
+Gateway, Microsoft MCP Gateway) filter and log but **none of them handles
+a signed human approval bound to the action**. ameesh must be or embed
+the gate: it alone holds the business credentials, so the rule "no
+irreversible action without a signed receipt" holds whatever the harness.
 
 ```
-empreinte = SHA-256(JCS{serveur, outil, arguments, compte cible, lot,
-                        version de politique, nonce, expiration})
+digest = SHA-256(JCS{server, tool, arguments, target account, lot,
+                     policy version, nonce, expiry})
 ```
 
-L'empreinte sert de challenge à ameesh-approve ; la porte la recalcule sur le
-`tools/call` réel, vérifie la signature et l'usage unique, exécute, journalise
-dans le fil. En attente : erreur « en attente, réf. X » (ou `defer` chez Claude).
-Le classement lecture/irréversible/coûteux vit dans le **canon OKF**, pas dans
-les annotations MCP (`destructiveHint` n'est qu'un indice). Défense en
-profondeur : hooks PreToolUse, sandbox réseau.
+The digest serves as the challenge for ameesh-approve; the gate
+recomputes it on the actual `tools/call`, verifies the signature and single use,
+executes, logs in the thread. While pending: error "en attente, réf. X" ("pending,
+ref. X") (or `defer` with Claude).
+The read/irreversible/costly classification lives in the **OKF canon**, not in
+the MCP annotations (`destructiveHint` is only a hint). Defence in
+depth: PreToolUse hooks, network sandbox.
 
-# Pièges
+# Pitfalls
 
-- **Slack** : apps hors Marketplace limitées à 1 requête/min et 15 objets sur
-  `conversations.history` ; interdiction d'archiver les données d'autres
-  organisations et d'entraîner des LLM → **une app interne par organisation** ;
-  offre gratuite : 90 jours visibles. Le journal de référence n'est pas Slack.
-- **Teams** : API protégées (validation 7 à 10 jours), notifications facturées.
-- **Google Chat** : 60 écritures/min par espace, partagées entre apps.
-- **`claude -p`** charge `.mcp.json` et les hooks du projet sans confirmation :
-  lancer avec `--bare` et une configuration explicite.
-- dsh est en developer preview.
+- **Slack**: non-Marketplace apps limited to 1 request/min and 15 objects on
+  `conversations.history`; ban on archiving other organisations' data
+  and on training LLMs → **one internal app per organisation**;
+  free plan: 90 days visible. The reference log is not Slack.
+- **Teams**: protected APIs (7 to 10 days validation), billed notifications.
+- **Google Chat**: 60 writes/min per space, shared between apps.
+- **`claude -p`** loads the project's `.mcp.json` and hooks without confirmation:
+  launch with `--bare` and an explicit configuration.
+- dsh is in developer preview.
 
-# Ce qu'ameesh crée
+# What ameesh creates
 
-1. adaptateurs de pilotage (stream-json Claude, app-server Codex, ACP) ;
-2. adaptateurs entrants et serveur MCP ameesh-fil ;
-3. ameesh-gate et la spécification d'empreinte et de reçu ;
-4. générateur canon OKF → SKILL.md, AGENTS.md, politique d'outils, plugin par harnais ;
-5. connecteurs manquants (IMAP/SMTP, transporteurs) en serveurs MCP standard.
+1. driving adapters (Claude stream-json, Codex app-server, ACP);
+2. inbound adapters and the ameesh-fil MCP server;
+3. ameesh-gate and the digest and receipt specification;
+4. OKF canon generator → SKILL.md, AGENTS.md, tool policy, plugin per harness;
+5. missing connectors (IMAP/SMTP, carriers) as standard MCP servers.

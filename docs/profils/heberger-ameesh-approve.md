@@ -1,31 +1,31 @@
-# Héberger ameesh-approve pour une équipe
+# Hosting ameesh-approve for a team
 
-Ce guide d'exploitation décrit l'installation d'**une** instance
-d'ameesh-approve pour **une** équipe. Il applique la décision
+This operations guide describes the installation of **one** instance of
+ameesh-approve for **one** team. It applies decision
 [0026](../design/decisions/0026-hebergement-d-ameesh-approve-par-equipe.md)
-et le [contrat d'hébergement](../design/ameesh-approve-hebergement-equipes.md)
-(lot L27). Les noms d'hôtes ci-dessous sont des exemples (`.example`) : chaque
-équipe a les siens.
+and the [hosting contract](../design/ameesh-approve-hebergement-equipes.md)
+(lot L27). The host names below are examples (`.example`): each team has
+its own.
 
-Règle de base : **une équipe = un hôte `H` = un RP ID WebAuthn égal à `H`**.
-Il n'y a jamais de page commune à plusieurs équipes, jamais de RP ID parent
-commun, jamais de partage d'hôte par chemin.
+Basic rule: **one team = one host `H` = one WebAuthn RP ID equal to `H`**.
+There is never a page shared by several teams, never a shared parent RP ID,
+never host sharing by path.
 
 ---
 
-## 1. Ce qu'il faut avant d'installer
+## 1. What you need before installing
 
-| Élément | Exigence |
+| Item | Requirement |
 |---|---|
-| hôte `H` | réservé durablement à l'équipe, choisi **avant** tout enrôlement (le changer impose de réenrôler les passkeys) |
-| base | une base ou un **schéma par équipe** (`AMEESH_DSN`, `AMEESH_SCHEMA`) ; le service n'a pas de filtre d'équipe |
-| utilisateur Unix | dédié au service, distinct de celui des agents |
-| rôle Postgres | `deploy/sql/role-approve.sql` (§6) : lecture seule de ce que lit le service |
-| HTTPS sur `H` | par un mandataire inverse, ou par le TLS local du service (§4) |
+| host `H` | reserved durably for the team, chosen **before** any enrolment (changing it forces re-enrolling the passkeys) |
+| database | one database or one **schema per team** (`AMEESH_DSN`, `AMEESH_SCHEMA`); the service has no team filter |
+| Unix user | dedicated to the service, distinct from the agents' user |
+| Postgres role | `deploy/sql/role-approve.sql` (§6): read-only access to what the service reads |
+| HTTPS on `H` | via a reverse proxy, or via the service's local TLS (§4) |
 
-## 2. Configuration du service (profil strict)
+## 2. Service configuration (strict profile)
 
-`~/.config/ameesh-approve/config.json` de l'utilisateur du service :
+`~/.config/ameesh-approve/config.json` of the service user:
 
 ```json
 {
@@ -39,202 +39,200 @@ commun, jamais de partage d'hôte par chemin.
 }
 ```
 
-Le **profil strict** est le défaut (`"profile": "strict"`). Au démarrage, le
-service refuse, avec un message qui dit pourquoi :
+The **strict profile** is the default (`"profile": "strict"`). At startup,
+the service refuses, with a message saying why:
 
-* un RP ID différent de l'hôte de l'origine (par exemple un parent) ;
-* plus d'une origine, une origine avec un port, en `http`, ou sur `localhost`
-  ou une adresse IP ;
-* une `public_url` sur un autre hôte ou avec un préfixe de chemin ;
-* un RP ID égal à une **zone réservée** (`reserved_zones` : la zone sous
-  laquelle des hôtes d'équipe sont attribués) ou à un **hôte réservé**
-  (`reserved_hosts`), ou parent de l'un d'eux. Les noms réservés par la
-  décision 0026 le sont toujours, même absents du fichier.
+* an RP ID different from the origin's host (for example a parent);
+* more than one origin, an origin with a port, over `http`, or on
+  `localhost` or an IP address;
+* a `public_url` on another host or with a path prefix;
+* an RP ID equal to a **reserved zone** (`reserved_zones`: the zone under
+  which team hosts are allocated) or to a **reserved host**
+  (`reserved_hosts`), or a parent of one of them. The names reserved by
+  decision 0026 always are, even if absent from the file.
 
-Le profil **compatible** (`"profile": "compatible"` ou
-`--profile compatible`) n'existe que pour les essais locaux
-(`http://localhost`, plusieurs origines, sous-domaines du RP ID). Il doit être
-écrit explicitement ; les noms réservés y restent refusés.
+The **compatible** profile (`"profile": "compatible"` or
+`--profile compatible`) exists only for local trials
+(`http://localhost`, several origins, subdomains of the RP ID). It must be
+written explicitly; reserved names are still refused in it.
 
-Les mêmes clés existent en variables `AMEESH_APPROVE_*` (`RP_ID`, `ORIGINS`,
+The same keys exist as `AMEESH_APPROVE_*` variables (`RP_ID`, `ORIGINS`,
 `PUBLIC_URL`, `PROFILE`, `RESERVED_ZONES`, `RESERVED_HOSTS`, `TLS_CERT`,
-`TLS_KEY`…) et, pour les principales, en options de `ameesh-approve serve`.
+`TLS_KEY`…) and, for the main ones, as options of `ameesh-approve serve`.
 
-## 3. Deux adresses : `public_url` et `approve_url`
+## 3. Two addresses: `public_url` and `approve_url`
 
-* `public_url` (service) : l'adresse des **pages humaines** (`/a/…`,
-  `/enroll/…`), toujours `https://H`.
-* `approve_url` (client ameesh, `AMEESH_APPROVE_URL`) : l'adresse **machine**
-  de l'API (`POST /requests`, `GET /receipts/<id>`, `GET /health`), avec le
-  jeton de service lu dans `AMEESH_APPROVE_TOKEN_FILE` (fichier `0600`).
+* `public_url` (service): the address of the **human pages** (`/a/…`,
+  `/enroll/…`), always `https://H`.
+* `approve_url` (ameesh client, `AMEESH_APPROVE_URL`): the **machine**
+  address of the API (`POST /requests`, `GET /receipts/<id>`, `GET /health`),
+  with the service token read from `AMEESH_APPROVE_TOKEN_FILE` (file `0600`).
 
-Aucune des deux ne se déduit de l'autre. Par défaut, l'API n'est servie que
-sous l'hôte local (`127.0.0.1:PORT`) : un appel sous l'hôte public reçoit
-`421`, et le client le dit. Pour que des exécuteurs d'autres machines
-appellent l'API par `https://H`, il faut l'**ouvrir explicitement** dans le
-JSON du service :
+Neither is derived from the other. By default, the API is only served
+under the local host (`127.0.0.1:PORT`): a call under the public host gets
+`421`, and the client says so. For runners on other machines to call the
+API via `https://H`, it must be **opened explicitly** in the service's
+JSON:
 
 ```json
 { "api_via_public": true }
 ```
 
-C'est un booléen JSON (`true`/`false`, jamais une chaîne), sans équivalent en
-variable d'environnement ni en option : ouvrir l'API est un choix écrit. L'API
-reste authentifiée par le jeton et refuse tout navigateur (`Origin`). Un accès
-privé (réseau privé, tunnel) est une alternative.
+It is a JSON boolean (`true`/`false`, never a string), with no equivalent
+as an environment variable or option: opening the API is a written choice.
+The API remains authenticated by the token and refuses any browser
+(`Origin`). Private access (private network, tunnel) is an alternative.
 
-Modifier `approve_url` ne change **pas** la confiance : seuls RP ID et origines
-la règlent (§5).
+Changing `approve_url` does **not** change trust: only the RP ID and origins
+determine it (§5).
 
-## 4. Exposer `H` en HTTPS
+## 4. Exposing `H` over HTTPS
 
-### 4.1 Derrière un mandataire inverse (défaut)
+### 4.1 Behind a reverse proxy (default)
 
-Le service parle HTTP sur la boucle locale ; le mandataire termine TLS pour
-`H`, transmet `Host` tel quel, ne met en cache ni ne journalise jetons, liens
-ou corps. Sans option, c'est le comportement historique.
+The service speaks HTTP on the loopback; the proxy terminates TLS for `H`,
+forwards `Host` as is, and neither caches nor logs tokens, links or
+bodies. Without options, this is the historical behaviour.
 
-### 4.2 Passthrough TLS : le certificat vit sur l'appareil
+### 4.2 TLS passthrough: the certificate lives on the device
 
-Quand la passerelle route par SNI **sans déchiffrer** vers un tunnel sortant
-de l'appareil, c'est le service qui termine TLS sur la boucle locale :
+When the gateway routes by SNI **without decrypting** to an outbound tunnel
+from the device, it is the service that terminates TLS on the loopback:
 
 ```
 ameesh-approve serve --tls-cert ~/.config/ameesh-approve/tls/H.crt \
                      --tls-key  ~/.config/ameesh-approve/tls/H.key
 ```
 
-(ou `"tls_cert"`/`"tls_key"` dans le JSON). Le service **ne parle à aucune
-autorité de certification** : l'obtention et le renouvellement du certificat
-de `H` (par exemple ACME DNS-01 piloté par la plateforme d'hébergement) se
-font ailleurs ; ce processus **dépose** les fichiers :
+(or `"tls_cert"`/`"tls_key"` in the JSON). The service **talks to no
+certificate authority**: obtaining and renewing the certificate of `H` (for
+example ACME DNS-01 driven by the hosting platform) happen elsewhere; that
+process **drops** the files:
 
-* dans un dossier privé de l'utilisateur du service (proposé :
-  `~/.config/ameesh-approve/tls/`, `0700`) ;
-* deux fichiers PEM **réguliers** (pas de lien symbolique), appartenant à
-  l'utilisateur du service, en `0600` (ou `0400`) — le service refuse tout
-  fichier lisible par le groupe ou les autres ;
-* par **renommage atomique** (`écrire H.key.tmp`, `rename` ; puis le
-  certificat) : à chaque nouvelle connexion, le service compare l'identité des
-  fichiers à celle du certificat chargé et le relit s'ils ont changé, sans
-  redémarrage. `kill -HUP` force une relecture. Un dépôt refusé (permissions,
-  clé et certificat qui ne correspondent pas) laisse l'ancien certificat en
-  service et le journal l'indique.
-* chaque fichier est ouvert **une seule fois**, sans suivre de lien, contrôlé
-  sur son descripteur puis lu ; ce sont ces octets qui sont chargés (copie
-  éphémère `0600` dans un sous-dossier `0700` de l'état privé, effacée
-  aussitôt) : remplacer un fichier pendant la relecture ne peut pas faire
-  servir une autre paire.
+* in a private directory of the service user (suggested:
+  `~/.config/ameesh-approve/tls/`, `0700`);
+* two **regular** PEM files (no symbolic link), owned by the service user,
+  in `0600` (or `0400`) — the service refuses any file readable by the group
+  or others;
+* by **atomic rename** (`write H.key.tmp`, `rename`; then the
+  certificate): on each new connection, the service compares the identity of
+  the files with that of the loaded certificate and re-reads it if they have
+  changed, without restart. `kill -HUP` forces a re-read. A refused drop
+  (permissions, key and certificate that do not match) leaves the old
+  certificate in service and the log says so.
+* each file is opened **only once**, without following links, checked on its
+  descriptor then read; those are the bytes that get loaded (ephemeral `0600`
+  copy in a `0700` subdirectory of the private state, erased immediately):
+  replacing a file during the re-read cannot make the service serve another
+  pair.
 
-Le certificat est **celui de `H` seulement** : jamais un certificat
-générique (wildcard) de la zone sur un appareil, jamais de RP ID égal à la
-zone.
+The certificate is **that of `H` only**: never a wildcard certificate of
+the zone on a device, never an RP ID equal to the zone.
 
-Avec le TLS local, l'exécuteur installé sur le même appareil continue de passer
-par la boucle locale, sans ouvrir l'API publique :
+With local TLS, the runner installed on the same device keeps going through
+the loopback, without opening the public API:
 
 ```
 AMEESH_APPROVE_URL=https://127.0.0.1:8765
-AMEESH_APPROVE_TLS_NAME=H        # le certificat est vérifié pour ce nom
+AMEESH_APPROVE_TLS_NAME=H        # the certificate is verified for this name
 ```
 
-## 5. Politique des vérificateurs et contrôle de concordance
+## 5. Verifier policy and concordance check
 
-ameesh vérifie et consomme les reçus avec **sa** politique, lue dans
-`AMEESH_APPROVE_RP_ID` et `AMEESH_APPROVE_ORIGINS` (indépendamment du JSON du
-service). Elle doit être identique sur le service et sur **tous** les postes
-qui vérifient :
+ameesh verifies and consumes receipts with **its own** policy, read from
+`AMEESH_APPROVE_RP_ID` and `AMEESH_APPROVE_ORIGINS` (independently of the
+service's JSON). It must be identical on the service and on **all** the
+workstations that verify:
 
 ```
 AMEESH_APPROVE_RP_ID=equipe-a.pages.example
 AMEESH_APPROVE_ORIGINS=https://equipe-a.pages.example
 ```
 
-Sur chaque poste vérificateur :
+On each verifying workstation:
 
 ```
-ameesh approve-check            # 0 concordance, 1 écart (listé), 2 injoignable
+ameesh approve-check            # 0 match, 1 discrepancy (listed), 2 unreachable
 ameesh approve-check --json
 ```
 
-La commande lit `GET /health` du service (sans jeton : le document publie RP
-ID, origines, URL publique, profil, niveau, ouverture de l'API, TLS — aucun
-secret) à `approve_url` (ou `--url`), et la compare à la politique locale. À
-lancer après l'installation, après toute modification de configuration et
-après chaque bascule. `/health` suit les règles de `Host` de l'API.
+The command reads the service's `GET /health` (without token: the document
+publishes RP ID, origins, public URL, profile, level, API opening, TLS — no
+secret) at `approve_url` (or `--url`), and compares it with the local
+policy. Run it after installation, after any configuration change and after
+each switchover. `/health` follows the API's `Host` rules.
 
-## 6. Droits en base
+## 6. Database rights
 
-Le service lit, dans le schéma de l'équipe, les actions (pour recalculer
-l'empreinte et rendre le résumé), le registre des authentificateurs et les
-nonces déjà consommés ; il n'écrit jamais en base (ses demandes, liens, reçus
-et propositions vivent dans son état privé).
+The service reads, in the team's schema, the actions (to recompute the
+fingerprint and render the summary), the authenticator registry and the
+nonces already consumed; it never writes to the database (its requests,
+links, receipts and proposals live in its private state).
 
 ```
-PGOPTIONS='-c search_path=<schéma de l équipe>' \
-psql "<DSN d'administration>" -v ON_ERROR_STOP=1 -v role=approve_equipe_a \
+PGOPTIONS='-c search_path=<team schema>' \
+psql "<admin DSN>" -v ON_ERROR_STOP=1 -v role=approve_equipe_a \
      -f deploy/sql/role-approve.sql
 
 CREATE ROLE approve_equipe_a_service LOGIN IN ROLE approve_equipe_a;
 ALTER ROLE approve_equipe_a_service SET default_transaction_read_only = on;
-ALTER ROLE approve_equipe_a_service SET search_path = <schéma de l équipe>;
+ALTER ROLE approve_equipe_a_service SET search_path = <team schema>;
 ```
 
-Le script est transactionnel, idempotent et audité comme les rôles
-superviseur : il refuse (et n'applique rien) si le rôle obtiendrait d'ailleurs
-plus que son contrat (droits donnés à `PUBLIC`, rôle parent, ACL par défaut,
-appartenance), y compris dans un **autre schéma** (celui d'une autre équipe),
-sur une base (CREATE, ou droit accordé au rôle lui-même : la connexion est
-donnée au rôle de connexion) ou sur un grand objet. Un rôle par équipe, chacun
-sur son schéma. Le DSN du service
-(`AMEESH_DSN`) utilise le rôle de connexion.
+The script is transactional, idempotent and audited like the supervisor
+roles: it refuses (and applies nothing) if the role would obtain from
+elsewhere more than its contract (rights given to `PUBLIC`, parent role,
+default ACLs, membership), including in **another schema** (another team's),
+on a database (CREATE, or a right granted to the role itself: connection is
+given to the login role) or on a large object. One role per team, each
+on its own schema. The service's DSN
+(`AMEESH_DSN`) uses the login role.
 
-## 7. Enrôlement
+## 7. Enrolment
 
-`H` fixé, configuration vérifiée (`approve-check`), puis, sous l'utilisateur
-du service :
+`H` fixed, configuration checked (`approve-check`), then, as the service
+user:
 
 ```
 ameesh-approve enroll-link --approver human:<id>
 ```
 
-L'humain ouvre le lien **sur son appareil** et crée sa passkey ; le service
-écrit une **proposition** de canon (jamais une clé active en base), relue par
-PR puis synchronisée (`ameesh canon sync`).
+The human opens the link **on their device** and creates their passkey; the
+service writes a canon **proposal** (never an active key in the database),
+reviewed by PR then synced (`ameesh canon sync`).
 
-## 8. Changer d'emplacement, changer d'hôte
+## 8. Changing location, changing host
 
-**Même `H`** (même RP ID, même origine, même registre) : les passkeys sont
-conservées.
+**Same `H`** (same RP ID, same origin, same registry): the passkeys are
+kept.
 
-1. Préparer la cible : même base/schéma et même canon, configuration RP/origine
-   identique, certificat de `H` présent et valide.
-2. Suspendre les nouvelles demandes ; laisser expirer ou aboutir les liens
-   ouverts ; arrêter l'ancienne instance (une seule instance active).
-3. Copier l'état privé (`state_dir`, propositions non intégrées) en gardant ses
-   permissions (`0700`/`0600`) ; ne jamais restaurer une sauvegarde plus
-   ancienne de l'état ni des nonces.
-4. Basculer le routage de `H` ; changer seulement `approve_url` si le point
-   d'entrée machine change ; distribuer un nouveau jeton et révoquer l'ancien
-   si besoin.
-5. `ameesh approve-check` sur chaque vérificateur ; une approbation avec une
-   passkey déjà enrôlée ; vérifier qu'un ancien lien consommé reste refusé.
+1. Prepare the target: same database/schema and same canon, identical
+   RP/origin configuration, certificate of `H` present and valid.
+2. Suspend new requests; let open links expire or complete; stop the old
+   instance (a single active instance).
+3. Copy the private state (`state_dir`, unintegrated proposals) keeping its
+   permissions (`0700`/`0600`); never restore an older backup of the state
+   or of the nonces.
+4. Switch the routing of `H`; change only `approve_url` if the machine entry
+   point changes; distribute a new token and revoke the old one if
+   needed.
+5. `ameesh approve-check` on each verifier; one approval with an already
+   enrolled passkey; check that an old consumed link is still refused.
 
-**Nouvel hôte** (`H` change) : ce n'est pas une migration. Nouvelle
-configuration (RP ID et origine du nouvel hôte), **nouvel enrôlement** de
-chaque humain, nouvelles propositions revues, politique des vérificateurs mise
-à jour, puis `approve-check`. Ne jamais élargir le RP ID à un parent pour
-recycler les anciennes passkeys.
+**New host** (`H` changes): this is not a migration. New configuration (RP
+ID and origin of the new host), **new enrolment** of each human, new
+reviewed proposals, verifier policy updated, then `approve-check`. Never
+widen the RP ID to a parent to recycle the old passkeys.
 
-## 9. Liste de contrôle
+## 9. Checklist
 
-- [ ] `ameesh-approve serve` démarre en profil strict, sans avertissement de
-      configuration ;
-- [ ] `ameesh approve-check` rend 0 sur chaque poste vérificateur ;
-- [ ] l'API n'est ouverte sous `H` que si `api_via_public` est écrit, et le
-      jeton est un fichier `0600` de l'utilisateur concerné ;
-- [ ] en passthrough : certificat de `H` seul, fichiers `0600` de
-      l'utilisateur du service, renouvellement par renommage atomique ;
-- [ ] rôle Postgres de l'équipe appliqué sans écart ; DSN du service sur son
-      rôle de connexion ;
-- [ ] aucune autre application ne sert de contenu sur `H` ni sous `H`.
+- [ ] `ameesh-approve serve` starts in strict profile, without configuration
+      warning;
+- [ ] `ameesh approve-check` returns 0 on each verifying workstation;
+- [ ] the API is open under `H` only if `api_via_public` is written, and the
+      token is a `0600` file of the user concerned;
+- [ ] in passthrough: certificate of `H` only, `0600` files of the service
+      user, renewal by atomic rename;
+- [ ] the team's Postgres role applied without discrepancy; the service's
+      DSN on its login role;
+- [ ] no other application serves content on `H` or under `H`.
