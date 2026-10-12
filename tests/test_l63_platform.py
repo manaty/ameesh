@@ -299,6 +299,13 @@ class PlatformTest(unittest.TestCase):
             self.assertEqual(process.service_managers(1000), frozenset({100}))
             proc(101, "(sd-pam)", 100, 11)
             self.assertEqual(process.service_managers(1000), frozenset({100, 101}))
+            # revue #377 r3 : le vrai (sd-pam) parti, le plus ancien enfant
+            # restant prend son nom : démarré trop tard, pas exempté
+            import shutil
+            shutil.rmtree(os.path.join(racine, "101"))
+            shutil.rmtree(os.path.join(racine, "102"))
+            proc(102, "(sd-pam)", 100, 10 + int(process.SD_PAM_DELAY_S * os.sysconf("SC_CLK_TCK")) + 1)
+            self.assertEqual(process.service_managers(1000), frozenset({100}))
         sans = subprocess.CompletedProcess([], 1, stdout="", stderr="")
         with mock.patch.object(process, "PROC", racine), \
                 mock.patch.object(platform, "SYSTEM", "linux"), \
