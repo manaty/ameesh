@@ -16,6 +16,26 @@ BUILDER_CONFIGS = ("electron-builder.yml", "electron-builder.yaml",
 DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 
 
+class _ScriptStream(io.StringIO):
+    """Let shlex skip comments while preserving shell command newlines."""
+
+    def __init__(self, script):
+        super().__init__(script)
+        self.source = script
+
+    def readline(self, size=-1):
+        # shlex calls readline after an unquoted/unescaped comment marker.
+        start = self.tell() - 1
+        line = super().readline(size)
+        if line.endswith("\n"):
+            self.seek(self.tell() - 1)
+            line = line[:-1]
+        end = self.tell()
+        # Keep offsets stable, but exclude comment text from token spelling.
+        self.source = self.source[:start] + " " * (end - start) + self.source[end:]
+        return line
+
+
 def _script_commands(script):
     """Command positions in simple shell pipelines and npm/npx invocations.
 
@@ -25,7 +45,8 @@ def _script_commands(script):
     This is declaration detection, not an interpreter for shell programs.
     """
     # shlex's punctuation_chars=True set, plus shell command newlines.
-    lexer = shlex.shlex(io.StringIO(script), posix=True,
+    stream = _ScriptStream(script)
+    lexer = shlex.shlex(stream, posix=True,
                         punctuation_chars="();<>|&\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
@@ -35,7 +56,7 @@ def _script_commands(script):
         # Punctuation lookahead is held by shlex rather than consumed as part
         # of this token; subtract it to recover the original token spelling.
         end = lexer.instream.tell() - len(lexer._pushback_chars)
-        spelling = script[start:end].strip(" \t\r")
+        spelling = stream.source[start:end].strip(" \t\r")
         start = end
         if spelling and all(char in ";&|()\n" for char in spelling):
             segments.append([])
