@@ -248,5 +248,57 @@ class Relecture424Test(unittest.TestCase):
                                                          "dev"))
 
 
+class Relecture424r2Test(unittest.TestCase):
+    """#424 r2 : canon lu en partie, mémoire des verdicts, clé de l'alerte."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def fake(self, canons):
+        cfg = types.SimpleNamespace(critical_agents=(), canon="home", state_dir=self.tmp)
+        return types.SimpleNamespace(cfg=cfg, db=None, _audit_canons=tuple(canons),
+                                     _orchestrators_declared=frozenset(),
+                                     _canon_complete=True)
+
+    def critical(self, fake, name, rows):
+        with mock.patch("ameesh.registry.get", lambda db, n: rows.get(n)), \
+                mock.patch("ameesh.runner.log_async"):
+            return runner.Runner.is_critical(fake, name)
+
+    def test_canon_lu_en_partie_le_verdict_tient(self):
+        from ameesh.canon import Finding
+        rows = _rows()
+        fake = self.fake([_Canon("A", CARTES)])
+        self.assertTrue(self.critical(fake, "codex1", rows))
+        # une erreur de lecture fait perdre la fiche de codex1, `readable` reste vrai
+        partiel = _Canon("A", {k: v for k, v in CARTES.items() if k != "codex1"})
+        partiel.load_findings = [Finding("canon-git-error", "error", "reading home: EIO")]
+        fake._audit_canons = (partiel,)
+        self.assertTrue(self.critical(fake, "codex1", rows))
+        self.assertFalse(su.fully_read(partiel))
+
+    def test_resume_relit_le_dernier_verdict(self):
+        rows = _rows()
+        self.assertTrue(self.critical(self.fake([_Canon("A", CARTES)]), "codex1", rows))
+        cfg = types.SimpleNamespace(critical_agents=(), canon="home", state_dir=self.tmp)
+        with mock.patch("ameesh.canon.load_configured", side_effect=OSError("git")), \
+                mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
+            self.assertTrue(reprise._critical(cfg, rows["codex1"]))
+        # un exécuteur redémarré aussi, canon illisible
+        neuf = self.fake([_Canon("A", {}, readable=False)])
+        self.assertTrue(self.critical(neuf, "codex1", rows))
+
+    def test_cle_d_alerte_stable_d_un_passage_au_suivant(self):
+        from ameesh import canon as canon_mod, exploitation, notify
+        cfg = types.SimpleNamespace(host="h1", canon="home")
+        with mock.patch.object(canon_mod, "from_config",
+                               side_effect=canon_mod.CanonError("ref introuvable")):
+            un = exploitation._critical_roles_unreadable(cfg, 100.0)
+            deux = exploitation._critical_roles_unreadable(cfg, 400.0)
+        self.assertEqual(notify.key_of(un[0]), notify.key_of(deux[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

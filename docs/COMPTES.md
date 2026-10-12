@@ -469,11 +469,15 @@ role. A conflicting card with the same name in another canon never makes an
 agent critical.
 
 **Unreadable canon.** When the agent's own canon cannot be loaded or read,
-its criticality is never lowered silently: the runner keeps the last
-verdict it read, and without one, `orchestrateur`, `mesh-design` and the
-`auditeur` agent stay critical (plus `critical_agents`). `ameesh alerts`
-raises `critical_roles_unreadable` for each configured canon that cannot be
-read on the host.
+or was read only in part (a card or the manifest could not be read:
+`canon-git-error`, `frontmatter-invalid` or `federation-invalid` errors), its
+criticality is never lowered silently: the last verdict read is kept, and
+without one, `orchestrateur`, `mesh-design` and the `auditeur` agent stay
+critical (plus `critical_agents`). The last verdicts are kept in the host's
+state (`critical-known.json`), so a restarted runner and `ameesh resume`
+read them too. `ameesh alerts` raises `critical_roles_unreadable` for each
+configured canon that cannot be read in full on the host; it stays one
+alert while the outage lasts.
 
 Two declarations still make an agent critical whatever its roles:
 

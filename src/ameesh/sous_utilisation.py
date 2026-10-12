@@ -110,6 +110,12 @@ _ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in 
 #: L242c (#424 r1) : canon propriétaire illisible et aucun verdict connu —
 #: critiques par défaut (avec la persona auditeur et `critical_agents`)
 CRITICAL_FALLBACK = ("orchestrateur", "mesh-design", "auditeur")
+#: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
+#: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
+READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
+#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
+#: relus par un exécuteur redémarré et par `ameesh resume`
+CRITICAL_MEMORY = "critical-known.json"
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -414,15 +420,61 @@ def critical_roles(canon) -> tuple:
                                                  if isinstance(r, str)) if role))
 
 
+def fully_read(canon) -> bool:
+    """L242c (#424 r2) : le canon s'est-il lu en entier ? Pas s'il est
+    illisible, ni si une fiche ou son manifeste n'a pu être lu (`READ_ERRORS`
+    de niveau erreur dans `load_findings`) : une fiche manquante ne doit pas
+    faire perdre un rôle en silence."""
+    if not getattr(canon, "readable", True):
+        return False
+    return not any(getattr(f, "code", None) in READ_ERRORS
+                   and getattr(f, "severity", None) == "error"
+                   for f in getattr(canon, "load_findings", None) or ())
+
+
+def critical_memory(cfg) -> dict:
+    """{agent: dernier verdict lu} (`CRITICAL_MEMORY`) ; {} s'il n'y en a pas."""
+    import json
+    path = os.path.join(getattr(cfg, "state_dir", None) or "", CRITICAL_MEMORY)
+    if not getattr(cfg, "state_dir", None):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def remember_critical(cfg, name: str, verdict: bool) -> None:
+    """Retient le verdict lu de `name` (écriture atomique) ; ne lève jamais."""
+    import json
+    state = getattr(cfg, "state_dir", None)
+    if not state:
+        return
+    known = critical_memory(cfg)
+    if known.get(name) is verdict:
+        return
+    known[name] = verdict
+    path = os.path.join(state, CRITICAL_MEMORY)
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(known, fh, sort_keys=True)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def critical_by_role(row, canons) -> bool | None:
     """L242c : l'agent du registre `row` porte-t-il un rôle critique de son
     organisation, dans la fiche de son canon propriétaire ? La persona
     `auditeur` l'est sans fiche tant que le rôle auditeur est critique.
     None (#424 r1) : son canon propriétaire n'est pas chargé ou illisible —
-    inconnu, jamais « non » (`critical_verdict`)."""
+    inconnu, jamais « non » (`critical_verdict`) ; de même s'il n'a été lu
+    qu'en partie (#424 r2, `fully_read`)."""
     from .alert_briefs import AUDITOR_NAME
     owners = _owners(row, canons)
-    if not owners or not all(getattr(c, "readable", True) for c in owners):
+    if not owners or not all(fully_read(c) for c in owners):
         return None
     for canon in owners:
         roles = critical_roles(canon)

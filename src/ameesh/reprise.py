@@ -629,7 +629,8 @@ def _critical(cfg: Config, row: dict) -> bool:
         canons = canon_mod.load_configured(cfg) if configured else []
     except Exception:
         canons = []
-    return su.critical_verdict(row, canons, configured=configured)[0]
+    return su.critical_verdict(row, canons, configured=configured,
+                               known=su.critical_memory(cfg).get(row["name"]))[0]
 
 
 def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:

@@ -5204,11 +5204,13 @@ class Runner:
             return True
         from . import canon as canon_mod, sous_utilisation as su
         canons = getattr(self, "_audit_canons", ())
-        known = self.__dict__.setdefault("_critical_known", {})
+        known = self.__dict__.get("_critical_known")
+        if known is None:   # #424 r2 : les verdicts lus avant un redémarrage
+            known = self._critical_known = su.critical_memory(self.cfg)
         # le registre n'est lu que pour un nom candidat, comme `is_auditor`
         # (tous les canons configurés chargés : un absent ne dit rien)
         if (getattr(self, "_canon_complete", True) and not known.get(name)
-                and all(getattr(c, "readable", True) for c in canons)
+                and all(su.fully_read(c) for c in canons)
                 and name not in su.critical_candidates(canons)):
             return False
         row = agent if agent is not None else registry.get(self.db, name)
@@ -5216,7 +5218,9 @@ class Runner:
             dict(row or {}, name=name), canons,
             configured=bool(canon_mod.configured(self.cfg)), known=known.get(name))
         if not unknown:
-            known[name] = verdict
+            if known.get(name) is not verdict:
+                known[name] = verdict
+                su.remember_critical(self.cfg, name, verdict)
         elif self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
             self._critical_held[name] = verdict
             log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
