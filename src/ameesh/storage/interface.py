@@ -1138,7 +1138,20 @@ class WorkItems(Domain):
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`)."""
 
-    # -- délégation à échéance (L40, décision 0030 point 5) -------------------
+    @abc.abstractmethod
+    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+                paused_prefix: str, note_prefix: str, window_s: float,
+                max_per_window: int, note: str, actor: str) -> dict | None:
+        """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
+        transaction sous verrou consultatif (une reprise à la fois pour tout
+        le mesh), journalisée comme `assign` ; None si l'une des conditions
+        ne tient plus au moment d'écrire : le lot a encore l'assigné `current`
+        et l'état `state` (celui contrôlé) ; `current` est encore en pause
+        (`blocked`, `status_text` commençant par `paused_prefix`, ligne
+        verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
+        de `max_per_window` notes commençant par `note_prefix` dans les
+        `window_s` dernières secondes."""
+
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
                  delegated_by: str, within_s: float, note: str, actor: str) -> dict | None:
@@ -1278,6 +1291,22 @@ class WorkItems(Domain):
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et
         `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+
+    @abc.abstractmethod
+    def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
+        """L233b : la dernière ligne de journal du lot dont la note commence
+        par l'un des `prefixes` (une attribution), puis sa ligne la plus
+        ancienne (la création), du plus récent au plus ancien — quelle que
+        soit la longueur du journal."""
+
+    @abc.abstractmethod
+    def handoff_lots(self, assignee: str, limit: int) -> list[dict]:
+        """L233b : les lots `intake` et `build` de `assignee`, hors file
+        d'amélioration, dans l'ordre de `unassigned_lots`. Chaque ligne ajoute
+        `lot_team`, `pending_decision`, `decision_milestone` (comme
+        `unassigned_lots`), `package_team` (équipe de la fiche, pour
+        `projects.lot_project`) et `frozen_ts` (dernier jalon de gel, None
+        sans gel)."""
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
