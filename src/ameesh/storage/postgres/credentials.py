@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Postgres driver: credential health per host, harness and account
-(L226a/L226b, migration 0060).
+(L226a/L226b, migrations 0060 and 0068).
 
 Only account NAMES pass here, never a secret.
 """
@@ -8,13 +8,17 @@ from __future__ import annotations
 
 from .. import interface
 
-_ROW = ("select host, harness, account, state, reason, source,"
-        " extract(epoch from checked_at)::float8 as checked_ts,"
-        " extract(epoch from failing_since)::float8 as failing_since_ts,"
-        " extract(epoch from expires_at)::float8 as expires_ts,"
-        " extract(epoch from last_failure_at)::float8 as last_failure_ts,"
-        " failing_fingerprint, failures"
-        " from credential_health")
+#: the columns the supervisor role is granted (role-superviseur.sql): no
+#: fingerprint — `listing` feeds the alerts, which that role reads
+_COLUMNS = ("select host, harness, account, state, reason, source,"
+            " extract(epoch from checked_at)::float8 as checked_ts,"
+            " extract(epoch from failing_since)::float8 as failing_since_ts,"
+            " extract(epoch from expires_at)::float8 as expires_ts,"
+            " extract(epoch from last_failure_at)::float8 as last_failure_ts,"
+            " failures")
+_LISTING = _COLUMNS + " from credential_health"
+#: and the fingerprint, for the sentinel and the runner (full role)
+_ROW = _COLUMNS + ", failing_fingerprint from credential_health"
 
 
 class Credentials(interface.Credentials):
@@ -60,5 +64,5 @@ class Credentials(interface.Credentials):
 
     def listing(self, host=None) -> list:
         if host is None:
-            return self.db.query(_ROW + " order by host, harness, account")
-        return self.db.query(_ROW + " where host = %s order by harness, account", (host,))
+            return self.db.query(_LISTING + " order by host, harness, account")
+        return self.db.query(_LISTING + " where host = %s order by harness, account", (host,))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from unittest import mock
 from ameesh import (account_turn, accounts, auth_failure, cost, exploitation, registry,
                     sentinel, storage)
 
-from .support import FAKEBIN
+from .support import FAKEBIN, REPO
 from .test_l30_accounts import _Base, _codex_rollout
 
 
@@ -316,6 +317,27 @@ class CredentialsConditionalTest(_AuthBase):
         self.assertEqual(creds.report(self.cfg.host, "codex", "b", "failing",
                                       source="sentinel", expect_failures=0)["state"],
                          "failing")
+
+    def test_listing_reads_only_what_the_supervisor_is_granted(self):
+        # #210 codex r4: the alerts read `listing()`, the supervisor role is
+        # not granted the fingerprint — selecting it emptied the alerts
+        from ameesh.storage.postgres import credentials as pg_credentials
+        with open(os.path.join(REPO, "deploy", "sql", "role-superviseur.sql"),
+                  encoding="utf-8") as fh:
+            grants = re.search(r"\('credential_health', ARRAY\[(.*?)\]", fh.read(), re.S)
+        granted = set(re.findall(r"'([a-z_]+)'", grants.group(1)))
+        columns = {row["column_name"] for row in self.db.query(
+            "select column_name from information_schema.columns"
+            " where table_name = 'credential_health' and table_schema = current_schema()")}
+        self.assertIn("failing_fingerprint", columns)
+        read = set(re.findall(r"[a-z_]+", pg_credentials._LISTING)) & columns
+        self.assertEqual(read - granted, set())
+        storage.of(self.db).credentials.report(self.cfg.host, "codex", "a", "failing",
+                                               source="turn", fingerprint="f1")
+        rows = storage.of(self.db).credentials.listing(self.cfg.host)
+        self.assertTrue(rows)
+        self.assertNotIn("failing_fingerprint", rows[0])
+        self.assertEqual(self._health("codex")["a"]["failing_fingerprint"], "f1")
 
 
 class ChooseTest(_AuthBase):

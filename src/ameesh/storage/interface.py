@@ -599,7 +599,7 @@ class Accounts(Domain):
 
 
 # --------------------------------------------------------------------------
-# credential health (L226a/L226b, migration 0060)
+# credential health (L226a/L226b, migrations 0060 and 0068)
 # --------------------------------------------------------------------------
 
 class Credentials(Domain):
@@ -630,7 +630,8 @@ class Credentials(Domain):
 
     @abc.abstractmethod
     def listing(self, host: str | None = None) -> list[dict]:
-        """Every row (of a host, or of all hosts)."""
+        """Every row (of a host, or of all hosts), without
+        `failing_fingerprint`: only columns the supervisor role reads."""
 
 
 # --------------------------------------------------------------------------
