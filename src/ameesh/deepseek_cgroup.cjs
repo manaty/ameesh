@@ -105,10 +105,14 @@ function assertNoProviderPreloads(nodeOptions = process.env.NODE_OPTIONS || '', 
 }
 
 function assertGuardFirst() {
-  const targets = preloadTargets([...optionTokens(process.env.NODE_OPTIONS || ''), ...process.execArgv], false);
+  const tokens = [...optionTokens(process.env.NODE_OPTIONS || ''), ...process.execArgv];
+  const targets = preloadTargets(tokens, false);
   const own = targets.findIndex(target => {
     try { return resolvePreload(target) === __filename; } catch { return false; }
   });
+  if (own < 0 && preloadTargets(tokens).some(target => {
+    try { return resolvePreload(target) === __filename; } catch { return false; }
+  })) throw new Error('cgroup guard must be loaded with --require, before ESM --import preloads');
   if (own > 0) throw new Error('cgroup guard must be the first --require preload; earlier modules can retain unguarded Worker references');
 }
 

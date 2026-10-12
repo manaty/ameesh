@@ -52,6 +52,8 @@ resolving to the provider. It does not try to patch an evaluated module. The
 guard must precede other `--require` preloads, so those cannot retain an
 unguarded `Worker` constructor before interception. The adapter puts it first,
 including when repositioning an existing guard option.
+The guard itself must use `--require`, not the later ESM `--import` phase,
+which could already have populated Node's separate ESM cache.
 
 Node's synchronous module hooks belong to one thread. The guard therefore
 wraps `worker_threads.Worker`, updates its ESM binding, and injects its preload

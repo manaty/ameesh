@@ -225,6 +225,14 @@ assert.equal(code,127);
             self.assertEqual(result.stdout, "")
             self.assertIn("cgroup guard must be the first --require preload", result.stderr)
 
+    def test_guard_itself_cannot_be_deferred_to_esm_import_phase(self):
+        options = "--import=" + json.dumps(deepseek_cgroup.PRELOAD.as_uri())
+        result = subprocess.run([NODE, "-e", 'console.log("COMMAND RAN");'],
+            env=dict(os.environ, NODE_OPTIONS=options), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("cgroup guard must be loaded with --require", result.stderr)
+
 
 class PlacementCheckTest(unittest.TestCase):
     def test_outside_scope_and_reparented_scope_member_are_reported(self):
