@@ -5197,7 +5197,7 @@ class Runner:
         rôle critique de sa fiche, dans son canon propriétaire seulement
         (`critical_roles` de l'organisation, défaut orchestrateur, conception,
         auditeur, relecture). Canon propriétaire illisible (#424 r1) : le
-        dernier verdict lu, sinon `sous_utilisation.CRITICAL_FALLBACK`."""
+        dernier verdict lu, sinon critique (#424 r6)."""
         if name in (getattr(self.cfg, "critical_agents", None) or ()):
             return True
         if name in getattr(self, "_orchestrators_declared", ()):
@@ -5234,7 +5234,7 @@ class Runner:
             log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
                       % (name, "critical" if verdict else "not critical",
                          "last known" if isinstance(last, bool) else
-                         "lost: fail-closed" if last == su.UNKNOWN else "default"))
+                         "unknown: fail-closed"))
         return verdict
 
     def audit_command(self, name: str, argv: list, agent=None, *,

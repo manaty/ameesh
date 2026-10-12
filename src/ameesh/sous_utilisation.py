@@ -107,9 +107,6 @@ CRITICAL_ROLES = ("orchestrateur", "conception", "auditeur", "relecture")
 ROLE_SYNONYMS = {"orchestrateur": ("orchestrator",), "conception": ("design",),
                  "auditeur": ("auditor",), "relecture": ("review", "reviewer")}
 _ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in aliases}
-#: L242c (#424 r1) : canon propriétaire illisible et aucun verdict connu —
-#: critiques par défaut (avec la persona auditeur et `critical_agents`)
-CRITICAL_FALLBACK = ("orchestrateur", "mesh-design", "auditeur")
 #: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
 #: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
 READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
@@ -455,7 +452,12 @@ def _memory_dir(cfg, *, create: bool) -> int | None:
     (`O_DIRECTORY|O_NOFOLLOW`, relatif au dossier d'état), à nous et en 0700 —
     tout le reste s'ouvre relativement à lui (`dir_fd`) : un parent remplacé ou
     lié ne redirige rien. None s'il n'existe pas (et `create` faux) ;
-    `_Untrusted` s'il n'est pas digne de confiance."""
+    `_Untrusted` s'il n'est pas digne de confiance.
+
+    Résiduel accepté (#424 r5, mesh-design) : le dossier d'état lui-même
+    s'ouvre en suivant les liens, sans contrôle de propriétaire. Le détourner
+    suppose une action malveillante sous le même UID dans le dossier d'état
+    de l'exécuteur, hors de notre modèle de menace."""
     import stat
     state = os.open(cfg.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
@@ -532,12 +534,12 @@ def critical_memory(cfg) -> dict | None:
 
 
 def remembered(memory: dict | None, name: str):
-    """Le dernier verdict lu de `name` : True, False, None (jamais lu dans un
-    cache sain), ou `UNKNOWN` (perdu : vaut critique, `critical_verdict`)."""
-    if memory is None:
+    """Le dernier verdict lu de `name` : True, False, ou `UNKNOWN` (vaut
+    critique, `critical_verdict`) — cache perdu, valeur invalide, ou nom
+    absent du cache (#424 r6 : jamais lu, ou cache recréé depuis par un
+    agent d'un autre canon ; aucun « non » faute de lecture)."""
+    if memory is None or name not in memory:
         return UNKNOWN
-    if name not in memory:
-        return None
     value = memory[name]
     return value if isinstance(value, bool) else UNKNOWN
 
@@ -549,7 +551,13 @@ def remember_critical(cfg, name: str, verdict: bool) -> bool:
     fois : aucun chemin de verrou à remplacer) : relecture, mise à jour, fichier temporaire exclusif, fsync, renommage des
     seules données, fsync du dossier, mode 0600. Un cache corrompu n'est
     jamais réécrit (il reste « inconnu », critique) ; ses valeurs invalides
-    sont gardées telles quelles. Ne lève jamais : l'appelant réessaie."""
+    sont gardées telles quelles. Ne lève jamais : l'appelant réessaie.
+
+    Résiduel accepté (#424 r5, mesh-design) : le dossier du cache remplacé
+    entre son ouverture et le `flock` : l'écriture va dans le dossier
+    détaché, la lecture suivante voit le nouveau (absent ou corrompu :
+    critique). Cela suppose une action malveillante sous le même UID dans le
+    dossier d'état de l'exécuteur, hors de notre modèle de menace."""
     import fcntl
     import json
     if _memory_path(cfg) is None:
@@ -616,7 +624,7 @@ def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
     l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
     illisible (#424 r1) : le dernier verdict lu (`known`, `remembered`) ;
-    perdu (`UNKNOWN`, #424 r3) : critique ; jamais lu : `CRITICAL_FALLBACK`.
+    sinon — perdu, invalide, jamais lu (#424 r6) — critique (fail-safe).
     Jamais une baisse silencieuse ; la surcharge `critical_agents` se juge
     avant."""
     from .alert_briefs import AUDITOR_NAME
@@ -625,11 +633,9 @@ def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     verdict = critical_by_role(row, canons)
     if verdict is not None:
         return verdict, False
-    if known == UNKNOWN:
-        return True, True
     if isinstance(known, bool):
         return known, True
-    return row.get("name") in CRITICAL_FALLBACK, True
+    return True, True
 
 
 def critical_candidates(canons) -> set:

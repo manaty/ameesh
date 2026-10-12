@@ -472,8 +472,8 @@ agent critical.
 or was read only in part (a card or the manifest could not be read:
 `canon-git-error`, `frontmatter-invalid` or `federation-invalid` errors), its
 criticality is never lowered silently: the last verdict read is kept, and
-without one, `orchestrateur`, `mesh-design` and the `auditeur` agent stay
-critical (plus `critical_agents`). The last verdicts are kept in the host's
+without one (never read, or absent from the cache) the agent counts as
+critical. The last verdicts are kept in the host's
 state (`critical-known/known.json`), so a restarted runner and `ameesh resume`
 read them too; `ameesh resume` refreshes them when the canon is readable,
 and the runner compares each verdict it reads with the disk (never with its
@@ -491,7 +491,12 @@ an exclusive temporary file, fsync, rename, fsync of the directory, mode
 0600; a corrupt file is never rewritten (delete it to start again: while it
 is missing, every agent counts as critical) and invalid values are kept as
 they are. The runner trusts a verdict only once written, and tries again
-at the next poll otherwise. `ameesh alerts` raises `critical_roles_unreadable` for each
+at the next poll otherwise. Two residual risks are accepted: the state
+directory itself is opened following links and without an owner check, and
+the cache directory could be replaced between its opening and the lock (the
+write then lands in the detached directory). Both need a malicious action
+under the runner's own user in its state directory, which is outside the
+threat model. `ameesh alerts` raises `critical_roles_unreadable` for each
 configured canon that cannot be read in full on the host; it stays one
 alert while the outage lasts.
 

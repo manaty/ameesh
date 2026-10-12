@@ -100,12 +100,13 @@ class CritiqueTest(unittest.TestCase):
         self.assertFalse(self.critical(self.fake([a, b]), "dev7", rows))
 
     def test_un_nom_hors_des_fiches_ne_lit_pas_le_registre(self):
+        # #424 r6 : une fois son verdict lu (« non ») ; avant, il est inconnu
         fake = self.fake([_Canon("A", CARTES)])
         fake.db = object()
+        self.assertFalse(runner.Runner.is_critical(fake, "dev7", {"name": "dev7",
+                                                                  "canon": "A"}))
         with mock.patch("ameesh.registry.get", side_effect=AssertionError):
-            self.assertFalse(runner.Runner.is_critical(fake, "inconnu"))
-            self.assertFalse(runner.Runner.is_critical(fake, "dev7", {"name": "dev7",
-                                                                      "canon": "A"}))
+            self.assertFalse(runner.Runner.is_critical(fake, "dev7"))
 
     def test_persona_auditeur_sans_canon(self):
         self.assertTrue(self.critical(self.fake([]), "auditeur", {}))
@@ -178,18 +179,17 @@ class Relecture424Test(unittest.TestCase):
             fake._audit_canons = tuple(canons)
             self.assertTrue(self.critical(fake, "codex1", rows))
             self.assertFalse(self.critical(fake, "dev7", rows))
-        # sans verdict connu : les critiques par défaut
+        # sans verdict connu : critique (#424 r6, fail-safe)
         neuf = self.fake([_Canon("A", {}, readable=False)])
-        for name in ("orchestrateur", "mesh-design", "auditeur"):
+        for name in ("orchestrateur", "mesh-design", "auditeur", "codex1", "dev7"):
             self.assertTrue(self.critical(neuf, name, rows), name)
-        self.assertFalse(self.critical(neuf, "codex1", rows))
 
     def test_reprise_canon_illisible_repli(self):
         cfg = types.SimpleNamespace(critical_agents=(), canon="home")
         with mock.patch("ameesh.canon.load_configured", side_effect=OSError("git")), \
                 mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
             self.assertTrue(reprise._critical(cfg, {"name": "mesh-design", "canon": "A"}))
-            self.assertFalse(reprise._critical(cfg, {"name": "dev7", "canon": "A"}))
+            self.assertTrue(reprise._critical(cfg, {"name": "dev7", "canon": "A"}))
 
     def test_alerte_canon_illisible(self):
         from ameesh import canon as canon_mod, exploitation, notify
@@ -199,7 +199,7 @@ class Relecture424Test(unittest.TestCase):
             alertes = exploitation._critical_roles_unreadable(cfg, 100.0)
         self.assertEqual([a["type"] for a in alertes], ["critical_roles_unreadable"])
         self.assertIn("ref introuvable", alertes[0]["detail"])
-        self.assertIn("mesh-design", alertes[0]["detail"])
+        self.assertIn("without one: critical", alertes[0]["detail"])
         self.assertIn("critical_roles_unreadable", exploitation.ALERT_TYPES)
         self.assertIn("critical_roles_unreadable", notify.TYPE_LABELS)
         ok = types.SimpleNamespace(readable=True, id="manaty")
@@ -490,6 +490,30 @@ class Relecture424r4Test(_Cache):
             b.join(5)
         memoire = su.critical_memory(self.cfg)
         self.assertEqual((memoire["codex1"], memoire["rev"]), (True, True))
+
+
+class Relecture424r5Test(_Cache):
+    """#424 r5 (décision de mesh-design) : un agent absent du cache, ou dont
+    le canon est illisible, compte comme critique ; aucun « non » faute de
+    lecture."""
+
+    def test_cache_recree_par_un_autre_canon(self):
+        self.rows["codex1"] = {"name": "codex1", "canon": "B"}
+        self.assertTrue(su.remember_critical(self.cfg, "codex1", True))
+        import shutil
+        shutil.rmtree(self.dir)                           # cache effacé
+        a = _Canon("A", CARTES)
+        b = _Canon("B", {}, readable=False)               # canon de codex1 illisible
+        # un agent lisible d'un autre canon recrée le cache sans codex1
+        self.assertFalse(self.critical(self.fake([a, b]), "dev7"))
+        self.assertEqual(su.critical_memory(self.cfg), {"dev7": False})
+        self.assertTrue(self.critical(self.fake([a, b]), "codex1"))
+        with mock.patch("ameesh.canon.load_configured", return_value=[a, b]), \
+                mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
+            self.assertTrue(reprise._critical(self.cfg, self.rows["codex1"]))
+        self.assertTrue(self.resume("codex1", None))
+        self.assertTrue(self.outage("codex1"))
+        self.assertFalse(self.outage("dev7"))
 
 
 if __name__ == "__main__":
