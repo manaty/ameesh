@@ -476,16 +476,36 @@ class ReservationsSimultaneesTest(PgTestCase):
 _INDEX = "work_items_migration_repo_idx"
 
 
-def _violation(*, marker=True, state=None) -> DbError:
-    """La violation d'unicité de l'index telle que le pilote la rend : le
-    marqueur standard de psql (`marker`) et/ou le code 23505 de psycopg
-    (`state`)."""
-    message = ('psql: ERROR:  duplicate key value violates unique constraint "%s"'
-               % _INDEX) if marker else "psycopg: %s" % _INDEX
-    exc = DbError(message)
-    if state is not None:
-        exc.sqlstate = state
-    return exc
+def _violation(*, constraint=_INDEX, state="23505") -> DbError:
+    """La violation d'unicité de `constraint` telle qu'un pilote la rend : le
+    code SQLSTATE 23505 et le nom exact de la contrainte — ceux de psycopg
+    (`diag.constraint_name`) comme ceux de psql (`VERBOSITY=verbose`). Le
+    message n'entre pas dans la classification (codex #478 r2)."""
+    return DbError('psql: ERROR:  duplicate key value violates unique constraint "%s"'
+                   % constraint, sqlstate=state, constraint=constraint)
+
+
+def _psql_verbose(constraint=_INDEX, *, severity="ERROR", state="23505",
+                  message=None) -> str:
+    """Le rapport d'erreur de psql en `VERBOSITY=verbose` : le code SQLSTATE
+    sur la ligne d'erreur, le nom exact dans son champ. `severity` et
+    `message` suivent `lc_messages` du serveur (« ERREUR », message
+    français) ; le code et le champ CONSTRAINT NAME, non."""
+    if message is None:
+        message = 'duplicate key value violates unique constraint "%s"' % constraint
+    return ("%s:  %s: %s\n"
+            "DETAIL:  Key (migration_repo, migration)=(manaty/nexlink, 377)"
+            " already exists.\n"
+            "SCHEMA NAME:  public\n"
+            "TABLE NAME:  work_items\n"
+            "CONSTRAINT NAME:  %s\n"
+            "LOCATION:  _bt_check_unique, nbtinsert.c:677\n"
+            % (severity, state, message, constraint))
+
+
+def _failed(stderr: str) -> subprocess.CompletedProcess:
+    """Un psql en échec (code 3, ON_ERROR_STOP) dont le `_fail` lit stderr."""
+    return subprocess.CompletedProcess([], 3, "", stderr)
 
 
 class _FakeTime:
@@ -570,26 +590,64 @@ class RetryReservationTest(PgTestCase):
         got, _, _, _ = self._reserve(denied, budget=0.05)
         self.assertIs(got, denied, got)
 
-    def test_la_violation_se_reconnait_au_code_ou_au_marqueur(self):
-        # codex #478 r1 : psycopg donne le code 23505 (sans le texte), psql
-        # donne le marqueur standard (sans code) ; les deux sont la
-        # contention de l'index
-        for exc in (_violation(), _violation(marker=False, state="23505")):
-            with self.subTest(exc=str(exc)):
-                got, _, _, _ = self._reserve(exc, budget=0.0)
-                self.assertIsInstance(got, work.WorkError, got)
-                self.assertEqual(str(got), "reservation contention, retry")
+    def test_la_violation_se_reconnait_au_code_sqlstate(self):
+        # codex #478 r1/r2 : psycopg donne le code 23505 et le nom exact par
+        # ses diagnostics ; c'est la contention de l'index
+        got, _, _, _ = self._reserve(_violation(), budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
 
-    def test_le_code_du_pilote_est_garde_sur_la_dberror(self):
-        # codex #478 r1 : le code SQLSTATE du pilote (psycopg) survit à la
-        # traduction en DbError, seul moyen de distinguer 23505 d'une autre
-        # erreur qui nomme le même index
+    def test_une_autre_contrainte_au_nom_proche_ne_retente_pas(self):
+        # codex #478 r2 : `work_items_migration_repo_idx_other` contient le
+        # nom de l'index sans être lui ; sa violation remonte telle quelle et
+        # n'entame aucune deuxième transaction (l'ancien test par sous-chaîne
+        # la retentait)
+        other = _violation(constraint=_INDEX + "_other")
+        got, _, attempts, _ = self._reserve(other, budget=10.0)
+        self.assertIs(got, other, got)
+        self.assertEqual(attempts, [0.0], "aucune deuxième transaction")
+
+    def test_psql_verbose_reconnait_la_violation_meme_en_francais(self):
+        # codex #478 r2 : un serveur en `lc_messages=fr` écrit « ERREUR » et
+        # un message français ; le code SQLSTATE et le champ CONSTRAINT NAME
+        # ne sont pas traduits, et c'est tout ce que la classification lit
+        exc = db_mod.PsqlDriver._fail(None, _failed(_psql_verbose(
+            severity="ERREUR",
+            message="la valeur d'une clé dupliquée rompt la contrainte unique"
+                    " « %s »" % _INDEX)))
+        self.assertEqual(exc.sqlstate, "23505")
+        self.assertEqual(exc.constraint, _INDEX)
+        got, _, _, _ = self._reserve(exc, budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+
+    def test_psql_verbose_autre_contrainte_ne_retente_pas(self):
+        # codex #478 r2 : le champ CONSTRAINT NAME tranche exactement, même
+        # quand le message (traduit) nomme l'index par sous-chaîne
+        exc = db_mod.PsqlDriver._fail(None, _failed(_psql_verbose(
+            constraint=_INDEX + "_other",
+            message='duplicate key value violates unique constraint "%s"' % _INDEX)))
+        self.assertEqual(exc.constraint, _INDEX + "_other")
+        got, _, attempts, _ = self._reserve(exc, budget=10.0)
+        self.assertIs(got, exc, got)
+        self.assertEqual(attempts, [0.0], "aucune deuxième transaction")
+
+    def test_le_code_et_la_contrainte_du_pilote_survivent_a_la_dberror(self):
+        # codex #478 r1/r2 : le code SQLSTATE et le nom de contrainte du
+        # pilote (psycopg) survivent à la traduction en DbError — seuls eux
+        # distinguent 23505 d'une autre erreur qui nomme le même index
+        class Diag:
+            constraint_name = _INDEX
+
         class DriverError(Exception):
             sqlstate = "23505"
+            diag = Diag()
 
         mapped = db_mod._map_error(DriverError("duplicate key value"))
         self.assertEqual(mapped.sqlstate, "23505")
+        self.assertEqual(mapped.constraint, _INDEX)
         self.assertIsNone(db_mod._map_error(Exception("boom")).sqlstate)
+        self.assertIsNone(db_mod._map_error(Exception("boom")).constraint)
 
     def test_l_attente_plein_jitter_part_de_zero(self):
         # codex #478 r1 (P3) : plein jitter — uniform(0, min(cap, base*2^n)) —

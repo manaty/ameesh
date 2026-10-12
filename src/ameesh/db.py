@@ -86,34 +86,45 @@ _CONNECT_HINTS = (
 
 #: code SQLSTATE de PostgreSQL pour une violation d'unicité
 UNIQUE_VIOLATION = "23505"
-#: ce que le pilote psql imprime pour elle (il ne donne pas le code)
-_UNIQUE_VIOLATION_MARKER = "duplicate key value violates unique constraint"
+#: une ligne d'erreur psql en verbosité `verbose` : « ERROR:  23505: … ».
+#: Le libellé de sévérité est traduit par le serveur (`ERREUR` en français),
+#: le code et le nom de contrainte, non : ils viennent des champs structurés
+#: du rapport d'erreur, que psql imprime aussi (`VERBOSITY=verbose`).
+_ERROR_LINE_RE = re.compile(r"^\w+:\s+([0-9A-Z]{5}):", re.MULTILINE)
+#: le champ structuré « CONSTRAINT NAME: x » (psql, client en locale C) ; il
+#: porte le nom de l'index même quand celui-ci n'est pas une contrainte.
+_CONSTRAINT_LINE_RE = re.compile(r"^CONSTRAINT NAME:[ \t]+(\S.*?)[ \t]*$", re.MULTILINE)
 
 
 class DbError(RuntimeError):
-    """Erreur SQL ou de protocole. `sqlstate` : le code du serveur quand le
-    pilote le donne (psycopg), None sinon (psql, qui n'imprime que le
-    message)."""
+    """Erreur SQL ou de protocole. `sqlstate` et `constraint` : le code du
+    serveur et le nom de la contrainte violée, quand le pilote les donne
+    (psycopg par ses diagnostics, psql par ses champs `verbose`) ; None
+    sinon. Le texte du message ne sert jamais à classifier : il dépend de
+    `lc_messages` du serveur (codex #478 r2)."""
 
-    def __init__(self, message, *, sqlstate: str | None = None) -> None:
+    def __init__(self, message, *, sqlstate: str | None = None,
+                 constraint: str | None = None) -> None:
         super().__init__(message)
         self.sqlstate = sqlstate
+        self.constraint = constraint
 
 
 def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bool:
     """`exc` est-elle la violation d'unicité de `constraint` (ou d'une
-    contrainte quelconque quand il est None) ? Le code SQLSTATE 23505 tranche
-    quand le pilote le donne ; le pilote psql ne le donne pas, son message
-    standard en tient lieu. Le nom de la contrainte est exigé : une autre
-    erreur qui le mentionne (« permission denied for relation ... ») n'est
-    pas une violation d'unicité (codex #478 r1)."""
-    if not isinstance(exc, DbError):
+    contrainte quelconque quand il est None) ?
+
+    Seuls le code SQLSTATE 23505 et le nom EXACT de la contrainte tranchent
+    (codex #478 r2) : le texte du message est traduit par le serveur
+    (`lc_messages`), et une sous-chaîne confondrait
+    `work_items_migration_repo_idx` avec
+    `work_items_migration_repo_idx_other` — une violation de cette autre
+    contrainte ne doit pas être retentée en contention."""
+    if not isinstance(exc, DbError) or exc.sqlstate != UNIQUE_VIOLATION:
         return False
-    if exc.sqlstate is not None:
-        unique = exc.sqlstate == UNIQUE_VIOLATION
-    else:
-        unique = _UNIQUE_VIOLATION_MARKER in str(exc)
-    return unique and (constraint is None or constraint in str(exc))
+    if constraint is None:
+        return True
+    return exc.constraint == constraint
 
 
 class Unavailable(DbError):
@@ -398,11 +409,20 @@ class PsqlDriver:
         self.password, base = split_password(cfg.dsn)
         self.env = os.environ.copy()
         self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
+        #: psql traduit les libellés des champs de son rapport d'erreur
+        #: (`CONSTRAINT NAME`) selon la locale du *client* : la classification
+        #: les lit, donc le client est forcé en C. Le message du serveur, lui,
+        #: reste traduit par `lc_messages` — et n'est jamais analysé
+        #: (codex #478 r2).
+        self.env["LC_ALL"] = "C"
         if self.password:
             self.env["PGPASSWORD"] = self.password
+        # `VERBOSITY=verbose` : psql imprime alors le code SQLSTATE sur la
+        # ligne d'erreur et les champs structurés (CONSTRAINT NAME) — la
+        # seule source du nom exact, indépendante de `lc_messages`.
         base_args = [
             binary, "-X", "-q", "-A", "-t", "-P", "pager=off",
-            "-v", "ON_ERROR_STOP=1", "-d", base,
+            "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-d", base,
         ]
         self._args = list(base_args)
         # Un `psql -c` ne lit jamais stdin : l'écouteur interactif a donc sa
@@ -469,16 +489,24 @@ class PsqlDriver:
             raise DbError("psql: %s" % message)
 
     def _fail(self, proc: subprocess.CompletedProcess) -> DbError:
-        lines = [l for l in (proc.stderr or "").strip().splitlines() if l.strip()]
+        stderr = proc.stderr or ""
+        lines = [l for l in stderr.strip().splitlines() if l.strip()]
         message = lines[-1] if lines else "code %d" % proc.returncode
         for line in reversed(lines):
             if "ERROR" in line or "ERREUR" in line:
                 message = line.strip()
                 break
-        low = (proc.stderr or "").lower()
+        low = stderr.lower()
         if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
             return Unavailable("psql: %s" % message)
-        return DbError("psql: %s" % message)
+        # `VERBOSITY=verbose` : le code SQLSTATE est sur la ligne d'erreur et
+        # le nom exact de la contrainte dans son champ structuré — ni l'un ni
+        # l'autre ne dépend de `lc_messages` (codex #478 r2)
+        state = _ERROR_LINE_RE.search(stderr)
+        name = _CONSTRAINT_LINE_RE.search(stderr)
+        return DbError("psql: %s" % message,
+                       sqlstate=state.group(1) if state else None,
+                       constraint=name.group(1) if name else None)
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
@@ -1138,6 +1166,14 @@ def _sqlstate(exc: Exception) -> str | None:
     return state if isinstance(state, str) and state else None
 
 
+def _constraint(exc: Exception) -> str | None:
+    """Le nom de la contrainte violée, quand le pilote le donne : psycopg 3
+    et psycopg 2 l'exposent dans `exc.diag.constraint_name` (codex #478 r2)."""
+    diag = getattr(exc, "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    return name if isinstance(name, str) and name else None
+
+
 def _map_error(exc: Exception) -> DbError:
     text = _one_line(exc).lower()
     state = _sqlstate(exc)
@@ -1145,7 +1181,7 @@ def _map_error(exc: Exception) -> DbError:
         return Unavailable(_one_line(exc), sqlstate=state)
     if "does not exist" in text and ("relation" in text or "table" in text):
         return SchemaMissing(_one_line(exc), sqlstate=state)
-    return DbError(_one_line(exc), sqlstate=state)
+    return DbError(_one_line(exc), sqlstate=state, constraint=_constraint(exc))
 
 
 def is_unavailable(exc: BaseException) -> bool:
