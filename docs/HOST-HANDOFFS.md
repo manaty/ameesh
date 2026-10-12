@@ -29,6 +29,13 @@ executor/checkout/session effects. It must use timeouts and never return
 credentials, OAuth caches or private diagnostics in evidence.
 The destination host gate must be open when planning and before host effects;
 a lending host without a fresh available gate holds the operation.
+After committing the enable intent, the controller takes the destination
+gate publication lock, rereads the latest gate, and holds the lock until
+`enable` returns. Host reading publication uses the same lock, so a closure
+published during intent creation is observed and a concurrent publication
+cannot interleave with enable. The adapter must complete enable synchronously
+inside this boundary; queued or delayed host jobs must enforce the current
+local gate themselves before starting an executor.
 
 | State | Next action and proof |
 | --- | --- |

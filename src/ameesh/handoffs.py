@@ -259,7 +259,18 @@ def _effect(api, adapter, step, op):
     if intent is None:
         raise HandoffError("host effect refused: reservation or controller intent changed")
     intent["controller_epoch"] = intent["evidence"]["controller_epoch"]
-    result = _adapter_call(adapter, step, intent)
+    if step == "enable":
+        with storage.of(api.db).hosts.gate_guard(op["target"]) as hosts:
+            target = hosts.latest(op["target"])
+            offer = {} if op["plan"].get("requires_gate") else None
+            if (intent["reserved_until_ts"] <= time.time() or target is None
+                    or not relocation.gate_open(target, offer)):
+                # No host call happened; this intent is safe to clear.
+                api.finish_effect(op["id"], intent["controller_epoch"])
+                raise HandoffError("destination host gate closed, stale or reservation expired")
+            result = _adapter_call(adapter, step, intent)
+    else:
+        result = _adapter_call(adapter, step, intent)
     # An exception or lock loss leaves the durable intent in place: nobody
     # can overtake an external effect whose completion is unknown.
     api.finish_effect(op["id"], intent["controller_epoch"])

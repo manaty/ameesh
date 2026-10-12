@@ -108,6 +108,53 @@ class HandoffTest(PgTestCase):
         self.assertEqual((held["state"], held["fenced"]), ("held", True))
         self.assertNotIn("enable", self.adapter.calls)
 
+    def test_gate_closing_during_enable_intent_prevents_host_call(self):
+        from ameesh.storage.postgres.handoffs import Handoffs
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        begin_effect = Handoffs.begin_effect
+
+        def begin(api, operation, expected, effect):
+            intent = begin_effect(api, operation, expected, effect)
+            if effect == "enable":
+                self.reading("target", 24*GIB, gate_state="draining")
+            return intent
+
+        with mock.patch.object(Handoffs, "begin_effect", new=begin):
+            held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
+        self.assertNotIn("pending_effect", held["evidence"])
+
+    def test_gate_publication_is_serialized_with_enable(self):
+        from ameesh import db as db_mod
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        other = db_mod.connect(self.cfg)
+        reading = {"host": "target", "mem_available_bytes": 24*GIB,
+                   "gate_state": "draining"}
+        try:
+            original_enable = self.adapter.enable
+
+            def enable(intent):
+                # A separate publisher cannot close the gate between the
+                # boundary read and the synchronous executor effect.
+                with self.assertRaises(db_mod.DbError):
+                    with other.transaction() as tx:
+                        tx.execute("SET LOCAL lock_timeout = '100ms'")
+                        storage.of(tx).hosts.record(reading)
+                self.assertNotEqual(self.api.hosts.latest("target")["gate_state"], "draining")
+                return original_enable(intent)
+
+            with mock.patch.object(self.adapter, "enable", side_effect=enable):
+                completed = self.advance(op)
+            self.assertEqual(completed["state"], "verified")
+            self.assertIn("enable", self.adapter.calls)
+            storage.of(other).hosts.record(reading)
+            self.assertEqual(self.api.hosts.latest("target")["gate_state"], "draining")
+        finally:
+            other.close()
+
     def candidate(self, name="dev"):
         return handoffs.plan(self.db, registry.get(self.db, name), limits_for=lambda host:self.limits)
 

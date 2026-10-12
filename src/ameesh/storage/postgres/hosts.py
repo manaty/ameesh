@@ -14,9 +14,11 @@ la base (`now()`) sauf quand un test la fournit.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any
 
 from .. import interface
+from ... import db as db_mod
 
 #: une liste de textes passée en paramètre : `NULL` si vide/None, sinon un
 #: JSON que l'instruction convertit en `text[]`
@@ -88,7 +90,29 @@ TURN_COLUMNS = (
 
 class Hosts(interface.HostResources):
 
+    @contextmanager
+    def gate_guard(self, host):
+        # Independent connection: the durable effect intent must stay
+        # committed while the gate lock spans the synchronous host call.
+        gate_db = db_mod.connect(self.db.cfg)
+        try:
+            with gate_db.transaction() as tx:
+                self._lock_gate(tx, host)
+                yield Hosts(tx)
+        finally:
+            gate_db.close()
+
+    @staticmethod
+    def _lock_gate(tx, host):
+        tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                 ("host-gate:" + host,))
+
     def record(self, reading) -> dict:
+        with self.db.transaction() as tx:
+            self._lock_gate(tx, reading.get("host") or "")
+            return Hosts(tx)._record(reading)
+
+    def _record(self, reading) -> dict:
         rows = self.db.query(
             """
             INSERT INTO host_resources

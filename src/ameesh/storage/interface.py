@@ -2222,6 +2222,12 @@ class HostResources(Domain):
     """
 
     @abc.abstractmethod
+    def gate_guard(self, host: str):
+        """Context manager yielding host storage under a gate publication lock.
+        All record() calls for this host share the lock. Read latest() inside
+        the context and complete synchronous enable before releasing it."""
+
+    @abc.abstractmethod
     def record(self, reading: dict) -> dict:
         """Ajoute un relevé (heure de la base) et élague les plus anciens que
         l'horizon de conservation ; rend la ligne écrite."""
