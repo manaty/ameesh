@@ -466,9 +466,10 @@ def decide(offer: Offer, signals: dict, previous: Decision, now: float, *,
     current = previous.level
     if level > current:
         return Decision(level, reason, now, None, end)
-    if current == 3 and previous.reason == "manual" and level < 3:
+    if current >= 3 and previous.reason == "manual" and level < 3:
         # a manual drain expired or cancelled, on a healthy host: its episode
-        # ends at once (no stop, no hysteresis: the application never asked)
+        # ends at once, at level 3 as at level 4 (no stop, no kill retried,
+        # no hysteresis: the application never asked)
         return Decision(level, reason, now, None, end)
     # same or lower: hold the current level, counting the calm
     if current == 2:

@@ -786,6 +786,28 @@ class DrainStopTest(unittest.TestCase):
         self.clock[0] = 2130.0
         self.assertEqual(g.step()["state"], "stopped")
 
+    def test_cancelled_manual_drain_ends_at_level_4_too(self):
+        # codex #238 r2: indefinite manual drain, level 4 at t=120, SIGKILL
+        # fails; cancelled at 125: back to available, the kill not retried
+        def run(argv, **kw):
+            self.calls.append(argv)
+            return mock.Mock(returncode=1 if argv[1] == "kill" else 0, stdout="", stderr="")
+        guard.request_drain(self.cfg.drain_request_path, 1000.0, None)
+        g = guard.Guard(self.cfg, observe=False, signals=lambda now: dict(self.reading),
+                        clock=lambda: self.clock[0],
+                        enforcer=guard.Enforcer(self.cfg, run=run, log=lambda t: None))
+        self.assertEqual(g.step()["level"], 3)
+        self.clock[0] = 1130.0
+        self.assertEqual(g.step()["level"], 4)
+        guard.cancel_drain(self.cfg.drain_request_path)
+        self.clock[0] = 1135.0
+        self.assertEqual(g.step()["state"], "available")
+        kills = len([c for c in self.calls if c[1] == "kill"])
+        for t in (1140.0, 1145.0):
+            self.clock[0] = t
+            self.assertEqual(g.step()["level"], 0)
+        self.assertEqual(len([c for c in self.calls if c[1] == "kill"]), kills)
+
     def test_manual_drain(self):
         path = self.cfg.drain_request_path
         self.assertFalse(guard.drain_requested(path, 0.0))
