@@ -11,6 +11,8 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 from __future__ import annotations
 
 import json
+import random
+import time
 
 from ...db import DbError
 from .. import interface
@@ -60,8 +62,13 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
-#: #443 : essais d'une réservation automatique perdue contre une autre simultanée
-_RESERVE_ATTEMPTS = 8
+#: #443, #478 : réservation automatique du prochain numéro libre — un budget
+#: de temps (et non plus un nombre d'essais) et une attente aléatoire
+#: croissante, pour que 20 réservations simultanées se départagent sans
+#: épuiser les essais ; épuisé, `ReservationContention` (WorkError lisible).
+_RESERVE_BUDGET_S = 30.0
+_RESERVE_WAIT_MIN_S = 0.005
+_RESERVE_WAIT_MAX_S = 0.5
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
@@ -625,9 +632,11 @@ class WorkItems(interface.WorkItems):
         ouvert dans le dépôt `repo`, avec une ligne de journal. Sans
         `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
         dans l'UPDATE même ; l'index unique `work_items_migration_repo_idx`
-        tranche entre deux réservations simultanées : la perdante échoue et
-        recalcule (nouvelle transaction). Un `number` explicite déjà pris lève
-        la DbError de l'index."""
+        tranche entre deux réservations simultanées : la perdante attend un
+        délai aléatoire croissant et recalcule (nouvelle transaction), dans un
+        budget de temps ; épuisé, `ReservationContention` — jamais la DbError
+        de l'index (#478). Un `number` explicite déjà pris lève la DbError de
+        l'index, sans réessai."""
         if release:
             value, params = "NULL", ()
         elif number is None:
@@ -636,7 +645,9 @@ class WorkItems(interface.WorkItems):
             params = (int(floor), repo)
         else:
             value, params = "%s", (int(number),)
-        for attempt in range(_RESERVE_ATTEMPTS):
+        deadline = time.monotonic() + _RESERVE_BUDGET_S
+        wait = _RESERVE_WAIT_MIN_S
+        while True:
             try:
                 with self.db.transaction() as tx:
                     rows = tx.query(
@@ -652,10 +663,16 @@ class WorkItems(interface.WorkItems):
                                          actor)
                     return rows[0]
             except DbError as exc:
-                if (number is not None or release or attempt == _RESERVE_ATTEMPTS - 1
+                if (number is not None or release
                         or "work_items_migration_repo_idx" not in str(exc)):
                     raise
-        return None
+                if time.monotonic() >= deadline:
+                    raise interface.ReservationContention(
+                        "reservation contention, retry") from exc
+                # plein jitter : les perdantes se répartissent au lieu de
+                # retenter ensemble, puis l'attente double jusqu'à un plafond
+                time.sleep(random.uniform(_RESERVE_WAIT_MIN_S, wait))
+                wait = min(wait * 2, _RESERVE_WAIT_MAX_S)
 
     def migration_holder(self, number, repo) -> dict | None:
         rows = self.db.query(

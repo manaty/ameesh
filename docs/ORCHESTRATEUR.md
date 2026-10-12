@@ -562,7 +562,10 @@ restée 4 h fusionnée sans être déployée :
    des numéros déjà réservés pour ce dépôt. Chaque dépôt a sa suite : la
    même valeur peut être réservée dans ameesh et dans nexlink. L'unicité
    (dépôt, numéro) est un index unique en base : deux réservations
-   simultanées ne prennent jamais le même numéro. La commande est
+   simultanées ne prennent jamais le même numéro ; la perdante réessaie avec
+   une attente aléatoire croissante, dans un budget de temps, et si le budget
+   s'épuise la commande rend « reservation contention, retry » (jamais
+   l'erreur brute de l'index). La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
    déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
    `--release` libère. La réservation se lit dans `ameesh work show <lot>`

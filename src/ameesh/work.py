@@ -381,6 +381,10 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     try:
         row = storage.of(db).work.reserve_migration(item_id, slug, number, floor, note=note,
                                                     actor=actor)
+    except storage.ReservationContention as exc:
+        # #478 : budget de réessais épuisé sous la rafale — message lisible,
+        # jamais la DbError brute de l'index unique
+        raise WorkError("reservation contention, retry") from exc
     except DbError as exc:
         if number is None or "work_items_migration_repo_idx" not in str(exc):
             raise

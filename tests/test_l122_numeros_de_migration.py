@@ -14,9 +14,11 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 from ameesh import db as db_mod, migrations, work
 from ameesh.db import DbError
+from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
 
@@ -443,8 +445,10 @@ class ReservationsSimultaneesTest(PgTestCase):
                 self.assertEqual(out["b"]["migration"], 378)
                 self.assertEqual(work.get(self.db, a)["migration"], 377)
 
-    def test_rafale_sur_les_deux_pilotes(self):
-        ids = self._lots(8)
+    def test_rafale_de_20_sur_les_deux_pilotes(self):
+        """#478 : 20 réservations simultanées, 20 numéros distincts — la
+        rafale de qa-443 épuisait les 8 essais de _RESERVE_ATTEMPTS."""
+        ids = self._lots(20)
         start, out = threading.Barrier(len(ids)), {}
 
         def reserve(item_id, driver):
@@ -464,8 +468,52 @@ class ReservationsSimultaneesTest(PgTestCase):
         for t in threads:
             t.start()
         for t in threads:
-            t.join(120)
+            t.join(180)
         self.assertEqual(sorted(out.values()), list(range(377, 377 + len(ids))), out)
+
+    def test_budget_epuise_rend_workerror_lisible(self):
+        """#478 : le budget de réessais épuisé (forcé à 0 s) sous une
+        réservation simultanée rend un WorkError lisible, jamais la DbError
+        brute de l'index `work_items_migration_repo_idx`."""
+        a, b = self._lots(2)
+        held, done, out = threading.Event(), threading.Event(), {}
+
+        def hold():
+            conn = db_mod.connect(self.cfg, driver="psql")
+            try:
+                with conn.transaction() as tx:
+                    tx.query("UPDATE work_items SET migration = 377,"
+                             " migration_repo = 'manaty/nexlink' WHERE id = %s"
+                             " RETURNING id", (a,))
+                    held.set()
+                    done.wait(60)   # jusqu'à ce que B attende sur l'index
+            finally:
+                conn.close()
+
+        def reserve():
+            conn = db_mod.connect(self.cfg, driver="psql")
+            try:
+                out["b"] = work.reserve_migration(conn, b, repo=self.nexlink)
+            except Exception as exc:  # noqa: BLE001 - rapporté par l'assertion
+                out["b"] = exc
+            finally:
+                conn.close()
+
+        ta = threading.Thread(target=hold)
+        with mock.patch.object(pg_work, "_RESERVE_BUDGET_S", 0.0):
+            ta.start()
+            self.assertTrue(held.wait(30))
+            tb = threading.Thread(target=reserve)
+            tb.start()
+            # B est réellement bloquée sur l'index avant que A ne valide
+            self.assertTrue(self._blocked(), "B never waited on A's reservation")
+            done.set()
+            ta.join(30)
+            tb.join(60)
+        got = out.get("b")
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+        self.assertNotIsInstance(got, DbError)
 
 
 if __name__ == "__main__":
