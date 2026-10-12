@@ -30,6 +30,7 @@ The VM side is `ameesh.offload_shell` (forced command of the SSH key).
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -40,7 +41,7 @@ import sys
 import tempfile
 import threading
 
-from .offload_shell import NONCE_RE, PREFIX
+from .offload_shell import NONCE_RE, PREFIX, result_mac
 
 #: exit code when the VM refused or stopped the job and no fallback is allowed
 EX_TEMPFAIL = 75
@@ -171,20 +172,22 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
     # session's nonce are protocol, a look-alike printed by the command is
     # relayed as output and never taken for a result. The VM shell draws the
     # nonce and announces it first (`N session`), before any job starts; no
-    # announce, no protocol at all (no result: never a local rerun)
+    # announce, no protocol at all (no result: never a local rerun). The
+    # result carries an HMAC keyed by the nonce: a result line that fails it
+    # is no result either
     proc = subprocess.Popen(remote.argv(*words),
                             stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
     state: dict = {"job": None, "result": None}
 
     def relay() -> None:
-        tag = None
+        tag = nonce = None
         for raw in iter(proc.stderr.readline, b""):
             line = raw.decode(errors="replace")
             if tag is None:
                 tag = ""
                 head, _, kind = line[len(PREFIX):].rstrip("\n").partition(" ")
                 if line.startswith(PREFIX) and NONCE_RE.match(head) and kind == "session":
-                    tag = "%s%s " % (PREFIX, head)
+                    tag, nonce = "%s%s " % (PREFIX, head), head
                     continue
             if not tag or not line.startswith(tag):
                 sys.stderr.write(line)
@@ -195,9 +198,14 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
                 state["job"] = rest
             elif kind == "result":
                 try:
-                    state["result"] = json.loads(rest)
+                    result = json.loads(rest)
                 except ValueError:
-                    state["result"] = {"outcome": "error", "reason": rest}
+                    result = None
+                if (isinstance(result, dict) and isinstance(result.get("mac"), str)
+                        and hmac.compare_digest(result["mac"], result_mac(nonce, result))):
+                    state["result"] = result
+                else:
+                    _note("result line without a valid MAC, ignored")
             elif kind == "waiting":
                 _note("all slots of %s are busy, waiting…" % remote.host)
             elif kind == "setup":

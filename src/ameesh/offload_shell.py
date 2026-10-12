@@ -18,12 +18,17 @@ no port forwarding, only these four verbs (read from SSH_ORIGINAL_COMMAND):
 Protocol lines go to stderr, prefixed with `ameesh-offload: `; for `run`,
 also with the session nonce (32 hex digits) that this shell draws itself and
 announces on the first line, `ameesh-offload: N session`, before any job
-starts: the command's own stderr shares the stream, and the client takes only
-lines carrying that nonce for protocol. The nonce never passes through argv or
-an environment, and the shell makes itself non-dumpable, so a job of the same
-UID cannot read it in `/proc/<pid>/{environ,cmdline,mem,fd}`. A `run` always
-ends with `ameesh-offload: N result {json}` (outcome `done`, `refused`,
-`stopped`, `timeout`, `cancelled` or `error`); the client strips them.
+starts. The job never holds the session's streams: every phase writes into
+pipes that this shell relays (stdout to stdout, stderr to stderr, a protocol
+line always starting a line), so no process of the job, even one surviving
+it, can read the stream back through `/proc/self/fd/2` or write into it once
+the job is over. The client takes only lines carrying the nonce for protocol;
+the nonce never passes through argv or an environment, and the shell makes
+itself non-dumpable, so a job of the same UID cannot read it in
+`/proc/<pid>/{environ,cmdline,mem,fd}`. A `run` always ends with
+`ameesh-offload: N result {json}` (outcome `done`, `refused`, `stopped`,
+`timeout`, `cancelled` or `error`), whose `mac` is an HMAC-SHA256 of the
+result keyed by the nonce; the client strips them.
 
 Each job runs:
 * under a concurrency token (`flock` on `locks/slot-N`; the client sees the
@@ -36,6 +41,11 @@ Each job runs:
 * supervised in every phase: cancel, SSH session loss, gate and one deadline
   for the whole job (from its slot) end setup, hooks and command alike;
 * with a private TMPDIR inside the job directory, removed at the end;
+* without XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS for the command and the
+  setup (the client's code): the profile's own hooks keep them (rootless
+  podman);
+* killed whole at the end: its slice, and the process group of each phase
+  (without `scope`); what survives anyway only writes into closed pipes;
 * with the dependencies of its profile cached by the hash of the profile's
   lock files (`profiles/<name>.json`, see `deploy/guest/`).
 
@@ -51,10 +61,12 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -73,7 +85,13 @@ RESERVED_ENV = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP",
                 "LD_PRELOAD", "LD_LIBRARY_PATH", "XDG_RUNTIME_DIR",
                 "DBUS_SESSION_BUS_ADDRESS", "OFFLOAD_JOB", "OFFLOAD_WORK",
                 "OFFLOAD_CACHE", "OFFLOAD_SLICE")
+#: the user manager's address: never given to the client's code (command,
+#: setup), which could start a unit outside the job's slice through it
+BUS_ENV = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 POLL_S = 1.0
+#: after a phase, or the job, ends: how long its pipes are still relayed
+#: (their last output) before being closed
+DRAIN_S = 2.0
 #: snapshots offered to the client as thin-pack bases
 HAVE_DEPTH = 32
 #: the `after` hook (teardown) runs even after a stop, within this delay
@@ -134,17 +152,88 @@ def _no_dump() -> None:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE, 0)")
 
 
+#: this shell's stderr carries both the protocol and the job's relayed
+#: stderr: one writer at a time, and whether the last byte ended a line
+_ERR_LOCK = threading.Lock()
+_err_at_bol = [True]
+
+
 def emit(kind: str, payload: object = None) -> None:
     line = PREFIX + (NONCE + " " if NONCE else "") + kind
     if payload is not None:
         line += " " + (payload if isinstance(payload, str)
                        else json.dumps(payload, sort_keys=True))
+    with _ERR_LOCK:
+        try:
+            # the job's last output may lack its newline: a protocol line
+            # always starts a line of its own
+            sys.stderr.write(("" if _err_at_bol[0] else "\n") + line + "\n")
+            sys.stderr.flush()
+            _err_at_bol[0] = True
+        except OSError:
+            # the SSH session is gone (EPIPE): the job loop sees it by its parent
+            pass
+
+
+def result_mac(nonce: str, result: dict) -> str:
+    """HMAC-SHA256 of a result (job id included), keyed by the session nonce;
+    the client checks it on the result line."""
+    body = json.dumps({k: v for k, v in result.items() if k != "mac"}, sort_keys=True)
+    return hmac.new(nonce.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+
+def emit_result(result: dict) -> None:
+    if NONCE:
+        result = dict(result, mac=result_mac(NONCE, result))
+    emit("result", result)
+
+
+def _relay_out(chunk: bytes) -> None:
     try:
-        sys.stderr.write(line + "\n")
-        sys.stderr.flush()
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
     except OSError:
-        # the SSH session is gone (EPIPE): the job loop sees it by its parent
         pass
+
+
+def _relay_err(chunk: bytes) -> None:
+    with _ERR_LOCK:
+        try:
+            sys.stderr.flush()
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+            _err_at_bol[0] = chunk.endswith(b"\n")
+        except OSError:
+            pass
+
+
+class Relay(threading.Thread):
+    """Copies one pipe of a phase (read end `fd`) to `sink` until the pipe is
+    closed by every writer, or until `close` and a short delay: a process
+    of the job that survives it keeps the write end, never the session's."""
+
+    def __init__(self, fd: int, sink):
+        super().__init__(daemon=True)
+        self.fd = fd
+        self.sink = sink
+        self.close_at: float | None = None
+
+    def run(self) -> None:
+        try:
+            while self.close_at is None or time.time() < self.close_at:
+                ready, _, _ = select.select([self.fd], [], [], 0.2)
+                if not ready:
+                    continue
+                chunk = os.read(self.fd, 65536)
+                if not chunk:
+                    break
+                self.sink(chunk)
+        finally:
+            os.close(self.fd)
+
+    def close(self, grace: float = DRAIN_S) -> None:
+        if self.close_at is None:
+            self.close_at = time.time() + grace
 
 
 # --------------------------------------------------------------------------
@@ -427,6 +516,9 @@ class Job:
         self.stop: dict = {}
         self.proc: subprocess.Popen | None = None
         self.scope = bool(cfg.get("scope"))
+        #: every phase's pipes and process group, closed and killed by `close`
+        self.relays: list[Relay] = []
+        self.groups: list[int] = []
 
     def set_limit(self, seconds: int) -> None:
         self.limit = seconds
@@ -466,11 +558,32 @@ class Job:
     def argv(self, phase: str, argv: list[str]) -> list[str]:
         if not self.scope:
             return argv
+        if phase in ("command", "setup"):
+            # systemd-run needs the user manager's address, the scope's
+            # process (the client's code) does not get it
+            unset = [w for key in BUS_ENV for w in ("-u", key)]
+            argv = ["/usr/bin/env", *unset, "--"] + argv
         slice_name, unit = unit_names(self.job_id)
         if phase != "command":
             unit += "-" + phase
         return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                 "--slice", slice_name, "--unit", unit, "--"] + argv
+
+    def close(self) -> None:
+        """End of the job: kills what is left of every phase, then relays
+        their pipes' last output and closes them. Without `scope`, a process
+        that left its group (setsid) lives on, writing into closed pipes."""
+        if self.scope:
+            _systemctl("kill", "--signal=SIGKILL", unit_names(self.job_id)[0])
+        for pgid in self.groups:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        for relay in self.relays:
+            relay.close()
+        for relay in self.relays:
+            relay.join(DRAIN_S + 1)
 
     def kill(self) -> None:
         if self.scope:
@@ -490,20 +603,34 @@ class Job:
     def run(self, phase: str, argv: list[str], cwd: str, env: dict,
             capture: bool = False, supervised: bool = True,
             limit: float | None = None) -> tuple[int, str]:
-        """Runs one phase in the job's slice. stdout passes through, goes to
-        stderr (hooks: the client's stdout is the command's alone), or is
-        captured. Returns (exit code, captured stdout); a supervised phase
-        ends early, killed, when `check` says so."""
-        out = subprocess.PIPE if capture else (None if phase == "command" else sys.stderr.fileno())
-        proc = subprocess.Popen(self.argv(phase, argv), cwd=cwd, env=env, stdout=out,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+        """Runs one phase in the job's slice. Its stdout and stderr are pipes
+        of this shell, never the session's: stdout is relayed to stdout,
+        to stderr (hooks: the client's stdout is the command's alone), or
+        captured; stderr to stderr. Returns (exit code, captured stdout); a
+        supervised phase ends early, killed, when `check` says so."""
+        if not self.scope and phase in ("command", "setup"):
+            env = {k: v for k, v in env.items() if k not in BUS_ENV}
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        try:
+            proc = subprocess.Popen(self.argv(phase, argv), cwd=cwd, env=env, stdout=out_w,
+                                    stderr=err_w, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+        except BaseException:
+            for fd in (out_r, err_r):
+                os.close(fd)
+            raise
+        finally:
+            os.close(out_w)
+            os.close(err_w)
         self.proc = proc
+        self.groups.append(proc.pid)
         chunks: list[bytes] = []
-        reader = None
-        if capture:
-            reader = threading.Thread(target=lambda: chunks.append(proc.stdout.read()),
-                                      daemon=True)
-            reader.start()
+        sink = chunks.append if capture else (_relay_out if phase == "command" else _relay_err)
+        reader = Relay(out_r, sink)
+        self.relays += [reader, Relay(err_r, _relay_err)]
+        for relay in self.relays[-2:]:
+            relay.start()
         end = None if limit is None else time.time() + limit
         try:
             while True:
@@ -518,8 +645,9 @@ class Job:
                     break
         finally:
             self.proc = None
-        if reader is not None:
-            reader.join(timeout=5)
+        # its output up to the end of the pipe; a child left running (a
+        # hook's server) holds the pipe open: then no more than DRAIN_S
+        reader.join(DRAIN_S)
         return rc, b"".join(chunks).decode(errors="replace")
 
 
@@ -646,18 +774,18 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         req = parse_run(args)
     except (Refused, ValueError) as exc:
         result.update(outcome="refused", reason=str(exc))
-        emit("result", result)
+        emit_result(result)
         return 2
     state, _, reason = gate_state(cfg)
     if state != "available":
         result.update(outcome="refused", reason="host %s%s" % (state, ": " + reason if reason else ""))
-        emit("result", result)
+        emit_result(result)
         return 75
     mirror = mirror_path(cfg, req["repo"])
     if subprocess.run(["git", "-C", mirror, "cat-file", "-e", req["commit"] + "^{commit}"],
                       stderr=subprocess.DEVNULL).returncode != 0:
         result.update(outcome="refused", reason="unknown commit %s (put it first)" % req["commit"])
-        emit("result", result)
+        emit_result(result)
         return 2
     touch_snapshot(mirror, req["commit"])
     env = base_env(cfg)
@@ -666,7 +794,7 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             check_user_manager(env)
         except Refused as exc:
             result.update(outcome="refused", reason=str(exc))
-            emit("result", result)
+            emit_result(result)
             return 75
     prune_orphans(cfg)
     job_dir = os.path.join(_dir(cfg, "jobs"), job_id)
@@ -751,6 +879,7 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
                 # teardown (the job's containers), even after a stop
                 _hook(job, "after", profile["after"], work, env, supervised=False)
         finally:
+            job.close()
             if sliced:
                 close_slice(job_id)
             result["seconds"] = round(time.time() - started, 1)
@@ -760,7 +889,7 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             if slot_fd is not None:
                 os.close(slot_fd)
             shutil.rmtree(job_dir, ignore_errors=True)
-            emit("result", result)
+            emit_result(result)
 
 
 def base_env(cfg: dict) -> dict:

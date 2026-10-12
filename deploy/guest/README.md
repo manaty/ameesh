@@ -48,6 +48,14 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   setup, hooks, the command (scope `ameesh-job-<id>.scope`) and its Podman
   containers (`--cgroup-parent $OFFLOAD_SLICE`). The slice is killed when
   the job ends. The whole guest is capped by its `user-<uid>.slice`.
+* No stream of the SSH session: every phase writes into pipes that the VM
+  shell relays, so no process of the job, even one that outlives it, can
+  read the session back (`/proc/self/fd/2`) nor write into it once the job
+  is over. The `result` line carries an HMAC keyed by the session's nonce.
+* No `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS` for the command and the
+  dependency setup (the repository's code): they cannot ask the user manager
+  for a unit outside the job's slice through them. The profile's hooks keep
+  them (rootless Podman).
 * One supervision for every phase: a cancel, the loss of the SSH session,
   the gate or the job's deadline (counted from its slot) end setup, hooks
   and command alike. The `after` hook still runs (teardown, 2 min at most).

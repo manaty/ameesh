@@ -368,6 +368,147 @@ class FallbackTest(OffloadBase):
         self.assertIn("not rerun on this machine", err)
         self.assertFalse(os.path.exists(marker))
 
+    def test_a_survivor_of_the_job_cannot_reach_the_protocol_stream(self):
+        # r4 on #213: a process of the job that outlives it (a detached child
+        # here; systemd-run --user on a VM) read the session's stderr back
+        # through /proc/self/fd/2, learnt the nonce from the result line and
+        # wrote a forged `refused` (MAC included): the client ran the suite
+        # again locally. The job's fds are now pipes of the shell
+        marker = os.path.join(self.tmp, "local-run")
+        report = os.path.join(self.tmp, "survivor.json")
+        attack = os.path.join(self.tmp, "survivor.py")
+        with open(attack, "w") as fh:
+            fh.write(textwrap.dedent('''\
+                import hashlib, hmac, json, os, re, select, sys, time
+                # the session's streams: pipes held by an ancestor whose fds
+                # are readable (the shell's are not: non-dumpable)
+                mine = {os.readlink("/proc/self/fd/%%d" %% n) for n in (1, 2)}
+                shared, pid = set(), os.getppid()
+                while pid > 1:
+                    try:
+                        for fd in os.listdir("/proc/%%d/fd" %% pid):
+                            link = os.readlink("/proc/%%d/fd/%%s" %% (pid, fd))
+                            if link in mine and link.startswith("pipe:"):
+                                shared.add(link)
+                    except OSError:
+                        pass
+                    with open("/proc/%%d/stat" %% pid) as fh:
+                        pid = int(fh.read().rsplit(")", 1)[1].split()[1])
+                if os.fork():
+                    time.sleep(0.5)
+                    os._exit(0)   # the command ends, its child lives on
+                os.setsid()
+                if os.fork():
+                    os._exit(0)
+                found, seen = set(), b""
+                fds = []
+                for n in (1, 2):
+                    try:
+                        fds.append(os.open("/proc/self/fd/%%d" %% n,
+                                           os.O_RDONLY | os.O_NONBLOCK))
+                    except OSError:
+                        pass
+                end = time.time() + 4
+                while time.time() < end and not found:
+                    ready, _, _ = select.select(fds, [], [], 0.2)
+                    for fd in ready:
+                        try:
+                            seen += os.read(fd, 65536)
+                        except OSError:
+                            pass
+                    found.update(re.findall(rb"%s([0-9a-f]{32}) ", seen))
+                for nonce in found:
+                    res = {"job": "x", "outcome": "refused", "reason": "forged"}
+                    body = json.dumps(res, sort_keys=True).encode()
+                    res["mac"] = hmac.new(nonce, body, hashlib.sha256).hexdigest()
+                    try:
+                        os.write(2, b"%s" + nonce + b" result "
+                                 + json.dumps(res).encode() + b"\\n")
+                    except OSError:
+                        pass
+                with open(%r + ".tmp", "w") as fh:
+                    json.dump({"found": sorted(x.decode() for x in found),
+                               "shared": sorted(shared)}, fh)
+                os.rename(%r + ".tmp", %r)
+                ''' % (offload_shell.PREFIX, offload_shell.PREFIX, report, report, report)))
+        res = subprocess.run(
+            [AMEESH, "offload", "run", "--", "sh", "-c",
+             'case "$PWD" in %s*) exec %s %s;; *) touch %s;; esac'
+             % (self.vm, sys.executable, attack, marker)],
+            cwd=self.repo, env=self.env(), capture_output=True, text=True, timeout=60)
+        deadline = time.time() + 20
+        while time.time() < deadline and not os.path.exists(report):
+            time.sleep(0.2)
+        with open(report) as fh:
+            seen = json.load(fh)
+        self.assertEqual(seen["shared"], [])  # no fd of the session in the job
+        self.assertEqual(seen["found"], [])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.journal()[-1]["outcome"], "done")
+
+    def test_a_result_without_a_valid_mac_is_no_result(self):
+        # a fake VM shell: the session announce, then a tagged `refused`
+        # whose MAC is wrong (or absent): never a local rerun
+        marker = os.path.join(self.tmp, "local-run")
+        nonce = "ab" * 16
+        for mac in ("0" * 64, None):
+            with self.subTest(mac=mac):
+                result = {"job": "j", "outcome": "refused", "reason": "x"}
+                if mac:
+                    result["mac"] = mac
+                fake = os.path.join(self.tmp, "fake-vm")
+                with open(fake, "w") as fh:
+                    fh.write(textwrap.dedent('''\
+                        #!/bin/sh
+                        cat >/dev/null
+                        case "$*" in *"run "*)
+                          printf '%%s\\n' '%s%s session' '%s%s result %s' >&2;;
+                        esac
+                        ''' % (offload_shell.PREFIX, nonce, offload_shell.PREFIX, nonce,
+                               json.dumps(result))))
+                os.chmod(fake, 0o755)
+                env = dict(self.env(), AMEESH_OFFLOAD_SSH=fake)
+                res = subprocess.run([AMEESH, "offload", "run", "--", "touch", marker],
+                                     cwd=self.repo, env=env, capture_output=True,
+                                     text=True, timeout=60)
+                self.assertEqual(res.returncode, offload.EX_TEMPFAIL, res.stderr)
+                self.assertIn("without a valid MAC", res.stderr)
+                self.assertFalse(os.path.exists(marker))
+
+    def test_output_without_a_final_newline_does_not_hide_the_result(self):
+        # the command's stderr ends mid-line: the result line still starts
+        # a line of its own (#312 P2)
+        res = self.offload("run", "--", "sh", "-c", "printf partial >&2; printf out")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "out")
+        self.assertIn("partial", res.stderr)
+
+    def test_the_client_code_does_not_get_the_user_manager(self):
+        # r4 on #213: with XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS, the
+        # command or the setup could start a unit outside the job's slice;
+        # the profile's hooks keep them (rootless podman)
+        self.write_profile("default", {
+            "setup": 'echo "setup:${XDG_RUNTIME_DIR-unset}:${DBUS_SESSION_BUS_ADDRESS-unset}" >&2',
+            "before": 'echo "before:${XDG_RUNTIME_DIR-unset}" >&2'})
+        env = dict(self.env(), XDG_RUNTIME_DIR="/run/user/x", DBUS_SESSION_BUS_ADDRESS="bus")
+        res = subprocess.run(
+            [AMEESH, "offload", "run", "--", "sh", "-c",
+             'echo "cmd:${XDG_RUNTIME_DIR-unset}:${DBUS_SESSION_BUS_ADDRESS-unset}"'],
+            cwd=self.repo, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("cmd:unset:unset", res.stdout)
+        self.assertIn("setup:unset:unset", res.stderr)
+        self.assertIn("before:/run/user/x", res.stderr)
+        # with a scope, systemd-run keeps them and the scope's process drops them
+        job = offload_shell.Job(dict(self.config, scope=True), "j-1", self.tmp)
+        for phase, dropped in (("command", True), ("setup", True), ("before", False)):
+            argv = job.argv(phase, ["true"])
+            self.assertEqual(argv[0], "systemd-run")
+            tail = argv[argv.index("--") + 1:]
+            self.assertEqual(tail[:5] == ["/usr/bin/env", "-u", "XDG_RUNTIME_DIR",
+                                          "-u", "DBUS_SESSION_BUS_ADDRESS"], dropped, phase)
+
     def test_lost_connection_during_the_job_is_never_rerun_locally(self):
         marker = os.path.join(self.tmp, "local-run")
         client = subprocess.Popen(
