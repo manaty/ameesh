@@ -123,15 +123,17 @@ def _valid_rpc_id(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _validate_message(message: dict) -> None:
+def _validate_message(message: dict, *, header: bool = True) -> None:
     """Valide l'enveloppe JSON-RPC 2.0 d'un message reçu de l'agent.
 
     Lève `AcpError` : un message non conforme n'est **jamais** ignoré, il met
     fin au tour. Sans cela, un `id` non hachable faisait mourir le fil de
     lecture avant d'avoir enregistré la panne, et le tour attendait le délai.
     """
-    if message.get("jsonrpc") != "2.0":
+    if header and message.get("jsonrpc") != "2.0":
         raise AcpError('JSON-RPC message without `jsonrpc: "2.0"`')
+    if not header and "jsonrpc" in message and message["jsonrpc"] != "2.0":
+        raise AcpError("invalid JSON-RPC `jsonrpc`: %r" % (message["jsonrpc"],))
     if "method" in message:
         method = message["method"]
         if not isinstance(method, str) or not method:
@@ -166,8 +168,12 @@ class JsonRpcPeer:
 
     def __init__(self, argv: Sequence[str], *, cwd: str | None = None,
                  env: Mapping[str, str] | None = None,
-                 max_message: int = MAX_MESSAGE_CHARS):
+                 max_message: int = MAX_MESSAGE_CHARS, header: bool = True,
+                 new_session: bool = False, stderr: Any = None):
         self.argv = list(argv)
+        #: L75: Codex app-server speaks JSON-RPC 2.0 without the `jsonrpc`
+        #: member; ACP requires it, both ways
+        self.header = header
         self.max_message = max(1024, int(max_message))
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -182,8 +188,8 @@ class JsonRpcPeer:
         self.fatal: AcpError | None = None
         self.proc = subprocess.Popen(
             self.argv, cwd=cwd, env=dict(env) if env is not None else None,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
-            text=True, bufsize=1,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+            text=True, bufsize=1, start_new_session=new_session,
         )
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -212,6 +218,8 @@ class JsonRpcPeer:
 
     # -- envoi -------------------------------------------------------------
     def _send(self, message: dict) -> None:
+        if not self.header:
+            message = {k: v for k, v in message.items() if k != "jsonrpc"}
         with self._write_lock:
             if self.proc.stdin is None or self.proc.poll() is not None:
                 raise AcpError("the ACP agent is no longer alive")
@@ -303,7 +311,7 @@ class JsonRpcPeer:
                                    % line[:200]) from exc
                 if not isinstance(message, dict):
                     raise AcpError("JSON-RPC message is not an object")
-                _validate_message(message)
+                _validate_message(message, header=self.header)
                 self._dispatch(message)
             except AcpError as exc:
                 self._fail(exc)
