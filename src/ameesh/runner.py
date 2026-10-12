@@ -335,6 +335,9 @@ class AgentWorker(threading.Thread):
         #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
         #: avant l'échéance de la base, quel que soit l'écart des horloges
         self.lease_held_until = self._held_until()
+        #: L159f4 r2 : le fil de renouvellement du tour (son renouvellement en
+        #: cours peut encore prolonger `lease_held_until` après la fin du tour)
+        self.heartbeat_thread: threading.Thread | None = None
         self.pgid: int | None = None  # groupe du harnais en cours
         #: dernier descripteur de harnais journalisé (chemin, empreinte) — L16
         self.descriptor_seen: tuple[str, str] = ("", "")
@@ -3193,7 +3196,9 @@ class AgentWorker(threading.Thread):
             return False
 
         heartbeat_done = threading.Event()
-        threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
@@ -4206,6 +4211,15 @@ class Runner:
         réussi ou l'échéance du bail (il n'est plus renouvelé) ; jamais
         « vidé » bail tenu (L159f4). Un arrêt de l'exécuteur coupe l'attente :
         sa part disparaît avec lui."""
+        # r2 : un renouvellement en cours à la fin du tour peut encore
+        # aboutir et prolonger le bail : l'échéance n'est figée qu'une fois
+        # le fil de renouvellement fini (la part reste « tenu » entre-temps)
+        heartbeat = worker.heartbeat_thread
+        while heartbeat is not None and heartbeat.is_alive():
+            gate.tick()
+            heartbeat.join(self.RELEASE_RETRY_S)
+            if self.stop.is_set():
+                return
         # r1 : l'échéance lue en base n'est pas comparée à l'horloge murale
         # de cet hôte (en avance, elle dirait la part libre bail tenu)
         until = worker.lease_held_until

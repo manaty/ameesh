@@ -757,6 +757,35 @@ class OnceTurnTest(PgTestCase):
         self.assertEqual(self.events[-1], ("tick", False))
         self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
 
+    def test_a_renewal_in_flight_is_awaited_before_the_expiry_is_fixed(self):
+        # r2 P2: the return failed while a renewal was in flight; it ends
+        # after the turn and extends the lease: the wait follows the new bound
+        import threading
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+        runner.RELEASE_RETRY_S = 0.05
+        bounds = {}
+
+        def turn(worker, _wait):
+            worker.lease_held_until = time.monotonic() + 0.05
+
+            def renewal():
+                time.sleep(0.2)  # the base answers after the failed return
+                worker.lease_held_until = bounds["renewed"] = time.monotonic() + 0.3
+            worker.heartbeat_thread = threading.Thread(target=renewal, daemon=True)
+            worker.heartbeat_thread.start()
+            return True
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn), \
+                mock.patch.object(runner_mod.AgentWorker, "release_lease",
+                                  return_value=False):
+            runner.sweep()
+            freed = time.monotonic()
+        self.assertGreaterEqual(freed, bounds["renewed"])
+        self.assertEqual(self.events[-1], ("tick", False))
+        self.assertTrue(all(held for kind, held in self.events[:-1] if kind == "tick"))
+
     def test_release_is_tried_even_after_renewal_failures(self):
         # r1 P2: three generic DbErrors at renewal set `lease_lost` before the
         # lease expires; the base still gives it to us, so the return is
