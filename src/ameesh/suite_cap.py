@@ -8,31 +8,34 @@ a suite launched without it gets the same cap from the runner, checked every
 `CAP_EVERY_S`: past it, the suite is stopped (SIGTERM, then SIGKILL after
 `TERM_GRACE_S`) and the agent is told, by mail and in its project thread.
 
-* Candidates: the runner's own descendants (the harnesses of the turns in
-  progress, and, the runner being their subreaper, what finished turns left
-  behind), never the runner's own group (its psql clients). A process is
-  never chosen through a bare historical PID.
 * A suite is recognised on its executable and its arguments (`argv[0]`, the
   script an interpreter runs, the `python -m` module, the package manager's
-  script), never on the flattened command line; only the top of a suite
-  counts, and never under `ameesh heavy` (it has its own cap).
-* Signals go through process handles (`pidfd`), opened while the process is
-  still the one seen in the process table (same start time): a reused PID is
-  never signalled. The suite and all its descendants are taken at SIGTERM
-  time; the SIGKILL goes to those handles, so a child that ignores SIGTERM and
-  is reparented when the suite exits is still stopped. A suite that leads its
-  own process group (neither a harness's nor the runner's) also gets the
-  signals on its group (`killpg`), for what it starts in between.
+  script), never on the flattened command line; an option whose value could
+  be read as the command (`npm --prefix test install`) makes it no suite.
+  Only the top of a suite counts, and never under `ameesh heavy` (it has its
+  own cap).
+* Every signal goes through a process handle (`pidfd`), opened while the
+  process still has the start time seen in the process table: a reused PID
+  is never signalled. Without pidfd, nothing is signalled (the cap is off on
+  that host, said once in the log). No process group is signalled.
+* The process table is only a list of candidates: every link is checked
+  again, live. A suite is stopped only if, parent by parent, re-read while
+  each one is held by a handle, it descends from the runner through a child
+  outside the runner's own group (its psql clients); its descendants are
+  taken the same way, at SIGTERM time and again at SIGKILL time, so a child
+  that ignores SIGTERM, even reparented once the suite is gone, is stopped.
+* The trace (thread note, mail) is written off the runner's thread: a lock a
+  suite holds never delays the SIGKILL nor the next checks.
 * No database protection on this path: a stopped suite is ended, not frozen,
   and the server releases its locks when its connections close. The freeze of
-  the tools under pressure is a separate lot (take 2).
+  the tools under pressure is a separate lot (#460).
 """
 from __future__ import annotations
 
-import errno
 import os
 import re
 import signal
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -49,10 +52,24 @@ RUNNERS = frozenset(("jest", "vitest", "mocha", "pytest", "py.test", "tox", "nox
 MODULES = frozenset(("pytest", "unittest", "nose2", "tox", "nox"))
 #: package managers whose `test` script (or `run test…`) runs a suite
 MANAGERS = frozenset(("npm", "pnpm", "yarn", "bun"))
-#: executors of a package (`npx jest`, `pnpm exec vitest`)
+#: executors of a package (`npx jest`)
 EXECUTORS = frozenset(("npx", "pnpx", "bunx"))
-#: interpreters: what counts is the script they run (or the module)
-INTERPRETERS = re.compile(r"^(python[0-9.]*|node|nodejs|bun|deno|bash|sh|dash|zsh|ksh)$")
+#: options of a package manager or executor known to take no value; any
+#: other option without `=` may take the next word: then no suite is read
+MANAGER_FLAGS = frozenset(("-s", "--silent", "-q", "--quiet", "--verbose", "-d",
+                           "--if-present", "-r", "--recursive", "--color", "--no-color",
+                           "--offline", "--frozen-lockfile", "-y", "--yes", "--no"))
+#: interpreters: what counts is the script they run (or the module), by
+#: family: the options that take a value, the options that run inline code
+PYTHON = re.compile(r"^python[0-9.]*$")
+FAMILIES = {
+    "python": ({"-X", "-W", "--check-hash-based-pycs"}, {"-c"}),
+    "node": ({"-r", "--require", "--import", "--loader", "--experimental-loader", "-C",
+              "--conditions", "--title", "--input-type"},
+             {"-e", "--eval", "-p", "--print"}),
+    "shell": ({"-o", "-O", "+o", "+O"}, {"-c"}),
+}
+SHELLS = frozenset(("bash", "sh", "dash", "zsh", "ksh"))
 SCRIPT_EXT = re.compile(r"\.(js|mjs|cjs|ts|py)$")
 TEST_SCRIPT = re.compile(r"^test(:.*)?$")
 
@@ -70,27 +87,66 @@ def _base(arg: str) -> str:
     return SCRIPT_EXT.sub("", os.path.basename(arg or ""))
 
 
-def _operands(args: list[str]) -> list[str]:
-    return [a for a in args if not a.startswith("-")]
+def _family(head: str) -> str | None:
+    if PYTHON.match(head):
+        return "python"
+    if head in ("node", "nodejs"):
+        return "node"
+    if head in SHELLS:
+        return "shell"
+    return None
+
+
+def _command(args: list[str], flags=MANAGER_FLAGS) -> tuple[str | None, list[str]]:
+    """The first word of `args` that is a command, and what follows it; None
+    when an option that may take a value stands before it (its value could
+    be read as the command), or at `--`."""
+    for i, arg in enumerate(args):
+        if arg == "--":
+            return None, []
+        if arg.startswith("-") or arg.startswith("+"):
+            if "=" in arg or arg in flags:
+                continue
+            return None, []
+        return arg, args[i + 1:]
+    return None, []
 
 
 def _script(argv: list[str]) -> tuple[str | None, list[str]]:
     """For an interpreter: (`-m` module or script, the arguments after it);
-    (None, []) for inline code (`-c`, `-e`) or nothing to run."""
+    (None, []) for inline code or nothing to run."""
+    family = _family(_base(argv[0]))
+    if family is None:
+        return None, []
+    valued, inline = FAMILIES[family]
     i = 1
     while i < len(argv):
         arg = argv[i]
-        if arg in ("-c", "-e", "--eval", "-p", "--print"):
+        if arg in inline:
             return None, []
-        if arg == "-m" and i + 1 < len(argv):
-            return "-m " + argv[i + 1], argv[i + 2:]
-        if arg in ("-X", "-W", "-O", "--require", "-r") and i + 1 < len(argv):
+        if family == "python" and arg == "-m":
+            return ("-m " + argv[i + 1], argv[i + 2:]) if i + 1 < len(argv) else (None, [])
+        if arg in valued:
             i += 2
             continue
-        if not arg.startswith("-"):
+        if not arg.startswith("-") and not arg.startswith("+"):
             return arg, argv[i + 1:]
         i += 1
     return None, []
+
+
+def _manager_suite(head: str, rest: list[str]) -> bool:
+    cmd, after = _command(rest)
+    if cmd is None:
+        return False
+    if cmd in ("exec", "dlx", "x"):
+        runner, _ = _command(after)
+        return runner is not None and _base(runner) in RUNNERS
+    if cmd in ("run", "run-script"):
+        cmd, _ = _command(after)
+        if cmd is None:
+            return False
+    return cmd == "t" or bool(TEST_SCRIPT.match(cmd))
 
 
 def is_suite(argv: list[str]) -> bool:
@@ -100,27 +156,23 @@ def is_suite(argv: list[str]) -> bool:
     head, rest = _base(argv[0]), argv[1:]
     if head in RUNNERS:
         return True
-    if head in ("go", "cargo"):
-        return rest[:1] == ["test"]
+    if head in ("go", "cargo", "deno"):
+        cmd, _ = _command(rest, flags=frozenset())
+        return cmd == "test"
     if head in EXECUTORS:
-        ops = _operands(rest)
-        return bool(ops) and _base(ops[0]) in RUNNERS
+        runner, _ = _command(rest)
+        return runner is not None and _base(runner) in RUNNERS
     if head in MANAGERS:
-        ops = _operands(rest)
-        if ops[:1] in (["exec"], ["dlx"], ["x"]):
-            return len(ops) > 1 and _base(ops[1]) in RUNNERS
-        if ops[:1] == ["run"]:
-            ops = ops[1:]
-        return bool(ops) and (ops[0] == "t" or bool(TEST_SCRIPT.match(ops[0])))
-    if INTERPRETERS.match(head):
-        script, args = _script(argv)
-        if script is None:
-            return False
-        if script.startswith("-m "):
-            return script[3:].split(".")[0] in MODULES
-        return _base(script) in RUNNERS or (_base(script) in MANAGERS and is_suite(
-            [script] + args))
-    return False
+        return _manager_suite(head, rest)
+    script, args = _script(argv)
+    if script is None:
+        return False
+    if script.startswith("-m "):
+        return script[3:].split(".")[0] in MODULES
+    name = _base(script)
+    if name in RUNNERS:
+        return True
+    return name in MANAGERS and _manager_suite(name, args)
 
 
 def is_heavy(argv: list[str]) -> bool:
@@ -129,59 +181,66 @@ def is_heavy(argv: list[str]) -> bool:
         return False
     head = _base(argv[0])
     if head in ("ameesh", "agent-mesh"):
-        return _operands(argv[1:])[:1] == ["heavy"]
-    if INTERPRETERS.match(head):
-        script, args = _script(argv)
-        if script is None:
-            return False
-        name = script[3:].split(".")[0] if script.startswith("-m ") else _base(script)
-        return name in ("ameesh", "agent-mesh") and _operands(args)[:1] == ["heavy"]
-    return False
+        return _command(argv[1:], flags=frozenset())[0] == "heavy"
+    script, args = _script(argv)
+    if script is None:
+        return False
+    name = script[3:].split(".")[0] if script.startswith("-m ") else _base(script)
+    return name in ("ameesh", "agent-mesh") and \
+        _command(args, flags=frozenset())[0] == "heavy"
+
+
+def pidfd_supported() -> bool:
+    return hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
 
 
 class Handle:
-    """A stopped process, held by a pidfd when the OS has them (opened while
-    it still had the start time seen in the table): signals never reach a
-    reused PID. Without pidfd (ENOSYS), the start time is checked again before
-    each signal (a narrow window)."""
+    """A process held by a pidfd: signals never reach a reused PID. No
+    handle without pidfd support (nothing is signalled then)."""
 
-    def __init__(self, pid: int, start, fd: int | None) -> None:
-        self.pid, self.start, self.fd = pid, start, fd
+    def __init__(self, pid: int, fd: int) -> None:
+        self.pid, self.fd = pid, fd
 
     @classmethod
     def open(cls, pid: int, start) -> "Handle | None":
+        """The handle of `pid` if it is still the process that had `start`
+        (exact start time, as in the table) — None otherwise."""
         if start is None:
             return None
-        fd = None
-        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-            try:
-                fd = os.pidfd_open(pid)
-            except ProcessLookupError:
-                return None
-            except OSError as exc:
-                if exc.errno != errno.ENOSYS:
-                    return None
+        h = cls.open_any(pid)
+        if h is None:
+            return None
         try:
             same = platform.start_time(pid) == start
         except Exception:
             same = False
         if not same:
-            if fd is not None:
-                os.close(fd)
+            h.close()
             return None
-        return cls(pid, start, fd)
+        return h
+
+    @classmethod
+    def open_any(cls, pid: int) -> "Handle | None":
+        """The handle of whatever process has `pid` now (its identity is
+        then established by the caller, e.g. as a live parent)."""
+        if not pidfd_supported() or not pid or pid <= 0:
+            return None
+        try:
+            return cls(pid, os.pidfd_open(pid))
+        except OSError:
+            return None
 
     def send(self, signum: int) -> bool:
-        try:
-            if self.fd is not None:
-                signal.pidfd_send_signal(self.fd, signum)
-            else:
-                if platform.start_time(self.pid) != self.start:
-                    return False
-                os.kill(self.pid, signum)
-            return True
-        except (ProcessLookupError, PermissionError, OSError):
+        if self.fd is None:
             return False
+        try:
+            signal.pidfd_send_signal(self.fd, signum)
+            return True
+        except OSError:
+            return False
+
+    def alive(self) -> bool:
+        return self.send(0)
 
     def close(self) -> None:
         if self.fd is not None:
@@ -197,23 +256,77 @@ class Capped:
     agent: str | None
     what: str
     term_at: float
-    handles: list = field(default_factory=list)
-    #: the suite's own process group, signalled too (None: not its own)
-    pgid: int | None = None
+    #: the suite and its descendants, by pid (checked links only)
+    handles: dict = field(default_factory=dict)
 
 
-def _descendants(table: list[dict], roots) -> set[int]:
-    children: dict[int, list[int]] = {}
+def lineage(h: Handle, me: int, own_group: int | None) -> list[tuple[int, list[str]]] | None:
+    """The ancestors of the process held by `h` up to the runner `me`, as
+    (pid, argv), nearest first, each link checked live: the parent read now,
+    then held by a handle, then the child's parent read again — a parent
+    cannot be replaced by a younger process, so the handle holds the real
+    parent. None if a link breaks, if the chain does not reach `me`, or if it
+    reaches it through the runner's own group."""
+    held: list[Handle] = []
+    out: list[tuple[int, list[str]]] = []
+    cur = h
+    try:
+        for _ in range(64):
+            ppid = platform.parent_pid(cur.pid)
+            if ppid is None or not cur.alive():
+                return None
+            if ppid == me:
+                try:
+                    group = os.getpgid(cur.pid)
+                except OSError:
+                    return None
+                return out if cur.alive() and group != own_group else None
+            if ppid <= 1:
+                return None
+            parent = Handle.open_any(ppid)
+            if parent is None:
+                return None
+            held.append(parent)
+            if platform.parent_pid(cur.pid) != ppid or not cur.alive():
+                return None
+            argv = argv_of(platform.command_argv(ppid))
+            if not parent.alive():
+                return None
+            out.append((ppid, argv))
+            cur = parent
+        return None
+    finally:
+        for parent in held:
+            parent.close()
+
+
+def _children(table: list[dict]) -> dict[int, list[dict]]:
+    out: dict[int, list[dict]] = {}
     for p in table:
-        children.setdefault(p["ppid"], []).append(p["pid"])
-    out, todo = set(), list(roots)
-    while todo:
-        pid = todo.pop()
-        if pid in out:
-            continue
-        out.add(pid)
-        todo.extend(children.get(pid, ()))
+        out.setdefault(p["ppid"], []).append(p)
     return out
+
+
+def gather(held: dict[int, Handle], table: list[dict]) -> None:
+    """Adds to `held` the descendants of its live processes, each one checked:
+    held by a handle with the table's start time, its parent re-read and
+    found to be a held process still alive."""
+    children = _children(table)
+    todo = [pid for pid, h in held.items() if h.alive()]
+    while todo:
+        parent = todo.pop()
+        for p in children.get(parent, ()):
+            pid = p["pid"]
+            if pid in held:
+                continue
+            h = Handle.open(pid, p.get("start"))
+            if h is None:
+                continue
+            if platform.parent_pid(pid) != parent or not held[parent].alive():
+                h.close()
+                continue
+            held[pid] = h
+            todo.append(pid)
 
 
 class SuiteCap:
@@ -227,6 +340,7 @@ class SuiteCap:
         #: suites sent SIGTERM, waiting for their SIGKILL, by suite pid
         self.capped: dict[int, Capped] = {}
         self._at = float("-inf")
+        self._said_off = False
 
     def tick(self, now: float | None = None) -> list[int]:
         now = self.clock() if now is None else float(now)
@@ -239,7 +353,6 @@ class SuiteCap:
             self.log("test suite cap failed (%s)" % exc)
             return []
 
-    # -- whose processes ------------------------------------------------------
     def _harnesses(self) -> dict[int, str]:
         out = {}
         for name, worker in dict(getattr(self.runner, "workers", {}) or {}).items():
@@ -248,142 +361,140 @@ class SuiteCap:
                 out[int(proc.pid)] = name
         return out
 
-    def _agent(self, pid: int, by_pid: dict, harnesses: dict) -> str | None:
-        """The agent of a candidate: the harness above it, else the background
-        work of a finished turn whose group it is in (None: unknown)."""
-        seen, cur = set(), pid
-        while cur in by_pid and cur not in seen:
-            seen.add(cur)
-            if cur in harnesses:
-                return harnesses[cur]
-            cur = by_pid[cur]["ppid"]
+    def _agent(self, h: Handle, ancestors, harnesses: dict) -> str | None:
+        """The agent of a suite: the harness among its checked ancestors, else
+        the background work of a finished turn whose group it is in (None:
+        unknown; only the message depends on it)."""
+        for pid, _ in ancestors:
+            if pid in harnesses:
+                return harnesses[pid]
+        try:
+            group = os.getpgid(h.pid)
+        except OSError:
+            return None
+        if not h.alive():
+            return None
         tracker = getattr(self.runner, "background", None)
-        groups = {int(e.pgid): e.agent for e in list(getattr(tracker, "entries", ()) or ())
-                  if getattr(e, "pgid", None)}
-        return groups.get(by_pid[pid]["pgid"])
+        for e in list(getattr(tracker, "entries", ()) or ()):
+            if getattr(e, "pgid", None) and int(e.pgid) == group:
+                return e.agent
+        return None
 
-    # -- one pass -------------------------------------------------------------
     def cap(self, now: float) -> list[int]:
         """Escalates the suites past their grace, then stops those past the
         cap. Returns the pids sent SIGTERM in this pass."""
         from . import heavy
 
-        for pid, item in list(self.capped.items()):
-            if now - item.term_at >= TERM_GRACE_S:
-                self._kill(item)
-                del self.capped[pid]
+        if not pidfd_supported():
+            if not self._said_off:
+                self._said_off = True
+                self.log("test suite cap off on this host: no pidfd (a PID could be "
+                         "reused between a check and a signal)")
+            return []
+        if self.capped:
+            table = [p for p in platform.process_table() if not p["zombie"]]
+            for pid, item in list(self.capped.items()):
+                if now - item.term_at >= TERM_GRACE_S:
+                    self._kill(item, table)
+                    del self.capped[pid]
         cap = heavy.max_duration(getattr(self.runner, "cfg", None))
         if cap <= 0:
             return []
         table = [p for p in platform.process_table() if not p["zombie"]]
-        by_pid = {p["pid"]: p for p in table}
         me = os.getpid()
         try:
             own_group = os.getpgrp()
         except OSError:
             own_group = None
-        # the subtrees of the runner's children outside its own group
-        # (harnesses, orphans adopted as subreaper); never its psql clients
-        roots = {p["pid"] for p in table if p["ppid"] == me and p["pgid"] != own_group}
-        candidates = _descendants(table, roots)
         harnesses = self._harnesses()
-        argvs: dict[int, list[str]] = {}
-
-        def argv(pid: int) -> list[str]:
-            if pid not in argvs:
-                try:
-                    argvs[pid] = argv_of(platform.command_argv(pid))
-                except Exception:
-                    argvs[pid] = []
-            return argvs[pid]
-
-        def above(pid: int) -> bool:
-            """Under `ameesh heavy`, or inside a suite already (not its top)."""
-            seen, cur = set(), by_pid[pid]["ppid"]
-            while cur in candidates and cur not in seen:
-                seen.add(cur)
-                if is_heavy(argv(cur)) or is_suite(argv(cur)):
-                    return True
-                cur = by_pid[cur]["ppid"]
-            return False
-
+        # candidates only: the subtrees of the runner's children outside its
+        # group, as the table shows them; every link is checked live below
+        children = _children(table)
+        todo = [p["pid"] for p in children.get(me, ()) if p["pgid"] != own_group]
+        candidates: dict[int, dict] = {}
+        while todo:
+            pid = todo.pop()
+            for p in children.get(pid, ()):
+                if p["pid"] not in candidates:
+                    candidates[p["pid"]] = p
+                    todo.append(p["pid"])
         stopped: list[int] = []
-        for pid in sorted(candidates):
-            p = by_pid[pid]
+        for pid, p in sorted(candidates.items()):
             if pid in self.capped or pid in harnesses or p.get("start") is None:
                 continue
-            if now - float(p["start"]) < cap or not is_suite(argv(pid)) or above(pid):
+            if now - float(p["start"]) < cap:
                 continue
-            what = _describe(argv(pid), pid)
-            item = self._term(pid, table, harnesses, own_group, now,
-                              self._agent(pid, by_pid, harnesses), what)
-            if item is None:
+            try:
+                if not is_suite(argv_of(platform.command_argv(pid))):
+                    continue
+            except Exception:
                 continue
+            h = Handle.open(pid, p["start"])
+            if h is None:
+                continue
+            item = None
+            try:
+                argv = argv_of(platform.command_argv(pid))
+                ancestors = lineage(h, me, own_group) if h.alive() else None
+                if ancestors is None or not is_suite(argv):
+                    continue
+                if any(is_heavy(a) or is_suite(a) for _, a in ancestors):
+                    continue    # under ameesh heavy, or inside a suite already
+                what = _describe(argv, pid)
+                item = Capped(self._agent(h, ancestors, harnesses), what, now, {pid: h})
+                self._term(item, table)
+            finally:
+                if item is None:
+                    h.close()
             self.capped[pid] = item
             stopped.append(pid)
-            text = ("Test suite stopped after %d min, the duration cap of a heavy command "
-                    "(heavy_max_seconds): %s. Run it through ameesh heavy (a slot of the "
-                    "host, its own cap: --max-duration), or narrow it."
-                    % (int(cap // 60), what))
-            self._trace(item.agent, text)
+            self._trace(item.agent, (
+                "Test suite stopped after %d min, the duration cap of a heavy command "
+                "(heavy_max_seconds): %s. Run it through ameesh heavy (a slot of the "
+                "host, its own cap: --max-duration), or narrow it."
+                % (int(cap // 60), item.what)))
         return stopped
 
-    def _term(self, pid, table, harnesses, own_group, now, agent, what) -> Capped | None:
-        """SIGTERM to the suite and its descendants, taken now by handle; to
-        its group too if it leads one of its own."""
-        by_pid = {p["pid"]: p for p in table}
-        leader = Handle.open(pid, by_pid[pid].get("start"))
-        if leader is None:
-            return None             # gone, or no longer that process
-        handles = [leader]
-        for victim in sorted(_descendants(table, {pid}) - {pid}):
-            h = Handle.open(victim, by_pid[victim].get("start"))
-            if h is not None:
-                handles.append(h)
-        pgid = by_pid[pid]["pgid"]
-        group = pgid if (pgid == pid and pgid not in harnesses and pgid != own_group) \
-            else None
-        if group is not None and leader.send(0):
-            try:
-                os.killpg(group, signal.SIGTERM)
-            except OSError:
-                pass
-        for h in handles:
+    def _term(self, item: Capped, table: list[dict]) -> None:
+        """SIGTERM to the suite and its descendants, each held by a handle."""
+        gather(item.handles, table)
+        for h in item.handles.values():
             h.send(signal.SIGTERM)
             h.send(signal.SIGCONT)  # a stopped process gets its SIGTERM
-        return Capped(agent, what, now, handles, group)
 
-    def _kill(self, item: Capped) -> None:
-        """SIGKILL to what is left: the handles taken at SIGTERM time, and the
-        suite's group while one of them is still in it."""
-        if item.pgid is not None:
-            for h in item.handles:
-                try:
-                    if h.send(0) and os.getpgid(h.pid) == item.pgid:
-                        os.killpg(item.pgid, signal.SIGKILL)
-                        break
-                except OSError:
-                    continue
-        for h in item.handles:
+    def _kill(self, item: Capped, table: list[dict]) -> None:
+        """SIGKILL to what is left: the handles taken at SIGTERM time (a
+        reparented child included), and the descendants started since."""
+        try:
+            gather(item.handles, table)
+        except Exception as exc:
+            self.log("test suite cap: descendants unreadable (%s)" % exc)
+        for h in item.handles.values():
             h.send(signal.SIGKILL)
             h.close()
 
     def _trace(self, agent: str | None, text: str) -> None:
+        """Logged at once; the thread note and the mail off this thread (a
+        lock a stopped suite holds never delays the SIGKILL)."""
         self.log("[%s] %s" % (agent or "?", text))
         if not agent:
             return
-        worker = (getattr(self.runner, "workers", {}) or {}).get(agent)
-        if worker is not None:
+
+        def write() -> None:
+            worker = (getattr(self.runner, "workers", {}) or {}).get(agent)
+            if worker is not None:
+                try:
+                    worker._fil_note(text, meta={"action": "plafond-suite",
+                                                 "hote": str(getattr(self.runner, "host", ""))})
+                except Exception:
+                    pass
             try:
-                worker._fil_note(text, meta={"action": "plafond-suite",
-                                             "hote": str(getattr(self.runner, "host", ""))})
-            except Exception:
-                pass
-        try:
-            from . import mail as mail_mod
-            mail_mod.send(self.runner.db, "ameesh", agent, text, kind="event")
-        except Exception as exc:
-            self.log("[%s] test suite stop not mailed (%s)" % (agent, exc))
+                from . import mail as mail_mod
+                mail_mod.send(self.runner.db, "ameesh", agent, text, kind="event")
+            except Exception as exc:
+                self.log("[%s] test suite stop not mailed (%s)" % (agent, exc))
+
+        threading.Thread(target=write, daemon=True, name="plafond-trace").start()
 
 
 def _describe(argv: list[str], pid: int) -> str:

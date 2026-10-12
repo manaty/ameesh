@@ -76,6 +76,18 @@ def ancestry(pid: int | None = None) -> list[int]:
     return out
 
 
+def parent_pid(pid: int) -> int | None:
+    """#453 : le parent ACTUEL de `pid`, relu à l'instant (None si disparu ou
+    illisible) — jamais celui d'une table lue plus tôt."""
+    ps = _psutil()
+    try:
+        if ps is not None:
+            return int(ps.Process(int(pid)).ppid())
+        return int(_stat_fields(int(pid))[1])
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # heures de démarrage
 # --------------------------------------------------------------------------

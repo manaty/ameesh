@@ -125,14 +125,21 @@ class SuiteRecognitionTest(unittest.TestCase):
                      ["npm", "test"], ["npm", "run", "test"], ["pnpm", "test", "--", "-w", "2"],
                      ["yarn", "test:e2e"], ["node", "/usr/bin/npm", "test"],
                      ["pnpm", "exec", "vitest"], ["go", "test", "./..."], ["cargo", "test"],
-                     ["/bin/sh", "/w/node_modules/.bin/jest"], argv_of(["npm test"])):
+                     ["/bin/sh", "/w/node_modules/.bin/jest"], argv_of(["npm test"]),
+                     ["python", "-O", "-m", "unittest"], ["python3", "-OO", "-m", "pytest"],
+                     ["npm", "--silent", "test"], ["npm", "--prefix=app", "test"],
+                     ["deno", "test"], ["bun", "test"]):
             with self.subTest(argv=argv):
                 self.assertTrue(is_suite(argv))
         for argv in (["rg", "pytest", "README.md"], ["python", "analysis.py", "--label", "jest"],
                      ["node", "server.js"], ["npm", "run", "build"], ["vim", "jest.config.js"],
                      ["python", "-m", "ameesh", "list"], ["git", "log", "--grep", "test"],
                      ["python3", "-c", "import pytest"], ["bash", "-c", "npm test"],
-                     ["grep", "-r", "jest", "."], argv_of(["npm run build"])):
+                     ["grep", "-r", "jest", "."], argv_of(["npm run build"]),
+                     ["npm", "--prefix", "test", "install"],
+                     ["npm", "--workspace", "test", "run", "build"],
+                     ["npx", "-p", "jest", "eslint"], ["python", "-X", "pytest", "app.py"],
+                     ["node", "-r", "jest", "server.js"], ["deno", "run", "test.ts"]):
             with self.subTest(argv=argv):
                 self.assertFalse(is_suite(argv))
         for argv in (["ameesh", "heavy", "--", "npm", "test"],
@@ -235,10 +242,6 @@ class SuiteCapTest(unittest.TestCase):
         debut = time.time()
         stopped = self._tick(debut)[0]
         self.assertEqual(sorted(stopped), sorted([self.propre, self.dedans]))
-        self.assertEqual(self.cap.capped[self.propre].pgid, self.propre,
-                         "a suite leading its own group: signalled on its group too")
-        self.assertIsNone(self.cap.capped[self.dedans].pgid,
-                          "the harness's group is never signalled")
         self.assertTrue(_wait(lambda: _gone(self.propre) and _gone(self.dedans)))
         enfants = self._children()
         survivants = [enfants[self.propre], enfants[self.dedans]]
@@ -274,6 +277,28 @@ class SuiteCapTest(unittest.TestCase):
         self.assertFalse(_gone(jest.pid))
 
 
+    def test_a_lock_the_suite_holds_never_delays_the_sigkill(self):
+        import threading
+        bloque = threading.Event()
+        self.runner.workers["a1"]._fil_note = lambda text, meta=None: bloque.wait(30)
+        self.addCleanup(bloque.set)
+        time.sleep(1.2)
+        debut = time.time()
+        t0 = time.monotonic()
+        self._tick(debut)
+        self._tick(debut + self.mod.TERM_GRACE_S)
+        self.assertLess(time.monotonic() - t0, 10)
+        enfants = self._children()
+        self.assertTrue(_wait(lambda: all(_gone(enfants[j]) for j in
+                                          (self.propre, self.dedans))))
+
+    def test_nothing_is_signalled_without_pidfd(self):
+        time.sleep(1.2)
+        with mock.patch.object(self.mod, "pidfd_supported", lambda: False):
+            self.assertEqual(self._tick(time.time())[0], [])
+        self.assertFalse(_gone(self.propre))
+
+
 @unittest.skipUnless(os.path.isdir("/proc"), "Linux /proc")
 class HandleTest(unittest.TestCase):
     def test_a_handle_is_only_opened_on_the_process_seen_in_the_table(self):
@@ -291,3 +316,24 @@ class HandleTest(unittest.TestCase):
         proc.wait()
         self.assertFalse(h.send(0), "gone: the handle never reaches another process")
         h.close()
+
+    def test_lineage_is_checked_live_up_to_the_runner(self):
+        from ameesh import platform
+        from ameesh.suite_cap import Handle, lineage
+        me, group = os.getpid(), os.getpgrp()
+        child = subprocess.Popen([sys.executable, "-c", "import subprocess, sys, time; "
+                                  "subprocess.Popen([sys.executable, '-c', "
+                                  "'import time; time.sleep(60)']); time.sleep(60)"],
+                                 start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(child.pid, 9), child.wait()))
+        self.assertTrue(_wait(lambda: any(
+            p["ppid"] == child.pid for p in platform.process_table())))
+        petit = next(p for p in platform.process_table() if p["ppid"] == child.pid)
+        h = Handle.open(petit["pid"], petit["start"])
+        self.addCleanup(h.close)
+        chaine = lineage(h, me, group)
+        self.assertEqual([pid for pid, _ in chaine], [child.pid])
+        # not the runner's: another process stands for `me` (a PID never in the chain)
+        self.assertIsNone(lineage(h, 2 ** 22 + 7, group))
+        # through the runner's own group: refused
+        self.assertIsNone(lineage(h, me, os.getpgid(child.pid)))
