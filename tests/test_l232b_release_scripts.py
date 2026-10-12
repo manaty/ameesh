@@ -40,6 +40,23 @@ class MigrationPinningTest(unittest.TestCase):
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         (bin_dir / "python3").symlink_to(sys.executable)
+        (bin_dir / "pg_dump").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "pg_dump").chmod(0o755)
+        (bin_dir / "ssh").write_text(
+            '#!/bin/sh\nfor arg do command=$arg; done\n'
+            '/bin/sh -c "$command"\n')
+        (bin_dir / "ssh").chmod(0o755)
+        (bin_dir / "systemctl").write_text(
+            '#!/bin/sh\ncase "$1" in\n'
+            'start) exit "${BACKUP_START_STATUS:-0}" ;;\n'
+            'show) case "$4" in\n'
+            'Result) echo "${BACKUP_RESULT:-success}" ;;\n'
+            'ExecMainStatus) echo "${BACKUP_EXIT_STATUS:-0}" ;;\n'
+            '*) exit 97 ;; esac ;;\n'
+            '*) exit 98 ;; esac\n')
+        (bin_dir / "systemctl").chmod(0o755)
+        (bin_dir / "ls").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "ls").chmod(0o755)
         self.env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
         self.git("init", "-q")
         self.script = self.repo / "deploy/mise-a-jour/poste.sh"
@@ -102,3 +119,17 @@ class MigrationPinningTest(unittest.TestCase):
         done = self.run_script("migrer", c, MIGRER_APRES="1")
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
         self.assertEqual(self.calls(), [{"release": "C", "args": ["migrate", "--dry-run", "--additive-only"]}])
+
+    def test_failed_backup_start_is_propagated(self):
+        done = self.run_script("sauvegarder", BACKUP_START_STATUS="42")
+        self.assertEqual(done.returncode, 42, done.stdout + done.stderr)
+
+    def test_completed_backup_result_and_exit_status_are_required(self):
+        for env in ({"BACKUP_RESULT": "exit-code"}, {"BACKUP_EXIT_STATUS": "1"}):
+            with self.subTest(env=env):
+                done = self.run_script("sauvegarder", **env)
+                self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_successful_oneshot_does_not_require_active_state(self):
+        done = self.run_script("sauvegarder")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)

@@ -128,7 +128,12 @@ sauvegarder() {
   pg_dump -Fc "$(dsn_de "$CONFIG")" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
-  ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
+  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
+  # Un échec de backup/upload doit arrêter cette étape avant les migrations.
+  ssh_vm 'set -e
+    systemctl start ameesh-sauvegarde.service
+    test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
+    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
   if ancienne; then
     etape "ancienne base"
     pg_dump -Fc "$(dsn_de "$CONFIG_RESTE")" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
