@@ -25,6 +25,7 @@ test_l160d_resolutions  # stockage : résolutions préparées (text[] passé en 
 test_l162_tmpfs  # stockage : signalements de /tmp filtrés par `kind` (housekeeping.recent, L162)
 test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS sur décisions et jalons (booléens) (L165)
 test_l52_persona_sessions  # storage: session history SQL, resume and lease-fenced rotation (L52)
+test_l56_role_executor  # driver: the creator role is set for several statements, which needs one session (psql: transaction) (L56)
 test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)
 test_l72_panne_de_base  # panne de base, reconnexion, réveils (listener)
 test_migrations  # couche base : migrations sur un schéma neuf

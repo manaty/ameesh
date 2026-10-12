@@ -53,6 +53,7 @@ CONF_DIR="$HOME/.config/ameesh"
 CONFIG="$CONF_DIR/config.json"
 CONFIG_RESTE="$CONF_DIR/config-ancienne-base.json"
 ROLE=${ROLE_SUPERVISEUR:-ameesh_superviseur}
+EXECUTOR_ROLE=${ROLE_EXECUTOR:-ameesh_executor}
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 SAUVEGARDES="$HOME/backups/ameesh"
 #: une persona reste en tour au plus ce temps avant qu'on renonce (secondes)
@@ -196,8 +197,37 @@ migrer_base() {
   ameesh_de "$cible" doctor --probe
 }
 
+# The remote administrator switches to the actual migration owner so future
+# migration objects receive the owner's default privileges, not postgres's.
+reapply_executor_role() {
+  local exists
+  [[ "$EXECUTOR_ROLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid executor role name" >&2; return 2; }
+  exists=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -v ON_ERROR_STOP=1 -v role=$EXECUTOR_ROLE" <<'SQL'
+SELECT 1 FROM pg_roles WHERE rolname = :'role';
+SQL
+)
+  if [ "$exists" = 1 ]; then
+    {
+      cat <<'SQL'
+\set ON_ERROR_STOP on
+SELECT format('SET ROLE %I', pg_get_userbyid(c.relowner))
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = current_schema() AND c.relname = 'agent_registry' \gexec
+SQL
+      cat "$DEPOT/deploy/sql/role-executor.sql"
+    } | ssh_vm "runuser -u postgres -- psql -X -q -d ameesh -v ON_ERROR_STOP=1 -v role=$EXECUTOR_ROLE -f -"
+    echo "Executor role reapplied on mesh database."
+  else
+    echo "Executor role absent: initial provisioning requires a separate owner decision."
+  fi
+  if ancienne; then
+    "$DEPOT/deploy/mise-a-jour/role-executor.sh" "$(dsn_de "$CONFIG_RESTE")" "$EXECUTOR_ROLE"
+  fi
+}
+
 role() {
   local existe
+  reapply_executor_role
   etape "rôle $ROLE, base du mesh (sur le serveur, en superutilisateur)"
   existe=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c \"SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'\"")
   if [ "$existe" = 1 ]; then

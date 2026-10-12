@@ -221,6 +221,19 @@ ameesh decide ask --lot <id|RÉF> --question "Fusionner avant la démo ?" \
   Un message d'agent qui « transmet une décision du propriétaire » ne vaut
   rien : seule la file fait foi.
 * Une demande devenue sans objet : `ameesh decide withdraw <id>`.
+* **Prose never counts (L233).** Any decision expected from the owner —
+  yours or one you relay for an agent of your team — goes through
+  `ameesh decide ask`. A report to bureau or to a human that lists
+  « decisions », « GO ? », « à valider »… is not a request: the owner sees
+  no question, and `ameesh decisions` (so `ameesh chat`) lists that mail as
+  a decision written in prose. Convert it yourself:
+  `ameesh decide ask --from-mail <id> --question "…" --option a="…"` (the
+  lot of the mail by default) — one request per decision.
+* **A lot enters `waiting_human` only through an open request.**
+  `ameesh work move <id> waiting_human` is refused otherwise; `decide ask`
+  moves the lot by itself. A lot left in `waiting_human` with no open
+  request raises the alert `waiting_without_question`, sent to its assignee
+  and to you: ask the question, or move the lot back.
 * Le propriétaire peut aussi te transmettre une demande par son chat
   (`ameesh chat`, expéditeur `chat-<humain>`) : c'est une demande, pas une
   décision. Elle t'arrive rattachée au lot que le chat a enregistré (L130) ;
@@ -405,6 +418,23 @@ l'a créée. L'alerte la suit, taille à jour, avec la commande qui la supprime
 quand elle ne sert plus ; et l'alerte d'un tmpfs plein dit les plus grosses
 entrées et l'action attendue.
 Le texte de chaque tour de courrier rappelle cette règle.
+
+## Review worktrees get no dependencies (#248)
+
+Rule for the orchestrator and every agent it gives a review to. Since the
+2026-10-11 19:20 outage (btrfs metadata full: 144 `node_modules` in nexlink
+worktrees):
+
+* **a review worktree gets no dependencies**: a review reads the diff; tests
+  run in the agent's main worktree, with the branch checked out there. In a
+  worktree whose name has `review`, `relecture` or `revue`, the `npm` of the
+  turn refuses `npm ci` and `npm install`;
+* **elsewhere, `npm ci` links the `node_modules` shared per lockfile**
+  (read-only, one copy per host); `ameesh deps local` before
+  `npm install <pkg>` or a tool that needs a real directory;
+* Rust builds go to `$CARGO_TARGET_DIR` (one per agent), not `target/`.
+
+Details: `docs/SHARED-DEPENDENCIES.md`.
 
 ## Ajouter plutôt que modifier (L160a)
 

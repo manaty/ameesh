@@ -134,6 +134,19 @@ def log_async(message: str) -> None:
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
 
+#: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
+BOOT_ORPHAN_PAGE = 500
+#: L147 (#220 r2) : un conteneur relancé par sa politique (unité du
+#: gestionnaire utilisateur, podman-restart) peut démarrer après l'exécuteur —
+#: aucune ligne n'est soldée moins de BOOT_SETTLE_S après le démarrage de
+#: l'hôte, ni tant que le gestionnaire utilisateur démarre encore (au plus
+#: BOOT_SETTLE_MAX_S) ; la revue est refaite toutes les BOOT_REVIEW_EVERY_S
+BOOT_SETTLE_S = 600.0
+BOOT_SETTLE_MAX_S = 1800.0
+BOOT_REVIEW_EVERY_S = 60.0
+#: #220 r3 : lignes revues au plus par passage (la suite au passage suivant)
+BOOT_REVIEW_MAX_ROWS = 2000
+
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
     """Écrit `data` sur `fd` **sans jamais attendre** le puits (diagnostic).
@@ -871,6 +884,13 @@ class AgentWorker(threading.Thread):
     # -- choix du travail --------------------------------------------------
     def idle_due(self) -> bool:
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
+
+    def placed_elsewhere(self) -> str:
+        """L147: the host the registry places this agent on, when it is not
+        this runner's host ('' otherwise, or for an agent without a host)."""
+        agent = registry.get(self.db, self.name) or {}
+        host = agent.get("host") or ""
+        return host if host and host != self.runner.host else ""
 
     def peek(self) -> bool:
         agent = registry.get(self.db, self.name)
@@ -3309,6 +3329,14 @@ class AgentWorker(threading.Thread):
                 try:
                     if self._consigne_a_restaurer:
                         self._restaure_consigne()
+                    ailleurs = self.placed_elsewhere()
+                    if ailleurs:
+                        # L147 : the agent was placed on another host (canon)
+                        # while this worker held its lease: between two turns,
+                        # the lease is released so that host can claim it
+                        log("[%s] placed on host %s, not %s: lease released after the "
+                            "current turn" % (self.name, ailleurs, self.runner.host))
+                        break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
                     spec = self.rotate_for_lot(self.pick())
@@ -3477,6 +3505,11 @@ class Runner:
         self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
+        #: L147 (#220 r2) : prochaine revue des lignes d'avant le démarrage
+        #: (horloge monotone), tant que leur solde attend les conteneurs
+        self.boot_review_at: float | None = None
+        #: et l'id d'où reprend la revue suivante (0 : depuis le début)
+        self._boot_review_after = 0
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -3995,6 +4028,27 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="ressources").start()
 
+    #: L120: how often the version thread wakes; the probe itself runs at
+    #: most every `harness_versions.PROBE_INTERVAL_S`
+    VERSIONS_WAKE_S = 600.0
+
+    def start_version_poll(self) -> threading.Thread | None:
+        """L120: harness versions read at startup, then every 6 h — on their
+        own thread, whatever `AMEESH_RESOURCE_INTERVAL` says (0 disables the
+        resource poll, not this). Not in `--once` mode."""
+        if self.once:
+            return None
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.harness_versions_once()
+                if self.stop.wait(self.VERSIONS_WAKE_S):
+                    return
+
+        thread = threading.Thread(target=boucle, daemon=True, name="versions")
+        thread.start()
+        return thread
+
     # -- ménage (L73) -----------------------------------------------------
     def housekeeping_policy(self):
         """Politique de ménage de l'hôte (L73) ; défauts sans canon."""
@@ -4058,6 +4112,7 @@ class Runner:
 
     def _housekeeping_pass(self) -> dict | None:
         from . import menage as menage_mod
+        from . import build_artifacts
         from . import resources as resources_mod
         db = None
         try:
@@ -4070,7 +4125,9 @@ class Runner:
             report = menage_mod.run_pass(
                 self.cfg, db, self.housekeeping_policy(), host=self.host,
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
-                runtime=self.container_runtime())
+                runtime=self.container_runtime(),
+                # L230: the worktrees are walked at most every few hours
+                artifact_scan=build_artifacts.due(time.time()))
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("ménage : %s" % " ; ".join(
@@ -4446,16 +4503,45 @@ class Runner:
         log_async("alimentation : %d agent(s) arrêté(s) proprement, baux rendus ; "
                   "reprise au retour du secteur" % len(workers))
 
+    def served_rows(self, db) -> list[dict]:
+        """The agents this runner leads: this host, mode `execute`, not
+        stopped, within `--agents`."""
+        return [r for r in registry.overview(db)
+                if (r.get("host") or "") == self.host
+                and (r.get("mode") or "execute") == "execute"
+                and r.get("status") != "stopped"
+                and (not self.agents_filter or r["name"] in self.agents_filter)]
+
+    def harness_versions_once(self, now: float | None = None) -> list[dict] | None:
+        """L120: read and record the version of the harnesses this runner
+        serves, at most every `PROBE_INTERVAL_S`; never raises. Read only:
+        a harness is never updated here."""
+        from . import harness_versions as versions_mod
+        now = time.monotonic() if now is None else now
+        if now < getattr(self, "_versions_due", 0.0):
+            return None
+        self._versions_due = now + versions_mod.PROBE_INTERVAL_S
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            served = {r.get("harness") for r in self.served_rows(db)} - {None, ""}
+            return versions_mod.probe_and_record(db, self.host, served)
+        except Exception as exc:  # never fatal for the runner
+            log_async("harness versions: not read (%s)" % type(exc).__name__)
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
     def log_harnesses(self) -> None:
         """Au démarrage (L106) : le binaire de chaque harnais servi, résolu et
         journalisé avec son chemin absolu — ou « hôte non prêt » tout de suite,
         sans attendre le premier tour. Ne lève jamais."""
         try:
-            rows = [r for r in registry.overview(self.db)
-                    if (r.get("host") or "") == self.host
-                    and (r.get("mode") or "execute") == "execute"
-                    and r.get("status") != "stopped"
-                    and (not self.agents_filter or r["name"] in self.agents_filter)]
+            rows = self.served_rows(self.db)
         except db_mod.DbError:
             return
         par_harnais: dict[str, list[str]] = {}
@@ -4471,30 +4557,139 @@ class Runner:
 
     def report_boot_orphans(self) -> list[dict]:
         """Après une coupure (L106) : les ressources de tour de CET hôte encore
-        `running` mais ouvertes AVANT le démarrage de l'hôte n'ont plus de
-        tour — marquées orphelines et journalisées (alerte `orphan_resource`
-        tout de suite, sans attendre une heure). Rien n'est supprimé : un
-        conteneur relancé par sa politique de redémarrage reste à examiner.
-        Les worktrees orphelins relèveront de L73. Ne lève jamais."""
+        `running` (ou déjà `orphan`) ouvertes AVANT le démarrage de l'hôte n'ont
+        plus de tour. L147 : aucun groupe de processus ne survit à un
+        redémarrage — une ligne sans conteneur encore en cours est soldée
+        (`done`) ; seule une ligne dont un conteneur tourne encore (relancé par
+        sa politique de redémarrage), ou invérifiable faute de moteur, reste
+        orpheline et signalée (alerte `orphan_resource`). Rien n'est supprimé.
+        Toutes les orphelines d'avant le démarrage sont revues, page par page.
+        #220 r2/r3 : juste après le démarrage, un conteneur que sa politique va
+        relancer n'est peut-être pas encore là — tant que `_boot_settle_ready`
+        est faux, rien n'est relevé ni écrit, la revue est refaite
+        (`boot_review_at`) ; le moteur n'est interrogé qu'APRÈS ce feu vert.
+        Seules les lignes qui changent sont écrites, par lots ; au plus
+        BOOT_REVIEW_MAX_ROWS lignes par passage, la suite au passage suivant
+        de la boucle. Rend les lignes restées orphelines. Ne lève jamais."""
         from . import resources as resources_mod
+        self.boot_review_at = None
         boot = resources_mod.boot_time()
         if not boot:
             return []
         try:
             turns = storage.of(self.db).turn_resources
-            rows = turns.stale_running(max(0.0, time.time() - boot), self.host)
+            after = self._boot_review_after
+            rows = turns.stale_running(max(0.0, time.time() - boot), self.host) \
+                if not after else []
+            more = False
+            while True:
+                if len(rows) >= BOOT_REVIEW_MAX_ROWS:
+                    more = True
+                    break
+                page = turns.orphans_started_before(self.host, boot, after, BOOT_ORPHAN_PAGE)
+                rows += page
+                if len(page) < BOOT_ORPHAN_PAGE:
+                    break
+                after = int(page[-1]["id"])
+            if not rows:
+                self._boot_review_after = 0
+                return []
+            if not self._boot_settle_ready(time.time() - boot):
+                # #220 r3 : ni relevé du moteur ni écriture avant le feu vert —
+                # un relevé vide pris pendant le démarrage solderait à tort
+                self._boot_review_after = 0
+                self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
+                log("%d tour(s) d'avant le redémarrage : revue différée, des conteneurs "
+                    "peuvent encore être relancés (hôte démarré il y a %ds) ; nouvelle "
+                    "revue dans %ds" % (len(rows), int(time.time() - boot),
+                                        int(BOOT_REVIEW_EVERY_S)))
+                return []
+            runtime = self.container_runtime()
+            running = self._running_containers(runtime)
+            kept, dead, newly = [], [], []
             for row in rows:
-                turns.mark_orphan(row["turn_id"])
+                alive = self._containers_alive(running, runtime, row)
+                if alive is not None and not alive:
+                    dead.append(row)
+                    continue
+                kept.append(row)
+                if row.get("status") != "orphan":
+                    newly.append((row, alive))
+            turns.settle_many([row["turn_id"] for row in dead])
+            turns.mark_orphan_many([row["turn_id"] for row, _ in newly])
+            for row in dead:
+                log("tour %s de %s d'avant le redémarrage de l'hôte : groupe %s "
+                    "disparu, aucun conteneur en cours — soldé"
+                    % (row["turn_id"], row.get("agent"), row.get("pgid") or "?"))
+            for row, alive in newly:
                 log("ressource orpheline d'avant le redémarrage de l'hôte : tour %s de %s "
                     "(groupe %s%s) — signalée, rien n'est supprimé"
                     % (row["turn_id"], row.get("agent"), row.get("pgid") or "?",
-                       ", conteneurs %s" % ", ".join(row["containers"])
+                       ", conteneurs %s" % ", ".join(alive or row["containers"])
                        if row.get("containers") else ""))
-            return rows
+            if len(kept) > len(newly):
+                log("%d ressource(s) d'avant le redémarrage déjà signalée(s), toujours là"
+                    % (len(kept) - len(newly)))
+            if more:
+                # la suite au prochain passage de la boucle, sans attendre
+                self._boot_review_after = after
+                self.boot_review_at = time.monotonic()
+            else:
+                self._boot_review_after = 0
+            return kept
         except db_mod.DbError as exc:
-            log_async("ressources d'avant le redémarrage non vérifiées (%s)"
-                      % db_mod.explain(exc))
+            log_async("ressources d'avant le redémarrage non vérifiées (%s) ; nouvelle "
+                      "revue dans %ds" % (db_mod.explain(exc), int(BOOT_REVIEW_EVERY_S)))
+            self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
             return []
+
+    def _boot_settle_ready(self, uptime: float) -> bool:
+        """#220 r2 : les conteneurs relancés au démarrage ont-ils eu le temps
+        de l'être ? Pas avant BOOT_SETTLE_S de fonctionnement, ni tant que le
+        gestionnaire utilisateur démarre encore ses unités (celles qui
+        relancent les conteneurs) ; au-delà de BOOT_SETTLE_MAX_S, oui."""
+        if uptime < BOOT_SETTLE_S:
+            return False
+        if uptime >= BOOT_SETTLE_MAX_S:
+            return True
+        return self._user_manager_state() not in ("initializing", "starting")
+
+    @staticmethod
+    def _user_manager_state() -> str | None:
+        """L'état du gestionnaire systemd de l'utilisateur
+        (`systemctl --user is-system-running`), None sans systemd."""
+        try:
+            out = subprocess.run(["systemctl", "--user", "is-system-running"],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() or None
+
+    @staticmethod
+    def _running_containers(runtime) -> dict | None:
+        """L147 : les conteneurs en cours par étiquette de tour (`ameesh.turn`),
+        en un seul relevé ; {} sans moteur ; None si le moteur ne répond pas."""
+        if runtime is None:
+            return {}
+        listed = runtime.list_all()
+        if listed is None:
+            return None
+        out: dict = {}
+        for row in listed:
+            turn = (row.get("labels") or {}).get("ameesh.turn")
+            if turn:
+                out.setdefault(turn, []).append(row["id"])
+        return out
+
+    @staticmethod
+    def _containers_alive(running, runtime, row) -> list | None:
+        """L147 : les conteneurs du tour encore en cours ([] : aucun), lus par
+        l'étiquette du tour même si la ligne n'en note aucun — un tour
+        interrompu n'en note pas (relevé à la fin du tour). None si le moteur
+        ne répond pas, ou si la ligne en note et que l'hôte n'a pas de moteur."""
+        if running is None or (runtime is None and row.get("containers")):
+            return None
+        return list(running.get(row["turn_id"], []))
 
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s, courrier "
@@ -4503,6 +4698,7 @@ class Runner:
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()
+        self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
         if self.once:
@@ -4530,6 +4726,8 @@ class Runner:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
                     log_async("garde d'alimentation en échec (%s)" % type(exc).__name__)
+                if self.boot_review_at is not None and time.monotonic() >= self.boot_review_at:
+                    self.report_boot_orphans()      # #220 r2 : solde différé
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
@@ -4728,6 +4926,22 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
     log_async("[%s] harnais arrêté (%s)" % (name or "?", reason))
 
 
+def _attach_permission_mode(cfg: Config, name: str) -> str:
+    """L223: the permission mode set for the agent (`ameesh set <agent>
+    permission_mode=…`, local state of its host), '' when unset; an unreadable
+    setting (permissions, invalid bytes) is ignored with a warning."""
+    path = os.path.join(cfg.agent_dir(name), "permission_mode")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError
+        print("ameesh attach: unreadable permission_mode setting (%s: %s), ignored"
+              % (path, exc), file=sys.stderr)
+        return ""
+
+
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                ttl: float | None = None) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
@@ -4821,20 +5035,24 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             stop.wait(max(0.05, min(0.5, reste)))
 
     thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
-    thread.start()
     veille = threading.Thread(target=veilleur, daemon=True, name="%s-attach-veilleur" % name)
-    veille.start()
-    argv = adapter.interactive_command(agent.get("session_id"))
-    env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
-    env.update(adapter.env())
-    holds: list = []
-    env.update(_attach_tmp_env(cfg, name, env, holds))
-    cwd = agent.get("cwd") or None
-    if cwd and not os.path.isdir(cwd):
-        cwd = None
     proc: subprocess.Popen | None = None
     code = 0
+    holds: list = []
     try:
+        # codex verdict #182 (P2): everything after taking the lease is under the
+        # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
+        # slow `claude --help`) still releases the lease
+        thread.start()
+        veille.start()
+        argv = adapter.interactive_command(agent.get("session_id"),
+                                           permission_mode=_attach_permission_mode(cfg, name))
+        env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
+        env.update(adapter.env())
+        env.update(_attach_tmp_env(cfg, name, env, holds))
+        cwd = agent.get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
             return 1  # le `finally` rend le bail
         log_async("[%s] session interactive : %s" % (name, " ".join(argv)))
@@ -4853,12 +5071,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         if proc is not None:
             stop_group_now(proc, "interruption (attach)", name=name)
             code = proc.wait()
+        else:
+            code = 130  # interrupted before the harness was launched
     finally:
         stop.set()
         for hold in holds:          # L219: the session is over
             hold.release()
-        thread.join(timeout=5)
-        veille.join(timeout=5)
+        for worker in (thread, veille):
+            if worker.ident is not None:    # started (L223)
+                worker.join(timeout=5)
         try:
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:
