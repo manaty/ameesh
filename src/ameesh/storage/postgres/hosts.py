@@ -39,7 +39,9 @@ READING_COLUMNS = (
     "app_cpu, guest_cpu, cpu_window_s, guest_mem_bytes, "
     "lendable_cpu, lendable_memory_bytes, lendable_disk_bytes, "
     # #246 (0067): btrfs allocation
-    "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes"
+    "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes, "
+    # L159e6 (0361): the guard's last restart, decoded by `_decoded`
+    "guard_restart::text AS guard_restart"
 )
 
 #: L159d (and #246) columns written by `record`, in this order
@@ -49,6 +51,14 @@ MEASURE_COLUMNS = (
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
     "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
 )
+
+def _decoded(rows: list[dict]) -> list[dict]:
+    """`guard_restart` read as text (whatever the driver), as an object."""
+    for row in rows:
+        if isinstance(row.get("guard_restart"), str):
+            row["guard_restart"] = json.loads(row["guard_restart"])
+    return rows
+
 
 #: colonnes d'une ressource de tour
 TURN_COLUMNS = (
@@ -67,8 +77,8 @@ class Hosts(interface.HostResources):
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
                  tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
-                 on_ac, battery_percent, """ + ", ".join(MEASURE_COLUMNS) + """)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, """
+                 on_ac, battery_percent, guard_restart, """ + ", ".join(MEASURE_COLUMNS) + """)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, """
             + ", ".join(["%s"] * len(MEASURE_COLUMNS)) + """)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
@@ -78,6 +88,8 @@ class Hosts(interface.HostResources):
              reading.get("tmp_path"), reading.get("tmp_fstype"),
              reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes"),
              reading.get("on_ac"), reading.get("battery_percent"),
+             None if reading.get("guard_restart") is None
+             else json.dumps(reading["guard_restart"]),
              *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
@@ -85,19 +97,19 @@ class Hosts(interface.HostResources):
         self.db.execute(
             "DELETE FROM host_resources"
             " WHERE sampled_at < now() - interval '7 days'", ())
-        return rows[0]
+        return _decoded(rows)[0]
 
     def latest(self, host) -> dict | None:
         rows = self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " ORDER BY sampled_at DESC, id DESC LIMIT 1", (host,))
-        return rows[0] if rows else None
+        return _decoded(rows)[0] if rows else None
 
     def history(self, host, limit) -> list[dict]:
         rows = self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " ORDER BY sampled_at DESC, id DESC LIMIT %s", (host, int(limit)))
-        return list(reversed(rows))
+        return list(reversed(_decoded(rows)))
 
     def current(self, host) -> list[dict]:
         params: list[Any] = []
@@ -108,7 +120,7 @@ class Hosts(interface.HostResources):
         rows = self.db.query(
             "SELECT DISTINCT ON (host) " + READING_COLUMNS + " FROM host_resources"
             + where + " ORDER BY host, sampled_at DESC, id DESC", tuple(params))
-        return rows
+        return _decoded(rows)
 
     def usage(self, host, since_s) -> dict:
         rows = self.db.query(
@@ -126,10 +138,10 @@ class Hosts(interface.HostResources):
         return rows[0] if rows else {"samples": 0}
 
     def since(self, host, since_s) -> list[dict]:
-        return self.db.query(
+        return _decoded(self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " AND sampled_at >= now() - make_interval(secs => %s)"
-            " ORDER BY sampled_at, id", (host, float(since_s)))
+            " ORDER BY sampled_at, id", (host, float(since_s))))
 
     def record_harness_version(self, host, harness, *, path, version, raw) -> None:
         self.db.execute(

@@ -154,6 +154,8 @@ TYPE_LABELS = {
     # L233: briefed to the assignee and the orchestrators (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
     "waiting_without_question": "lot waiting for the owner with no question asked",
+    # L159e6: not pushed by default (add it to `notify.types`)
+    "guard_restart": "agents started again by the capacity guard",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

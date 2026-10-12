@@ -20,6 +20,7 @@ minute. `min_mem_available`, `min_disk_free`, `min_btrfs_unallocated` et
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -627,6 +628,30 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
+def guard_restart(path: str | None = None) -> dict | None:
+    """L159e6: the last restart the capacity guard of this host published
+    (`guard.restart` of its state, `path`: `guard.DEFAULT_STATE_PATH`), as
+    {ts, started, skipped}; None without a guard, an unreadable state or an
+    ill-typed record."""
+    from . import guard
+    try:
+        with open(path or guard.DEFAULT_STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    record = (state.get("guard") or {}).get("restart") if isinstance(state, dict) else None
+    if not isinstance(record, dict) or isinstance(record.get("ts"), bool) \
+            or not isinstance(record.get("ts"), (int, float)) \
+            or finite_float(record["ts"]) is None:
+        return None
+    started, skipped = record.get("started"), record.get("skipped")
+    if not isinstance(started, list) or not all(isinstance(u, str) for u in started) \
+            or not isinstance(skipped, dict) \
+            or not all(isinstance(r, str) for r in skipped.values()):
+        return None
+    return {"ts": float(record["ts"]), "started": list(started), "skipped": dict(skipped)}
+
+
 def collect(cfg, db: Db, *, now: float | None = None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
@@ -647,6 +672,7 @@ def collect(cfg, db: Db, *, now: float | None = None) -> dict:
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         basis = None
     reading.update(lendable(reading, basis))
+    reading["guard_restart"] = guard_restart()
     storage.of(db).hosts.record(reading)
     return reading
 

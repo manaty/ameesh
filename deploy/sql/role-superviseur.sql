@@ -268,7 +268,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
         'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
         -- #246 (0067): btrfs allocation, numbers only
-        'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes'
+        'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',
+        -- L159e6 (0361): the guard's last restart (unit names and reasons)
+        'guard_restart'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
