@@ -328,6 +328,8 @@ class AgentWorker(threading.Thread):
         self.fast_failure = False
         self.fast_failures = 0
         self.last_activity = time.monotonic()
+        #: #408 : dernière lecture des lots actionnables (règle 1)
+        self._lot_wake_checked = float("-inf")
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
@@ -2604,7 +2606,8 @@ class AgentWorker(threading.Thread):
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
         spec = self._pick()
         if spec is not None:
-            spec["lot"] = self.turn_lot(spec)
+            # #408 : le réveil sur un lot actionnable porte déjà son lot
+            spec["lot"] = spec.get("lot") or self.turn_lot(spec)
         return spec
 
     def _pick(self) -> dict | None:
@@ -2705,8 +2708,85 @@ class AgentWorker(threading.Thread):
             # l'exécuteur reprend la MÊME session (registre), une fois.
             self._reprise_attach = False
             return {"kind": "idle", "prompt": adapters.ATTACH_RESUME_PROMPT, "ids": []}
+        if all(mail.passive_reason(m) for m in messages):
+            # #408 : un courrier qui réveillera l'agent passe avant (fenêtre L125)
+            reveil = self._lot_wake_spec()
+            if reveil is not None:
+                return reveil
         if self.idle_due():
             return {"kind": "idle", "prompt": adapters.IDLE_PROMPT, "ids": []}
+        return None
+
+    #: #408 : intervalle minimal entre deux lectures des lots actionnables
+    LOT_WAKE_CHECK_S = 30.0
+
+    def lot_wake_enabled(self) -> bool:
+        """Règle 1 (#408) : réglage de l'agent (`ameesh set lot_wake=on|off`),
+        sinon celui de l'hôte (`AMEESH_LOT_WAKE`, actif par défaut)."""
+        reglage = ((self.agent or {}).get("lot_wake") or "").strip()
+        if reglage:
+            return reglage == "on"
+        return bool(getattr(self.cfg, "lot_wake", True))
+
+    def lot_wake_allowed(self, row: dict, now: float, base: float) -> bool:
+        """Un réveil sur ce lot est-il dû ? Le premier, oui. Si le lot a vécu
+        depuis le dernier réveil (lot, journal, branche, courrier), le compte
+        repart : un nouveau réveil après `base`. Sinon le réveil précédent
+        est resté sans effet : au plus `lot_wake_max` réveils, espacés d'un
+        délai doublé à chaque fois (plafonné à `idle_nudge`). Tout vit en
+        base : un redémarrage de l'exécuteur ne relance rien."""
+        wakes = int(row.get("wakes") or 0)
+        derniere = row.get("last_wake_ts")
+        if not wakes or derniere is None:
+            return True
+        vecu = row.get("activity_ts") is not None and (
+            row.get("wake_activity_ts") is None
+            or float(row["activity_ts"]) > float(row["wake_activity_ts"]) + 0.001)
+        ecoule = now - float(derniere)
+        if vecu:
+            return ecoule >= base
+        if wakes >= int(getattr(self.cfg, "lot_wake_max", 3)):
+            return False
+        plafond = max(base, float(self.runner.idle_nudge))
+        return ecoule >= min(base * (2 ** wakes), plafond)
+
+    def _lot_wake_spec(self) -> dict | None:
+        """Règle 1 (#408) : l'agent au repos depuis plus de `mail_batch` +
+        `lot_wake_margin` qui détient un lot `intake`/`build` (ni tenu, ni en
+        attente d'une décision ou d'un autre lot) est réveillé avec la
+        consigne de le reprendre, le plus prioritaire puis le plus ancien
+        d'abord ; le tour part dans la session de ce lot. Les gardes de
+        `_pick` (arrêt, budget, porte et pression d'hôte, authentification)
+        sont déjà passées."""
+        if not self.lot_wake_enabled():
+            return None
+        base = self.mail_batch() + float(getattr(self.cfg, "lot_wake_margin", 60.0))
+        repos = time.monotonic() - self.last_activity
+        dernier_tour = (self.agent or {}).get("last_turn_ts")
+        if dernier_tour:
+            repos = min(repos, time.time() - float(dernier_tour))
+        if repos < base:
+            return None
+        if time.monotonic() - self._lot_wake_checked < self.LOT_WAKE_CHECK_S:
+            return None
+        self._lot_wake_checked = time.monotonic()
+        import datetime as _dt
+        st = storage.of(self.db).lot_sessions
+        now = time.time()
+        try:
+            lots = st.actionable(self.name, today=_dt.date.today().isoformat())
+            for row in lots:
+                if not self.lot_wake_allowed(row, now, base):
+                    continue
+                note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
+                log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
+                          % (self.name, row["id"], row["state"], note.get("wakes")))
+                return {"kind": "idle", "ids": [], "lot": str(row["id"]),
+                        "prompt": adapters.LOT_WAKE_PROMPT % {
+                            "id": int(row["id"]), "title": row.get("title") or "",
+                            "state": row["state"]}}
+        except db_mod.DbError as exc:
+            log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
         return None
 
     def _mail_spec(self, messages: list[dict]) -> dict | None:

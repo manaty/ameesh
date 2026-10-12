@@ -1461,10 +1461,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
 #: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
-#: interactive sessions (`ameesh attach`), also local
+#: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
+#: (rule 1, the runner's wake on an actionable lot), in the database
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode")
+            "permission_mode", "lot_wake")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1553,13 +1554,16 @@ def cmd_set(cfg: Config, args) -> int:
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
-                      "permission_mode=auto|acceptEdits|…"
+                      "permission_mode=auto|acceptEdits|… lot_wake=on|off"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
             if cle == "mode" and valeur and valeur not in registry.MODES:
                 print("invalid mode: %r (%s)" % (valeur, " | ".join(registry.MODES)),
                       file=sys.stderr)
+                return 2
+            if cle == "lot_wake" and valeur and valeur not in ("on", "off"):
+                print("invalid lot_wake: %r (on | off)" % valeur, file=sys.stderr)
                 return 2
             if cle == "session_policy" and valeur and valeur not in SESSION_POLICIES:
                 print("invalid session_policy: %r (%s)"
@@ -1661,12 +1665,13 @@ def cmd_set(cfg: Config, args) -> int:
             regroupement, secondes = "", int(cfg.mail_batch)
         regroupement_txt = ("immediate" if secondes == 0 else "%ds" % secondes) + (
             "" if regroupement else " (default)")
+        reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
         print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
-              "(takes effect at the next turn)"
+              "lot_wake=%s (takes effect at the next turn)"
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
-                 grace_txt, regroupement_txt))
+                 grace_txt, regroupement_txt, reveil_txt))
         for local in ("mail_batch", "permission_mode"):
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
                 print("warning: %s is read from the local state of the agent's host "
@@ -2154,6 +2159,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="key=value",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "lot_wake=on|off "
                             "context_max_tokens=15M|0 "
                             "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
                             "turn_grace_seconds=20m|0 "

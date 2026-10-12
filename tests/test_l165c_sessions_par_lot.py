@@ -114,6 +114,7 @@ class StockageTest(_Base):
         t = time.time()
         self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 1)
         self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 2)
+        self.assertEqual(self.st.note_wake("a5", a, t + 0.0005)["wakes"], 3, "arrondi")
         self.assertEqual(self.st.note_wake("a5", a, t + 5)["wakes"], 1)
 
     def test_lots_actionnables(self):
@@ -208,3 +209,91 @@ class RoutageTest(_Base):
             self.assertEqual(worker.pick()["lot"], str(b))
         finally:
             worker.watchdog_stop.set()
+
+
+class ReveilTest(_Base):
+    """Règle 1 : l'exécuteur réveille l'agent au repos qui détient un lot
+    actionnable ; borné, gardé en base, désactivable."""
+
+    def _worker(self, name, **cfg_extra):
+        import dataclasses
+        cfg = dataclasses.replace(self.cfg, **cfg_extra) if cfg_extra else self.cfg
+        runner = Runner(cfg, self.db, once=True)
+        self.register(name, "claude", cwd=self._cwd(name))
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        worker.last_activity = time.monotonic() - 10_000   # au repos
+        worker.nudged = True        # la relance d'inactivité unique (L11) est passée
+        self.addCleanup(worker.watchdog_stop.set)
+        return worker
+
+    def pick(self, worker):
+        worker._lot_wake_checked = float("-inf")
+        return worker.pick()
+
+    def recule(self, name, lot, secondes):
+        self.db.execute("UPDATE agent_lot_sessions SET last_wake_at = last_wake_at"
+                        " - make_interval(secs => %s) WHERE agent = %s AND work_item_id = %s",
+                        (float(secondes), name, lot))
+
+    def test_reveil_sur_le_lot_actionnable(self):
+        worker = self._worker("r1")
+        qa = work.add(self.db, title="en relecture", assignee="r1")["id"]
+        work.move(self.db, qa, "build")
+        work.move(self.db, qa, "qa")
+        self.assertIsNone(self.pick(worker), "un lot en qa ne réveille pas")
+        b = work.add(self.db, title="à faire", assignee="r1")["id"]
+        spec = self.pick(worker)
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(b)))
+        self.assertIn("Resuming lot #%d" % b, spec["prompt"])
+        self.assertIn('hold: <reason>', spec["prompt"])
+        self.assertIsNone(self.pick(worker), "pas deux réveils de suite")
+
+    def test_backoff_en_base_survit_au_redemarrage(self):
+        worker = self._worker("r2")
+        b = work.add(self.db, title="à faire", assignee="r2")["id"]
+        self.assertIsNotNone(self.pick(worker))
+        relance = self._worker("r2")    # nouvel exécuteur, même agent
+        relance.runner.idle_nudge = 100_000.0    # plafond du délai doublé
+        self.assertIsNone(self.pick(relance))
+        base = relance.mail_batch() + relance.cfg.lot_wake_margin
+        self.recule("r2", b, 2 * base - 30)
+        self.assertIsNone(self.pick(relance), "délai doublé")
+        self.recule("r2", b, 31)
+        self.assertEqual(self.pick(relance)["lot"], str(b))
+        for _ in range(3):
+            self.recule("r2", b, 100_000)
+            self.pick(relance)
+        self.recule("r2", b, 100_000)
+        self.assertEqual(self.st.listing("r2")[0]["wakes"], 3)
+        self.assertIsNone(self.pick(relance), "au plus lot_wake_max réveils sans effet")
+        work.note(self.db, b, "avancé", actor="r2")       # le lot vit : le compte repart
+        self.assertEqual(self.pick(relance)["lot"], str(b))
+        self.assertEqual(self.st.listing("r2")[0]["wakes"], 1)
+
+    def test_desactivable_par_agent_et_par_hote(self):
+        worker = self._worker("r3", lot_wake=False)
+        work.add(self.db, title="à faire", assignee="r3")
+        self.assertIsNone(self.pick(worker))
+        storage.of(self.db).operations.set_settings("r3", {"lot_wake": "on"})
+        self.assertIsNotNone(self.pick(worker), "l'agent l'emporte sur l'hôte")
+        autre = self._worker("r4")
+        work.add(self.db, title="à faire", assignee="r4")
+        storage.of(self.db).operations.set_settings("r4", {"lot_wake": "off"})
+        self.assertIsNone(self.pick(autre))
+
+    def test_pas_de_reveil_sans_repos_ni_pendant_le_courrier(self):
+        worker = self._worker("r5")
+        work.add(self.db, title="à faire", assignee="r5")
+        worker.last_activity = time.monotonic()
+        self.assertIsNone(self.pick(worker), "pas encore au repos")
+        worker.last_activity = time.monotonic() - 10_000
+        worker.runner.mail_batch = 3600.0
+        mail.send(self.db, "orch", "r5", "un message en fenêtre de regroupement")
+        self.assertIsNone(self.pick(worker), "le courrier réveillera, pas la règle 1")
+
+    def test_lot_tenu_ne_reveille_pas(self):
+        worker = self._worker("r6")
+        b = work.add(self.db, title="à faire", assignee="r6")["id"]
+        work.note(self.db, b, "hold: attend l'hôte de test", actor="r6")
+        self.assertIsNone(self.pick(worker))
