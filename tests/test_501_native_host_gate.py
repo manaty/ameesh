@@ -129,3 +129,74 @@ class NativeGateTest(unittest.TestCase):
                 ctl.tick()
                 ctl.apply(host_gate.GateState("available", 3))
                 self.assertTrue(ctl.may_claim())
+
+    def test_guest_first_ack_enospc_closes_until_success(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = SimpleNamespace(cfg=config.Config(runner_id="guest-test"),
+                                     runner_id="guest-test", workers={})
+            gate = host_gate.FileGate(ack_path=os.path.join(tmp, "ack.json"), use_inotify=False)
+            self.addCleanup(gate.close)
+            ctl = host_gate.GateController(runner, gate)
+            clock = [100.0]
+            with mock.patch.object(gate, "state", return_value=host_gate.GateState("available", 1)), \
+                    mock.patch.object(host_gate.time, "monotonic", side_effect=lambda: clock[0]):
+                with mock.patch.object(os, "makedirs", side_effect=OSError(errno.ENOSPC, "full")):
+                    ctl.refresh()
+                    self.assertFalse(ctl.may_claim())
+                    ctl.refresh()  # backoff must not reopen
+                    self.assertFalse(ctl.may_claim())
+                clock[0] += 1
+                ctl.refresh()
+                ctl.refresh()
+                self.assertTrue(ctl.may_claim())
+
+    def test_guest_uid_refuses_gate_override_before_runner_initialization(self):
+        import pwd
+        from types import SimpleNamespace
+        from ameesh.runner import Runner
+        for kind in ("none", "bogus"):
+            with self.subTest(kind=kind), \
+                    mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")):
+                cfg = config.Config(runner_id="native:test", host_gate=kind)
+                with self.assertRaisesRegex(SystemExit, "guest.*file"):
+                    Runner(cfg, None)
+
+    def test_guest_unit_identity_cannot_be_hidden_by_environment(self):
+        import pwd
+        from types import SimpleNamespace
+        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh")), \
+                mock.patch("builtins.open", mock.mock_open(read_data="0::/system.slice/ameesh-guest-runner@test.service\n")), \
+                mock.patch.dict(os.environ, {"USER": "ameesh", "SYSTEMD_UNIT": "native.service"}):
+            self.assertTrue(host_gate.is_guest(config.Config(runner_id="native:test")))
+            with self.assertRaisesRegex(ValueError, "guest.*file"):
+                host_gate.gate_kind(config.Config(host_gate="none"))
+
+    def test_native_first_ack_enospc_keeps_explicit_gate_and_backoff(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = SimpleNamespace(cfg=config.Config(runner_id="native:test", host_gate="file"),
+                                     runner_id="native:test", workers={}, reject_host_gate=mock.Mock())
+            gate = host_gate.FileGate(ack_path=os.path.join(tmp, "ack.json"), use_inotify=False)
+            self.addCleanup(gate.close)
+            ctl = host_gate.GateController(runner, gate)
+            with mock.patch.object(gate, "state", return_value=host_gate.GateState("available", 1)), \
+                    mock.patch.object(os, "makedirs", side_effect=OSError(errno.ENOSPC, "full")) as write:
+                ctl.refresh()
+                ctl.refresh()
+                self.assertTrue(ctl.may_claim())
+                self.assertEqual(write.call_count, 1)
+                runner.reject_host_gate.assert_not_called()
+
+    def test_guest_override_refused_even_if_database_is_unavailable(self):
+        import io
+        import pwd
+        from types import SimpleNamespace
+        from ameesh import runner
+        with mock.patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_name="ameesh-guest")), \
+                mock.patch.object(runner, "load_config", return_value=config.Config(host_gate="none")), \
+                mock.patch.object(runner, "_connect_at_start") as connect, \
+                mock.patch.object(runner.sys, "stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(runner.main(["--once", "--runner-id", "native:test"]), 2)
+            self.assertIn("guest runner requires host_gate=file", stderr.getvalue())
+            connect.assert_not_called()

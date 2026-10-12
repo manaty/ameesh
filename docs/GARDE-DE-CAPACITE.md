@@ -301,8 +301,10 @@ settings in [EXPLOITATION.md](EXPLOITATION.md#host-gate-l159f)):
 - a guest runner on a lending host (Host fiche with `policy.lend`) has a
   gate by default, closed when the state is absent, unreadable or stale;
   native runners exclude that guest gate by default (#501), preserving
-  explicit overrides; EACCES/EPERM on ack removes a native gate but keeps
-  a guest closed until a successful ack;
+  native explicit overrides; a guest identity (Unix UID or kernel systemd
+  unit membership, also the guest runner ID) requires `file` and refuses
+  `none` or another override at startup. EACCES/EPERM on ack removes a
+  native gate; every guest ack error closes its gate until a successful ack;
 - in `draining`, a turn stops at its next safe point, and at the latest at
   `drain_deadline_ts`; the background work of finished turns stops at that
   deadline too, and `drained` is `true` only once no lease and no such work

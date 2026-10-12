@@ -35,6 +35,7 @@ AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     lease_owner, lease_epoch,
+    extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,

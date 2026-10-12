@@ -90,14 +90,14 @@ class DefaultsTest(unittest.TestCase):
                          (capacity_guard.STATE_PATH, capacity_guard.ACK_PATH, "stopped", True))
 
     def test_a_classic_host_has_no_gate_unless_configured(self):
-        self.assertIsNone(host_gate.from_config(self.cfg(), lending=False))
+        self.assertIsNone(host_gate.from_config(self.cfg(runner_id="native-test"), lending=False))
         gate = host_gate.from_config(self.cfg(host_gate="file"), lending=False)
         self.assertEqual((gate.fallback, gate.lending), ("available", False))
         gate = host_gate.from_config(self.cfg(host_gate="file", host_gate_fallback="stopped"))
         self.assertTrue(gate.lending)  # closed by default: freshness of a lending host
 
     def test_none_disables_even_on_a_lending_host(self):
-        self.assertIsNone(host_gate.from_config(self.cfg(host_gate="none"), lending=True))
+        self.assertIsNone(host_gate.from_config(self.cfg(runner_id="native-test", host_gate="none"), lending=True))
 
     def test_drain_seconds(self):
         self.assertEqual(host_gate.drain_seconds(self.cfg()), 90.0)

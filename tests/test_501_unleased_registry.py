@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from .support import PgTestCase
-from ameesh import exploitation, registry, storage
+from ameesh import exploitation, notify, registry, storage
 from ameesh.runner import Runner
 
 
@@ -33,6 +33,23 @@ class UnleasedRegistryTest(PgTestCase):
         self.assertIsNone(registry.get(self.db, "waiting")["last_error"])
         self.assertEqual(self.alerts(), [])
         self.assertFalse(self.note())
+
+    def test_alert_episode_survives_reason_and_sequence_changes(self):
+        self.assertTrue(self.note())
+        first = self.alerts()[0]
+        self.db.execute("UPDATE agent_registry SET updated_at = now() + interval '1 minute'"
+                        " WHERE name = 'waiting'")
+        self.error = "lease_not_taken: host gate: stopped (seq 2, memory)"
+        self.assertTrue(self.note())
+        second = self.alerts()[0]
+        self.assertEqual(notify.key_of(first), notify.key_of(second))
+        self.assertEqual(first["since"], second["since"])
+        self.assertTrue(registry.claim(self.db, "waiting", "runner", 60))
+        self.assertIsNone(registry.get(self.db, "waiting")["lease_wait_since_ts"])
+        lease = registry.get(self.db, "waiting")
+        self.assertTrue(registry.release(self.db, "waiting", "runner", lease["lease_epoch"]))
+        self.assertTrue(self.note())
+        self.assertGreater(self.alerts()[0]["since"], first["since"])
 
     def test_live_lease_other_host_and_blocked_status_are_preserved(self):
         self.assertFalse(self.note(host="other-host"))

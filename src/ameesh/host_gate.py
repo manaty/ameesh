@@ -610,22 +610,33 @@ def is_guest(cfg, runner_id: str | None = None) -> bool:
         return True
     try:
         import pwd
-        return pwd.getpwuid(os.geteuid()).pw_name == "ameesh-guest"
+        if pwd.getpwuid(os.geteuid()).pw_name == "ameesh-guest":
+            return True
     except (ImportError, KeyError):
+        pass
+    # The kernel supplies cgroup membership; EnvironmentFile cannot override it.
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as stream:
+            return any(part.startswith("ameesh-guest-runner@") and part.endswith(".service")
+                       for line in stream for part in line.rstrip().split("/"))
+    except OSError:
         return False
 
 
 def gate_choice(cfg, lending: bool = False, *, runner_id: str | None = None) -> tuple[str, str]:
-    """Explicit configuration wins; lending's default gate belongs to guests."""
+    """Native overrides are preserved; guests always require the file gate."""
     kind = str(getattr(cfg, "host_gate", "") or "").strip().lower()
+    guest = is_guest(cfg, runner_id)
+    if guest and kind and kind != "file":
+        raise ValueError("guest runner requires host_gate=file; refusing host_gate=%s" % kind)
     if kind == "none":
         return "", "explicit host_gate=none"
     if kind:
         if kind not in GATE_KINDS:
             raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
         return kind, "explicit host_gate=%s" % kind
-    if lending and is_guest(cfg, runner_id):
-        return "file", "guest runner on lending host"
+    if guest:
+        return "file", "guest runner on lending host" if lending else "guest runner requires file gate"
     return "", "native runner; guest gate excluded" if lending else "classic host default"
 
 
@@ -788,14 +799,15 @@ class GateController:
         only a later seq, or the same seq closing (the fallback of an
         unreadable file): a state read before the loop applied a newer one
         never reopens the controller (r5)."""
-        if getattr(self.gate, "ack_permission_denied", False) and is_guest(
+        if getattr(self.gate, "ack_error", "") and is_guest(
                 getattr(self.runner, "cfg", None), getattr(self.runner, "runner_id", None)):
-            state = dataclasses.replace(state, state="stopped", reason="ack permission denied")
+            state = dataclasses.replace(state, state="stopped", reason="ack failed")
         now = self._clock()
         with self._lock:
             if newer_only and self._applied is not None and (
                     state.seq < self._state.seq
-                    or (state.seq == self._state.seq and state.may_claim)):
+                    or (state.seq == self._state.seq and state.may_claim
+                        and self._state.reason != "ack failed")):
                 return False
             self._account_freeze(state, now)
             if _key(state) == self._applied:
@@ -909,6 +921,8 @@ class GateController:
         if key != self._ack_key:
             if self.gate.acknowledge(ack):
                 self._ack_key = key
+                if state.reason == "ack failed":
+                    self.apply(self.gate.state(), newer_only=True)
                 self.acks = (self.acks + [ack])[-20:]
                 if drained:
                     self._log("host gate: drained (seq %d), no lease held, no background "
@@ -919,14 +933,13 @@ class GateController:
             merge = getattr(self.gate, "merge", None)
             if merge is not None:
                 merge()
-        if getattr(self.gate, "ack_permission_denied", False):
-            if is_guest(getattr(self.runner, "cfg", None),
-                        getattr(self.runner, "runner_id", None)):
-                self.apply(dataclasses.replace(state, state="stopped", reason="ack permission denied"))
-            else:
-                reject = getattr(self.runner, "reject_host_gate", None)
-                if reject is not None:
-                    reject(self, self.gate.ack_error)
+        if getattr(self.gate, "ack_error", "") and is_guest(
+                getattr(self.runner, "cfg", None), getattr(self.runner, "runner_id", None)):
+            self.apply(dataclasses.replace(state, state="stopped", reason="ack failed"))
+        elif getattr(self.gate, "ack_permission_denied", False):
+            reject = getattr(self.runner, "reject_host_gate", None)
+            if reject is not None:
+                reject(self, self.gate.ack_error)
         return ack
 
 

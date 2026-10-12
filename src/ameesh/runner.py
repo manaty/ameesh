@@ -4495,6 +4495,11 @@ class Runner:
         dry_run: bool = False,
         max_turns: int | None = None,
     ):
+        from .host_gate import gate_choice
+        try:
+            gate_choice(cfg, runner_id=cfg.runner)
+        except ValueError as exc:
+            raise SystemExit("agent-runner: %s" % exc) from exc
         self.cfg = cfg
         self.db = db
         self.host = cfg.host
@@ -7081,6 +7086,12 @@ def main(argv: list[str] | None = None) -> int:
     if parsed.idle_nudge:
         cfg = dataclasses.replace(cfg, idle_nudge=parsed.idle_nudge)
 
+    from .host_gate import gate_choice
+    try:
+        gate_choice(cfg, runner_id=cfg.runner)
+    except ValueError as exc:
+        print("agent-runner: %s" % exc, file=sys.stderr)
+        return 2
     db = _connect_at_start(cfg, wait=not parsed.once)
     if db is None:
         return 1
