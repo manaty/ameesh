@@ -376,7 +376,8 @@ ameesh canon check [--canon DIR] [--ref REV] [--fetch] [--json] [--host H]
 ameesh canon show  [--canon DIR] [--ref REV] [--fetch] [--json]
 ameesh canon sync  [--canon DIR] [--ref REV] [--fetch] [--json] [--host H] [--bootstrap-ref BRANCH]
 ameesh placement check [--canon DIR] [--ref REV] [--fetch] [--json] [--agent A]
-ameesh agent spawn <name> --by CREATOR --ttl TTL [--cwd DIR] [--prompt TEXT] [--json]
+ameesh agent name  --role R [--project P …] [--canon DIR] [--ref REV] [--fetch] [--json]
+ameesh agent spawn [name] --by CREATOR --ttl TTL [--role R] [--project P …] [--cwd DIR] [--prompt TEXT] [--json]
 ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] [--json]
 ```
 
@@ -388,6 +389,7 @@ ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] 
 | `--host` | host whose state is diagnosed or synced (else `AMEESH_HOST` / this machine) |
 | `--bootstrap-ref` | first bootstrap of the passkey registry only: trusted canonical branch (`origin/<BRANCH>`), logged, ignored afterwards |
 | `--ttl` (spawn) | expiry: `30m`, `2h`, `1d` (max `7d`) |
+| `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused. Two repos never share a segment and one repo keeps the same segment in every canon (a divergent mesh is refused); a configured canon that cannot be read also refuses generation, naming the canon and its ref |
 | `--diff` (review-class) | files changed since REF (`REF..HEAD` + working tree) |
 
 ## Actions: `ameesh action`
