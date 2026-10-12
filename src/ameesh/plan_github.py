@@ -952,10 +952,11 @@ def _ref_parts(ref: str | None) -> tuple[str, int] | None:
 
 
 def lot_project(item: dict) -> str | None:
-    """Le projet d'un lot, comme `ameesh projects` (L62) : `app`, chantier,
+    """Le projet d'un lot, comme `ameesh projects` (L62) : `app`, `workstream`,
     équipe de sa fiche du plan (à défaut, son équipe : file d'amélioration,
-    L119), projet (équipe ou chantier) de son assigné."""
+    L119), projet (équipe ou `workstream`) de son assigné."""
     agent = projects_mod.agent_project({"team": item.get("assignee_team"),
+                                        "workstream": item.get("assignee_workstream"),
                                         "chantier": item.get("assignee_chantier")})
     lot = dict(item, package_team=item.get("package_team") or item.get("team"))
     return projects_mod.lot_project(lot, {item.get("assignee") or "": agent})
