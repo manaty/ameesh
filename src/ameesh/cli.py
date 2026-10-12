@@ -78,7 +78,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, mail, migrations, platform, signing, storage
+from . import fil, identity, mail, migrations, platform, registry, signing, storage
 from . import session_bindings as sb
 from .config import NAME_RE, Config
 
@@ -915,6 +915,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             bk.register(name, tool, data.get("cwd"), session_id,
                         leased=binding.bound_to_lease)
             if bk.kind == "pg":
+                # L52: record only after L133/L166 have filtered child IDs.
+                # Under a runner lease, session_id is None; stream parsing
+                # and registry.set_session own the authoritative session.
+                if session_id:
+                    registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
         if binding.source == "explicit" and bk.kind == "pg":
             # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a

@@ -107,6 +107,7 @@
         | status [<job>] | cancel <job>
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
         same output and exit code, local fallback;
+  ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
 
 The human approval service (spec §9) is a separate command,
@@ -237,6 +238,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "sessions":
+        # L52 (0032 §2): current and past persona sessions.
+        from . import persona_sessions
+        return persona_sessions.main(rest)
     if command == "watch":
         # L121: the watch of an agent (timer + versioned instruction)
         from . import watch
