@@ -149,6 +149,15 @@ class FileGateTest(unittest.TestCase):
         self.assertEqual(self.gate(True).state().state, "stopped")
         self.assertEqual(self.gate(False).state().state, "available")
 
+    def test_a_huge_integer_closes_the_gate(self):
+        # 10**400 is valid JSON; math.isfinite on it raises OverflowError: the
+        # state is unreadable (fallback), never left `available`
+        for field in ({"expires_ts": 10 ** 400}, {"until_ts": 10 ** 400},
+                      {"caps": {"max_concurrent": 10 ** 400}}):
+            with self.subTest(field=sorted(field)):
+                _write_state(self.path, **field)
+                self.assertEqual(self.gate(True).state().state, "stopped")
+
     def test_ack_goes_to_its_own_directory(self):
         self.gate(True).acknowledge(host_gate.GateAck(seq=8, state="draining", drained=True))
         with open(self.ack, encoding="utf-8") as fh:
