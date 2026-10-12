@@ -113,6 +113,22 @@ base64 of the 32-byte seed or key). Rules:
   immediately invalidates all signatures of that agent. The default role
   is `agent`; passing `--role owner` delegates the owner's authority and
   displays a warning.
+* the owner's own key (a human, not an agent, #330) is registered without
+  any agent:
+  `ameesh key register --human smichea --public-key ~/.config/ameesh/owner.key/smichea.pub --role owner`.
+  It goes to `key_holders`, an identity that holds a key and nothing else:
+  never executable, never woken, in no project, alert or L165 take, out of
+  reach of `attach`, hook sessions and canon cards (none of them reads that
+  table). Its name is the one `ameesh decide --key` signs under by default
+  (`human:smichea` → `smichea`). It is refused when an agent already has
+  that name (the owner's authority never sits on an agent's identity), and
+  an agent key can no longer be registered under a key holder's name. The
+  key lookups read both through the `mesh_keys` view, the human's key first.
+  Migration 0364 copies the stopgap registry row of 2026-10-12 (`smichea`,
+  harness `none`, mode `externe`, responsible `human:smichea`, no turn)
+  there, with its key if one had been registered; `key register --human
+  smichea` then removes that row from the registry (an additive migration
+  deletes nothing).
 
 ### What it looks like in a hook
 

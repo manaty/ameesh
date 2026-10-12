@@ -39,6 +39,8 @@ DOMAIN = "agent-mesh/v1"
 #: rôles de clé : seul 'owner' porte l'autorité du propriétaire
 KEY_ROLES = ("owner", "agent")
 DEFAULT_KEY_ROLE = "agent"
+#: nom d'un détenteur de clé (même règle que agent_registry.name)
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_TTL = 24 * 3600.0
 MAX_TTL = 30 * 24 * 3600.0
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -187,11 +189,45 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
     if role not in KEY_ROLES:
         raise AuthorityError("unknown key role: %r (%s)" % (role, ", ".join(KEY_ROLES)))
     fingerprint = signing.fingerprint(public)
-    found = storage.of(db).keys.register(agent, b64(public), fingerprint, role, note)
+    keys = storage.of(db).keys
+    if (keys.info(agent) or {}).get("holder") == "human":
+        raise AuthorityError(
+            "%s holds a human's key: ameesh key register --human %s --public-key … "
+            "--role %s" % (agent, agent, role))
+    found = keys.register(agent, b64(public), fingerprint, role, note)
     if not found:
         raise AuthorityError(
-            "agent %s not in the registry: declare it before registering its key" % agent)
+            "agent %s not in the registry: declare it before registering its key; "
+            "a human's key (the owner's) is registered without any agent: "
+            "ameesh key register --human %s --public-key <file.pub> --role owner"
+            % (agent, agent))
     return {"agent": agent, "fingerprint": fingerprint, "role": role}
+
+
+def register_human_key(db: Db, human: str, public: bytes, *,
+                       role: str = DEFAULT_KEY_ROLE) -> dict:
+    """Enregistre la clé PUBLIQUE d'un humain (#330) : `human` est
+    `human:<id>` ou `<id>` ; la clé est rangée sous `<id>` dans `key_holders`,
+    une identité qui ne détient qu'une clé — jamais un agent (ni exécutable,
+    ni réveillable, ni dans un projet, une alerte ou une prise L165). C'est le
+    nom que `decide --key` prend par défaut (`human:<id>` → `<id>`). Refusé si
+    un agent porte ce nom : la clé du propriétaire ne s'attache jamais à
+    l'identité d'un agent."""
+    name = human.split(":", 1)[1] if human.startswith("human:") else human
+    if len(public) != 32:
+        raise AuthorityError("Ed25519 public key: 32 bytes expected")
+    if role not in KEY_ROLES:
+        raise AuthorityError("unknown key role: %r (%s)" % (role, ", ".join(KEY_ROLES)))
+    if not _NAME_RE.match(name):
+        raise AuthorityError("invalid name for a key holder: %r" % name)
+    fingerprint = signing.fingerprint(public)
+    if not storage.of(db).keys.register_human(name, "human:" + name, b64(public),
+                                              fingerprint, role):
+        raise AuthorityError(
+            "an agent is named %s: a human's key never sits on an agent's identity "
+            "(choose another name, then decide … --as <name>)" % name)
+    return {"agent": name, "human": "human:" + name, "fingerprint": fingerprint,
+            "role": role}
 
 
 def revoke_key(db: Db, agent: str) -> bool:

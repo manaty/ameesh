@@ -45,6 +45,7 @@
 --   * clés publiques et identifiants d'authentificateurs — pas secrets, mais
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
+--       key_holders.public_key (et la vue mesh_keys, #330)
 --       authenticators.public_key, .credential_id
 --   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
 --     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
@@ -212,6 +213,15 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'decision', 'signature_key', 'created_at', 'expires_at',
         'consumed_at', 'consumed_by', 'unconsumed', 'unexpired',
         'key_known', 'key_live', 'key_matches', 'expires_ts', 'key_is_owner'
+    ]),
+    -- #330 (0364) : clés des humains, hors registre des agents
+    ('key_holders', ARRAY[
+        'name', 'human', 'public_key_fingerprint', 'key_role',
+        'key_updated_at', 'key_revoked_at', 'created_at'
+    ]),
+    ('mesh_keys', ARRAY[
+        'name', 'holder', 'public_key_fingerprint', 'key_role',
+        'key_updated_at', 'key_revoked_at'
     ]),
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'approval_id', 'consumed_by', 'consumed_at'

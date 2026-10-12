@@ -801,7 +801,8 @@ class Wakeups(Domain):
 # --------------------------------------------------------------------------
 
 class Keys(Domain):
-    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`)."""
+    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`) et
+    des humains (`key_holders`, #330), lues ensemble dans la vue `mesh_keys`."""
 
     @abc.abstractmethod
     def info(self, agent: str) -> dict | None:
@@ -813,13 +814,23 @@ class Keys(Domain):
         """Enregistre la clé publique (base64) ; faux si l'agent est inconnu."""
 
     @abc.abstractmethod
+    def register_human(self, name: str, human: str, public_key: str, fingerprint: str,
+                       role: str) -> bool:
+        """Enregistre la clé d'un humain sous `name`, hors du registre des
+        agents (`key_holders`, #330) : crée ou met à jour le détenteur ; faux
+        si un agent porte déjà ce nom. La ligne de contournement du 12/10
+        (harnais none, mode externe, aucun tour, responsable cet humain)
+        quitte alors le registre."""
+
+    @abc.abstractmethod
     def revoke(self, agent: str) -> bool:
         """Révoque la clé active ; faux s'il n'y en avait pas."""
 
     @abc.abstractmethod
     def registered(self) -> list[dict]:
-        """Agents qui ont une clé publique (révoquée comprise), par nom :
-        name, public_key_fingerprint, key_role, key_updated_ts, key_revoked_ts."""
+        """Détenteurs d'une clé publique (révoquée comprise), par nom : name,
+        holder (`human` ou `agent`), public_key_fingerprint, key_role,
+        key_updated_ts, key_revoked_ts."""
 
 
 class Approvals(Domain):

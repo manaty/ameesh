@@ -18,10 +18,10 @@ class Keys(interface.Keys):
     def info(self, agent) -> dict | None:
         rows = self.db.query(
             """
-            SELECT name, public_key, public_key_fingerprint, key_role,
+            SELECT name, holder, public_key, public_key_fingerprint, key_role,
                    extract(epoch from key_updated_at)::float8 as key_updated_ts,
                    extract(epoch from key_revoked_at)::float8 as key_revoked_ts
-              FROM agent_registry WHERE name = %s
+              FROM mesh_keys WHERE name = %s
             """,
             (agent,),
         )
@@ -45,7 +45,49 @@ class Keys(interface.Keys):
         )
         return bool(rows)
 
+    def register_human(self, name, human, public_key, fingerprint, role) -> bool:
+        # the stopgap row of 2026-10-12 (0364): a registry row that only ever
+        # stood for this human's key leaves the registry
+        self.db.query(
+            """
+            DELETE FROM agent_registry
+             WHERE name = %s AND harness = 'none' AND mode = 'externe' AND turns = 0
+               AND responsible = %s AND lease_owner IS NULL
+            RETURNING name
+            """,
+            (name, human),
+        )
+        if self.db.query("SELECT 1 FROM agent_registry WHERE name = %s", (name,)):
+            return False
+        self.db.query(
+            """
+            INSERT INTO key_holders (name, human, public_key, public_key_fingerprint,
+                                     key_role, key_updated_at, key_revoked_at)
+            VALUES (%s, %s, %s, %s, %s, now(), NULL)
+            ON CONFLICT (name) DO UPDATE
+               SET human = excluded.human,
+                   public_key = excluded.public_key,
+                   public_key_fingerprint = excluded.public_key_fingerprint,
+                   key_role = excluded.key_role,
+                   key_updated_at = now(),
+                   key_revoked_at = NULL
+            RETURNING name
+            """,
+            (name, human, public_key, fingerprint, role),
+        )
+        return True
+
     def revoke(self, agent) -> bool:
+        held = self.db.query(
+            """
+            UPDATE key_holders SET key_revoked_at = now()
+             WHERE name = %s AND public_key IS NOT NULL AND key_revoked_at IS NULL
+            RETURNING name
+            """,
+            (agent,),
+        )
+        if held:
+            return True
         rows = self.db.query(
             """
             UPDATE agent_registry
@@ -60,10 +102,10 @@ class Keys(interface.Keys):
     def registered(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, public_key_fingerprint, key_role,
+            SELECT name, holder, public_key_fingerprint, key_role,
                    extract(epoch from key_updated_at)::float8 as key_updated_ts,
                    extract(epoch from key_revoked_at)::float8 as key_revoked_ts
-              FROM agent_registry
+              FROM mesh_keys
              WHERE public_key IS NOT NULL
              ORDER BY name
             """

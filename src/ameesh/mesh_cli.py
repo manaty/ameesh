@@ -636,14 +636,29 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             print("private key: %s (0600 — keep it offline, never commit it)" % private_path)
             print("public key : %s" % public_path)
             print("fingerprint: %s" % fingerprint)
-            print("register it: agent-mesh key register <agent> --public-key %s" % public_path)
+            print("register it: ameesh key register --human %s --public-key %s --role owner"
+                  % (args.name, public_path))
             return 0
         if args.key_command == "register":
+            if bool(args.agent) == bool(args.human):
+                print(USAGE_HINT % "key register: give an agent, or --human <id> "
+                      "for a human's key (the owner's)", file=sys.stderr)
+                return 2
             public = signing.read_public(os.path.expanduser(args.public_key))
-            result = authority.register_key(
-                db, args.agent, public, role=args.role, note=args.note)
-            print("key of %s registered: %s (role %s)" % (
-                result["agent"], result["fingerprint"], result["role"]))
+            try:
+                if args.human:
+                    result = authority.register_human_key(
+                        db, args.human, public, role=args.role)
+                else:
+                    result = authority.register_key(
+                        db, args.agent, public, role=args.role, note=args.note)
+            except authority.AuthorityError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
+            print("key of %s registered: %s (role %s)%s" % (
+                result["agent"], result["fingerprint"], result["role"],
+                " — %s, key holder only (no agent)" % result["human"]
+                if result.get("human") else ""))
             if result["role"] == "owner":
                 print("warning: this key carries the owner's authority for %s; "
                       "its private key must exist only with the owner."
@@ -663,7 +678,8 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(info, ensure_ascii=False, indent=2))
                 return 0
-            print("agent      : %s" % info["name"])
+            print("%-11s: %s" % ("human" if info.get("holder") == "human" else "agent",
+                                   info["name"]))
             print("fingerprint: %s" % info.get("public_key_fingerprint"))
             print("role       : %s%s" % (
                 info.get("key_role") or "agent",
@@ -683,8 +699,8 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 print("no key registered")
                 return 0
             for row in rows:
-                print("%-20s %-8s %s  %s" % (
-                    row["name"], row.get("key_role") or "agent",
+                print("%-20s %-6s %-8s %s  %s" % (
+                    row["name"], row.get("holder") or "agent", row.get("key_role") or "agent",
                     row["public_key_fingerprint"],
                     "revoked %s" % _fmt_moment(row["key_revoked_ts"])
                     if row.get("key_revoked_ts") else "registered %s"
@@ -1789,7 +1805,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="confirms that the owner is the one acting")
     p_gen.set_defaults(func=cmd_key)
     p_reg = key_sub.add_parser("register")
-    p_reg.add_argument("agent")
+    p_reg.add_argument("agent", nargs="?")
+    p_reg.add_argument("--human", metavar="ID",
+                       help="a human's key (human:ID or ID), held outside the agents (#330)")
     p_reg.add_argument("--public-key", required=True)
     p_reg.add_argument("--role", choices=list(authority.KEY_ROLES), default=authority.DEFAULT_KEY_ROLE,
                        help="owner = owner's authority; agent = provenance only")

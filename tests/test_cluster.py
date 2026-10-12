@@ -39,6 +39,8 @@ SIGNATURES = {
     "standing_approvals": {"receipt", "nonce", "challenge"},
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
+    "key_holders": {"public_key"},     # #330
+    "mesh_keys": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
