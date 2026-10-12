@@ -198,7 +198,7 @@ class Mailbox(interface.Mailbox):
     # est alors marqué `deja_consigne` et signalé « re-livré ».
 
     @staticmethod
-    def _bail_sql(owner, *, reservation=False) -> str:
+    def _lease_sql(owner, *, reservation=False) -> str:
         if owner:
             return ("v.lease_owner = %s AND v.lease_epoch = %s"
                     " AND v.lease_expires_at > clock_timestamp()")
@@ -212,7 +212,7 @@ class Mailbox(interface.Mailbox):
         return "TRUE"
 
     @staticmethod
-    def _bail_params(owner, epoch) -> tuple:
+    def _lease_params(owner, epoch) -> tuple:
         return (owner, int(epoch)) if owner else ()
 
     ACTIVE_SQL = """
@@ -260,9 +260,9 @@ class Mailbox(interface.Mailbox):
               FROM cibles
              WHERE m.id = cibles.id
             RETURNING %s, cibles.deja AS deja_avant
-        """ % (filtre, self._bail_sql(owner, reservation=True), self.ACTIVE_SQL,
+        """ % (filtre, self._lease_sql(owner, reservation=True), self.ACTIVE_SQL,
                MAIL_COLUMNS.replace("id,", "m.id,", 1))
-        params = ((recipient, recipient) + self._bail_params(owner, epoch)
+        params = ((recipient, recipient) + self._lease_params(owner, epoch)
                   + (int(limit), owner or None, int(epoch) if owner else None,
                      token, porteur, float(ttl_seconds)))
         rows = self.db.query(sql, params)
@@ -289,8 +289,8 @@ class Mailbox(interface.Mailbox):
                AND m.meta->'consigne'->>'jeton' = %%s
                AND %s
             RETURNING m.id
-            """ % (", ".join(str(i) for i in clean), self._bail_sql(owner)),
-            (recipient, recipient, token) + self._bail_params(owner, epoch),
+            """ % (", ".join(str(i) for i in clean), self._lease_sql(owner)),
+            (recipient, recipient, token) + self._lease_params(owner, epoch),
         )
         return sorted(int(row["id"]) for row in rows)
 
