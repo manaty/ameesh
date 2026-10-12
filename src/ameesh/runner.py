@@ -4972,7 +4972,9 @@ class Runner:
                 gate.refresh()  # confirm ack permission before any new lease
         gate = self.host_gate
         if gate is not None and gate.holds_turns():
-            error = getattr(gate.gate, "ack_error", "")
+            # The mediated gate has no local file acknowledgement.
+            error = "" if getattr(self, "mediated", False) else \
+                getattr(gate.gate, "ack_error", "")
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
             return  # host gate closed: registry diagnosis without taking a lease
