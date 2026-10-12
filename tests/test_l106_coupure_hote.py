@@ -730,6 +730,7 @@ class CoupureTest(PgTestCase):
         for turn in (relance, mort):
             self.assertEqual(turns.get(turn)["status"], "running")
         self.assertIsNotNone(runner.boot_review_at)
+        moteur.list_all.assert_not_called()     # #220 r3 : aucun relevé avant le feu vert
         # le conteneur arrive ; la revue suivante, délai passé, le voit
         moteur.list_all.return_value = [
             {"id": "c-tardif", "name": "pg", "image": "postgres", "created": "",
@@ -738,6 +739,92 @@ class CoupureTest(PgTestCase):
         self.assertEqual(turns.get(relance)["status"], "orphan")
         self.assertEqual(turns.get(mort)["status"], "done")
         self.assertIsNone(runner.boot_review_at)
+
+    def _revue(self, runner, uptime, moteur, etat="running"):
+        with mock.patch.object(resources, "boot_time", return_value=time.time() - uptime), \
+                mock.patch.object(runner, "container_runtime", return_value=moteur), \
+                mock.patch.object(runner, "_user_manager_state",
+                                  side_effect=etat if callable(etat) else lambda: etat), \
+                mock.patch.object(runner_mod, "log"):
+            return [r["turn_id"] for r in runner.report_boot_orphans()]
+
+    def _xmin(self, turn_id) -> str:
+        return str(self.db.query("SELECT xmin::text AS x FROM turn_resources"
+                                 " WHERE turn_id = %s", (turn_id,))[0]["x"])
+
+    def test_le_moteur_est_releve_apres_le_feu_vert(self):
+        # codex r3 P2 : à la 12e minute l'unité démarre encore ; le conteneur
+        # arrive au moment où le gestionnaire passe `running` — un relevé pris
+        # AVANT ce contrôle était vide et soldait la ligne pour de bon
+        turns = storage.of(self.db).turn_resources
+        tour = "tour-course-%s" % uuid.uuid4().hex[:6]
+        turns.open_turn(tour, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(tour)
+        runner = Runner(self.cfg, self.db, once=True)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+
+        def demarre():
+            moteur.list_all.return_value = [
+                {"id": "c-course", "name": "pg", "image": "postgres", "created": "",
+                 "labels": {"ameesh.turn": tour}}]
+            return "running"
+
+        self.assertIn(tour, self._revue(runner, 12 * 60, moteur, demarre))
+        self.assertEqual(turns.get(tour)["status"], "orphan")
+
+    def test_une_revue_n_ecrit_que_ce_qui_change(self):
+        # codex r3 P2 : les orphelines déjà signalées et toujours là ne sont
+        # pas réécrites ; une revue différée n'écrit rien du tout
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        vivantes = ["tour-vivant-%s-%d" % (jeton, i) for i in range(3)]
+        for turn in vivantes:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+            turns.mark_orphan(turn)
+        neuve = "tour-neuf-%s" % jeton
+        turns.open_turn(neuve, "a1", self.cfg.host, pgid=4242, label="l")
+        self._avant_le_demarrage(*vivantes, neuve)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = [
+            {"id": "c-%s" % t, "name": "x", "image": "x", "created": "",
+             "labels": {"ameesh.turn": t}} for t in vivantes + [neuve]]
+        avant = {t: self._xmin(t) for t in vivantes + [neuve]}
+        runner = Runner(self.cfg, self.db, once=True)
+        self.assertEqual(self._revue(runner, 60, moteur), [])          # différée
+        self.assertEqual({t: self._xmin(t) for t in avant}, avant)
+        restes = self._revue(runner, 3600, moteur)
+        self.assertTrue(set(vivantes + [neuve]) <= set(restes))
+        self.assertEqual({t: self._xmin(t) for t in vivantes}, {t: avant[t] for t in vivantes})
+        self.assertNotEqual(self._xmin(neuve), avant[neuve])            # running -> orphan
+        self.assertEqual(turns.get(neuve)["status"], "orphan")
+        apres = {t: self._xmin(t) for t in avant}
+        self._revue(runner, 3600, moteur)
+        self.assertEqual({t: self._xmin(t) for t in avant}, apres)
+
+    def test_au_plus_un_lot_de_lignes_par_passage(self):
+        turns = storage.of(self.db).turn_resources
+        jeton = uuid.uuid4().hex[:6]
+        mortes = ["tour-mort-%s-%d" % (jeton, i) for i in range(5)]
+        for turn in mortes:
+            turns.open_turn(turn, "a1", self.cfg.host, pgid=4242, label="l")
+            turns.mark_orphan(turn)
+        self._avant_le_demarrage(*mortes)
+        moteur = mock.Mock()
+        moteur.list_all.return_value = []
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch.object(runner_mod, "BOOT_ORPHAN_PAGE", 2), \
+                mock.patch.object(runner_mod, "BOOT_REVIEW_MAX_ROWS", 2):
+            self._revue(runner, 3600, moteur)
+            self.assertIsNotNone(runner.boot_review_at)       # la suite, sans attendre
+            self.assertLessEqual(runner.boot_review_at, time.monotonic())
+            for _ in range(20):
+                if runner.boot_review_at is None:
+                    break
+                self._revue(runner, 3600, moteur)
+        self.assertIsNone(runner.boot_review_at)
+        for turn in mortes:
+            self.assertEqual(turns.get(turn)["status"], "done", turn)
 
     def test_le_solde_attend_le_gestionnaire_utilisateur(self):
         runner = Runner(self.cfg, self.db, once=True)

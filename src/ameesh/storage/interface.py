@@ -2080,6 +2080,16 @@ class TurnResources(Domain):
         (groupe disparu au redémarrage de l'hôte, aucun conteneur en cours)."""
 
     @abc.abstractmethod
+    def settle_many(self, turn_ids: Sequence[str]) -> int:
+        """#220 r3 : `settle` de plusieurs lignes en une écriture ; le nombre
+        de lignes soldées."""
+
+    @abc.abstractmethod
+    def mark_orphan_many(self, turn_ids: Sequence[str]) -> int:
+        """#220 r3 : `mark_orphan` (sans conteneurs) de plusieurs lignes en une
+        écriture ; seules celles qui n'étaient pas encore `orphan` changent."""
+
+    @abc.abstractmethod
     def get(self, turn_id: str) -> dict | None:
         """La ligne d'un tour (L73 : un conteneur étiqueté par ce tour), ou None."""
 

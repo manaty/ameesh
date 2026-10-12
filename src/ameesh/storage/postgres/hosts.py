@@ -165,6 +165,22 @@ class TurnResources(interface.TurnResources):
             "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
             " WHERE turn_id = %s AND status <> 'done' RETURNING id", (turn_id,))
 
+    def settle_many(self, turn_ids) -> int:
+        if not turn_ids:
+            return 0
+        return len(self.db.query(
+            "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status <> 'done' RETURNING id",
+            (_array(turn_ids),)))
+
+    def mark_orphan_many(self, turn_ids) -> int:
+        if not turn_ids:
+            return 0
+        return len(self.db.query(
+            "UPDATE turn_resources SET status = 'orphan', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status NOT IN ('done', 'orphan')"
+            " RETURNING id", (_array(turn_ids),)))
+
     def get(self, turn_id) -> dict | None:
         rows = self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources WHERE turn_id = %s",

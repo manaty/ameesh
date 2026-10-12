@@ -144,6 +144,8 @@ BOOT_ORPHAN_PAGE = 500
 BOOT_SETTLE_S = 600.0
 BOOT_SETTLE_MAX_S = 1800.0
 BOOT_REVIEW_EVERY_S = 60.0
+#: #220 r3 : lignes revues au plus par passage (la suite au passage suivant)
+BOOT_REVIEW_MAX_ROWS = 2000
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -3506,6 +3508,8 @@ class Runner:
         #: L147 (#220 r2) : prochaine revue des lignes d'avant le démarrage
         #: (horloge monotone), tant que leur solde attend les conteneurs
         self.boot_review_at: float | None = None
+        #: et l'id d'où reprend la revue suivante (0 : depuis le début)
+        self._boot_review_after = 0
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -4507,11 +4511,13 @@ class Runner:
         sa politique de redémarrage), ou invérifiable faute de moteur, reste
         orpheline et signalée (alerte `orphan_resource`). Rien n'est supprimé.
         Toutes les orphelines d'avant le démarrage sont revues, page par page.
-        #220 r2 : juste après le démarrage, un conteneur que sa politique va
+        #220 r2/r3 : juste après le démarrage, un conteneur que sa politique va
         relancer n'est peut-être pas encore là — tant que `_boot_settle_ready`
-        est faux, une ligne sans conteneur en cours n'est pas soldée mais
-        laissée telle quelle, et la revue est refaite (`boot_review_at`).
-        Rend les lignes restées orphelines. Ne lève jamais."""
+        est faux, rien n'est relevé ni écrit, la revue est refaite
+        (`boot_review_at`) ; le moteur n'est interrogé qu'APRÈS ce feu vert.
+        Seules les lignes qui changent sont écrites, par lots ; au plus
+        BOOT_REVIEW_MAX_ROWS lignes par passage, la suite au passage suivant
+        de la boucle. Rend les lignes restées orphelines. Ne lève jamais."""
         from . import resources as resources_mod
         self.boot_review_at = None
         boot = resources_mod.boot_time()
@@ -4519,42 +4525,64 @@ class Runner:
             return []
         try:
             turns = storage.of(self.db).turn_resources
-            rows = turns.stale_running(max(0.0, time.time() - boot), self.host)
-            after = 0
+            after = self._boot_review_after
+            rows = turns.stale_running(max(0.0, time.time() - boot), self.host) \
+                if not after else []
+            more = False
             while True:
+                if len(rows) >= BOOT_REVIEW_MAX_ROWS:
+                    more = True
+                    break
                 page = turns.orphans_started_before(self.host, boot, after, BOOT_ORPHAN_PAGE)
                 rows += page
                 if len(page) < BOOT_ORPHAN_PAGE:
                     break
                 after = int(page[-1]["id"])
+            if not rows:
+                self._boot_review_after = 0
+                return []
+            if not self._boot_settle_ready(time.time() - boot):
+                # #220 r3 : ni relevé du moteur ni écriture avant le feu vert —
+                # un relevé vide pris pendant le démarrage solderait à tort
+                self._boot_review_after = 0
+                self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
+                log("%d tour(s) d'avant le redémarrage : revue différée, des conteneurs "
+                    "peuvent encore être relancés (hôte démarré il y a %ds) ; nouvelle "
+                    "revue dans %ds" % (len(rows), int(time.time() - boot),
+                                        int(BOOT_REVIEW_EVERY_S)))
+                return []
             runtime = self.container_runtime()
-            running = self._running_containers(runtime) if rows else {}
-            settle = self._boot_settle_ready(time.time() - boot) if rows else True
-            kept, deferred = [], 0
+            running = self._running_containers(runtime)
+            kept, dead, newly = [], [], []
             for row in rows:
                 alive = self._containers_alive(running, runtime, row)
-                if alive is not None and not alive and not settle:
-                    deferred += 1           # revue au prochain passage
-                    continue
                 if alive is not None and not alive:
-                    turns.settle(row["turn_id"])
-                    log("tour %s de %s d'avant le redémarrage de l'hôte : groupe %s "
-                        "disparu, aucun conteneur en cours — soldé"
-                        % (row["turn_id"], row.get("agent"), row.get("pgid") or "?"))
+                    dead.append(row)
                     continue
-                turns.mark_orphan(row["turn_id"])
                 kept.append(row)
+                if row.get("status") != "orphan":
+                    newly.append((row, alive))
+            turns.settle_many([row["turn_id"] for row in dead])
+            turns.mark_orphan_many([row["turn_id"] for row, _ in newly])
+            for row in dead:
+                log("tour %s de %s d'avant le redémarrage de l'hôte : groupe %s "
+                    "disparu, aucun conteneur en cours — soldé"
+                    % (row["turn_id"], row.get("agent"), row.get("pgid") or "?"))
+            for row, alive in newly:
                 log("ressource orpheline d'avant le redémarrage de l'hôte : tour %s de %s "
                     "(groupe %s%s) — signalée, rien n'est supprimé"
                     % (row["turn_id"], row.get("agent"), row.get("pgid") or "?",
                        ", conteneurs %s" % ", ".join(alive or row["containers"])
                        if row.get("containers") else ""))
-            if deferred:
-                self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
-                log("%d tour(s) d'avant le redémarrage sans conteneur en cours : solde "
-                    "différé, des conteneurs peuvent encore être relancés (hôte démarré "
-                    "il y a %ds) ; nouvelle revue dans %ds"
-                    % (deferred, int(time.time() - boot), int(BOOT_REVIEW_EVERY_S)))
+            if len(kept) > len(newly):
+                log("%d ressource(s) d'avant le redémarrage déjà signalée(s), toujours là"
+                    % (len(kept) - len(newly)))
+            if more:
+                # la suite au prochain passage de la boucle, sans attendre
+                self._boot_review_after = after
+                self.boot_review_at = time.monotonic()
+            else:
+                self._boot_review_after = 0
             return kept
         except db_mod.DbError as exc:
             log_async("ressources d'avant le redémarrage non vérifiées (%s) ; nouvelle "
