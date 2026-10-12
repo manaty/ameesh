@@ -357,6 +357,46 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def _emprunt(self, name, parquee_sous):
+        """Un agent claude qui emprunte codex (L242b) passe de B à A, dont la
+        session a été mise de côté sous `parquee_sous`."""
+        worker = self._worker(name)
+        self.addCleanup(worker.watchdog_stop.set)
+        a = work.add(self.db, title="A", assignee=name)["id"]
+        b = work.add(self.db, title="B", assignee=name)["id"]
+        epoch = worker.epoch
+        ops = storage.of(self.db).operations
+        cwd = registry.get(self.db, name)["cwd"]
+        ops.set_session_work_item(name, worker.runner.runner_id, epoch, str(a))
+        registry.set_session(self.db, name, "sess-A", None, harness=parquee_sous, cwd=cwd)
+        self.st.switch(name, worker.runner.runner_id, epoch, to_lot=str(b),
+                       harness=parquee_sous, account=None, cwd=cwd, current="sess-A")
+        worker.agent = registry.get(self.db, name)
+        worker._state_note("session_harness", "claude")
+        with mock.patch.object(type(worker), "turn_harness", lambda self: "codex"), \
+                mock.patch.object(type(worker), "current_session", lambda self: None):
+            self.assertTrue(worker._switch_lot(str(b), str(a)))
+        return worker
+
+    def test_emprunt_de_harnais_ne_reprend_pas_une_session_claude(self):
+        """r4 #420 : agent claude qui emprunte codex, session claude mise de
+        côté pour A : jamais lancée sous codex (écartée, session neuve)."""
+        worker = self._emprunt("w5", "claude")
+        self.assertIsNone(registry.get(self.db, "w5")["session_id"])
+        self.assertIsNone(worker.read_session_file())
+        self.assertEqual(worker._state_read("session_harness"), "")
+
+    def test_emprunt_de_harnais_reprend_la_session_codex(self):
+        """r4 #420 : l'inverse : la session de A a été ouverte sous codex
+        (emprunté) ; l'agent emprunte encore codex : elle est reprise, et le
+        marqueur local du harnais de la session dit codex."""
+        worker = self._emprunt("w6", "codex")
+        self.assertEqual(registry.get(self.db, "w6")["session_id"], "sess-A")
+        self.assertEqual(worker.read_session_file(), "sess-A")
+        self.assertEqual(worker._state_read("session_harness"), "codex")
+        from ameesh import account_turn
+        self.assertEqual(account_turn.session_harness(worker), "codex")
+
     def test_le_lot_du_tour_est_l_unique_lot_actionnable(self):
         worker = self._worker("w2")
         try:

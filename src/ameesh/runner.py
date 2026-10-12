@@ -1542,10 +1542,14 @@ class AgentWorker(threading.Thread):
         compte = account_turn.for_turn(self)
         nom = None if compte is None or compte is account_turn.INVALID else compte.name
         session = self.current_session()
+        # le harnais que le tour lancera (L242b : celui qu'un agent critique
+        # emprunte), pas celui de la fiche : une session n'est reprise que
+        # sous le harnais qui l'a ouverte
+        harnais = self.turn_harness()
         try:
             out = storage.of(self.db).lot_sessions.switch(
                 self.name, self.runner.runner_id, self.epoch, to_lot=lot,
-                harness=self.agent.get("harness"), account=nom, cwd=self.agent.get("cwd"),
+                harness=harnais, account=nom, cwd=self.agent.get("cwd"),
                 current=session)
         except db_mod.DbError as exc:
             log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
@@ -1554,6 +1558,10 @@ class AgentWorker(threading.Thread):
             log_async("[%s] session switch to lot %s cancelled: lease lost" % (self.name, lot))
             return False
         repris = out.get("resumed")
+        # L242b (3) : le marqueur local du harnais de la session suit la
+        # session active (celui de la session reprise ; aucun sans session,
+        # le tour qui l'ouvrira le note)
+        self._state_note("session_harness", harnais if repris else "")
         if repris:
             self.write_session_file(repris)
             self.resume_summary = None
