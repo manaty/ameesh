@@ -233,6 +233,25 @@ class SlotPoolTest(unittest.TestCase):
         self.assertIsNotNone(pool.acquire(3))
 
 
+class PartialSyncKeepsTheGateTest(unittest.TestCase):
+    def test_a_sync_missing_a_canon_neither_removes_nor_changes_the_gate(self):
+        # codex r2 #279: after a complete sync, a sync where only the classic
+        # canon was read refreshed the limits on that subset and removed the
+        # gate of a lending host, while `_gate_settled` stayed set
+        from unittest import mock
+        from ameesh.runner import Runner
+        calls: list = []
+        runner = types.SimpleNamespace(host="h1", _sync_host_gate=lambda *a: calls.append(a))
+        canon = types.SimpleNamespace(host=None, hosts=[])
+        mine = {"limits": {}, "max_agents": None, "origin": None}
+        with mock.patch("ameesh.resources.host_limits", return_value=mine), \
+                mock.patch("ameesh.menage.effective", return_value=None):
+            Runner.refresh_host_limits(runner, canon, complete=False)
+            self.assertEqual(calls, [])
+            Runner.refresh_host_limits(runner, canon)
+            self.assertEqual(calls, [(False, None)])
+
+
 class FakeWorker:
     def __init__(self, name: str, in_turn: bool = False):
         self.name = name

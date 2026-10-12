@@ -4364,12 +4364,12 @@ class Runner:
                     log_async("removed canons: %s" % " ".join(str(exc).split())[:200])
             # L31 : seuils de pression de l'hôte. `canon_sync_once` est aussi
             # exercé sur un objet factice (tests d'authentificateurs).
-            refresh = getattr(self, "refresh_host_limits", None)
-            if refresh is not None and synced:
-                refresh(*synced)
             # L159f : la porte d'hôte n'est fixée que sur TOUS les canons
             # configurés (un hôte prêteur l'est par sa fiche Host, `policy.lend`)
             self._canon_complete = bool(entries) and len(synced) == len(entries)
+            refresh = getattr(self, "refresh_host_limits", None)
+            if refresh is not None and synced:
+                refresh(*synced, complete=self._canon_complete)
             orchestres = getattr(self, "refresh_orchestrators", None)
             if orchestres is not None and synced:
                 orchestres(*synced)
@@ -4758,7 +4758,7 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="menage").start()
 
-    def refresh_host_limits(self, canon, *others) -> None:
+    def refresh_host_limits(self, canon, *others, complete: bool = True) -> None:
         """Met à jour les limites physiques de CET hôte depuis les canons.
 
         Appelé après chaque `canon sync` (le canon est la source déclarative
@@ -4773,7 +4773,12 @@ class Runner:
 
         Défensif sur les attributs : `canon_sync_once` est aussi exercé sur un
         objet factice par les tests d'authentificateurs, qui n'a que `cfg` et
-        `host`."""
+        `host`.
+
+        L159f : `complete` est faux quand un canon configuré n'a pas été lu ;
+        la porte d'hôte garde alors son état (la fiche Host qui fait un hôte
+        prêteur peut être dans le canon manquant : jamais de porte retirée,
+        ni changée, sur une partie des canons)."""
         from . import resources as resources_mod
         canons = [c for c in (canon,) + tuple(others)
                   if c is not None and hasattr(c, "host") and hasattr(c, "hosts")]
@@ -4793,7 +4798,7 @@ class Runner:
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)
-        if sync_gate is not None:
+        if sync_gate is not None and complete:
             offer = limits.get("lend")
             sync_gate(bool(offer), offer)
         from . import menage as menage_mod
