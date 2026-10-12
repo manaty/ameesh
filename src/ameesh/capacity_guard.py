@@ -86,19 +86,33 @@ def gate_state(doc, now: float, *, lending: bool) -> str:
     classic host an absent or null `expires_ts` is admitted (the gate
     predates it); anything else unreadable or stale falls back to
     `available`, as before."""
-    fallback = FALLBACK_LENDING if lending else FALLBACK_CLASSIC
-    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA_HOST_STATE \
-            or doc.get("state") not in STATES:
-        return fallback
+    if state_problem(doc, now, lending=lending) is not None:
+        return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
+    return doc["state"]
+
+
+def state_problem(doc, now: float, *, lending: bool) -> str | None:
+    """Why a guest may not obey the state document `doc` at `now`, or None
+    when it may (the rule of `gate_state`, with its reason for the logs)."""
+    if not isinstance(doc, dict):
+        return "not an object"
+    if doc.get("schema") != SCHEMA_HOST_STATE:
+        return "schema %s expected" % SCHEMA_HOST_STATE
+    if doc.get("state") not in STATES:
+        return "unknown state %r" % (doc.get("state"),)
     seq, expires = doc.get("seq"), doc.get("expires_ts")
     if isinstance(seq, bool) or not isinstance(seq, int):
-        return fallback
+        return "seq: integer expected"
     if expires is None and not lending:
-        return doc["state"]
+        return None
     expires = _finite(expires)
-    if expires is None or not now < expires <= now + MAX_STATE_TTL_S:
-        return fallback
-    return doc["state"]
+    if expires is None:
+        return "no finite expires_ts (required on a lending host)"
+    if now >= expires:
+        return "stale (expired %ds ago)" % int(now - expires)
+    if expires > now + MAX_STATE_TTL_S:
+        return "expires_ts more than %ds ahead" % int(MAX_STATE_TTL_S)
+    return None
 
 
 def parse_window(text) -> dict | None:

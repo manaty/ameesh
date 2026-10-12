@@ -244,6 +244,21 @@ class Config:
     #: cours est arrêté, sa consigne remise en attente). Un second signal
     #: arrête tout de suite. L'unité systemd garde TimeoutStopSec au-dessus.
     drain_seconds: float = 1800.0
+    #: L159f: host gate, the state a capacity guard writes for this host
+    #: (docs/GARDE-DE-CAPACITE.md). `host_gate`: empty (no gate on a classic
+    #: host; a `file` gate on a lending host, one whose Host fiche has
+    #: `policy.lend`), `file`, or `none` (no gate, even on a lending host).
+    #: `host_gate_path`, `host_gate_ack`: the state and the acknowledgement
+    #: (defaults `/run/ameesh-gate/state/state.json`, `…/ack/ack.json`).
+    host_gate: str = ""
+    host_gate_path: str = ""
+    host_gate_ack: str = ""
+    #: what an unreadable, absent or stale state counts as: empty = `stopped`
+    #: on a lending host, `available` on a classic one
+    host_gate_fallback: str = ""
+    #: withdrawal deadline when a `draining` state gives none (seconds); 0 =
+    #: the offer's `drain_seconds` on a lending host, 90 otherwise
+    host_gate_drain: float = 0.0
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -582,6 +597,24 @@ def load(env: dict | None = None) -> Config:
         approve_tls_name=str(pick("AMEESH_APPROVE_TLS_NAME", default=cfg.approve_tls_name)
                              or "").strip().lower(),
     )
+    # L159f: host gate
+    gate_path = pick("AMEESH_HOST_GATE_PATH", default=cfg.host_gate_path) or ""
+    gate_ack = pick("AMEESH_HOST_GATE_ACK", default=cfg.host_gate_ack) or ""
+    cfg = replace(
+        cfg,
+        host_gate=str(pick("AMEESH_HOST_GATE", default=cfg.host_gate) or "").strip().lower(),
+        host_gate_path=_expand(str(gate_path)) if gate_path else "",
+        host_gate_ack=_expand(str(gate_ack)) if gate_ack else "",
+        host_gate_fallback=str(pick("AMEESH_HOST_GATE_FALLBACK",
+                                    default=cfg.host_gate_fallback) or "").strip().lower(),
+        host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
+                                        int(cfg.host_gate_drain))),
+    )
+    if cfg.host_gate not in ("", "none", "file"):
+        raise SystemExit("AMEESH_HOST_GATE invalide : %r (file | none)" % cfg.host_gate)
+    if cfg.host_gate_fallback not in ("", "available", "draining", "stopped"):
+        raise SystemExit("AMEESH_HOST_GATE_FALLBACK invalide : %r "
+                         "(available | draining | stopped)" % cfg.host_gate_fallback)
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("invalid AMEESH_CANON_REF: %r" % cfg.canon_ref)
     seen_paths: set[str] = set()

@@ -178,6 +178,8 @@ class Entry:
     containers: list = field(default_factory=list)
     containers_seen: dict = field(default_factory=dict)
     containers_at: float = 0.0
+    #: L159f: why the grace was cut short (the host withdraws), else ''
+    capped: str = ""
     #: running | done | expired | stopped
     state: str = "running"
     closed: float | None = None
@@ -468,6 +470,24 @@ class Tracker:
                 platform.reap(p["pid"])
 
     # -- l'agent, au tour suivant --------------------------------------------
+    def cap_deadline(self, deadline: float, reason: str) -> int:
+        """L159f: the host withdraws (host gate `draining` or `stopped`): the
+        grace of every running entry ends at `deadline` at the latest; the
+        tracker's next pass cleans up what still runs then. Gives the number
+        of entries whose grace was just cut short."""
+        cut = []
+        with self.lock:
+            for entry in self.entries:
+                if entry.state == "running" and entry.deadline > deadline:
+                    entry.deadline = deadline
+                    entry.capped = reason
+                    cut.append(entry)
+        for entry in cut:
+            self.log("[%s] background work of turn %s: %s — stopped within %s at the latest"
+                     % (entry.agent, entry.turn_id[:8], reason,
+                        _minutes(max(0.0, deadline - time.time()))))
+        return len(cut)
+
     def has_jobs(self, agent: str) -> bool:
         with self.lock:
             return any(e.agent == agent and e.state == "running" for e in self.entries)
@@ -572,6 +592,9 @@ class Tracker:
         if state == "done":
             return "finished %s after the turn ended — %s" % (
                 _minutes((entry.closed or now) - entry.ended), self._what(entry, state=state))
+        if state == "expired" and entry.capped:
+            return "stopped before the end of the grace period (%s) — %s" % (
+                entry.capped, self._what(entry, state=state))
         if state == "expired":
             return "stopped when the grace period (%s) ran out — %s" % (
                 _minutes(entry.grace_s), self._what(entry, state=state))

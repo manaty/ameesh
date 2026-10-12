@@ -365,6 +365,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
 
             for line in _host_measure_lines(latest, limits.get("lend")):
                 print(line)
+            if latest.get("gate_state") is not None or limits.get("lend"):
+                # L159f: the host gate its executor obeys; relocation reads it
+                print("  gate       %s" % (
+                    "%s (%s, seq %s)" % (latest["gate_state"], latest.get("gate_reason") or "?",
+                                         latest.get("gate_seq"))
+                    if latest.get("gate_state") is not None
+                    else "none recorded: closed to relocation (lending host)"))
 
             if verdict and verdict["breaches"]:
                 tag = "CRITICAL" if verdict["critical"] else "PRESSURE"
