@@ -10,7 +10,7 @@ from unittest import mock
 from tests import support
 from tests.support import PgTestCase
 from tests.test_l317_project_modules import federation
-from ameesh import alert_briefs, db as db_mod, exploitation, modules, notify, registry, work
+from ameesh import alert_briefs, db as db_mod, exploitation, fil, mail, modules, notify, registry, storage, work
 from ameesh.modules import it
 from ameesh.modules.storage import ModuleStore
 
@@ -24,6 +24,12 @@ def missing(**changes):
 def auditor_canon(*names):
     return SimpleNamespace(agents=[SimpleNamespace(
         title=name, fiche=SimpleNamespace(data={"roles": ["auditor"]})) for name in names])
+
+
+def reporting_canon():
+    c = auditor_canon("auditeur")
+    c.agents.append(SimpleNamespace(title="orch", fiche=SimpleNamespace(data={"roles": ["orchestrator"]})))
+    return c
 
 
 class AuditReportingTest(unittest.TestCase):
@@ -64,9 +70,11 @@ class AuditReportingTest(unittest.TestCase):
             findings = exploitation._module_deviations(None, mock.Mock(), listing)
         self.assertEqual(findings[0]["orchestrators"], ["orch"])
         self.assertEqual(findings[0]["schema"], exploitation.ALERT_SCHEMA)
-        briefs = alert_briefs.briefs(findings[0], listing, auditor_names=["auditeur"])
+        briefs = alert_briefs.briefs(findings[0], listing, auditor_names=["auditeur"],
+                                    orchestrator_names=["orch", "other"])
         self.assertEqual(set(briefs), {"orch", "auditeur"})
         self.assertIn("execution proof", briefs["orch"])
+        self.assertEqual(alert_briefs.briefs(findings[0], listing), {})
 
     def test_missing_project_orchestrator_never_falls_back(self):
         listing = [{"name": "orch", "chantier": "other"}, {"name": "global-orch"}]
@@ -171,7 +179,7 @@ class AuditEvidenceTest(PgTestCase):
         cfg = dataclasses.replace(self.cfg, canon="test-canon")
         notifier = notify.Notifier(cfg, ncfg, sender=sender, log=lambda text: None, clock=lambda: 200.)
         alert = dict(self.findings()[0], orchestrators=["orch"])
-        with mock.patch("ameesh.canon.load_configured", return_value=[auditor_canon("auditeur")]):
+        with mock.patch("ameesh.canon.load_configured", return_value=[reporting_canon()]):
             notifier.run_pass(self.db, current=[alert])
             notifier.run_pass(self.db, current=[alert])
         self.assertEqual(len(sender.sent), 1)
@@ -184,6 +192,112 @@ class AuditEvidenceTest(PgTestCase):
         self.assertEqual(len(sender.sent), 2)
         self.assertIn("resolved", sender.sent[-1][1].body)
         self.assertEqual(notifier.state["briefs"], {})
+
+    def scoped_notifier(self, sender=None):
+        registry.upsert(self.db, "orch", chantier="acme", harness="claude", host=self.cfg.host)
+        cfg = dataclasses.replace(self.cfg, canon="test-canon")
+        ncfg = notify.parse_config({"default_human": "human:owner", "default": ["desktop"]})
+        return notify.Notifier(cfg, ncfg, sender=sender or notify.DrySender(),
+                               log=lambda text: None, clock=lambda: 200.)
+
+    def test_reassignment_during_owner_notification_cannot_use_cached_recipient(self):
+        sender = notify.DrySender()
+        notifier = self.scoped_notifier(sender)
+        stale = storage.of(self.db).operations.listing()
+        alert = dict(self.findings()[0], orchestrators=["orch"])
+        original = sender.send
+
+        def send(channel, message):
+            original(channel, message)
+            registry.upsert(self.db, "orch", chantier="other")
+
+        with mock.patch.object(sender, "send", side_effect=send), \
+                mock.patch("ameesh.canon.load_configured", return_value=[reporting_canon()]), \
+                mock.patch("ameesh.storage.postgres.operations.Operations.listing", return_value=stale):
+            notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(sender.sent), 1)
+        self.assertEqual(self.db.query("SELECT recipient FROM agent_mailbox"), [])
+        self.assertEqual(notifier.state["briefs"], {})
+
+    def test_orchestrator_role_removed_after_preparation_prevents_deposit(self):
+        notifier = self.scoped_notifier()
+        alert = dict(self.findings()[0], orchestrators=["orch"])
+        with mock.patch("ameesh.canon.load_configured", side_effect=[[reporting_canon()], []]):
+            notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(self.db.query("SELECT recipient FROM agent_mailbox"), [])
+        self.assertEqual(notifier.state["briefs"], {})
+
+    def test_recipient_lock_blocks_reassignment_until_mailbox_commit(self):
+        notifier = self.scoped_notifier()
+        other = db_mod.connect(self.cfg)
+        other.execute("SET lock_timeout = '100ms'")
+        alert = dict(self.findings()[0], orchestrators=["orch"])
+        send = mail.send
+
+        def concurrent_send(*args, **kwargs):
+            with self.assertRaisesRegex(db_mod.DbError, "lock timeout"):
+                other.execute("UPDATE agent_registry SET chantier = 'other' WHERE name = 'orch'")
+            return send(*args, **kwargs)
+
+        try:
+            with mock.patch("ameesh.canon.load_configured", return_value=[reporting_canon()]), \
+                    mock.patch.object(mail, "send", side_effect=concurrent_send):
+                self.assertTrue(notifier._send_module_brief(self.db, alert, "orch", alert["detail"], alert))
+            self.assertEqual(self.db.query("SELECT recipient FROM agent_mailbox"), [{"recipient": "orch"}])
+            other.execute("UPDATE agent_registry SET chantier = 'other' WHERE name = 'orch'")
+        finally:
+            other.close()
+
+    def test_event_thread_uses_finding_project_despite_canon_team(self):
+        notifier = self.scoped_notifier()
+        self.db.execute("UPDATE agent_registry SET team = 'other', canon_ref = 'agents/orch.md' WHERE name = 'orch'")
+        alert = dict(self.findings()[0], orchestrators=["orch"])
+        with mock.patch("ameesh.canon.load_configured", return_value=[reporting_canon()]), \
+                mock.patch.object(fil, "record", wraps=fil.record) as record:
+            notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(record.call_count, 1)
+        self.assertEqual(record.call_args.kwargs["project"], "acme")
+        self.assertTrue(Path(self.cfg.state_dir, "fils", "acme", "_projet.md").exists())
+        self.assertFalse(Path(self.cfg.state_dir, "fils", "other", "_projet.md").exists())
+
+    def test_foreign_assignee_human_never_overrides_lot_owner_or_default(self):
+        registry.upsert(self.db, "dev-b", chantier="other", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:owner-b' WHERE name = 'dev-b'")
+        storage.of(self.db).packages.upsert({"id": "owner-a", "kind": "lot", "title": "A",
+                                           "responsible": "human:owner-a", "canon_ref": "lots/a.md"})
+        self.db.execute("UPDATE work_items SET assignee = 'dev-b', package_id = 'owner-a' WHERE id = %s", (self.lot,))
+        alert = self.findings()[0]
+        self.assertIsNone(alert["agent"])
+        self.assertEqual(alert["assignee"], "dev-b")
+        ncfg = notify.parse_config({"default_human": "human:default"})
+        router = notify.Router(self.cfg, self.db, ncfg)
+        # Also protect generic module findings which still supply an agent.
+        self.assertEqual(router.resolve(dict(alert, agent="dev-b")), ("human:owner-a", "lot"))
+        self.db.execute("UPDATE work_packages SET responsible = NULL WHERE id = 'owner-a'")
+        self.assertEqual(router.resolve(dict(alert, agent="dev-b")), ("human:default", "defaut"))
+
+    def test_persisted_foreign_human_delivery_is_reconciled_before_retry_or_resolution(self):
+        storage.of(self.db).packages.upsert({"id": "owner-a", "kind": "lot", "title": "A",
+                                           "responsible": "human:owner-a", "canon_ref": "lots/a.md"})
+        self.db.execute("UPDATE work_items SET package_id = 'owner-a' WHERE id = %s", (self.lot,))
+        alert = dict(self.findings()[0], agent="dev-b")
+        key = notify.key_of(alert)
+        sender = notify.DrySender()
+        ncfg = notify.NotifyConfig(routes={"human:owner-a": ("a",), "human:owner-b": ("b",)},
+                                  channels={name: notify.Channel(name, "desktop") for name in ("a", "b")})
+        notifier = notify.Notifier(self.cfg, ncfg, sender=sender, log=lambda text: None, clock=lambda: 200.)
+        old = {"alert": alert, "human": "human:owner-b", "source": "agent", "raised_ts": 100.,
+               "status": "envoi", "channels": {"b": {"ok": False, "attempts": 1}}}
+        notifier.state["active"][key] = old
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual([channel for channel, message in sender.sent], ["a"])
+        self.assertEqual(notifier.state["active"][key]["human"], "human:owner-a")
+        # An old delivery which resolves must not produce one last foreign copy.
+        notifier.state["active"][key] = dict(old, human="human:owner-b", source="agent",
+                                             channels={"b": {"ok": True, "attempts": 1}})
+        sender.sent.clear()
+        notifier.run_pass(self.db, current=[])
+        self.assertEqual(sender.sent, [])
 
     def test_no_project_recipient_reports_to_owner_without_cross_project_events(self):
         for name in ("orch-b", "audit-b", "auditeur"):

@@ -112,7 +112,8 @@ def audit(store, project):
                   % (row["type"], row["id"], project, missing))
         out.append({"type": "module_deviation", "module": NAME,
                     "rule": "execution-proof", "project": project, "lot": row["id"],
-                    "title": row["title"], "agent": row["assignee"], "lot_state": row["state"],
+                    "title": row["title"], "agent": None, "assignee": row["assignee"],
+                    "lot_state": row["state"],
                     "declaration_id": declaration, "subject": row["subject"],
                     "since": row["declaration_ts"] or row["created_ts"],
                     "value": 1, "threshold": 0,

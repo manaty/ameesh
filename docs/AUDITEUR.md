@@ -87,6 +87,11 @@ et l'action du module ; ne jamais exécuter un artefact pour compléter un audit
 Le circuit `ameesh notify` transmet le constat au canal configuré du
 propriétaire, aux orchestrateurs du projet et aux auditeurs déclarés par rôle
 dans le canon, affectés à ce projet ou sans projet (auditeurs globaux).
+Les orchestrateurs doivent aussi avoir un rôle explicite dans le canon.
+L'envoi revérifie rôle et projet sous verrou de la ligne du destinataire
+jusqu'au dépôt en boîte ; le fil est écrit dans le projet du constat.
+Le responsable humain vient du paquet de travail du lot, sinon de la
+configuration par défaut, jamais de l'assigné ou de son hôte.
 Le nom `auditeur` seul ne donne pas accès aux constats des modules ; aucun
 repli vers les agents d'un autre projet. Sans destinataire agent, le canal
 propriétaire reste le circuit de signalement. Une décision

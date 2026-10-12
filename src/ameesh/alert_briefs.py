@@ -124,14 +124,15 @@ def _for_auditor(alert: dict) -> str:
 
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
-           auditor_names=()) -> dict:
+           auditor_names=(), *, orchestrator_names=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
     l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
-    l'estimateur lui-même s'il est un agent du registre. Auditeurs : toujours. Un agent à la fois orchestrateur et auditeur
-    reçoit le texte d'orchestrateur."""
+    l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
+    rôle explicite et projet, sans repli. Auditeurs : toujours pour les autres
+    types. Un agent à la fois orchestrateur et auditeur reçoit un seul texte."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
@@ -143,7 +144,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         if not project:
             return {}
         out = {o: text for o in orchestras
-               if o in by_name and by_name[o].get("chantier") == project}
+               if o in orchestrator_names and o in by_name
+               and by_name[o].get("chantier") == project}
         for name in auditor_names or ():
             if name in by_name and by_name[name].get("chantier") in (None, "", project):
                 out.setdefault(name, text)

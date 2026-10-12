@@ -112,6 +112,12 @@ no fallback to agents of other projects or to the implicit `auditeur` name;
 without an eligible agent, the owner's alert channel receives the finding.
 The alert's identity includes the declaration so a
 new delivery starts a new episode rather than reusing a previous notice.
+Orchestrators also require an explicit canon role, rechecked at delivery.
+Recipient project checks hold a registry row share lock through mailbox commit,
+on both database drivers. Event thread writes occur after commit in the finding's
+project, never the recipient's team. Human routing follows the lot's work-package
+owner or the configured default, never the assignee's human or host; persisted
+retries/resolutions are reconciled with that routing.
 No automatic decision request is needed: the owner's alert channel is the
 authorized reporting route. A missing channel is reported by the notifier's
 existing delivery diagnostics, never replaced by prose mail to the owner.
