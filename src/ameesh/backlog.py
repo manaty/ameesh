@@ -130,9 +130,11 @@ def _capabilities(values) -> list:
 def add(db: Db, *, title: str, expected_value: str, value_score: int,
         priority: int = DEFAULT_PRIORITY, source: str = "", team: str | None = None,
         required_capabilities=None, body: str = "", package: str | None = None,
-        actor: str = "") -> dict:
+        actor: str = "", app: str | None = None) -> dict:
     """Ajoute un élément à la file. La valeur attendue est obligatoire : la
-    file ne reçoit pas de travail pour occuper."""
+    file ne reçoit pas de travail pour occuper.
+
+    `app`: the lot's project (L118c), which the CLI inherits from the creator."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -159,7 +161,7 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         note="improvement backlog (value %d): %s" % (value_score, expected_value),
-        actor=actor)
+        actor=actor, app=(app or "").strip())
 
 
 def items(db: Db, *, open_only: bool = True, limit: int = 100) -> list:
@@ -555,7 +557,8 @@ def run(db: Db, args) -> int:
                        value_score=args.value_score, priority=args.priority,
                        source=args.source, team=args.team,
                        required_capabilities=args.requires, body=args.body,
-                       package=args.package, actor=args.actor)
+                       package=args.package, actor=args.actor,
+                       app=getattr(args, "app", None))
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2

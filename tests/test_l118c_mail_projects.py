@@ -115,6 +115,22 @@ class MailProjectTests(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "bound")
 
+    def test_backlog_add_inherits_the_creator_project(self):
+        self.project("dev1", team="creator")
+        proc = self.mesh("work", "backlog", "add", "--title", "Item", "--value", "one rule",
+                         "--score", "30", "--team", "creator",
+                         env=self.env(AGENT_MAIL_NAME="dev1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.list_items(self.db)[0]
+        self.assertEqual((item["type"], item["app"]), ("improvement", "creator"))
+        self.assertNotIn(item["id"], [a["lot"] for a in work_projects.alerts(self.db)])
+        proc = self.mesh("work", "backlog", "add", "--title", "Unknown", "--value", "kept",
+                         "--score", "30", env=self.env(AGENT_MAIL_NAME="dev2"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        unknown = work.list_items(self.db)[0]
+        self.assertEqual((unknown["title"], unknown["app"]), ("Unknown", ""))
+        self.assertIn(unknown["id"], [a["lot"] for a in work_projects.alerts(self.db)])
+
     def test_decision_creation_inherits_requester_then_parent(self):
         parent = work.add(self.db, title="Parent", app="parent")
         self.project("dev1", team="requester")
