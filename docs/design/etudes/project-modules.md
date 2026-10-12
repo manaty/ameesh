@@ -90,3 +90,31 @@ blocking copy I/O are bounded by a main-thread timer and monotonic checks;
 copy consumes the requested execution timeout instead of preceding it. Error
 cleanup removes partial copies. Tests use a small sparse file and reduced caps,
 never allocate a huge file, and exercise growth, expiry, reserve and total budget.
+
+# Design for lot #319
+
+Installed modules may provide audit findings for their active projects. The
+core collects these findings as generic `module_deviation` alerts, without
+knowledge of release types, artifacts or execution. The IT module queries
+release/publication lots and the latest delivery together in one database
+snapshot. Missing delivery, missing proof, and proof bound to an older
+declaration are deviations, including already delivered historical lots.
+Abandoned and superseded lots are excluded. Proof for the current delivery
+resolves the finding on the next pass. Auditing never executes an artifact.
+
+Findings retain the lot, project, module, rule and current declaration ID.
+The existing notifier sends them to the owner's configured alert channel
+and briefs the project's orchestrators and the auditor through event mail.
+A project matches the registry's project identity, independently of the
+assignee's team; when no project orchestrator is known, known orchestrators
+receive the report. The alert's identity includes the declaration so a
+new delivery starts a new episode rather than reusing a previous notice.
+No automatic decision request is needed: the owner's alert channel is the
+authorized reporting route. A missing channel is reported by the notifier's
+existing delivery diagnostics, never replaced by prose mail to the owner.
+
+Tests cover inactive projects, both IT types, missing and stale proof,
+redeclaration with identical bytes, resolved findings, historical terminal
+lots, project-specific routing, notifier deduplication and human delivery.
+Database integration is delegated to CI on both drivers; local checks stay
+focused and offline under nice -n 10.
