@@ -609,11 +609,21 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     }
   }
   function section(box, title) { box.appendChild(el("h3", null, title)); }
+  function plannedWaitLabel(lot) {
+    var wait = lot.planned_wait;
+    if (!wait) return "";
+    if (wait.what === "scheduled") return "planned start " + wait.start;
+    return "waiting on lots " + (wait.lots || []).map(function (id) { return "#" + id; }).join(", ");
+  }
+  function lotWaitLabel(lot) {
+    return [plannedWaitLabel(lot), lot.waiting_for && lot.waiting_for.label].filter(Boolean).join(" · ");
+  }
   function lotLine(box, lot) {
     var line = el("div", "line");
     line.appendChild(link("#" + lot.id + " " + lot.title, function () { openModal("lot", lot.id); }));
     line.appendChild(document.createTextNode(" "));
     line.appendChild(lotChip(lot));
+    if (lot.planned_wait) line.appendChild(el("span", "meta", " " + plannedWaitLabel(lot)));
     if (lot.waiting_for) line.appendChild(el("span", "meta", " waiting for: " + lot.waiting_for.label));
     box.appendChild(line);
   }
@@ -653,6 +663,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       var m = lot.milestones || {}, head = el("div", "line");
       head.appendChild(lotChip(lot));
       if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stale " + dur(lot.stale.idle_s)));
+      if (lot.planned_wait) head.appendChild(el("span", "meta", " " + plannedWaitLabel(lot)));
       if (lot.waiting_for) head.appendChild(el("span", "meta", " waiting for: " + lot.waiting_for.label));
       box.appendChild(head);
       section(box, "Dated milestones");
@@ -666,7 +677,10 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       section(box, "Who, what");
       var assignee = lot.assignee ? link(lot.assignee, function () { openModal("agent", lot.assignee); }) : null;
       box.appendChild(dl([
-        ["attend", lot.waiting_for ? lot.waiting_for.label : null],
+        ["attend", lotWaitLabel(lot) || null],
+        ["prerequisites", (lot.dependencies || []).map(function (d) {
+          return "#" + d.blocker_id + " (" + d.blocker_state + ", " + (d.blocking ? "blocking" : "satisfied") + ")";
+        }).join(", ") || null],
         ["delegation", lot.delegation ? lot.delegation.label : null],
         ["author", assignee], ["review", lot.reviewer], ["project", lot.project],
         ["epic", lot.epic], ["package", lot.package], ["type", lot.type],
@@ -845,7 +859,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
         view: "lots", label: "work items", rows: sc.lots, allLabel: "merged and closed",
         empty: "No work item matches.",
         hidden: function (l) { return !!l.closed || l.state === "merged"; },
-        text: function (l) { return ["#" + l.id, l.title, l.project, l.assignee, l.epic, LOT_FR[l.state], l.waiting_for && l.waiting_for.label].join(" "); },
+        text: function (l) { return ["#" + l.id, l.title, l.project, l.assignee, l.epic, LOT_FR[l.state], lotWaitLabel(l)].join(" "); },
         order: function (a, b) {
           return (LOT_ORDER[a.state] - LOT_ORDER[b.state]) || ((b.last_activity_ts || 0) - (a.last_activity_ts || 0));
         },
@@ -858,7 +872,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
             var s = el("span"); s.appendChild(lotChip(l));
             if (l.stale) s.appendChild(el("span", "chip st-stale", "‖ " + dur(l.stale.idle_s)));
             return s; }},
-          {label: "attend", key: function (l) { return l.waiting_for ? l.waiting_for.label : ""; }, cell: function (l) { return l.waiting_for ? l.waiting_for.label : ""; }},
+          {label: "attend", key: lotWaitLabel, cell: lotWaitLabel},
           {label: "author", key: function (l) { return l.assignee || ""; }, cell: function (l) { return l.assignee; }},
           {label: "activity", n: true, desc: true, key: function (l) { return l.last_activity_ts; }, cell: function (l) { return ago(l.last_activity_ts); }}
         ]
