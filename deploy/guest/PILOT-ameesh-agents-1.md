@@ -6,16 +6,20 @@ general steps and the report are in
 the design in the [L159 study](../../docs/design/etudes/l159-capacite-des-hotes.md),
 sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
 
-* guests: `deepseek5` and `deepseek6` (today on manaty-mesh-1), DeepSeek
-  through `dsh`, no subscription account; installed in observation only;
+* guests: `deepseek6` and `deepseek1` (today the last two personas on
+  manaty-mesh-1; `deepseek5` became a native agent of the host with
+  manaty/home#27), DeepSeek through `dsh`, no subscription account; installed
+  in observation only;
 * the script's default offer: `cpu_max 2`, `cpu_weight 10`, `memory_max
   9GiB`, `agent_memory_max 4.5GiB`, `disk_max 40GiB`; reclaim at 6 GiB
   available, CPU pressure 20 %, memory 2 %, I/O 20 %, 10 GiB free on `/`;
   drain 120 s, calm 600 s;
-* the host's own agents stay six, to be reviewed with the report of 20/10;
-  the canon's `max_agents` goes from 6 to 8 because it counts every
-  placement of the host, the guests' included (6 would make the fiche
-  invalid).
+* the host's own agents stay thirteen (manaty/home#22, #23, #26, #27), to be
+  reviewed with the report of 20/10; the canon's `max_agents` goes from 13
+  to 15 because it counts every placement of the host, the guests' included
+  (13 would make the fiche invalid); manaty-mesh-1 goes to `max_agents: 0`
+  and carries only the mesh database (validated by the owner, relayed by
+  bureau on 2026-10-12 at 19:40).
 
 ## Before
 
@@ -89,9 +93,9 @@ give it with `--path`.
 ```sh
 cd /root/ameesh
 sudo deploy/guest/install-pilot.sh --dry-run --host ameesh-agents-1 \
-  --agent deepseek5 --agent deepseek6 --path /opt/node/bin    # read it all
+  --agent deepseek6 --agent deepseek1 --path /opt/node/bin    # read it all
 sudo deploy/guest/install-pilot.sh --host ameesh-agents-1 \
-  --agent deepseek5 --agent deepseek6 --path /opt/node/bin
+  --agent deepseek6 --agent deepseek1 --path /opt/node/bin
 ```
 
 Then the secrets (files created empty, `0640 root:ameesh-guest`, never
@@ -99,7 +103,7 @@ overwritten by the script):
 
 ```sh
 sudoedit /etc/ameesh/guest.env             # AMEESH_DSN=… the host's login role (L56)
-sudoedit /etc/ameesh/guest-deepseek5.env   # DEEPSEEK_API_KEY=…, GH_TOKEN=…
+sudoedit /etc/ameesh/guest-deepseek1.env   # DEEPSEEK_API_KEY=…, GH_TOKEN=…
 sudoedit /etc/ameesh/guest-deepseek6.env
 sudo deploy/guest/install-pilot.sh --check # every line "ok"
 ```
@@ -107,14 +111,15 @@ sudo deploy/guest/install-pilot.sh --check # every line "ok"
 ## Enable the two guests
 
 Only once the canon PR (manaty/home#24, a draft until that day) is merged: the Host fiche gets `policy.lend` (the
-offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 8` (6
+offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 15` (13
 own agents + 2 guests), without `volatile`; `policy.work_dirs` puts the guests'
-work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek5 and
-deepseek6 move from manaty-mesh-1 to ameesh-agents-1. Their runners on manaty-mesh-1 are
+work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek6 and
+deepseek1 move from manaty-mesh-1 to ameesh-agents-1, which keeps
+`max_agents: 0` there. Their runners on manaty-mesh-1 are
 stopped first: an agent runs on one host at a time.
 
 ```sh
-sudo deploy/guest/install-pilot.sh --enable deepseek5 deepseek6
+sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1
 sudo deploy/guest/install-pilot.sh --check
 systemctl status 'ameesh-guest-runner@*'
 ```
@@ -133,7 +138,7 @@ From the lightest to the full one; each step is enough on its own.
 | When | Command |
 |---|---|
 | The guard's caps get in the way of the host | `sudo deploy/guest/install-pilot.sh --set-guard-mode observe` (stops the guard, takes its caps off the slice and the runners, starts it again observing) |
-| A guest misbehaves | `sudo deploy/guest/install-pilot.sh --disable deepseek5` (its turn drains first, 180 s at most) |
+| A guest misbehaves | `sudo deploy/guest/install-pilot.sh --disable deepseek1` (its turn drains first, 180 s at most) |
 | The pilot stops (§4.4 target missed, natives delayed) | `sudo deploy/guest/install-pilot.sh --uninstall` |
 | Nothing of the pilot must stay | `sudo deploy/guest/install-pilot.sh --uninstall --purge` |
 
@@ -153,7 +158,7 @@ What stays keeps its record, so a later `--purge` can still remove it,
 the user too when `userdel` fails (its processes still running). A `--root`
 through a symbolic link is refused: give the resolved path. The install refuses a volume bigger than `disk_max` (nothing else
 holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
-deepseek5 and deepseek6 back on manaty-mesh-1 and removes `policy.lend`, and
+deepseek6 and deepseek1 back on manaty-mesh-1 (its `max_agents` back to 2) and removes `policy.lend`, and
 the host's login role (L56) is dropped. The volume: `sudo
 deploy/guest/volume-pilot.sh unmount` on the host, then
 `deploy/guest/volume-pilot.sh detach [--delete]` from the workstation

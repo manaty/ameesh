@@ -18,7 +18,7 @@
 #   --dry-run            print every command and file, change nothing
 #   --host NAME          host name in the canon (default: hostname -s)
 #   --agent NAME         a guest agent: its secrets file is prepared
-#                        (repeatable; default deepseek5, deepseek6)
+#                        (repeatable; default deepseek6, deepseek1)
 #   --max-agents N       guest agents at once, for the guard (default 2)
 #   --lend FILE          the offer, JSON: the `policy.lend` of the canon's
 #                        Host fiche (default: the one printed by --dry-run)
@@ -112,7 +112,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
-[ ${#AGENTS[@]} -gt 0 ] || AGENTS=(deepseek5 deepseek6)
+[ ${#AGENTS[@]} -gt 0 ] || AGENTS=(deepseek6 deepseek1)
 
 valid_name() { case "$1" in ''|*[!a-z0-9_-]*|-*) return 1 ;; esac; }
 valid_name "$HOST" || die "invalid --host $HOST"
