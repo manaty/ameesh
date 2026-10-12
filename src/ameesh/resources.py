@@ -2,8 +2,8 @@
 """Ressources des hôtes (lot L31, décision 0028).
 
 Chaque exécuteur relève périodiquement l'état de son hôte — mémoire
-disponible, swap utilisé, charge CPU (1 minute), disque libre du dossier de
-travail, allocation btrfs de ce disque (#246), tours en cours — et le publie
+disponible, swap utilisé, charge CPU (1 minute), disque libre et allocation
+btrfs (#246) de chaque volume où l'hôte écrit (#253), tours en cours — et le publie
 en base (`host_resources`). `ameesh hosts` montre le dernier relevé de
 chaque hôte et l'historique court.
 
