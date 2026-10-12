@@ -1266,9 +1266,9 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       });
       var sum = track(a !== null ? [{a: a, b: Math.max(z, a + 3600), cls: "rm-real" + (nLate ? " late" : open.length ? "" : " done")}] : []);
       var title = g.epic ? "epic " + g.epic.id + " " + (g.epic.title || "") : g.title;
-      // déplié d'office s'il porte une tâche en retard ou en cours (le reste attend)
-      var hot = g.rows.some(function (x) { return (x.late && x.late.open) || x.state === "en_cours"; });
-      var det = group(g.key, title, count, sum, hot);
+      // déplié d'office seulement s'il porte une tâche en retard (mesh-design,
+      // n°9311) : « en cours » ne suffit pas, presque tout groupe en a une
+      var det = group(g.key, title, count, sum, nLate > 0);
       if (g.epic && g.epic.planned) pkgRow(det, g.epic);
       shown.forEach(function (x) { taskRow(det, x); });
     });
