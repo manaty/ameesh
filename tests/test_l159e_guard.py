@@ -10,11 +10,13 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from ameesh import guard
+from ameesh.platform import host
 
 from .test_l159a_capacity_guard import errors as schema_errors
 from .test_l159a_capacity_guard import schema
@@ -160,6 +162,25 @@ class OfferTest(unittest.TestCase):
         self.assertEqual(dst.end_if_open(_epoch("2026-10-25T00:15:00")),
                          _epoch("2026-10-25T00:45:00"))
         self.assertIsNone(dst.end_if_open(_epoch("2026-10-25T01:15:00")))
+        # the skipped hour of 2026-03-29 (02:00-03:00 Paris = 01:00Z): a
+        # range wholly in it never opens; an end in it is its start (codex
+        # #276 r1: both landed an hour later)
+        for t in range(int(_epoch("2026-03-28T23:00:00")), int(_epoch("2026-03-29T03:00:00")), 60):
+            self.assertIsNone(dst.end_if_open(t), t)
+        night = guard.parse_window("sat 23:30-02:30 Europe/Paris")
+        self.assertEqual(night.end_if_open(_epoch("2026-03-28T23:00:00")),
+                         _epoch("2026-03-29T01:00:00"))
+        self.assertIsNone(night.end_if_open(_epoch("2026-03-29T01:00:00")))
+        self.assertEqual(night.end_if_open(_epoch("2026-03-28T22:30:00")),
+                         _epoch("2026-03-29T01:00:00"))
+        self.assertIsNone(night.end_if_open(_epoch("2026-03-28T22:29:59")))
+        # a start in the gap opens at its end; whole days end at midnight
+        late = guard.parse_window("sun 02:30-04:00 Europe/Paris")
+        self.assertIsNone(late.end_if_open(_epoch("2026-03-29T00:59:59")))
+        self.assertEqual(late.end_if_open(_epoch("2026-03-29T01:00:00")),
+                         _epoch("2026-03-29T02:00:00"))
+        self.assertEqual(guard.parse_window("sun Europe/Paris").end_if_open(
+            _epoch("2026-03-29T12:00:00")), _epoch("2026-03-29T22:00:00"))
         # every open instant around both changes of 2026 ends in the future
         windows = [guard.parse_window(w) for w in (
             "sun 02:00-02:45 Europe/Paris", "sat-sun 23:30-02:30 Europe/Paris",
@@ -985,6 +1006,57 @@ class EnforcerTest(unittest.TestCase):
                 self.assertEqual(state["level"], 2, published)
                 self.assertEqual(self.runs()[-1][-1], "20", published)
                 self.setUp()
+
+    def test_no_freeze_dispatched_when_the_episode_is_not_written(self):
+        # codex #276 r1: a write that fails dispatches nothing (a restart
+        # would bound the episode anew); the next evaluation tries again
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, make = self._guard_cfg(tmp)
+            g = make()
+            real = guard.write_state
+            failing = [OSError("full")]     # the episode's write only
+            def write(path, record):
+                if failing:
+                    raise failing.pop()
+                real(path, record)
+            with mock.patch.object(guard, "write_state", side_effect=write):
+                state = g.step()
+            self.assertEqual(state["level"], 2)
+            self.assertFalse(state["freeze"]["enforced"])
+            self.assertEqual((self.runs(), self.frozen), ([], set()))
+            self.assertNotIn("freeze", state["guard"])
+            self.assertIn("freeze refused: episode not written", self.logged)
+            self.tick(5)
+            self.assertTrue(g.step()["freeze"]["enforced"])
+            self.assertEqual(self.runs()[-1][-1], "55")
+
+    def test_freeze_script_holds_the_bound_across_a_suspend(self):
+        # codex #276 r1: the script, run by sh on fake systemctl and sleep;
+        # each `sleep` moves the boot clock by its seconds, the third one
+        # spans a 300 s suspend: the clock is read again, the slice thaws
+        # at once (a single `sleep 50` would hold it 50 s after resume)
+        with tempfile.TemporaryDirectory() as tmp:
+            uptime, log = os.path.join(tmp, "uptime"), os.path.join(tmp, "log")
+            with open(uptime, "w") as fh:
+                fh.write("10.00 5.00\n")
+            for name, body in (
+                    ("systemctl", 'echo "systemctl $*" >> "%s"' % log),
+                    ("sleep", 'echo "sleep $*" >> "%s"; n=$(grep -c sleep "%s"); '
+                              'awk -v s="$1" -v n="$n" \'{print $1 + s + (n == 3 ? 300 : 0), $2}\' '
+                              '"%s" > "%s.new" && mv "%s.new" "%s"'
+                              % (log, log, uptime, uptime, uptime, uptime))):
+                path = os.path.join(tmp, name)
+                with open(path, "w") as fh:
+                    fh.write("#!/bin/sh\n" + body + "\n")
+                os.chmod(path, 0o755)
+            script = guard.FREEZE_SCRIPT.replace(host.UPTIME, uptime)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""))
+            subprocess.run(["/bin/sh", "-c", script, "ameesh-guest.slice", "60.000", "50"],
+                           env=env, check=True, timeout=20)
+            with open(log) as fh:
+                self.assertEqual(fh.read().splitlines(), [
+                    "systemctl freeze ameesh-guest.slice", "sleep 1", "sleep 1", "sleep 1",
+                    "systemctl thaw ameesh-guest.slice"])
 
     def test_restart_takes_over_the_service(self):
         # an earlier guard's service still holds the slice: the new guard

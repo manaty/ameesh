@@ -153,16 +153,41 @@ class Window:
         from zoneinfo import ZoneInfo
         return ZoneInfo(self.tz)
 
-    def _span(self, day_start: dt.datetime) -> tuple[dt.datetime, dt.datetime] | None:
+    @staticmethod
+    def _instant(wall: dt.datetime) -> float:
+        """The instant of a wall time: its first occurrence when repeated
+        (DST in autumn); when skipped (DST in spring), the start of the gap:
+        a bound in the gap never lands on a later hour (codex #276 r1)."""
+        wall = wall.replace(fold=0)
+        ts = wall.timestamp()
+        if dt.datetime.fromtimestamp(ts, wall.tzinfo).replace(tzinfo=None) \
+                == wall.replace(tzinfo=None):
+            return ts
+        # skipped: the gap lies between the instants of both offsets; the
+        # first second carrying the later offset starts it
+        low, high = sorted((ts, wall.replace(fold=1).timestamp()))
+        offset = dt.datetime.fromtimestamp(high, wall.tzinfo).utcoffset()
+        low, high = math.floor(low), math.ceil(high)
+        while high - low > 1:
+            mid = (low + high) // 2
+            if dt.datetime.fromtimestamp(mid, wall.tzinfo).utcoffset() == offset:
+                high = mid
+            else:
+                low = mid
+        return float(high)
+
+    def _span(self, day_start: dt.datetime) -> tuple[float, float] | None:
+        """The window opened on this day, as instants: empty when its whole
+        time range is skipped (DST in spring)."""
         if DAYS[day_start.weekday()] not in self.days:
             return None
         if self.start_min is None:
-            return day_start, day_start + dt.timedelta(days=1)
+            return self._instant(day_start), self._instant(day_start + dt.timedelta(days=1))
         start = day_start + dt.timedelta(minutes=self.start_min)
         end = day_start + dt.timedelta(minutes=self.end_min)
         if end <= start:
             end += dt.timedelta(days=1)
-        return start, end
+        return self._instant(start), self._instant(end)
 
     def end_if_open(self, now: float) -> float | None:
         """The end of the window if it is open at `now` (epoch), else None."""
@@ -172,15 +197,17 @@ class Window:
             span = self._span(day)
             # the instants are compared, never the wall times (same zone:
             # Python ignores `fold`): a repeated hour (DST) is in the window
-            # once, at its first occurrence (codex #211 r7)
-            if span and span[0].timestamp() <= now < span[1].timestamp():
+            # once, at its first occurrence (codex #211 r7), a skipped one
+            # never (`_instant`)
+            if span and span[0] <= now < span[1]:
+                if self.start_min is not None:
+                    return span[1]
                 # whole days chain: a window open on consecutive days ends
                 # at the end of the last one
-                end = span[1]
-                while self.start_min is None and DAYS[end.weekday()] in self.days \
-                        and end - at < dt.timedelta(days=7):
+                end = day + dt.timedelta(days=1)
+                while DAYS[end.weekday()] in self.days and end - at < dt.timedelta(days=7):
                     end += dt.timedelta(days=1)
-                return end.timestamp()
+                return self._instant(end)
         return None
 
 
@@ -770,11 +797,14 @@ SLICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]*\.slice")
 FREEZE_UNIT = "ameesh-guard-freeze"
 FREEZE_BACKSTOP_S = 30
 #: `$1`: the episode's bound on the boot clock (`host.UPTIME` reads it), so
-#: no delay in starting the service lengthens the freeze (L159e5); `$2`: the
-#: seconds left, when there is no boot clock. An unreadable bound sleeps 0
+#: no delay in starting the service lengthens the freeze (L159e5); the
+#: clock is read again every second: a suspend (counted by the boot clock,
+#: not by `sleep` nor RuntimeMaxSec=) never holds it past the bound (codex
+#: #276 r1). `$2`: the seconds left, when there is no boot clock. An
+#: unreadable clock ends the wait
 FREEZE_SCRIPT = ('systemctl freeze "$0" && { if [ -n "$1" ]; then '
-                 'sleep "$(awk -v d="$1" \'{l = d - $1; print (l > 0 ? l : 0)}\' '
-                 + host.UPTIME + ')"; '
+                 'while awk -v d="$1" \'{exit !($1 < d)}\' ' + host.UPTIME + '; '
+                 'do sleep 1; done; '
                  'else sleep "$2"; fi; }; '
                  'until systemctl thaw "$0"; do sleep 2; done')
 
@@ -869,8 +899,9 @@ class Enforcer:
         #: boot clock, kept across retries and restarts (codex #237 r5)
         self.episode: dict | None = None
         #: writes a new episode before its freeze is dispatched (the guard
-        #: sets it: a crash before the state is published keeps the bound)
-        self.persist: Callable[[dict], None] = lambda episode: None
+        #: sets it: a crash before the state is published keeps the bound);
+        #: False when not written: no freeze is dispatched
+        self.persist: Callable[[dict], bool] = lambda episode: True
         #: the agent units a stop found running, to start again (L159e4):
         #: {units: {unit: systemd's monotonic clock once stopped}, boot_id,
         #: manual, low_since}; published as `guard.stopped`
@@ -968,7 +999,8 @@ class Enforcer:
         restart: the episode ends only when the guard leaves level 2, never
         with a `since_ts` a wall clock moved back changed, codex #237 r6),
         else from `until` (at most `FREEZE_MAX_S`). A new episode is
-        persisted (`persist`) before any freeze is dispatched."""
+        persisted (`persist`) before any freeze is dispatched: None when it
+        could not be (codex #276 r1: a restart would bound it anew)."""
         boot, now = self.boot_id(), self.boottime()
         episode = self.episode
         if boot is None or now is None:
@@ -978,7 +1010,10 @@ class Enforcer:
         else:
             left = min(FREEZE_MAX_S, until - self.clock())
             self.episode = {"since_ts": since, "boot_id": boot, "boot_deadline": now + left}
-            self.persist(dict(self.episode))
+            if not self.persist(dict(self.episode)):
+                self.episode = None
+                self.log("freeze refused: episode not written")
+                return None
         return int(left) if left >= 1 else None
 
     def freeze(self, on: bool, until: float | None = None,
@@ -1011,7 +1046,9 @@ class Enforcer:
         self._quiet("reset-failed", self.freeze_unit)
         seconds = self._seconds_left(until, since)
         if seconds is None:
-            self.log("freeze refused: bound past")
+            # an episode not written is already reported
+            if self.episode is not None or self.boot_id() is None:
+                self.log("freeze refused: bound past")
             self.freeze(False)
             return False
         bound = self.episode["boot_deadline"] if self.episode \
@@ -1259,11 +1296,12 @@ class Guard:
         self.last_key = None
         self.written_decision = None
 
-    def _persist_episode(self, episode: dict) -> None:
+    def _persist_episode(self, episode: dict) -> bool:
         """A new freeze episode, written into the last published state before
         its freeze is dispatched: a guard killed before publishing the new
         state takes the bound back (codex #237 r6). Nothing published yet: a
-        record of the episode alone (no schema: a guest reads no state)."""
+        record of the episode alone (no schema: a guest reads no state).
+        False when the write failed: the freeze is not dispatched."""
         record = dict(self.published) if isinstance(self.published, dict) else {}
         # with the decision that freezes: a restart takes both back
         record["guard"] = dict(record.get("guard") or {}, freeze=episode,
@@ -1273,7 +1311,9 @@ class Guard:
             write_state(self.cfg.state_path, record)
         except OSError as exc:
             print("ameesh guard: %s: %s" % (self.cfg.state_path, exc), file=sys.stderr)
+            return False
         self.published = record
+        return True
 
     def stop(self) -> None:
         """Leaving: thaw the guest; the caps stay (slice properties)."""
