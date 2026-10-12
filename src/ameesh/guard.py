@@ -469,7 +469,9 @@ def decide(offer: Offer, signals: dict, previous: Decision, now: float, *,
     if current == 3 and not drained \
             and now >= previous.since_ts + offer.drain_seconds + STOP_GRACE_S:
         return Decision(4, previous.reason, now, previous.calm_since_ts, end)
-    if level == current:
+    # a stop holds while the breach that drained does: only a level under 3
+    # is calm (codex #211 r7: a stop withdrawn 600 s later, breach still there)
+    if level == current or (current == 4 and level == 3):
         return dataclasses.replace(previous, calm_since_ts=None, window_end_ts=end)
     calm = previous.calm_since_ts if previous.calm_since_ts is not None else now
     if now - calm >= offer.calm_seconds:
