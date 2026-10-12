@@ -51,7 +51,7 @@ it or executes an artifact.
    Create the root-owned `snapshot_root` on disk, mode 0755, with all parent
    directories root-owned and unmodifiable by agents. Never place it in an
    executor-owned TMPDIR. Each request streams the artifact from an O_NOFOLLOW
-   descriptor into a helper-owned copy, makes that copy mode 0555, hashes it,
+   descriptor opened with the worker’s read permissions into a helper-owned copy, makes that copy mode 0555, hashes it,
    checks the declared digest and executes only the copy. The helper never
    rereads the original path after copying. It deletes the snapshot at exit;
    proof keeps its digest and actual command. Source substitution cannot change

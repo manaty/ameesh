@@ -70,7 +70,8 @@ class ProofHelperTest(unittest.TestCase):
         with mock.patch("pwd.getpwnam", return_value=account), \
                 mock.patch("os.geteuid", return_value=0), \
                 mock.patch("subprocess.Popen", return_value=process) as popen, \
-                mock.patch.object(proof_service, "private_path", return_value=folder.name):
+                mock.patch.object(proof_service, "private_path", return_value=folder.name), \
+                mock.patch("os.seteuid"), mock.patch("os.setegid"), mock.patch("os.setgroups"):
             execute(artifact, execution_user="worker", snapshot_root=folder.name)
         _, options = popen.call_args
         self.assertEqual(options["user"], 65534)
@@ -96,12 +97,25 @@ class ProofHelperTest(unittest.TestCase):
             artifact = Path(folder, "artifact.py")
             artifact.write_text("import os\nprint(os.geteuid(), os.environ.get('PGPASSWORD', 'absent'), os.access(__file__, os.W_OK))\n")
             artifact.chmod(0o644)
-            code = ("import sys, os, json, tempfile; sys.path.insert(0, sys.argv[1]); "
-                    "from ameesh.modules.it.execution import execute; "
-                    "os.environ['PGPASSWORD'] = 'service-secret'; "
-                    "root = tempfile.TemporaryDirectory(dir='/var/lib'); os.chmod(root.name, 0o755); "
-                    "print(json.dumps(execute(sys.argv[2], runner=sys.argv[3], execution_user='nobody', "
-                    "snapshot_root=root.name))); root.cleanup()")
+            code = """
+import sys, os, json, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from ameesh.modules.it.execution import execute
+os.environ['PGPASSWORD'] = 'service-secret'
+with tempfile.TemporaryDirectory(dir='/var/lib') as root:
+    os.chmod(root, 0o755)
+    protected = Path(root, 'private.py')
+    protected.write_text("print('private producer data')")
+    protected.chmod(0o600)
+    try:
+        execute(protected, runner=sys.argv[3], execution_user='nobody', snapshot_root=root)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('helper copied a file unreadable by its artifact worker')
+    print(json.dumps(execute(sys.argv[2], runner=sys.argv[3], execution_user='nobody', snapshot_root=root)))
+"""
             result = subprocess.run(["sudo", "-n", sys.executable, "-I", "-c", code,
                                      str(Path(__file__).resolve().parents[1] / "src"), str(artifact),
                                      "/usr/bin/python3"],

@@ -16,10 +16,25 @@ import time
 OUTPUT_BYTES = 16384
 
 
-def open_artifact(artifact):
+def open_artifact(artifact, *, reader=None):
     path = Path(artifact).absolute()
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        if reader is None:
+            fd = os.open(path, flags)
+        else:
+            # One-shot helper, before its output-reader thread exists: open
+            # only files the worker can read, then restore producer credentials.
+            uid, gid, groups = os.geteuid(), os.getegid(), os.getgroups()
+            try:
+                os.setgroups([])
+                os.setegid(reader.pw_gid)
+                os.seteuid(reader.pw_uid)
+                fd = os.open(path, flags)
+            finally:
+                os.seteuid(uid)
+                os.setegid(gid)
+                os.setgroups(groups)
     except OSError as exc:
         raise ValueError("artifact must be a readable regular file without symlink substitution") from exc
     if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -38,10 +53,10 @@ def digest(artifact):
 
 
 @contextmanager
-def snapshot(artifact, *, root=None):
+def snapshot(artifact, *, root=None, reader=None):
     # Root helpers use a separately validated, root-owned parent. They never
     # put authoritative snapshots in an executor-owned directory or TMPDIR.
-    path, stream = open_artifact(artifact)
+    path, stream = open_artifact(artifact, reader=reader)
     with stream, tempfile.TemporaryDirectory(prefix="execution-", dir=root) as folder:
         copied = Path(folder, Path(path).name)
         sha = hashlib.sha256()
@@ -50,7 +65,6 @@ def snapshot(artifact, *, root=None):
                 target.write(block)
                 sha.update(block)
         os.chmod(copied, 0o555)
-        os.chmod(folder, 0o755)  # worker traversal, never worker write
         yield path, str(copied), sha.hexdigest()
 
 
@@ -60,6 +74,7 @@ def execute(artifact, *, runner=None, arguments=(), timeout=60, execution_user=N
         raise ValueError("execution timeout must be between 0 and 3600 seconds")
     started = time.monotonic()
     isolation = {}
+    account = None
     if execution_user is not None:
         import pwd
         account = pwd.getpwnam(execution_user)
@@ -72,9 +87,11 @@ def execute(artifact, *, runner=None, arguments=(), timeout=60, execution_user=N
         isolation = dict(user=account.pw_uid, group=account.pw_gid, extra_groups=[],
                          cwd="/", env={"PATH": "/usr/bin:/bin", "HOME": account.pw_dir,
                                        "LANG": "C.UTF-8"}, umask=0o077)
-    with snapshot(artifact, root=snapshot_root) as (source, path, sha):
+    with snapshot(artifact, root=snapshot_root, reader=account) as (source, path, sha):
         if expected_sha is not None and sha != expected_sha:
             raise ValueError("artifact differs from the declared delivery; nothing executed")
+        # Keep the copy private until its digest was admitted.
+        os.chmod(Path(path).parent, 0o755)  # worker traversal, never worker write
         command = ([runner] if runner else []) + [path] + list(arguments)
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               start_new_session=(os.name == "posix"), **isolation) as process:
