@@ -755,7 +755,8 @@ class NexlinkVerificationTests(_Base):
             os.chmod(os.path.join(bindir, "npm"), 0o755)
         with open(os.path.join(fakebin, "node"), "w") as fh:
             fh.write('#!/bin/sh\nif [ -f .pin ]; then v=22; else v=26; fi\n'
-                     'case "$1" in --version) echo v$v;; -p) printf "v$v\\n%s/node$v/bin/node\\n";; '
+                     'case "$1" in --version) echo v$v;; -p) if [ "$2" = process.version ]; then echo v$v; '
+                     'else printf "v$v\\n%s/node$v/bin/node\\n"; fi;; '
                      'esac\n' % self.base)
         with open(os.path.join(fakebin, "shim-npm"), "w") as fh:
             fh.write('#!/bin/sh\nif [ "$1" = --version ]; then '
@@ -806,6 +807,62 @@ class NexlinkVerificationTests(_Base):
             with open(log) as fh:
                 self.assertEqual(fh.read().split(), [shim, pinned])
             self.assertEqual(marker["npm"], "10.9")
+
+    def test_r3_a_toolchain_changed_since_the_key_discards_the_fill(self):
+        # an npm shim answering by directory, no npm beside the node: the pin
+        # changes within the TTL, the key (cached) says npm 10.9, the fill
+        # would run npm 11.19
+        fakebin, log = self._toolchains()
+        os.unlink(os.path.join(self.base, "node22/bin/npm"))
+        os.unlink(os.path.join(self.base, "node26/bin/npm"))
+        pkg = _package(os.path.join(self.base, "main"))
+        pin = os.path.join(pkg, ".pin")
+        open(pin, "w").close()
+        shim = os.path.join(fakebin, "shim-npm")
+        root = deps.nm_root(self.cache)
+        with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin",
+                                          "AMEESH_REAL_NPM": shim}), \
+                mock.patch.object(deps, "toolchain", toolchain):
+            tool = deps.toolchain(pkg)
+            self.assertEqual((tool["node"], tool["npm"], tool["npm_version"]),
+                             ("v22", shim, "10.9"))
+            os.unlink(pin)                              # within the TTL
+            done = deps.link_package(pkg, self.cache)
+            self.assertEqual(done["status"], "local-kept")
+            self.assertIn("toolchain changed before the fill", done["reason"])
+            self.assertIn("npm_version 11.19, key 10.9", done["reason"])
+            self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+            self.assertFalse(os.path.exists(log))                  # npm ci never ran
+            self.assertIsNone(deps.read_marker(deps.entry_of(root, done["key"])))
+            self.assertEqual([n for n in os.listdir(root) if deps.TMP_SEP in n], [])
+            # the next attempt resolves again: the new pin, its own key, linked
+            again = deps.link_package(pkg, self.cache)
+            self.assertEqual(again["status"], "linked")
+            self.assertNotEqual(again["key"], done["key"])
+            with open(log) as fh:
+                self.assertEqual(fh.read().split(), [shim, pkg])
+
+    def test_r3_a_toolchain_changing_during_the_install_discards_it(self):
+        fakebin, log = self._toolchains()
+        pkg = _package(os.path.join(self.base, "main"))
+        pin = os.path.join(pkg, ".pin")
+        open(pin, "w").close()
+        root = deps.nm_root(self.cache)
+        real_npm_ci = deps.npm_ci
+
+        def installer(directory, env=None, *, lock_fd=None):
+            real_npm_ci(directory, env, lock_fd=lock_fd)
+            os.unlink(pin)                              # the pin changes meanwhile
+
+        with mock.patch.dict(os.environ, {"PATH": fakebin + os.pathsep + "/usr/bin:/bin"}), \
+                mock.patch.object(deps, "toolchain", toolchain):
+            os.environ.pop("AMEESH_REAL_NPM", None)
+            done = deps.link_package(pkg, self.cache, installer=installer)
+        self.assertEqual(done["status"], "local-kept")
+        self.assertIn("toolchain changed after the fill (node v26, key v22)", done["reason"])
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+        self.assertIsNone(deps.read_marker(deps.entry_of(root, done["key"])))
+        self.assertEqual([n for n in os.listdir(root) if deps.TMP_SEP in n], [])
 
     def test_r1_4_toolchain_is_one_entry_not_kept_past_its_ttl(self):
         fakebin, _log = self._toolchains()

@@ -154,6 +154,12 @@ class FillError(RuntimeError):
     """The cache entry could not be filled."""
 
 
+class ToolchainChanged(FillError):
+    """The node or npm a fill runs with is not the one its key was made with
+    (a pin changed within PROBE_TTL_S, a shim answering by directory): the
+    entry is discarded, nothing is linked and nothing installed locally."""
+
+
 # --------------------------------------------------------------------------
 # roots and keys
 # --------------------------------------------------------------------------
@@ -173,10 +179,12 @@ _probes: dict = {}
 FILL_FROM = "AMEESH_FILL_FROM"
 
 
-def _probe(command: list[str], cwd: str | None = None, path: str | None = None) -> str:
+def _probe(command: list[str], cwd: str | None = None, path: str | None = None,
+           env: dict | None = None) -> str:
     """The output of a toolchain probe run in `cwd` (where a version manager
     such as mise or asdf picks the version), "" if it fails."""
-    env = None if path is None else dict(os.environ, PATH=path)
+    if path is not None:
+        env = dict(os.environ if env is None else env, PATH=path)
     try:
         return subprocess.run(command, capture_output=True, text=True, cwd=cwd, env=env,
                               timeout=20).stdout.strip()
@@ -526,6 +534,26 @@ def npm_ci(directory: str, env: dict | None = None, *, lock_fd: int | None = Non
         raise FillError("npm ci failed (%d): %s" % (done.returncode, " | ".join(tail)))
 
 
+def _check_toolchain(pkg_dir: str, tool: dict, env: dict, when: str) -> None:
+    """Raise ToolchainChanged if the fill's environment (`env`, run from
+    FILL_FROM, as npm ci is) resolves another node or npm than the key's
+    `tool`, before or after the install; only what `tool` resolved is
+    checked."""
+    run_env, cwd = fill_env(env), env.get(FILL_FROM)
+    seen = {}
+    if tool.get("bindir"):
+        seen["node"] = _probe(["node", "-p", "process.version"], cwd, env=run_env)
+    if tool.get("npm"):
+        seen["npm_version"] = _probe([tool["npm"], "--version"], cwd, env=run_env)
+    changed = ["%s %s, key %s" % (name, got or "?", tool[name])
+               for name, got in seen.items() if got != tool[name]]
+    if changed:
+        for memo in [m for m in _probes if m[0] == pkg_dir]:
+            del _probes[memo]               # the next attempt resolves again
+        raise ToolchainChanged("toolchain changed %s the fill (%s): entry discarded"
+                               % (when, "; ".join(changed)))
+
+
 def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | None = None,
          wait: float = FILL_WAIT_S, tool: dict | None = None) -> dict:
     """Fill the entry `key` from `pkg_dir` if it is not complete yet; returns
@@ -571,7 +599,9 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
         env[FILL_FROM] = os.path.abspath(pkg_dir)
         started = time.time()
         try:
+            _check_toolchain(pkg_dir, tool, env, "before")
             installer(stage, env, lock_fd=lock.fileno())
+            _check_toolchain(pkg_dir, tool, env, "after")
             modules = os.path.join(stage, NODE_MODULES)
             if os.path.islink(modules) or not os.path.isdir(modules):
                 raise FillError("the installer left no node_modules directory")
@@ -723,6 +753,8 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
         try:
             fill(pkg_dir, root, key, installer=installer, env=env, wait=wait, tool=tool)
             filled = True
+        except ToolchainChanged as exc:
+            return dict(result, status="local-kept", reason=str(exc))   # nothing linked
         except FillError as exc:
             if os.path.isdir(link) and not os.path.islink(link) and \
                     not (replace and had_real):
