@@ -84,37 +84,20 @@ esac
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
 dsn_de() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
-# DSN sans mot de passe éventuel (postgresql://u:secret@h → postgresql://u@h)
-sans_secret() { sed -E 's#(://[^:/@]+):[^@]*@#\1@#'; }
 # #518: a DSN's password never goes on a command line, which every process of
-# the host can read (ps, /proc/<pid>/cmdline). `dsn_sans_mdp CONFIG` is the DSN
-# of CONFIG without its password, for argv; `avec_mdp CONFIG cmd…` runs cmd
-# with that password in PGPASSWORD, which libpq reads. The split is the one of
-# ameesh's psql driver (db.split_password), kept here because this script runs
-# before ameesh is installed.
-partie_dsn() {  # CONFIG 0|1 → 0: the DSN's password, 1: the DSN without it
-  python3 -c 'import json, re, sys
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
-dsn, password = json.load(open(sys.argv[1]))["dsn"], ""
-if "://" in dsn:
-    parts = urlsplit(dsn)
-    if parts.netloc and "@" in parts.netloc:
-        creds, host = parts.netloc.rsplit("@", 1)
-        user, _, pwd = creds.partition(":")
-        password = unquote(pwd)
-        dsn = urlunsplit((parts.scheme, "%s@%s" % (quote(user), host), parts.path,
-                          parts.query, parts.fragment))
-else:
-    match = re.search(r"(?:^|\s)password=(\S+)", dsn)
-    if match:
-        password = match.group(1).strip("\x27\"")
-        dsn = (dsn[: match.start()] + " " + dsn[match.end():]).strip()
-print((password, dsn)[int(sys.argv[2])])' "$1" "$2"
-}
-dsn_sans_mdp() { partie_dsn "$1" 1; }
+# the host can read (ps, /proc/<pid>/cmdline), nor in a trace (bash -x) or a
+# display. src/ameesh/dsn.py splits it as libpq reads it, the DSN on its
+# standard input; it is the copy of the commit being deployed (the installed
+# ameesh may be older). `dsn_sans_mdp CONFIG`: the DSN of CONFIG without its
+# password, for argv and display. `avec_mdp CONFIG cmd…`: cmd with that
+# password in PGPASSWORD, which libpq reads, in a subshell without xtrace.
+DSN_PY="$DEPOT/src/ameesh/dsn.py"
+dsn_sans_mdp() { dsn_de "$1" | python3 "$DSN_PY" dsn; }
 avec_mdp() {
-  local mdp; mdp=$(partie_dsn "$1" 0); shift
-  if [ -n "$mdp" ]; then PGPASSWORD=$mdp "$@"; else "$@"; fi
+  ( { set +x; } 2>/dev/null
+    mdp=$(dsn_de "$1" | python3 "$DSN_PY" password) || exit
+    shift
+    if [ -n "$mdp" ]; then PGPASSWORD=$mdp exec "$@"; else exec "$@"; fi )
 }
 ancienne() { [ -f "$CONFIG_RESTE" ]; }
 ameesh_ancienne() { AMEESH_CONFIG="$CONFIG_RESTE" "$AMEESH" "$@"; }
@@ -141,8 +124,8 @@ verifier() {
   echo "dépôt : $DEPOT @ $(git -C "$DEPOT" rev-parse --short HEAD)"
   echo "installé : $("$VENV/bin/pip" show ameesh 2>/dev/null | sed -n 's/^Version: //p') depuis $(readlink "$PARTAGE/src-current" || echo '?')"
   etape "bases visées (sans mot de passe)"
-  echo "mesh     : $(dsn_de "$CONFIG" | sans_secret)"
-  if ancienne; then echo "ancienne : $(dsn_de "$CONFIG_RESTE" | sans_secret)"
+  echo "mesh     : $(dsn_sans_mdp "$CONFIG")"
+  if ancienne; then echo "ancienne : $(dsn_sans_mdp "$CONFIG_RESTE")"
   else echo "ancienne : aucune ($CONFIG_RESTE absent)"; fi
   etape "exécuteurs"
   echo "poste, base du mesh : $(unites_mesh | tr '\n' ' ')"
@@ -230,12 +213,12 @@ migrer() {
     etape "migrations de $(basename "$cible"), avant son installation (additives seulement)"
   fi
   etape "base du mesh (une seule fois pour tout le mesh)"
-  echo "base : $(dsn_de "$CONFIG" | sans_secret)"
+  echo "base : $(dsn_sans_mdp "$CONFIG")"
   ameesh_de "$cible" migrate --dry-run
   migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
-    echo "base : $(dsn_de "$CONFIG_RESTE" | sans_secret)"
+    echo "base : $(dsn_sans_mdp "$CONFIG_RESTE")"
     AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   fi
 }

@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""A PostgreSQL connection string without its password (#518).
+
+`split_password(dsn)` returns `(password, dsn without it)`: the password goes
+to PGPASSWORD, which libpq reads, and the rest may go on a command line, which
+every process of the host can read (ps, /proc/<pid>/cmdline). It follows
+libpq's own parsing (`conninfo_parse`, `conninfo_uri_parse_options` and
+`conninfo_uri_parse_params` in fe-connect.c), so that the connection the rest
+describes is the one the whole string described:
+
+* a URI (`postgresql://` or `postgres://`): the password of the userinfo
+  (before the first `@` that comes before any `/`) and every `password` query
+  parameter are taken out, percent-decoded; the user and every other part are
+  kept as written, never re-encoded. A password in both places is refused;
+* key/value pairs: libpq's tokenizer (blanks around `=`, single-quoted values,
+  backslash escapes in quoted and bare values); every `password` entry is
+  taken out, the last one wins, and the other entries are written back in
+  order, quoted as libpq reads them;
+* anything else is a bare database name, with no password.
+
+A string libpq would refuse is refused (`DsnError`), with a message that
+never quotes the string. Standard library only: `deploy/mise-a-jour/poste.sh`
+runs this file with the host's python3 before ameesh is installed
+(`python3 dsn.py password|dsn`, the DSN on standard input).
+"""
+from __future__ import annotations
+
+import re
+import sys
+
+#: isspace() in the C locale, as libpq tests it
+_BLANKS = " \t\n\r\f\v"
+_URI_PREFIXES = ("postgresql://", "postgres://")
+_HEX = "0123456789abcdefABCDEF"
+
+
+class DsnError(ValueError):
+    """A connection string libpq would refuse; the message never quotes it."""
+
+
+def split_password(dsn: str) -> tuple[str, str]:
+    """(password, the same connection string without it); ("", dsn) without one."""
+    if dsn.startswith(_URI_PREFIXES):
+        return _split_uri(dsn)
+    if "=" in dsn:
+        return _split_keywords(dsn)
+    return "", dsn
+
+
+# -- URI ---------------------------------------------------------------------
+
+def _uri_decode(text: str) -> str:
+    """libpq's conninfo_uri_decode: %XX only, %00 forbidden."""
+    raw = text.encode("utf-8", "surrogateescape")
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        if raw[i] == 0x25:   # '%'
+            pair = raw[i + 1:i + 3].decode("ascii", "replace")
+            if len(pair) != 2 or any(c not in _HEX for c in pair):
+                raise DsnError("invalid percent-encoded token in the URI")
+            if pair == "00":
+                raise DsnError("forbidden value %00 in the URI")
+            out.append(int(pair, 16))
+            i += 3
+        else:
+            out.append(raw[i])
+            i += 1
+    return out.decode("utf-8", "surrogateescape")
+
+
+def _split_uri(dsn: str) -> tuple[str, str]:
+    prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
+    rest = dsn[len(prefix):]
+    in_userinfo = None
+    userinfo = ""
+    end = 0
+    while end < len(rest) and rest[end] not in "@/":
+        end += 1
+    if end < len(rest) and rest[end] == "@":
+        user, colon, secret = rest[:end].partition(":")
+        if colon and secret:   # libpq ignores an empty one
+            in_userinfo = _uri_decode(secret)
+        userinfo = user + "@" if user else ""
+        rest = rest[end + 1:]
+    base, question, query = rest.partition("?")
+    in_query = None
+    kept = []
+    params = query.split("&") if query else []
+    if params and not params[-1]:   # libpq accepts one trailing "&"
+        params.pop()
+    for param in params:
+        if param.count("=") != 1:
+            raise DsnError("malformed query parameter in the URI")
+        key, value = param.split("=")
+        if _uri_decode(key) == "password":
+            in_query = _uri_decode(value)   # the last one wins
+        else:
+            kept.append(param)
+    if in_userinfo is not None and in_query is not None:
+        raise DsnError("a password in both the userinfo and the query of the URI")
+    if question and kept:
+        base += "?" + "&".join(kept)
+    password = in_query if in_query is not None else in_userinfo
+    return password or "", prefix + userinfo + base
+
+
+# -- key/value pairs ----------------------------------------------------------
+
+def _tokens(dsn: str) -> list[tuple[str, str]]:
+    """[(keyword, value)] as libpq's conninfo_parse reads them."""
+    out = []
+    i, n = 0, len(dsn)
+    while i < n:
+        if dsn[i] in _BLANKS:
+            i += 1
+            continue
+        start = i
+        while i < n and dsn[i] != "=" and dsn[i] not in _BLANKS:
+            i += 1
+        key = dsn[start:i]
+        while i < n and dsn[i] in _BLANKS:
+            i += 1
+        if i >= n or dsn[i] != "=" or not key:
+            raise DsnError("missing \"=\" after a keyword, or an empty keyword")
+        i += 1
+        while i < n and dsn[i] in _BLANKS:
+            i += 1
+        value = []
+        if i < n and dsn[i] == "'":
+            i += 1
+            while True:
+                if i >= n:
+                    raise DsnError("unterminated quoted string")
+                c = dsn[i]
+                i += 1
+                if c == "\\":
+                    if i < n:
+                        value.append(dsn[i])
+                        i += 1
+                    continue
+                if c == "'":
+                    break
+                value.append(c)
+        else:
+            while i < n:
+                c = dsn[i]
+                i += 1
+                if c in _BLANKS:
+                    break
+                if c == "\\":
+                    if i < n:
+                        value.append(dsn[i])
+                        i += 1
+                    continue
+                value.append(c)
+        out.append((key, "".join(value)))
+    return out
+
+
+def _quote(value: str) -> str:
+    """A value as libpq reads it back (psycopg's `_param_escape`)."""
+    if not value:
+        return "''"
+    value = re.sub(r"([\\'])", r"\\\1", value)
+    return "'%s'" % value if re.search(r"\s", value) else value
+
+
+def _split_keywords(dsn: str) -> tuple[str, str]:
+    password = ""
+    kept = []
+    for key, value in _tokens(dsn):
+        if key == "password":
+            password = value
+        else:
+            kept.append("%s=%s" % (key, _quote(value)))
+    return password, " ".join(kept)
+
+
+# -- command line (deploy/mise-a-jour/poste.sh) --------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    """`dsn.py password|dsn`, the DSN on standard input: writes the password,
+    or the DSN without it, on standard output. Neither reaches argv."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv not in (["password"], ["dsn"]):
+        print("usage: dsn.py password|dsn < DSN", file=sys.stderr)
+        return 2
+    dsn = sys.stdin.read().rstrip("\n")
+    try:
+        password, rest = split_password(dsn)
+    except DsnError as exc:
+        print("dsn.py: %s" % exc, file=sys.stderr)
+        return 1
+    out = password if argv == ["password"] else rest
+    sys.stdout.buffer.write(out.encode("utf-8", "surrogateescape"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
