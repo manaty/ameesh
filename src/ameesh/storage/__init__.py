@@ -39,7 +39,7 @@ from .interface import Storage
 from .postgres import PostgresStorage
 from .remote.client import RemoteDb
 
-__all__ = ["Storage", "PostgresStorage", "of"]
+__all__ = ["Storage", "PostgresStorage", "of", "is_remote"]
 
 
 def of(db) -> Storage:
@@ -50,3 +50,9 @@ def of(db) -> Storage:
     if isinstance(db, RemoteDb):
         return db.storage
     return PostgresStorage(db)
+
+
+def is_remote(db) -> bool:
+    """Connexion d'exécuteur médié (L109) : chaque opération est sa propre
+    requête, aucune transaction ni aucun verrou ne tient de l'une à l'autre."""
+    return isinstance(db, RemoteDb)

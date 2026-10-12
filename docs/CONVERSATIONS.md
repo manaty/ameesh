@@ -162,6 +162,15 @@ Shared threads keep **one year** of entries by default (0033 §9):
   or expiry of that thread first recounts it from the file as it is.
   Between two entries with the same timestamp, the later one is the most
   recent.
+* **Mediated executor host** (L109): no transaction or lock holds from one
+  remote request to the next, so the executor contract admits neither
+  `threads.lock` nor `threads.expired`. Indexing there works as before
+  L361 (no lock, no recount, every entry counted: `threads.index` with
+  `count` left at its default, true). Such a host does not expire its
+  threads yet: `fil expire` answers with an error and changes nothing (a
+  `--dry-run` still reports), and the runner logs it once per daily pass.
+  The server-side operation that does lock, recount and expiry in a single
+  transaction is the follow-up of #421.
 * **R12 outbox**: an undelivered copy older than thread retention is
   deleted by `Log.prune` (its thread entry would expire on arrival);
   younger ones still wait for delivery, past detail retention.

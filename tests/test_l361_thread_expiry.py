@@ -307,6 +307,61 @@ class TransportTest(unittest.TestCase):
             self.assertIn("thread expiry failed", logged.call_args.args[0])
 
 
+class MediatedHostTest(TransportTest):
+    """#421, option B: a mediated executor host keeps the index of before L361
+    (no lock, no recount: a lock would not hold from one remote request to
+    the next) and does not expire its threads until a server-side op does."""
+
+    def remote_db(self):
+        from ameesh.storage.remote.client import RemoteDb
+        db = object.__new__(RemoteDb)
+        db.storage = mock.Mock()
+        return db
+
+    def test_index_without_lock_nor_recount_every_entry_counted(self):
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        self.expire()
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        threads = db.storage.threads
+        threads.lock.assert_not_called()
+        threads.expired.assert_not_called()
+        threads.index.assert_called_once()
+        kwargs = threads.index.call_args.kwargs
+        self.assertNotIn("count", kwargs)  # the contract's default: counted
+        self.assertEqual((kwargs["entry_id"], kwargs["mailbox_ids"], kwargs["location"]),
+                         (external_id, [9], self.path))
+
+    def test_expiry_is_said_unavailable_and_touches_nothing(self):
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        before = self.read_bytes()
+        db = self.remote_db()
+        with self.assertRaises(fil.ExpiryUnavailable):
+            fil.expire(cfg, db, now=NOW)
+        self.assertEqual(self.read_bytes(), before)
+        self.assertEqual(db.storage.mock_calls, [])
+        # a dry run reads the file only: still answered
+        self.assertEqual(fil.expire(cfg, db, now=NOW, dry_run=True)[0]["dropped"], 1)
+        self.assertEqual(self.read_bytes(), before)
+
+    def test_runner_logs_it_once_per_pass(self):
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1), thread=fil.ThreadRef("other"))
+        self.post(entry("old", 500), entry("kept", 1))
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
+        with mock.patch.object(runner, "log_async") as logged:
+            self.assertIsNone(runner.Runner.expire_threads_once(fake, self.remote_db(), now=NOW))
+        self.assertEqual(logged.call_count, 1)
+        self.assertIn("thread expiry skipped", logged.call_args.args[0])
+        self.assertIn("mediated", logged.call_args.args[0])
+        self.assertIsNone(runner.Runner.expire_threads_once(fake, self.remote_db(),
+                                                            now=NOW + 3600))
+
+
 class IndexAndOutboxTest(PgTestCase):
     def setUp(self):
         super().setUp()

@@ -122,6 +122,11 @@ class ThreadError(RuntimeError):
     """Fil inaccessible (emplacement hors de la racine, identifiant étranger…)."""
 
 
+class ExpiryUnavailable(ThreadError):
+    """L361 (#421, option B) : pas d'expiration sur un hôte d'exécuteur médié,
+    faute d'opération atomique côté serveur (verrou, recomptage, expiration)."""
+
+
 # --------------------------------------------------------------------------
 # modèle
 # --------------------------------------------------------------------------
@@ -1076,6 +1081,14 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
     key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
                host=host, location=(transport.location(thread)
                                     if hasattr(transport, "location") else thread.key))
+    if storage.is_remote(db):
+        # exécuteur médié : un verrou ne tiendrait pas d'une requête à l'autre ;
+        # l'index d'avant L361, chaque entrée comptée (ces hôtes n'expirent pas)
+        storage.of(db).threads.index(
+            **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
+            excerpt=excerpt(entry.text), ts=float(entry.ts),
+            trace={"fil": {"transport": transport.name, "id": external_id, "host": host}})
+        return
     with db.transaction() as tx:
         threads = storage.of(tx).threads
         counted = threads.lock(**key)
@@ -1128,6 +1141,9 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
         raise ValueError("thread retention must be a whole number of days, >= 0")
     if days == 0:
         return []
+    if db is not None and not dry_run and storage.is_remote(db):
+        raise ExpiryUnavailable("thread expiry is not available on a mediated executor host"
+                                " (no server-side atomic operation yet): nothing expired")
     now = time.time() if now is None else float(now)
     transport = transport or transport_for(cfg)
     host = cfg.host if transport.name == "file" else ""

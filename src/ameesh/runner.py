@@ -5696,6 +5696,9 @@ class Runner:
         self._threads_expire_next = now + 86400.0
         try:
             reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
+        except fil.ExpiryUnavailable as exc:  # mediated host: said once per pass
+            log_async("thread expiry skipped: %s" % exc)
+            return None
         except Exception as exc:  # never fatal for the runner
             log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
             return None
