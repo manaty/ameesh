@@ -3028,6 +3028,7 @@ class AgentWorker(threading.Thread):
             rp = self.resident
         if rp is not None:
             pourquoi = ("exited" if not rp.alive else
+                        "being stopped" if rp.closing else
                         "launch settings changed" if rp.key != key else
                         "session changed" if (rp.session or None) != (session or None) else
                         "a turn still running" if rp.driver.busy else "")
@@ -3070,16 +3071,23 @@ class AgentWorker(threading.Thread):
 
     def _close_resident(self, reason: str) -> None:
         """Arrête le processus résident (son groupe entier) et ferme sa ligne
-        de ressource. Jamais pendant un tour : le tour l'a dépublié avant."""
+        de ressource. Jamais pendant un tour : le tour l'a dépublié avant.
+        Il reste dans `self.resident` jusqu'à la fin de l'arrêt (codex r1,
+        #417) : un bail perdu pendant la grâce le tue encore (`stop_group_now`)."""
         with self.lock:
-            rp, self.resident = self.resident, None
-        if rp is None:
-            return
+            rp = self.resident
+            if rp is None or rp.closing:
+                return
+            rp.closing = True
         try:
             rp.close(rp.CLOSE_GRACE)
         except Exception as exc:  # le groupe est tué quoi qu'il arrive
             rp.kill_now()
             log_async("[%s] resident close failed (%s): group killed" % (self.name, exc))
+        finally:
+            with self.lock:
+                if self.resident is rp:
+                    self.resident = None
         with self.runner.launch_lock:
             self.runner.harness_pids.discard(rp.pgid)
         if rp.resource_open:
@@ -3430,7 +3438,7 @@ class AgentWorker(threading.Thread):
             self._close_resident("one turn per event: %s" % refus_resident)
         cle_resident = None if refus_resident else resident_runner.launch_key(
             adapter, model=model, effort=effort, tier=tier,
-            account=compte.name if compte is not None else None, cwd=cwd)
+            account=compte.name if compte is not None else None, cwd=cwd, env=env)
         rp = None
         tour_resident = None
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —

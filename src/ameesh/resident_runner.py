@@ -103,10 +103,24 @@ def _binary_stamp(path: str) -> tuple:
     return (path, st.st_mtime_ns, st.st_size)
 
 
+#: variables of a turn's environment that name the turn itself: replaced by
+#: the life id in the resident's environment, never part of its launch key
+PER_TURN_ENV = ("AMEESH_TURN_ID", "AMEESH_CONTAINER_LABELS")
+
+
+def _env_digest(env) -> str:
+    import hashlib
+    items = sorted((k, v) for k, v in (env or {}).items() if k not in PER_TURN_ENV)
+    return hashlib.sha256(repr(items).encode("utf-8", "surrogateescape")).hexdigest()
+
+
 def launch_key(adapter, *, model: str | None, effort: str | None, tier: str | None,
-               account: str | None, cwd: str) -> tuple:
+               account: str | None, cwd: str, env=None) -> tuple:
+    """What the process was started with. `env`: the turn's environment — its
+    hook reads settings there (`AMEESH_TURN_MAIL_MAX`…), frozen at launch:
+    one that changes restarts the process (codex r1, #417)."""
     return (adapter.descriptor.id, adapter.descriptor.sha256, _binary_stamp(adapter.binary),
-            model or "", effort or "", tier or "", account or "", cwd)
+            model or "", effort or "", tier or "", account or "", cwd, _env_digest(env))
 
 
 _versions: dict[tuple, str | None] = {}
@@ -153,6 +167,8 @@ class ResidentProcess:
         self.turns = 0
         #: its `turn_resources` row (under `life_id`) is open
         self.resource_open = False
+        #: a close is under way (`AgentWorker._close_resident`)
+        self.closing = False
 
     @staticmethod
     def new_life_id() -> str:
@@ -202,13 +218,28 @@ class ResidentProcess:
         yield from self.drain()
 
     def kill_now(self) -> None:
-        """SIGKILL to the whole group, nothing written before (lost lease)."""
-        pgid = self.pgid
-        if pgid:
+        """SIGKILL to the whole group, nothing written before (lost lease).
+
+        Never a reused group (codex r1, #417): while the leader is not reaped
+        (`returncode` None), its pid — the group's number — cannot be given
+        to another process. Once reaped, a process that carries that pid
+        means the number was reused, so nothing of ours is left in it (a
+        number still used as a group id is never reallocated): no signal."""
+        proc, pgid = self.proc, self.pgid
+        if proc is None or not pgid:
+            return
+        if proc.returncode is not None:
             try:
-                os.killpg(pgid, signal.SIGKILL)
-            except OSError:
-                pass
+                os.kill(pgid, 0)
+                return                  # reused pid: not our group
+            except ProcessLookupError:
+                pass                    # free: only our survivors carry it
+            except PermissionError:
+                return                  # another user's process: not ours
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def close(self, grace: float) -> None:
         try:

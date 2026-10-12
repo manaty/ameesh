@@ -210,6 +210,54 @@ class ResidentRunnerTest(PgTestCase):
         runner.once = True
         self.assertIn("--once", worker._resident_refusal(self.adapter, False))
 
+    # codex r1 (#417)
+
+    def test_lease_lost_during_a_close_still_kills(self):
+        import threading
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        libre = threading.Event()
+        vraie = rp.close
+        rp.close = lambda grace: (libre.wait(10), vraie(grace))
+        fil = threading.Thread(target=worker._close_resident, args=("asleep",), daemon=True)
+        fil.start()
+        deadline = time.monotonic() + 5
+        while not rp.closing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIs(worker.resident, rp)        # still reachable while it closes
+        worker.stop_group_now("lease deadline reached", grace=0, hard=True)
+        self.assertTrue(_group_gone(rp.pgid))
+        libre.set()
+        fil.join(10)
+        self.assertIsNone(worker.resident)
+
+    def test_kill_now_never_signals_a_reused_group(self):
+        import subprocess
+        etranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                    start_new_session=True)
+        self.addCleanup(lambda: (etranger.kill(), etranger.wait()))
+        reaped = mock.Mock(returncode=0, pid=etranger.pid)
+        driver = mock.Mock(proc=reaped, pgid=etranger.pid)
+        resident_runner.ResidentProcess(driver, key=(), life_id="x").kill_now()
+        time.sleep(0.2)
+        self.assertIsNone(etranger.poll())        # leader reaped, pid reused: untouched
+        vivant = mock.Mock(returncode=None, pid=etranger.pid)
+        driver = mock.Mock(proc=vivant, pgid=etranger.pid)
+        resident_runner.ResidentProcess(driver, key=(), life_id="y").kill_now()
+        self.assertEqual(etranger.wait(5), -signal.SIGKILL)
+
+    def test_a_changed_turn_environment_restarts(self):
+        _runner, worker = self._worker()
+        with mock.patch.object(worker, "turn_mail_max", return_value=20):
+            self.assertTrue(self._turn(worker, "un"))
+        premier = worker.resident
+        with mock.patch.object(worker, "turn_mail_max", return_value=1):
+            self.assertTrue(self._turn(worker, "deux"))
+        self.assertIsNot(worker.resident, premier)
+        self.assertEqual(len(self._starts()), 2)
+        self.assertEqual(worker.resident.driver.extra_env["AMEESH_TURN_MAIL_MAX"], "1")
+
     def test_resident_off_stops_it_between_turns(self):
         _runner, worker = self._worker()
         self.assertTrue(self._turn(worker, "un"))
