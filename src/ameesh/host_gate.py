@@ -72,6 +72,11 @@ REASON_MAX = 64
 MAX_STATE_BYTES = 65536
 
 
+#: `host_yield` of a turn the runner closed at its safe point (harness alone,
+#: `AgentWorker.HOST_SAFE_POINT`)
+SAFE_POINT = "point sûr"
+
+
 def _number(value: Any) -> bool:
     """A finite number (`json` reads `NaN` and `Infinity`; a bool is no number;
     an integer too large for a float, `10**400`, is none either)."""
@@ -599,9 +604,13 @@ class GateController:
         if not state.may_claim and self.deadline is not None and now >= self.deadline:
             # at each pass: a turn published just after the deadline is
             # caught at the next one
+            # a turn closed at its safe point stopped its harness alone: a
+            # child still holding its output keeps the turn (and the lease)
+            # open, so the deadline stops the group too; only a worker already
+            # stopped for the deadline is skipped
             for worker in workers:
                 if getattr(worker, "proc", None) is not None \
-                        and getattr(worker, "host_yield", None) is None:
+                        and getattr(worker, "host_yield", None) in (None, SAFE_POINT):
                     worker.yield_to_host("host drain deadline" if state.state == "draining"
                                          else "host stopped")
         background = getattr(self.runner, "background", None)

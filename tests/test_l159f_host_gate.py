@@ -244,6 +244,23 @@ class ControllerTest(unittest.TestCase):
         self.assertTrue(ack.drained)
         self.assertEqual(self.gate.acks[-1].seq, 2)
 
+    def test_the_deadline_also_stops_a_turn_closed_at_its_safe_point(self):
+        # the harness stopped at its safe point, but a child keeps its output
+        # open: the turn is still running at the deadline, and is stopped
+        from ameesh import runner as runner_mod
+        self.assertEqual(runner_mod.AgentWorker.HOST_SAFE_POINT, host_gate.SAFE_POINT)
+        worker = FakeWorker("a", in_turn=True)
+        worker.host_yield = host_gate.SAFE_POINT
+        self.runner.workers["a"] = worker
+        self.state("draining", 2, drain_deadline_ts=1060.0, reason="app_memory")
+        self.ctl.tick()
+        self.assertEqual(worker.yields, [])
+        self.now = 1060.0
+        self.ctl.tick()
+        self.assertEqual(worker.yields, ["host drain deadline"])
+        self.ctl.tick()
+        self.assertEqual(worker.yields, ["host drain deadline"])  # once
+
     def test_a_failed_ack_is_written_again(self):
         # a transient write failure: the same ack (here `drained`) is retried at
         # the next tick, not taken for published
