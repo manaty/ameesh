@@ -743,6 +743,34 @@ class ShellTest(OffloadBase):
         # the same command, alone on its streams, reaches the job checks
         self.assertEqual(self.shell("run acme-widget %s -- true" % ("0" * 40)).returncode, 2)
 
+    def test_a_planted_promisor_remote_never_runs(self):
+        # r6 on #213: a job (same UID) makes the mirror a partial clone whose
+        # promisor's uploadpack is a command; a cat-file of a missing object
+        # by the shell would lazily fetch, so run it
+        missing = "run acme-widget %s -- true" % ("1" * 40)
+        self.assertEqual(self.shell(missing).returncode, 2)  # creates the mirror
+        mirror = os.path.join(self.vm, "mirrors", "acme-widget.git")
+        source = os.path.join(self.tmp, "source.git")
+        git(self.tmp, "init", "-q", "--bare", source)
+        marker = os.path.join(self.tmp, "upload-pack-ran")
+        for key, value in (("core.repositoryformatversion", "1"),
+                           ("extensions.partialClone", "evil"),
+                           ("remote.evil.url", source),
+                           ("remote.evil.promisor", "true"),
+                           ("remote.evil.uploadpack", "touch %s; git-upload-pack" % marker)):
+            git(mirror, "config", key, value)
+        res = self.shell(missing)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn(b"unknown commit", res.stderr)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_helper_kept_open_by_its_child_is_bounded(self):
+        # r6 on #213: a child keeping the captured stderr blocked the shell
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            offload_shell._helper(["sh", "-c", "sleep 60 & echo started"], timeout=1)
+        self.assertLess(time.monotonic() - started, 10)
+
     def test_names_and_paths_are_validated(self):
         self.assertIn(b"invalid repository name", self.shell("put ../x --have").stderr)
         self.assertIn(b"invalid commit id", self.shell("put repo zzz").stderr)

@@ -111,23 +111,49 @@ AFTER_HOOK_S = 120
 #: mirrors' config or ~/.gitconfig, its hooks would run outside the slice
 GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
             "-c", "core.sshCommand=false", "-c", "core.pager=cat",
-            "-c", "core.alternateRefsCommand=", "-c", "gc.auto=0"]
+            "-c", "core.alternateRefsCommand=", "-c", "gc.auto=0",
+            # no transport at all: a promisor remote planted in the mirror's
+            # config (extensions.partialClone, remote.*.uploadpack) would run
+            # its command on a lazy fetch of a missing object
+            "-c", "protocol.allow=never"]
 GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
-           "GIT_TERMINAL_PROMPT": "0", "GIT_ATTR_NOSYSTEM": "1"}
+           "GIT_TERMINAL_PROMPT": "0", "GIT_ATTR_NOSYSTEM": "1",
+           "GIT_NO_LAZY_FETCH": "1"}
+
+#: a helper that has not finished in this delay is killed (with its process
+#: group): a child keeping the captured stderr open would block the shell
+HELPER_TIMEOUT_S = 600
+#: index-pack reads the upload: the client's own bound on it
+INDEX_PACK_TIMEOUT_S = 1800
 
 
 def _helper(argv: list[str], *, stdin=None, input: bytes | None = None,
-            check: bool = False) -> subprocess.CompletedProcess:
+            check: bool = False, timeout: float = HELPER_TIMEOUT_S
+            ) -> subprocess.CompletedProcess:
     """A helper of the shell (git, systemctl): never a fd of the session —
     stdin closed (or the given pipe / bytes), stdout and stderr captured —
-    and, for git, the isolated config above. `check` raises with its stderr."""
+    and, for git, the isolated config above. `check` raises with its stderr;
+    past `timeout`, OSError."""
     if argv[0] == "git":
         argv = GIT_SAFE + argv[1:]
     env = dict(os.environ, **GIT_ENV)
     if input is None and stdin is None:
         stdin = subprocess.DEVNULL
-    res = subprocess.run(argv, input=input, stdin=stdin if input is None else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else stdin,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        for pipe in (proc.stdout, proc.stderr):
+            pipe.close()
+        raise OSError("%s: no end after %d s, killed" % (" ".join(argv[:4]), timeout))
+    res = subprocess.CompletedProcess(argv, proc.returncode, out, err)
     if check and res.returncode != 0:
         raise subprocess.CalledProcessError(res.returncode, argv, res.stdout, res.stderr)
     return res
@@ -407,7 +433,8 @@ def index_pack(mirror: str) -> None:
         try:
             with os.fdopen(read_fd, "rb") as pipe:
                 box["res"] = _helper(["git", "-C", mirror, "index-pack", "--stdin",
-                                      "--fix-thin"], stdin=pipe)
+                                      "--fix-thin"], stdin=pipe,
+                                     timeout=INDEX_PACK_TIMEOUT_S)
         except BaseException as exc:  # given back to the caller
             box["exc"] = exc
 
