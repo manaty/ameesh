@@ -476,7 +476,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     now = time.time() if now is None else float(now)
     mail_lot = None
     if source_mail is not None:
-        mail_row = storage.of(db).mailbox.get(int(source_mail))
+        mail_row = storage.of(db).decisions.source_mail(int(source_mail))
         if mail_row is None:
             raise DecisionError("--from-mail %s: no such mail" % source_mail)
         if mail_row.get("sender") != requester:

@@ -274,7 +274,7 @@ class MailProjectTests(_Base):
                 args = ("--actor", actor) if actor else ()
                 proc = self.mesh("work", "set-app", str(lot["id"]), "p", *args, env=env)
                 self.assertNotEqual(proc.returncode, 0)
-                self.assertIn("correction refused", proc.stderr)
+                self.assertIn("correction refusée", proc.stderr)
                 self.assertEqual(work.get(self.db, lot["id"])["app"], "")
                 self.assertEqual(work.events(self.db, lot["id"]), events)
 
@@ -334,7 +334,7 @@ class MailProjectTests(_Base):
             for action in (lambda: work.corrector(self.cfg, self.db),
                            lambda: work_projects.set_app(self.cfg, self.db, lot["id"], "p"),
                            lambda: work_projects.backfill_app(self.cfg, self.db)):
-                with self.assertRaisesRegex(work.WorkError, "correction refused"):
+                with self.assertRaisesRegex(work.WorkError, "correction refusée"):
                     action()
             own.agents[0].fiche.data["roles"] = ["design"]
             self.assertEqual(work.corrector(self.cfg, self.db), "dev1")

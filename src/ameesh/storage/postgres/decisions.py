@@ -45,6 +45,13 @@ PENDING_BOARD_SQL = """
 
 class Decisions(interface.Decisions):
 
+    def source_mail(self, message_id) -> dict | None:
+        rows = self.db.query(
+            "SELECT id, sender, recipient, body, kind, work_item_id, "
+            "extract(epoch from created_at)::float8 AS created_ts "
+            "FROM agent_mailbox WHERE id = %s", (int(message_id),))
+        return rows[0] if rows else None
+
     def create(self, *, sender, recipient, body, payload, work_item_id, host) -> dict:
         rows = self.db.query(
             """

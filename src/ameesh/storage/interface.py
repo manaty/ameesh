@@ -1744,6 +1744,10 @@ class Decisions(Domain):
         """La demande `decision_id` (en attente ou close), ou None."""
 
     @abc.abstractmethod
+    def source_mail(self, message_id: int) -> dict | None:
+        """Mail used for decision project inheritance, including work_item_id."""
+
+    @abc.abstractmethod
     def pending(self, *, limit: int) -> list[dict]:
         """Les demandes en attente, les plus anciennes d'abord."""
 
