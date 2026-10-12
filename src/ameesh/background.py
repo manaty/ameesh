@@ -241,7 +241,31 @@ class Tracker:
         self.thread.start()
 
     # -- fin de tour --------------------------------------------------------
-    def survivors(self, turn_id: str, pgid: int | None) -> tuple[list, list] | None:
+    def capture_before_wait(self, proc, *, wait: bool = True) -> dict:
+        """Capture survivors while an unreaped leader still reserves its PGID.
+
+        Popen's wait lock excludes concurrent poll/wait reaping. If another
+        caller already reaped it, observations cannot establish ownership.
+        """
+        if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
+            return {}
+        held = Entry(agent="capture", turn_id="", pgid=proc.pid,
+                     ended=0, deadline=0, grace_s=0)
+        try:
+            with proc._waitpid_lock:
+                if proc.returncode is not None:
+                    return {}
+                flags = os.WEXITED | os.WNOWAIT | (0 if wait else os.WNOHANG)
+                os.waitid(os.P_PID, proc.pid, flags)
+                table = platform.process_table()
+                self._capture(held, [p for p in table if p["pgid"] == proc.pid])
+            return held.handles
+        except Exception:
+            self._drop_handles(held)
+            return {}
+
+    def survivors(self, turn_id: str, pgid: int | None, *,
+                  handles: dict | None = None) -> tuple[list, list] | None:
         """À la fin d'un tour normal (harnais fini et moissonné) : ce qui
         tourne encore, `(processus vivants du groupe, conteneurs du tour sans
         lot)`, ou None si rien. Attend `SETTLE_S` au plus que le groupe se
@@ -252,7 +276,12 @@ class Tracker:
             fin = time.monotonic() + self.SETTLE_S
             while True:
                 try:
-                    vivants = self._members(pgid, platform.process_table())
+                    table = platform.process_table()
+                    vivants = self._members(pgid, table)
+                    observed = {p["pid"] for p in vivants}
+                    vivants += [p for p in table if p["pid"] not in observed
+                                and not p["zombie"] and p["pid"] in (handles or {})
+                                and handles[p["pid"]].live()]
                 except platform.NotAvailable:
                     return None
                 if not vivants or time.monotonic() >= fin:
@@ -266,7 +295,8 @@ class Tracker:
                               if not c.get("lot")]
             except Exception:  # un moteur indisponible n'est pas un travail
                 conteneurs = []
-        if not vivants and not conteneurs:
+        if not vivants and not conteneurs and not any(
+                h.live() for h in (handles or {}).values()):
             return None
         return vivants, conteneurs
 
@@ -288,7 +318,8 @@ class Tracker:
         return vivants
 
     def start(self, *, agent: str, turn_id: str, pgid: int | None, members: list,
-              containers: list, grace_s: int, now: float | None = None) -> Entry:
+              containers: list, grace_s: int, now: float | None = None,
+              handles: dict | None = None) -> Entry:
         """Inscrit le travail de fond d'un tour fini en délai de grâce."""
         now = time.time() if now is None else float(now)
         pids = {p["pid"] for p in members}
@@ -297,8 +328,12 @@ class Tracker:
                       lineage=set(pids) | ({pgid} if pgid else set()),
                       containers=list(containers),
                       containers_seen={c["id"]: c for c in containers},
-                      containers_at=now)
-        self._capture(entry, members)
+                      containers_at=now, handles=dict(handles or {}))
+        # A snapshot after reaping proves identity, never turn ownership.
+        owned = self._owned_members(entry, members)
+        self._capture(entry, owned)
+        entry.unverified = entry.unverified or any(
+            p["pid"] not in entry.handles and not p["zombie"] for p in members)
         for p in members:
             if p["ppid"] not in pids:  # racine : son parent (le harnais) a fini
                 entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p))
@@ -364,12 +399,17 @@ class Tracker:
                 entry.unverified = any(p["pgid"] == entry.pgid and not p["zombie"]
                                        for p in table)
                 entry.pgid = None
-                self._drop_handles(entry)
+                # Detached members remain ours through their retained handle.
+                for pid, handle in list(entry.handles.items()):
+                    if not handle.live():
+                        handle.close()
+                        del entry.handles[pid]
             else:
                 self._capture(entry, membres)
             entry.lineage.update(p["pid"] for p in membres)
             vivants = self._members(entry.pgid, membres, entry) if entry.pgid else []
-            pids = {p["pid"] for p in vivants}
+            pids = {p["pid"] for p in vivants} | {
+                pid for pid, handle in entry.handles.items() if handle.live()}
             for job in entry.jobs.values():
                 if job.ended is None and job.pid not in pids:
                     job.code, job.ended = platform.reap(job.pid), now
@@ -381,7 +421,8 @@ class Tracker:
             vivants = [{"pid": entry.pgid}]  # détail indisponible : le groupe vit
         if not vivants or now - entry.containers_at >= self.CONTAINERS_EVERY_S:
             self._containers(entry, now)
-        if not vivants and not entry.containers:
+        retained_live = any(h.live() for h in entry.handles.values())
+        if not vivants and not retained_live and not entry.containers:
             # le verdict de CE passage fait foi jusqu'à la fermeture : une
             # nouvelle sonde verrait un groupe au numéro recyclé (#458 r2)
             self._close(entry, "done", now, survives=False)
@@ -419,7 +460,7 @@ class Tracker:
         while a live retained handle still anchors that group in this pass.
         Unreadable tables or unavailable handles mean no numeric fallback.
         """
-        if not entry.pgid:
+        if not entry.pgid and not entry.handles:
             return entry.unverified
         try:
             try:
@@ -430,9 +471,8 @@ class Tracker:
                 return True  # no reliable verdict; preserve orphan status
             members = self._owned_members(entry, table)
             if not members:
-                self.log("[%s] background stop: no live owned group members"
-                         % entry.agent)
-                return entry.unverified or any(h.live() for h in entry.handles.values())
+                entry.unverified |= any(p["pgid"] == entry.pgid and not p["zombie"]
+                                        for p in table)
             self._capture(entry, members)
             for handle in entry.handles.values():
                 handle.send(signal.SIGTERM)
@@ -440,7 +480,7 @@ class Tracker:
             end = time.monotonic() + self.TERM_GRACE_S
             while time.monotonic() < end:
                 if not any(h.live() for h in entry.handles.values()):
-                    return entry.unverified
+                    return self._survival_verdict(entry)
                 time.sleep(0.1)
             # Capture late children only through a still-owned live group.
             # Previously captured children remain targets after reparenting
@@ -454,11 +494,27 @@ class Tracker:
             end = time.monotonic() + 2.0
             while time.monotonic() < end:
                 if not any(h.live() for h in entry.handles.values()):
-                    return entry.unverified
+                    return self._survival_verdict(entry)
                 time.sleep(0.1)
-            return entry.unverified or any(h.live() for h in entry.handles.values())
+            return self._survival_verdict(entry)
         finally:
             self._drop_handles(entry)
+
+    def _survival_verdict(self, entry: Entry) -> bool:
+        """One final observation includes children forked during signalling.
+
+        Without a retained group anchor, remaining members cannot be signalled,
+        but their presence still prevents claiming successful cleanup.
+        """
+        live = any(h.live() for h in entry.handles.values())
+        if entry.pgid:
+            try:
+                table = platform.process_table()
+            except Exception:
+                return True
+            if any(p["pgid"] == entry.pgid and not p["zombie"] for p in table):
+                return True
+        return entry.unverified or live
 
     def _owned_members(self, entry: Entry, table: list[dict]) -> list[dict]:
         members = [p for p in table if p["pgid"] == entry.pgid and not p["zombie"]]

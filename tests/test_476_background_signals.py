@@ -132,7 +132,7 @@ class BackgroundSignalTest(unittest.TestCase):
                 mock.patch.object(os, "killpg") as killpg:
             entry = self.tracker.start(agent="test", turn_id="unknown-child",
                                        pgid=7000, members=[row()], containers=[],
-                                       grace_s=1, now=0)
+                                       grace_s=1, now=0, handles={7001: leader})
             self.assertFalse(entry.unverified)
             self.assertEqual(entry.handles, {7001: leader})
             # The leader dies between passes; this child was never captured.
@@ -148,6 +148,154 @@ class BackgroundSignalTest(unittest.TestCase):
         self.assertTrue(entry.unverified)
         store.return_value.turn_resources.close_turn.assert_called_once_with(
             "unknown-child", orphan=True, containers=None)
+
+    def test_capture_refuses_a_harness_already_reaped_by_another_poller(self):
+        proc = SimpleNamespace(pid=7000, returncode=0, _waitpid_lock=threading.Lock())
+        with mock.patch.object(os, "waitid") as wait, \
+                mock.patch.object(platform, "process_table") as scan:
+            self.assertEqual(self.tracker.capture_before_wait(proc), {})
+        wait.assert_not_called()
+        scan.assert_not_called()
+
+    def test_reaped_initial_snapshot_never_authorizes_foreign_processes(self):
+        # Real entry/expiry path, with a recycled PGID after harness reaping.
+        with mock.patch.object(background.ProcessHandle, "open") as acquire, \
+                mock.patch.object(platform, "command_line", return_value="foreign"), \
+                mock.patch.object(platform, "process_table", return_value=[row(start=99)]), \
+                mock.patch.object(platform, "reap", return_value=None), \
+                mock.patch.object(background.storage, "of") as store:
+            entry = self.tracker.start(agent="test", turn_id="recycled-initial",
+                                       pgid=7000, members=[row(start=99)], containers=[],
+                                       grace_s=1, now=0)
+            self.tracker.tick(now=2)
+        acquire.assert_not_called()
+        self.assertEqual(entry.handles, {})
+        store.return_value.turn_resources.close_turn.assert_called_once_with(
+            "recycled-initial", orphan=True, containers=None)
+
+    def test_detached_retained_child_stays_tracked_until_expiry(self):
+        child = mock.Mock()
+        child.live.return_value = True
+        detached = row()
+        detached["pgid"] = 7001
+        with mock.patch.object(platform, "command_line", return_value="child"), \
+                mock.patch.object(platform, "process_table", return_value=[detached]), \
+                mock.patch.object(platform, "reap", return_value=None), \
+                mock.patch.object(background.storage, "of") as store:
+            self.tracker.SETTLE_S = 0
+            survivors = self.tracker.survivors("detached", 7000, handles={7001: child})
+            self.assertEqual(survivors[0], [detached])
+            entry = self.tracker.start(agent="test", turn_id="detached",
+                                       pgid=7000, members=survivors[0], containers=[],
+                                       grace_s=10, now=0, handles={7001: child})
+            self.tracker.tick(now=2)
+            self.assertEqual(entry.state, "running")
+            self.assertEqual(entry.handles, {7001: child})
+            child.close.assert_not_called()
+            self.tracker.TERM_GRACE_S = 0
+            with mock.patch.object(background.time, "monotonic", side_effect=[0, 1, 2, 9]):
+                self.tracker.tick(now=11)
+        self.assertEqual(child.send.call_args_list,
+                         [mock.call(signal.SIGTERM), mock.call(signal.SIGCONT),
+                          mock.call(signal.SIGKILL)])
+        store.return_value.turn_resources.close_turn.assert_called_once_with(
+            "detached", orphan=True, containers=None)
+
+    def test_shutdown_preserves_uncaptured_child_after_anchor_exit(self):
+        leader = mock.Mock()
+        leader.live.return_value = True
+        with mock.patch.object(platform, "command_line", return_value="leader"), \
+                mock.patch.object(platform, "reap", return_value=None), \
+                mock.patch.object(background.storage, "of") as store:
+            self.tracker.start(agent="test", turn_id="shutdown-child", pgid=7000,
+                               members=[row()], containers=[], grace_s=10, now=0,
+                               handles={7001: leader})
+            leader.live.return_value = False
+            with mock.patch.object(platform, "process_table", return_value=[row(pid=7002)]), \
+                    mock.patch.object(background.ProcessHandle, "open") as acquire:
+                self.tracker.stop_all("shutdown")
+        acquire.assert_not_called()
+        leader.send.assert_not_called()
+        store.return_value.turn_resources.close_turn.assert_called_once_with(
+            "shutdown-child", orphan=True, containers=None)
+
+    def test_term_exit_rescans_for_child_forked_after_capture(self):
+        leader = mock.Mock()
+        leader.live.return_value = True
+
+        def send(signum):
+            if signum == signal.SIGTERM:
+                leader.live.return_value = False
+
+        leader.send.side_effect = send
+        with mock.patch.object(platform, "command_line", return_value="leader"), \
+                mock.patch.object(platform, "reap", return_value=None), \
+                mock.patch.object(background.storage, "of") as store:
+            entry = self.tracker.start(agent="test", turn_id="late-child", pgid=7000,
+                                       members=[row()], containers=[], grace_s=1, now=0,
+                                       handles={7001: leader})
+            # Refresh, stop's initial scan, then a child forked during TERM.
+            with mock.patch.object(platform, "process_table",
+                                   side_effect=[[row()], [row()], [row(pid=7002)]]):
+                self.tracker.tick(now=2)
+        self.assertEqual(entry.state, "expired")
+        store.return_value.turn_resources.close_turn.assert_called_once_with(
+            "late-child", orphan=True, containers=None)
+
+    @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
+    def test_capture_before_wait_holds_unreaped_leader_through_initial_scan(self):
+        # Harness exits, leaving an actual child in its group. The initial
+        # snapshot must occur before Popen (or another poller) can reap it.
+        code = ("import subprocess,sys; "
+                "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+                "stdout=subprocess.DEVNULL); print(p.pid,flush=True)")
+        parent = subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
+                                  stdout=subprocess.PIPE, text=True)
+        held = {}
+        child = None
+        try:
+            import select
+            self.assertTrue(select.select([parent.stdout], [], [], 5)[0])
+            child = int(parent.stdout.readline())
+            real_scan = platform.process_table
+
+            def scan():
+                table = real_scan()
+                leader = next(p for p in table if p["pid"] == parent.pid)
+                self.assertTrue(leader["zombie"])
+                self.assertIsNone(parent.returncode)
+                self.assertFalse(parent._waitpid_lock.acquire(blocking=False))
+                return table
+
+            with mock.patch.object(platform, "process_table", side_effect=scan):
+                held = self.tracker.capture_before_wait(parent)
+            self.assertIn(child, held)
+            self.assertEqual(parent.wait(timeout=5), 0)
+            self.tracker.SETTLE_S = 0
+            survivors = self.tracker.survivors("pre-reap", parent.pid)
+            self.assertIsNotNone(survivors)
+            with mock.patch.object(background.storage, "of"):
+                entry = self.tracker.start(agent="test", turn_id="pre-reap", pgid=parent.pid,
+                                           members=survivors[0], containers=survivors[1],
+                                           grace_s=1, now=0, handles=held)
+                self.tracker.TERM_GRACE_S = .1
+                self.tracker.tick(now=2)
+            self.assertEqual(entry.state, "expired")
+            self.assertFalse(entry.unverified)
+        finally:
+            for handle in held.values():
+                handle.send(signal.SIGKILL)
+                handle.close()
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=5)
+            parent.stdout.close()
 
     def test_handle_rejects_snapshot_start_mismatch_and_closes_fd(self):
         with mock.patch.object(os, "pidfd_open", return_value=42, create=True), \
@@ -239,10 +387,13 @@ class BackgroundSignalTest(unittest.TestCase):
                 child = int(parent.stdout.readline())
                 fd = os.pidfd_open(child)
                 members = [p for p in platform.process_table() if p["pgid"] == parent.pid]
+                held = background.Entry(agent="test", turn_id="", pgid=parent.pid,
+                                        ended=0, deadline=1, grace_s=1)
+                self.tracker._capture(held, members)
                 with mock.patch.object(background.storage, "of"):
                     entry = self.tracker.start(agent="test", turn_id="real-expiry",
                                                pgid=parent.pid, members=members,
-                                               containers=[], grace_s=1, now=0)
+                                               containers=[], grace_s=1, now=0, handles=held.handles)
                 self.tracker.TERM_GRACE_S = .5
                 with mock.patch.object(os, "killpg") as killpg:
                     self.tracker._kill(entry)
