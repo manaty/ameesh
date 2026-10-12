@@ -3883,6 +3883,10 @@ class Runner:
         self._gate_settled = threading.Event()
         #: L159f : places de `caps.max_concurrent` tenues (agent → fd verrouillé)
         self._gate_slots: dict[str, int] = {}
+        self._gate_slots_lock = threading.RLock()
+        #: L159f : le worker du tour `--once` (au premier plan, hors de
+        #: `workers`) : l'accusé de la porte le compte tant qu'il tient son bail
+        self.gate_foreground = None
         if once or not cfg.canon:
             self._gate_settled.set()
         self._sync_host_gate(False, None)
@@ -3955,29 +3959,58 @@ class Runner:
         if gate is None:
             return True, None
         cap = gate.max_concurrent()
-        from . import host_gate as host_gate_mod
-        directory = os.path.join(os.path.dirname(gate.gate.ack_path) or ".", "slots")
-        pool = host_gate_mod.SlotPool(directory)
+        pool = self._slot_pool(gate)
         try:
-            with self.lock:
-                missing = [name for name, worker in self.workers.items()
-                           if worker.is_alive() and name not in self._gate_slots]
-            for name in missing:
-                self._gate_slots[name] = pool.acquire(None)
-            slot = pool.acquire(cap)
+            with self._gate_slots_lock:
+                self._hold_slots_of(pool)
+                slot = pool.acquire(cap)
         except OSError as exc:
-            message = "host gate: slots %s unusable (%s)%s" % (
-                directory, exc, ": no claim while caps.max_concurrent is set"
-                if cap is not None else "")
-            if getattr(self, "_slot_error_logged", None) != message:
-                self._slot_error_logged = message
-                log_async(message)
+            self._slot_error(pool, exc, cap)
             return cap is None, None
         return slot is not None, slot
 
+    @staticmethod
+    def _slot_pool(gate):
+        from . import host_gate as host_gate_mod
+        return host_gate_mod.SlotPool(
+            os.path.join(os.path.dirname(gate.gate.ack_path) or ".", "slots"))
+
+    def _slot_error(self, pool, exc: OSError, cap) -> None:
+        message = "host gate: slots %s unusable (%s)%s" % (
+            pool.directory, exc, ": no claim while caps.max_concurrent is set"
+            if cap is not None else "")
+        if getattr(self, "_slot_error_logged", None) != message:
+            self._slot_error_logged = message
+            log_async(message)
+
+    def _hold_slots_of(self, pool) -> None:
+        """Une place pour chaque worker vivant qui n'en tient pas (ceux d'avant
+        la porte), sous `_gate_slots_lock` ; lève OSError."""
+        with self.lock:
+            missing = [name for name, worker in self.workers.items()
+                       if worker.is_alive() and name not in self._gate_slots]
+        for name in missing:
+            self._gate_slots[name] = pool.acquire(None)
+
+    def gate_hold_slots(self) -> None:
+        """L159f (r3) : appelé par le contrôleur de la porte à son démarrage
+        puis à chaque tick — les workers d'avant la porte prennent leur place
+        tout de suite, pas à la prochaine réclamation de CET exécuteur (un
+        autre exécuteur admettrait au-delà du plafond entre-temps)."""
+        gate = self.host_gate
+        if gate is None:
+            return
+        pool = self._slot_pool(gate)
+        try:
+            with self._gate_slots_lock:
+                self._hold_slots_of(pool)
+        except OSError as exc:
+            self._slot_error(pool, exc, gate.max_concurrent())
+
     def _release_slot(self, name: str) -> None:
         from . import host_gate as host_gate_mod
-        host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
+        with self._gate_slots_lock:
+            host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
 
     # -- réclamation -------------------------------------------------------
     def expire_delegations_once(self) -> list[dict]:
@@ -4020,12 +4053,17 @@ class Runner:
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
+        finished = []
         with self.lock:
             for name, worker in list(self.workers.items()):
                 if not worker.is_alive():
                     log("worker %s finished" % name)
                     del self.workers[name]
-                    self._release_slot(name)  # L159f : place de la porte rendue
+                    finished.append(name)
+        for name in finished:
+            # L159f : place de la porte rendue, hors de `self.lock` (le
+            # contrôleur prend `_gate_slots_lock` puis `self.lock`)
+            self._release_slot(name)
         if self.power_hold.is_set():
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
         if self.draining.is_set():
@@ -4043,7 +4081,8 @@ class Runner:
             if not admitted:
                 continue  # L159f : `caps.max_concurrent` de la porte, par hôte
             if slot is not None:
-                self._gate_slots[agent["name"]] = slot
+                with self._gate_slots_lock:
+                    self._gate_slots[agent["name"]] = slot
             if not self.once and not self.admits_new_worker(agent):
                 self._release_slot(agent["name"])
                 # L43 (0031) : hôte plein (max_agents physique) — l'agent reste
@@ -4079,10 +4118,28 @@ class Runner:
                         meta={"action": "reprise-attach",
                               "session": agent.get("session_id") or None})
                 if self.once:
-                    ran = worker.process_once(self.wait)
+                    gate = self.host_gate
+                    if gate is not None:
+                        # L159f (r3) : la part d'accusé de cet exécuteur dit
+                        # le bail tenu AVANT le tour, puis la porte est relue :
+                        # un autre exécuteur ne dit jamais l'hôte vidé pendant
+                        # ce tour, et une fermeture d'entre-temps l'empêche
+                        self.gate_foreground = worker
+                        gate.tick()
+                    try:
+                        if gate is not None and gate.holds_turns():
+                            log_async("host gate closed meanwhile (%s): no turn for %s"
+                                      % (gate.describe(), agent["name"]))
+                            ran = False
+                        else:
+                            ran = worker.process_once(self.wait)
+                    finally:
+                        self.gate_foreground = None
+                        worker.release_lease()
+                        self._release_slot(agent["name"])
+                        if gate is not None:
+                            gate.tick()
                     self.did_turn = self.did_turn or ran
-                    worker.release_lease()
-                    self._release_slot(agent["name"])
                 else:
                     with self.lock:
                         self.workers[agent["name"]] = worker
@@ -5308,15 +5365,21 @@ class Runner:
             "batch %ds (L125)" % (self.host, self.runner_id, self.db.name,
                                      self.cfg.schema, int(self.mail_batch)))
         self.start_canon_sync()
-        if not self.once:
-            self._start_host_gate()  # L159f : suivi de la porte et acquittements
+        # L159f : suivi de la porte et acquittements — en `--once` aussi (r3) :
+        # le tour de premier plan compte dans l'accusé partagé de l'hôte
+        self._start_host_gate()
         self.start_balance_poll()
         self.start_resource_poll()
         self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
         if self.once:
-            self.sweep()
+            try:
+                self.sweep()
+            finally:
+                gate = self.host_gate
+                if gate is not None:
+                    gate.stop()  # sa part d'accusé quitte le dossier partagé
             if not self.did_turn:
                 log_async("no work available")  # chemin de sortie : par la file
             return 0 if self.did_turn else 3

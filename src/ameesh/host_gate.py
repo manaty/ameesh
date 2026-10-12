@@ -300,9 +300,10 @@ class SlotPool:
         a cap set later). Raises OSError when the folder is unusable."""
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
         pool = self._open(".lock")
+        free = None
         try:
             fcntl.flock(pool, fcntl.LOCK_EX)
-            held, free = 0, None
+            held = 0
             names = sorted(n for n in os.listdir(self.directory) if n.startswith("slot-"))
             for name in names:
                 fd = self._open(name)
@@ -312,22 +313,27 @@ class SlotPool:
                     held += 1
                     os.close(fd)
                     continue
+                except OSError:
+                    os.close(fd)
+                    raise
                 if free is None:
                     free = fd
                 else:
                     os.close(fd)
             if cap is not None and held >= cap:
-                if free is not None:
-                    os.close(free)
-                return None
+                return None  # the free slot is closed below
             if free is None:
                 index = 0
                 while "slot-%d" % index in names:
                     index += 1
                 free = self._open("slot-%d" % index)
                 fcntl.flock(free, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return free
+            slot, free = free, None
+            return slot
         finally:
+            # an error (opening slot-N, r3) never leaks the free slot held
+            if free is not None:
+                os.close(free)
             os.close(pool)
 
     @staticmethod
@@ -491,6 +497,10 @@ class FileGate:
             lock = os.open(os.path.join(parts, ".lock"),
                            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._closed.is_set():
+                # closed meanwhile (r3): no part recreated, it would outlive
+                # `close` and hold the host's ack
+                return False
             if self._part is None:
                 ident = "%d-%s" % (os.getpid(), secrets.token_hex(4))
                 fd = os.open(os.path.join(parts, ident + ".lock"),
@@ -513,17 +523,30 @@ class FileGate:
         return True
 
     def _drop_part(self) -> None:
-        if self._part is None:
-            return
-        ident, fd = self._part
-        self._part = None
+        """Under the parts' lock, after `_closed` is set: a `_publish` running
+        meanwhile either wrote before (its part is removed here) or sees the
+        gate closed (and writes nothing)."""
         parts = os.path.join(os.path.dirname(self.ack_path) or ".", "parts")
-        for name in (ident + ".json", ident + ".lock"):
-            try:
-                os.unlink(os.path.join(parts, name))
-            except OSError:
-                pass
-        os.close(fd)
+        lock = -1
+        try:
+            lock = os.open(os.path.join(parts, ".lock"), os.O_RDWR | os.O_CLOEXEC)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            pass  # no parts folder: nothing to hold
+        try:
+            if self._part is None:
+                return
+            ident, fd = self._part
+            self._part = None
+            for name in (ident + ".json", ident + ".lock"):
+                try:
+                    os.unlink(os.path.join(parts, name))
+                except OSError:
+                    pass
+            os.close(fd)
+        finally:
+            if lock >= 0:
+                os.close(lock)
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -620,6 +643,8 @@ class GateController:
         self._ack_key: tuple | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: the loop and the runner (`--once`, shutdown) both tick
+        self._tick_lock = threading.Lock()
         #: freezes announced by the guard, `{since: end}` (the last
         #: `FREEZES_KEPT`): frozen time is read from them, not sampled, since
         #: the runner itself is frozen meanwhile
@@ -669,6 +694,7 @@ class GateController:
         if self._thread is not None:
             return
         self.apply(self.gate.state())
+        self._hold_slots()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="host-gate")
         self._thread.start()
 
@@ -692,13 +718,25 @@ class GateController:
             if self._thread is not None and self._thread is not threading.current_thread():
                 self._thread.join(timeout=2.0)
 
+    def _hold_slots(self) -> None:
+        """Every live worker of the runner holds its slot at once (r3), even
+        one started before the gate: not at the runner's next claim."""
+        hold = getattr(self.runner, "gate_hold_slots", None)
+        if hold is not None:
+            hold()
+
     def _workers(self) -> list:
+        """The runner's live workers, and its `--once` worker during its turn
+        (`gate_foreground`, outside `workers`)."""
         lock = getattr(self.runner, "lock", None)
         workers = getattr(self.runner, "workers", {}) or {}
         if lock is None:
-            return list(workers.values())
-        with lock:
-            return list(workers.values())
+            live = [w for w in workers.values() if w.is_alive()]
+        else:
+            with lock:
+                live = [w for w in workers.values() if w.is_alive()]
+        foreground = getattr(self.runner, "gate_foreground", None)
+        return live + ([foreground] if foreground is not None else [])
 
     # -- transitions --------------------------------------------------------
     def apply(self, state: GateState) -> bool:
@@ -766,11 +804,16 @@ class GateController:
 
     def tick(self) -> GateAck:
         """Drain deadline, lateness, ack; gives the ack."""
+        with self._tick_lock:
+            return self._tick()
+
+    def _tick(self) -> GateAck:
+        self._hold_slots()
         now = self._clock()
         state = self.current
         with self._lock:
             self._account_freeze(state, now)
-        workers = [w for w in self._workers() if w.is_alive()]
+        workers = self._workers()
         if not state.may_claim and self.deadline is not None and now >= self.deadline:
             # at each pass: a turn published just after the deadline is
             # caught at the next one

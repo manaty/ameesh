@@ -208,6 +208,40 @@ class FileGateTest(unittest.TestCase):
         parts = os.listdir(os.path.join(self.tmp, "ack", "parts"))
         self.assertEqual(len([n for n in parts if n.endswith(".json")]), 1)  # the dead part went
 
+    def test_a_closed_gate_writes_no_part(self):
+        # codex r3 #279: an ack (a tick running during `stop`) after close()
+        # recreated the part, which then held the host's ack until exit
+        gate = self.gate(True)
+        self.assertTrue(gate.acknowledge(host_gate.GateAck(seq=2, state="draining")))
+        gate.close()
+        self.assertFalse(gate.acknowledge(host_gate.GateAck(seq=2, state="draining")))
+        gate.merge()  # nothing of its own left to merge
+        parts = os.path.join(self.tmp, "ack", "parts")
+        self.assertEqual([n for n in os.listdir(parts) if not n.startswith(".")], [])
+
+    def test_a_once_turn_keeps_the_host_from_being_drained(self):
+        # codex r3 #279: with --once, no controller and no part: another
+        # runner said the host drained during that turn. The `--once` worker
+        # (`gate_foreground`) counts in this runner's part
+        _write_state(self.path, seq=5, state="draining", drain_deadline_ts=time.time() + 600)
+        idle = host_gate.GateController(
+            types.SimpleNamespace(workers={}, lock=threading.Lock()), self.gate(True))
+        once_runner = types.SimpleNamespace(workers={}, lock=threading.Lock(),
+                                            gate_foreground=FakeWorker("solo", in_turn=True))
+        once = host_gate.GateController(once_runner, self.gate(True))
+        self.addCleanup(idle.stop)
+        self.addCleanup(once.stop)
+        for ctl in (idle, once):
+            ctl.apply(ctl.gate.state())
+        once.tick()
+        idle.tick()
+        ack = self.read_ack()
+        self.assertEqual((ack["seq"], ack["drained"], ack["in_turn"]), (5, False, ["solo"]))
+        once_runner.gate_foreground = None  # the turn ended, its lease returned
+        once.tick()
+        idle.tick()
+        self.assertTrue(self.read_ack()["drained"])
+
     def test_a_part_for_an_older_seq_is_not_drained(self):
         first, second = self.gate(True), self.gate(True)
         self.addCleanup(first.close)
@@ -221,6 +255,30 @@ class FileGateTest(unittest.TestCase):
         first.close()
         second.acknowledge(host_gate.GateAck(seq=4, state="draining", drained=True))
         self.assertEqual((self.read_ack()["seq"], self.read_ack()["drained"]), (4, True))
+
+def slot_runner(ack: str, cap, workers=None):
+    """A runner reduced to the gate's slots: the real `Runner` methods, on a
+    plain object (no database)."""
+    from ameesh.runner import Runner
+
+    class SlotRunner:
+        _gate_slot = Runner._gate_slot
+        _slot_pool = staticmethod(Runner._slot_pool)
+        _slot_error = Runner._slot_error
+        _hold_slots_of = Runner._hold_slots_of
+        gate_hold_slots = Runner.gate_hold_slots
+        _release_slot = Runner._release_slot
+
+    runner = SlotRunner()
+    runner.host_gate = types.SimpleNamespace(
+        max_concurrent=cap if callable(cap) else (lambda: cap),
+        gate=types.SimpleNamespace(ack_path=ack))
+    runner.lock = threading.Lock()
+    runner.workers = workers if workers is not None else {}
+    runner._gate_slots = {}
+    runner._gate_slots_lock = threading.RLock()
+    return runner
+
 
 class SlotPoolTest(unittest.TestCase):
     """`caps.max_concurrent` per host: two runners share the cap."""
@@ -260,13 +318,7 @@ class SlotPoolTest(unittest.TestCase):
         from ameesh.runner import Runner
         ack = os.path.join(os.path.dirname(self.dir), "ack.json")
 
-        def runner():
-            gate = types.SimpleNamespace(max_concurrent=lambda: 1,
-                                         gate=types.SimpleNamespace(ack_path=ack))
-            return types.SimpleNamespace(host_gate=gate, lock=threading.Lock(),
-                                         workers={}, _gate_slots={})
-
-        first, second = runner(), runner()
+        first, second = slot_runner(ack, 1), slot_runner(ack, 1)
         admitted, slot = Runner._gate_slot(first, {"name": "a"})
         self.assertTrue(admitted)
         first._gate_slots["a"] = slot
@@ -278,10 +330,7 @@ class SlotPoolTest(unittest.TestCase):
 
     def fake_runner(self, cap, workers=None):
         ack = os.path.join(os.path.dirname(self.dir), "ack.json")
-        gate = types.SimpleNamespace(max_concurrent=lambda: cap["value"],
-                                     gate=types.SimpleNamespace(ack_path=ack))
-        return types.SimpleNamespace(host_gate=gate, lock=threading.Lock(),
-                                     workers=workers or {}, _gate_slots={})
+        return slot_runner(ack, lambda: cap["value"], workers)
 
     def test_agents_admitted_without_a_cap_count_when_one_is_set(self):
         # codex r2 #279: a worker admitted without max_concurrent held no slot,
@@ -313,6 +362,40 @@ class SlotPoolTest(unittest.TestCase):
         self.assertEqual(Runner._gate_slot(runner, {"name": "a"}), (False, None))
         cap["value"] = None  # without a cap, nothing to count: admitted
         self.assertEqual(Runner._gate_slot(runner, {"name": "a"}), (True, None))
+
+    def test_workers_from_before_the_gate_hold_their_slot_at_once(self):
+        # codex r3 #279: a worker from before the gate took its slot only at
+        # its runner's next claim; with nothing to claim on A, B admitted past
+        # the cap. The controller makes them hold one as it starts
+        ack = os.path.join(os.path.dirname(self.dir), "ack.json")
+        a = slot_runner(ack, 1, workers={"old": FakeWorker("old")})
+        b = slot_runner(ack, 1)
+        gate = FakeGate(host_gate.GateState("available", 1))
+        ctl = host_gate.GateController(a, gate)
+        self.addCleanup(ctl.stop)
+        ctl.start()  # A claims nothing, ever
+        self.assertIsNotNone(a._gate_slots.get("old"))
+        self.assertEqual(host_gate.SlotPool(self.dir).acquire(1), None)
+        self.assertEqual(b._gate_slot({"name": "new"}), (False, None))
+        # and at each tick: a worker A registered meanwhile (no claim) too
+        a.workers["late"] = FakeWorker("late")
+        ctl.tick()
+        self.assertIsNotNone(a._gate_slots.get("late"))
+        for name in ("old", "late"):
+            a._release_slot(name)
+
+    def test_a_failed_slot_open_leaks_no_slot(self):
+        # codex r3 #279: slot-0 free and opened, opening slot-1 fails: the fd
+        # of slot-0 stayed open and locked, the slot lost until the runner died
+        pool = host_gate.SlotPool(self.dir)
+        host_gate.SlotPool.release(pool.acquire(None))  # slot-0, now free
+        os.makedirs(os.path.join(self.dir, "slot-1"))  # opening it fails
+        with self.assertRaises(OSError):
+            pool.acquire(2)
+        os.rmdir(os.path.join(self.dir, "slot-1"))
+        held = [pool.acquire(1)]
+        self.assertIsNotNone(held[0])  # slot-0 is free again
+        host_gate.SlotPool.release(held[0])
 
     def test_a_lower_cap_counts_every_held_slot(self):
         pool = host_gate.SlotPool(self.dir)
@@ -366,6 +449,10 @@ class FakeGate:
         self.fail_acks = 0
 
     def state(self):
+        return self.st
+
+    def wait_change(self, timeout):
+        time.sleep(min(timeout, 0.05))
         return self.st
 
     def acknowledge(self, ack):
@@ -545,6 +632,58 @@ class ClaimErrorTest(PgTestCase):
         slot = host_gate.SlotPool(slots).acquire(1)  # the only slot is free
         self.assertIsNotNone(slot)
         host_gate.SlotPool.release(slot)
+
+
+class OnceTurnTest(PgTestCase):
+    """codex r3 #279: `--once` runs its turn in the foreground, outside
+    `workers`; its runner had neither controller nor ack part."""
+
+    def once_runner(self, holds):
+        import dataclasses
+        from ameesh.runner import Runner
+        self.register("solo", "claude", cwd=self.tmp, prompt="consigne")
+        runner = Runner(dataclasses.replace(self.cfg, poll=1.0), self.db, once=True)
+        self.addCleanup(runner.stop.set)
+        self.events: list = []
+        runner.host_gate = types.SimpleNamespace(
+            max_concurrent=lambda: None, holds_turns=lambda: holds["value"],
+            describe=lambda: "draining (test, seq 2)",
+            tick=lambda: self.events.append(("tick", runner.gate_foreground is not None)),
+            gate=types.SimpleNamespace(ack_path=os.path.join(self.tmp, "gate", "ack.json")))
+        runner._gate_settled.set()
+        return runner
+
+    def test_the_part_says_held_before_the_turn_and_free_after(self):
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        runner = self.once_runner({"value": False})
+
+        def turn(worker, _wait):
+            self.events.append(("turn", runner.gate_foreground is worker))
+            return True
+
+        with mock.patch.object(runner_mod.AgentWorker, "process_once", turn):
+            runner.sweep()
+        self.assertEqual(self.events, [("tick", True), ("turn", True), ("tick", False)])
+        self.assertTrue(runner.did_turn)
+
+    def test_a_gate_closed_before_the_turn_runs_none(self):
+        from unittest import mock
+        from ameesh import runner as runner_mod
+        holds = {"value": False}
+        runner = self.once_runner(holds)
+        tick = runner.host_gate.tick
+
+        def closing_tick():
+            tick()
+            holds["value"] = True  # the guard closes the gate meanwhile
+
+        runner.host_gate.tick = closing_tick
+        with mock.patch.object(runner_mod.AgentWorker, "process_once",
+                               side_effect=AssertionError("no turn")):
+            runner.sweep()
+        self.assertFalse(runner.did_turn)
+        self.assertIsNone(registry.get(self.db, "solo").get("lease_owner"))
 
 
 class RelocationPlanTest(PgTestCase):
