@@ -464,7 +464,7 @@ class RoadmapPgTest(PgTestCase):
         self.assertIn("ROADMAP", self.mesh("progress").stdout)
         self.assertNotIn("ROADMAP", self.mesh("progress", "--no-gantt").stdout)
         html = progress.render_html(snap)
-        self.assertIn('id="roadmap-section"', html)
+        self.assertIn('id="panel-gantt"', html)  # L304 : la frise est l'onglet Gantt
         self.assertIn('"ameesh-roadmap/1"', html)
         self.assertNotIn("<script src", html)
 
