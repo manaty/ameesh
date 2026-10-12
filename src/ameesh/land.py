@@ -241,13 +241,21 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         if row["state"] == "landing" and project.land == "pr":
-            return _follow_pr(db, project, row, slug, unlock, held, gh=gh)
+            return _follow_pr(db, project, row, slug, unlock, held, gh=gh,
+                              replayer=replayer)
         # land: local — a lot left `landing` (lease lost or runner gone) is
         # landed again from the start: the push to the target is never forced
         replayer.ensure()
         ops.queue_update(lot, state="landing", note="merge queue of %s: landing (%s)"
                          % (row["target"], project.land), actor=work.SYSTEM_SENDER)
         base = fresh_target(replayer, project, row["target"])
+        if project.land == "local" and resolutions._run(
+                replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
+                base).returncode == 0:
+            # #194 r4: another executor (an earlier epoch) already pushed it
+            unlock()
+            return _landed(db, project, row, {"sha": base, "state": "already", "files": []},
+                           base)
         rows = ops.resolutions([lot])
         merged = merge(replayer, base, row, rows)
         if merged["state"] == "conflict":
@@ -269,10 +277,16 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         if project.land == "local":
             if not held():
                 return lost
-            proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", url,
-                                    "%s:refs/heads/%s" % (merged["sha"],
-                                                          _branch_of(row["target"])),
+            # #194 r4: the lease cannot fence git; the push does: compare and
+            # swap on the target seen, so a stale executor never lands over
+            # another one (or over anyone who moved the target)
+            target_ref = "refs/heads/%s" % _branch_of(row["target"])
+            proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
+                                    "--force-with-lease=%s:%s" % (target_ref, base), url,
+                                    "%s:%s" % (merged["sha"], target_ref),
                                     timeout=FETCH_TIMEOUT)
+            if proc.returncode != 0 and not held():
+                return lost      # the holder of the next epoch owns the row now
             unlock()
             if proc.returncode != 0:
                 ops.queue_update(lot, state="queued", reason="target moved during the merge: "
@@ -305,9 +319,14 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             return dict(out, result="ejected")
         if not held():
             return lost
-        proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", url,
-                                "%s:refs/heads/%s" % (merged["sha"], row["branch"]),
+        # #194 r4: compare and swap on the freeze (see `local`)
+        branch_ref = "refs/heads/%s" % row["branch"]
+        proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
+                                "--force-with-lease=%s:%s" % (branch_ref, row["frozen_sha"]),
+                                url, "%s:%s" % (merged["sha"], branch_ref),
                                 timeout=FETCH_TIMEOUT)
+        if proc.returncode != 0 and not held():
+            return lost
         if proc.returncode != 0:
             unlock()
             out = _eject(db, row, project, "push to %s refused (%s)" % (
@@ -337,7 +356,31 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return error
 
 
-def _follow_pr(db, project, row: dict, slug, unlock, held, *, gh) -> dict:
+def target_moved(replayer, project, row: dict) -> str | None:
+    """#194 r4 (PR mode): the target's tip now, when it is no longer the base
+    of the merge commit `landing_sha` (its first parent); None if it has not
+    moved. Raises (LandError, GitError) when either cannot be read: the lot
+    stays `landing` and is read again (never a merge on an unknown base)."""
+    from . import resolutions
+    url = _origin(project) or project.repo
+    proc = resolutions._run(project.repo, "ls-remote", url,
+                            "refs/heads/%s" % _branch_of(row["target"]), timeout=FETCH_TIMEOUT)
+    tip = resolutions._text(proc).split()
+    if proc.returncode != 0 or not tip:
+        raise LandError("git ls-remote %s: %s" % (_branch_of(row["target"]),
+                                                  resolutions._err(proc)[:200] or "no tip"))
+    parent = resolutions._run(replayer.path, "rev-parse", "%s^1" % row["landing_sha"])
+    if parent.returncode != 0:
+        replayer.ensure()
+        resolutions._run(replayer.path, "fetch", "--quiet", url,
+                         "+refs/heads/%s:%s" % (row["branch"], FRESH_REF + "-lot"),
+                         timeout=FETCH_TIMEOUT)
+        parent = resolutions._run(replayer.path, "rev-parse", "%s^1" % row["landing_sha"])
+    base = resolutions._check(parent, "rev-parse")
+    return None if tip[0] == base else tip[0]
+
+
+def _follow_pr(db, project, row: dict, slug, unlock, held, *, gh, replayer) -> dict:
     lot = int(row["work_item_id"])
     ops = storage.of(db).work
     status = pr_status(slug, row["branch"], gh=gh) if slug else None
@@ -374,6 +417,17 @@ def _follow_pr(db, project, row: dict, slug, unlock, held, *, gh) -> dict:
     if not held():
         return {"lot": lot, "result": "busy",
                 "error": "lease lost before merging PR #%s" % status["number"]}
+    # #194 r4: the CI ran on the merge with the target as it was; GitHub has
+    # no compare-and-swap on the base, so the target is read right before the
+    # merge (the window left is that read and `gh pr merge`)
+    moved = target_moved(replayer, project, row)
+    if moved:
+        unlock()
+        return dict(_eject(db, row, project, "%s moved to %s since the merge %s: its CI "
+                           "ran on an older base" % (row["target"], moved[:12],
+                                                     row["landing_sha"][:12]),
+                           "Integrate %s again into your branch, freeze again, then ameesh "
+                           "work queue add %d." % (row["target"], lot)), result="ejected")
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     if error is not None:
         # #194 r3: the branch holds the merge commit; the lot stays `landing`

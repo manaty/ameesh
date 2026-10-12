@@ -359,6 +359,84 @@ class Review194Test(_Land):
                                            a, 1, "", "")), "exit 1")
 
 
+class StaleExecutorTest(_Land):
+    """#194 r4: a pause after the renewal, beyond the lease: another executor
+    takes the next epoch and lands; the first one's push is refused."""
+
+    def pause_after_renewal(self, then):
+        """The renewal right before the push succeeds, then the lease
+        expires, runner-2 takes it and `then()` runs (what runner-2 does)."""
+        real = self.locks.land_lock
+
+        def lock(key, owner, ttl_s, *, epoch=None):
+            got = real(key, owner, ttl_s, epoch=epoch)
+            if epoch is not None and owner == "runner-1" and got is not None:
+                held = self.locks.held[key]
+                self.locks.held[key] = (held[0], held[1], 0)
+                self.assertIsNotNone(real(key, "runner-2", 600))
+                then()
+            return got
+        self.fake.land_lock = lock
+
+    def test_local_push_refused_never_landed(self):
+        self.queued(4)
+        moved = {}
+
+        def runner2():
+            # runner-2, under the next epoch, lands another lot first (the same
+            # lot would give the very same merge commit within a second, and
+            # the push of an identical commit is rightly a no-op)
+            self.fake.land_lock = self.locks.land_lock
+            _git(self.repo, "push", "-q", "origin", "lot/3-c:main")
+            moved["sha"] = _git(self.origin, "rev-parse", "main")
+        self.pause_after_renewal(runner2)
+        out = self.land(4)
+        self.assertEqual(out["result"], "busy", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), moved["sha"])
+        self.assertNotIn("ameesh-work: 4", self.origin_log())
+        self.assertNotEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_local_next_epoch_sees_it_already_landed(self):
+        self.queued(4)
+        _git(self.repo, "push", "-q", "origin", "lot/4-d:main")   # pushed by an earlier epoch
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)  # nothing pushed
+
+    def test_pr_target_moved_since_the_merge_is_not_merged(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "landing", out)
+        _git(self.repo, "push", "-q", "origin", "lot/3-c:main")  # someone moved main
+        gh.head, gh.ci = out["sha"], "green"
+        self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
+        self.assertIn("since the merge", self.fake.queue_rows[4]["reason"])
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+    def test_pr_push_refused_not_ejected(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        moved = {}
+
+        def runner2():
+            # runner-2 pushed its own merge commit to the branch meanwhile
+            _git(self.repo, "push", "-q", "-f", "origin", "lot/3-c:lot/4-d")
+            moved["sha"] = _git(self.origin, "rev-parse", "lot/4-d")
+            self.fake.queue_rows[4]["landing_sha"] = moved["sha"]
+        self.pause_after_renewal(runner2)
+        out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "busy", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "lot/4-d"), moved["sha"])
+        self.assertNotEqual(self.fake.queue_rows[4]["state"], "ejected")
+        self.assertEqual(self.fake.queue_rows[4]["landing_sha"], moved["sha"])
+
+
 class SettingsAndAlertTest(unittest.TestCase):
     def test_settings(self):
         ok = radar.parse_settings({"projects": {"n": {"repo": "/r", "land": "local",
