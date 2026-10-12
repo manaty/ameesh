@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 from . import platform, storage
@@ -129,7 +130,10 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
 
     Rend None si la valeur est absente ou illisible (l'appelant décide du
     défaut ou du constat). Un texte négatif n'est pas un octet valide.
-    """
+    `decimal_ok=False` exige un nombre entier d'octets : « 4.5GiB » (exact)
+    passe, « 0.001KiB » (1.024 octet) est refusé au lieu d'être tronqué à 1
+    (codex #459 r2), et chaque chiffre compte, même au-delà des 28 chiffres
+    du contexte décimal (codex #459 r3)."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -137,7 +141,9 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
         return value if value >= 0 and finite_float(value) is not None else None
     if isinstance(value, float):
         # .inf, .nan (YAML): no size, never an unbounded one
-        if not decimal_ok or not math.isfinite(value) or value < 0:
+        if not math.isfinite(value) or value < 0:
+            return None
+        if not decimal_ok and not value.is_integer():
             return None
         return int(value)
     if not isinstance(value, str):
@@ -149,10 +155,40 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     if unit not in _UNITS:
         return None
     factor = _UNITS[unit]
-    if not decimal_ok and "." in number and factor == 1:
-        return None
     size = float(number) * factor
-    return int(size) if math.isfinite(size) else None
+    if not math.isfinite(size):
+        return None
+    if decimal_ok:
+        return int(size)
+    # arithmétique entière exacte : le texte doit désigner un nombre entier
+    # d'octets, et aucun chiffre ne doit être perdu. Une multiplication
+    # `Decimal` garde le contexte par défaut (28 chiffres significatifs) et
+    # arrondit : « 1.0000000000000000000000000001GiB » passait pour 1 GiB
+    # (codex #459 r3). On multiplie donc le nombre entier de chiffres par le
+    # facteur, puis on exige que l'échelle décimale divise exactement.
+    whole, _, fraction = number.partition(".")
+    try:
+        exact = int(whole + fraction) * factor
+    except ValueError:
+        # plus de chiffres que la limite de conversion des entiers de Python
+        # (4300 par défaut) : aucune taille, jamais une exception (codex #459
+        # r4 : `1.` suivi de 4300 zéros levait un ValueError non rattrapé)
+        return None
+    scale = 10 ** len(fraction)
+    if exact % scale:
+        return None
+    return exact // scale
+
+
+def bytes_digit_limit() -> int:
+    """The digit count beyond which Python refuses to convert a text to an
+    integer (`sys.get_int_max_str_digits()`, 4300 by default); 0 when the
+    running interpreter has no such limit (before 3.11).
+
+    A size written with more digits cannot be checked by the exact reader of
+    `parse_bytes(decimal_ok=False)`: the caller refuses it rather than reading
+    it through the float path (codex #459 r4)."""
+    return getattr(sys, "get_int_max_str_digits", lambda: 0)()
 
 
 def parse_fraction(value) -> float | None:
@@ -187,10 +223,17 @@ def finite_float(value) -> float | None:
 
 
 def parse_percent(value) -> float | None:
-    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None."""
+    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None. Le signe
+    `%` est unique et à la fin (codex #459 r1 : « 20%% » n'est pas 20)."""
     if isinstance(value, str):
-        value = value.strip().rstrip("%").strip()
-    number = finite_float(value)
+        text = value.strip()
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        if "%" in text:
+            return None
+        number = finite_float(text)
+    else:
+        number = finite_float(value)
     if number is None or not 0.0 <= number <= 100.0:
         return None
     return number

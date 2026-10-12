@@ -196,6 +196,32 @@ class InstallPilotTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("`memory_max` required", res.stderr)
 
+    def test_a_legacy_offer_the_previous_reader_accepted_installs(self):
+        # mesh-design #459 r4c: a refused `disk_paths` and a size the previous
+        # reader truncated to <= 0 drop the offer; the guard starts closed and
+        # lends nothing, but the installation goes on. The classification is
+        # structural: a value that copies the wording of a refused path does
+        # not pass for one.
+        for reclaim in ({"disk_paths": ["rel/x"]},
+                        {"disk_paths": ["/srv", "/srv/../etc"]},
+                        {"disk_free_min": 0},
+                        {"memory_available_min": "0.5B"}):
+            with self.subTest(reclaim=reclaim):
+                offer = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB",
+                         "reclaim": reclaim}
+                res = self.dry("--allow-rootfs", "--lend", "/dev/stdin",
+                               stdin=json.dumps(offer))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("offer dropped (the guard starts closed and lends nothing)",
+                              res.stderr)
+                self.assertIn('"lend": null', res.stdout)
+        # the same wording inside another value stays a real refusal
+        offer = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB",
+                 "windows": ["mon 10:00-11:00 disk_paths` refused path"]}
+        res = self.dry("--allow-rootfs", "--lend", "/dev/stdin", stdin=json.dumps(offer))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("invalid offer", res.stderr)
+
     def test_arguments_are_checked(self):
         for args in (["--enable", "x;rm"], ["--purge"], ["--set-guard-mode"],
                      ["--set-guard-mode", "on"], ["--root", "srv"]):
