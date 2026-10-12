@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from ameesh import adapters, conversation as C, db as db_mod, fil, progress, storage
@@ -172,11 +173,29 @@ class StoreTest(PgTestCase):
         if listener is None:
             self.skipTest("driver has no LISTEN")
         self.addCleanup(listener.close)
+        # psql starts LISTEN asynchronously. Observe a unique probe before
+        # testing transaction delivery; startup latency is not a lost event.
+        probe = json.dumps({"probe": uuid.uuid4().hex})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            storage.of(self.db).wakeups.notify(C.CHANNEL, probe)
+            message = listener.wait(0.5)
+            if message is not None and message.get("payload") == probe:
+                for _ in range(32):
+                    message = listener.wait(0.1)
+                    if message is None:
+                        break
+                    self.assertNotEqual(message.get("event"), "down", message)
+                else:
+                    self.fail("conversation listener probe queue did not drain")
+                break
+        else:
+            self.fail("conversation listener never became ready")
         with self.db.transaction() as tx:
             log = C.Log(tx, self.cfg, agent="worker", project="acme")
             row = log.append("text", "sensitive " * 2000, event_id="1")
             self.assertIsNone(listener.wait(0.1))
-        notification = listener.wait(3)
+        notification = listener.wait(5)
         self.assertIsNotNone(notification)
         self.assertEqual(json.loads(notification["payload"]), {"agent": "worker", "seq": row["seq"]})
         self.log.append("text", "ignored", event_id="1")
