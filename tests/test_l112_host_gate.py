@@ -698,7 +698,7 @@ class ExecuteurTest(PgTestCase):
         row = registry.get(self.db, "enfant")
         self.assertEqual(row["pending_prompt"], "travail")
         self.assertIsNone(row["lease_owner"])
-        self.assertIn("hôte indisponible", row["status_text"])
+        self.assertIn("host unavailable", row["status_text"])
         with open(os.path.join(self.cfg.agent_dir("enfant"), "session")) as fh:
             self.assertEqual(fh.read().strip(), "sess-l112")  # session gardée
         # rien n'est réclamé tant que l'hôte n'est pas revenu

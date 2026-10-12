@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 326,
+  "interface_total": 330,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4020,6 +4020,10 @@
     "open_for_sweep",
     "overdue_delegations",
     "publish_reference",
+    "queue",
+    "queue_add",
+    "queue_remove",
+    "queue_update",
     "recent_or_cited",
     "record_resolution",
     "reference",
