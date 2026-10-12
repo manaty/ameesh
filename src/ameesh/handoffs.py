@@ -16,7 +16,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
-from . import projects, resources, storage
+from . import projects, relocation, resources, storage
 from .db import DbError
 
 GIB = 1024 ** 3
@@ -94,6 +94,7 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
         target_limits = limits_for(target)
         if (not target_limits or not isinstance(target_limits.get("max_agents"), int)
                 or target_limits["max_agents"] < 1 or not _readings_ready(rows,now)
+                or not relocation.gate_open(rows[-1], target_limits.get("lend"), now=now)
                 or any(resources.pressure(r, limits=target_limits)["blocked"] for r in rows)):
             continue
         canon = agent.get("canon") or ""
@@ -114,6 +115,7 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "memory_bytes": memory_bytes, "disk_bytes": disk_bytes,
                       "available_memory": memory, "available_disk": disk,
                       "max_agents": target_limits["max_agents"],
+                      "requires_gate": target_limits.get("lend") is not None,
                       "sampled_ts": rows[-1]["sampled_ts"], "harness": agent["harness"],
                       "reason": "source_pressure" if current_pressure else "spare_capacity",
                       "source_cwd": agent.get("cwd") or "",
@@ -246,6 +248,13 @@ def _serialized(function):
 
 
 def _effect(api, adapter, step, op):
+    if step not in ("revalidate", "restore_source"):
+        # The domain API is bound to the same controller DB; host readings
+        # come through storage, not through an adapter's cached admission.
+        target = storage.of(api.db).hosts.latest(op["target"])
+        offer = {} if op["plan"].get("requires_gate") else None
+        if target is None or not relocation.gate_open(target, offer):
+            raise HandoffError("destination host gate closed or stale")
     intent = api.begin_effect(op["id"], op["state"], step)
     if intent is None:
         raise HandoffError("host effect refused: reservation or controller intent changed")

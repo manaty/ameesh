@@ -86,10 +86,27 @@ class HandoffTest(PgTestCase):
         self.limits["max_agents"] = 4
         self.adapter = HostAdapter()
 
-    def reading(self, host, memory):
+    def reading(self, host, memory, **fields):
         return self.api.hosts.record({"host": host, "mem_available_bytes": memory,
                                      "swap_used_bytes": 0, "cpu_count": 8, "load1": 0.0,
-                                     "disk_free_bytes": 100*GIB, "turns_in_progress": 0})
+                                     "disk_free_bytes": 100*GIB, "turns_in_progress": 0, **fields})
+
+    def test_withdrawing_destination_is_not_planned(self):
+        self.assertIsNotNone(self.candidate())
+        for state in ("draining", "stopped"):
+            self.reading("target", 24*GIB, gate_state=state)
+            self.assertIsNone(self.candidate())
+        self.reading("target", 24*GIB, gate_state="available")
+        self.assertIsNotNone(self.candidate())
+
+    def test_gate_closing_after_activation_prevents_enable(self):
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        self.assertEqual(op["state"], "activated")
+        self.reading("target", 24*GIB, gate_state="draining")
+        held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
 
     def candidate(self, name="dev"):
         return handoffs.plan(self.db, registry.get(self.db, name), limits_for=lambda host:self.limits)
