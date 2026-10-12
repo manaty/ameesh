@@ -2235,6 +2235,19 @@ class HostLifecycle(Domain):
     def agents(self, host: str, generation: int) -> list[dict]:
         """Agent origins ordered critical first, with progress/refusals."""
 
+    @abc.abstractmethod
+    def demand(self, agent: str, current_host: str) -> dict | None:
+        """Current withdrawal or return request applicable to this agent."""
+
+    @abc.abstractmethod
+    def progress(self, host: str, generation: int, agent: str, *, operation: str | None,
+                 missing: Sequence[str]) -> bool:
+        """CAS progress against the current host generation."""
+
+    @abc.abstractmethod
+    def expire_returns(self) -> list[dict]:
+        """Convert elapsed planned withdrawals to durable return requests."""
+
 
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).

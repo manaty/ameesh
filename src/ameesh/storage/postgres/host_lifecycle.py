@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L232e: withdrawal writes serialize with claims and enable publication."""
+import json
+
 from .. import interface
 from .hosts import Hosts
 
@@ -55,3 +57,37 @@ class HostLifecycle(interface.HostLifecycle):
         return self.db.query("SELECT agent, critical, operation, missing "
                              "FROM host_lifecycle_agents WHERE host=%s AND generation=%s "
                              "ORDER BY critical DESC,agent", (host, generation))
+
+    def demand(self, agent, current_host):
+        source = self.get(current_host)
+        if source and source["mode"] == "draining":
+            return dict(source, reason="host_drain", target=None)
+        rows = self.db.query(
+            "SELECT c.host,c.generation FROM host_lifecycle c "
+            "JOIN host_lifecycle_agents a ON a.host=c.host AND a.generation=c.generation "
+            "WHERE a.agent=%s AND c.mode='returning' AND c.host<>%s "
+            "ORDER BY c.requested_at DESC,c.host LIMIT 1", (agent, current_host))
+        return dict(rows[0], reason="host_return", target=rows[0]["host"]) if rows else None
+
+    def progress(self, host, generation, agent, *, operation, missing):
+        rows = self.db.query(
+            "UPDATE host_lifecycle_agents a SET operation=%s,missing=%s::jsonb "
+            "FROM host_lifecycle c WHERE a.host=c.host AND a.generation=c.generation "
+            "AND c.host=%s AND c.generation=%s AND a.agent=%s RETURNING a.agent",
+            (operation, json.dumps(list(missing)), host, generation, agent))
+        return bool(rows)
+
+    def expire_returns(self):
+        rows = self.db.query("SELECT host,generation FROM host_lifecycle "
+                             "WHERE mode='draining' AND return_at<=clock_timestamp()", ())
+        changed = []
+        for row in rows:
+            with self.db.transaction() as tx:
+                Hosts._lock_gate(tx, row["host"])
+                updated = tx.query(
+                    "UPDATE host_lifecycle SET mode='returning',return_at=NULL, "
+                    "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
+                    "AND mode='draining' AND return_at<=clock_timestamp() RETURNING " + _ROW,
+                    (row["host"], row["generation"]))
+                changed.extend(updated)
+        return changed

@@ -82,7 +82,8 @@ def _capacity(reading, limits):
     return max(0, (memory or 0)-limits["min_mem_available"]), max(0, (disk or 0)-limits["min_disk_free"])
 
 
-def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, disk_bytes=2*GIB):
+def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, disk_bytes=2*GIB,
+         demand=None, readiness_for=None):
     """Fresh admitted targets; sustained pressure or materially better spare capacity.
 
     limits_for returns the effective physical limits (strictest across canons),
@@ -92,7 +93,10 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
     if agent.get("status") in ("stopped", "paused") or agent.get("mode") != "execute":
         return None
     api = storage.of(db)
-    if api.handoffs.active(agent["name"]) or api.handoffs.cooling(agent["name"], COOLDOWN):
+    forced = demand is not None
+    if forced and demand.get("reason") not in ("host_drain", "host_return"):
+        raise HandoffError("invalid host lifecycle request")
+    if api.handoffs.active(agent["name"]) or (not forced and api.handoffs.cooling(agent["name"], COOLDOWN)):
         return None
     history = api.hosts.history(agent["host"], SAMPLES)
     if not _readings_ready(history, now):
@@ -107,7 +111,7 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
     current_mem, _ = _capacity(history[-1], limits)
     found = []
     for target in agent.get("admitted_hosts") or []:
-        if target == agent["host"]:
+        if target == agent["host"] or (forced and demand.get("target") and target != demand["target"]):
             continue
         rows = api.hosts.history(target, SAMPLES)
         target_limits = limits_for(target)
@@ -126,7 +130,9 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
         memory, disk = _capacity(rows[-1], target_limits)
         if memory < memory_bytes or disk < disk_bytes:
             continue
-        if not current_pressure and (not queued or memory < current_mem+memory_bytes):
+        if not forced and not current_pressure and (not queued or memory < current_mem+memory_bytes):
+            continue
+        if forced and (readiness_for is None or not readiness_for(agent, target).get("ready")):
             continue
         found.append({"agent": agent["name"], "source": agent["host"], "target": target,
                       "owner": agent.get("lease_owner"), "epoch": agent.get("lease_epoch"),
@@ -136,7 +142,9 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "max_agents": target_limits["max_agents"],
                       "requires_gate": target_limits.get("lend") is not None,
                       "sampled_ts": rows[-1]["sampled_ts"], "harness": agent["harness"],
-                      "reason": "source_pressure" if current_pressure else "spare_capacity",
+                      "reason": demand["reason"] if forced else ("source_pressure" if current_pressure else "spare_capacity"),
+                      **({"lifecycle_host": demand["host"], "lifecycle_generation": demand["generation"]}
+                         if forced else {}),
                       "source_cwd": agent.get("cwd") or "",
                       "checkpoint_lot": agent.get("session_work_item"),
                       "project": projects.agent_project(agent) or ""})

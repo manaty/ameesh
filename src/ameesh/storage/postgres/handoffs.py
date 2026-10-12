@@ -168,6 +168,13 @@ class Handoffs(interface.Handoffs):
             api = Handoffs(tx)
             if api.active(plan["agent"]):
                 return api.active(plan["agent"])
+            if plan.get("reason") in ("host_drain", "host_return"):
+                mode = "draining" if plan["reason"] == "host_drain" else "returning"
+                controls = tx.query("SELECT host FROM host_lifecycle WHERE host=%s "
+                                    "AND generation=%s AND mode=%s",
+                                    (plan["lifecycle_host"], plan["lifecycle_generation"], mode))
+                if not controls:
+                    return None
             if (not agent["live"] or (agent["canon"] or "") != plan["canon"]
                     or agent["host"] != plan["source"] or plan["target"] not in (agent["admitted_hosts"] or [])
                     or agent["status"] == "stopped" or agent["mode"] != "execute"
@@ -262,7 +269,7 @@ class Handoffs(interface.Handoffs):
             active_lot = tx.query("SELECT id FROM work_items WHERE assignee=%s"
                                   " AND state NOT IN ('intake','merged','promoted','closed') LIMIT 1",
                                   (op["agent"],))
-            if active_lot:
+            if active_lot and plan.get("reason") not in ("host_drain", "host_return"):
                 return None
             rows = tx.query("UPDATE host_handoffs SET state='drained', fenced=true,"
                             " updated_at=clock_timestamp() WHERE id=%s AND state='prepared'"
