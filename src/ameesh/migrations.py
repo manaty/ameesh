@@ -75,9 +75,13 @@ def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
 REPO_PATH = "src/ameesh/migrations"
 #: le dépôt d'ameesh lui-même : seul à compter aussi les migrations du paquet
 AMEESH_REPO = "manaty/ameesh"
-#: un fichier de migration d'un dépôt quelconque : `NNN_nom.sql` ou `NNNN_nom.sql`
-_REPO_FILE_RE = re.compile(r"^(\d{3,4})_[A-Za-z0-9._-]+\.sql$")
-_ORIGIN_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+#: un numéro pris dans un dépôt : tout nom qui commence par des chiffres et `_`,
+#: quel que soit le reste (`377_receipt+fix.sql`, `360_restore.sql`)
+_REPO_FILE_RE = re.compile(r"^(\d+)_")
+#: `owner/repo` GitHub, sans le suffixe `.git`
+_SLUG_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+#: l'URL courte ssh : `[user@]github.com:owner/repo[.git]`
+_SCP_RE = re.compile(r"^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):(?!/)(.+)$")
 
 
 @dataclass(frozen=True)
@@ -103,13 +107,20 @@ LAYOUTS = {
 }
 
 
+def repo_key(repo: str | None) -> str:
+    """La clé d'un dépôt `owner/repo` : sans espaces, en minuscules (GitHub ne
+    distingue pas la casse ; une seule suite par dépôt)."""
+    return (repo or "").strip().lower()
+
+
 def layout_for(repo: str, cfg=None) -> Layout | None:
     """La disposition des migrations du dépôt `owner/repo`, ou None."""
+    repo = repo_key(repo)
+    known = LAYOUTS.get(repo)
     for project in _radar_projects(cfg):
-        if project.github.casefold() == repo.casefold() and project.migrations:
-            known = LAYOUTS.get(repo)
+        if repo_key(project.github) == repo and project.migrations:
             return Layout(repo, project.migrations, known.width if known else 4)
-    return LAYOUTS.get(repo)
+    return known
 
 
 def _radar_projects(cfg) -> list:
@@ -126,7 +137,7 @@ def _radar_projects(cfg) -> list:
 def checkout_for(repo: str, cfg=None) -> str | None:
     """Un clone local de `repo` déclaré à l'hôte (`radar.projects.<p>.repo`)."""
     for project in _radar_projects(cfg):
-        if project.github.casefold() == repo.casefold() and os.path.isdir(project.repo):
+        if repo_key(project.github) == repo_key(repo) and os.path.isdir(project.repo):
             return project.repo
     return None
 
@@ -151,10 +162,32 @@ def _git(repo: str, *args: str) -> str:
         return ""
 
 
+def github_repo(url: str) -> str | None:
+    """Le dépôt `owner/repo` (minuscules) d'une URL git dont l'hôte est
+    exactement github.com : https, ssh:// ou forme courte `git@github.com:`.
+    None pour tout autre hôte ou chemin (pas de recherche de sous-chaîne)."""
+    from urllib.parse import urlsplit
+
+    url = (url or "").strip()
+    if "://" in url:
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "http", "ssh", "git"):
+            return None
+        host, path = (parts.hostname or ""), parts.path.lstrip("/")
+    else:
+        match = _SCP_RE.match(url)
+        if not match:
+            return None
+        host, path = match.group(1), match.group(2)
+    if host.lower() != "github.com":
+        return None
+    match = _SLUG_RE.match(path)
+    return repo_key("%s/%s" % match.groups()) if match else None
+
+
 def origin_repo(checkout: str) -> str | None:
     """Le dépôt GitHub `owner/repo` de l'`origin` d'un clone, ou None."""
-    match = _ORIGIN_RE.search(_git(checkout, "remote", "get-url", "origin").strip())
-    return match.group(1) if match else None
+    return github_repo(_git(checkout, "remote", "get-url", "origin"))
 
 
 def toplevel(path: str) -> str:

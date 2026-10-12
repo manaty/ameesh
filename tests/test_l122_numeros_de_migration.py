@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 from ameesh import db as db_mod, migrations, work
@@ -108,6 +109,29 @@ class NumerosDuDepotTest(unittest.TestCase):
             self.assertEqual(sorted(migrations.repo_numbers(nexlink, NEXLINK, package=package)),
                              [12])
 
+    def test_tout_nom_numerote_compte(self):
+        """#443 r1 P2 : `377_receipt+fix.sql` occupe 377, même hors du format."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink", NEXLINK.directory,
+                          ["376_a.sql", "377_receipt+fix.sql", "378_x.SQL", "README.md",
+                           "v379_pas_un_numero.sql"])
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK)), [376, 377, 378])
+
+    def test_origin_hote_exact(self):
+        """#443 r1 P2 : l'hôte doit être github.com, pas une sous-chaîne."""
+        for url in ("https://github.com/manaty/nexlink.git", "https://github.com/Manaty/Nexlink",
+                    "https://user@github.com/manaty/nexlink.git/", "git@github.com:manaty/nexlink.git",
+                    "ssh://git@github.com/manaty/nexlink", "github.com:manaty/nexlink"):
+            with self.subTest(url=url):
+                self.assertEqual(migrations.github_repo(url), "manaty/nexlink")
+        for url in ("https://notgithub.com/manaty/nexlink.git",
+                    "https://github.com.evil.example/manaty/nexlink.git",
+                    "git@gitlab.com:manaty/nexlink.git", "https://example.com/github.com/manaty/nexlink",
+                    "https://github.com/manaty/nexlink/tree/x", "file:///srv/github.com/manaty/nexlink",
+                    "/srv/github.com:manaty/nexlink", ""):
+            with self.subTest(url=url):
+                self.assertIsNone(migrations.github_repo(url))
+
     def test_disposition(self):
         self.assertEqual(NEXLINK.file(378), "supabase/migrations/378_<name>.sql")
         self.assertEqual(AMEESH.file(378), "src/ameesh/migrations/0378_<name>.sql")
@@ -191,6 +215,11 @@ class ReservationTest(PgTestCase):
         with self.assertRaises(work.WorkError) as ctx:
             work.reserve_migration(self.db, nx["id"], repo=self.ameesh)
         self.assertIn("clone of manaty/ameesh, not of manaty/nexlink", str(ctx.exception))
+        # #443 r1 P2 : un hôte qui contient « github.com » n'est pas github.com
+        _git(self.nexlink, "remote", "set-url", "origin", "https://notgithub.com/manaty/nexlink.git")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(nx)
+        self.assertIn("no GitHub origin", str(ctx.exception))
         bare = work.add(self.db, title="sans issue", actor="mesh-design")
         with self.assertRaises(work.WorkError) as ctx:
             work.reserve_migration(self.db, bare["id"], repo=self.ameesh)
@@ -200,6 +229,47 @@ class ReservationTest(PgTestCase):
             work.reserve_migration(self.db, unknown["id"], repo=self.ameesh)
         self.assertIn("migrations directory unknown", str(ctx.exception))
         self.assertIsNone(work.get(self.db, nx["id"])["migration"])
+
+    def test_cle_de_depot_en_minuscules(self):
+        """#443 r1 P2 : `Manaty/Nexlink` et `manaty/nexlink` sont une seule suite,
+        avec la disposition de nexlink, même déclarée en majuscules à l'hôte."""
+        cfg = types.SimpleNamespace(github=None, radar={"projects": {"nx": {
+            "repo": self.nexlink, "github": "Manaty/Nexlink",
+            "migrations": NEXLINK.directory}}})
+        upper = self._lot("nx", "Manaty/Nexlink", 3)
+        got = work.reserve_migration(self.db, upper["id"], cfg=cfg)
+        self.assertEqual((got["migration"], got["migration_repo"]), (378, "manaty/nexlink"))
+        self.assertEqual(got["migration_file"], "supabase/migrations/378_<name>.sql")
+        lower = self._lot("nx2", "manaty/nexlink", 4)
+        with self.assertRaises(work.WorkError) as ctx:
+            work.reserve_migration(self.db, lower["id"], 378, cfg=cfg)
+        self.assertIn("lot #%d" % upper["id"], str(ctx.exception))
+        self.assertEqual(work.reserve_migration(self.db, lower["id"], cfg=cfg)["migration"], 379)
+        # en base aussi : un dépôt écrit en majuscules tombe dans la même suite
+        with self.assertRaises(DbError):
+            self.db.execute("UPDATE work_items SET migration = 379,"
+                            " migration_repo = 'MANATY/nexlink' WHERE id = %d"
+                            % self._lot("nx3", n=5)["id"])
+
+    def test_pas_d_espace_de_noms_invente(self):
+        """#443 r1 P2 : sans dépôt d'issue, un client d'avant #443 est refusé
+        (pas de `unknown/<app>`) ; une issue entourée d'espaces garde son dépôt."""
+        held = work.add(self.db, title="nx", app="nexlink", issue_ref=" manaty/nexlink#9 ",
+                        actor="mesh-design")
+        self.db.execute("UPDATE work_items SET migration = 389 WHERE id = %d" % held["id"])
+        self.assertEqual(work.get(self.db, held["id"])["migration_repo"], "manaty/nexlink")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(self._lot("nx2", "manaty/nexlink", 10), 389)
+        self.assertIn("lot #%d" % held["id"], str(ctx.exception))
+        bare = work.add(self.db, title="sans issue", app="nexlink", actor="mesh-design")
+        with self.assertRaises(DbError) as ctx:
+            self.db.execute("UPDATE work_items SET migration = 390 WHERE id = %d" % bare["id"])
+        self.assertIn("without a repository", str(ctx.exception))
+        rows = self.db.query("SELECT work_items_issue_repo(%s) AS a, work_items_issue_repo(%s) AS b,"
+                             " work_items_issue_repo(%s) AS c",
+                             (" Manaty/Nexlink#3\n", "", "manaty/nexlink"))
+        self.assertEqual((rows[0]["a"], rows[0]["b"], rows[0]["c"]),
+                         ("manaty/nexlink", None, None))
 
     def test_la_base_garantit_l_unicite(self):
         """Hors de l'outil, la contrainte refuse un doublon (dépôt, numéro)."""

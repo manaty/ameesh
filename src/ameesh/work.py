@@ -304,9 +304,11 @@ _ISSUE_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[0-9]+$")
 def lot_repository(item: dict, cfg=None) -> str:
     """#443 : le dépôt `owner/repo` d'un lot, celui de son issue, sinon celui
     que la configuration de l'hôte donne à son projet (`github.projects`)."""
+    from .migrations import repo_key
+
     match = _ISSUE_REPO_RE.match((item.get("issue_ref") or "").strip())
     if match:
-        return match.group(1)
+        return repo_key(match.group(1))
     if cfg is not None and (item.get("app") or "").strip():
         from . import plan_github
 
@@ -315,7 +317,7 @@ def lot_repository(item: dict, cfg=None) -> str:
         except plan_github.SettingsError:
             repo = None
         if repo:
-            return repo
+            return repo_key(repo)
     raise WorkError("lot #%s has no repository: link its issue first "
                     "(`ameesh work link %s owner/repo#N`)" % (item["id"], item["id"]))
 
@@ -416,7 +418,7 @@ def _checkout(slug: str, path: str | None, cfg=None) -> str:
     if not top:
         raise WorkError("%s is not a git repository: pass --repo <clone of %s>" % (where, slug))
     origin = migrations.origin_repo(top)
-    if (origin or "").casefold() != slug.casefold():
+    if origin != slug:
         raise WorkError("%s is a clone of %s, not of %s (the lot's repository): "
                         "pass --repo <clone of %s>" % (top, origin or "no GitHub origin",
                                                        slug, slug))
