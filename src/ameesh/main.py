@@ -102,6 +102,8 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
+        reserved host move at a lot boundary, durable journal (L232a);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
@@ -129,7 +131,7 @@ import sys
 MESH_COMMANDS = (
     "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
-    "review-class",
+    "review-class", "handoff",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)

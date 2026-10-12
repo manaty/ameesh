@@ -2322,46 +2322,35 @@ class AgentWorker(threading.Thread):
             self._compta_en_echec = True
 
     def maybe_relocate(self, pressure: dict) -> bool:
-        """Déplace l'agent vers un hôte admis disponible (L31, 0028), si activé.
+        """L232a: reserve a complete handoff; never directly move a worktree.
 
-        Entre deux tours seulement : l'hôte d'exécution change (`relocate`) et
-        le worker s'arrête, ce qui rend le bail ; l'exécuteur de l'hôte
-        d'arrivée réclamera l'agent. Jamais au milieu d'un tour ; ne lève
-        jamais."""
-        if not self.runner.relocate:
+        The separate L232b controller prepares hosts and drains at a lot
+        boundary. Only a persisted claim fence stops this source worker.
+        """
+        if not getattr(self.runner, "relocate", False):
             return False
-        from . import relocation as relocation_mod
+        from . import handoffs, storage, work
         try:
-            plan = relocation_mod.plan(
-                self.agent.get("admitted_hosts") or [], self.runner.host, db=self.db,
-                current_limits=(pressure or {}).get("limits"),
-                limits_for=self.runner.host_limits_for,
-                shared_sessions=self.runner.shared_sessions,
-                gate_max_age_s=max(relocation_mod.GATE_MAX_AGE_S,
-                                   5 * float(self.runner.cfg.resource_interval or 0)))
-            if plan is None:
+            active = storage.of(self.db).handoffs.active(self.name)
+            if active:
+                if active["fenced"]:
+                    self.stopping.set()
+                    self.wake.set()
+                    return True
                 return False
-            result = relocation_mod.move(self.db, self.agent, plan,
-                                         current_host=self.runner.host,
-                                         owner=self.runner.runner_id, epoch=self.epoch)
-        except db_mod.DbError as exc:
-            log("[%s] relocation failed (%s)" % (self.name, exc))
-            return False
-        if result is None:
-            return False
-        log("[%s] relocation to %s: %s (session %s)" % (
-            self.name, result["target"], result["reason"],
-            "kept" if result["keep_session"] else "rotated with a summary"))
-        self._fil_note(
-            "Relocation to %s: %s. %s" % (
-                result["target"], result["reason"],
-                "The session is resumed (shared storage)." if result["keep_session"]
-                else "The session is not portable: resuming from a summary at the top "
-                     "of the instruction."),
-            meta={"action": "deplacement", "vers": result["target"]})
-        self.stopping.set()
-        self.wake.set()
-        return True
+            queued = bool(self.agent.get("pending_prompt") or work.open_lots(self.db, self.name))
+            candidate = handoffs.plan(self.db, self.agent,
+                                      limits_for=self.runner.handoff_limits_for, queued=queued)
+            if candidate is None:
+                return False
+            remote = subprocess.run(["git", "-C", self.agent.get("cwd") or "", "remote", "get-url", "origin"],
+                                    check=True, text=True, capture_output=True, timeout=10).stdout.strip()
+            operation = handoffs.request(self.db, candidate, repository=remote)
+            log("[%s] host handoff %s reserved to %s; waits for host preparation and lot boundary"
+                % (self.name, operation["id"], operation["target"]))
+        except (db_mod.DbError, handoffs.HandoffError, OSError, subprocess.SubprocessError):
+            log("[%s] host handoff unavailable; source and worktree retained" % self.name)
+        return False
 
     def _held_by_pressure(self, pressure: dict) -> bool:
         """La pression de l'hôte retient-elle le prochain tour de cet agent ?
@@ -2604,6 +2593,8 @@ class AgentWorker(threading.Thread):
                           % (self.name, self.DB_STATUS))
             self._base_marquee = False
             self.agent = agent = registry.get(self.db, self.name) or agent
+        if self.maybe_relocate({}):
+            return None  # L232a persisted fence: return this worker's source lease
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         if self.runner.gate_holds():
@@ -2613,8 +2604,6 @@ class AgentWorker(threading.Thread):
         # (auditeur excepté ; orchestrateur sous pression non critique).
         pressure = self.runner.host_pressure()
         if self._held_by_pressure(pressure):
-            if self.maybe_relocate(pressure):
-                return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
             return None
         self._host_pressure_release()
@@ -5078,7 +5067,11 @@ class Runner:
         for one in canons:
             for h in one.hosts:
                 if h.title not in par_hote:
-                    par_hote[h.title] = resources_mod.host_limits(canons, h.title)["limits"]
+                    effective = resources_mod.host_limits(canons, h.title)
+                    par_hote[h.title] = effective["limits"]
+                    if not hasattr(self, "_handoff_limits"):
+                        self._handoff_limits = {}
+                    self._handoff_limits[h.title] = dict(effective["limits"], max_agents=effective["max_agents"])
         self._host_max_agents = mine["max_agents"]
         self._host_limits_origin = mine["origin"]
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
@@ -5117,6 +5110,10 @@ class Runner:
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
         return getattr(self, "_all_host_limits", {}).get(host)
+
+    def handoff_limits_for(self, host: str) -> dict | None:
+        """Effective physical limits and max_agents, for reserved host moves."""
+        return getattr(self, "_handoff_limits", {}).get(host)
 
     def container_runtime(self):
         """Le moteur de conteneurs de l'hôte, ou None (L31, 0028)."""

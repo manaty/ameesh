@@ -9,3 +9,4 @@
 * [Owner decisions](decisions/) - One decision per file, reported by mesh-design.
 * [Studies](etudes/) - Messaging, work catalog, human authority, business domains, harness standards.
 * [ameesh-approve: three hosting options](ameesh-approve-hebergement-equipes.md) - One WebAuthn identity per team, three hosting modes, switchover without re-enrollment.
+* [Durable host handoffs](../HOST-HANDOFFS.md) - Planner, lot-boundary fence, journal, simulated adapter contract and recovery (L232a).
