@@ -66,7 +66,8 @@ def main(argv):
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     rest = args.arguments
-    if any(arg in ("-h", "--help") for arg in rest):
+    option_args = rest[:rest.index("--")] if "--" in rest else rest
+    if any(arg in ("-h", "--help") for arg in option_args):
         return installed()[args.name].main(None, rest, actor="")
     cfg = config.load()
     db = db_mod.connect(cfg)

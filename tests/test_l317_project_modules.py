@@ -2,11 +2,10 @@
 """Project isolation and real execution evidence, including storage bypasses."""
 from __future__ import annotations
 
-import dataclasses
-import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -24,6 +23,13 @@ def federation(project="acme", names=None):
 
 
 class ModuleConfigurationTest(unittest.TestCase):
+    def test_it_cli_parses_artifact_options_after_lot_and_preserves_program_arguments(self):
+        with mock.patch.object(it, "prove", return_value={"id": 1}) as prove:
+            it.main(mock.Mock(), ["proof", "123", "--artifact", "/artifact", "--runner", "python3",
+                                 "--", "--help", "quoted argument"], actor="tester")
+        prove.assert_called_once_with(mock.ANY, 123, "/artifact", actor="tester", runner="python3",
+                                      arguments=["--help", "quoted argument"], timeout=60)
+
     def test_only_named_project_is_enabled(self):
         entries = modules.declarations(federation())
         self.assertEqual([(e["project"], e["module"]) for e in entries], [("acme", "it")])
@@ -53,6 +59,25 @@ class ModuleConfigurationTest(unittest.TestCase):
             result = canon_sync._sync_locked(lock, c, "main", "", "host")
         self.assertEqual(result.status, canon_sync.AUTH_REFUSED)
         apply.assert_not_called()
+
+    def test_partial_canon_preserves_policies_and_trusted_complete_canon_applies(self):
+        c = canon.Canon(root=".", readable=True, federation=federation())
+        lock = mock.Mock()
+        for partial in (True, False):
+            with self.subTest(partial=partial), \
+                    mock.patch.object(canon_sync, "last_applied", return_value=None), \
+                    mock.patch.object(canon_sync, "_verify", return_value=("main", "trusted", [])), \
+                    mock.patch.object(canon_sync, "_lag", return_value=([], [])), \
+                    mock.patch.object(canon_sync, "_partial", return_value=partial), \
+                    mock.patch.object(canon_sync.receipts, "_apply_authenticators", return_value={}), \
+                    mock.patch.object(canon_sync, "_record"), \
+                    mock.patch.object(modules, "sync") as apply:
+                result = canon_sync._sync_locked(lock, c, "main", "", "host")
+                self.assertEqual(result.status, canon_sync.AUTH_SYNCED)
+                if partial:
+                    apply.assert_not_called()
+                else:
+                    apply.assert_called_once_with(lock.db, c)
 
 
 class ExecutionTest(unittest.TestCase):
@@ -177,6 +202,32 @@ class LifecycleGateTest(PgTestCase):
             work.close_merged(self.db, self.lot)
         it.prove(self.db, self.lot, self.artifact, actor="tester", runner=sys.executable)
         self.assertEqual(work.close_merged(self.db, self.lot)["result"], "merged")
+
+    def test_closure_rechecks_after_waiting_for_concurrent_declaration(self):
+        self.prove()
+        result = []
+        entered = threading.Event()
+
+        def close_from_other_connection():
+            other = db_mod.connect(self.cfg)
+            try:
+                entered.set()
+                work.close_merged(other, self.lot, source="concurrent-sync")
+                result.append("closed")
+            except db_mod.DbError:
+                result.append("refused")
+            finally:
+                other.close()
+
+        with self.db.transaction() as tx:
+            it.declare(tx, self.lot, self.artifact, actor="tester")
+            thread = threading.Thread(target=close_from_other_connection, daemon=True)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=15))
+        thread.join(timeout=15)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, ["refused"])
+        self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
 
     def test_changed_delivery_blocks_promotion(self):
         self.prove()

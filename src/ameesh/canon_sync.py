@@ -940,6 +940,9 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
         return AuthenticatorSync(AUTH_REFUSED, "database: %s — transaction rolled back, "
                                                "authenticator registry unchanged" % exc,
                                  canon=key)
+    except ValueError as exc:
+        return AuthenticatorSync(AUTH_REFUSED, "module policy: %s — transaction rolled back" % exc,
+                                 canon=key)
 
 
 def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,

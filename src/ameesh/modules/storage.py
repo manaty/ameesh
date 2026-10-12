@@ -14,6 +14,10 @@ class ModuleStore:
         self.db = db
 
     def replace(self, canon, declarations):
+        with self.db.transaction() as tx:
+            ModuleStore(tx)._replace_locked(canon, declarations)
+
+    def _replace_locked(self, canon, declarations):
         # Serialized across all canons; ownership conflicts must never steal
         # another canon's project, including projects removed in this sync.
         self.db.execute("SELECT pg_advisory_xact_lock(hashtext('ameesh-project-modules'))")

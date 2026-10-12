@@ -66,6 +66,8 @@ def main(db, argv, *, actor):
     import argparse
     import json
     from ..storage import ModuleStore
+    split = argv.index("--") if "--" in argv else len(argv)
+    options, arguments = argv[:split], argv[split + 1:]
     parser = argparse.ArgumentParser(prog="ameesh module it")
     sub = parser.add_subparsers(dest="operation", required=True)
     for name in ("delivery", "proof"):
@@ -75,16 +77,16 @@ def main(db, argv, *, actor):
         if name == "proof":
             command.add_argument("--runner", help="optional interpreter/compatibility executable")
             command.add_argument("--timeout", type=float, default=60)
-            command.add_argument("arguments", nargs=argparse.REMAINDER)
     show = sub.add_parser("show")
     show.add_argument("lot", type=int)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(options)
+    if arguments and args.operation != "proof":
+        parser.error("artifact arguments are only valid for proof")
     if args.operation == "show":
         row = ModuleStore(db).milestones(args.lot)
     elif args.operation == "delivery":
         row = declare(db, args.lot, args.artifact, actor=actor)
     else:
-        arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         row = prove(db, args.lot, args.artifact, actor=actor, runner=args.runner,
                     arguments=arguments, timeout=args.timeout)
     print(json.dumps(row, ensure_ascii=False, default=str))
