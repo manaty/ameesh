@@ -76,14 +76,6 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
         pass
 
 
-def _eject(db, row: dict, project, reason: str, todo: str) -> dict:
-    lot = int(row["work_item_id"])
-    return merge_queue._eject(db, row, reason, (
-        "Merge queue of %s, lot #%d « %s »: ameesh could not merge it, %s. %s"
-        % (row["target"], lot, row.get("title") or "", reason, todo)),
-        {"project": project.name, "target": row["target"], "kind": "land"})
-
-
 # --------------------------------------------------------------------------
 # the merge in the clone
 # --------------------------------------------------------------------------
@@ -204,6 +196,111 @@ def pr_merge(slug: str, number, sha: str, method: str, gh=_gh) -> str | None:
 # one landing
 # --------------------------------------------------------------------------
 
+#: #194 r5: the lease of a target, on the remote itself (local mode): moved by
+#: each new holder before anything else, checked by every landing push
+LEASE_REF = "refs/ameesh/land/"
+#: a fixed identity and date: the lease commit of (key, epoch, owner) is the
+#: same commit whoever computes it, on any pass
+_LEASE_ENV = {"GIT_AUTHOR_NAME": "ameesh", "GIT_AUTHOR_EMAIL": "ameesh@localhost",
+              "GIT_COMMITTER_NAME": "ameesh", "GIT_COMMITTER_EMAIL": "ameesh@localhost",
+              "GIT_AUTHOR_DATE": "1970-01-01T00:00:00Z",
+              "GIT_COMMITTER_DATE": "1970-01-01T00:00:00Z"}
+
+
+def lease_commit(path: str, key: str, epoch: int, owner: str) -> str:
+    """The commit that stands for the lease `key` at `epoch` (empty tree)."""
+    env = dict(os.environ, **_LEASE_ENV)
+    tree = subprocess.run(["git", "-C", path, "mktree"], input=b"", capture_output=True,
+                          env=env, check=False)
+    if tree.returncode != 0:
+        raise GitError("git mktree: %s" % tree.stderr.decode("utf-8", "replace")[:200])
+    proc = subprocess.run(["git", "-C", path, "commit-tree", tree.stdout.decode().strip(),
+                           "-m", "ameesh land lease %s epoch %d (%s)" % (key, epoch, owner)],
+                          capture_output=True, env=env, check=False)
+    if proc.returncode != 0:
+        raise GitError("git commit-tree: %s" % proc.stderr.decode("utf-8", "replace")[:200])
+    return proc.stdout.decode().strip()
+
+
+class _Landing:
+    """One landing under the lease `(key, owner, epoch)` (#194 r5): every
+    queue write is a compare-and-swap on the lease, in the same statement — a
+    stale holder's writes fail, and it reports `busy`; the lease is released
+    once, at the end (`land_head`)."""
+
+    def __init__(self, db, project, row, key, owner, epoch, locks):
+        self.db, self.project, self.row = db, project, row
+        self.lot = int(row["work_item_id"])
+        self.ops = storage.of(db).work
+        self.key, self.owner, self.epoch, self.locks = key, owner, epoch, locks
+        self.release = False
+
+    @property
+    def lease(self):
+        return (self.key, self.owner, self.epoch)
+
+    def busy(self, why: str) -> dict:
+        self.locks.pop(self.key, None)
+        self.release = False
+        return {"lot": self.lot, "result": "busy", "error": why}
+
+    def held(self) -> bool:
+        """The lease is still ours, renewed, right before a push or a merge."""
+        if self.ops.land_lock(self.key, self.owner, LOCK_TTL_S, epoch=self.epoch) is not None:
+            return True
+        self.locks.pop(self.key, None)
+        return False
+
+    def write(self, **kw) -> bool:
+        return self.ops.queue_update(self.lot, lease=self.lease, **kw) is not None
+
+    def eject(self, reason: str, todo: str, **extra) -> dict:
+        self.release = True
+        row = self.row
+        if not self.write(state="ejected", reason=reason,
+                          note="merge queue of %s: ejected, %s" % (row["target"], reason),
+                          actor=work.SYSTEM_SENDER):
+            return self.busy("lease on %s lost: ejection not written" % self.key)
+        sent = merge_queue._wake(self.db, row.get("assignee"), self.lot, (
+            "Merge queue of %s, lot #%d « %s »: ameesh could not merge it, %s. %s"
+            % (row["target"], self.lot, row.get("title") or "", reason, todo)),
+            {"project": self.project.name, "target": row["target"], "kind": "land",
+             "lot": self.lot, "reason": reason})
+        return dict({"lot": self.lot, "to": row.get("assignee"), "kind": "ejected",
+                     "message_id": sent, "result": "ejected"}, **extra)
+
+    def landed(self, merged: dict, base, *, pr=None, wrong_base=None) -> dict:
+        self.release = True
+        row, project = self.row, self.project
+        reason = "merged by ameesh (%s)" % merged["sha"][:12]
+        if wrong_base:
+            reason = "merged by ameesh (%s) into %s, NOT %s: check it by hand" % (
+                merged["sha"][:12], wrong_base, _branch_of(row["target"]))
+        if not self.write(state="landed", reason=reason,
+                          note="merge queue of %s: landed by ameesh, %s%s" % (
+                              row["target"], merged["sha"][:12],
+                              ", PR #%s" % pr if pr else ""), actor=work.SYSTEM_SENDER):
+            return self.busy("lease on %s lost: landing not written" % self.key)
+        if wrong_base:
+            merge_queue._wake(self.db, row.get("assignee"), self.lot, (
+                "Merge queue of %s, lot #%d: PR #%s was merged into %s, not %s (retargeted "
+                "between the last read and the merge). Check it by hand."
+                % (row["target"], self.lot, pr, wrong_base, _branch_of(row["target"]))),
+                {"project": project.name, "target": row["target"], "kind": "land",
+                 "lot": self.lot, "reason": "wrong base"})
+        gates_text = ", ".join("`%s`" % g for g in project.gates)
+        _passive(self.db, row.get("assignee"), self.lot, (
+            "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on "
+            "the merged tree: %s. The branch sweep closes the lot."
+            % (row["target"], self.lot, row.get("title") or "", merged["sha"][:12],
+               ", PR #%s" % pr if pr else ", on %s" % (base or "?")[:12],
+               "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
+               if merged.get("state") == "replayed" else "", gates_text)),
+            {"project": project.name, "target": row["target"], "commit": merged["sha"]})
+        return {"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
+                "wrong_base": wrong_base}
+
+
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
               gh=_gh) -> dict:
     """Lands (or follows the landing of) `row`, the head of its queue.
@@ -221,139 +318,135 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         locks.pop(key, None)
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
-
-    def unlock() -> None:
-        ops.land_unlock(key, owner, epoch)
-        locks.pop(key, None)
-
-    def held() -> bool:
-        """#194 r3: the lease is still ours, renewed, right before a push or
-        a merge (gates may outlive it, and another runner take it)."""
-        if ops.land_lock(key, owner, LOCK_TTL_S, epoch=epoch) is not None:
-            return True
-        locks.pop(key, None)
-        return False
-
-    lost = {"lot": lot, "result": "busy", "error": "lease on %s lost before pushing" % key}
-
+    landing = _Landing(db, project, row, key, owner, epoch, locks)
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
+        return _land(landing, replayer, slug, gh)
+    except (GitError, LandError, OSError, ValueError) as exc:
+        error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
         if row["state"] == "landing" and project.land == "pr":
-            return _follow_pr(db, project, row, slug, unlock, held, gh=gh,
-                              replayer=replayer)
-        # land: local — a lot left `landing` (lease lost or runner gone) is
-        # landed again from the start: the push to the target is never forced
-        replayer.ensure()
-        ops.queue_update(lot, state="landing", note="merge queue of %s: landing (%s)"
-                         % (row["target"], project.land), actor=work.SYSTEM_SENDER)
-        base = fresh_target(replayer, project, row["target"])
-        if project.land == "local" and resolutions._run(
-                replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
-                base).returncode == 0:
-            # #194 r4: another executor (an earlier epoch) already pushed it
-            unlock()
-            return _landed(db, project, row, {"sha": base, "state": "already", "files": []},
-                           base)
-        rows = ops.resolutions([lot])
-        merged = merge(replayer, base, row, rows)
-        if merged["state"] == "conflict":
-            unlock()
-            out = _eject(db, row, project, "conflict on %s with %s at %s" % (
-                ", ".join(merged["files"][:6]) or "?", row["target"], base[:12]),
-                "Integrate %s into your branch (or prepare the resolution), freeze again, "
-                "then ameesh work queue add %d." % (row["target"], lot))
-            return dict(out, result="ejected")
-        checked = gates(project, replayer.path)
-        if not checked["ok"]:
-            unlock()
-            out = _eject(db, row, project, "gate `%s` failed on the merged tree"
-                         % checked["gate"],
-                         "Its output:\n%s\nFix it on your branch, freeze again, then "
-                         "ameesh work queue add %d." % (checked["output"], lot))
-            return dict(out, result="ejected", output=checked["output"])
-        url = _origin(project) or project.repo
-        if project.land == "local":
-            if not held():
-                return lost
-            # #194 r4: the lease cannot fence git; the push does: compare and
-            # swap on the target seen, so a stale executor never lands over
-            # another one (or over anyone who moved the target)
-            target_ref = "refs/heads/%s" % _branch_of(row["target"])
-            proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
-                                    "--force-with-lease=%s:%s" % (target_ref, base), url,
-                                    "%s:%s" % (merged["sha"], target_ref),
-                                    timeout=FETCH_TIMEOUT)
-            if proc.returncode != 0 and not held():
-                return lost      # the holder of the next epoch owns the row now
-            unlock()
-            if proc.returncode != 0:
-                ops.queue_update(lot, state="queued", reason="target moved during the merge: "
+            # its branch holds the merge commit: it stays `landing`, lease kept,
+            # and the PR is read again at the next pass (an error never merges)
+            landing.write(reason="reading PR failed (%s): retried" % str(exc)[:200])
+            return error
+        landing.release = True
+        landing.write(state="queued", reason="landing failed (%s): retried" % str(exc)[:200])
+        return error
+    finally:
+        if landing.release:
+            ops.land_unlock(key, owner, epoch)
+            locks.pop(key, None)
+
+
+def _land(landing: _Landing, replayer, slug, gh) -> dict:
+    from . import resolutions
+    project, row, lot = landing.project, landing.row, landing.lot
+    if row["state"] == "landing" and project.land == "pr":
+        return _follow_pr(landing, slug, gh=gh, replayer=replayer)
+    replayer.ensure()
+    url = _origin(project) or project.repo
+    branch = _branch_of(row["target"])
+    lease_ref = LEASE_REF + branch
+    mine = None
+    if project.land == "local":
+        # #194 r5: the lease on the remote, moved BEFORE any write of this
+        # holder: from then on a stale holder's landing push is refused
+        mine = lease_commit(replayer.path, landing.key, landing.epoch, landing.owner)
+        proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", "--force",
+                                url, "%s:%s" % (mine, lease_ref), timeout=FETCH_TIMEOUT)
+        if proc.returncode != 0:
+            landing.release = True
+            raise LandError("lease ref %s not moved (%s): nothing written, retried"
+                            % (lease_ref, resolutions._err(proc)[-200:]))
+    # land: local — a lot left `landing` (lease lost or runner gone) is
+    # landed again from the start: the push to the target is never forced
+    if not landing.write(state="landing", note="merge queue of %s: landing (%s)"
+                         % (row["target"], project.land), actor=work.SYSTEM_SENDER):
+        return landing.busy("lease on %s lost before landing" % landing.key)
+    base = fresh_target(replayer, project, row["target"])
+    if project.land == "local" and resolutions._run(
+            replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
+            base).returncode == 0:
+        # #194 r4: another executor (an earlier epoch) already pushed it
+        return landing.landed({"sha": base, "state": "already", "files": []}, base)
+    merged = merge(replayer, base, row, landing.ops.resolutions([lot]))
+    if merged["state"] == "conflict":
+        return landing.eject("conflict on %s with %s at %s" % (
+            ", ".join(merged["files"][:6]) or "?", row["target"], base[:12]),
+            "Integrate %s into your branch (or prepare the resolution), freeze again, "
+            "then ameesh work queue add %d." % (row["target"], lot))
+    checked = gates(project, replayer.path)
+    if not checked["ok"]:
+        return landing.eject("gate `%s` failed on the merged tree" % checked["gate"],
+                             "Its output:\n%s\nFix it on your branch, freeze again, then "
+                             "ameesh work queue add %d." % (checked["output"], lot),
+                             output=checked["output"])
+    if project.land == "local":
+        if not landing.held():
+            return landing.busy("lease on %s lost before pushing" % landing.key)
+        # #194 r4/r5: one atomic push, two compare-and-swaps: the target on
+        # the base seen, the remote lease on this holder's epoch — a stale
+        # holder is refused by the server once the next one moved the lease
+        target_ref = "refs/heads/%s" % branch
+        proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", "--atomic",
+                                "--force-with-lease=%s:%s" % (target_ref, base),
+                                "--force-with-lease=%s:%s" % (lease_ref, mine), url,
+                                "%s:%s" % (merged["sha"], target_ref),
+                                "%s:%s" % (mine, lease_ref), timeout=FETCH_TIMEOUT)
+        if proc.returncode != 0:
+            if not landing.held():
+                return landing.busy("lease on %s lost: push refused" % landing.key)
+            landing.release = True
+            if not landing.write(state="queued", reason="target moved during the merge: "
                                  "retried at the next pass", note="merge queue of %s: push "
                                  "refused (%s), retried" % (row["target"],
                                                             resolutions._err(proc)[-200:]),
-                                 actor=work.SYSTEM_SENDER)
-                return {"lot": lot, "result": "retry", "error": resolutions._err(proc)}
-            return _landed(db, project, row, merged, base)
-        # land: pr — the merge commit goes to the lot branch, its CI decides
-        status = pr_status(slug, row["branch"], gh=gh) if slug else None
-        if status is None:
-            unlock()
-            out = _eject(db, row, project, "no open PR for %s" % row["branch"],
-                         "Open the PR, then ameesh work queue add %d." % lot)
-            return dict(out, result="ejected")
-        if status.get("base") != _branch_of(row["target"]):
-            unlock()
-            out = _eject(db, row, project, "PR #%s targets %s, not %s" % (
-                status["number"], status.get("base") or "?", _branch_of(row["target"])),
-                "Point the PR at %s (or queue the lot for its target), then ameesh work "
-                "queue add %d." % (_branch_of(row["target"]), lot))
-            return dict(out, result="ejected")
-        if not merge_queue._same(status["head"], row["frozen_sha"]):
-            unlock()
-            out = _eject(db, row, project, "PR #%s is at %s, not at the freeze %s" % (
-                status["number"], (status["head"] or "?")[:12], row["frozen_sha"][:12]),
-                "Something pushed to the branch after its freeze: freeze again, then "
-                "ameesh work queue add %d." % lot)
-            return dict(out, result="ejected")
-        if not held():
-            return lost
-        # #194 r4: compare and swap on the freeze (see `local`)
-        branch_ref = "refs/heads/%s" % row["branch"]
-        proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
-                                "--force-with-lease=%s:%s" % (branch_ref, row["frozen_sha"]),
-                                url, "%s:%s" % (merged["sha"], branch_ref),
-                                timeout=FETCH_TIMEOUT)
-        if proc.returncode != 0 and not held():
-            return lost
-        if proc.returncode != 0:
-            unlock()
-            out = _eject(db, row, project, "push to %s refused (%s)" % (
-                row["branch"], resolutions._err(proc)[-200:]),
-                "Something pushed to the branch after its freeze: freeze again, then "
-                "ameesh work queue add %d." % lot)
-            return dict(out, result="ejected")
-        ops.queue_update(lot, state="landing", landing_sha=merged["sha"],
+                                 actor=work.SYSTEM_SENDER):
+                return landing.busy("lease on %s lost: push refused" % landing.key)
+            return {"lot": lot, "result": "retry", "error": resolutions._err(proc)}
+        return landing.landed(merged, base)
+    # land: pr — the merge commit goes to the lot branch, its CI decides
+    status = pr_status(slug, row["branch"], gh=gh) if slug else None
+    if status is None:
+        return landing.eject("no open PR for %s" % row["branch"],
+                             "Open the PR, then ameesh work queue add %d." % lot)
+    if status.get("base") != branch:
+        return landing.eject("PR #%s targets %s, not %s" % (
+            status["number"], status.get("base") or "?", branch),
+            "Point the PR at %s (or queue the lot for its target), then ameesh work "
+            "queue add %d." % (branch, lot))
+    if not merge_queue._same(status["head"], row["frozen_sha"]):
+        return landing.eject("PR #%s is at %s, not at the freeze %s" % (
+            status["number"], (status["head"] or "?")[:12], row["frozen_sha"][:12]),
+            "Something pushed to the branch after its freeze: freeze again, then "
+            "ameesh work queue add %d." % lot)
+    if not landing.held():
+        return landing.busy("lease on %s lost before pushing" % landing.key)
+    # #194 r4: compare and swap on the freeze (see `local`)
+    branch_ref = "refs/heads/%s" % row["branch"]
+    proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
+                            "--force-with-lease=%s:%s" % (branch_ref, row["frozen_sha"]),
+                            url, "%s:%s" % (merged["sha"], branch_ref),
+                            timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        if not landing.held():
+            return landing.busy("lease on %s lost: push refused" % landing.key)
+        return landing.eject("push to %s refused (%s)" % (
+            row["branch"], resolutions._err(proc)[-200:]),
+            "Something pushed to the branch after its freeze: freeze again, then "
+            "ameesh work queue add %d." % lot)
+    if not landing.write(state="landing", landing_sha=merged["sha"],
                          reason="PR #%s: CI on the merge %s" % (status["number"],
                                                                 merged["sha"][:12]),
                          note="merge queue of %s: %s merged into the branch (%s), waiting "
                          "for the CI of PR #%s" % (row["target"], row["target"],
                                                    merged["sha"][:12], status["number"]),
-                         actor=work.SYSTEM_SENDER)
-        return {"lot": lot, "result": "landing", "sha": merged["sha"],
-                "replayed": merged["files"] if merged["state"] == "replayed" else []}
-    except (GitError, LandError, OSError, ValueError) as exc:
-        error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
-        if row["state"] == "landing":
-            # its branch holds the merge commit: it stays `landing`, lease kept,
-            # and the PR is read again at the next pass (an error never merges)
-            ops.queue_update(lot, reason="reading PR failed (%s): retried" % str(exc)[:200])
-            return error
-        unlock()
-        ops.queue_update(lot, state="queued", reason="landing failed (%s): retried"
-                         % str(exc)[:200])
-        return error
+                         actor=work.SYSTEM_SENDER):
+        return landing.busy("lease on %s lost after pushing" % landing.key)
+    return {"lot": lot, "result": "landing", "sha": merged["sha"],
+            "replayed": merged["files"] if merged["state"] == "replayed" else []}
 
 
 def target_moved(replayer, project, row: dict) -> str | None:
@@ -380,82 +473,77 @@ def target_moved(replayer, project, row: dict) -> str | None:
     return None if tip[0] == base else tip[0]
 
 
-def _follow_pr(db, project, row: dict, slug, unlock, held, *, gh, replayer) -> dict:
-    lot = int(row["work_item_id"])
-    ops = storage.of(db).work
+def pr_view(slug: str, number, gh=_gh) -> dict:
+    """#194 r5: base and head of PR `number`, read together in one call."""
+    proc = gh(["pr", "view", str(number), "--repo", slug, "--json",
+               "baseRefName,headRefOid,state"])
+    if proc.returncode != 0:
+        raise LandError("gh pr view: %s" % (proc.stderr or proc.stdout or "").strip()[:300])
+    data = json.loads(proc.stdout or "{}")
+    return {"base": data.get("baseRefName"), "head": data.get("headRefOid"),
+            "state": data.get("state")}
+
+
+def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
+    project, row, lot = landing.project, landing.row, landing.lot
+    branch = _branch_of(row["target"])
     status = pr_status(slug, row["branch"], gh=gh) if slug else None
     if status is None:
-        unlock()
         if row.get("item_state") in work.MERGED_STATES:
-            ops.queue_update(lot, state="landed", reason="merged",
-                             note="merge queue of %s: landed" % row["target"],
-                             actor=work.SYSTEM_SENDER)
+            landing.release = True
+            if not landing.write(state="landed", reason="merged",
+                                 note="merge queue of %s: landed" % row["target"],
+                                 actor=work.SYSTEM_SENDER):
+                return landing.busy("lease on %s lost" % landing.key)
             return {"lot": lot, "result": "landed"}
-        return dict(_eject(db, row, project, "its PR is no longer open",
-                           "Reopen it, then ameesh work queue add %d." % lot), result="ejected")
-    if status.get("base") != _branch_of(row["target"]):
-        unlock()
-        return dict(_eject(db, row, project, "PR #%s targets %s, not %s" % (
-            status["number"], status.get("base") or "?", _branch_of(row["target"])),
-            "Point the PR at %s, freeze again, then ameesh work queue add %d."
-            % (_branch_of(row["target"]), lot)), result="ejected")
+        return landing.eject("its PR is no longer open",
+                             "Reopen it, then ameesh work queue add %d." % lot)
+    if status.get("base") != branch:
+        return landing.eject("PR #%s targets %s, not %s" % (
+            status["number"], status.get("base") or "?", branch),
+            "Point the PR at %s, freeze again, then ameesh work queue add %d." % (branch, lot))
     if not merge_queue._same(status["head"], row.get("landing_sha")):
-        unlock()
-        return dict(_eject(db, row, project, "its branch moved while ameesh was landing it "
-                           "(%s)" % (status["head"] or "?")[:12],
-                           "Freeze again, then ameesh work queue add %d." % lot),
-                    result="ejected")
+        return landing.eject("its branch moved while ameesh was landing it (%s)"
+                             % (status["head"] or "?")[:12],
+                             "Freeze again, then ameesh work queue add %d." % lot)
     if status["ci"] == "pending":
         return {"lot": lot, "result": "landing", "pr": status["number"]}
     if status["ci"] == "red":
-        unlock()
-        return dict(_eject(db, row, project, "the CI of PR #%s is red on the merge %s"
-                           % (status["number"], row["landing_sha"][:12]),
-                           "Fix it on your branch (it already holds the merge of %s), freeze "
-                           "again, then ameesh work queue add %d." % (row["target"], lot)),
-                    result="ejected")
-    if not held():
-        return {"lot": lot, "result": "busy",
-                "error": "lease lost before merging PR #%s" % status["number"]}
-    # #194 r4: the CI ran on the merge with the target as it was; GitHub has
-    # no compare-and-swap on the base, so the target is read right before the
-    # merge (the window left is that read and `gh pr merge`)
+        return landing.eject("the CI of PR #%s is red on the merge %s"
+                             % (status["number"], row["landing_sha"][:12]),
+                             "Fix it on your branch (it already holds the merge of %s), "
+                             "freeze again, then ameesh work queue add %d."
+                             % (row["target"], lot))
+    if not landing.held():
+        return landing.busy("lease lost before merging PR #%s" % status["number"])
+    # #194 r4: the CI ran on the merge with the target as it was
     moved = target_moved(replayer, project, row)
     if moved:
-        unlock()
-        return dict(_eject(db, row, project, "%s moved to %s since the merge %s: its CI "
-                           "ran on an older base" % (row["target"], moved[:12],
-                                                     row["landing_sha"][:12]),
-                           "Integrate %s again into your branch, freeze again, then ameesh "
-                           "work queue add %d." % (row["target"], lot)), result="ejected")
+        return landing.eject("%s moved to %s since the merge %s: its CI ran on an older "
+                             "base" % (row["target"], moved[:12], row["landing_sha"][:12]),
+                             "Integrate %s again into your branch, freeze again, then "
+                             "ameesh work queue add %d." % (row["target"], lot))
+    # #194 r5: base and head read again together, right before the merge.
+    # GitHub's merge takes no base nor epoch precondition: the window left —
+    # between this read and `gh pr merge` — is a residual risk the owner
+    # accepts or not (land: local has none); a wrong base is checked after
+    now = pr_view(slug, status["number"], gh=gh)
+    if now["base"] != branch or not merge_queue._same(now["head"], row["landing_sha"]):
+        return landing.eject("PR #%s changed right before its merge (base %s, head %s)" % (
+            status["number"], now["base"] or "?", (now["head"] or "?")[:12]),
+            "Check the PR, freeze again, then ameesh work queue add %d." % lot)
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     if error is not None:
         # #194 r3: the branch holds the merge commit; the lot stays `landing`
         # with it (and the lease: a lasting refusal raises `merge_blocked`)
-        ops.queue_update(lot, reason="PR merge refused (%s): retried" % error[:200])
+        landing.write(reason="PR merge refused (%s): retried" % error[:200])
         return {"lot": lot, "result": "retry", "error": error}
-    unlock()
-    return _landed(db, project, row, {"sha": row["landing_sha"], "state": "pr",
-                                      "files": []}, None, pr=status["number"])
-
-
-def _landed(db, project, row: dict, merged: dict, base, *, pr=None) -> dict:
-    lot = int(row["work_item_id"])
-    storage.of(db).work.queue_update(
-        lot, state="landed", reason="merged by ameesh (%s)" % merged["sha"][:12],
-        note="merge queue of %s: landed by ameesh, %s%s" % (
-            row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""),
-        actor=work.SYSTEM_SENDER)
-    gates_text = ", ".join("`%s`" % g for g in project.gates)
-    _passive(db, row.get("assignee"), lot, (
-        "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on the "
-        "merged tree: %s. The branch sweep closes the lot."
-        % (row["target"], lot, row.get("title") or "", merged["sha"][:12],
-           ", PR #%s" % pr if pr else ", on %s" % (base or "?")[:12],
-           "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
-           if merged.get("state") == "replayed" else "", gates_text)),
-        {"project": project.name, "target": row["target"], "commit": merged["sha"]})
-    return {"lot": lot, "result": "landed", "sha": merged["sha"], "pr": pr}
+    try:
+        after = pr_view(slug, status["number"], gh=gh)["base"]
+    except LandError:
+        after = branch          # unread: the merge itself is not in doubt
+    return landing.landed({"sha": row["landing_sha"], "state": "pr", "files": []}, None,
+                          pr=status["number"], wrong_base=after if after != branch else None)
 
 
 def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) -> list[dict]:

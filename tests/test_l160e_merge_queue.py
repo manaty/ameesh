@@ -54,9 +54,11 @@ class FakeQueue(FakeWork):
         return self._row(item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False):
+                     note="", actor="", clear_rank=False, lease=None):
         q = self.queue_rows.get(item_id)
         if q is None:
+            return None
+        if lease is not None and not getattr(self, "lease_ok", lambda lease: True)(lease):
             return None
         if state:
             q["state"] = state

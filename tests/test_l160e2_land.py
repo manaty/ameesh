@@ -43,6 +43,11 @@ class FakeLocks:
         self.held[key] = (owner, epoch, now + ttl_s)
         return epoch
 
+    def holds(self, lease):
+        key, owner, epoch = lease
+        cur = self.held.get(key)
+        return bool(cur and cur[0] == owner and cur[1] == epoch and cur[2] > time.time())
+
     def land_unlock(self, key, owner, epoch):
         cur = self.held.get(key)
         if cur and cur[0] == owner and cur[1] == epoch:
@@ -59,6 +64,7 @@ class _Land(_Base):
         locks = FakeLocks()
         self.fake.land_lock = locks.land_lock
         self.fake.land_unlock = locks.land_unlock
+        self.fake.lease_ok = locks.holds
         self.locks = locks
         self.origin = os.path.join(self.tmp, "origin.git")
         _git(self.tmp, "clone", "-q", "--bare", self.repo, self.origin)
@@ -169,6 +175,7 @@ class FakeGh:
         self.ci = "pending"
         self.fail = False
         self.merge_result = (0, "", "")
+        self.base_on_merge = None
         self.calls: list = []
 
     def __call__(self, args, timeout=60.0):
@@ -183,7 +190,12 @@ class FakeGh:
                     "statusCheckRollup": [check]}]
             return subprocess.CompletedProcess(args, 0, json.dumps(out), "")
         if args[:2] == ["pr", "merge"]:
+            if self.merge_result[0] == 0 and self.base_on_merge:
+                self.base = self.base_on_merge      # retargeted just before the merge
             return subprocess.CompletedProcess(args, *self.merge_result)
+        if args[:2] == ["pr", "view"]:
+            out = {"baseRefName": self.base, "headRefOid": self.head, "state": "OPEN"}
+            return subprocess.CompletedProcess(args, 0, json.dumps(out), "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
@@ -363,14 +375,20 @@ class StaleExecutorTest(_Land):
     """#194 r4: a pause after the renewal, beyond the lease: another executor
     takes the next epoch and lands; the first one's push is refused."""
 
-    def pause_after_renewal(self, then):
-        """The renewal right before the push succeeds, then the lease
-        expires, runner-2 takes it and `then()` runs (what runner-2 does)."""
+    def pause_after_renewal(self, then, nth=1):
+        """The `nth` renewal of runner-1 (the one right before the push or
+        the merge) succeeds, then the lease expires, runner-2 takes it and
+        `then()` runs (what runner-2 does)."""
         real = self.locks.land_lock
+        seen = []
 
         def lock(key, owner, ttl_s, *, epoch=None):
             got = real(key, owner, ttl_s, epoch=epoch)
             if epoch is not None and owner == "runner-1" and got is not None:
+                seen.append(epoch)
+            if len(seen) == nth and epoch is not None and owner == "runner-1" \
+                    and got is not None:
+                seen.append(None)
                 held = self.locks.held[key]
                 self.locks.held[key] = (held[0], held[1], 0)
                 self.assertIsNotNone(real(key, "runner-2", 600))
@@ -437,6 +455,109 @@ class StaleExecutorTest(_Land):
         self.assertEqual(self.fake.queue_rows[4]["landing_sha"], moved["sha"])
 
 
+class EpochFenceTest(_Land):
+    """#194 r5: a stale holder that would succeed is fenced by the epoch —
+    on the remote (local mode, lease ref) and in every queue write."""
+
+    pause_after_renewal = StaleExecutorTest.pause_after_renewal
+
+    def acquire_runner2(self, lease_ref=True):
+        """runner-2 takes the next epoch and, in local mode, moves the remote
+        lease ref — WITHOUT moving the target (its gates still run)."""
+        key = "p:main"
+        epoch = self.locks.held[key][1]
+        if lease_ref:
+            clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p")).path
+            mine = land.lease_commit(clone, key, epoch, "runner-2")
+            _git(clone, "push", "-q", "--force", self.origin,
+                 "%s:%s" % (mine, land.LEASE_REF + "main"))
+
+    def test_local_stale_push_refused_target_unmoved(self):
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        self.pause_after_renewal(self.acquire_runner2)
+        out = self.land(4)
+        self.assertEqual(out["result"], "busy", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertNotEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_pr_stale_writes_fail(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        self.pause_after_renewal(lambda: self.acquire_runner2(lease_ref=False))
+        out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "busy", out)
+        self.assertIsNone(self.fake.queue_rows[4]["landing_sha"])
+
+    def test_stale_follower_never_overwrites_landed(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci = out["sha"], "green"
+
+        def runner2_lands():
+            self.acquire_runner2(lease_ref=False)
+            self.fake.queue_rows[4]["state"] = "landed"           # runner-2 merged it
+            _git(self.repo, "push", "-q", "origin", "lot/3-c:main")
+        # renewal 1: taking the lease again; 2: right before the merge
+        self.pause_after_renewal(runner2_lands, nth=2)
+        stale = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(stale["result"], "busy", stale)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+    def test_pr_retargeted_after_the_status_read(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci = out["sha"], "green"
+        real = gh.__call__
+
+        def retarget(args, timeout=60.0):
+            if args[:2] == ["pr", "view"]:
+                gh.base = "develop"                    # between the list and the merge
+            return real(args, timeout=timeout)
+        stale = self.land(4, gh=retarget, locks=locks)
+        self.assertEqual(stale["result"], "ejected", stale)
+        self.assertIn("changed right before its merge", self.fake.queue_rows[4]["reason"])
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+    def test_pr_retargeted_inside_the_last_window_is_reported(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci, gh.base_on_merge = out["sha"], "green", "develop"
+        done = self.land(4, gh=gh, locks=locks)
+        self.assertEqual((done["result"], done["wrong_base"]), ("landed", "develop"))
+        self.assertIn("NOT main", self.fake.queue_rows[4]["reason"])
+        self.assertTrue(any("merged into develop, not main" in body for _, body, _ in self.sent))
+
+    def test_lease_ref_not_moved_nothing_written(self):
+        self.queued(4)
+        hook = os.path.join(self.origin, "hooks", "pre-receive")
+        with open(hook, "w") as fh:
+            fh.write("#!/bin/sh\ngrep -q refs/ameesh/ && exit 1\nexit 0\n")
+        os.chmod(hook, 0o755)
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("lease ref", out["error"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertIsNone(self.locks.held["p:main"][0])        # lease released
+
+
 class SettingsAndAlertTest(unittest.TestCase):
     def test_settings(self):
         ok = radar.parse_settings({"projects": {"n": {"repo": "/r", "land": "local",
@@ -491,6 +612,24 @@ class LeaseDbTest(PgTestCase):
         self.assertIsNone(ops.land_lock("p:main", "r2", 60, epoch=3))
         self.assertFalse(ops.land_unlock("p:main", "r2", 3))
         self.assertEqual(ops.land_lock("p:other", "r2", 60), 1)
+
+    def test_queue_write_fenced_by_the_lease(self):
+        """#194 r5: a queue write under a lease happens only while it holds."""
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="fenced")["id"]
+        self.assertIsNotNone(ops.queue_add(lot, target="main", frozen_sha="a" * 40,
+                                           note="queued", actor="t"))
+        one = ops.land_lock("q:main", "r1", 60)
+        self.assertIsNotNone(ops.queue_update(lot, state="landing", lease=("q:main", "r1", one)))
+        self.assertIsNone(ops.queue_update(lot, state="ejected", lease=("q:main", "r2", one)))
+        self.db.execute("UPDATE merge_locks SET expires_at = now() - interval '1 second'"
+                        " WHERE target = 'q:main'")
+        self.assertIsNone(ops.queue_update(lot, state="ejected", lease=("q:main", "r1", one)))
+        two = ops.land_lock("q:main", "r2", 60)
+        self.assertIsNone(ops.queue_update(lot, state="ejected", lease=("q:main", "r1", one)))
+        self.assertIsNotNone(ops.queue_update(lot, state="landed", lease=("q:main", "r2", two)))
+        self.assertEqual(ops.queue()[0]["state"], "landed")
+        self.assertIsNotNone(ops.queue_update(lot, reason="radar"))   # no lease: unchanged
 
 
 if __name__ == "__main__":

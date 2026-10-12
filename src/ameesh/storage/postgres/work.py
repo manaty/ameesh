@@ -709,7 +709,8 @@ class WorkItems(interface.WorkItems):
             return self._queue_row(tx, item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False) -> dict | None:
+                     note="", actor="", clear_rank=False, lease=None) -> dict | None:
+        key, owner, epoch = lease if lease is not None else (None, None, None)
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE merge_queue SET state = coalesce(%s, state),"
@@ -717,9 +718,13 @@ class WorkItems(interface.WorkItems):
                 "   landing_sha = CASE WHEN %s IN ('queued', 'ejected') THEN NULL"
                 "                      ELSE coalesce(%s, landing_sha) END,"
                 "   reason = coalesce(%s, reason), updated_at = now()"
-                " WHERE work_item_id = %s RETURNING work_item_id",
+                " WHERE work_item_id = %s"
+                "   AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM merge_locks l"
+                "        WHERE l.target = %s AND l.owner = %s AND l.epoch = %s"
+                "          AND l.expires_at > now()))"
+                " RETURNING work_item_id",
                 (state, state == "ejected" or bool(clear_rank), rank, state or "", landing_sha, reason,
-                 int(item_id)))
+                 int(item_id), key, key, owner, epoch))
             if not rows:
                 return None
             if note:
