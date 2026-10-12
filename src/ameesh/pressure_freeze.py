@@ -86,6 +86,67 @@ def freeze_max(cfg) -> float:
     return value if value >= 0 and value == value else DEFAULT_FREEZE_MAX_S
 
 
+#: never frozen: a stopped database client could hold a lock everyone waits on
+DB_CLIENTS = ("psql", "pg_dump", "pg_restore", "postgres", "postmaster")
+
+
+def db_port(cfg) -> int:
+    """The port of the mesh database (`cfg.dsn`, URL or key=value), 5432 by
+    default."""
+    dsn = str(getattr(cfg, "dsn", "") or "")
+    try:
+        if "://" in dsn:
+            from urllib.parse import urlsplit
+            port = urlsplit(dsn).port
+            if port:
+                return int(port)
+        for token in dsn.split():
+            key, _, value = token.partition("=")
+            if key == "port" and value.isdigit():
+                return int(value)
+    except ValueError:
+        pass
+    return 5432
+
+
+def _db_sockets(port: int, proc: str = "/proc") -> set[str]:
+    """Inodes of the host's TCP sockets connected to `port` (Linux)."""
+    out: set[str] = set()
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(os.path.join(proc, "net", name), encoding="ascii") as fh:
+                next(fh, None)
+                for row in fh:
+                    fields = row.split()
+                    if len(fields) > 9 and int(fields[2].rsplit(":", 1)[1], 16) == port:
+                        out.add(fields[9])
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def holds_db(pid: int, name: str, inodes: set[str], proc: str = "/proc") -> bool:
+    """Does the process talk to the mesh database (a client by name, or a TCP
+    socket to its port)? Unreadable: it is spared (False only when sure)."""
+    if (name or "") in DB_CLIENTS:
+        return True
+    if not inodes:
+        return False
+    fds = os.path.join(proc, str(pid), "fd")
+    try:
+        entries = os.listdir(fds)
+    except OSError:
+        return True
+    for fd in entries:
+        try:
+            link = os.readlink(os.path.join(fds, fd))
+        except OSError:
+            continue
+        if link.startswith("socket:[") and link[8:-1] in inodes:
+            return True
+    return False
+
+
 def _shell(name: str) -> bool:
     return (name or "").lstrip("-") in SHELLS
 
@@ -102,6 +163,17 @@ def _descendants(table: list[dict], roots) -> set[int]:
         out.add(pid)
         todo.extend(children.get(pid, ()))
     return out
+
+
+def _runner_own(table: list[dict]) -> set[int]:
+    """The runner and its own group (its database clients, psql): never
+    frozen nor stopped (mesh-design, #453)."""
+    try:
+        group = os.getpgrp()
+    except OSError:
+        group = None
+    return {os.getpid()} | {p["pid"] for p in table if group is not None
+                            and p["pgid"] == group}
 
 
 def turn_tools(table: list[dict], leader: int) -> set[int]:
@@ -125,7 +197,7 @@ def turn_tools(table: list[dict], leader: int) -> set[int]:
     roots = {p["pid"] for p in live if p["ppid"] == leader and tool(p)}
     under = _descendants(live, {leader})
     roots |= {p["pid"] for p in live if p["pgid"] == leader and p["pid"] not in under}
-    return _descendants(live, roots) - {leader, os.getpid()}
+    return _descendants(live, roots) - {leader} - _runner_own(table)
 
 
 def group_tools(table: list[dict], pgid: int, lineage=()) -> set[int]:
@@ -133,7 +205,7 @@ def group_tools(table: list[dict], pgid: int, lineage=()) -> set[int]:
     of its known lineage, with their descendants."""
     live = [p for p in table if not p["zombie"]]
     roots = {p["pid"] for p in live if p["pgid"] == pgid or p["pid"] in set(lineage)}
-    return _descendants(live, roots) - {os.getpid()}
+    return _descendants(live, roots) - _runner_own(table)
 
 
 class Freezer:
@@ -212,18 +284,26 @@ class Freezer:
             self.log("pressure freeze: targets unreadable (%s)" % exc)
             wanted = {}
         frozen_now: dict[str, list[str]] = {}
+        names = {p["pid"]: p["name"] for p in table}
+        inodes = _db_sockets(db_port(getattr(self.runner, "cfg", None))) \
+            if any(pid not in self.frozen for pid in wanted) else set()
         for pid, (agent, what) in wanted.items():
             if pid in self.frozen:
                 continue
+            if holds_db(pid, names.get(pid, ""), inodes):
+                continue        # mesh-design: a stopped client may hold a lock
             if self._signal(pid, starts.get(pid), signal.SIGSTOP):
                 self.frozen[pid] = Frozen(pid, starts.get(pid), agent, now,
                                           _describe(pid, what))
                 frozen_now.setdefault(agent, []).append(self.frozen[pid].what)
+        maximum = freeze_max(getattr(self.runner, "cfg", None))
         for agent, whats in frozen_now.items():
             self._trace(agent, "Critical pressure on host %s: %d tool process(es) frozen "
-                        "(SIGSTOP), resumed when the pressure goes down: %s."
-                        % (self._host(), len(whats), _list(whats)), action="gel")
-        maximum = freeze_max(getattr(self.runner, "cfg", None))
+                        "(SIGSTOP), resumed when the pressure goes down%s: %s." % (
+                            self._host(), len(whats),
+                            "; still frozen after %d min, they are stopped (SIGTERM, then "
+                            "SIGKILL)" % int(maximum // 60) if maximum > 0 else "",
+                            _list(whats)), action="gel", mail=True)
         thawed: dict[str, list[str]] = {}
         stopped: dict[str, list[str]] = {}
         for pid, item in list(self.frozen.items()):

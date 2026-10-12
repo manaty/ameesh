@@ -301,3 +301,36 @@ class TestCapTest(unittest.TestCase):
         self.assertEqual(sent[0][1:3], ("ameesh", "a1"))
         self.assertIn("Test suite stopped after", sent[0][3])
         self.assertIn("ameesh heavy", notes[-1])
+
+
+class SafeguardTest(unittest.TestCase):
+    def test_database_clients_are_never_frozen(self):
+        from ameesh import pressure_freeze as pf
+        self.assertTrue(pf.holds_db(1, "psql", set()))
+        self.assertEqual(pf.db_port(SimpleNamespace(dsn="postgresql://u@10.0.0.1:55432/db")),
+                         55432)
+        self.assertEqual(pf.db_port(SimpleNamespace(dsn="host=x port=6543 dbname=a")), 6543)
+        self.assertEqual(pf.db_port(SimpleNamespace(dsn="")), 5432)
+        proc = tempfile.mkdtemp(prefix="ameesh-453-proc-")
+        os.makedirs(os.path.join(proc, "net"))
+        os.makedirs(os.path.join(proc, "42", "fd"))
+        with open(os.path.join(proc, "net", "tcp"), "w") as fh:
+            fh.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+                     "retrnsmt   uid  timeout inode\n"
+                     "   0: 0100007F:9C40 0100007F:D8B8 01 00000000:00000000 00:00000000 "
+                     "00000000  1000        0 777 1 0 20 4 30 10 -1\n")
+        os.symlink("socket:[777]", os.path.join(proc, "42", "fd", "3"))
+        inodes = pf._db_sockets(55480, proc=proc)
+        self.assertEqual(inodes, {"777"})
+        self.assertTrue(pf.holds_db(42, "node", inodes, proc=proc))
+        self.assertFalse(pf.holds_db(42, "node", pf._db_sockets(5432, proc=proc), proc=proc))
+
+    def test_the_runner_and_its_group_are_never_targets(self):
+        from ameesh import pressure_freeze as pf
+        me, group = os.getpid(), os.getpgrp()
+        table = [{"pid": 900001, "ppid": 1, "pgid": 900001, "name": "claude", "start": 0.0,
+                  "zombie": False},
+                 {"pid": me, "ppid": 900001, "pgid": group, "name": "bash", "start": 50.0,
+                  "zombie": False}]
+        self.assertEqual(pf.turn_tools(table, 900001), set())
+        self.assertEqual(pf.group_tools(table, group), set())
