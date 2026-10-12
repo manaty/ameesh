@@ -487,8 +487,7 @@ the turn and before any pause. The runner journal and the team thread say
 change. No `account_switches` row is written, since the shared choice did not
 change.
 
-**Fallback order for a critical agent at its threshold** (steps 1, 2 and 4
-are in place; step 3 comes with lot #340's last PR):
+**Fallback order for a critical agent at its threshold**:
 
 1. another plan account of the same harness with headroom (§ 4 order);
 2. the harness's default account (`~/.claude`) beyond its implicit 50 % cap.
@@ -502,8 +501,50 @@ are in place; step 3 comes with lot #340's last PR):
    As soon as another account has headroom again (for example after its
    window resets), the agent leaves the default account: continuity only keeps
    a session on an account that is under its ordinary threshold;
-3. another plan harness (Codex), then an API-key harness (DeepSeek), via a
-   rotation with summary. This step is not done yet (lot #340, PR 2b);
+3. another harness, in the order of `critical_fallback_harnesses` (host
+   configuration, `AMEESH_CRITICAL_FALLBACK_HARNESSES`; default `codex`, then
+   `deepseek`: a plan harness, then an API-key one). The first one that has
+   headroom is used:
+   * it must be installed on the host;
+   * it must have an account under its threshold. With declared accounts,
+     this is a choice for the agent alone, as in steps 1–2; without, its
+     default plan must be under its pace;
+   * if it is paid per token, the mesh hourly cap must still hold. A critical
+     agent has it in full, since non-critical agents stop at
+     `noncritical_hourly_share`.
+
+   The switch goes through a rotation with summary. The summary is made
+   under the old harness and the session's account, the only ones that can
+   resume it; when that is impossible, a deterministic brief is used (L39).
+   A paid-per-token old harness must still hold the mesh caps for the
+   summary, like a turn; otherwise the brief is used. The summary (or
+   brief) is kept in the agent's state (`resume-pending.json`) before the
+   old session is forgotten: a runner restarted before the new session
+   starts still opens it with the summary. It is dropped only once the new
+   session has reported its id (or its turn completed): a harness that dies
+   at launch leaves it for the next turn. If it cannot be written (disk
+   full), the rotation does not happen: the old session is kept and the
+   turn waits. An ordinary rotation (L11) never
+   runs while the next turn would go to another harness than the session's:
+   the switch does it.
+   A fresh session then starts under the new harness. The agent's model,
+   effort and tier do not follow it: the borrowed harness uses its own
+   defaults. Each turn is counted under the harness it ran on (ledger,
+   mesh cap): that harness is written to the agent's state before the
+   accounting marker, and the turn does not start if it cannot be. The
+   thread says "its turns run under codex/<account> until its
+   own account has headroom again" and "Harness switch: …".
+
+   **Coming back.** Before every turn the agent's own harness is evaluated
+   first. While the agent runs under a borrowed harness, it comes back only
+   when one of its accounts has the headroom of a non-critical agent: the
+   reserve of 10 points under the pace (`accounts.RESERVE`) and
+   `noncritical_hourly_share` of the hourly cap, including on the default
+   account taken beyond its 50 % cap (step 2). Without that margin, each
+   crossing of a rising pace cap would cost a summary and a rotation. If no
+   borrowed harness has headroom left, its own account is used without the
+   margin rather than a pause. The return is the same rotation, with the
+   summary made under the borrowed harness;
 4. pause, once all of the above are exhausted.
 
 **Reserve for the critical agents** (L242b (2)). The other agents stop
