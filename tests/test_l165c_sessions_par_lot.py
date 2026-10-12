@@ -128,6 +128,41 @@ class StockageTest(_Base):
                              **neuf)
         self.assertEqual((out["resumed"], out["discarded"]), (None, "sess-z"))
 
+    def test_reprise_garde_l_origine_de_l_ouverture(self):
+        """r2 #420 : une session reprise (même id annoncé) sans origine donnée
+        garde celle de son ouverture ; un autre id la rend inconnue."""
+        self.bail("a8")
+        registry.set_session(self.db, "a8", "S", "X", harness="claude", cwd="/old")
+        registry.set_session(self.db, "a8", "S", "Y")
+        self.assertEqual(self.origine("a8"), ("claude", "/old", "S"))
+        registry.set_session(self.db, "a8", "T", "Y")
+        self.assertEqual(self.origine("a8"), (None, None, None))
+
+    def test_tout_autre_writer_de_session_invalide_l_origine(self):
+        """r2 #420 : S ouverte sous X ; `upsert(session_id=T)` (ou tout autre
+        chemin qui écrit session_id) rend l'origine inconnue ; un exécuteur
+        qui tient encore S la met de côté sans origine : jamais reprise."""
+        runner, lease = self.bail("a9")
+        epoch = lease["lease_epoch"]
+        a = work.add(self.db, title="A", assignee="a9")["id"]
+        b = work.add(self.db, title="B", assignee="a9")["id"]
+        storage.of(self.db).operations.set_session_work_item("a9", runner.runner_id, epoch,
+                                                             str(a))
+        registry.set_session(self.db, "a9", "S", "X", harness="claude", cwd="/w")
+        registry.upsert(self.db, "a9", session_id="T")
+        self.assertEqual(self.origine("a9"), (None, None, None))
+        compte = registry.get(self.db, "a9")["session_account"]
+        cle = dict(harness="claude", account=compte, cwd="/w")
+        self.assertEqual(self.st.switch("a9", runner.runner_id, epoch, to_lot=str(b),
+                                        current="S", **cle)["parked"], "S")
+        out = self.st.switch("a9", runner.runner_id, epoch, to_lot=str(a), current=None,
+                             **cle)
+        self.assertEqual((out["resumed"], out["discarded"]), (None, "S"))
+        # toute écriture directe de session_id aussi (déclencheur de 0384)
+        registry.set_session(self.db, "a9", "U", None, harness="claude", cwd="/w")
+        self.db.execute("UPDATE agent_registry SET session_id = 'V' WHERE name = 'a9'")
+        self.assertEqual(self.origine("a9"), (None, None, None))
+
     def test_lot_fini_ou_reassigne_jamais_repris_ni_mis_de_cote(self):
         """r1 #420 : un courrier `--lot A` après la fusion, la clôture ou la
         réassignation de A, avant le relevé des branches, ne reprend pas sa
@@ -293,6 +328,30 @@ class RoutageTest(_Base):
             b = work.add(self.db, title="B", assignee="w3")["id"]
             self.tour(worker, b, "prends B", session="sess-B")
             argv = self.tour(worker, a, "retour de relecture sur A", session="sess-A2")
+            self.assertNotIn("--resume", argv)
+            self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_tour_de_reprise_n_ecrase_pas_l_origine(self):
+        """r2 #420 : A ouverte dans un dossier, le placement change, un autre
+        tour sur A la reprend (même id annoncé) : l'origine reste celle de
+        l'ouverture, et le retour A→B→A dans le nouveau dossier ne la reprend
+        pas."""
+        worker = self._worker("w4")
+        try:
+            a = work.add(self.db, title="A", assignee="w4")["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = %s",
+                            (self._cwd("w4-new"), "w4"))
+            argv = self.tour(worker, a, "suite de A", session="jamais")
+            self.assertEqual(argv[argv.index("--resume") + 1], "sess-A")
+            self.assertEqual(self.origine("w4"), ("claude", self._cwd("w4"), "sess-A"))
+            work.move(self.db, a, "qa")
+            b = work.add(self.db, title="B", assignee="w4")["id"]
+            self.tour(worker, b, "prends B", session="sess-B")
+            argv = self.tour(worker, a, "retour sur A", session="sess-A2")
             self.assertNotIn("--resume", argv)
             self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
         finally:

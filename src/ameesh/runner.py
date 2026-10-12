@@ -3500,19 +3500,24 @@ class AgentWorker(threading.Thread):
                         # L39 (0030) : le compte d'origine de la session, en
                         # registre avec son id (le marqueur du flux reste la
                         # source des relevés du tour) ; #408 : et le harnais
-                        # et le dossier de son ouverture, ceux du lancement
+                        # et le dossier de son ouverture, ceux du lancement,
+                        # seulement si le tour l'OUVRE (une session reprise
+                        # garde l'origine de son ouverture)
+                        ouverte = session_new != session
+                        origine = (harnais_lance if ouverte else None,
+                                   cwd if ouverte else None)
                         try:
                             registry.set_session(
                                 self.db, self.name, session_new,
                                 compte.name if compte is not None else None,
-                                harness=harnais_lance, cwd=cwd)
+                                harness=origine[0], cwd=origine[1])
                         except db_mod.DbError as exc:
                             # L72 : une panne de base ne tue pas le tour (le
                             # bail, lui, est défendu par le battement) ;
                             # l'enregistrement est rejoué après le tour.
                             self._session_en_attente = (
                                 session_new, compte.name if compte is not None else None,
-                                harnais_lance, cwd)
+                                *origine)
                             log_async("[%s] session %s not recorded (%s): replayed "
                                       "after the turn" % (self.name, session_new,
                                                          db_mod.explain(exc)))

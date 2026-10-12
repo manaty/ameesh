@@ -24,7 +24,7 @@ class LotSessions(interface.LotSessions):
         with self.db.transaction() as tx:
             reg = tx.query(
                 "SELECT session_work_item,"
-                "       session_origin IS NOT DISTINCT FROM %s AS origine,"
+                "       (session_id = %s AND session_origin = session_id) AS origine,"
                 "       session_account, session_harness, session_cwd,"
                 "       (lease_owner = %s AND lease_epoch = %s"
                 "        AND lease_expires_at > clock_timestamp()) AS ours"
