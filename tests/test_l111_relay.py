@@ -459,6 +459,21 @@ class RelaisSansBaseTest(unittest.TestCase):
         vide = relay.settle(relay.Usage(model="m"), 900, 100)
         self.assertEqual(vide.input_tokens, 300)
 
+    def test_interrupted_unicode_stream_bills_the_output_cap(self):
+        meter = relay.UsageMeter("deepseek-flash")
+        meter.event({"type": "message_start", "message": {"usage": {"input_tokens": 10}}})
+        # Few Python characters can encode many tokens. The provider may also
+        # keep generating after the client disconnects, without final usage.
+        meter.event({"type": "content_block_delta", "delta": {"text": "🙂𐍈漢"}})
+        usage = relay.settle(meter.usage, 1000, 100)
+        self.assertEqual(usage.output_tokens, 100)
+        self.assertEqual(usage.input_tokens, 10)
+        self.assertEqual(meter.usage.output_tokens, 0)
+        meter.usage.output_tokens = 120
+        self.assertEqual(relay.settle(meter.usage, 1000, 100).output_tokens, 120)
+        meter.event({"type": "message_delta", "usage": {"output_tokens": 7}})
+        self.assertEqual(relay.settle(meter.usage, 1000, 100).output_tokens, 120)
+
 
 if __name__ == "__main__":
     unittest.main()

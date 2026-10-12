@@ -584,6 +584,12 @@ passe par le serveur (`mediated_executor/work_repo.py`, monté par
   Il pousse ensuite `agent/<nom>` avec ses propres identifiants, en avance
   rapide seulement (`--force-with-lease`). Il rend
   `ameesh-exec-bundle/1` : `{branch, commit, device_head, commits}`.
+  Après la préparation Git, le serveur recontrôle le bail et la révocation
+  sous verrous de lignes (exécuteur, puis agent), conservés pendant la
+  publication et l'enregistrement du reçu. Le cache conserve les mappings
+  des commits et les reçus du bail : une réponse perdue est rejouée, sans
+  nouvelle poussée, et un envoi suivant peut reprendre depuis sa base non
+  acquittée sans dupliquer les commits déjà publiés.
 - **Fin du bail.** Le travail non commité est commité, envoyé, puis le
   dossier est effacé. Un bail perdu efface aussi le dossier, sans envoi.
 

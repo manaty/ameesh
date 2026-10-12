@@ -15,12 +15,14 @@ qui appelle la route du serveur :
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from ameesh.mediated_executor import contract as C
 from ameesh.mediated_executor import work_repo
@@ -176,6 +178,107 @@ class DepotTest(unittest.TestCase):
             work_repo.push(self.transport, self.fence, self.work)
         self.assertEqual(ctx.exception.code, "bad_args")
         self.assertEqual(work_repo._read_meta(self.work)["pushed"], base)
+
+    def test_publication_rechecks_and_locks_after_git_preparation(self):
+        # Exercise the production checker without starting a database. The
+        # fake transaction tracks both row locks at the actual forge push.
+        class Connection:
+            live = True
+            revoked = False
+            active = False
+            executor_locked = False
+            agent_locked = False
+
+            @contextlib.contextmanager
+            def transaction(conn):
+                conn.active = True
+                try:
+                    yield conn
+                finally:
+                    conn.active = conn.executor_locked = conn.agent_locked = False
+
+            def query(conn, sql, params):
+                if "JOIN executors" in sql:
+                    return [{"ok": 1}] if conn.live and not conn.revoked else []
+                if "FROM executors" in sql:
+                    conn.executor_locked = conn.active and "FOR SHARE" in sql
+                    return [] if conn.revoked else [{"ok": 1}]
+                conn.agent_locked = conn.active and "FOR UPDATE" in sql
+                return [{"lease_owner": OWNER, "lease_epoch": 42,
+                         "host": "anna-portable", "live": conn.live}]
+
+        conn = Connection()
+        @contextlib.contextmanager
+        def connection():
+            yield conn
+        self.route.lease_check = work_repo.lease_checker(types.SimpleNamespace(connection=connection))
+        work_repo.checkout(self.transport, self.fence, self.work)
+        self._commit("page.html", "test\n", "page")
+        real_replay = self.route._replay
+        real_git = work_repo.git
+        pushes = []
+
+        def guarded_git(repo, *args, **kw):
+            if args[0] == "push":
+                self.assertTrue(conn.active and conn.executor_locked and conn.agent_locked)
+                pushes.append(args)
+            return real_git(repo, *args, **kw)
+
+        for invalidation in ("expired", "revoked", None):
+            conn.live, conn.revoked = True, False
+            def replay(*args):
+                result = real_replay(*args)
+                conn.live = invalidation != "expired"
+                conn.revoked = invalidation == "revoked"
+                return result
+            with self.subTest(invalidation=invalidation), \
+                    mock.patch.object(self.route, "_replay", side_effect=replay), \
+                    mock.patch.object(work_repo, "git", side_effect=guarded_git):
+                if invalidation:
+                    with self.assertRaises(Exception) as ctx:
+                        work_repo.push(self.transport, self.fence, self.work)
+                    self.assertEqual(ctx.exception.code, "forbidden_scope")
+                    self.assertEqual(pushes, [])
+                    self.assertIsNone(self.route._rev(self.forge, "refs/heads/agent/inge-front"))
+                else:
+                    work_repo.push(self.transport, self.fence, self.work)
+                    self.assertEqual(len(pushes), 1)
+
+    def test_lost_upload_reply_is_replayable_and_later_commits_append(self):
+        work_repo.checkout(self.transport, self.fence, self.work)
+        base = work_repo._read_meta(self.work)["pushed"]
+        self._commit("page.html", "v1\n", "v1")
+        put = self.transport.put_work
+        sent = []
+
+        def lost_reply(fence, old_base, bundle):
+            reply = put(fence, old_base, bundle)
+            sent.append((old_base, bundle, reply))
+            raise OSError("reply lost after forge push")
+
+        with mock.patch.object(self.transport, "put_work", side_effect=lost_reply):
+            with self.assertRaises(OSError):
+                work_repo.push(self.transport, self.fence, self.work)
+        self.assertEqual(work_repo._read_meta(self.work)["pushed"], base)
+        head = sh(self.forge, "rev-parse", "refs/heads/agent/inge-front")
+        # Receipts survive a server route restart. An identical retry must not
+        # publish again; a later bundle from the unacknowledged base must reuse
+        # its published prefix rather than duplicate it.
+        self.route = work_repo.WorkDepot(self.route.repos, self.route.cache, self.route.lease_check)
+        self.transport.route = self.route
+        with mock.patch.object(self.route, "_replay", side_effect=AssertionError("replayed twice")):
+            self.assertEqual(put(self.fence, sent[0][0], sent[0][1]), sent[0][2])
+        self._commit("page.html", "v2\n", "v2")
+        reply = work_repo.push(self.transport, self.fence, self.work)
+        head2 = sh(self.forge, "rev-parse", "refs/heads/agent/inge-front")
+        self.assertEqual(sh(self.forge, "rev-parse", head2 + "^"), head)
+        self.assertEqual(reply["device_head"], sh(self.work, "rev-parse", "HEAD"))
+        self.assertEqual(put(self.fence, sent[0][0], sent[0][1]), sent[0][2])
+        self.assertEqual(sh(self.forge, "rev-parse", "refs/heads/agent/inge-front"), head2)
+        self._commit("page.html", "v3\n", "v3")
+        work_repo.push(self.transport, self.fence, self.work)
+        head3 = sh(self.forge, "rev-parse", "refs/heads/agent/inge-front")
+        self.assertEqual(sh(self.forge, "rev-parse", head3 + "^"), head2)
 
     def test_archive_hostile_refusee(self):
         import io

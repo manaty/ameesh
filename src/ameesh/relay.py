@@ -373,7 +373,7 @@ class Usage:
     complete: bool = False
     #: le début (`message_start`, ou corps complet) a été vu
     started: bool = False
-    #: caractères produits vus dans le flux (estimation d'un flux coupé)
+    #: caractères produits vus dans le flux (diagnostic, pas une borne de jetons)
     produced_chars: int = 0
 
     @property
@@ -472,15 +472,15 @@ def settle(usage: Usage, request_bytes: int, max_tokens: int) -> Usage:
     """L'usage à facturer, complété par excès quand le flux a été coupé.
 
     Sans relevé d'entrée : un jeton pour trois octets de requête. Sans relevé
-    final de sortie : le plus grand de ce qui a été vu, d'un jeton pour deux
-    caractères produits — borné par `max_tokens`.
+    final de sortie : le plafond demandé, sans réduire un compteur observé
+    supérieur. Le texte reçu ne borne ni les jetons Unicode ni la génération
+    facturée en amont après une déconnexion de l'appareil.
     """
     out = dataclasses.replace(usage)
     if not out.started:
         out.input_tokens = max(out.input_tokens, int(math.ceil(request_bytes / 3.0)))
     if not out.complete:
-        estimate = int(math.ceil(out.produced_chars / 2.0))
-        out.output_tokens = min(max(out.output_tokens, estimate), max(max_tokens, out.output_tokens))
+        out.output_tokens = max(out.output_tokens, max_tokens)
     return out
 
 

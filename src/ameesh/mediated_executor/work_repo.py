@@ -35,6 +35,7 @@ propres clés) ; le cache (`--work-cache`) garde un clone nu par dépôt.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -225,6 +226,23 @@ class WorkDepot:
             json.dump(state, fh)
         os.replace(path + ".tmp", path)
 
+    @contextlib.contextmanager
+    def _publication(self, principal, fence: Fence):
+        """Recheck after Git preparation and fence the external publication.
+
+        The production checker holds executor and agent row locks throughout
+        the push and receipt save. In-memory checkers used by offline callers
+        recheck here; their authority changes must be serialized by the caller.
+        """
+        guard = getattr(self.lease_check, "publication", None)
+        if guard is not None:
+            with guard(principal, fence):
+                yield
+        else:
+            if not self.lease_check(principal, fence.agent, fence.owner, fence.epoch):
+                raise DepotError("forbidden_scope", "bail perdu avant publication")
+            yield
+
     @staticmethod
     def _rev(repo: str, ref: str) -> Optional[str]:
         proc = git(repo, "rev-parse", "-q", "--verify", ref + "^{commit}", check=False)
@@ -289,7 +307,8 @@ class WorkDepot:
     def receive(self, entry: Mapping, fence: Fence, principal, base: str,
                 bundle: bytes) -> dict:
         state = self._load(fence.agent)
-        if state.get("epoch") != fence.epoch or state.get("repo") != entry["repo"]:
+        if (state.get("epoch") != fence.epoch or state.get("owner") != fence.owner
+                or state.get("repo") != entry["repo"]):
             raise DepotError("forbidden_scope", "aucune archive rendue sous ce bail")
         parent = (state.get("map") or {}).get(base)
         if not _SHA_RE.match(base or "") or parent is None:
@@ -308,6 +327,13 @@ class WorkDepot:
             git(mirror, "fetch", "-q", "--no-tags", fh.name,
                 "+refs/heads/%s:%s" % (DEVICE_BRANCH, incoming))
         head = _out(git(mirror, "rev-parse", incoming))
+        receipt_key = base + ":" + head
+        receipt = state.get("receipts", {}).get(receipt_key)
+        if receipt is not None:
+            # Immutable Git identities also admit a repacked retry. Never push
+            # again or replace a newer remote_head when replaying an old reply.
+            with self._publication(principal, fence):
+                return receipt
         if head == base:
             return {"schema": contract.SCHEMA_BUNDLE, "branch": state["branch"],
                     "commit": parent, "device_head": head, "commits": 0}
@@ -316,25 +342,41 @@ class WorkDepot:
         commits = _out(git(mirror, "rev-list", "--reverse", "--parents",
                            "%s..%s" % (base, head))).splitlines()
         new = parent
+        mapping = dict(state["map"])
+        appending = False
         for line in commits:
             shas = line.split()
             if len(shas) != 2:
                 raise DepotError("bad_args", "historique linéaire attendu (fusion %s)" % shas[0])
+            if shas[0] in mapping:
+                new = mapping[shas[0]]
+                continue
+            # A response may have been lost before the device learned its new
+            # base. Reuse the published prefix, then append only new commits.
+            if not appending and new != (state.get("remote_head") or parent):
+                raise DepotError("idempotency_mismatch", "historique déjà publié divergent")
+            appending = True
             new = self._replay(mirror, shas[0], new, principal)
+            mapping[shas[0]] = new
+        if not appending and state.get("remote_head") and new != state["remote_head"]:
+            raise DepotError("idempotency_mismatch", "tête déjà publiée plus récente")
         lease = "refs/heads/%s:%s" % (state["branch"], state.get("remote_head") or "")
-        proc = git(mirror, "push", "-q", "--force-with-lease=" + lease, "origin",
-                   "%s:refs/heads/%s" % (new, state["branch"]), check=False, timeout=600.0)
-        if proc.returncode != 0:
-            raise DepotError("unavailable", "poussée de %s refusée : %s" % (
-                state["branch"], proc.stderr.decode("utf-8", "replace").strip()[:300]))
-        state["map"] = {head: new}   # la base suivante est la tête reçue
-        state["remote_head"] = new
-        git(mirror, "update-ref", "refs/ameesh/device/%s" % fence.agent, head)
-        self._save(fence.agent, state)
+        reply = {"schema": contract.SCHEMA_BUNDLE, "branch": state["branch"], "commit": new,
+                 "device_head": head, "commits": len(commits)}
+        with self._publication(principal, fence):
+            proc = git(mirror, "push", "-q", "--force-with-lease=" + lease, "origin",
+                       "%s:refs/heads/%s" % (new, state["branch"]), check=False, timeout=600.0)
+            if proc.returncode != 0:
+                raise DepotError("unavailable", "poussée de %s refusée : %s" % (
+                    state["branch"], proc.stderr.decode("utf-8", "replace").strip()[:300]))
+            state["map"] = mapping
+            state["remote_head"] = new
+            state.setdefault("receipts", {})[receipt_key] = reply
+            git(mirror, "update-ref", "refs/ameesh/device/%s" % fence.agent, head)
+            self._save(fence.agent, state)
         log.info("dépôt de travail : %s ← %d commit(s), %s", state["branch"], len(commits),
                  new[:12])
-        return {"schema": contract.SCHEMA_BUNDLE, "branch": state["branch"], "commit": new,
-                "device_head": head, "commits": len(commits)}
+        return reply
 
     @staticmethod
     def _replay(mirror: str, commit: str, parent: str, principal) -> str:
@@ -350,19 +392,43 @@ class WorkDepot:
                         + b"\n"))
 
 
+class _LeaseChecker:
+    def __init__(self, pool):
+        self.pool = pool
+
+    def __call__(self, principal, agent: str, owner: str, epoch: int) -> bool:
+        if not owner.startswith("exec:%s:" % principal.executor_id):
+            return False
+        with self.pool.connection() as conn:
+            rows = conn.query(
+                "SELECT 1 FROM agent_registry a JOIN executors e ON e.id = %s"
+                " WHERE a.name = %s AND a.lease_owner = %s AND a.lease_epoch = %s"
+                " AND a.lease_expires_at > clock_timestamp() AND a.host = %s"
+                " AND e.host = a.host AND e.revoked_at IS NULL",
+                (principal.executor_id, agent, owner, int(epoch), principal.host))
+        return bool(rows)
+
+    @contextlib.contextmanager
+    def publication(self, principal, fence: Fence):
+        from .dispatcher import fence_holds
+        with self.pool.connection() as conn:
+            with conn.transaction() as tx:
+                # Same lock order as revocation: executor first, then agent.
+                # FOR SHARE conflicts with UPDATE revoked_at, and the agent
+                # FOR UPDATE fence blocks lease takeover until push is done.
+                rows = tx.query(
+                    "SELECT 1 FROM executors WHERE id = %s AND host = %s"
+                    " AND revoked_at IS NULL FOR SHARE",
+                    (principal.executor_id, principal.host))
+                if not rows or not fence_holds(tx, principal, fence):
+                    raise DepotError("forbidden_scope", "bail perdu ou exécuteur révoqué avant publication")
+                yield
+
+
 def lease_checker(pool) -> Callable[[Any, str, str, int], bool]:
     """Le bail (agent, owner, epoch) est-il vivant, de cet exécuteur, sur
     son hôte ? Lu en base par le réservoir du serveur."""
-    def check(principal, agent: str, owner: str, epoch: int) -> bool:
-        if not owner.startswith("exec:%s:" % principal.executor_id):
-            return False
-        with pool.connection() as conn:
-            rows = conn.query(
-                "SELECT 1 FROM agent_registry WHERE name = %s AND lease_owner = %s"
-                "   AND lease_epoch = %s AND lease_expires_at > clock_timestamp()"
-                "   AND host = %s", (agent, owner, int(epoch), principal.host))
-        return bool(rows)
-    return check
+    return _LeaseChecker(pool)
 
 
 # ==========================================================================
