@@ -92,7 +92,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked",
                  # L226a : un identifiant est en échec, ou expire bientôt
-                 "credential_failing", "credential_expiring",
+                 "credential_failing", "credential_expiring", "module_deviation",
                  # L317c : analyse profonde demandée, sans rapport dans les 30 min
                  "deep_analysis_overdue")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
@@ -161,6 +161,8 @@ TYPE_LABELS = {
     "waiting_without_question": "lot waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
+
+    "module_deviation": "module procedure deviation",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
@@ -917,7 +919,8 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
-_KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
+_KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
+         "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
          "provider", "currency", "urgent",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
@@ -1245,7 +1248,8 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
-            for field_ in ("lot", "agents", "lots", "harness", "account", "gauge",
+            for field_ in ("module", "rule", "project", "declaration_id", "subject",
+                           "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):
                 if alert.get(field_) is not None:
                     payload[field_] = alert[field_]

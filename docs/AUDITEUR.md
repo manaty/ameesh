@@ -77,6 +77,19 @@ le JSON plutôt que le texte.
 | 11 | Estimations (L157, L157b, L157c) | `ameesh alerts --json` (`estimate_bias`), `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`), `ameesh work show <id> --json` (`measure`), `ameesh work schedule --json` | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré ; L157c: delivered lots without a measure (`measure` null) or with CI unknown; measured size differing from the declared size (`size_match` false) for one estimator again and again; the phase that carries the gap (agent, CI, review, human); open lots left unplanned by `work schedule` |
 | 12 | Conformité aux procédures (L234) | `ameesh work list --json`, `ameesh decisions --json`, `ameesh fil show <projet> --last 200`, `ameesh work show <id> --json`, requêtes 10–12, journaux et forge | attente humaine sans demande ouverte ; question hors `ameesh decide` ; réparation manuelle par humain/bureau ; annonce sans fait correspondant — suivre la méthode ci-dessous |
 
+### Contrôles apportés par les modules (point 12, L317b)
+
+Le cœur de l'auditeur reste générique. À chaque passage court, lire aussi
+`ameesh alerts --json` : les modules actifs par projet y apportent leurs
+écarts sous `module_deviation`. Le constat contient le module, la règle, le
+projet, le lot et la référence de la déclaration concernée. Suivre la règle
+et l'action du module ; ne jamais exécuter un artefact pour compléter un audit.
+Le circuit `ameesh notify` transmet le constat au canal configuré du
+propriétaire, aux orchestrateurs du projet et à l'auditeur. Une décision
+nécessaire ensuite passe par `ameesh decide`, jamais par courrier libre au
+propriétaire. Au passage suivant, vérifier que le constat a disparu après
+la correction, ou expliquer la preuve encore manquante.
+
 ### Conformité aux procédures (point 12, L234)
 
 À chaque passage court, l'auditeur lit aussi les faits que les alertes ne

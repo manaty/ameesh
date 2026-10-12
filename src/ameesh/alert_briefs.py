@@ -20,7 +20,7 @@ from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
-                 "waiting_without_question")
+                 "waiting_without_question", "module_deviation")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -135,7 +135,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         return {}
     by_name = {row["name"]: row for row in listing}
     orchestras = list(alert.get("orchestrators") or ())
-    if kind == "idle_capacity":
+    if kind == "module_deviation":
+        text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
+        out = {o: text for o in orchestras if o in by_name}
+        audit_text = text
+    elif kind == "idle_capacity":
         out = sous_utilisation.orchestrator_briefs(alert, listing, lot_titles)
         audit_text = _for_auditor(alert)
     else:

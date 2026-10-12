@@ -96,3 +96,26 @@ def main(db, argv, *, actor):
                       arguments=arguments, timeout=args.timeout)
     print(json.dumps(row, ensure_ascii=False, default=str))
     return 0
+
+
+def audit(store, project):
+    """Point 12: a release/publication without current execution evidence."""
+    out = []
+    for row in store.audit_evidence(project, NAME, TYPES, "delivery", "proof"):
+        if row["proved"]:
+            continue
+        declaration = row["declaration_id"]
+        missing = "delivery declaration missing" if declaration is None else "execution proof missing or stale"
+        detail = ("IT procedure deviation: %s lot #%s in project %s: %s. "
+                  "Declare the delivered artifact and record successful execution for its current "
+                  "SHA-256 with ameesh module it delivery/proof; audit never executes it."
+                  % (row["type"], row["id"], project, missing))
+        out.append({"type": "module_deviation", "module": NAME,
+                    "rule": "execution-proof", "project": project, "lot": row["id"],
+                    "title": row["title"], "agent": row["assignee"], "lot_state": row["state"],
+                    "declaration_id": declaration, "subject": row["subject"],
+                    "since": row["declaration_ts"] or row["created_ts"],
+                    "value": 1, "threshold": 0,
+                    "reason": "it:execution-proof:%s" % (declaration or "undeclared"),
+                    "detail": detail, "action": detail})
+    return out
