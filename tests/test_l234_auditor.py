@@ -94,7 +94,7 @@ class AuditorTest(unittest.TestCase):
         self.assertEqual(self.runner._pressure_episode["orchestrator_turns"], 1)
 
     def take(self, item, name="auditeur", queue=False, *, canons=None, owner=None,
-             load_error=None):
+             load_error=None, cfg=None):
         row = {"name": name, "team": "ameesh", "host": "test", "harness": "codex",
                "canon": owner}
         work = types.SimpleNamespace(auto_takes_since=lambda *a: 0,
@@ -102,12 +102,15 @@ class AuditorTest(unittest.TestCase):
                                      backlog=lambda **kw: [item] if queue else [])
         st = types.SimpleNamespace(work=work, operations=types.SimpleNamespace(
             open_lots_activity=lambda *a: []))
-        cfg = types.SimpleNamespace(host=None)
+        real_cfg = cfg is not None
+        cfg = cfg or types.SimpleNamespace(host=None)
         loaded = canon([agent("controle", roles=["auditor"])])
+        load_patch = (mock.patch("ameesh.auditor.load_all", wraps=auditor.load_all)
+                      if real_cfg else mock.patch("ameesh.auditor.load_all",
+                          return_value=canons or [loaded], side_effect=load_error))
         with mock.patch("ameesh.backlog.storage.of", return_value=st), \
                 mock.patch("ameesh.registry.get", return_value=dict(row, capabilities=[])), \
-                mock.patch("ameesh.auditor.load_all", return_value=canons or [loaded],
-                           side_effect=load_error), \
+                load_patch, \
                 mock.patch("ameesh.sous_utilisation.idle_agents", return_value=[row]):
             return backlog.auto_take(cfg, object(), now=10000, listing=[row],
                                      paid=set(), budget_check=lambda n: "", dry_run=True,
@@ -160,6 +163,37 @@ class AuditorTest(unittest.TestCase):
         lot = {"id": 1, "type": "evolution", "title": "Evolution", "state": "intake",
                "created_ts": 100, "lot_team": "ameesh"}
         self.assertEqual(self.take(lot, "controle", load_error=canon_mod.CanonError("missing")), [])
+
+    def test_r3_any_load_error_closes_automatic_take(self):
+        cfg = types.SimpleNamespace(canon_entries=[types.SimpleNamespace(path="bad")])
+        loaded = canon([])
+        loaded.load_findings = [canon_mod.Finding("canon-git-error", canon_mod.ERROR,
+                                                "objet git illisible")]
+        with mock.patch("ameesh.canon.from_config", return_value=loaded):
+            with self.assertRaises(canon_mod.CanonError):
+                auditor.load_all(cfg)
+
+    def test_r3_malformed_auditor_card_closes_automatic_take(self):
+        lot = {"id": 1, "type": "evolution", "title": "Evolution", "state": "intake",
+               "created_ts": 100, "lot_team": "ameesh"}
+        with tempfile.TemporaryDirectory() as root:
+            cards = Path(root) / "agents"
+            cards.mkdir()
+            card = cards / "controle.md"
+            cfg = types.SimpleNamespace(canon=root, canon_ref="", canon_untrusted=True,
+                                        host=None)
+            for type_line in ("type: Agent\n", ""):
+                with self.subTest(type_line=type_line):
+                    card.write_text("---\n" + type_line + "title: controle\nroles: [auditor\n---\n",
+                                    encoding="utf-8")
+                    loaded = canon_mod.from_config(cfg)
+                    self.assertTrue(loaded.readable)
+                    self.assertFalse(loaded.scope_unread)
+                    self.assertIsNone(loaded.agent("controle"))
+                    self.assertIn("frontmatter-invalid", {f.code for f in loaded.load_findings})
+                    with self.assertRaises(canon_mod.CanonError):
+                        auditor.load_all(cfg)
+                    self.assertEqual(self.take(lot, "controle", cfg=cfg), [])
 
     def test_r1_real_card_path_is_protected_without_matching_agent_name(self):
         loaded = canon([agent("controle", path="personas/sentinel-safety.md", roles=["auditor"])])

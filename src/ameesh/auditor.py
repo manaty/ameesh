@@ -9,7 +9,11 @@ def load_all(cfg):
     out = []
     for entry in canon_mod.configured(cfg):
         loaded = canon_mod.from_config(cfg, entry=entry)
-        if not loaded.readable or loaded.scope_unread:
+        # Un frontmatter invalide peut masquer le rôle de l'auditeur, même
+        # classé warning quand son type est indéterminable.
+        if (not loaded.readable or loaded.scope_unread
+                or canon_mod.errors(loaded.load_findings)
+                or any(f.code == "frontmatter-invalid" for f in loaded.load_findings)):
             raise canon_mod.CanonError("canon illisible ou périmètre incomplet : %s" % entry.path)
         out.append(loaded)
     canon_mod.check_identities(out)
