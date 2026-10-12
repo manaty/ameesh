@@ -387,6 +387,9 @@ class Config:
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
+    #: #453: duration cap of a heavy command (`ameesh heavy`), seconds or
+    #: `90m`/`2h`; `AMEESH_HEAVY_MAX_S` overrides it; 0 = no cap
+    heavy_max_seconds: float | str = 3600.0
     #: L226a: the `credential_sentinel` key of the host configuration
     #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
     credential_sentinel: dict = field(default_factory=dict)

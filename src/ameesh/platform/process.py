@@ -76,6 +76,18 @@ def ancestry(pid: int | None = None) -> list[int]:
     return out
 
 
+def parent_pid(pid: int) -> int | None:
+    """#453 : le parent ACTUEL de `pid`, relu à l'instant (None si disparu ou
+    illisible) — jamais celui d'une table lue plus tôt."""
+    ps = _psutil()
+    try:
+        if ps is not None:
+            return int(ps.Process(int(pid)).ppid())
+        return int(_stat_fields(int(pid))[1])
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # heures de démarrage
 # --------------------------------------------------------------------------
@@ -383,6 +395,23 @@ def command_line(pid: int) -> str:
             return " ".join(a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a)
     except OSError:
         return ""
+
+
+def command_argv(pid: int) -> list[str]:
+    """#453 : les arguments de `pid`, un par élément (vide si illisible,
+    disparu, zombie) : une commande se reconnaît à son exécutable et à ses
+    arguments, jamais à sa ligne aplatie."""
+    ps = _psutil()
+    if ps is not None:
+        try:
+            return [str(a) for a in ps.Process(int(pid)).cmdline()]
+        except Exception:
+            return []
+    try:
+        with open(os.path.join(PROC, str(int(pid)), "cmdline"), "rb") as fh:
+            return [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return []
 
 
 def become_subreaper() -> bool:

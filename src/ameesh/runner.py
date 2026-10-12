@@ -4589,6 +4589,10 @@ class Runner:
         #: compris : `launch_lock`)
         from . import background as background_mod
         self.background = background_mod.Tracker(self, log=log_async)
+        #: #453 : une suite de tests lancée hors `ameesh heavy` a le plafond
+        #: de durée d'une commande lourde
+        from . import suite_cap
+        self.suite_cap = suite_cap.SuiteCap(self, log=log_async)
         self.launch_lock = threading.Lock()
         self.harness_pids: set[int] = set()
         self.turns = 0
@@ -5919,6 +5923,22 @@ class Runner:
         return dict(verdict)
 
     # -- pression : orchestrateurs et épisodes ------------------------------
+    #: #453 : période du fil `plafond` (secondes ; le plafond lui-même n'est
+    #: relu que toutes les `suite_cap.CAP_EVERY_S`, hors arrêt en cours)
+    SUITE_CAP_TICK_S = 5.0
+
+    def start_suite_cap(self) -> None:
+        """#453 : le fil `plafond` arrête les suites de tests lancées hors
+        `ameesh heavy` au-delà du plafond d'une commande lourde (`suite_cap`)."""
+        def boucle() -> None:
+            while not self.stop.wait(self.SUITE_CAP_TICK_S):
+                try:
+                    self.suite_cap.tick()
+                except Exception as exc:  # jamais fatal à l'exécuteur
+                    log_async("test suite cap failed (%s)" % type(exc).__name__)
+
+        threading.Thread(target=boucle, daemon=True, name="plafond").start()
+
     def is_orchestrator(self, name: str) -> bool:
         """`name` est-il un orchestrateur ? Rôle au canon (`roles:
         [orchestrateur]` de sa fiche Agent) ou `AMEESH_ALERT_ORCHESTRATORS`."""
@@ -6433,6 +6453,7 @@ class Runner:
         # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
         # orphelins de ses tours (codes de sortie), et les suit.
         self.background.start_monitor(self.stop)
+        self.start_suite_cap()
         if not self.background.subreaper:
             log_async("background work of turns: no subreaper on this OS, "
                       "exit codes unknown")
