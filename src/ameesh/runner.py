@@ -33,6 +33,7 @@ import getpass
 import json
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -936,6 +937,17 @@ class AgentWorker(threading.Thread):
                 # `ameesh restart` (L26) : même point de passage, même grâce
                 self.stop_group_now("redémarrage demandé", grace=1.0)
                 return
+
+    def _audit_deadline_monitor(self, done: threading.Event, deadline: float) -> None:
+        """L234 : échéance monotone indépendante du flux et de la base.
+
+        Le scope a aussi RuntimeMaxSec : il arrête les descendants qui ont
+        quitté le groupe POSIX, même si l'exécuteur meurt.
+        """
+        if done.wait(max(0.0, deadline - time.monotonic())) or done.is_set():
+            return
+        self._audit_guard_error = "plafond dur du tour auditeur atteint"
+        self.stop_group_now(self._audit_guard_error, grace=0, hard=True)
 
     def request_restart(self) -> None:
         """`ameesh restart` (L26) : arrêter le tour en cours, puis appliquer."""
@@ -2207,9 +2219,14 @@ class AgentWorker(threading.Thread):
         orchestrateur sous une pression NON critique et hors batterie basse :
         ses tours sont courts, et c'est lui qui distribue le travail des autres
         (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
-        le sien, et personne pour répartir)."""
+        le sien, et personne pour répartir). L234 exempte les auditeurs,
+        y compris sous pression critique ; leur harnais a une priorité réduite."""
         if not pressure.get("blocked"):
             return False
+        # L234 : la surveillance reste active, même sous pression critique.
+        if self.runner.is_auditor(self.name, self.agent):
+            from .platform import audit_guard
+            return not audit_guard.available()
         if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
             return True
         return any(b.get("power") for b in pressure.get("breaches") or ())
@@ -2439,7 +2456,7 @@ class AgentWorker(threading.Thread):
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
         # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
-        # (l'orchestrateur excepté, sous une pression non critique).
+        # (auditeur excepté ; orchestrateur sous pression non critique).
         pressure = self.runner.host_pressure()
         if self._held_by_pressure(pressure):
             if self.maybe_relocate(pressure):
@@ -2693,7 +2710,7 @@ class AgentWorker(threading.Thread):
             self._host_pressure_note(pression)
             return False
         if pression.get("blocked"):
-            self.runner.pressure_bypassed(self.name)  # orchestrateur, non critique
+            self.runner.pressure_bypassed(self.name)  # orchestrateur ou auditeur
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -3058,6 +3075,16 @@ class AgentWorker(threading.Thread):
             self.preempting.clear()
         threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
                          daemon=True).start()
+        from .platform import audit_guard
+        audit_exempt = (self.runner.is_auditor(self.name, self.agent)
+                        and self.runner.host_pressure().get("blocked"))
+        self._audit_guard_error = ""
+        audit_seconds = min(audit_guard.WALL_SECONDS,
+                            self.turn_max_seconds() or audit_guard.WALL_SECONDS)
+        if audit_exempt:
+            threading.Thread(target=self._audit_deadline_monitor,
+                             args=(preempt_done, time.monotonic() + audit_seconds),
+                             daemon=True).start()
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
@@ -3074,11 +3101,15 @@ class AgentWorker(threading.Thread):
                     # même pas pendant son lancement (voir `background`).
                     with self.runner.launch_lock:
                         proc = subprocess.Popen(
-                            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                            self.runner.audit_command(self.name, argv, self.agent,
+                                                      exempt=audit_exempt, seconds=audit_seconds),
+                            cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                             text=True, bufsize=1, env=env,
                             start_new_session=True,  # son groupe : on peut le tuer en entier
                         )
                         self.runner.harness_pids.add(proc.pid)
+                except RuntimeError as exc:
+                    raise _LancementImpossible(str(exc)) from exc
                 except OSError as exc:
                     raise _LancementImpossible("lancement impossible de %s : %s"
                                                % (argv[0], exc.strerror or exc)) from exc
@@ -3088,6 +3119,13 @@ class AgentWorker(threading.Thread):
             # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
             # tour, pour repérer ce qui survivrait à sa fin.
             self._open_turn_resource(turn_id, proc.pid)
+            # Le trampoline valide le cgroup AVANT de lancer le harnais.
+            # L'attente de ce signal est bornée par le minuteur indépendant.
+            # Un scope refusé ne consomme aucun courrier.
+            if audit_exempt and (proc.stdout is None
+                                 or proc.stdout.readline().strip() != audit_guard.READY):
+                raise _LancementImpossible("scope auditeur non validé : plafond mémoire "
+                                           "absent ou création du scope refusée")
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
@@ -3250,6 +3288,8 @@ class AgentWorker(threading.Thread):
             # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
             # le code de sortie est celui de l'arrêt demandé.
             result_code, error = 0, None
+        if self._audit_guard_error:
+            result_code, error = 124, self._audit_guard_error
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code
@@ -4517,9 +4557,47 @@ class Runner:
                 or name in getattr(self, "_orchestrators_roles", ()))
 
     def refresh_orchestrators(self, *canons) -> None:
-        """Après chaque `canon sync` : les agents au rôle d'orchestrateur."""
+        """Après chaque `canon sync` : les rôles orchestrateur et auditeur."""
         from . import sous_utilisation as su
         self._orchestrators_roles = frozenset(su.role_orchestrators(canons))
+        self._audit_canons = tuple(canons)
+
+    def is_auditor(self, name: str, agent=None) -> bool:
+        """L234 : persona auditeur ou rôle auditeur/auditor au canon."""
+        from . import alert_briefs
+        if name == alert_briefs.AUDITOR_NAME:
+            return True
+        canons = getattr(self, "_audit_canons", ())
+        from . import auditor as auditor_mod, sous_utilisation as su
+        # Ne consulte le registre que pour un nom candidat ; le worker passe
+        # sa ligne fraîche, ce qui évite une requête sur le chemin de lancement.
+        if name not in su.role_orchestrators(
+                canons, alert_briefs.AUDITOR_ROLES):
+            return False
+        row = agent if agent is not None else registry.get(self.db, name)
+        return bool(row and name in auditor_mod.cards([row], canons))
+
+    def audit_command(self, name: str, argv: list, agent=None, *,
+                      exempt: bool = False, seconds: float = 300) -> list:
+        """L234 : faible priorité CPU et I/O, héritée par les sous-processus.
+
+        Les wrappers sont facultatifs sur les plateformes qui ne les ont pas.
+        Aucun preexec_fn dans cet exécuteur multithreadé.
+        """
+        if not self.is_auditor(name, agent):
+            return argv
+        prefix = []
+        ionice = shutil.which("ionice")
+        nice = shutil.which("nice")
+        if ionice:
+            prefix.extend([ionice, "-t", "-c", "3"])
+        if nice:
+            prefix.extend([nice, "-n", "10"])
+        bounded = prefix + list(argv)
+        if exempt:
+            from .platform import audit_guard
+            return audit_guard.command(bounded, seconds)
+        return bounded
 
     def _pressure_episode_update(self, verdict: dict) -> None:
         """À chaque verdict FRAIS, sous `_pressure_lock` : une ligne de journal
@@ -4533,9 +4611,10 @@ class Runner:
                 self._pressure_episode = episode = {
                     "since": time.time(), "critical": bool(verdict.get("critical")),
                     "delayed": set(), "rotations": set(), "orchestrator_turns": 0,
+                    "auditor_turns": 0,
                     "tmpfs": False}
                 batterie = any(b.get("power") for b in verdict.get("breaches") or ())
-                log_async("pression de l'hôte %s : début — %s ; plus de nouveau tour%s"
+                log_async("pression de l'hôte %s : début — %s ; sauf auditeurs, plus de nouveau tour%s"
                           % (self.host, resources_mod.describe(verdict.get("breaches"))
                              or "seuil",
                              " (pression critique)" if verdict.get("critical") else
@@ -4566,7 +4645,9 @@ class Runner:
                       " ; rotation de session reportée : %s"
                       % ", ".join(sorted(episode["rotations"])) if episode["rotations"] else "",
                       " ; %d tour(s) d'orchestrateur passé(s)" % episode["orchestrator_turns"]
-                      if episode["orchestrator_turns"] else ""))
+                      if episode["orchestrator_turns"] else "")
+                  + (" ; %d tour(s) d'auditeur passé(s)" % episode.get("auditor_turns", 0)
+                     if episode.get("auditor_turns") else ""))
 
     def pressure_delayed(self, agent: str, *, rotation: bool = False) -> None:
         """Un tour (ou une rotation de session) de `agent` attend la fin de
@@ -4577,11 +4658,12 @@ class Runner:
                 episode["rotations" if rotation else "delayed"].add(agent)
 
     def pressure_bypassed(self, agent: str) -> None:
-        """Un tour d'orchestrateur part malgré la pression (non critique)."""
+        """Un tour d'orchestrateur ou d'auditeur part malgré la pression."""
         with self._pressure_lock:
             episode = getattr(self, "_pressure_episode", None)
             if episode is not None:
-                episode["orchestrator_turns"] += 1
+                key = "auditor_turns" if self.is_auditor(agent) else "orchestrator_turns"
+                episode[key] = episode.get(key, 0) + 1
 
     def power_reading(self) -> dict:
         """Alimentation de l'hôte (L106) ; surchargée par les tests."""
