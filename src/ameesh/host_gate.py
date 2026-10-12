@@ -15,21 +15,25 @@ writes `ameesh-host-ack/1` to `/run/ameesh-gate/ack/ack.json`
 
 * `available`: the runner claims, within `min(caps.max_concurrent,
   max_agents)`;
-* `draining`: no new claim; each turn stops at its next safe point, at the
-  latest at `drain_deadline_ts` (else now + `host_gate_drain`, 90 s); its
-  background work stops after the end-of-turn grace; leases are released;
-  then the ack says `drained: true`;
+* `draining`: no new claim; each turn stops at its next safe point (the
+  harness alone, as when a turn is closed), at the latest at
+  `drain_deadline_ts` (else now + `host_gate_drain`, else the offer's
+  `drain_seconds`, else 90 s); the background work of a turn keeps its
+  end-of-turn grace, cut at that same deadline; leases are released; then,
+  no lease and no background work left, the ack says `drained: true`;
 * `stopped`: no turn; a running one is stopped at once;
 * `freeze` (`{since_ts, until_ts}`, with `available`): the guard froze the
   agents' units; the runner keeps going, and the frozen time does not count
-  in its turn deadlines (`frozen_seconds`);
+  in its turn deadlines (`frozen_between`);
 * back to `available`: claims resume without a human.
 
-Freshness: a state past its `expires_ts` is unreadable. On a lending host
-(Host `policy.lend`, or `host_gate_fallback: stopped`), a missing or null
-`expires_ts` is unreadable too (L159a). Unreadable, absent or of an unknown
-schema: `stopped` on a lending host, `available` on a classic host with a
-gate (`host_gate_fallback` overrides). Without `host_gate`, nothing changes.
+Freshness is the rule of the contract (`capacity_guard.state_problem`,
+section 5.3): on a lending host (Host `policy.lend`, or
+`host_gate_fallback: stopped`) a state without a finite, near `expires_ts`
+is stale. Unreadable, absent or stale: `stopped` on a lending host,
+`available` on a classic host with a gate (`host_gate_fallback` overrides).
+A lending host has a `file` gate by default; a classic host has none, and
+nothing changes there.
 
 The ack echoes the `seq` of the state it answers: the guard counts
 `drained` only for the seq it is draining (L159e).
@@ -40,20 +44,15 @@ import ctypes
 import ctypes.util
 import dataclasses
 import json
+import math
 import os
 import select
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-try:  # the contract of L159a (#212); identical copies until it lands
-    from .capacity_guard import ACK_PATH, SCHEMA_HOST_ACK, SCHEMA_HOST_STATE, STATE_PATH, STATES
-except ImportError:  # pragma: no cover - before L159a is merged
-    SCHEMA_HOST_STATE = "ameesh-host-state/1"
-    SCHEMA_HOST_ACK = "ameesh-host-ack/1"
-    STATE_PATH = "/run/ameesh-gate/state/state.json"
-    ACK_PATH = "/run/ameesh-gate/ack/ack.json"
-    STATES = ("available", "draining", "stopped")
+from .capacity_guard import (ACK_PATH, FALLBACK_CLASSIC, FALLBACK_LENDING, SCHEMA_HOST_ACK,
+                             SCHEMA_HOST_STATE, STATE_PATH, STATES, state_problem)
 
 GATE_KINDS = ("file",)
 #: rereading the state without inotify (seconds)
@@ -67,12 +66,16 @@ DEFAULT_MAX_CONCURRENT: Optional[int] = None
 FREEZE_MAX_S = 60.0
 #: past the drain deadline, delay before the drain is said to be late
 OVERDUE_GRACE_S = 30.0
+#: longest reason published in a host reading (the guard's text is free)
+REASON_MAX = 64
 #: largest state read (a huge file is unreadable)
 MAX_STATE_BYTES = 65536
 
 
 def _number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A finite number (`json` reads `NaN` and `Infinity`; a bool is no number)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,16 +108,25 @@ class GateState:
             return int(cap)
         return DEFAULT_MAX_CONCURRENT
 
-    def frozen_at(self, now: float) -> bool:
-        """The guard froze the agents' units at `now` (study 1.6, level 2)."""
+    @property
+    def freeze_span(self) -> Optional[tuple]:
+        """`(since, end)` of the freeze this state announces (study 1.6, tier
+        2), bounded to `FREEZE_MAX_S`; None without one. A freeze only goes
+        with `available`."""
         if not self.freeze or self.state != "available":
-            return False
+            return None
         since = self.freeze.get("since_ts")
-        if not _number(since) or now < since:
-            return False
+        if not _number(since):
+            return None
         until = self.freeze.get("until_ts")
         end = until if _number(until) else since + FREEZE_MAX_S
-        return now < min(end, since + FREEZE_MAX_S)
+        end = min(end, since + FREEZE_MAX_S)
+        return (float(since), float(end)) if end > since else None
+
+    def frozen_at(self, now: float) -> bool:
+        """The guard froze the agents' units at `now`."""
+        span = self.freeze_span
+        return span is not None and span[0] <= now < span[1]
 
     def to_json(self) -> dict:
         body = {"schema": SCHEMA_HOST_STATE, "state": self.state, "seq": self.seq,
@@ -130,8 +142,9 @@ class GateState:
 @dataclasses.dataclass(frozen=True)
 class GateAck:
     """`ameesh-host-ack/1`: what the runner did with state `seq`. `in_turn`:
-    agents in a turn; `held`: leases still held; `drained`: no lease held
-    after a `draining` (or `stopped`) of that seq."""
+    agents in a turn; `held`: leases still held; `drained`: after a
+    `draining` (or `stopped`) of that seq, no lease held and no background
+    work of a turn left."""
 
     seq: int
     state: str
@@ -146,18 +159,18 @@ class GateAck:
                 "drained": self.drained, "ts": self.ts}
 
 
-def parse_state(raw: Any, *, now: Optional[float] = None,
-                require_expiry: bool = False) -> GateState:
-    """A state read from the guard; `ValueError` when it is wrong or stale
-    (the caller then applies its fallback). Unknown fields are ignored."""
-    if not isinstance(raw, Mapping) or raw.get("schema") != SCHEMA_HOST_STATE:
-        raise ValueError("schema %s expected" % SCHEMA_HOST_STATE)
-    seq = raw.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool):
-        raise ValueError("seq: integer expected")
+def parse_state(raw: Any, *, now: Optional[float] = None, lending: bool = False) -> GateState:
+    """A state read from the guard; `ValueError` when the runner may not obey
+    it (the caller then applies its fallback). Freshness is the contract's
+    (`capacity_guard.state_problem`); the fields the runner acts on are
+    checked on top. Unknown fields are ignored."""
+    now = time.time() if now is None else now
+    problem = state_problem(raw, now, lending=lending)
+    if problem is not None:
+        raise ValueError(problem)
     for key in ("until_ts", "drain_deadline_ts", "expires_ts"):
         if raw.get(key) is not None and not _number(raw.get(key)):
-            raise ValueError("%s: number or null expected" % key)
+            raise ValueError("%s: finite number or null expected" % key)
     caps = raw.get("caps") or {}
     if not isinstance(caps, Mapping):
         raise ValueError("caps: object expected")
@@ -167,15 +180,10 @@ def parse_state(raw: Any, *, now: Optional[float] = None,
     freeze = raw.get("freeze")
     if freeze is not None and not isinstance(freeze, Mapping):
         raise ValueError("freeze: object expected")
-    expires = raw.get("expires_ts")
-    now = time.time() if now is None else now
-    if expires is None and require_expiry:
-        raise ValueError("no expires_ts (required on a lending host)")
-    if expires is not None and expires < now:
-        raise ValueError("stale state (expired %ds ago)" % int(now - expires))
-    return GateState(state=raw.get("state"), seq=seq, until_ts=raw.get("until_ts"),
+    return GateState(state=raw["state"], seq=raw["seq"], until_ts=raw.get("until_ts"),
                      drain_deadline_ts=raw.get("drain_deadline_ts"), caps=dict(caps),
-                     reason=str(raw.get("reason") or "unknown"), expires_ts=expires,
+                     reason=str(raw.get("reason") or "unknown"),
+                     expires_ts=raw.get("expires_ts"),
                      freeze=dict(freeze) if freeze is not None else None)
 
 
@@ -248,7 +256,7 @@ class FileGate:
     its own folder (the guest may write there, not in the state's)."""
 
     def __init__(self, path: str = STATE_PATH, ack_path: str = ACK_PATH, *,
-                 fallback: str = "available", require_expiry: bool = False,
+                 fallback: str = FALLBACK_CLASSIC, lending: bool = False,
                  poll: float = FILE_POLL_S, use_inotify: bool = True,
                  log: Callable[[str], None] | None = None,
                  clock: Callable[[], float] = time.time):
@@ -257,7 +265,7 @@ class FileGate:
         self.path = path
         self.ack_path = ack_path
         self.fallback = fallback
-        self.require_expiry = require_expiry
+        self.lending = lending
         self.poll = max(0.05, float(poll))
         self._use_inotify = use_inotify
         self._inotify: _Inotify | None = None
@@ -289,7 +297,7 @@ class FileGate:
             if len(data) > MAX_STATE_BYTES:
                 raise ValueError("state too large")
             state = parse_state(json.loads(data.decode("utf-8")), now=self._clock(),
-                                require_expiry=self.require_expiry)
+                                lending=self.lending)
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
             return self._note_error("unreadable state (%s)" % exc)
         self._last_seq = state.seq
@@ -358,21 +366,41 @@ def default_fallback(cfg, lending: bool = False) -> str:
     chosen = str(getattr(cfg, "host_gate_fallback", "") or "").strip()
     if chosen:
         return chosen
-    return "stopped" if lending else "available"
+    return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
+
+
+def gate_kind(cfg, lending: bool = False) -> str:
+    """The gate of this host: `host_gate`, else `file` on a lending host
+    (closed by default: no state, no claim) and '' on a classic one."""
+    kind = str(getattr(cfg, "host_gate", "") or "").strip().lower()
+    if kind == "none":
+        return ""
+    if not kind:
+        return "file" if lending else ""
+    if kind not in GATE_KINDS:
+        raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
+    return kind
+
+
+def drain_seconds(cfg, offer: Optional[Mapping] = None) -> float:
+    """Withdrawal deadline when a `draining` state gives none:
+    `host_gate_drain`, else the offer's `drain_seconds`, else 90 s."""
+    chosen = float(getattr(cfg, "host_gate_drain", 0) or 0)
+    if chosen > 0:
+        return chosen
+    seconds = (offer or {}).get("drain_seconds")
+    return float(seconds) if _number(seconds) and seconds > 0 else DEFAULT_DRAIN_S
 
 
 def from_config(cfg, *, lending: bool = False,
                 log: Callable[[str], None] | None = None) -> Optional[FileGate]:
     """The configured gate, or None (no gate: nothing changes)."""
-    kind = str(getattr(cfg, "host_gate", "") or "").strip().lower()
-    if kind in ("", "none"):
+    if not gate_kind(cfg, lending):
         return None
-    if kind not in GATE_KINDS:
-        raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
     fallback = default_fallback(cfg, lending)
     return FileGate(str(getattr(cfg, "host_gate_path", "") or "") or STATE_PATH,
                     str(getattr(cfg, "host_gate_ack", "") or "") or ACK_PATH,
-                    fallback=fallback, require_expiry=lending or fallback == "stopped",
+                    fallback=fallback, lending=lending or fallback == FALLBACK_LENDING,
                     log=log)
 
 
@@ -390,6 +418,7 @@ class GateController:
     `workers`, `lock` and `wake_all`."""
 
     TICK = 0.25
+    FREEZES_KEPT = 64
 
     def __init__(self, runner, gate: FileGate, *, drain_s: float = DEFAULT_DRAIN_S,
                  log: Callable[[str], None] | None = None,
@@ -407,8 +436,10 @@ class GateController:
         self._ack_key: tuple | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._frozen_total = 0.0
-        self._frozen_mark: float | None = None
+        #: freezes announced by the guard, `{since: end}` (the last
+        #: `FREEZES_KEPT`): frozen time is read from them, not sampled, since
+        #: the runner itself is frozen meanwhile
+        self._freezes: dict = {}
         self.acks: list[GateAck] = []  # last acks (tests, display)
 
     # -- reads (any thread) -----------------------------------------------
@@ -434,14 +465,20 @@ class GateController:
         st = self.current
         return "%s (%s, seq %d)" % (st.state, st.reason, st.seq)
 
-    def frozen_seconds(self) -> float:
-        """Seconds the guard kept the agents frozen since the runner started:
-        a turn deadline moves by the difference between its start and now."""
+    def frozen_between(self, start: float, end: Optional[float] = None) -> float:
+        """Seconds of `[start, end]` (end: now) during which the guard kept
+        the agents frozen: not counted in a turn's duration (study 1.6)."""
+        end = self._clock() if end is None else end
         with self._lock:
-            total = self._frozen_total
-            if self._frozen_mark is not None:
-                total += max(0.0, self._clock() - self._frozen_mark)
-            return total
+            spans = list(self._freezes.items())
+        return sum(max(0.0, min(until, end) - max(since, start)) for since, until in spans)
+
+    def snapshot(self) -> dict:
+        """The gate in a host reading (`resources.collect`): what relocation
+        reads of a destination host."""
+        st = self.current
+        return {"gate_state": st.state, "gate_seq": st.seq,
+                "gate_reason": st.reason[:REASON_MAX]}
 
     # -- loop ---------------------------------------------------------------
     def start(self) -> None:
@@ -519,13 +556,14 @@ class GateController:
         return True
 
     def _account_freeze(self, state: GateState, now: float) -> None:
-        """Counts frozen time (called under the lock)."""
-        frozen = state.frozen_at(now)
-        if frozen and self._frozen_mark is None:
-            self._frozen_mark = now
-        elif not frozen and self._frozen_mark is not None:
-            self._frozen_total += max(0.0, now - self._frozen_mark)
-            self._frozen_mark = None
+        """Notes the freeze a state announces (called under the lock); a
+        freeze rewritten with another end replaces the first."""
+        span = state.freeze_span
+        if span is None or span[0] > now:
+            return
+        self._freezes[span[0]] = span[1]
+        while len(self._freezes) > self.FREEZES_KEPT:
+            del self._freezes[min(self._freezes)]
 
     def _announce(self, previous: GateState | None, state: GateState, now: float) -> None:
         before = previous.state if previous is not None else "start"
@@ -557,14 +595,19 @@ class GateController:
                         and getattr(worker, "host_yield", None) is None:
                     worker.yield_to_host("host drain deadline" if state.state == "draining"
                                          else "host stopped")
+        background = getattr(self.runner, "background", None)
+        if not state.may_claim and self.deadline is not None and background is not None:
+            # the background work of finished turns stops at the deadline too
+            background.cap_deadline(self.deadline, "l'hôte se retire (%s)" % state.reason)
         in_turn = sorted(w.name for w in workers if getattr(w, "proc", None) is not None)
         held = sorted(w.name for w in workers)
-        drained = (not state.may_claim) and not held
-        if not state.may_claim and held and self.deadline is not None \
+        left = background.running_count() if background is not None else 0
+        drained = (not state.may_claim) and not held and not left
+        if not state.may_claim and (held or left) and self.deadline is not None \
                 and now >= self.deadline + OVERDUE_GRACE_S and not self._overdue:
             self._overdue = True
             self._log("host gate: drain %ds late, leases still held: %s"
-                      % (int(now - self.deadline), ", ".join(held)))
+                      % (int(now - self.deadline), ", ".join(held) or "none"))
         ack = GateAck(seq=state.seq, state=state.state, in_turn=tuple(in_turn),
                       held=tuple(held), drained=drained, ts=now)
         key = (ack.seq, ack.state, ack.in_turn, ack.held, ack.drained)
@@ -573,16 +616,16 @@ class GateController:
             self.gate.acknowledge(ack)
             self.acks = (self.acks + [ack])[-20:]
             if drained:
-                self._log("host gate: drained (seq %d), no lease held" % state.seq)
+                self._log("host gate: drained (seq %d), no lease held, no background work"
+                          % state.seq)
         return ack
 
 
-def controller_from_config(runner, *, lending: bool = False,
+def controller_from_config(runner, *, lending: bool = False, offer: Optional[Mapping] = None,
                            log: Callable[[str], None] | None = None) -> Optional[GateController]:
-    """The runner's controller, or None without a configured gate."""
+    """The runner's controller, or None without a gate (`gate_kind`)."""
     cfg = runner.cfg
     gate = from_config(cfg, lending=lending, log=log)
     if gate is None:
         return None
-    return GateController(runner, gate, drain_s=getattr(cfg, "host_gate_drain", DEFAULT_DRAIN_S),
-                          log=log)
+    return GateController(runner, gate, drain_s=drain_seconds(cfg, offer), log=log)

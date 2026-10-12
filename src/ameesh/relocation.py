@@ -12,6 +12,9 @@ entre les hôtes ; sinon l'agent est déplacé avec un résumé de reprise en t�
 de sa consigne (rotation, 0025). Aucun déplacement au milieu d'un tour, et les
 comptes/identifiants (L30) sont revérifiés sur l'hôte d'arrivée par son propre
 `canon sync`.
+
+L159f : l'hôte d'arrivée doit aussi accepter des agents selon sa porte
+d'hôte (`gate_open`) : jamais vers un hôte qui se retire.
 """
 from __future__ import annotations
 
@@ -39,6 +42,16 @@ def _score(reading: dict, offer: dict | None = None) -> tuple:
     load = reading.get("load1")
     return (-(mem if mem is not None else -1),
             load if load is not None else float("inf"))
+
+
+def gate_open(reading: dict, offer: dict | None = None) -> bool:
+    """L159f : la porte d'hôte du dernier relevé admet-elle des agents ?
+    `available`, ou pas de porte sur un hôte classique. Un hôte prêteur
+    (`offer`, son `policy.lend`) sans porte relevée est fermé par défaut."""
+    state = reading.get("gate_state")
+    if state is None:
+        return offer is None
+    return state == "available"
 
 
 def candidates(admitted_hosts, current_host: str, *, db,
@@ -71,7 +84,8 @@ def plan(admitted_hosts, current_host: str, *, db, current_limits=None,
     if not current["blocked"]:
         return None
     dispo = [c for c in candidates(admitted_hosts, current_host, db=db, limits_for=limits_for)
-             if not c["pressure"]["blocked"]]
+             if not c["pressure"]["blocked"] and gate_open(
+                 c["reading"], (c["pressure"].get("limits") or {}).get("lend"))]
     if not dispo:
         return None
     meilleur = min(dispo, key=lambda c: _score(
