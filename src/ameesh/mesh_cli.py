@@ -1990,6 +1990,9 @@ def build_parser() -> argparse.ArgumentParser:
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     from . import budget as budget_mod
     budget_mod.add_parsers(sub)
+    # L131 : suites lourdes plafonnées par hôte
+    from . import heavy as heavy_mod
+    heavy_mod.add_parser(sub)
 
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")

@@ -29,6 +29,8 @@
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
         | unset [--per-hour] [--per-day] [--agent A]
         plafonds de budget du mesh, en base, relus à chaud (L70) ;
+  ameesh heavy [--nice N] -- <commande> | --status [--json]
+        heavy suite (tests, build) in one of the host's capped slots (L131) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
         context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
         turn_grace_seconds=20m|0
@@ -127,6 +129,8 @@ MESH_COMMANDS = (
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
     "budget",
+    # L131 : suites lourdes plafonnées par hôte (`ameesh heavy -- <commande>`)
+    "heavy",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
