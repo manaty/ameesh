@@ -14,7 +14,7 @@
 # une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
 # deux endroits différents du fichier, sans conflit.
 
-test_508_runner_liveness.py # #508 : preuve de vie groupée à l’heure DB, sans bail
+test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
