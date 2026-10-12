@@ -461,6 +461,9 @@ def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
 #: copies of a metadata chunk on distinct devices, per mirrored profile (the
 #: sysfs name of its directory under allocation/<kind>/)
 BTRFS_MIRRORS = {"raid1": 2, "raid1c3": 3, "raid1c4": 4}
+#: the kernel's stripe unit (volumes.h): a device with less room holds no
+#: chunk, and every stripe is a multiple of it
+BTRFS_STRIPE_LEN = 64 * 1024
 #: parity stripes and minimum devices of a parity profile
 BTRFS_PARITY = {"raid5": (1, 2), "raid6": (2, 3)}
 
@@ -491,40 +494,45 @@ def _striped_parity(free: list[int], parity: int, devs_min: int) -> int:
 
 def _raid10(free: list[int]) -> int:
     """What RAID10 chunks can still take of the per-device `free` space
-    (#311 r1, r2). The kernel (fs/btrfs/volumes.c, `btrfs_raid_array`:
-    devs_min 2, devs_increment 2 since 5.15) gives each chunk the devices
-    with the most room, as many as there are rounded down to an even number,
-    its stripes equal — the smallest room among them — half of them copies.
-    Unlike RAID1 a small device fills with the others: [100 GiB, 400 MiB x 3]
-    holds 800 MiB, not 1200; and two devices still hold chunks once the
-    others are full.
+    (#311 r1, r2), in whole stripes (`BTRFS_STRIPE_LEN`). The kernel
+    (fs/btrfs/volumes.c, `btrfs_raid_array`: devs_min 2, devs_increment 2
+    since 5.15) gives each chunk the devices with the most room, as many as
+    there are rounded down to an even number, its stripes equal — the
+    smallest room among them, 1 GiB at most — half of them copies. Unlike
+    RAID1 a small device fills with the others: [100 GiB, 400 MiB x 3] holds
+    800 MiB, not 1200; and two devices still hold chunks once the others are
+    full.
 
-    Simulated by events, not by chunks (O(n²), however large the devices):
-    with an even number of devices all of them shrink together until the
-    smallest is full; with an odd number the one left out is one of the
-    smallest, those tied at the minimum taking turns (chunk after chunk, a
-    chunk being 1 GiB at most): together they shrink at (t - 1) / t of the
-    others' pace, until a larger device comes down to them or they are full.
-    Exact up to that turn-taking, i.e. to a chunk per device."""
-    above = sorted(f for f in free if f > 0)    # room, before `shift`
+    Simulated by events, not by chunks (O(n log n), however large the
+    devices): with an even number of devices all of them shrink together
+    until the smallest is full; with an odd number the one left out is one
+    of the smallest, those tied at the minimum taking turns: together they
+    shrink at (t - 1) / t of the others' pace, until a larger device comes
+    down to them or they are full. That turn-taking is continuous, the
+    kernel's is chunk by chunk: the result is an approximation, the limit of
+    small chunks (L229e). Against an allocator of one-stripe chunks it is
+    never above and at most one stripe below ([1, 1, 1, 1, 2] stripes: 2,
+    the allocator 3); against chunks of k stripes, within -k/2 and +k, on
+    every case of up to 6 devices checked (tests/test_246_btrfs_guard.py)."""
+    above = sorted(f // BTRFS_STRIPE_LEN for f in free if f >= BTRFS_STRIPE_LEN)
     shift = low = Fraction(0)   # all above shrink alike; the tied smallest: `low`
-    tied = growth = 0
+    tied = growth = at = 0      # above[at:] are still above
     while True:
         if not low:             # the smallest are full: the next ones are
             tied = 0
-            if above:
-                low = above[0] - shift
-        while above and above[0] - shift == low:
-            above.pop(0)
+            if at < len(above):
+                low = above[at] - shift
+        while at < len(above) and above[at] - shift == low:
+            at += 1
             tied += 1
-        n = tied + len(above)
+        n = tied + len(above) - at
         if n < 2:
-            return int(growth)
+            return int(growth) * BTRFS_STRIPE_LEN
         if n % 2 == 0:          # every device, until the smallest is full
             span, pace = low, 1
         else:                   # the smallest take turns being left out
             pace = Fraction(tied - 1, tied)
-            span = min(([(above[0] - shift - low) * tied] if above else [])
+            span = min(([(above[at] - shift - low) * tied] if at < len(above) else [])
                        + ([low / pace] if pace else []))
         growth += span * (n - n % 2) / 2
         shift += span
@@ -541,6 +549,7 @@ def btrfs_growth(profile: str | None, free: list[int], copies: int) -> int:
     nothing — RAID5/6 the stripes left. An unknown profile reads as
     `copies` copies (disk_total / total_bytes, rounded up): on one device
     DUP, on several a mirror, the smaller of what it could be."""
+    free = [f - f % BTRFS_STRIPE_LEN for f in free]     # whole stripes only (L229e)
     if profile in ("single", "raid0"):
         return sum(free)
     if profile == "dup":
