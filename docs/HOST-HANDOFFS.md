@@ -50,7 +50,8 @@ connection from its enable worker.
 A controller process allows at most four outstanding enable workers;
 `AMEESH_HANDOFF_ENABLE_WORKERS` configures 1–64 before startup. A worker
 retains its permit after a timeout until its adapter call actually returns.
-Each advance reserves capacity before revalidation or any journal/effect
+Each advance, including a held operation that a concurrent retry may resume,
+reserves capacity before revalidation or any journal/effect
 change. At saturation, it leaves the operation at its existing checkpoint
 (a new handoff stays planned), creates no effect intent, changes no fence,
 and logs `handoff-enable-capacity-exhausted` as an operator warning.
