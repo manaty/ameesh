@@ -23,6 +23,9 @@ def _compte() -> dict:
 
 def main() -> int:
     args = sys.argv[1:]
+    if args == ["--version"]:  # L120: read by the runner, not a turn
+        print("9.9.9")
+        return 0
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:

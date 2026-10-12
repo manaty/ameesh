@@ -19,7 +19,8 @@ from __future__ import annotations
 from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
-BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias")
+BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
+                 "waiting_without_question")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -53,50 +54,71 @@ def _stale_lot(alert: dict) -> str:
     lot = int(alert["lot"])
     who = alert.get("agent")
     title = alert.get("title")
-    head = "Lot stagnant : #%d%s (%s) sans activité depuis %s, %s%s." % (
-        lot, " « %s »" % title if title else "", alert.get("lot_state") or "?",
+    head = "Stale lot: #%d%s (%s) no activity for %s, %s%s." % (
+        lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
         sous_utilisation._duration(alert.get("value") or 0),
-        "assigné à %s" % who if who else "sans assigné",
-        ", attend : %s" % alert["waiting_for"] if alert.get("waiting_for") else "")
+        "assigned to %s" % who if who else "unassigned",
+        ", waiting for: %s" % alert["waiting_for"] if alert.get("waiting_for") else "")
     if who:
-        move = ("relance %s : ameesh mail send %s \"…\" --lot %d, ou réattribue-le : "
+        move = ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
                 "ameesh work assign %d <agent>" % (who, who, lot, lot))
     else:
-        move = "attribue-le : ameesh work assign %d <agent>" % lot
-    return ("%s Action attendue : s'il est fusionné hors PR, ferme-le : ameesh work merged %d "
-            "--sha <commit de fusion> ; sinon %s ; s'il n'a plus lieu d'être : ameesh work "
-            "close %d --abandoned (ou --superseded-by <id>)." % (head, lot, move, lot))
+        move = "assign it: ameesh work assign %d <agent>" % lot
+    return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
+            "--sha <merge commit>; otherwise %s; if it is no longer needed: ameesh work "
+            "close %d --abandoned (or --superseded-by <id>)." % (head, lot, move, lot))
 
 
 def _plan_underused(alert: dict) -> str:
     idle = list(alert.get("idle_agents") or ())
     if idle:
-        move = ("confie du travail aux agents au repos (%s), lié à un lot : ameesh mail send "
-                "<agent> \"…\" --lot <id> (ou --new-lot \"titre\"), ou ameesh work assign "
+        move = ("give work to the idle agents (%s), tied to a lot: ameesh mail send "
+                "<agent> \"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign "
                 "<lot> <agent>" % ", ".join(idle))
     else:
-        move = ("aucun agent %s n'est au repos : avance le travail sur ce harnais (ameesh "
-                "work assign <lot> <agent>) ou réveille un agent arrêté (ameesh resume "
-                "<agent>)" % (alert.get("harness") or "de ce compte"))
-    return ("Forfait sous-employé : %s. Action attendue : %s ; lots ouverts sans agent : "
+        move = ("no %s agent is idle: move work onto this harness (ameesh "
+                "work assign <lot> <agent>) or wake a stopped agent (ameesh resume "
+                "<agent>)" % (alert.get("harness") or "of this account"))
+    return ("Underused plan: %s. Expected action: %s; open lots without an agent: "
             "ameesh projects." % (alert.get("detail") or "?", move))
 
 
 def _estimate_bias(alert: dict) -> str:
     """L157b : à l'estimateur et aux orchestrateurs."""
     ratio = alert.get("value")
-    sens = ("sous-estime" if ratio is not None and float(ratio) > 1 else "surestime")
-    return ("Biais d'estimation : %s. %s %s les lots. Action attendue : partir de "
-            "l'estimation de référence (affichée par ameesh work add et ameesh work show, "
-            "table publiée par l'auditeur) et ne s'en écarter qu'en le justifiant "
-            "(--estimate-source), estimation décomposée en phases (agent, CI, attente de "
-            "relecture, humain)." % (alert.get("detail") or "?", alert.get("agent") or "?",
-                                    sens))
+    sens = ("underestimates" if ratio is not None and float(ratio) > 1 else "overestimates")
+    return ("Estimate bias: %s. %s %s lots. Expected action: start from "
+            "the reference estimate (shown by ameesh work add and ameesh work show, "
+            "table published by the auditor) and deviate from it only with a justification "
+            "(--estimate-source), estimate broken down into phases (agent, CI, waiting for "
+            "review, human)." % (alert.get("detail") or "?", alert.get("agent") or "?",
+                                 sens))
+
+
+def _waiting_without_question(alert: dict) -> str:
+    """L233: to the assignee and the orchestrators of its team."""
+    lot = int(alert["lot"])
+    title = alert.get("title")
+    return ("Lot #%d%s is in waiting_human but no decision request is open: the owner sees "
+            "a lot waiting for them and has no question to answer. Expected action: ask the "
+            "owner through the queue — ameesh decide ask --lot %d --question \"…\" "
+            "--option a=\"…\" [--recommend a --why \"…\"] — or, if nothing is expected from "
+            "him, move the lot back: ameesh work move %d <state>. A decision written in a "
+            "mail (to bureau or anyone) never counts." % (
+                lot, " « %s »" % title if title else "", lot, lot))
 
 
 def _for_auditor(alert: dict) -> str:
-    """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte."""
-    return "Capacité au repos : %s." % (alert.get("detail") or "?")
+    """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
+    des lots ouverts sans agent, l'écart est le sien (L165b, niveau 1)."""
+    text = "Idle capacity: %s." % (alert.get("detail") or "?")
+    if alert.get("lots"):
+        text += (" Lots are waiting with idle agents: if this still holds at your next "
+                 "pass, 30 min or more after this mail, fix it yourself (level 1, reversible): ameesh "
+                 "work assign <lot> <agent> (an idle agent of the lot's team, highest "
+                 "priority first), then agent-mail send <agent> \"…\" --lot <lot> to "
+                 "wake it; name it in your report.")
+    return text
 
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
@@ -123,12 +145,16 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+        elif kind == "waiting_without_question":
+            text = _waiting_without_question(alert)
+            teams = {_team(by_name, alert.get("agent"))} - {""}
         else:
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
         out = {o: text for o in _of_teams(orchestras, by_name, teams)}
-        if kind == "estimate_bias" and alert.get("agent") in by_name:
-            out.setdefault(alert["agent"], text)       # l'estimateur lui-même
+        if kind in ("estimate_bias", "waiting_without_question") \
+                and alert.get("agent") in by_name:
+            out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même
         audit_text = text
     for name in auditor_names or ():
         out.setdefault(name, audit_text)
@@ -137,5 +163,5 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
 
 def reminder(text: str, raised_ts: float, now: float) -> str:
     """Le texte de la relance : le même, précédé de l'âge de l'alerte."""
-    return "Relance, alerte toujours en cours depuis %s : %s" % (
+    return "Reminder, alert still active for %s: %s" % (
         sous_utilisation._duration(max(0.0, now - raised_ts)), text)

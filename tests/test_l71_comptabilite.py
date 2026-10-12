@@ -127,7 +127,7 @@ class FenetreEchueTest(ComptesBase):
         self.assertEqual(jauge["used"], 0.0)
         self.assertAlmostEqual(jauge["last_used"], 0.93)
         texte = accounts.format_rows(list(rows.values()))
-        self.assertIn("codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%)",
+        self.assertIn("codex-300min 0% (pace 90%, reset passed, last reading 93%)",
                       texte)
         # la règle de choix existante peut donc basculer sur le secondaire
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
@@ -161,8 +161,9 @@ class SessionRepriseTest(Sandbox, PgTestCase):
             "input_tokens": 6, "cache_creation_input_tokens": 1000,
             "cache_read_input_tokens": 100_000, "output_tokens": 892})
         usage = self.book().record("claude1", start=start)
-        # (6 + 1000) × 5 + 100 000 × 0,5 + 892 × 25 = 77 330 µ$ ≈ 0,0773 $
-        self.assertAlmostEqual(usage.usd, 0.07733, places=5)
+        # 6 × 5 + 1000 × 5 × 1,25 (écriture de cache, L225) + 100 000 × 0,5
+        # + 892 × 25 = 78 580 µ$ ≈ 0,0786 $
+        self.assertAlmostEqual(usage.usd, 0.07858, places=5)
         # le cumul est gardé comme repère : le tour suivant est la différence
         start = self._tour_claude("claude1", self.SESSION, 67.16, {"output_tokens": 303})
         self.assertAlmostEqual(self.book().record("claude1", start=start).usd, 0.18, places=6)

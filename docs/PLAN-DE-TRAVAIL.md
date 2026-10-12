@@ -1,236 +1,236 @@
-# Plan de travail — jalons, epics, lots (L29)
+# Work plan — milestones, epics, lots (L29)
 
-Le plan est **déclaré au canon** (OKF, [décision 0005](design/decisions/0005-canon-okf.md)) ;
-l'**état d'exécution** des lots reste dans ameesh (`work_items`) ; GitHub n'en
-est qu'une **vue**. Une modification faite dans GitHub n'est jamais reprise
-comme état : au plus, elle est signalée comme **proposition** à porter au
-canon par une PR.
+The plan is **declared in the canon** (OKF, [decision 0005](design/decisions/0005-canon-okf.md));
+the **execution state** of lots stays in ameesh (`work_items`); GitHub is only
+a **view** of it. A change made in GitHub is never taken back as state: at
+most, it is reported as a **proposal** to be carried into the canon through
+a PR.
 
-## Le modèle
+## The model
 
 ```
-jalon (milestone) ──► epic ──► lot          fiches WorkPackage du canon
+jalon (milestone) ──► epic ──► lot          WorkPackage cards in the canon
                                  │
-                                 └──► work_items (#12, #13…)   état, jalons L10, actions
+                                 └──► work_items (#12, #13…)   state, L10 milestones, actions
 ```
 
-Une fiche `WorkPackage` (frontmatter seulement, comme toute fiche du profil) :
+A `WorkPackage` card (frontmatter only, like every card in the profile):
 
 ```yaml
 type: WorkPackage
 title: "Recherche plein texte dans le catalogue"
 kind: lot                    # milestone | epic | lot
-parent: catalogue            # identifiant d'une autre fiche WorkPackage
-responsible: human:alice     # REQUIS, résolu vers une fiche Member (comme pour Agent)
-team: acme-web               # facultatif
-scope: ["src/catalogue/recherche/**"]   # globs de fichiers, facultatif
-status: draft                # déclaratif, facultatif (cycle de la fiche, pas l'avancement)
-id: cat-recherche            # facultatif : par défaut le nom du fichier sans .md
-start: 2026-10-12            # L96, facultatifs : début, fin, livraison prévus (AAAA-MM-JJ)
+parent: catalogue            # identifier of another WorkPackage card
+responsible: human:alice     # REQUIRED, resolved to a Member card (as for Agent)
+team: acme-web               # optional
+scope: ["src/catalogue/recherche/**"]   # file globs, optional
+status: draft                # declarative, optional (lifecycle of the card, not progress)
+id: cat-recherche            # optional: defaults to the file name without .md
+start: 2026-10-12            # L96, optional: planned start, end, delivery (YYYY-MM-DD)
 end: 2026-10-16
-delivery: 2026-10-19         # un jalon peut écrire `date:` (alias de delivery)
+delivery: 2026-10-19         # a milestone may write `date:` (alias of delivery)
 ```
 
-Règles vérifiées par `ameesh canon check` :
+Rules checked by `ameesh canon check`:
 
-| Code | Gravité | Règle |
+| Code | Severity | Rule |
 |---|---|---|
-| `package-kind-invalid` | erreur | `kind` ∉ {milestone, epic, lot} |
-| `package-parent-unknown` | erreur | `parent` ne désigne aucune fiche |
-| `package-kind-incoherent` | erreur | un lot se place sous un epic ou un jalon ; un epic sous un jalon (ou rien) ; un jalon n'a pas de parent |
-| `package-cycle` | erreur | les parents bouclent |
-| `package-responsible-missing` / `-unresolved` | erreur | responsable absent, ou qui ne résout pas vers un Member humain unique |
-| `package-duplicate`, `package-id-invalid` | erreur | identifiant en double ou hors grammaire (`[A-Za-z0-9][A-Za-z0-9._-]*`, 64 car.) |
-| `package-lot-orphan` | avertissement | lot sans parent |
-| `package-date-invalid` | avertissement | (L96) `start`, `end`, `delivery` ou `date` illisible (attendu `AAAA-MM-JJ`) : la date est ignorée, la fiche reste lue |
+| `package-kind-invalid` | error | `kind` ∉ {milestone, epic, lot} |
+| `package-parent-unknown` | error | `parent` designates no card |
+| `package-kind-incoherent` | error | a lot sits under an epic or a milestone; an epic under a milestone (or nothing); a milestone has no parent |
+| `package-cycle` | error | the parents form a loop |
+| `package-responsible-missing` / `-unresolved` | error | lead missing, or not resolving to a single human Member |
+| `package-duplicate`, `package-id-invalid` | error | duplicate identifier or outside the grammar (`[A-Za-z0-9][A-Za-z0-9._-]*`, 64 chars) |
+| `package-lot-orphan` | warning | lot without a parent |
+| `package-date-invalid` | warning | (L96) `start`, `end`, `delivery` or `date` unreadable (expected `YYYY-MM-DD`): the date is ignored, the card is still read |
 
-Une erreur du plan **ne bloque aucun agent** (elle n'entre pas dans la
-condition de réclamation) ; elle figure au diagnostic du canon.
+A plan error **blocks no agent** (it is not part of the claim
+condition); it appears in the canon diagnostics.
 
-`ameesh canon sync` recopie les fiches dans la table `work_packages`
-(migration 0026) avec leur `canon_ref` (`membre:chemin@commit`). Une fiche en
-erreur n'est pas écrite (sa copie précédente reste) ; une fiche retirée du
-canon est marquée absente, jamais effacée ; les lots rattachés suivent le
-parent courant de leur fiche.
+`ameesh canon sync` copies the cards into the `work_packages` table
+(migration 0026) with their `canon_ref` (`member:path@commit`). A card in
+error is not written (its previous copy remains); a card removed from the
+canon is marked absent, never deleted; the attached lots follow the
+current parent of their card.
 
-Exemple complet : [`examples/canon/plan/`](../examples/canon/plan/) (jalon
-`v1`, epics `catalogue` et `paiement`, trois lots).
+Full example: [`examples/canon/plan/`](../examples/canon/plan/) (milestone
+`v1`, epics `catalogue` and `paiement`, three lots).
 
-## Les lots (`ameesh work`)
+## Lots (`ameesh work`)
 
 ```
-ameesh work add --title T --package <fiche>       rattacher dès la création (lot ou epic)
-ameesh work link <id> <fiche> | --none             rattacher / détacher après coup
-ameesh work list [--stale-after 6h] [--json]       colonne EPIC, attente, stagnation
-ameesh work show <id> [--json]                     fiche, epic, PR, attente
-ameesh work close <id> --abandoned                 lot qui ne sera pas fait
-ameesh work close <id> --superseded-by <id2>       lot remplacé ou absorbé par un autre
+ameesh work add --title T --package <fiche>       attach at creation (lot or epic)
+ameesh work link <id> <fiche> | --none             attach / detach afterwards
+ameesh work list [--stale-after 6h] [--json]       EPIC column, waiting, stagnation
+ameesh work show <id> [--json]                     card, epic, PR, waiting
+ameesh work close <id> --abandoned                 lot that will not be done
+ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
 ```
 
-`close` passe le lot dans l'état terminal `closed` et pose un jalon `closed` :
-rien ne reste ouvert par oubli. Un lot fermé n'est **jamais rouvert** par une
-fusion constatée plus tard (le constat est signalé).
+`close` moves the lot to the terminal state `closed` and records a `closed` milestone:
+nothing stays open by oversight. A closed lot is **never reopened** by a
+merge observed later (the observation is reported).
 
-Pour chaque lot non fusionné, ameesh dit **ce qu'il attend et de qui**
-(`waiting_for` : `{what, who, label}`), dérivé de l'état, des jalons (L10) et
-des actions : démarrage, travail de l'auteur, verdict du relecteur, correction
-de l'auteur, approbation de la fusion, fusion, issue de fusion inconnue,
-décision humaine (du responsable de la fiche), déblocage. Une action du lot
-qui attend un humain (approbation, réconciliation) passe avant tout ; un
-verdict bloquant ne compte que s'il suit le dernier gel. Quand ameesh ne sait
-pas qui, il le dit (« relecteur non désigné ») au lieu de deviner.
+For each unmerged lot, ameesh says **what it is waiting for and from whom**
+(`waiting_for`: `{what, who, label}`), derived from the state, the milestones (L10) and
+the actions: start, author's work, reviewer's verdict, author's fix,
+merge approval, merge, unknown merge outcome,
+human decision (by the card's lead), unblocking. An action of the lot
+waiting for a human (approval, reconciliation) takes precedence over everything; a
+blocking verdict only counts if it follows the last freeze. When ameesh does not know
+who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of guessing.
 
-Un lot ni fusionné ni fermé sans activité (modification, transition, note,
-jalon, action, message lié) depuis le seuil (`--stale-after`,
-`AMEESH_STALE_AFTER`, défaut 6 h) est **stagnant** : il est signalé avec la
-durée, et la frise ne le dessine plus comme actif.
+A lot neither merged nor closed with no activity (change, transition, note,
+milestone, action, linked message) since the threshold (`--stale-after`,
+`AMEESH_STALE_AFTER`, default 6 h) is **stale**: it is reported with the
+duration, and the timeline no longer draws it as active.
 
-Ces règles sont dans un seul module, `ameesh.stagnation`, appelé par
-`ameesh progress`, `ameesh work list/show` et l'alerte `stale_lot` de
-`ameesh alerts` (qui garde son champ `waiting_for` en un mot et ajoute
-`waiting`, la forme détaillée).
+These rules live in a single module, `ameesh.stagnation`, called by
+`ameesh progress`, `ameesh work list/show` and the `stale_lot` alert of
+`ameesh alerts` (which keeps its one-word `waiting_for` field and adds
+`waiting`, the detailed form).
 
-## Fusion constatée : fermeture automatique
+## Observed merge: automatic closing
 
-Une fusion se prouve **par le contenu**, jamais par le nom (une branche se
-renomme, une fusion se fait par rebase, squash ou cherry-pick). Cinq voies,
-toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
-(commit et auteur de la fusion) :
+A merge is proven **by content**, never by name (a branch can be
+renamed, a merge can be done by rebase, squash or cherry-pick). Five paths,
+all idempotent, which set the lot to `merged` with its `merged` milestone
+(merge commit and author):
 
-1. **la porte** : quand l'action `git-merge` liée au lot (`--work-item`) est
-   confirmée (exécution, issue tardive ou réconciliation) ;
-2. **le contenu**, dans un clone local (lecture seule, aucun `fetch`) :
+1. **the gate**: when the `git-merge` action linked to the lot (`--work-item`) is
+   confirmed (execution, late outcome or reconciliation);
+2. **the content**, in a local clone (read-only, no `fetch`):
 
    ```
    ameesh work sync-merges --git-dir D [--target origin/main] [--repo owner/repo] [--dry-run] [--json]
    ```
 
-   seul le **dernier gel** du lot fait autorité (jalon `frozen` le plus
-   récent, avec son commit) : un gel antérieur déjà fusionné ne prouve rien
-   sur le travail courant. Ce commit est **ancêtre** de la cible ; sinon
-   chaque commit du gel a son **`git patch-id --verbatim`** parmi les commits
-   de la cible depuis leur base commune (rebase, cherry-pick) ; sinon le diff
-   entier du gel est un commit de la cible (**squash**). `--verbatim` ne
-   normalise aucun espace (`--stable` confondrait `"a b"` et `"ab"`) : faux
-   négatif plutôt que faux positif ; sans lui (git < 2.40), seul l'ancêtre
-   prouve. La fermeture est conditionnée en base au gel examiné : un nouveau
-   gel déclaré entre-temps l'empêche (`refrozen`) ;
-3. **la PR liée** (à défaut, ou seule) :
+   only the lot's **last freeze** is authoritative (most recent `frozen`
+   milestone, with its commit): an earlier freeze already merged proves nothing
+   about the current work. That commit is an **ancestor** of the target; otherwise
+   every commit of the freeze has its **`git patch-id --verbatim`** among the commits
+   of the target since their common base (rebase, cherry-pick); otherwise the whole
+   diff of the freeze is one commit of the target (**squash**). `--verbatim` does not
+   normalize any whitespace (`--stable` would confuse `"a b"` and `"ab"`): false
+   negative rather than false positive; without it (git < 2.40), only ancestry
+   proves. Closing is conditioned in the database on the examined freeze: a new
+   freeze declared in the meantime prevents it (`refrozen`);
+3. **the linked PR** (as a fallback, or alone):
 
    ```
    ameesh work sync-github --repo owner/repo [--limit 200] [--dry-run] [--json]
    ```
 
-   lit les PR fusionnées (`gh pr list`, lecture seule) ; une PR se relie à
-   une fiche par sa branche `lot/<id>` ou `lot/<id>-…` (la plus longue
-   correspondance, sans casse) ou par une ligne `ameesh-lot: <id>` du corps ;
-   une ligne `ameesh-work: <n>` désigne un lot précis (et seulement lui).
-   Seuls les lots créés **avant** la fusion sont fermés.
+   reads merged PRs (`gh pr list`, read-only); a PR is linked to
+   a card by its branch `lot/<id>` or `lot/<id>-…` (longest
+   case-insensitive match) or by an `ameesh-lot: <id>` line in the body;
+   an `ameesh-work: <n>` line designates one specific lot (and only that one).
+   Only lots created **before** the merge are closed.
 
-4. **la branche du lot** (L118), avec ou sans PR ni gel :
+4. **the lot's branch** (L118), with or without PR or freeze:
 
    ```
    ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
    ```
 
-   un lot qui porte sa branche (`work add|assign --branch`, ou branche
-   `agent/…` citée par un `mail send --lot`) est fermé quand elle entre dans
-   sa cible : pointe entrée par un commit de fusion, dernier commit vu en
-   avance retrouvé dans la cible (ancêtre, patch-id, squash), ou commit de
-   fusion qui cite la branche. L'exécuteur fait ce relevé toutes les 5 min
-   dans le dossier de travail de l'assigné ; voir EXPLOITATION.md,
-   « Courrier lié aux lots et fusion des branches ». Le même relevé ferme un
-   lot, avec ou sans branche, qu'un commit de **fusion** de la cible désigne
-   par une ligne `ameesh-work: <id>` (ou par `#<id>` dans son titre si le
-   dépôt l'active : `git config ameesh.lotRef hash`) ;
-5. **la déclaration** (correctif du 2026-10-11), pour une fusion que rien
-   d'autre ne voit :
+   a lot that carries its branch (`work add|assign --branch`, or an `agent/…`
+   branch cited by a `mail send --lot`) is closed when the branch enters
+   its target: tip brought in by a merge commit, last commit seen
+   ahead found in the target (ancestor, patch-id, squash), or merge
+   commit citing the branch. The runner performs this check every 5 min
+   in the assignee's working directory; see EXPLOITATION.md,
+   "Courrier lié aux lots et fusion des branches" (lot-linked mail and branch merges). The same check closes a
+   lot, with or without a branch, that a **merge** commit of the target designates
+   with an `ameesh-work: <id>` line (or with `#<id>` in its title if the
+   repository enables it: `git config ameesh.lotRef hash`);
+5. **the declaration** (fix of 2026-10-11), for a merge nothing
+   else sees:
 
    ```
-   ameesh work merged <id> --sha <commit de fusion> [--note …]
+   ameesh work merged <id> --sha <merge commit> [--note …]
    ```
 
-   tout état ouvert → `merged`, en une fois, jalon `merged` avec le commit.
+   any open state → `merged`, in one step, `merged` milestone with the commit.
 
-Un lot absorbé par un autre se clôt par `--superseded-by`.
+A lot absorbed by another is closed with `--superseded-by`.
 
-## Projection GitHub
+## GitHub projection
 
 ```
 ameesh work project-github --repo owner/repo [--dry-run] [--canon-url URL] [--json]
 ```
 
-* une issue par fiche `lot` : titre `[<id>] <titre>`, lien vers la fiche
-  (`--canon-url https://…/blob/{commit}` ; sinon le `canon_ref`), labels
-  `ameesh` et `ameesh:<état>` (`intake`, `build`, `qa`, `merged`, `blocked`,
-  `waiting_human`) ; fermée (terminée) quand le lot est fusionné, fermée
-  (non planifiée) quand il est abandonné ;
-* une issue par `epic` (label `ameesh:epic`), progression dans le corps, et
-  ses lots en **sous-issues** (API sub-issues de GitHub) ; si l'API est
-  indisponible, liste de tâches `- [x] #12` dans le corps de l'epic ;
-* chaque issue porte un marqueur caché `<!-- ameesh:package=<id> d=… -->` :
-  il la retrouve parmi **toutes** les issues du dépôt, quels que soient ses
-  labels — jamais de doublon, même si le label `ameesh` a été retiré (mise à
-  jour idempotente : rien n'est écrit si rien n'a changé) et garde l'empreinte de ce qu'ameesh a écrit. Un titre, un corps,
-  un label `ameesh…` ou un état changé dans GitHub est signalé
-  `PROPOSITION` (à porter au canon), puis la vue est réécrite. Les autres
-  labels ne sont jamais touchés ;
-* `--dry-run` lit GitHub et montre ce qui serait créé ou mis à jour, sans
-  rien écrire.
+* one issue per `lot` card: title `[<id>] <title>`, link to the card
+  (`--canon-url https://…/blob/{commit}`; otherwise the `canon_ref`), labels
+  `ameesh` and `ameesh:<state>` (`intake`, `build`, `qa`, `merged`, `blocked`,
+  `waiting_human`); closed (completed) when the lot is merged, closed
+  (not planned) when it is abandoned;
+* one issue per `epic` (label `ameesh:epic`), progress in the body, and
+  its lots as **sub-issues** (GitHub sub-issues API); if the API is
+  unavailable, a `- [x] #12` task list in the epic's body;
+* each issue carries a hidden marker `<!-- ameesh:package=<id> d=… -->`:
+  it finds the issue among **all** the repository's issues, whatever its
+  labels — never a duplicate, even if the `ameesh` label was removed (idempotent
+  update: nothing is written if nothing changed) and keeps the fingerprint of what ameesh wrote. A title, a body,
+  an `ameesh…` label or a state changed in GitHub is reported as
+  `PROPOSITION` (to be carried into the canon), then the view is rewritten. Other
+  labels are never touched;
+* `--dry-run` reads GitHub and shows what would be created or updated, without
+  writing anything.
 
-Les **lots** eux-mêmes, rattachés à une fiche ou non, ont chacun leur issue
-(L126) : `ameesh work project-github --app <projet>`, dépôt lu dans la
-configuration de l'hôte, tenue automatique par `ameesh notify` ; voir
-[EXPLOITATION.md](EXPLOITATION.md), « Issues GitHub des lots ».
+The **lots** themselves, attached to a card or not, each have their own issue
+(L126): `ameesh work project-github --app <projet>`, repository read from the
+host configuration, kept up to date automatically by `ameesh notify`; see
+[EXPLOITATION.md](EXPLOITATION.md), "Issues GitHub des lots" (GitHub issues for lots).
 
-`gh` est résolu comme pour le connecteur `git-merge` (`AMEESH_GH_BIN`,
-`AMEESH_BIN_DIR/gh`, PATH) ; les tests utilisent un faux `gh`
-(`tests/fake_github.py`), jamais GitHub.
+`gh` is resolved as for the `git-merge` connector (`AMEESH_GH_BIN`,
+`AMEESH_BIN_DIR/gh`, PATH); the tests use a fake `gh`
+(`tests/fake_github.py`), never GitHub.
 
 ## `ameesh progress`
 
-Champs **ajoutés** au schéma `ameesh-progress/1` (voir [PROGRESS.md](PROGRESS.md)) :
-`epics` (lots regroupés par epic, progression), `milestones` (les fiches
-`milestone`), `stale_after_s`, et par lot `package`, `epic`, `pr_ref`,
-`closed`, `waiting_for`, `last_activity_ts`, `stale`. Le texte et la page
-montrent l'attente, la stagnation et la section EPICS.
+Fields **added** to the `ameesh-progress/1` schema (see [PROGRESS.md](PROGRESS.md)):
+`epics` (lots grouped by epic, progress), `milestones` (the `milestone`
+cards), `stale_after_s`, and per lot `package`, `epic`, `pr_ref`,
+`closed`, `waiting_for`, `last_activity_ts`, `stale`. The text and the page
+show waiting, stagnation and the EPICS section.
 
-## Feuille de route : dates prévues et engagements (L96)
+## Roadmap: planned dates and commitments (L96)
 
-Le plan dit **quoi** ; la feuille de route dit **pour quand**, et compare au
-réel. Migration 0044.
+The plan says **what**; the roadmap says **by when**, and compares with
+reality. Migration 0044.
 
-* **Dates prévues** d'une tâche (`ameesh work plan <id> --debut J --fin J
-  --livraison J --source S`) et d'une fiche (`ameesh work plan <fiche> …`,
-  qui prime sur les dates du canon ci-dessus). La replanification n'est pas
-  une activité de la tâche.
-* **Engagements datés** (`ameesh plan add "…" --pour J --projet P --source
-  S [--lot N] [--depend-de REF]`) et **jalons de décision** (`--decision`) ;
-  `plan accept | done | cancel`. Un engagement rattaché à une tâche est tenu
-  à sa livraison.
-* **Propositions** (`ameesh plan propose [--from docs/design/decisions]
-  [--record]`) : tirées des fiches `Decision` (question ouverte → jalon de
-  décision ; « pour le 2026-10-20 », « on fera ça lundi » → engagement ;
-  « lots L97–L104 », « même vague que L95 » → élément et dépendances) et du
-  corps des tâches ouvertes. À valider : rien n'est créé sans `--record`,
-  rien n'est daté sans `plan accept`.
-* **Gantt** : `ameesh plan show [--json]` et la section `roadmap` de `ameesh
-  progress` (affichée par défaut, `--no-gantt` pour la retirer) — epics et
-  jalons (prévu de la fiche, réel de leurs tâches), tâches (prévu face aux
-  jalons réels génériques : demandée, en cours, soumise, verdict, livrée),
-  engagements, décisions attendues, ligne du jour, retards, source de chaque
-  élément ; plus « qui avance sur quoi ».
-* **Alerte** `engagement_overdue` (poussée par `ameesh notify`) : un
-  engagement ou une date prévue passé sans que l'élément soit atteint.
+* **Planned dates** of a task (`ameesh work plan <id> --debut J --fin J
+  --livraison J --source S`) and of a card (`ameesh work plan <fiche> …`,
+  which takes precedence over the canon dates above). Rescheduling is not
+  an activity of the task.
+* **Dated commitments** (`ameesh plan add "…" --pour J --projet P --source
+  S [--lot N] [--depend-de REF]`) and **decision milestones** (`--decision`);
+  `plan accept | done | cancel`. A commitment attached to a task is met
+  at its delivery.
+* **Proposals** (`ameesh plan propose [--from docs/design/decisions]
+  [--record]`): drawn from `Decision` cards (open question → decision
+  milestone; "pour le 2026-10-20" (by 2026-10-20), "on fera ça lundi" (we'll do it on
+  Monday) → commitment; "lots L97–L104", "même vague que L95" (same wave as L95) →
+  item and dependencies) and from the body of open tasks. To be validated: nothing is created without `--record`,
+  nothing is dated without `plan accept`.
+* **Gantt**: `ameesh plan show [--json]` and the `roadmap` section of `ameesh
+  progress` (shown by default, `--no-gantt` to remove it) — epics and
+  milestones (planned from the card, actual from their tasks), tasks (planned versus the
+  generic actual milestones: requested, in progress, submitted, verdict, delivered),
+  commitments, pending decisions, today line, delays, source of each
+  item; plus "who is advancing on what".
+* **Alert** `engagement_overdue` (pushed by `ameesh notify`): a
+  commitment or planned date passed without the item being reached.
 
-Le suivi de projet est au **cœur générique** : le code de la feuille de
-route ne nomme aucun état ni jalon de métier ; la correspondance avec le
-cycle actuel des lots tient dans `roadmap_dev.CORRESPONDANCES`, que le futur
-module « développement » reprendra. Détail, schéma `ameesh-roadmap/1` et
-consigne des orchestrateurs : [EXPLOITATION.md](EXPLOITATION.md), « Feuille
-de route ».
+Project tracking is in the **generic core**: the roadmap code
+names no business state or milestone; the mapping to the
+current lot lifecycle lives in `roadmap_dev.CORRESPONDANCES`, which the future
+"development" module will take over. Details, the `ameesh-roadmap/1` schema and
+the orchestrators' prompt: [EXPLOITATION.md](EXPLOITATION.md), "Feuille de route" (roadmap)
+section.
 
-## File d'amélioration continue (L119, décision 0037)
+## Continuous improvement queue (L119, decision 0037)
 
 ```
 ameesh work backlog add --title T --value "valeur attendue" --score 1-100
@@ -238,28 +238,28 @@ ameesh work backlog add --title T --value "valeur attendue" --score 1-100
 ameesh work backlog list [--all] [--json]
 ```
 
-Un élément de la file est un lot de type `improvement`, en `intake`, sans
-assigné ; sa valeur attendue (une phrase) et son score sont obligatoires : pas
-de travail pour occuper. La file se lit dans l'ordre de prise : priorité, puis
-score, puis ancienneté. Un élément en file n'est ni stagnant ni un « lot sans
-assigné » d'`idle_capacity` : il attend son preneur.
+A queue item is a lot of type `improvement`, in `intake`, with no
+assignee; its expected value (one sentence) and its score are mandatory: no
+busywork. The queue is read in pick-up order: priority, then
+score, then age. A queued item is neither stale nor a "lot without
+assignee" for `idle_capacity`: it is waiting for its taker.
 
-À chaque passage, `ameesh notify` confie l'élément le mieux classé qui
-correspond à l'équipe et aux capacités d'un agent réveillable au repos depuis
-`--take-idle` (30 min), par l'attribution gardée et un courrier lié au lot.
-Garde-fous :
+On each pass, `ameesh notify` hands the best-ranked item that
+matches the team and capabilities of a wakeable agent idle for
+`--take-idle` (30 min), through guarded assignment and a lot-linked mail.
+Safeguards:
 
-* **seulement si aucun lot ne l'attend** : ni lot ouvert, ni courrier non lu,
-  ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
-  du projet attend un preneur, aucune amélioration n'est prise ;
-* **jamais un geste irréversible ou de production** : le courrier de prise
-  l'interdit (déploiement, fusion, suppression de données, serveur de
-  production, dépense engagée) ; l'agent le propose à un humain ;
-* forfaits d'abord ; le token seulement avec `--take-paid`, jamais pendant
-  `balance_low` ; rien sous un plafond atteint ni sur un hôte sous pression,
-  sur batterie faible ou non prêt ; au plus `--take-max-per-hour` (2) prises
-  par heure glissante pour tout le mesh.
+* **only if no lot is waiting for it**: no open lot, no unread mail,
+  no pending prompt, no session lot still open; and as long as a lot
+  of the project is waiting for a taker, no improvement is taken;
+* **never an irreversible or production action**: the pick-up mail
+  forbids it (deployment, merge, data deletion, production
+  server, committed spending); the agent proposes it to a human;
+* plans first; the token only with `--take-paid`, never during
+  `balance_low`; nothing under a reached cap nor on a host under pressure,
+  on low battery or not ready; at most `--take-max-per-hour` (2) pick-ups
+  per sliding hour for the whole mesh.
 
-Quand des agents sont au repos et que la file est vide (et qu'aucun lot du
-projet n'attend), l'alerte `backlog_empty` invite l'humain responsable à la
-remplir.
+When agents are idle and the queue is empty (and no lot of the
+project is waiting), the `backlog_empty` alert invites the human lead to
+fill it.

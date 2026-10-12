@@ -1,44 +1,44 @@
 ---
 type: Decision
-title: "L'hébergement est une configuration, préparée par le harnais de l'utilisateur"
-description: "Pas de machine imposée : local, page Nexlink ou VPS provisionné ; l'installation est conduite par le harnais d'agent que l'utilisateur a déjà."
+title: "Hosting is a configuration, prepared by the user's harness"
+description: "No imposed machine: local, Nexlink page or provisioned VPS; installation is driven by the agent harness the user already has."
 status: stable
 tags: [hebergement, installation, provisionnement]
 decided_by: human:smichea
 decision_date: 2026-10-04
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:40:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-La question ouverte M4 (« première machine en plus du PC ») supposait un choix
-d'infrastructure fait une fois pour toutes.
+The open question M4 ("first machine besides the PC") assumed an
+infrastructure choice made once and for all.
 
-# Décision
+# Decision
 
-- **Où tourne ameesh est une configuration, par projet**, pas une décision
-  d'architecture. Profils possibles : **local** (projet personnel, une
-  machine), **page Nexlink** (hébergée par un serveur de page), **VPS
-  provisionné** (proposé et créé par du code d'infrastructure), et par
-  extension un serveur ou un cluster existant.
-- **La personne qui lance ameesh en local a déjà un harnais d'agent** (Claude
-  Code, Codex, DeepSeek Harness…) : on l'utilise **tout de suite** pour un
-  **provisionnement intelligent** — il demande à l'utilisateur où il veut
-  héberger, ou s'il reste en local pour un projet perso, puis prépare la
+- **Where ameesh runs is a configuration, per project**, not an architecture
+  decision. Possible profiles: **local** (personal project, one
+  machine), **Nexlink page** (hosted by a page server), **provisioned
+  VPS** (proposed and created by infrastructure code), and by
+  extension an existing server or cluster.
+- **The person who launches ameesh locally already has an agent harness** (Claude
+  Code, Codex, DeepSeek Harness…): we use it **right away** for
+  **intelligent provisioning** — it asks the user where they want to
+  host, or whether they stay local for a personal project, then prepares the
   configuration.
 
-# Conséquences
+# Consequences
 
-- ameesh se distribue aussi comme **skill / plugin d'installation** au
-  standard des harnais ([0007](0007-standards-des-harnais.md)) : entretien avec
-  l'utilisateur, choix du profil, amorçage du canon (racine OKF, fédération,
-  fiches des premiers agents), déploiement de l'exécuteur et de la base,
-  enrôlement de la passkey de l'utilisateur dans ameesh-approve.
-- Provisionnement d'un VPS par **OpenTofu** (MPL-2.0, Linux Foundation) plutôt
-  que Terraform (BSL depuis 2023) pour rester open source.
-- **Toute dépense** (VPS, domaine) est une action coûteuse : elle passe par une
-  approbation signée de l'utilisateur — la première cérémonie d'ameesh-approve
-  sert à approuver sa propre infrastructure.
-- La question de la base (ex-M3) suit le profil : elle vit là où tourne
-  l'exécuteur, sauvegardée hors de la machine dès qu'on quitte le profil local.
+- ameesh is also distributed as an **installation skill / plugin** following
+  the harness standards ([0007](0007-standards-des-harnais.md)): interview with
+  the user, choice of profile, bootstrapping of the canon (OKF root, federation,
+  cards of the first agents), deployment of the runner and the database,
+  enrolment of the user's passkey in ameesh-approve.
+- Provisioning of a VPS with **OpenTofu** (MPL-2.0, Linux Foundation) rather
+  than Terraform (BSL since 2023) to stay open source.
+- **Any spending** (VPS, domain) is a costly action: it goes through a
+  signed approval from the user — the first ameesh-approve ceremony
+  serves to approve one's own infrastructure.
+- The database question (formerly M3) follows the profile: it lives where the
+  runner runs, backed up off the machine as soon as one leaves the local profile.

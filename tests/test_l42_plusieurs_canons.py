@@ -380,7 +380,7 @@ class CliTest(_DeuxCanons):
         proc = self.mesh("agent", "spawn", "aide", "--by", "b1", "--ttl", "1h",
                          env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("responsable human:bob", proc.stdout)
+        self.assertIn("responsible human:bob", proc.stdout)
         self.assertEqual(self.row("aide")["canon"], ID_B)
         # un nom déclaré par le canon B n'est pas un éphémère
         proc = self.mesh("agent", "spawn", "b2", "--by", "a1", "--ttl", "1h",

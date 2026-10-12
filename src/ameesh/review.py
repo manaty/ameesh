@@ -31,7 +31,7 @@ DEFAULT_CLASS = "normal"
 #: rang de gravité : la classe d'un changement est le maximum
 RANK = {name: index for index, name in enumerate(CLASSES)}
 #: libellés français (CLI et messages)
-DISPLAY = {"light": "léger", "normal": "normal", "sensitive": "sensible"}
+DISPLAY = {"light": "light", "normal": "normal", "sensitive": "sensitive"}
 #: codes de constat produits par [`parse`] (préfixe des constats du canon)
 INVALID = "review-policies-invalid"
 UNKNOWN_CLASS = "review-policies-class-unknown"
@@ -165,7 +165,7 @@ def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
         return ReviewPolicy(), problems
     if not isinstance(policies, dict):
         return ReviewPolicy(), [(INVALID, "error",
-                                 "review_policies doit être un mapping")]
+                                 "review_policies must be a mapping")]
 
     default = policies.get("default", DEFAULT_CLASS)
     if policies and "default" not in policies:
@@ -173,42 +173,42 @@ def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
         # sinon un fichier hors portée est classé par un défaut implicite. Un
         # mapping vide n'est pas une politique : pas d'avertissement.
         problems.append((NO_DEFAULT, "warning",
-                         "review_policies.risk_classes sans `default` : %s par défaut"
+                         "review_policies.risk_classes without `default`: %s by default"
                          % DEFAULT_CLASS))
     if not isinstance(default, str) or default not in CLASSES:
         problems.append((UNKNOWN_CLASS, "error",
-                         "classe par défaut inconnue : %r (attendu : %s)"
+                         "unknown default class: %r (expected: %s)"
                          % (default, ", ".join(CLASSES))))
         default = DEFAULT_CLASS
 
     raw_rules = policies.get("rules", [])
     if not isinstance(raw_rules, list):
         problems.append((BAD_RULE, "error",
-                         "review_policies.rules doit être une liste"))
+                         "review_policies.rules must be a list"))
         raw_rules = []
 
     rules: list[Rule] = []
     for index, entry in enumerate(raw_rules):
-        where = "règle %d" % (index + 1)
+        where = "rule %d" % (index + 1)
         if not isinstance(entry, dict):
-            problems.append((BAD_RULE, "error", "%s : mapping attendu" % where))
+            problems.append((BAD_RULE, "error", "%s: mapping expected" % where))
             continue
         paths = entry.get("paths")
         if not isinstance(paths, list) or not paths:
             problems.append((BAD_RULE, "error",
-                             "%s : `paths` doit être une liste non vide" % where))
+                             "%s: `paths` must be a non-empty list" % where))
             continue
         if any(not isinstance(p, str) or not p.strip() for p in paths):
             problems.append((BAD_RULE, "error",
-                             "%s : chaque `paths` doit être un motif non vide" % where))
+                             "%s: each `paths` entry must be a non-empty pattern" % where))
             continue
         if "class" not in entry:
-            problems.append((BAD_RULE, "error", "%s : `class` manquante" % where))
+            problems.append((BAD_RULE, "error", "%s: `class` missing" % where))
             continue
         cls = entry.get("class")
         if not isinstance(cls, str) or cls not in CLASSES:
             problems.append((UNKNOWN_CLASS, "error",
-                             "%s : classe inconnue %r (attendu : %s)"
+                             "%s: unknown class %r (expected: %s)"
                              % (where, cls, ", ".join(CLASSES))))
             continue
         regexes = []
@@ -218,7 +218,7 @@ def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
                 regexes.append(compile_glob(pattern))
             except re.error as exc:
                 problems.append((BAD_GLOB, "error",
-                                 "%s : motif %r invalide (%s)" % (where, pattern, exc)))
+                                 "%s: invalid pattern %r (%s)" % (where, pattern, exc)))
                 failed = True
         if failed:
             continue
@@ -241,7 +241,7 @@ def policy_from_federation(federation) -> tuple[ReviewPolicy, list[tuple[str, st
         return ReviewPolicy(), []
     if not isinstance(policies, dict):
         return ReviewPolicy(), [(INVALID, "error",
-                                 "review_policies doit être un mapping")]
+                                 "review_policies must be a mapping")]
     if "risk_classes" not in policies:
         return ReviewPolicy(), []
     return parse(policies["risk_classes"])
@@ -258,15 +258,15 @@ def classify(policy: ReviewPolicy, paths) -> dict:
     for raw in paths:
         value = str(raw).strip()
         if value.startswith("/") or _WINDOWS_ABSOLUTE.match(value):
-            raise ReviewError("chemin absolu : %r" % raw)
+            raise ReviewError("absolute path: %r" % raw)
         path = normalize_path(value)
         if not path or path == ".." or path.startswith("../"):
-            raise ReviewError("chemin hors dépôt : %r" % raw)
+            raise ReviewError("path outside the repository: %r" % raw)
         cls, rule = policy.class_of(path)
         files.append({"path": path, "class": cls,
                       "rule": list(rule.paths) if rule else None})
     if not files:
-        raise ReviewError("aucun fichier à classer")
+        raise ReviewError("no file to classify")
     files.sort(key=lambda item: item["path"])
     overall = max((item["class"] for item in files), key=lambda name: RANK[name])
     return {

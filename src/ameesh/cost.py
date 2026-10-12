@@ -51,6 +51,7 @@ from typing import Callable, Iterable, Sequence
 from . import config as config_mod
 from . import harnesses
 from . import storage
+from .gauge_cache import CLAUDE_GAUGES
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
@@ -60,6 +61,42 @@ DEFAULT_PRICES = {
     "gpt-6.1-sol": [1.25, 0.125, 10.0],
     "default-codex": [1.25, 0.125, 10.0],
     "default-deepseek": [0.27, 0.07, 1.10],
+    # L225 : barème officiel Anthropic, relevé le 2026-10-11 sur
+    # https://platform.claude.com/docs/en/about-claude/pricing (entrée de base,
+    # « cache hits and refreshes », sortie ; tarif standard, hors mode rapide,
+    # lots et résidence des données). Les modèles retirés encore servis
+    # (Opus 4/4.1) restent : ils bornent le majorant de la famille.
+    "claude-fable-5-1": [10.0, 0.25, 50.0],
+    "claude-mythos-5-1": [10.0, 0.25, 50.0],
+    "claude-fable-5": [10.0, 1.0, 50.0],
+    "claude-mythos-5": [10.0, 1.0, 50.0],
+    "claude-opus-5-5": [4.0, 0.20, 20.0],
+    "claude-opus-5": [5.0, 0.50, 25.0],
+    "claude-opus-4-8": [5.0, 0.50, 25.0],
+    "claude-opus-4-7": [5.0, 0.50, 25.0],
+    "claude-opus-4-6": [5.0, 0.50, 25.0],
+    "claude-opus-4-5": [5.0, 0.50, 25.0],
+    "claude-opus-4-1": [15.0, 1.50, 75.0],
+    "claude-opus-4": [15.0, 1.50, 75.0],
+    "claude-sonnet-5-5": [2.0, 0.10, 10.0],
+    "claude-sonnet-5": [2.0, 0.20, 10.0],
+    "claude-sonnet-4-6": [3.0, 0.30, 15.0],
+    "claude-sonnet-4-5": [3.0, 0.30, 15.0],
+    "claude-sonnet-4": [3.0, 0.30, 15.0],
+    # Haiku 5.5 : tarif des invites de plus de 100 000 jetons, le plus cher des
+    # deux paliers (majorant) ; chaque requête Claude est facturée à son palier
+    # (`PROMPT_TIERS`)
+    "claude-haiku-5-5": [0.50, 0.05, 2.50],
+    "claude-haiku-4-5": [1.0, 0.10, 5.0],
+}
+
+#: L225 : modèles facturés selon la longueur de l'invite de CHAQUE requête
+#: (entrée + cache relu + cache écrit) : jusqu'au seuil, le palier bas ;
+#: au-delà, le tarif de `DEFAULT_PRICES`. Un usage agrégé sur plusieurs
+#: requêtes n'a le palier bas que si son total reste sous le seuil (exact :
+#: chaque requête y est alors aussi).
+PROMPT_TIERS = {
+    "claude-haiku-5-5": (100_000, [0.10, 0.01, 0.50]),
 }
 
 #: Fenêtres nommées par les jauges, en secondes.
@@ -70,8 +107,8 @@ KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 DEFAULT_HOURLY_USD = 10.0
 
 #: L70 : fenêtres glissantes des plafonds (secondes → libellés de la raison)
-WINDOW_LABELS = {3600: ("horaire", "les 60 dernières minutes"),
-                 86400: ("journalier", "les 24 dernières heures")}
+WINDOW_LABELS = {3600: ("hourly", "the last 60 minutes"),
+                 86400: ("daily", "the last 24 hours")}
 
 
 def gauges_source(harness: str) -> str:
@@ -90,8 +127,8 @@ def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
     """
     descriptors = harnesses.scan(host=host)[0]
     if not descriptors:
-        raise CostError("aucun descripteur de harnais lisible : le plafond horaire "
-                        "payé au token ne peut pas être appliqué")
+        raise CostError("no readable harness descriptor: the pay-per-token hourly cap "
+                        "cannot be applied")
     return tuple(sorted(ident for ident, d in descriptors.items() if d.paid_per_token))
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
@@ -117,6 +154,49 @@ ACCOUNT_MARKER = "ameesh.account"
 #: compté au cumul de toute la session (Claude `total_cost_usd`, Codex
 #: `turn.completed`), pas à la différence.
 TURN_MARKER = "ameesh.turn"
+
+
+@dataclass(frozen=True)
+class Overage:
+    """Paid usage beyond the plan for one account (L226b), as its harness
+    last reported it. Never a secret: two flags.
+
+    * `capable`: the account may go beyond its plan and be billed (Claude
+      `overageStatus` allowed, Codex `credits.has_credits`); None if the
+      harness did not say;
+    * `in_use`: the account is consuming paid usage now (Claude
+      `isUsingOverage`, Codex a window at 100 % with credits).
+    """
+
+    capable: bool | None = None
+    in_use: bool = False
+
+
+class Gauges(list):
+    """The gauges of one reading, with the overage flags of the same reading
+    (`overage`, None if unknown): a list, so every reader of gauges is
+    unchanged."""
+
+    overage: Overage | None = None
+
+    def __init__(self, items=(), overage: Overage | None = None):
+        super().__init__(items)
+        self.overage = overage
+
+    def in_overage(self, now: float) -> bool:
+        """Is the account billed beyond its plan at `now`? A reading in
+        overage goes stale once the windows that ran out have reset (L71):
+        the next window is fresh, and an unused account would otherwise never
+        publish the reading that clears the flag. A saturated window with no
+        reset date keeps the flag (never overage when in doubt)."""
+        if self.overage is None or not self.overage.in_use:
+            return False
+        spent = self.spent()
+        return not spent or any(not g.reset_passed(now) for g in spent)
+
+    def spent(self) -> list:
+        """The windows that ran out (all of them if the reading names none)."""
+        return [g for g in self if g.used >= 1.0] or list(self)
 
 
 class CostError(Exception):
@@ -190,6 +270,14 @@ class TurnUsage:
     output_tokens: int = 0
     turn: str | None = None
     session: str | None = None
+    #: L225 : non None = tour au barème sans aucun barème ; la ligne est
+    #: écartée des sommes et l'alerte `turn_unpriced` le dit
+    void_reason: str | None = None
+    #: L225 : non None = tour facturé au repli prudent (maximum du barème),
+    #: faute de tarif du modèle et de sa famille ; alerte `turn_unpriced`
+    price_fallback: str | None = None
+    #: L225 : écritures de cache Claude du tour (None : harnais sans)
+    cache_write_tokens: int | None = None
 
     def row(self) -> dict:
         return {
@@ -264,14 +352,51 @@ PRICE_FAMILY = {
 }
 
 
+#: suffixes qu'un harnais ajoute à l'identifiant d'un modèle sans en changer
+#: le tarif : variante de contexte (`claude-opus-4-6[1m]`), instantané daté
+#: (`claude-haiku-4-5-20251001`)
+_MODEL_SUFFIX = re.compile(r"(\[[^\]]*\]|-\d{8})$")
+
+
+def priced_name(prices: dict, model: str | None) -> str | None:
+    """Le nom sous lequel un modèle est **nommé** au barème, ou None (L225).
+
+    L'identifiant exact d'abord, puis sans ses suffixes de variante ou de date."""
+    name = str(model or "")
+    while name:
+        if name in prices and not name.startswith("default-"):
+            return name
+        stripped = _MODEL_SUFFIX.sub("", name)
+        if stripped == name:
+            return None
+        name = stripped
+    return None
+
+
+def known_price(prices: dict, model: str | None) -> list | None:
+    """Le triplet de prix **nommé** d'un modèle au barème, ou None (L225)."""
+    name = priced_name(prices, model)
+    return list(prices[name]) if name else None
+
+
+def prompt_tier(prices: dict, model: str | None) -> tuple | None:
+    """L225 : (seuil, triplet du palier bas) d'un modèle facturé selon la
+    longueur de l'invite, ou None. Seulement au tarif officiel : un barème
+    local qui renomme le prix du modèle n'a pas de palier."""
+    name = priced_name(prices, model)
+    tier = PROMPT_TIERS.get(name or "")
+    if tier is None or list(prices[name]) != DEFAULT_PRICES.get(name):
+        return None
+    return tier
+
+
 def price_of(prices: dict, harness: str, model: str | None) -> list:
     """Le triplet de prix d'un modèle, avec le repli par harnais."""
-    if model and model in prices:
-        return prices[model]
-    return prices.get("default-%s" % harness) or prices["default-deepseek"]
+    return known_price(prices, model) or prices.get("default-%s" % harness) \
+        or prices["default-deepseek"]
 
 
-def max_price_of(prices: dict, harness: str) -> list:
+def max_price_of(prices: dict, harness: str) -> list | None:
     """Un **majorant sûr** du tarif d'un modèle inconnu de la famille du harnais.
 
     Le maximum se prend **composante par composante** — entrée, entrée en cache,
@@ -283,23 +408,60 @@ def max_price_of(prices: dict, harness: str) -> list:
     produit 1 M de jetons de sortie était facturé 1 $ au lieu de 100 $).
 
     Un modèle inconnu (ou vide) ne doit jamais être facturé au tarif par défaut,
-    qui est le moins cher (0019 §3, repli fail-closed). Si la famille n'a aucun
-    tarif connu, on prend le maximum composante par composante de **tout** le
-    barème utilisable plutôt que le défaut d'un harnais.
+    qui est le moins cher (0019 §3, repli fail-closed). L225 : si la famille n'a
+    **aucun** tarif connu, il n'y a pas de majorant sûr — None. L'appelant
+    prend alors le repli prudent (`worst_price_of`) **et** le marque
+    (`price_fallback`, alerte `turn_unpriced`) : sans prix claude, ce repli
+    facturait un tour opus aux tarifs codex, sans un mot.
     """
     prefixes = PRICE_FAMILY.get(harness, ())
-
-    def connus(retenir) -> list:
-        return [triplet for key, value in prices.items()
-                if not key.startswith("default-") and retenir(key)
-                for triplet in [_valid_triplet(value)] if triplet is not None]
-
-    candidats = connus(lambda key: any(key.startswith(prefixe) for prefixe in prefixes))
+    candidats = [triplet for key, value in prices.items()
+                 if not key.startswith("default-")
+                 and any(key.startswith(prefixe) for prefixe in prefixes)
+                 for triplet in [_valid_triplet(value)] if triplet is not None]
     if not candidats:
-        candidats = connus(lambda key: True)
-    if not candidats:
-        return list(prices.get("default-%s" % harness) or prices["default-deepseek"])
+        return None
     return [max(triplet[i] for triplet in candidats) for i in range(3)]
+
+
+def worst_price_of(prices: dict) -> list | None:
+    """L225 : le repli prudent, maximum composante par composante de **tout** le
+    barème utilisable (défauts compris) ; None s'il n'y a aucun barème."""
+    candidats = [triplet for value in prices.values()
+                 for triplet in [_valid_triplet(value)] if triplet is not None]
+    if not candidats:
+        return None
+    return [max(triplet[i] for triplet in candidats) for i in range(3)]
+
+
+def price_for(prices: dict, harness: str, model: str | None) -> tuple[list | None, dict]:
+    """L225 : (triplet, marque) du tarif d'un tour compté au barème.
+
+    Tarif du modèle, sinon majorant de sa famille (0019 §3) : marque vide.
+    Famille sans tarif (ou harnais sans famille) : repli prudent sur tout le
+    barème, marqué `price_fallback` — le tour reste dans la dépense et les
+    plafonds. Aucun barème du tout : (None, `void_reason`), la ligne est écartée.
+    Les deux marques lèvent l'alerte `turn_unpriced`."""
+    triplet = known_price(prices, model) or max_price_of(prices, harness)
+    if triplet:
+        return triplet, {}
+    what = "modèle %s (harnais %s)" % (model or "inconnu", harness or "?")
+    worst = worst_price_of(prices)
+    if worst:
+        return worst, {"price_fallback": "%s : %s sans tarif au barème ni dans sa famille, "
+                       "facturé au maximum du barème" % (FALLBACK_REASON, what)}
+    return None, {"void_reason": "%s : %s, aucun barème" % (UNPRICED_REASON, what)}
+
+
+#: L225 : début du `void_reason` d'un tour sans aucun barème, et de la
+#: `price_fallback` d'un tour facturé au repli prudent (alerte `turn_unpriced`)
+UNPRICED_REASON = "prix inconnu"
+FALLBACK_REASON = "repli prudent"
+
+#: L225 : écritures de cache Claude, en multiple du prix d'entrée de base
+#: (barème officiel : 5 min ×1,25, 1 h ×2 ; durée inconnue : ×1,25)
+CACHE_WRITE_5M = 1.25
+CACHE_WRITE_1H = 2.0
 
 
 class CostBook:
@@ -342,6 +504,9 @@ class CostBook:
         #: L95 : dossiers Codex des comptes déclarés (`CODEX_HOME`), où chercher
         #: le journal d'un fil (modèle, total avant le tour) en plus du défaut
         self.codex_homes = [h for h in (codex_homes or []) if h]
+        # Workers create a CostBook each poll: reuse verified observations,
+        # not account selection or budget decisions, across those instances.
+        self._claude_gauge_cache = CLAUDE_GAUGES
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -429,14 +594,12 @@ class CostBook:
 
     # -- jauges de forfait --------------------------------------------------
     def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
-        """Le dernier `rate_limit_event` vu par un agent Claude.
+        """Read the latest Claude rate-limit gauges, shared across an account.
 
-        Le forfait est partagé par tout le compte : la jauge la plus récente de
-        n'importe quel agent Claude vaut pour les autres.
-
-        `account` (L30) : seulement les événements de ce compte, reconnus par le
-        marqueur qui précède chaque tour ; un événement sans marqueur avant lui
-        appartient au compte `primary`.
+        With `account` (L30), use the marker preceding each turn, including
+        markers outside the read tail. Only a stream with no account marker
+        belongs to `primary`. Leading readings before any established marker
+        in a marked stream stay unknown, never primary.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary or account)
@@ -457,50 +620,43 @@ class CostBook:
                 gauges = _claude_windows(line)
                 if gauges is None:
                     break
-                newest = (mtime, gauges)
+                newest = (mtime, Gauges(gauges, _claude_overage(line)))
                 break
         return newest[1] if newest else []
 
     def _claude_gauges_of(self, account: str, primary: str) -> list:
-        """Les jauges Claude d'UN compte (L30) : le dernier relevé de ce compte.
+        """Read the newest gauges for one Claude account (L30).
 
-        Chaque tour est précédé d'un marqueur daté ; le relevé le plus récent est
-        celui du tour au marqueur le plus récent, tous agents confondus. Dans un
-        flux sans aucun marqueur (agent d'avant L30), les relevés sont du compte
-        primaire et datés par le fichier.
+        Compare turn-marker timestamps across agents. Only a stream without
+        any marker uses the primary account and file modification time.
         """
         best = None
         for agent in self.agents():
             if not self._claude_candidate(agent):
                 continue
-            path = os.path.join(self.agent_dir(agent), "events.jsonl")
+            path = os.path.abspath(os.path.join(self.agent_dir(agent), "events.jsonl"))
             try:
-                mtime = os.stat(path).st_mtime
+                signature = _journal_signature(os.stat(path))
+                cached = self._claude_gauge_cache.get(path)
+                if cached is not None and cached[0] == signature:
+                    readings = cached[1]
+                else:
+                    events, stat, complete = _claude_account_tail(path)
+                    readings = _claude_account_readings(events, stat.st_mtime)
+                    if complete:
+                        self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
+                    else:
+                        self._claude_gauge_cache.pop(path, None)
             except OSError:
+                self._claude_gauge_cache.pop(path, None)
                 continue
-            events = self.events(agent, tail=True)
-            marked = any(e.get("type") == ACCOUNT_MARKER for e in events)
-            current, stamp = primary, (0.0 if marked else mtime)
-            found = None
-            for event in events:
-                kind = event.get("type")
-                if kind == ACCOUNT_MARKER:
-                    if event.get("harness") not in (None, "", "claude"):
-                        continue
-                    current = str(event.get("account") or primary)
-                    try:
-                        stamp = float(event.get("ts") or 0.0)
-                    except (TypeError, ValueError):
-                        stamp = 0.0
-                    continue
-                if kind != "rate_limit_event" or current != account:
-                    continue
-                gauges = _claude_windows(event)
-                if gauges is not None:
-                    found = (stamp, gauges)
+            found = readings.get(account)
+            if found is None and account == primary:
+                found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
-        return best[1] if best else []
+        # A caller must not mutate the cached list seen by another CostBook.
+        return list(best[1]) if best else []
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -546,7 +702,7 @@ class CostBook:
                     minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
                 ))
             if gauges:
-                return gauges
+                return Gauges(gauges, _codex_overage(limits, gauges))
         return []
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> list:
@@ -606,8 +762,8 @@ class CostBook:
         now = self.clock()
         for gauge in self.gauges(harness):
             if gauge.exceeded(now):
-                return ("forfait %s %s : %.0f%% utilisé pour %.0f%% de la fenêtre "
-                        "écoulée (plafond de rythme %.0f%%)" % (
+                return ("plan %s %s: %.0f%% used with %.0f%% of the window "
+                        "elapsed (pace cap %.0f%%)" % (
                             harness, gauge.key, gauge.used * 100,
                             gauge.elapsed(now) * 100, gauge.pace_cap(now) * 100))
         return ""
@@ -852,12 +1008,12 @@ class CostBook:
             # lit dans le journal de session du fil, ou sa configuration.
             model = self.codex_thread_model(session)
         prices = load_prices(self.prices_path)
-        if model and model in prices:
-            pin, pcache, pout = prices[model]
-            modele = model
-        else:
-            pin, pcache, pout = max_price_of(prices, harness or "deepseek")
-            modele = model or "inconnu"
+        modele = model if known_price(prices, model) else (model or "inconnu")
+        # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
+        # un tour effectivement compté au barème, avec des jetons.
+        triplet, marque = price_for(prices, harness or "deepseek", model)
+        pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
+        tier = prompt_tier(prices, model) if not marque else None
         cum = self.baseline(agent, harness, session)
         # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
         # de la session (autre agent, ou flux local d'avant le tour) sert de repère.
@@ -878,6 +1034,7 @@ class CostBook:
                       if isinstance(e.get("total_cost_usd"), (int, float))]
             usage = [e["usage"] for e in results if _has_tokens(e.get("usage"))]
             last = cum.get("cum_usd")
+            au_bareme = True
             # L221 : c'est le `result` principal **final** qui décide. Sans usage,
             # il ne dit rien des jetons du tour ; le garder (`[{}]`, vrai pour
             # Python) sautait le repli L105 et faisait du cumul du processus le
@@ -888,28 +1045,34 @@ class CostBook:
                 # appel, lu sur les messages du modèle (une fois par id), au
                 # barème ; le cumul n'en fait jamais le coût du tour.
                 usage = _claude_call_usages(events)
-                usd = sum(
-                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
-                     + _num(u, "cache_read_input_tokens") * pcache
-                     + _num(u, "output_tokens") * pout) / 1e6
-                    for u in usage)
+                usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in usage)
             elif not totals:
                 usd = 0.0
+                au_bareme = False
             elif unknown_resume:
                 # L71 : total d'avant le tour inconnu — estimation par les
                 # jetons du tour (`usage` de `result` est celui du tour), au
                 # barème ; le cumul de la ligne sert de repère au tour suivant.
-                usd = sum(
-                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
-                     + _num(u, "cache_read_input_tokens") * pcache
-                     + _num(u, "output_tokens") * pout) / 1e6
-                    for u in usage)
+                usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in usage)
+                if tier is not None and any(_prompt_tokens(u) > tier[0] for u in usage):
+                    # L225 : un usage agrégé au-delà du seuil ne dit pas le
+                    # palier de chaque requête — il se lit appel par appel ;
+                    # sans appels qui couvrent l'invite, palier haut marqué.
+                    par_appel = _claude_tiered_usd(usage, _claude_call_usages(events),
+                                                   pin, pcache, pout, tier)
+                    if par_appel is not None:
+                        usd = par_appel
+                    else:
+                        marque = {"price_fallback": "%s : %s, palier de chaque requête "
+                                  "inconnu, facturé au palier haut" % (FALLBACK_REASON, modele)}
             elif last is None or session != cum.get("session"):
+                au_bareme = False
                 # Session neuve (ou inconnue) : son `total_cost_usd` cumulé part de
                 # zéro, donc le dernier relevé EST le coût du tour. Le soustraire
                 # d'un repère d'une autre session compterait faux.
                 usd = float(totals[-1])
             else:
+                au_bareme = False
                 usd = float(totals[-1]) - float(last)
                 if usd < 0:  # session reprise : le cumul repart de plus bas
                     usd = float(totals[-1])
@@ -918,7 +1081,8 @@ class CostBook:
                 input_tokens=_sum(usage, "input_tokens"),
                 cached_input_tokens=_sum(usage, "cache_read_input_tokens"),
                 output_tokens=_sum(usage, "output_tokens"),
-            )
+                cache_write_tokens=_sum(usage, "cache_creation_input_tokens"),
+                **(marque if au_bareme and any(map(_has_tokens, usage)) else {}))
 
         if harness == "codex":
             completed = [e.get("usage") or {} for e in events if e.get("type") == "turn.completed"]
@@ -947,7 +1111,8 @@ class CostBook:
             usd = (uncached * pin + delta[1] * pcache + delta[2] * pout) / 1e6
             return TurnUsage(agent, harness, modele, usd,
                              input_tokens=delta[0], cached_input_tokens=delta[1],
-                             output_tokens=delta[2])
+                             output_tokens=delta[2],
+                             **(marque if any(delta) else {}))
 
         # DeepSeek (et tout harnais qui publie un usage par étape).
         steps = [e.get("usage") or {} for e in events
@@ -957,7 +1122,8 @@ class CostBook:
         tout = _sum(steps, "outputTokens")
         usd = (tin * pin + tcache * pcache + tout * pout) / 1e6
         return TurnUsage(agent, harness or "deepseek", modele, usd,
-                         input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout)
+                         input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
+                         **(marque if tin or tcache or tout else {}))
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
@@ -976,7 +1142,7 @@ class CostBook:
         deux) ne réécrit pas la ligne : avant L60, il la doublait.
         """
         if self.db is None:
-            raise CostError("record sans base : le repère de cumul vit dans turn_costs")
+            raise CostError("record without a database: the cumulative baseline lives in turn_costs")
         events = self.events(agent, start)
         # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
         # l'insertion : la ligne et le repère doivent porter la même session.
@@ -1008,7 +1174,9 @@ class CostBook:
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
             output_tokens=row["output_tokens"], cum_usd=cum_usd, cum_input_tokens=cum_input,
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
-            account=account, spend_key=key)
+            account=account, spend_key=key, void_reason=usage.void_reason,
+            price_fallback=usage.price_fallback,
+            cache_write_tokens=usage.cache_write_tokens)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -1093,16 +1261,16 @@ class CostBook:
             if cap and cap > 0:
                 total = self.spent("all", window, harnesses=paid)
                 if total >= cap:
-                    return ("budget %s (payé au token) : %.2f $ sur %s "
-                            "(plafond %.2f $)" % (WINDOW_LABELS[window][0], total,
+                    return ("%s budget (pay-per-token): %.2f $ over %s "
+                            "(cap %.2f $)" % (WINDOW_LABELS[window][0], total,
                                                   WINDOW_LABELS[window][1], cap))
         if agent != "all":
             for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
                 if cap and cap > 0 and window in WINDOW_LABELS:
                     total = self.spent(agent, window, harnesses=paid)
                     if total >= cap:
-                        return ("budget %s de l'agent %s (payé au token) : %.2f $ sur %s "
-                                "(plafond %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
+                        return ("%s budget of agent %s (pay-per-token): %.2f $ over %s "
+                                "(cap %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
                                                       WINDOW_LABELS[window][1], cap))
         return ""
 
@@ -1145,7 +1313,7 @@ class CostBook:
             rows[-1].update({
                 "agent": agent,
                 "harness": harness,
-                "model": self.model_of(agent) or "défaut",
+                "model": self.model_of(agent) or "default",
                 # L95 : payé au token (vrais dollars) ou forfait (équivalent
                 # théorique au barème) ; None si les descripteurs sont illisibles
                 "paid": (harness in paid) if paid is not None else None,
@@ -1175,12 +1343,12 @@ def format_report(rows: Iterable[dict]) -> str:
     """Le tableau de `ameesh cost report`, puis ses deux totaux (L95)."""
     rows = list(rows)
     lines = ["%-16s %-9s %-16s %-8s %10s %10s  %s" % (
-        "agent", "harnais", "modèle", "paiement", "1 h (USD)", "24 h (USD)", "jauges")]
+        "agent", "harness", "model", "payment", "1 h (USD)", "24 h (USD)", "gauges")]
     for row in rows:
         gauges = ", ".join(
-            "%s %.0f%% (rythme %.0f%%%s)" % (
+            "%s %.0f%% (pace %.0f%%%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
-                ", remise à zéro passée, dernier relevé %.0f%%" % (g["last_used"] * 100)
+                ", reset passed, last reading %.0f%%" % (g["last_used"] * 100)
                 if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-16s %-9s %-16s %-8s %10.4f %10.4f  %s" % (
@@ -1194,7 +1362,7 @@ def format_report(rows: Iterable[dict]) -> str:
 
 
 #: libellé du mode de paiement d'une ligne de rapport (L95)
-PAYMENT_LABELS = {True: "token", False: "forfait", None: "?"}
+PAYMENT_LABELS = {True: "token", False: "plan", None: "?"}
 
 
 def totals(rows: Iterable[dict]) -> dict:
@@ -1212,13 +1380,13 @@ def totals(rows: Iterable[dict]) -> dict:
 
 
 def format_totals(sums: dict) -> list:
-    lines = ["dépensé (payé au token, estimé)  : 1 h %.4f $ · 24 h %.4f $" % (
+    lines = ["spent (pay-per-token, estimated): 1 h %.4f $ · 24 h %.4f $" % (
                  sums["paid"]["1h"], sums["paid"]["24h"]),
-             "valeur consommée sur les forfaits : 1 h %.4f $ · 24 h %.4f $ "
-             "(équivalent au barème, non payé au tour)" % (
+             "value consumed on plans:          1 h %.4f $ · 24 h %.4f $ "
+             "(price-list equivalent, not paid per turn)" % (
                  sums["plan_value"]["1h"], sums["plan_value"]["24h"])]
     if sums["unknown"]["1h"] or sums["unknown"]["24h"]:
-        lines.append("mode de paiement inconnu          : 1 h %.4f $ · 24 h %.4f $" % (
+        lines.append("unknown payment mode:             1 h %.4f $ · 24 h %.4f $" % (
             sums["unknown"]["1h"], sums["unknown"]["24h"]))
     return lines
 
@@ -1231,6 +1399,72 @@ def _claude_main_results(events: Sequence[dict], session: str | None) -> list[di
     return [e for e in events
             if e.get("type") == "result" and not e.get("parent_tool_use_id")
             and (not session or e.get("session_id") in (None, "", session))]
+
+
+def _claude_usd(usage: dict, pin: float, pcache: float, pout: float,
+                tier: tuple | None = None) -> float:
+    """Coût d'un usage Claude au barème (USD), écritures de cache comprises (L225).
+
+    `cache_creation_input_tokens` au prix d'entrée ×1,25 (cache 5 min), sauf la
+    part que `cache_creation.ephemeral_1h_input_tokens` déclare en cache 1 h
+    (×2) ; durée non déclarée : ×1,25. `tier` (`prompt_tier`) : invite d'au
+    plus le seuil (entrée + cache relu + cache écrit) au palier bas."""
+    written = _num(usage, "cache_creation_input_tokens")
+    if tier is not None and (_num(usage, "input_tokens") + written
+                             + _num(usage, "cache_read_input_tokens")) <= tier[0]:
+        pin, pcache, pout = tier[1]
+    hour = _hour_written(usage)
+    return (_num(usage, "input_tokens") * pin
+            + ((written - hour) * CACHE_WRITE_5M + hour * CACHE_WRITE_1H) * pin
+            + _num(usage, "cache_read_input_tokens") * pcache
+            + _num(usage, "output_tokens") * pout) / 1e6
+
+
+def _hour_written(usage) -> int:
+    """L225 : les écritures de cache qu'un usage Claude déclare en cache 1 h."""
+    detail = usage.get("cache_creation") if isinstance(usage, dict) else None
+    if not isinstance(detail, dict):
+        return 0
+    return min(_num(detail, "ephemeral_1h_input_tokens"),
+               _num(usage, "cache_creation_input_tokens"))
+
+
+#: L225 : les jetons d'une invite Claude (entrée, cache écrit, cache relu)
+PROMPT_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _prompt_tokens(usage) -> int:
+    """L225 : la longueur d'une invite Claude, celle qui fixe le palier."""
+    return sum(_num(usage, k) for k in PROMPT_KEYS)
+
+
+def _claude_tiered_usd(totals: Sequence[dict], calls: Sequence[dict], pin: float,
+                       pcache: float, pout: float, tier: tuple) -> float | None:
+    """L225 : le coût d'un usage agrégé, chaque requête à son palier.
+
+    `calls` (`_claude_call_usages`) doit couvrir exactement l'invite de
+    `totals` ; sinon None (l'appelant facture au palier haut, marqué). Le flux
+    peut sous-déclarer la sortie d'un appel : le reste de la sortie agrégée va
+    au palier haut. De même pour la durée du cache : les écritures que
+    l'agrégat déclare en cache 1 h et que les appels ne disent pas passent du
+    tarif 5 min au tarif 1 h sur les écritures sans durée des appels, les plus
+    chères (palier haut) d'abord — un majorant, jamais sous l'agrégat."""
+    calls = [u for u in calls if _has_tokens(u)]
+    if not calls or any(_sum(calls, k) != _sum(totals, k) for k in PROMPT_KEYS):
+        return None
+    reste = max(_sum(totals, "output_tokens") - _sum(calls, "output_tokens"), 0)
+    usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in calls) + reste * pout / 1e6
+    heure = sum(map(_hour_written, totals)) - sum(map(_hour_written, calls))
+    sans_duree = sorted(((tier[1][0] if _prompt_tokens(u) <= tier[0] else pin,
+                          _num(u, "cache_creation_input_tokens") - _hour_written(u))
+                         for u in calls), reverse=True)
+    for prix, ecrits in sans_duree:
+        if heure <= 0:
+            break
+        part = min(heure, ecrits)
+        usd += part * (CACHE_WRITE_1H - CACHE_WRITE_5M) * prix / 1e6
+        heure -= part
+    return usd
 
 
 def _has_tokens(usage) -> bool:
@@ -1275,6 +1509,27 @@ def _claude_windows(event: dict) -> list | None:
               float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
         for key, value in windows.items() if isinstance(value, dict)
     ]
+
+
+def _claude_overage(event: dict) -> Overage:
+    """The overage flags of a Claude `rate_limit_event` (L226b)."""
+    info = event.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return Overage()
+    status = info.get("overageStatus")
+    capable = None if not isinstance(status, str) or not status \
+        else status.startswith("allowed")
+    return Overage(capable, info.get("isUsingOverage") is True)
+
+
+def _codex_overage(limits: dict, gauges: list) -> Overage:
+    """The overage flags of a Codex `rate_limits` object (L226b): credits
+    let the account go on, billed, once a window is at 100 %."""
+    credits = limits.get("credits")
+    if not isinstance(credits, dict):
+        return Overage()
+    capable = credits.get("has_credits") is True or credits.get("unlimited") is True
+    return Overage(capable, capable and any(g.used >= 1.0 for g in gauges))
 
 
 def _find_rate_limits(node, depth: int = 0):
@@ -1375,6 +1630,122 @@ def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
             return fh.read().decode("utf-8", "ignore")
     except OSError:
         return ""
+
+
+def _is_claude_marker(event: dict) -> bool:
+    return (event.get("type") == ACCOUNT_MARKER
+            and event.get("harness") in (None, "", "claude"))
+
+
+def _last_claude_marker(fh, end: int) -> dict | None:
+    """Find the last complete Claude marker before end by reverse block scan.
+
+    Memory holds one block plus the JSONL line crossing its boundary. Stop at
+    the first matching marker; scan to the beginning to prove a legacy stream.
+    Read failures propagate so callers cannot mistake them for legacy input.
+    """
+    pending: list[bytes] = []
+    while end:
+        start = max(0, end - 64_000)
+        fh.seek(start)
+        block = fh.read(end - start)
+        if len(block) != end - start:
+            raise OSError("Account marker prefix changed during read")
+        lines = block.split(b"\n")
+        if len(lines) > 1:
+            lines[-1] += b"".join(reversed(pending))
+            pending = []
+        if start:
+            pending.append(lines.pop(0))
+        else:
+            lines[0] += b"".join(reversed(pending))
+        for line in reversed(lines):
+            if ACCOUNT_MARKER.encode() not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict) and _is_claude_marker(event):
+                return event
+        end = start
+    return None
+
+
+def _journal_signature(stat) -> tuple:
+    # Inode/device cover replacement; nanosecond ctime covers in-place writes
+    # even when a producer restores mtime. Size detects append/truncation.
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _claude_account_readings(events: list, mtime: float) -> dict:
+    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    marked = any(_is_claude_marker(e) for e in events)
+    current, stamp = None, 0.0 if marked else mtime
+    readings = {}
+    for event in events:
+        if _is_claude_marker(event):
+            current = str(event.get("account") or "") or None
+            try:
+                stamp = float(event.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                stamp = 0.0
+        elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
+            gauges = _claude_windows(event)
+            if gauges is not None:
+                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+    return readings
+
+
+def _claude_account_tail(path: str) -> tuple[list, os.stat_result, bool]:
+    """Read a snapshot tail and recover a preceding marker only if needed.
+
+    A visible marker before every tail reading makes prefix recovery redundant.
+    The final flag allows caching only complete, stable snapshots. Leading
+    readings in a marked stream without a preceding marker stay unknown.
+    """
+    with open(path, "rb") as fh:
+        stat = os.fstat(fh.fileno())
+        start = max(0, stat.st_size - TAIL_BYTES)
+        if start:
+            # Keep complete lines only; the prefix scan includes a marker that
+            # straddles the raw tail boundary.
+            fh.seek(start - 1)
+            if fh.read(1) != b"\n":
+                fh.readline(stat.st_size - start)
+                start = fh.tell()
+        fh.seek(start)
+        raw = fh.read(stat.st_size - start)
+        if len(raw) != stat.st_size - start:
+            raise OSError("Account marker tail changed during read")
+        events = []
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        need_prefix = False
+        for event in events:
+            if _is_claude_marker(event):
+                break
+            if event.get("type") == "rate_limit_event":
+                need_prefix = True
+                break
+        complete = True
+        if start and need_prefix:
+            try:
+                marker = _last_claude_marker(fh, start)
+            except OSError:
+                # Preserve later explicit markers, but ignore the unknown turn.
+                marker = {"type": ACCOUNT_MARKER, "harness": "claude"}
+                complete = False
+            if marker is not None:
+                events.insert(0, marker)
+        if _journal_signature(os.fstat(fh.fileno())) != _journal_signature(stat):
+            raise OSError("Account marker snapshot changed during read")
+        return events, stat, complete
 
 
 def _num(usage: dict, key: str) -> int:

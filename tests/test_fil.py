@@ -24,7 +24,7 @@ from ameesh import db as db_mod
 from ameesh import fil, mail, registry
 from ameesh.backend import FileBackend, PgBackend
 
-from .support import REPO, SRC, PgTestCase
+from .support import REPO, SRC, PgTestCase, v0_in_english
 
 HEADING = re.compile(r"^### (\S+) — (.+?) → (.*)$", re.M)
 UNREACHABLE = "postgresql://ameesh:ameesh@127.0.0.1:5599/ameesh"
@@ -156,7 +156,7 @@ class FilFormatTest(unittest.TestCase):
         self.assertEqual(self.transport.location(thread), path)
         with open(path, encoding="utf-8") as fh:
             content = fh.read()
-        self.assertTrue(content.startswith("# Fil — nexlink / lot 12\n"))
+        self.assertTrue(content.startswith("# Thread — nexlink / lot 12\n"))
         iso = fil.iso_local(TS)
         self.assertRegex(iso, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$")
         self.assertIn(
@@ -236,7 +236,7 @@ class FilFormatTest(unittest.TestCase):
         contenu, attendus = self.poster_tous(thread, PIEGES)
         vu = structure(contenu)
         self.assertEqual([t for g, t in vu if g == "titre"],
-                         ["# Fil — pieges (fil du projet)"] + attendus)
+                         ["# Thread — pieges (project thread)"] + attendus)
         self.assertEqual([t for g, t in vu if g == "setext"], [])
         self.assertEqual([t for g, t in vu if g == "html"],
                          ['<!-- ameesh {"n": %d} -->' % n for n in range(len(PIEGES))])
@@ -280,7 +280,7 @@ class FilFormatTest(unittest.TestCase):
                          + ["heading_open", "fence", "html_block"] * len(corps))
         self.assertEqual([tokens[i + 1].content for i, t in enumerate(tokens)
                           if t.type == "heading_open"],
-                         ["Fil — rendu (fil du projet)"] + [a[4:] for a in attendus])
+                         ["Thread — rendu (project thread)"] + [a[4:] for a in attendus])
         # chaque bloc de code montre exactement le corps envoyé
         self.assertEqual([t.content for t in tokens if t.type == "fence"],
                          [texte + "\n" if texte else "" for texte in corps])
@@ -346,7 +346,7 @@ class FilFormatTest(unittest.TestCase):
         with open(self.transport.location(thread), encoding="utf-8") as fh:
             contenu = fh.read()
         self.assertEqual(len(HEADING.findall(contenu)), workers * count)
-        self.assertEqual(contenu.count("# Fil — "), 1, "un seul en-tête de fichier")
+        self.assertEqual(contenu.count("# Thread — "), 1, "un seul en-tête de fichier")
 
     def test_noms_assainis_sans_traversee(self):
         cas = {
@@ -389,7 +389,7 @@ class FilFormatTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertIsNone(fil.record(cfg, None, sender="a", recipients=["b"], text="x",
                                          project="piege"))
-        self.assertIn("écriture du fil impossible", err.getvalue())
+        self.assertIn("thread write failed", err.getvalue())
         self.assertEqual(os.listdir(dehors), [])
 
     def secret_dehors(self, *names: str) -> tuple[str, bytes]:
@@ -432,7 +432,7 @@ class FilFormatTest(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(fil.main(argv), 1)
             self.assertNotIn("SECRET", out.getvalue() + err.getvalue())
-            self.assertIn("refusé", err.getvalue())
+            self.assertIn("refused", err.getvalue())
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
         self.assertEqual(fil.v0_recorded(cfg), set())
         self.assertEqual(sorted(os.listdir(dehors)), ["_projet.md", "cible.md"])
@@ -506,13 +506,13 @@ class FilFormatTest(unittest.TestCase):
         b64 = "QUJD" * 60 + "ZA=="            # 244 caractères base64
         hexa = "deadbeef0123456789" * 15      # 270 caractères hexadécimaux
         refus = {
-            "": "vide", "   \n\t": "vide",
-            "abc\x00def": "contrôle", "\x1b[31mrouge\x1b[0m": "contrôle",
-            "bin\udc80aire": "contrôle",
+            "": "empty", "   \n\t": "empty",
+            "abc\x00def": "control", "\x1b[31mrouge\x1b[0m": "control",
+            "bin\udc80aire": "control",
             '{"a": 1}': "JSON", "[1, 2, 3]": "JSON", '  {"a": {"b": [1]}}\n': "JSON",
             "[]": "JSON",
-            b64: "encodé", hexa: "encodé",
-            "voici la pièce : " + b64 + " merci": "encodé",
+            b64: "encoded", hexa: "encoded",
+            "voici la pièce : " + b64 + " merci": "encoded",
         }
         for corps, motif in refus.items():
             with self.subTest(corps=corps[:30]):
@@ -590,7 +590,7 @@ class FilFormatTest(unittest.TestCase):
             with self.subTest(nom):
                 raison = fil.unreadable_reason(corps)
                 self.assertIsNotNone(raison)
-                self.assertIn("encodé", raison)
+                self.assertIn("encoded", raison)
                 with self.assertRaises(fil.UnreadableBody):
                     fil.ensure_readable(corps)
                 fil.ensure_readable(corps, allow_structured=True)
@@ -651,7 +651,7 @@ class FilFormatTest(unittest.TestCase):
         cfg = dataclasses.replace(config_mod.Config(), humans="proprio, smichea")
         self.assertEqual(fil.member(cfg, "proprio"), "human:proprio")
         self.assertEqual(fil.member(cfg, "alpha"), "agent:alpha")
-        self.assertEqual(fil.member(cfg, "all"), "tous")
+        self.assertEqual(fil.member(cfg, "all"), "all")
         # déjà qualifié (humain, agent, ou outil ameesh) : tel quel
         for name in ("human:alice", "agent:beta", "ameesh:porte"):
             self.assertEqual(fil.member(cfg, name), name)
@@ -828,8 +828,8 @@ class FilPgTest(PgTestCase):
                 message_id = mail.send(casse, "alpha", "beta", "message à ne pas perdre")
         finally:
             casse.close()
-        self.assertIn("écriture du fil impossible", err.getvalue())
-        self.assertIn("message conservé dans la boîte (id %d)" % message_id, err.getvalue())
+        self.assertIn("thread write failed", err.getvalue())
+        self.assertIn("message kept in the mailbox (id %d)" % message_id, err.getvalue())
         self.assertEqual([m["body"] for m in mail.unread(self.db, "beta")],
                          ["message à ne pas perdre"])
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM thread_index")[0]["n"], 0)
@@ -845,7 +845,7 @@ class FilPgTest(PgTestCase):
         with mock.patch.object(fil, "index", side_effect=db_mod.DbError("index cassé")), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             mail.send(self.db, "alpha", "beta", "troisième")
-        self.assertIn("index des fils non mis à jour", err.getvalue())
+        self.assertIn("thread index not updated", err.getvalue())
         self.assertEqual([e.text for e in self.entries("default")], ["troisième"])
         self.assertEqual(self.unread_count("beta"), 3)
 
@@ -854,8 +854,8 @@ class FilPgTest(PgTestCase):
         env = self.env(AGENT_MAIL_NAME="alpha", AMEESH_THREADS=self.broken_threads())
         proc = self.cli("send", "beta", "toujours livré", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
-        self.assertIn("écriture du fil impossible", proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertIn("thread write failed", proc.stderr)
         self.assertEqual(self.unread_count("beta"), 1)
 
     # -- repli fichier v0 ---------------------------------------------------
@@ -863,7 +863,7 @@ class FilPgTest(PgTestCase):
         proc = self.cli("send", "beta", "via les fichiers", "--lot", "9",
                         env=self.env_bad(AGENT_MAIL_NAME="alpha", AMEESH_PROJECT="banc"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
+        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
         [fichier] = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         with open(os.path.join(self.v0state, "inbox", "beta", fichier), encoding="utf-8") as fh:
             self.assertEqual(set(json.load(fh)), {"from", "to", "ts", "text", "host"})
@@ -876,17 +876,17 @@ class FilPgTest(PgTestCase):
         # base absente : `fil list` montre les fils du disque, hors index
         proc = self.mesh("fil", "list", env=self.env_bad())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("index des fils indisponible", proc.stderr)
+        self.assertIn("thread index unavailable", proc.stderr)
         ligne = [l for l in proc.stdout.splitlines() if l.startswith("banc")][0]
-        self.assertIn("hors index", ligne)
+        self.assertIn("not indexed", ligne)
         self.assertRegex(ligne, r"^banc\s+9\s+1\s")
 
     def test_repli_fichier_avec_fil_casse(self):
         env = self.env_bad(AGENT_MAIL_NAME="alpha", AMEESH_THREADS=self.broken_threads())
         proc = self.cli("send", "beta", "repli et fil cassé", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("écriture du fil impossible", proc.stderr)
-        self.assertIn("boîte fichier", proc.stderr)
+        self.assertIn("thread write failed", proc.stderr)
+        self.assertIn("file mailbox", proc.stderr)
         self.assertEqual(len(os.listdir(os.path.join(self.v0state, "inbox", "beta"))), 1)
 
     def test_import_v0_sans_doublon(self):
@@ -909,12 +909,12 @@ class FilPgTest(PgTestCase):
     def test_cli_refuse_les_corps_illisibles(self):
         registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         env = self.env(AGENT_MAIL_NAME="alpha")
-        for corps, motif in (('{"etat": "ok"}', "JSON"), ("\x1b[31mrouge", "contrôle"),
-                             ("ab12" * 60, "encodé")):
+        for corps, motif in (('{"etat": "ok"}', "JSON"), ("\x1b[31mrouge", "control"),
+                             ("ab12" * 60, "encoded")):
             with self.subTest(motif=motif):
                 proc = self.cli("send", "beta", corps, env=env)
                 self.assertEqual(proc.returncode, 2)
-                self.assertIn("message refusé", proc.stderr)
+                self.assertIn("message refused", proc.stderr)
                 self.assertIn(motif, proc.stderr)
                 self.assertIn("--allow-structured", proc.stderr)
                 self.assertEqual(proc.stdout, "")
@@ -941,7 +941,7 @@ class FilPgTest(PgTestCase):
         mail.send(self.db, "alpha", "beta", '{"a": 1}', allow_structured=True)
         self.assertEqual(self.unread_count("beta"), 1)
 
-    # -- hooks : JSON strictement v0, même fil cassé ------------------------
+    # -- hooks : JSON de la v0 (en anglais, L156c), même fil cassé ------------------------
     def _seed(self, name: str, sender: str, text: str) -> None:
         shutil.rmtree(os.path.join(self.state, "hooks"), ignore_errors=True)
         inbox = os.path.join(self.v0state, "inbox", name)
@@ -967,8 +967,7 @@ class FilPgTest(PgTestCase):
                     input=payload, capture_output=True, text=True, env=env)
                 v1 = self.cli("hook", "claude", env=env, stdin=payload)
                 self.assertEqual(v1.returncode, 0)
-                self.assertEqual(v1.stdout, v0.stdout)
-                self.assertEqual(json.loads(v1.stdout), json.loads(v0.stdout))
+                self.assertEqual(v1.stdout, v0_in_english(v0.stdout))
 
     def test_hook_livre_un_message_dont_le_fil_a_echoue(self):
         casse = self.broken_threads()
@@ -998,7 +997,7 @@ class FilPgTest(PgTestCase):
         proc = self.mesh("fil", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lignes = proc.stdout.splitlines()
-        self.assertTrue(lignes[0].startswith("PROJET"))
+        self.assertTrue(lignes[0].startswith("PROJECT"))
         self.assertTrue(any(re.match(r"^nexlink\s+—\s+3\s", l) for l in lignes), lignes)
         self.assertTrue(any(re.match(r"^nexlink\s+12\s+1\s", l) for l in lignes), lignes)
 
@@ -1016,7 +1015,7 @@ class FilPgTest(PgTestCase):
 
         proc = self.mesh("fil", "show", "inconnu")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("aucun fil", proc.stderr)
+        self.assertIn("no thread", proc.stderr)
         proc = self.mesh("fil", "show", "nexlink", "--last", "-1")
         self.assertEqual(proc.returncode, 2)
 

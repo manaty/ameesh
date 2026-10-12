@@ -132,6 +132,23 @@ memory:                          # dépôt de mémoire de la persona (L31, 0029)
   repository: "git@forge.example:equipe/persona-deepseek7.git"
 ```
 
+**`type: Persona`** (L51, [0029](decisions/0029-persona-et-session.md),
+[0032](decisions/0032-persona-roles-and-sessions.md)) replaces `Agent`, which
+remains readable during the transition (same keys and validation; declaring
+one name as both `Agent` and `Persona` is a duplicate). Additional fields:
+
+```yaml
+type: Persona
+title: migration-checker        # role name (convention of 2026-10-08)
+responsible: human:smichea
+harnesses: [deepseek, claude]    # admitted harnesses in preference order;
+                               # `harness` defaults to the first if omitted
+roles: [reviewer, domain-expert] # held roles (0033 §8 foundation and canon roles)
+```
+
+A `harness` outside `harnesses` produces a warning (`agent-harness-outside-list`);
+a listed harness without a descriptor is an error (`agent-harness-unknown`).
+
 **`type: Host`**
 
 ```yaml
@@ -150,6 +167,8 @@ policy:
     max_swap_used: 8GiB
     max_load: 24
     min_disk_free: 2GiB
+    min_btrfs_unallocated: 10GiB         # #246 : btrfs seulement
+    min_btrfs_metadata_headroom: 1GiB
   work_dirs: {deepseek7: ~/wt/deepseek7-lot12}   # dossier par agent (L35), prioritaire
   work_roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
   work_root: ~/src               # défaut : work_root/<projet>
@@ -209,6 +228,12 @@ sur les canons connus.
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
+`deputies:` and `superiors:` (L51, 0032 §2, 0033 §7): lists of `human:<id>`
+references in the same canon. Deputies can act in the responsible human's
+place under their own identities; superiors receive escalations. Unresolved
+or self references are errors (`member-deputies-unresolved`,
+`member-superiors-self`…). These cards declare the relationships; authorisation
+enforcement belongs to subsequent v2 work.
 
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
 
@@ -598,15 +623,15 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L12 | lecteurs de jauges de forfait, comptabilité par tour, `ameesh cost` (R20) | — | 0014 | codex |
 | L13 | garde de budget avant chaque tour, modèle et effort par harnais, `ameesh set` (R20) | L8, L12 | — | codex3 |
 | L14 | catalogue et découverte des modèles (API des fournisseurs, options des harnais, barèmes), événements de changement, `ameesh models list|discover|show` (R21) | L12 | 0015 | codex |
-| L15 | évaluation sur tâches de référence (action coûteuse sous la porte), rapports au canon, **rejeu isolé de toute trace de la solution** (dépôt reconstruit sans historique, branches, remote, board ni autres worktrees — sinon la mesure ne vaut rien), `ameesh models evaluate|recommend` ; métrique de qualité globale après revue et recette, adoption seulement sur gain significatif ([0023](decisions/0023-critere-d-adoption-des-reglages.md)) (R21) | L5, L14 | 0016 | codex3 |
+| L15 | évaluation sur tâches de référence (action coûteuse sous la porte), rapports au canon, **rejeu isolé de toute trace de la solution** (dépôt reconstruit sans historique, branches, remote, board ni autres worktrees — sinon la mesure ne vaut rien), `ameesh models evaluate|recommend` ; métrique de qualité globale après revue et recette, adoption seulement sur gain significatif ([0023](decisions/0023-critere-d-adoption-des-reglages.md)) (R21) **Kept (L154, 2026-10-12): start 2026-10-26.** | L5, L14 | 0016 | codex3 |
 | L16 | descripteurs de harnais au format du **manifeste du registre ACP** (`agent.json` : id, version, capacités, authentification, distribution), étendu par un espace de clés `ameesh` (pilotage sans interface, reprise de session, flux, hooks, jauges et coût, permissions) ; adaptateur ACP générique, adaptateur piloté par descripteur ; fin de la liste fermée de harnais (R22) | L8 | — | codex3 |
-| L17 | catalogue central des harnais, banc de conformité, évaluation harnais × modèle × effort, installation signée (R22) | L14, L15, L16 | 0017 | codex3 |
-| L18 | entrée des signaux (table `signals`, webhooks authentifiés, e-mail, fil), empreintes et déduplication à deux niveaux, liens signal ↔ lot (R23 : A1, A3) | L4 | 0018 | codex3 |
-| L19 | classifieur et politique d'auto-réparation au canon ; passage automatique ouvert → en cours pour les bugs admis (R23 : A2, A5) | L2, L18 | — | codex |
-| L20 | exécution de réparation : consigne « reproduire d'abord », rapport, gardes sur le diff (substituts, portée, contrats, tests), porte de changement sur l'empreinte du diff (R23 : A6, A7) | L5, L8 | 0019 | codex3 |
-| L21 | preuves de vérification et QA bornée (R23 : A8) | L20 | — | codex |
-| L22 | demandes aux humains : destinataire par le canon, échéances par gravité, remplaçants, escalade sans décision implicite (R23 : A9) | L2, L5 | 0020 | codex3 |
-| L23 | surveillance après livraison, réouverture sur récidive, corrélation avec les versions, notification du demandeur, auto-guérison des exécutions, balayage (R23 : A4, A10–A12) | L18, L21 | 0021 | codex |
+| L17 | catalogue central des harnais, banc de conformité, évaluation harnais × modèle × effort, installation signée (R22) **Kept (L154, 2026-10-12): after L15; builds on L75 descriptors and harness versions (#207).** | L14, L15, L16 | 0017 | codex3 |
+| L18 | entrée des signaux (table `signals`, webhooks authentifiés, e-mail, fil), empreintes et déduplication à deux niveaux, liens signal ↔ lot (R23 : A1, A3) **Kept (L154, 2026-10-12): start 2026-10-20.** | L4 | 0018 | codex3 |
+| L19 | classifieur et politique d'auto-réparation au canon ; passage automatique ouvert → en cours pour les bugs admis (R23 : A2, A5) **Closed (L154, 2026-10-12): superseded by the auditor's triage and L317c (automatic deep analysis).** | L2, L18 | — | codex |
+| L20 | exécution de réparation : consigne « reproduire d'abord », rapport, gardes sur le diff (substituts, portée, contrats, tests), porte de changement sur l'empreinte du diff (R23 : A6, A7) **Kept (L154, 2026-10-12): after L18.** | L5, L8 | 0019 | codex3 |
+| L21 | preuves de vérification et QA bornée (R23 : A8) **Closed (L154, 2026-10-12): superseded by L317a (project modules, IT execution evidence gate).** | L20 | — | codex |
+| L22 | demandes aux humains : destinataire par le canon, échéances par gravité, remplaçants, escalade sans décision implicite (R23 : A9) **Closed (L154, 2026-10-12): superseded by `ameesh decide` (L233) and L124.** | L2, L5 | 0020 | codex3 |
+| L23 | surveillance après livraison, réouverture sur récidive, corrélation avec les versions, notification du demandeur, auto-guérison des exécutions, balayage (R23 : A4, A10–A12) **Closed (L154, 2026-10-12): superseded by the auditor and L317c.** | L18, L21 | 0021 | codex |
 | L24 | vue temps réel de l'avancement : `ameesh progress --json` (lots, agents, jalons, budget) alimenté par les événements, vue de référence lisible sur téléphone (maquette : page de suivi du chantier Nexlink, privée) ([0024](decisions/0024-vue-temps-reel.md)) | L5, L8, L12 | — | codex |
 | L25 | profil d'hébergement « cluster » : image de l'exécuteur, manifestes Kubernetes d'exemple (un agent persistant par pod, canon en lecture seule), sonde `doctor --probe`, rôle Postgres de superviseur en lecture seule (contenus exclus par défaut) ([0011](decisions/0011-hebergement-configurable.md)) | L1, L2 | — | codex3 |
 | L26 | parité d'exploitation v0 → v1 : rotation de session au changement de lot et alerte « session trop grosse » ([0025](decisions/0025-une-session-par-lot.md)) ; `ameesh list --json` enrichi (harnais, modèle, effort, tier, état, depuis quand, lot courant, non-lus) ; usage par tour ; historique des jauges de forfait ; solde et dépense réelle du fournisseur payé au token ; alertes en flux `--json` (tour long, repos avec courrier, exécuteur mort, session trop grosse) ; `ameesh restart <agent> --brief` (session neuve) ; tier Codex dans `ameesh set` ; `ameesh interrupt` (R19, R20) | L11, L13 | 0027 | codex3 |

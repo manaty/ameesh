@@ -46,6 +46,10 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       authenticators.public_key, .credential_id
+--   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
+--     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
+--     reconnaîtrait un jeton fuité ; inutile à la supervision :
+--       credential_health.failing_fingerprint
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes
@@ -63,6 +67,8 @@
 --       commitments.note (L96)
 --       work_item_events.note
 --       work_item_milestones.note
+--       work_module_milestones.payload
+--       project_modules.schemas, .rules
 --       mesh_approvals.meta (et mesh_approvals_status)
 --       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
 --
@@ -229,6 +235,16 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'action_class', 'currency', 'reserved_by', 'reserved_at',
         'released_at', 'released_reason'
     ]),
+    -- L385 (0373): explicit prerequisites and their audit attribution.
+    ('work_item_dependencies', ARRAY[
+        'work_item_id', 'blocker_id', 'created_by', 'created_at'
+    ]),
+    -- L78 (0368): conversation cursors and state, without message content.
+    ('conversation_heads', ARRAY['agent', 'seq']),
+    ('conversation_log', ARRAY[
+        'agent', 'seq', 'session', 'turn', 'kind', 'author', 'truncated',
+        'event_id', 'created_at', 'project', 'lot', 'thread_entry'
+    ]),
     ('thread_index', ARRAY[
         'project', 'lot', 'transport', 'host', 'location', 'last_entry_id',
         'last_mailbox_id', 'last_author', 'last_at', 'entries',
@@ -250,6 +266,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
         'observed_at', 'account'
     ]),
+    -- L120 (0065): harness versions per host, a version line, no content
+    ('harness_versions', ARRAY[
+        'host', 'harness', 'path', 'version', 'raw', 'observed_at'
+    ]),
     -- ressources des hôtes (L31, 0029) : des mesures et l'état des ressources
     -- d'un tour, jamais un contenu
     ('host_resources', ARRAY[
@@ -258,7 +278,17 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L73 : occupation du /tmp du système
         'tmp_path', 'tmp_fstype', 'tmp_size_bytes', 'tmp_used_bytes',
         -- L106 (0047) : alimentation de l'hôte
-        'on_ac', 'battery_percent'
+        'on_ac', 'battery_percent',
+        -- L159d (0061): shared host measure, numbers only
+        'mem_total_bytes', 'psi_cpu_some', 'psi_mem_some', 'psi_mem_full',
+        'psi_io_some', 'app_cpu', 'guest_cpu', 'cpu_window_s', 'guest_mem_bytes',
+        'lendable_cpu', 'lendable_memory_bytes', 'lendable_disk_bytes',
+        -- #246 (0067): btrfs allocation, numbers only
+        'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',
+        -- #253 (0359): every filesystem the host writes to, paths and numbers
+        'volumes',
+        -- L159e6 (0361): the guard's last restart (unit names and reasons)
+        'guard_restart'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
@@ -287,7 +317,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
         'spend_key',
         -- L95 (0043) : raison d'une ligne écartée des sommes
-        'void_reason'
+        'void_reason',
+        -- L225 (0059) : raison d'un tour facturé au repli prudent
+        'price_fallback',
+        -- L225 (0059) : écritures de cache Claude du tour
+        'cache_write_tokens'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
@@ -307,6 +341,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
     ]),
+    -- credential health (L226a/L226b, 0060, 0068): account NAMES and their state
+    -- (short cause and fix command), never a credential
+    ('credential_health', ARRAY[
+        'host', 'harness', 'account', 'state', 'reason', 'source', 'checked_at',
+        'failing_since', 'expires_at', 'last_failure_at', 'failures'
+    ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu
     -- feuille de route (L96, 0044) : engagements datés, de l'ÉTAT (quoi, pour
@@ -321,6 +361,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('budget_events', ARRAY[
         'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
+    ]),
+    -- L121 (0362): the watches ameesh manages (agent, period, host, when)
+    ('agent_watches', ARRAY[
+        'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'
     ]),
     -- liaisons de session (L41, 0030) : quelle session externe parle au nom
     -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
@@ -342,11 +386,21 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
         'duration_s', 'failed_at', 'message_id', 'recorded_at'
     ]),
+    -- Session history (L52, 0032 §2): which sessions, when and where;
+    -- no content (transcripts stay in harness storage).
+    ('persona_sessions', ARRAY[
+        'id', 'persona', 'session_id', 'harness', 'host', 'account', 'work_item',
+        'started_at', 'ended_at', 'end_reason'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),
     ('work_item_milestones', ARRAY[
         'id', 'work_item_id', 'kind', 'at', 'sha', 'actor', 'verdict'
+    ]),
+    ('project_modules', ARRAY['project', 'module', 'canon', 'types']),
+    ('work_module_milestones', ARRAY[
+        'id', 'work_item_id', 'module', 'kind', 'subject', 'binding_id', 'actor', 'at'
     ]),
     ('work_items', ARRAY[
         'id', 'type', 'source', 'app', 'title', 'issue_ref', 'workstream',
@@ -364,6 +418,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'required_capabilities',
         -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
         'branch', 'branch_target', 'branch_head',
+        -- L118d (0372) : quand le relevé a vu branch_head, et la dernière
+        -- fusion partielle (vue la première fois quand)
+        'branch_head_at', 'partial_merge', 'partial_seen_at',
         -- L157 (0052) : durée estimée (minutes, source courte, auteur,
         -- instant) et début mesuré du travail — de l'ÉTAT, comme les dates
         -- prévues

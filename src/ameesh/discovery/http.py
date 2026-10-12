@@ -43,7 +43,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse toute redirection : `redirect_request` ne rend rien, donc 3xx final."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
-        raise RedirectRefused(f"redirection {code} refusée")
+        raise RedirectRefused(f"redirect {code} refused")
 
 
 def opener() -> urllib.request.OpenerDirector:
@@ -79,9 +79,9 @@ def fetch_json(
     parts = urllib.parse.urlsplit(url)
     loopback = parts.hostname in ("127.0.0.1", "::1", "localhost")
     if parts.scheme != "https" and not (allow_http or loopback):
-        raise InsecureEndpoint(f"endpoint non HTTPS refusé : {parts.scheme or 'sans schéma'}")
+        raise InsecureEndpoint(f"non-HTTPS endpoint refused: {parts.scheme or 'no scheme'}")
     if not parts.hostname:
-        raise InsecureEndpoint("endpoint sans hôte")
+        raise InsecureEndpoint("endpoint without a host")
     request = urllib.request.Request(url, headers=headers or {})
     try:
         with (open_with or opener()).open(request, timeout=timeout) as answer:  # noqa: S310
@@ -90,7 +90,7 @@ def fetch_json(
             final = getattr(answer, "geturl", None)
             final = final() if callable(final) else final
             if final and not _same_origin(url, final):
-                raise OriginChanged("la réponse ne vient pas de l'origine demandée")
+                raise OriginChanged("the response does not come from the requested origin")
             body = answer.read().decode("utf-8")
     except RedirectRefused:
         raise

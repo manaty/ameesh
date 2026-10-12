@@ -212,8 +212,8 @@ class ResourcesDbTest(PgTestCase):
         texte = self.mesh("hosts", "pc-test")
         self.assertEqual(texte.returncode, 0, texte.stderr)
         self.assertIn("pc-test", texte.stdout)
-        self.assertIn("seuils", texte.stdout)
-        self.assertIn("pression", texte.stdout)
+        self.assertIn("thresholds", texte.stdout)
+        self.assertIn("pressure", texte.stdout)
 
     def test_executeur_publie_un_releve(self):
         proc = self.runner("--once", "--wait", "0",

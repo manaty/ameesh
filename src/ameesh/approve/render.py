@@ -71,16 +71,16 @@ def has_non_ascii(text) -> bool:
 
 def format_amount(amount, currency) -> str:
     if amount is None:
-        return "aucun"
+        return "none"
     if currency is None:
-        return "%d (unités mineures, sans devise)" % amount
+        return "%d (minor units, no currency)" % amount
     exponent = _MINOR_EXPONENT.get(currency, 2)
     if exponent:
         units, minor = divmod(amount, 10 ** exponent)
         major = "%d.%0*d" % (units, exponent, minor)
     else:
         major = "%d" % amount
-    return "%s %s (%d en unités mineures)" % (major, currency, amount)
+    return "%s %s (%d in minor units)" % (major, currency, amount)
 
 
 def short_digest(digest: str) -> str:
@@ -89,43 +89,43 @@ def short_digest(digest: str) -> str:
     return " ".join(hexa[i:i + 4] for i in range(0, len(hexa), 4))
 
 
-_JSON_LABELS = ("version de politique", "arguments")
+_JSON_LABELS = ("policy version", "arguments")
 #: première ligne du résumé d'une décision « assumer le doublon » : elle ne
 #: peut pas être confondue avec un résumé d'approbation ordinaire
-ASSUME_DUPLICATE_DECISION = ("ASSUMER LE RISQUE D'UN DOUBLON — l'issue de l'action est "
-                             "inconnue (elle a peut-être déjà eu lieu) ; une nouvelle action "
-                             "identique la remplace")
+ASSUME_DUPLICATE_DECISION = ("ASSUME THE RISK OF A DUPLICATE: the outcome of the action is "
+                             "unknown (it may already have happened); a new identical "
+                             "action replaces it")
 
 
 def summary_lines(action: dict, approver: str, requested_by: str, *,
                   assume_duplicate: bool = False) -> list[tuple[str, str]]:
     content = [
-        ("projet", action["project"]),
-        ("connecteur", action["connector"]),
-        ("opération", action["operation"]),
-        ("cible", action["target"]),
-        ("classe", action["class"]),
-        ("montant", format_amount(action.get("amount"), action.get("currency"))),
-        ("version de politique", jcs.dumps(action.get("policy_version"))),
+        ("project", action["project"]),
+        ("connector", action["connector"]),
+        ("operation", action["operation"]),
+        ("target", action["target"]),
+        ("class", action["class"]),
+        ("amount", format_amount(action.get("amount"), action.get("currency"))),
+        ("policy version", jcs.dumps(action.get("policy_version"))),
         ("arguments", jcs.dumps(action["args"])),
     ]
-    people = [("approbateur", approver), ("demandé par", requested_by)]
+    people = [("approver", approver), ("requested by", requested_by)]
     if assume_duplicate:
-        return ([("décision", ASSUME_DUPLICATE_DECISION),
-                 ("action remplacée", action["action_id"])]
+        return ([("decision", ASSUME_DUPLICATE_DECISION),
+                 ("replaced action", action["action_id"])]
                 + content
-                + [("empreinte de l'action", action["computed_digest"]),
-                   ("empreinte de la décision", duplicate.assume_duplicate_digest(action))]
+                + [("action digest", action["computed_digest"]),
+                   ("decision digest", duplicate.assume_duplicate_digest(action))]
                 + people)
     return ([("action", action["action_id"])] + content
-            + [("empreinte", action["computed_digest"])] + people)
+            + [("digest", action["computed_digest"])] + people)
 
 
 def render_summary(action: dict, approver: str, requested_by: str, *,
                    assume_duplicate: bool = False) -> str:
     """Le résumé signé (par son empreinte) : texte stable, une ligne par champ."""
     lines = [SUMMARY_VERSION]
-    lines += ["%s : %s" % (label, visible(value, json_text=label in _JSON_LABELS))
+    lines += ["%s: %s" % (label, visible(value, json_text=label in _JSON_LABELS))
               for label, value in summary_lines(action, approver, requested_by,
                                                 assume_duplicate=assume_duplicate)]
     return "\n".join(lines) + "\n"
@@ -151,7 +151,7 @@ def _page(title: str, body: str, *, base: str) -> str:
     return (
         "<!DOCTYPE html>\n"
         "<!-- SPDX-License-Identifier: AGPL-3.0-only -->\n"
-        "<html lang=\"fr\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
         "<meta name=\"referrer\" content=\"no-referrer\">\n"
         "<title>%s</title>\n"
@@ -173,12 +173,11 @@ def _field(label: str, value, *, warn: str = "") -> str:
 
 #: approbation ordinaire d'une action déjà tentée : la page le dit
 _RETRY_NOTICES = {
-    "failed": "Nouvelle tentative de la MÊME action (même identifiant) : la tentative "
-              "précédente a échoué de façon certaine. Votre approbation autorise UNE "
-              "nouvelle tentative.",
-    "unknown": "Nouvelle tentative de la MÊME action (même identifiant) : l'issue de la "
-               "tentative précédente est inconnue, mais le connecteur garantit la "
-               "déduplication.",
+    "failed": "New attempt of the SAME action (same identifier): the previous attempt "
+              "definitely failed. Your approval authorizes ONE new attempt.",
+    "unknown": "New attempt of the SAME action (same identifier): the outcome of the "
+               "previous attempt is unknown, but the connector guarantees "
+               "deduplication.",
 }
 
 
@@ -187,15 +186,14 @@ def _duplicate_warning(action: dict) -> str:
     risque d'avoir lieu deux fois (opération, cible, montant)."""
     return (
         "<section class=\"duplicate\" role=\"alert\">\n"
-        "<h2>Ceci n'est PAS une approbation ordinaire</h2>\n"
-        "<p>L'action <code>%s</code> — <code>%s / %s</code> sur la cible <code>%s</code>, "
-        "montant <code>%s</code> — a été lancée, mais son issue est "
-        "<strong>INCONNUE</strong> : elle a peut-être déjà eu lieu.</p>\n"
-        "<p>En signant, vous <strong>assumez le risque d'un DOUBLON de cette action</strong> : "
-        "une nouvelle action identique la remplace et pourra produire le même effet une "
-        "seconde fois (elle exigera encore sa propre approbation). Ne signez que si un "
-        "second effet est acceptable, ou si vous avez vérifié que le premier n'a pas eu "
-        "lieu.</p>\n"
+        "<h2>This is NOT an ordinary approval</h2>\n"
+        "<p>The action <code>%s</code> (<code>%s / %s</code> on the target <code>%s</code>, "
+        "amount <code>%s</code>) was started, but its outcome is "
+        "<strong>UNKNOWN</strong>: it may already have happened.</p>\n"
+        "<p>By signing, you <strong>assume the risk of a DUPLICATE of this action</strong>: "
+        "a new identical action replaces it and may produce the same effect a second "
+        "time (it will still require its own approval). Only sign if a second effect "
+        "is acceptable, or if you have checked that the first one did not happen.</p>\n"
         "</section>\n"
     ) % (_e(visible(action["action_id"])), _e(visible(action["connector"])),
          _e(visible(action["operation"])), _e(visible(action["target"])),
@@ -212,24 +210,24 @@ def approval_page(view: dict) -> str:
     action = view["action"]
     request = view["request"]
     assume = view.get("assume_duplicate") is True
-    non_ascii = "Attention : contient des caractères non ASCII (risque de sosie)"
+    non_ascii = "Warning: contains non-ASCII characters (lookalike risk)"
     fields = [
-        _field("Opération", "%s / %s" % (action["connector"], action["operation"]),
+        _field("Operation", "%s / %s" % (action["connector"], action["operation"]),
                warn=non_ascii if has_non_ascii(action["connector"] + action["operation"])
                else ""),
-        _field("Cible", action["target"],
+        _field("Target", action["target"],
                warn=non_ascii if has_non_ascii(action["target"]) else ""),
-        _field("Montant", format_amount(action.get("amount"), action.get("currency"))),
-        _field("Classe", action["class"]),
-        _field("Projet", action["project"],
+        _field("Amount", format_amount(action.get("amount"), action.get("currency"))),
+        _field("Class", action["class"]),
+        _field("Project", action["project"],
                warn=non_ascii if has_non_ascii(action["project"]) else ""),
-        _field("Action remplacée" if assume else "Action", action["action_id"]),
-        _field("Demandé par", request["requested_by"]),
-        _field("Approbateur", request["approver"]),
-        _field("Lien valable jusqu'à", _moment(view["link_exp"])),
+        _field("Replaced action" if assume else "Action", action["action_id"]),
+        _field("Requested by", request["requested_by"]),
+        _field("Approver", request["approver"]),
+        _field("Link valid until", _moment(view["link_exp"])),
     ]
     if assume:
-        fields.insert(0, _field("Décision", "ASSUMER LE DOUBLON (remplacement)"))
+        fields.insert(0, _field("Decision", "ASSUME THE DUPLICATE (replacement)"))
     data = {
         "kind": "assume-duplicate" if assume else "approve",
         "rp-id": view["rp_id"],
@@ -240,27 +238,27 @@ def approval_page(view: dict) -> str:
     }
     attributes = " ".join("data-%s=\"%s\"" % (name, _e(value)) for name, value in data.items())
     if assume:
-        heading = "Assumer le risque d'un DOUBLON"
-        lead = ("Vérifiez l'action remplacée, sa cible et son montant. Signez "
-                "<strong>sur votre téléphone</strong> uniquement — ne scannez jamais un QR "
-                "code d'approbation affiché sur un ordinateur.")
+        heading = "Assume the risk of a DUPLICATE"
+        lead = ("Check the replaced action, its target and its amount. Sign "
+                "<strong>on your phone</strong> only; never scan an approval QR code "
+                "shown on a computer.")
         notice = _duplicate_warning(action)
-        digest_title = "Empreinte de la décision"
-        digest_extra = ("<p class=\"digest\">empreinte de l'action remplacée : "
+        digest_title = "Decision digest"
+        digest_extra = ("<p class=\"digest\">digest of the replaced action: "
                         "<code>%s</code></p>\n" % _e(action["computed_digest"]))
-        approve_label = "Assumer le doublon"
-        title = "Doublon à assumer — ameesh"
+        approve_label = "Assume the duplicate"
+        title = "Duplicate to assume — ameesh"
     else:
-        heading = "Approbation demandée"
-        lead = ("Vérifiez l'opération, la cible et le montant. Approuvez "
-                "<strong>sur votre téléphone</strong> uniquement — ne scannez jamais un QR "
-                "code d'approbation affiché sur un ordinateur.")
+        heading = "Approval requested"
+        lead = ("Check the operation, the target and the amount. Approve "
+                "<strong>on your phone</strong> only; never scan an approval QR code "
+                "shown on a computer.")
         retry = _RETRY_NOTICES.get(action.get("state"))
         notice = "<p class=\"notice\">%s</p>\n" % _e(retry) if retry else ""
-        digest_title = "Empreinte"
+        digest_title = "Digest"
         digest_extra = ""
-        approve_label = "Approuver"
-        title = "Approbation — ameesh"
+        approve_label = "Approve"
+        title = "Approval — ameesh"
     body = (
         "<main id=\"ameesh-approval\" %s>\n"
         "<h1>%s</h1>\n"
@@ -270,14 +268,14 @@ def approval_page(view: dict) -> str:
         "<section>\n<h2>%s</h2>\n<p class=\"digest-short\">%s</p>\n"
         "<p class=\"digest\"><code>%s</code></p>\n%s</section>\n"
         "<section>\n<h2>Arguments</h2>\n<pre class=\"args\">%s</pre>\n</section>\n"
-        "<section>\n<h2>Résumé signé</h2>\n<pre class=\"summary\">%s</pre>\n"
-        "<p class=\"digest\">empreinte du résumé : <code>%s</code></p>\n</section>\n"
+        "<section>\n<h2>Signed summary</h2>\n<pre class=\"summary\">%s</pre>\n"
+        "<p class=\"digest\">summary digest: <code>%s</code></p>\n</section>\n"
         "<div class=\"buttons\">\n"
         "<button id=\"approve\" type=\"button\" class=\"approve\">%s</button>\n"
-        "<button id=\"deny\" type=\"button\" class=\"deny\">Refuser</button>\n"
+        "<button id=\"deny\" type=\"button\" class=\"deny\">Deny</button>\n"
         "</div>\n"
         "<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n"
-        "<noscript><p>JavaScript est nécessaire pour signer avec votre passkey.</p></noscript>\n"
+        "<noscript><p>JavaScript is required to sign with your passkey.</p></noscript>\n"
         "</main>"
     ) % (
         attributes, _e(heading), lead, notice, "\n".join(fields), _e(digest_title),
@@ -300,18 +298,18 @@ def enroll_page(view: dict) -> str:
     attributes = " ".join("data-%s=\"%s\"" % (name, _e(value)) for name, value in data.items())
     body = (
         "<main id=\"ameesh-enroll\" %s>\n"
-        "<h1>Enrôler une passkey</h1>\n"
-        "<p class=\"lead\">Pour <code>%s</code>, sur le domaine <code>%s</code>. Créez la "
-        "passkey <strong>sur votre téléphone</strong> (ou une clé matérielle).</p>\n"
-        "<p>La clé ne sera <strong>pas active</strong> tout de suite : le service produit une "
-        "proposition d'entrée de canon, qui doit être relue et fusionnée par une PR avant de "
-        "faire autorité.</p>\n"
-        "<p>Lien valable jusqu'à %s.</p>\n"
+        "<h1>Enroll a passkey</h1>\n"
+        "<p class=\"lead\">For <code>%s</code>, on the domain <code>%s</code>. Create the "
+        "passkey <strong>on your phone</strong> (or a hardware key).</p>\n"
+        "<p>The key will <strong>not be active</strong> right away: the service produces a "
+        "canon entry proposal, which must be reviewed and merged through a PR before it "
+        "becomes authoritative.</p>\n"
+        "<p>Link valid until %s.</p>\n"
         "<div class=\"buttons\">\n"
-        "<button id=\"enroll\" type=\"button\" class=\"approve\">Créer la passkey</button>\n"
+        "<button id=\"enroll\" type=\"button\" class=\"approve\">Create the passkey</button>\n"
         "</div>\n"
         "<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n"
-        "<noscript><p>JavaScript est nécessaire pour créer une passkey.</p></noscript>\n"
+        "<noscript><p>JavaScript is required to create a passkey.</p></noscript>\n"
         "</main>"
     ) % (attributes, _e(view["approver"]), _e(view["rp_id"]), _e(_moment(view["exp"])))
-    return _page("Enrôlement — ameesh", body, base="../")
+    return _page("Enrollment — ameesh", body, base="../")

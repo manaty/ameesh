@@ -16,9 +16,11 @@ ce module garde les règles et les signatures publiques.
 """
 from __future__ import annotations
 
+import sys
+
 from typing import Sequence
 
-from . import storage
+from . import persona_sessions, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import registry as _pg
@@ -45,7 +47,7 @@ STOP_REASONS = ("manuel", "bail_expire", "retire_du_canon", "externe", "erreur")
 
 def _check_name(name: str) -> str:
     if not NAME_RE.match(name or ""):
-        raise ValueError("nom d'agent invalide : %r" % (name,))
+        raise ValueError("invalid agent name: %r" % (name,))
     return name
 
 
@@ -76,7 +78,7 @@ def upsert(
     (`set_mode` / `ameesh set <agent> mode=…` pour le changer)."""
     _check_name(name)
     if mode is not None and mode not in MODES:
-        raise ValueError("mode d'agent inconnu : %r (%s)" % (mode, " | ".join(MODES)))
+        raise ValueError("unknown agent mode: %r (%s)" % (mode, " | ".join(MODES)))
     return storage.of(db).agents.upsert(
         name, chantier=chantier, harness=harness, host=host, cwd=cwd,
         session_id=session_id, status=status, status_text=status_text, model=model,
@@ -151,15 +153,15 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     """
     row = storage.of(db).leases.state(name)
     if row is None:
-        return False, "agent %s inconnu du registre" % name
+        return False, "agent %s not in the registry" % name
     if row.get("status") == "stopped":
-        return False, "agent arrêté"
+        return False, "agent stopped"
     if (row.get("lease_owner") or "") != owner:
-        return False, "bail détenu par %s" % (row.get("lease_owner") or "personne")
+        return False, "lease held by %s" % (row.get("lease_owner") or "nobody")
     if int(row.get("lease_epoch") or 0) != int(epoch):
-        return False, "epoch %s au registre, %s dans la session" % (row.get("lease_epoch"), epoch)
+        return False, "epoch %s in the registry, %s in the session" % (row.get("lease_epoch"), epoch)
     if not row.get("live"):
-        return False, "bail expiré"
+        return False, "lease expired"
     return True, ""
 
 
@@ -250,6 +252,7 @@ def set_session(db: Db, name: str, session_id: str, account: str | None = None) 
     """Enregistre la session et, L39 (0030), le compte sous lequel elle tourne
     (`session_account` ; None : aucun compte déclaré pour le harnais)."""
     storage.of(db).agents.set_session(name, session_id, account)
+    record_session_history(db, name, session_id, account=account)
 
 
 def set_session_account(db: Db, name: str, account: str | None) -> bool:
@@ -267,7 +270,27 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     l'échéance est recontrôlée avec `clock_timestamp()` dans l'écriture, comme
     les autres opérations de bail.
     """
-    return storage.of(db).leases.clear_session(name, owner, epoch)
+    rows = _record_history(lambda: db.query(
+        "SELECT session_id FROM agent_registry WHERE name = %s", (name,))) or []
+    ok = storage.of(db).leases.clear_session(name, owner, epoch)
+    if ok and rows and rows[0].get("session_id"):
+        _record_history(lambda: persona_sessions.record_end(db, name, rows[0]["session_id"],
+                                                       "rotation"))
+    return ok
+
+
+def record_session_history(db: Db, name: str, session_id: str,
+                           account: str | None = None) -> None:
+    """Record an accepted session after runner or hook session filtering."""
+    _record_history(lambda: persona_sessions.record_start(db, name, session_id, account=account))
+
+
+def _record_history(action):
+    """History never blocks the agent, including before its migration is installed."""
+    try:
+        return action()
+    except Exception as exc:  # noqa: BLE001
+        print("ameesh: session history could not be recorded: %s" % exc, file=sys.stderr)
 
 
 def pause(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
@@ -342,7 +365,7 @@ def set_status(
     `stopped`/`dead` ; il est effacé pour tout autre statut (déclencheur de la
     migration 0030), donc dès que l'agent repart."""
     if stop_reason is not None and stop_reason not in STOP_REASONS:
-        raise ValueError("raison d'arrêt inconnue : %r (%s)"
+        raise ValueError("unknown stop reason: %r (%s)"
                          % (stop_reason, " | ".join(STOP_REASONS)))
     storage.of(db).agents.set_status(name, status, status_text, error, stop_reason)
 
@@ -350,7 +373,7 @@ def set_status(
 def set_mode(db: Db, name: str, mode: str) -> bool:
     """Change le mode d'un agent (`ameesh set <agent> mode=…`, L37)."""
     if mode not in MODES:
-        raise ValueError("mode d'agent inconnu : %r (%s)" % (mode, " | ".join(MODES)))
+        raise ValueError("unknown agent mode: %r (%s)" % (mode, " | ".join(MODES)))
     return storage.of(db).agents.set_mode(name, mode)
 
 
@@ -360,32 +383,32 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
     À L'INSTANT parce que le canon de son hôte n'est pas `ok`."""
     row = storage.of(db).agents.wake_check(name)
     if row is None:
-        return False, "%s n'est pas dans le registre (agent inconnu)" % name, ""
+        return False, "%s is not in the registry (unknown agent)" % name, ""
     if (row.get("mode") or "execute") == "externe":
-        return False, ("%s est un agent externe (session humaine, non réveillable)%s"
+        return False, ("%s is an external agent (human session, cannot be woken)%s"
                        % (name, "" if row.get("responsible")
-                          else " et n'a pas de responsable humain")), ""
+                          else " and has no human owner")), ""
     if not row.get("alive"):
-        return False, "%s est un éphémère échu" % name, ""
+        return False, "%s is an expired ephemeral agent" % name, ""
     if cfg is None:
         cfg = getattr(db, "cfg", None)
     if cfg is not None and getattr(cfg, "responsible_required", False) \
             and not (row.get("responsible") or "").strip():
-        return False, "%s n'a pas de responsable humain (requis avec un canon)" % name, ""
+        return False, "%s has no human owner (required with a canon)" % name, ""
     if not row.get("placement_admitted"):
         if row.get("placement_ok") is True:
-            why = "profil divergé depuis l'évaluation (prochaine canon sync)"
+            why = "profile diverged since evaluation (next canon sync)"
         else:
             why = row.get("placement_diagnostic") or (
-                "placement non évalué" if row.get("placement_ok") is None
-                else "placement refusé")
-        return False, ("%s n'est pas admis sur son hôte %s (%s)"
+                "placement not evaluated" if row.get("placement_ok") is None
+                else "placement refused")
+        return False, ("%s is not admitted on its host %s (%s)"
                        % (name, row.get("host") or "?", why)), ""
     note = ""
     if not row.get("canon_claim_ok"):
-        note = ("canon de l'hôte %s momentanément %s : %s ne sera réclamé qu'à la "
-                "prochaine synchronisation valide" % (
-                    row.get("host") or "?", row.get("canon_status") or "sans état", name))
+        note = ("canon of host %s temporarily %s: %s will only be claimed at the "
+                "next valid sync" % (
+                    row.get("host") or "?", row.get("canon_status") or "no state", name))
     return True, "", note
 
 

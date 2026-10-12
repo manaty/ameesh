@@ -40,6 +40,7 @@
       "key_env": "DEEPSEEK_API_KEY"
     },
     "backup": {"session_files": ["sessions/*/{session}"]},
+    "resident": {"protocol": "acp", "launcher": ["--profile", "acp"], "command": [], "min_version": "0.2.0-rc.2"},
     "install": {"note": "binaire `dsh` installé par l'hôte ; distribution signée en L17"}
   }
 }

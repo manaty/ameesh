@@ -87,10 +87,10 @@ class BuildReferenceTest(unittest.TestCase):
         g = estimates.lookup(self.body, type="evolution", size="m", host="vm1",
                              harness="claude")
         text = estimates.proposal_label(dict(g, published_ts=NOW, published_by="auditeur"))
-        self.assertIn("médiane 30 min · p80 36 min", text)
-        self.assertIn("evolution, moyen, vm1, claude, 3 lots", text)
-        self.assertIn("par auditeur", text)
-        self.assertIn("aucune", estimates.proposal_label(None))
+        self.assertIn("median 30 min · p80 36 min", text)
+        self.assertIn("evolution, medium, vm1, claude, 3 lots", text)
+        self.assertIn("by auditeur", text)
+        self.assertIn("none", estimates.proposal_label(None))
 
 
 class BriefTest(unittest.TestCase):
@@ -102,7 +102,7 @@ class BriefTest(unittest.TestCase):
         listing = [{"name": "dev1"}, {"name": "orch"}, {"name": "auditeur"}]
         out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
         self.assertEqual(set(out), {"dev1", "orch", "auditeur"})
-        self.assertIn("surestime", out["dev1"])
+        self.assertIn("overestimates", out["dev1"])
         self.assertIn("phases", out["orch"])
         self.assertIn("estimate_bias", exploitation.ALERT_TYPES)
 
@@ -136,7 +136,7 @@ class ReferencePgTest(PgTestCase):
         proc = self.mesh("work", "add", "--title", "avant", "--actor", "orch",
                          "--estimate", "1h", "--size", "m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("référence : aucune", proc.stdout)
+        self.assertIn("none (no published table", proc.stdout)
         work.close(self.db, work.list_items(self.db)[0]["id"], abandoned=True)
 
         # trois lots estimés 10 fois trop par orch
@@ -149,7 +149,7 @@ class ReferencePgTest(PgTestCase):
 
         proc = self.mesh("work", "estimates", "--publish", "--actor", "auditeur")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("BIAIS (estimate_bias)", proc.stdout)
+        self.assertIn("BIAS (estimate_bias)", proc.stdout)
         ref = estimates.current_reference(self.db)
         self.assertEqual((ref["published_by"], ref["body"]["measured"]), ("auditeur", 3))
         self.assertEqual([e["estimator"] for e in ref["body"]["bias"]], ["orch"])
@@ -158,7 +158,7 @@ class ReferencePgTest(PgTestCase):
                          "--estimate", "30m", "--size", "m",
                          "--estimate-source", "référence ×1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("référence : médiane 30 min · p80 36 min (evolution, moyen, 3 lots",
+        self.assertIn("median 30 min · p80 36 min (evolution, medium, 3 lots",
                       proc.stdout)
         new = [i for i in work.list_items(self.db) if i["title"] == "après"][0]
         self.assertEqual(new["change_size"], "m")
@@ -166,8 +166,8 @@ class ReferencePgTest(PgTestCase):
         shown = json.loads(proc.stdout)
         self.assertEqual(shown["estimate_reference"]["median_minutes"], 30.0)
         proc = self.mesh("work", "show", str(new["id"]))
-        self.assertIn("référence: médiane 30 min", proc.stdout)
-        self.assertIn("taille moyen", proc.stdout)
+        self.assertIn(": median 30 min", proc.stdout)
+        self.assertIn(" medium", proc.stdout)
 
         bias = [a for a in exploitation.alerts(self.cfg, self.db)
                 if a["type"] == "estimate_bias"]

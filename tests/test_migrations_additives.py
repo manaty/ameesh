@@ -38,17 +38,17 @@ class NonAdditiveTest(unittest.TestCase):
         for sql, reason in (
             ("drop table t;", "drop table"),
             ("alter table t drop column c;", "drop column"),
-            ("alter table t rename column c to d;", "renommage"),
+            ("alter table t rename column c to d;", "rename"),
             ("alter table t alter column c type bigint;", "type"),
             ("alter table t alter column c set data type text;", "type"),
             ("alter table t alter column c set not null;", "set not null"),
-            ("alter table t add column c text not null;", "sans défaut"),
+            ("alter table t add column c text not null;", "without default"),
             ("truncate t;", "truncate"),
             ("delete from t where c is null;", "delete"),
             ("drop view if exists v;", "drop view v"),
             ("drop function f();", "drop function f"),
             ("-- ameesh: non additive\nalter table t add constraint k check (c > 0);",
-             "marquée"),
+             "marked"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))

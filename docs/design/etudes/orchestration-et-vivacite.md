@@ -1,213 +1,213 @@
 ---
 type: Study
-title: "Étude — un orchestrateur arrêté bloque un chantier : vivacité, reprise, alertes, délégation, cloisonnement"
-description: "Analyse, dans le code d'ameesh, du blocage d'un chantier par son orchestrateur externe arrêté (2026-10-07) ; décision proposée « pas de travail sans réveil possible » et plan de lots L36–L41."
+title: "Study — a stopped orchestrator blocks a project: liveness, resume, alerts, delegation, isolation"
+description: "Analysis, in the ameesh code, of a project blocked by its stopped external orchestrator (2026-10-07); proposed decision \"no work without a possible wake-up\" and lot plan L36–L41."
 status: stable
 tags: [orchestrateur, bail, sessions, alertes, delegation, cloisonnement, comptes]
 generated: { by: "claude3/claude-opus-5-5", at: "2026-10-07T12:00:00+02:00" }
 sources:
-  - { resource: "decisions/0010-responsabilite-et-orchestrateurs.md", title: "Décision 0010 (responsable humain)" }
-  - { resource: "decisions/0014-orchestrateurs-a-tours-et-placement.md", title: "Décision 0014 (orchestrateurs à tours, attach)" }
-  - { resource: "decisions/0025-une-session-par-lot.md", title: "Décision 0025 (sessions, résumé de reprise)" }
-  - { resource: "decisions/0027-bascule-automatique-entre-comptes.md", title: "Décision 0027 (bascule de compte)" }
-  - { resource: "../BASCULE.md", title: "Bascule v0 → v1 (coexistence, étape 8)" }
+  - { resource: "decisions/0010-responsabilite-et-orchestrateurs.md", title: "Decision 0010 (responsible human)" }
+  - { resource: "decisions/0014-orchestrateurs-a-tours-et-placement.md", title: "Decision 0014 (turn-based orchestrators, attach)" }
+  - { resource: "decisions/0025-une-session-par-lot.md", title: "Decision 0025 (sessions, resume summary)" }
+  - { resource: "decisions/0027-bascule-automatique-entre-comptes.md", title: "Decision 0027 (account switch)" }
+  - { resource: "../BASCULE.md", title: "Switchover v0 → v1 (coexistence, step 8)" }
 ---
 
-# Contexte
+# Context
 
-Signalement du propriétaire (2026-10-07) : un chantier d'une trentaine de lots
-est bloqué depuis le matin. Son orchestrateur est une session Codex
-interactive, sans bail. Son dernier tour s'est terminé normalement, puis il a
-attendu un prompt humain qui n'est jamais venu. Ses relais sont eux aussi
-externes, arrêtés ou au repos, et le compte Codex de la session est au seuil.
-Propositions P1 à P6 du propriétaire : adoption, reprise, alertes poussées,
-délégation à échéance, cloisonnement, compteur de `ameesh list`.
+Report from the owner (2026-10-07): a project of some thirty lots
+has been blocked since the morning. Its orchestrator is an interactive Codex
+session, without a lease. Its last turn ended normally, then it
+waited for a human prompt that never came. Its relays are also
+external, stopped or idle, and the session's Codex account is at its threshold.
+The owner's proposals P1 to P6: adoption, resume, pushed alerts,
+delegation with a deadline, isolation, `ameesh list` counter.
 
-L'état observé le jour même (`ameesh list`, `ameesh show`, `ameesh work
-list`, `ameesh alerts`) confirme le constat et l'aggrave. Dans la suite,
-« l'orchestrateur » désigne cette session.
+The state observed the same day (`ameesh list`, `ameesh show`, `ameesh work
+list`, `ameesh alerts`) confirms the finding and makes it worse. In what follows,
+"the orchestrator" refers to this session.
 
-# Ce que le code fait réellement
+# What the code actually does
 
-## 1. « Agent externe » n'existe pas dans le modèle
+## 1. "External agent" does not exist in the model
 
-* Le statut de l'orchestrateur (« … mailbox identity only, no runner
-  lease ») est un **texte libre** posé par
-  `agent-mail status`. Aucune colonne ne distingue un agent mené par
-  l'exécuteur d'une session humaine : pour le registre, c'est un agent
-  `stopped` comme un autre.
-* Un hook qui voit une identité sans bail l'**enregistre** au premier contact
-  (`cli.py` `cmd_hook` → `registry.upsert`, `status` par défaut `idle`,
-  `harness` `other`). L'identité « explicite » (`identity.py`, seulement
-  `AGENT_MAIL_NAME`) est acceptée sans aucune vérification.
-* L'orchestrateur n'a **aucun responsable humain** (`ameesh show` :
-  « responsable : aucun »), ce qui contredit 0010.
+* The orchestrator's status (« … mailbox identity only, no runner
+  lease ») is **free text** set by
+  `agent-mail status`. No column distinguishes an agent driven by
+  the runner from a human session: for the registry, it is a
+  `stopped` agent like any other.
+* A hook that sees an identity without a lease **registers** it on first contact
+  (`cli.py` `cmd_hook` → `registry.upsert`, `status` defaulting to `idle`,
+  `harness` `other`). The "explicit" identity (`identity.py`, only
+  `AGENT_MAIL_NAME`) is accepted without any verification.
+* The orchestrator has **no responsible human** (`ameesh show`:
+  « responsable : aucun », "responsible: none"), which contradicts 0010.
 
-## 2. Un lot s'assigne à n'importe quel nom
+## 2. A lot can be assigned to any name
 
-* `work_items.assignee` est un texte libre, fixé à la création
-  (`work add --assignee`) ; il n'y a **pas de réassignation** et **aucune
-  vérification** que l'assigné existe, a un bail ou un exécuteur.
-* Sur le chantier bloqué, sept lots sont assignés à des noms **absents du
-  registre** (des relais lancés hors d'ameesh, pour un tour borné) et une
-  dizaine d'autres à des agents arrêtés.
-* L'étiquette « attend : démarrage par X » / « travail de X »
-  (`stagnation.py`, `_LABELS`) ne dit jamais que X est inconnu, arrêté ou
-  externe.
-* Aucune notion de délégation ni d'échéance sur un lot.
+* `work_items.assignee` is free text, set at creation
+  (`work add --assignee`); there is **no reassignment** and **no
+  verification** that the assignee exists, has a lease or a runner.
+* On the blocked project, seven lots are assigned to names **absent from the
+  registry** (relays launched outside ameesh, for a bounded turn) and about
+  ten others to stopped agents.
+* The label « attend : démarrage par X » ("waiting: start by X") / « travail de X » ("work of X")
+  (`stagnation.py`, `_LABELS`) never says that X is unknown, stopped or
+  external.
+* No notion of delegation or deadline on a lot.
 
-## 3. Les alertes ne voient pas un agent arrêté et ne sont jamais poussées
+## 3. Alerts do not see a stopped agent and are never pushed
 
-* `idle_with_mail` ne vise que l'état dérivé `idle` (`exploitation.py:177`) ;
-  `stopped` et `dead` sont fusionnés en `stopped` (`progress.py:332-341`) et
-  n'alertent pas. Au moment de l'analyse, plusieurs agents arrêtés avaient
-  chacun de 5 à 17 messages non lus, sans aucune alerte.
-* L'arrêt à la main ne se distingue d'un bail expiré que par `status_text`
-  (« arrêté à la main », `runner.py:2490`, contre « bail expiré »,
-  `registry.py:433`) : il n'existe aucune raison d'arrêt structurée.
-* `stale_lot` ne se déclenche qu'après 6 h et ne regarde pas si l'assigné peut
-  tourner.
-* Aucun envoi vers un humain : ni Slack, ni webhook, ni notification de bureau.
-  Le seul envoi est le NOTIFY Postgres vers les exécuteurs. Les alertes se
-  lisent en tirant `ameesh alerts`. Cela contredit 0014 (« alertes à l'humain
-  responsable concerné »).
+* `idle_with_mail` only targets the derived state `idle` (`exploitation.py:177`);
+  `stopped` and `dead` are merged into `stopped` (`progress.py:332-341`) and
+  do not alert. At the time of the analysis, several stopped agents each had
+  5 to 17 unread messages, without any alert.
+* A manual stop is distinguished from an expired lease only by `status_text`
+  (« arrêté à la main », "stopped by hand", `runner.py:2490`, versus « bail expiré », "lease expired",
+  `registry.py:433`): there is no structured stop reason.
+* `stale_lot` only fires after 6 h and does not check whether the assignee can
+  run.
+* Nothing is sent to a human: no Slack, no webhook, no desktop notification.
+  The only send is the Postgres NOTIFY to the runners. Alerts are
+  read by pulling `ameesh alerts`. This contradicts 0014 ("alerts to the relevant
+  responsible human").
 
-## 4. La reprise n'est pas une opération ameesh
+## 4. Resume is not an ameesh operation
 
-* Il n'y a ni `adopt` ni `resume`. Il existe `agent-runner register <nom>
-  <harnais> --session S`, qui écrit l'identifiant d'une session que
-  l'exécuteur reprendra, et `ameesh attach`, qui prend le bail et ouvre le
-  harnais interactif sur la même session : c'est le modèle de 0014, déjà codé
-  mais pas imposé. `register` sans `--session` garde la session enregistrée
-  (`coalesce`), et `ameesh restart`, qui l'oublie, est refusé pour un agent
-  arrêté : il n'y a donc aucun moyen propre de repartir d'une session neuve
-  pour un agent arrêté.
-* Le compte d'une session se lit dans le marqueur d'`events.jsonl`
-  (`account_turn._session_account`) ; une session que l'exécuteur n'a pas
-  lancée n'en a pas. Codex : une session n'est **jamais** portable vers un
-  autre `CODEX_HOME` (`accounts.session_portable`) ; la bascule fait alors
-  une rotation **avec un résumé produit sous l'ancien compte**, ce qui échoue
-  si l'ancien compte est inutilisable.
-* Le descripteur Codex déclare `interactive: []` (attach admis) et
-  `session.flag: ["resume"]` : le « interactif : - » vu par le propriétaire est
-  un affichage, pas une limite.
+* There is neither `adopt` nor `resume`. There is `agent-runner register <nom>
+  <harnais> --session S`, which writes the identifier of a session that
+  the runner will resume, and `ameesh attach`, which takes the lease and opens the
+  interactive harness on the same session: this is the model of 0014, already coded
+  but not enforced. `register` without `--session` keeps the recorded session
+  (`coalesce`), and `ameesh restart`, which forgets it, is refused for a
+  stopped agent: there is therefore no clean way to start again from a fresh session
+  for a stopped agent.
+* A session's account is read from the marker in `events.jsonl`
+  (`account_turn._session_account`); a session that the runner did not
+  launch has none. Codex: a session is **never** portable to another
+  `CODEX_HOME` (`accounts.session_portable`); the switch then does
+  a rotation **with a summary produced under the old account**, which fails
+  if the old account is unusable.
+* The Codex descriptor declares `interactive: []` (attach allowed) and
+  `session.flag: ["resume"]`: the « interactif : - » seen by the owner is
+  a display matter, not a limit.
 
-## 5. Cause profonde du cloisonnement et de la « surdité » des sessions externes
+## 5. Root cause of the isolation failure and of the "deafness" of external sessions
 
-* Les hooks de ce poste (`~/.claude/settings.json`, `~/.codex/hooks.json`,
-  `~/.codex-secondary/hooks.json`) appellent `~/.local/bin/agent-mail`, qui
-  est **encore la v0** (coexistence, [BASCULE.md](../../BASCULE.md), avant
-  l'étape 8). La v0 **déduit l'identité du dossier** : `AGENT_MAIL_NAME`, sinon
-  un alias de `~/.config/agent-mail/aliases.tsv` par préfixe de chemin,
-  sinon le nom du dossier. L'alias `orchestrateur → /home/smichea/Work`
-  (chantier nexlink) capture tout ce qui vit sous `~/Work`, et un dossier
-  nommé comme un agent Nexlink prend son identité. C'est l'explication la plus
-  probable du courrier d'une autre équipe injecté dans une session du
-  chantier bloqué, sans que le dossier exact soit vérifié.
-* La v0 lit la boîte **fichier**. Le courrier v1 (Postgres, `ameesh mail send`)
-  n'est remis que par l'exécuteur, dans la consigne d'un tour, donc **à un
-  agent qui a un bail**. Une session externe est donc sourde à sa boîte v1
-  par construction : même réveillé, l'orchestrateur n'aurait pas vu ses
-  messages sans lancer `ameesh mail inbox` à la main.
-* Rien dans le code d'ameesh ne lie une identité à l'identifiant de session
-  ou à l'ascendance des processus ; seul `find_tty` remonte les processus, pour
-  le titre du terminal. **Hors du dépôt**, un pont local écrit le
+* The hooks on this workstation (`~/.claude/settings.json`, `~/.codex/hooks.json`,
+  `~/.codex-secondary/hooks.json`) call `~/.local/bin/agent-mail`, which
+  is **still v0** (coexistence, [BASCULE.md](../../BASCULE.md), before
+  step 8). v0 **infers the identity from the folder**: `AGENT_MAIL_NAME`, otherwise
+  an alias from `~/.config/agent-mail/aliases.tsv` by path prefix,
+  otherwise the folder name. The alias `orchestrateur → /home/smichea/Work`
+  (nexlink project) captures everything that lives under `~/Work`, and a folder
+  named like a Nexlink agent takes its identity. This is the most
+  likely explanation for another team's mail being injected into a session of the
+  blocked project, though the exact folder was not verified.
+* v0 reads the **file** mailbox. v1 mail (Postgres, `ameesh mail send`)
+  is only delivered by the runner, in a turn's prompt, hence **to an
+  agent that has a lease**. An external session is therefore deaf to its v1 mailbox
+  by construction: even if woken up, the orchestrator would not have seen its
+  messages without running `ameesh mail inbox` by hand.
+* Nothing in the ameesh code ties an identity to the session identifier
+  or to process ancestry; only `find_tty` walks up the processes, for
+  the terminal title. **Outside the repository**, a local bridge written on
   2026-10-07 (`~/.local/bin/ameesh-session-mail-hook`, table
-  `~/.config/ameesh/external-session-bindings.json`) le fait : il lie
-  l'identifiant de session du harnais et un PID ancêtre à un nom, pose
-  `AGENT_MAIL_NAME`, puis appelle l'`agent-mail` v0. Il n'est branché que
-  sur les configurations Claude secondaire et tertiaire, pas sur Codex :
-  l'orchestrateur n'en profitait pas. Et même lié, il ne remet que la boîte
-  fichier v0, jamais le courrier v1. L41 reprend cette idée dans ameesh. Côté v1 : `send all` n'a **aucun filtre d'équipe ou de
-  chantier** (`backend.py:230`), et `bk.register(..., session_id)` d'un hook
-  peut **écraser** le `session_id` d'un agent de l'exécuteur, que celui-ci
-  reprendra au tour suivant.
+  `~/.config/ameesh/external-session-bindings.json`) does it: it ties
+  the harness's session identifier and an ancestor PID to a name, sets
+  `AGENT_MAIL_NAME`, then calls the v0 `agent-mail`. It is only wired
+  into the secondary and tertiary Claude configurations, not into Codex:
+  the orchestrator did not benefit from it. And even when bound, it only delivers the v0 file
+  mailbox, never v1 mail. L41 brings this idea into ameesh. On the v1 side: `send all` has **no team or
+  project filter** (`backend.py:230`), and a hook's `bk.register(..., session_id)`
+  can **overwrite** the `session_id` of a runner agent, which the runner will
+  resume on the next turn.
 
 ## 6. `ameesh list`
 
-`mesh_cli.py:155-170` est dans la boucle des agents : le total global des lots
-(`work.delays`, sans filtre) est imprimé, et recalculé, à chaque ligne.
+`mesh_cli.py:155-170` is inside the agents loop: the global lot total
+(`work.delays`, unfiltered) is printed, and recomputed, on every row.
 
-# Décision proposée (adoptée le 2026-10-07 : [0030](../decisions/0030-pas-de-travail-sans-reveil-possible.md))
+# Proposed decision (adopted on 2026-10-07: [0030](../decisions/0030-pas-de-travail-sans-reveil-possible.md))
 
-**« Pas de travail sans réveil possible. »** Elle prolonge 0014 : ce que 0014
-annonçait pour les orchestrateurs devient une règle vérifiée par ameesh pour
-tout porteur de travail.
+**"No work without a possible wake-up."** It extends 0014: what 0014
+announced for orchestrators becomes a rule checked by ameesh for
+every work holder.
 
-1. **Mode d'agent explicite.** Chaque agent est `exécuté` (mené par un
-   exécuteur, sous bail) ou `externe` (session humaine, boîte seulement). Le
-   mode est une colonne, pas un texte libre. Un agent externe a
-   **obligatoirement** un responsable humain, et `ameesh list` l'affiche
-   comme tel.
-2. **Attribution gardée.** Un lot, une délégation ou un rôle d'orchestrateur ne
-   peut être confié qu'à un agent **réveillable** : connu, en mode `exécuté`,
-   admis sur un hôte dont l'exécuteur vit. Les autres cas sont **refusés**
-   avec la raison. Seul le responsable humain peut forcer une attribution à un
-   agent externe (`--externe`). Le lot affiche alors « attend : <humain> (session
-   externe) », et c'est cet humain qui reçoit les alertes. P1 (« pas
-   d'orchestrateur externe sans bail ») en est le cas général.
-3. **Adoption et reprise sont des opérations d'ameesh, jamais des prompts.**
-   * `ameesh adopt <agent> --session <id> --account <compte> [--cwd D]` fait
-     passer une session interactive existante en agent `exécuté`. Elle
-     enregistre la session **et son compte d'origine**, exige que la session
-     interactive soit fermée (aucun processus du harnais sur ce fichier de
-     session), puis réveille l'agent. L'humain y revient par `ameesh attach`.
-   * `ameesh resume <agent>` relance un agent arrêté sur sa session
-     enregistrée et son compte, et lie l'identité à la nouvelle exécution
-     (variables d'identité et de bail posées par l'exécuteur). Si le compte
-     d'origine est au seuil, la règle de 0027 s'applique : même session si
-     elle est portable, sinon rotation. Le résumé est fait sous l'ancien compte
-     s'il reste utilisable. Sinon, **brief de reprise déterministe** construit
-     par ameesh : fil du projet, lots, derniers messages, et chemin du
-     transcript d'origine en lecture. On ne fouille plus `~/.codex*/sessions`
-     à la main.
-4. **Alertes de vivacité, poussées à l'humain responsable.**
-   * Raison d'arrêt structurée : `manuel`, `bail_expiré`, `retiré_du_canon`,
+1. **Explicit agent mode.** Each agent is `exécuté` (driven by a
+   runner, under lease) or `externe` (human session, mailbox only). The
+   mode is a column, not free text. An external agent **must**
+   have a responsible human, and `ameesh list` displays it
+   as such.
+2. **Guarded assignment.** A lot, a delegation or an orchestrator role can
+   only be entrusted to a **wakeable** agent: known, in `exécuté` mode,
+   admitted on a host whose runner is alive. Other cases are **refused**
+   with the reason. Only the responsible human can force an assignment to an
+   external agent (`--externe`). The lot then displays « attend : <humain> (session
+   externe) » ("waiting: <human> (external session)"), and it is that human who receives the alerts. P1 ("no
+   external orchestrator without a lease") is the general case of it.
+3. **Adoption and resume are ameesh operations, never prompts.**
+   * `ameesh adopt <agent> --session <id> --account <compte> [--cwd D]` turns
+     an existing interactive session into an `exécuté` agent. It
+     records the session **and its original account**, requires that the interactive
+     session be closed (no harness process on that session
+     file), then wakes the agent. The human comes back to it via `ameesh attach`.
+   * `ameesh resume <agent>` restarts a stopped agent on its recorded
+     session and its account, and ties the identity to the new execution
+     (identity and lease variables set by the runner). If the original
+     account is at its threshold, the rule of 0027 applies: same session if
+     it is portable, otherwise rotation. The summary is made under the old account
+     if it remains usable. Otherwise, a **deterministic resume brief** built
+     by ameesh: the project thread, lots, latest messages, and path of the
+     original transcript for reading. No more digging through `~/.codex*/sessions`
+     by hand.
+4. **Liveness alerts, pushed to the responsible human.**
+   * Structured stop reason: `manuel`, `bail_expiré`, `retiré_du_canon`,
      `externe`, `erreur`.
-   * `stopped_with_mail` : agent arrêté ou mort avec du courrier non lu plus
-     vieux que le seuil, sauf arrêt `manuel`.
-   * `orphan_lot` : lot ouvert dont l'assigné est inconnu, arrêté, externe sans
-     humain joignable, ou sans tour sur ce lot depuis N min (défaut 30). Le
-     seuil est bien plus court que les 6 h de `stale_lot`.
-   * `delegation_expired` (voir 5).
-   * **Envoi** par un service `ameesh notify` (unité systemd, comme
-     l'exécuteur), qui suit les alertes et les achemine vers le responsable
-     humain de l'agent ou du lot. Destinations : notification de bureau, ntfy,
-     Slack par webhook entrant (0004). Il évite les doublons, envoie la
-     résolution et limite le débit. Les secrets restent ceux de l'hôte.
-5. **Délégation à échéance.** `ameesh work delegate <lot> <agent> --within
-   30m` enregistre le délégant, le délégué et l'échéance. À l'échéance, sans
-   tour du délégué sur ce lot (`session_work_item`), le lot **revient au
-   délégant**. Un événement part dans sa boîte, ce qui réveille un agent
-   exécuté, et l'alerte part au responsable. `work assign` (réassignation)
-   rejoint la CLI, gardée par la règle 2.
-6. **Cloisonnement : l'identité ne vient jamais du dossier.**
-   * Les hooks passent à la v1 (étape 8 de la bascule, en avance pour les
-     hooks), puisque la v1 ne déduit déjà aucune identité du dossier.
-   * Session externe : liaison explicite `ameesh mail bind <agent>`, qui lie
-     l'identifiant de session du harnais (reçu par le hook en JSON) au nom.
-     Le hook ne remet que si cette liaison existe ; sans identité liée, il ne
-     remet **rien**.
-   * Un hook n'écrit plus le `session_id` d'un agent `exécuté`.
-   * `send all` est limité à l'équipe ou au chantier de l'expéditeur.
-7. **`ameesh list`** : une ligne globale de lots, et le nombre de lots ouverts
-   par agent sur sa ligne.
+   * `stopped_with_mail`: stopped or dead agent with unread mail older
+     than the threshold, except for a `manuel` stop.
+   * `orphan_lot`: open lot whose assignee is unknown, stopped, external without
+     a reachable human, or with no turn on that lot for N min (default 30). The
+     threshold is much shorter than the 6 h of `stale_lot`.
+   * `delegation_expired` (see 5).
+   * **Sending** by an `ameesh notify` service (systemd unit, like
+     the runner), which follows the alerts and routes them to the responsible
+     human of the agent or the lot. Destinations: desktop notification, ntfy,
+     Slack via incoming webhook (0004). It avoids duplicates, sends the
+     resolution and rate-limits. The secrets remain those of the host.
+5. **Delegation with a deadline.** `ameesh work delegate <lot> <agent> --within
+   30m` records the delegator, the delegate and the deadline. At the deadline, with no
+   turn by the delegate on that lot (`session_work_item`), the lot **returns to the
+   delegator**. An event goes to their mailbox, which wakes an executed
+   agent, and the alert goes to the responsible human. `work assign` (reassignment)
+   joins the CLI, guarded by rule 2.
+6. **Isolation: identity never comes from the folder.**
+   * The hooks move to v1 (step 8 of the switchover, brought forward for the
+     hooks), since v1 already infers no identity from the folder.
+   * External session: explicit binding `ameesh mail bind <agent>`, which ties
+     the harness's session identifier (received by the hook as JSON) to the name.
+     The hook only delivers if this binding exists; without a bound identity, it delivers
+     **nothing**.
+   * A hook no longer writes the `session_id` of an `exécuté` agent.
+   * `send all` is limited to the sender's team or project.
+7. **`ameesh list`**: one global lots line, and the number of open lots
+   per agent on its row.
 
-# Plan de lots proposé
+# Proposed lot plan
 
-Les migrations 0030 et 0031 sont réservées. Chaque lot : branche
-`lot/L3x-…`, tests, revue indépendante, puis fusion **sur accord du
-propriétaire**.
+Migrations 0030 and 0031 are reserved. Each lot: branch
+`lot/L3x-…`, tests, independent review, then merge **with the
+owner's agreement**.
 
-| Lot | Contenu | Dépend de | Taille |
+| Lot | Content | Depends on | Size |
 |---|---|---|---|
-| **L36** — correctifs immédiats | P6 (`list` : total une fois, compte par agent) ; étiquettes « attend » qui disent *inconnu* / *arrêté* / *externe* ; avertissement sur `work add` pour un assigné inconnu ; le hook n'écrase plus le `session_id` d'un agent de l'exécuteur ; `send all` limité au chantier | — | S |
-| **L37** — mode, raison d'arrêt, alertes de vivacité | migration 0030 : `agent_registry.mode`, `stop_reason`, responsable requis pour `externe` ; `stopped_with_mail`, `orphan_lot` ; `work assign` ; règle 2 (refus, `--externe` par le responsable) | L36 | M |
-| **L38** — alertes poussées | `ameesh notify` (systemd) : desktop, ntfy, Slack webhook ; acheminement au responsable humain ; doublons, résolution, débit ; `doctor --notify-test` étendu | L37 | M |
-| **L39** — adoption et reprise | `ameesh adopt`, `ameesh resume` ; compte d'origine de la session en registre ; contrôle de session fermée ; brief de reprise déterministe quand l'ancien compte est inutilisable | L37 | M–L |
-| **L40** — délégation à échéance | migration 0031 : `delegated_by`, `due_at` sur `work_items` ; `work delegate` ; échéance traitée par l'exécuteur (retour au délégant, événement, `delegation_expired`) | L37 | M |
-| **L41** — cloisonnement des hooks | `ameesh mail bind` (liaison par identifiant de session du harnais) ; le hook v1 ne remet rien sans liaison ; procédure de bascule des hooks vers la v1 (`BASCULE.md`, étape 8 avancée, avec retour arrière) | L36 | M |
+| **L36** — immediate fixes | P6 (`list`: total once, count per agent); "attend" labels that say *unknown* / *stopped* / *external*; warning on `work add` for an unknown assignee; the hook no longer overwrites the `session_id` of a runner agent; `send all` limited to the project | — | S |
+| **L37** — mode, stop reason, liveness alerts | migration 0030: `agent_registry.mode`, `stop_reason`, responsible human required for `externe`; `stopped_with_mail`, `orphan_lot`; `work assign`; rule 2 (refusal, `--externe` by the responsible human) | L36 | M |
+| **L38** — pushed alerts | `ameesh notify` (systemd): desktop, ntfy, Slack webhook; routing to the responsible human; duplicates, resolution, rate; extended `doctor --notify-test` | L37 | M |
+| **L39** — adoption and resume | `ameesh adopt`, `ameesh resume`; session's original account in the registry; closed-session check; deterministic resume brief when the old account is unusable | L37 | M–L |
+| **L40** — delegation with a deadline | migration 0031: `delegated_by`, `due_at` on `work_items`; `work delegate`; deadline handled by the runner (return to the delegator, event, `delegation_expired`) | L37 | M |
+| **L41** — hook isolation | `ameesh mail bind` (binding by the harness's session identifier); the v1 hook delivers nothing without a binding; procedure for switching the hooks to v1 (`BASCULE.md`, step 8 brought forward, with rollback) | L36 | M |
 
-Ordre conseillé : L36, puis L37, puis L38 / L39 / L41 en parallèle, puis L40.
-L36 et L38 suffisent à ce qu'un tel blocage ne passe plus
-inaperçu ; L39 et L41 suppriment la cause.
+Recommended order: L36, then L37, then L38 / L39 / L41 in parallel, then L40.
+L36 and L38 are enough for such a blockage to no longer go
+unnoticed; L39 and L41 remove the cause.

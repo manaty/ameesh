@@ -77,9 +77,9 @@ class BudgetSepareTest(unittest.TestCase):
         self.assertEqual(b["spend"]["24h"]["paid_usd"], 2.0)
         self.assertEqual(b["spend"]["24h"]["plan_value_usd"], 75.0)
         text = progress.format_text(_snap_avec(b), width=100)
-        self.assertIn("dépensé (payé au token, estimé) : 1 h 2.00", text)
-        self.assertIn("valeur consommée sur les forfaits", text)
-        self.assertNotIn("total estimé", text)
+        self.assertIn("spent (pay-per-token, estimated): 1 h 2.00", text)
+        self.assertIn("value consumed on plans", text)
+        self.assertNotIn("estimated total", text)
 
     def test_tours_en_echec_et_jetons(self):
         rows = [_row("codex1", "codex", 0.0, turns=5, failed_turns=5),
@@ -97,18 +97,18 @@ class BudgetSepareTest(unittest.TestCase):
         self.assertEqual(agents["codex2"]["fresh_input_tokens"], 300_000)
         self.assertEqual(agents["d1"]["fresh_input_tokens"], 100)
         text = progress.format_text(_snap_avec(b), width=100)
-        self.assertIn("codex1 (codex) : 0 tour(s) + 5 en échec", text)
-        self.assertIn("cache relu 9,00 M", text)
+        self.assertIn("codex1 (codex): 0 turn(s) + 5 failed", text)
+        self.assertIn("cache read 9.00 M", text)
 
     def test_page_colonnes_et_totaux(self):
         b = progress.build_budget([_row("d1", "deepseek", 1.0)], [], NOW,
                                   paid_harnesses=["deepseek"])
         html = progress.render_html(_snap_avec(b))
-        for text in ("valeur consommée sur les forfaits", "dépensé (payé au token)",
-                     '"cache relu"', '"entrée"', '"en échec"', "prochain choix",
-                     "perdu à la remise à zéro"):
+        for text in ("value consumed on plans", "spent (paid per token)",
+                     '"cache read"', '"input"', '"failed"', "next choice",
+                     "lost at reset"):
             self.assertIn(text, html)
-        self.assertNotIn("total estimé", html)
+        self.assertNotIn("estimated total", html)
 
     def test_comptes_toutes_fenetres(self):
         compte = {"harness": "claude", "account": "tertiaire", "active": False,
@@ -128,10 +128,10 @@ class BudgetSepareTest(unittest.TestCase):
         self.assertTrue(acc["next"])
         self.assertNotIn("_gauges", acc)
         text = progress.format_text(_snap_avec(b), width=100)
-        self.assertIn("compte claude/tertiaire — prochain choix", text)
+        self.assertIn("account claude/tertiaire — next choice", text)
         self.assertIn("five_hour 90", text)
         # la jauge de la machine n'est pas répétée pour un harnais à comptes
-        self.assertNotIn("forfait claude five_hour", text)
+        self.assertNotIn("plan claude five_hour", text)
 
 
 def _snap_avec(budget: dict) -> dict:
@@ -152,9 +152,9 @@ class CostReportTest(unittest.TestCase):
         self.assertEqual(cost.totals(rows)["plan_value"], {"1h": 10.0, "24h": 70.0})
         text = cost.format_report(rows)
         self.assertRegex(text, r"d1 +deepseek +m +token")
-        self.assertRegex(text, r"c1 +claude +m +forfait")
-        self.assertIn("dépensé (payé au token, estimé)  : 1 h 0.5000 $ · 24 h 2.0000 $", text)
-        self.assertIn("valeur consommée sur les forfaits : 1 h 10.0000 $ · 24 h 70.0000 $", text)
+        self.assertRegex(text, r"c1 +claude +m +plan")
+        self.assertIn("spent (pay-per-token, estimated): 1 h 0.5000 $ · 24 h 2.0000 $", text)
+        self.assertIn("value consumed on plans:          1 h 10.0000 $ · 24 h 70.0000 $", text)
 
 
 # --------------------------------------------------------------------------
@@ -194,8 +194,8 @@ class DepenseReelleTest(unittest.TestCase):
         text = balance.describe({"provider": "deepseek", "currency": "USD", "period": "24h",
                                  "real_spent": 6.29, "estimated_usd": 12.03,
                                  "gap_usd": 5.74, "alert": True, "topups": 0.0})
-        self.assertEqual(text, "dépense réelle deepseek 24 h (soldes) : 6.29 USD · estimée "
-                               "12.03 $ · écart +5.74 $ — ÉCART AU-DELÀ DU SEUIL")
+        self.assertEqual(text, "actual spend deepseek 24 h (balances): 6.29 USD · estimated "
+                               "12.03 $ · gap +5.74 $ — GAP ABOVE THRESHOLD")
 
 
 class DepenseReellePgTest(PgTestCase):
@@ -356,7 +356,7 @@ class PlanCorrectionTest(unittest.TestCase):
         s = "8fbfa9b3"
         rows = [_ligne(514, "claude1", "claude", 66.982122, NOW, session=s,
                        model="claude-x", input_tokens=6, cached_input_tokens=1_555_487,
-                       output_tokens=892, cum_usd=66.982122),
+                       output_tokens=892, cum_usd=66.982122, cache_write_tokens=0),
                 _ligne(518, "claude1", "claude", 0.181149, NOW + 60, session=s,
                        model="claude-x", input_tokens=2, cached_input_tokens=773_527,
                        output_tokens=303, cum_usd=67.163271)]
@@ -457,10 +457,10 @@ class CorrectionPgTest(PgTestCase):
         self._insert()                                   # doublon de réparation
         self._insert(agent="claude1", harness="claude", model="claude-x", session="s1",
                      usd=66.98, input_tokens=6, cached_input_tokens=1_555_487,
-                     output_tokens=892, cum_usd=66.98)
+                     output_tokens=892, cum_usd=66.98, cache_write_tokens=0)
         self._insert(agent="claude1", harness="claude", model="claude-x", session="s1",
                      usd=0.18, input_tokens=2, cached_input_tokens=773_527,
-                     output_tokens=303, cum_usd=67.16)
+                     output_tokens=303, cum_usd=67.16, cache_write_tokens=0)
         prices = os.path.join(tempfile.mkdtemp(prefix="ameesh-l95-"), "prices.json")
         with open(prices, "w", encoding="utf-8") as fh:
             json.dump(PRICES, fh)
@@ -483,7 +483,7 @@ class CorrectionPgTest(PgTestCase):
         self.assertEqual(len(rows), 4)                   # rien n'est supprimé
         ids = sorted(rows)
         self.assertEqual(rows[ids[0]]["model"], "deepseek-flash")
-        self.assertTrue(rows[ids[1]]["void_reason"].startswith("doublon de #"))
+        self.assertTrue(rows[ids[1]]["void_reason"].startswith("duplicate of #"))
         self.assertLess(rows[ids[2]]["usd"], 1.0)
         journal = self.db.query("SELECT turn_cost_id, kind, old_row, actor"
                                 " FROM turn_cost_corrections ORDER BY id")
@@ -505,7 +505,7 @@ class CorrectionPgTest(PgTestCase):
         self._insert()
         proc = self.mesh("cost", "correct")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("ESSAI : rien n'a été écrit", proc.stdout)
+        self.assertIn("DRY RUN: nothing was written", proc.stdout)
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM turn_costs"
                                        " WHERE void_reason IS NOT NULL")[0]["n"], 0)
         proc = self.mesh("cost", "correct", "--apply", "--json")

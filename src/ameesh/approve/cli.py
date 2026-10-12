@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh-approve — service d'approbation humaine (spec §9, C8).
+"""ameesh-approve: human approval service (spec §9, C8).
 
-  ameesh-approve serve [--config F] [--rp-id R] [--origin O]… [--public-url U]
+  ameesh-approve serve [--config F] [--rp-id R] [--origin O]... [--public-url U]
                        [--bind 127.0.0.1] [--port 8765] [--token-file F]
                        [--state-dir D] [--proposals-dir D] [--level standard|eleve]
                        [--profile strict|compatible] [--tls-cert F --tls-key F]
-        lance le service sur la boucle locale : HTTP derrière un mandataire
-        HTTPS, ou TLS local (--tls-cert/--tls-key) derrière une passerelle en
-        passthrough ; le certificat est relu quand il change (et sur SIGHUP) ;
-        profil strict par défaut (RP ID = hôte de l'unique origine https) ;
-  ameesh-approve enroll-link --approver human:ID [--ttl S] [options de config]
-        crée un lien d'enrôlement à usage unique (à ouvrir SUR LE TÉLÉPHONE) ;
-        la passkey créée devient une PROPOSITION de canon, active après PR revue ;
+        runs the service on loopback: HTTP behind an HTTPS reverse proxy,
+        or local TLS (--tls-cert/--tls-key) behind a passthrough gateway;
+        the certificate is reloaded when it changes (and on SIGHUP);
+        strict profile by default (RP ID = host of the single https origin);
+  ameesh-approve enroll-link --approver human:ID [--ttl S] [config options]
+        creates a single-use enrollment link (to open ON THE PHONE);
+        the passkey created becomes a canon PROPOSAL, active after a reviewed PR;
   ameesh-approve gen-token [--token-file F]
-        crée le jeton de service (256 bits, fichier 0600 ; n'écrase jamais).
+        creates the service token (256 bits, 0600 file; never overwrites).
 
-À lancer sous l'utilisateur Unix du service, jamais sous celui des agents.
-La base (registre de confiance, table des actions) est lue avec la
-configuration d'ameesh (AMEESH_DSN, AMEESH_SCHEMA…).
+Run it as the service's Unix user, never as the agents' user.
+The database (trust registry, actions table) is read with the ameesh
+configuration (AMEESH_DSN, AMEESH_SCHEMA...).
 """
 from __future__ import annotations
 
@@ -35,18 +35,18 @@ from .config import ApproveConfigError
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", default=None, help="fichier JSON de configuration")
+    parser.add_argument("--config", default=None, help="JSON configuration file")
     parser.add_argument("--rp-id", default=None)
     parser.add_argument("--origin", action="append", default=[],
-                        help="origine autorisée exacte, ex. https://approve.example.org "
-                             "(répétable)")
+                        help="exact allowed origin, e.g. https://approve.example.org "
+                             "(repeatable)")
     parser.add_argument("--public-url", default=None)
     parser.add_argument("--state-dir", default=None)
     parser.add_argument("--proposals-dir", default=None)
     parser.add_argument("--level", default=None, choices=["standard", "eleve"])
     parser.add_argument("--profile", default=None, choices=list(config_mod.PROFILES),
-                        help="strict (défaut : RP ID = hôte de l'unique origine) | "
-                             "compatible (essais locaux, explicite)")
+                        help="strict (default: RP ID = host of the single origin) | "
+                             "compatible (local trials, explicit)")
 
 
 def _config(args: argparse.Namespace, **extra) -> config_mod.ApproveConfig:
@@ -83,20 +83,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try:
             source.check()
         except ActionSourceError as exc:
-            print("attention : %s — POST /requests répondra 503 tant qu'elle manque" % exc,
+            print("warning: %s; POST /requests will answer 503 while it is missing" % exc,
                   file=sys.stderr)
         service = ApproveService(cfg, db, source, service_token=token, db_lock=lock)
         server = make_server(service, tls=tls)
         if tls is not None and hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, lambda _sig, _frame: tls.request_reload())
         host, port = server.server_address[:2]
-        print("ameesh-approve écoute sur %s://%s:%d — profil %s, RP ID %s, origines %s, "
-              "API de service %s, état %s"
+        print("ameesh-approve listening on %s://%s:%d: profile %s, RP ID %s, origins %s, "
+              "service API %s, state %s"
               % ("https" if tls is not None else "http",
                  host if ":" not in host else "[%s]" % host, port, cfg.profile, cfg.rp_id,
                  ", ".join(cfg.origins),
-                 "AUSSI sous l'hôte public (api_via_public)" if cfg.api_via_public
-                 else "sur la boucle locale seulement", cfg.state_dir), file=sys.stderr)
+                 "ALSO under the public host (api_via_public)" if cfg.api_via_public
+                 else "on loopback only", cfg.state_dir), file=sys.stderr)
         try:
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
@@ -120,11 +120,11 @@ def cmd_enroll_link(args: argparse.Namespace) -> int:
     try:
         result = service.create_enroll_link(args.approver, args.ttl)
     except ApproveError as exc:
-        print("erreur : %s" % exc.message, file=sys.stderr)
+        print("error: %s" % exc.message, file=sys.stderr)
         return 2
     print(result["link"])
-    print("valable jusqu'à %s, une seule fois — à ouvrir SUR LE TÉLÉPHONE de %s ; la passkey "
-          "créée sera une proposition de canon (PR revue)."
+    print("valid until %s, once only: open it ON THE PHONE of %s; the passkey "
+          "created will be a canon proposal (reviewed PR)."
           % (time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(result["exp"])),
              result["approver"]), file=sys.stderr)
     return 0
@@ -134,7 +134,7 @@ def cmd_gen_token(args: argparse.Namespace) -> int:
     path = (args.token_file or os.environ.get("AMEESH_APPROVE_TOKEN_FILE")
             or config_mod.DEFAULT_TOKEN_FILE)
     written = config_mod.write_service_token(path)
-    print("jeton de service créé : %s (0600)" % written)
+    print("service token created: %s (0600)" % written)
     return 0
 
 
@@ -144,27 +144,27 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
 
-    p_serve = sub.add_parser("serve", help="lancer le service")
+    p_serve = sub.add_parser("serve", help="run the service")
     _common(p_serve)
-    p_serve.add_argument("--bind", default=None, help="adresse de boucle locale")
+    p_serve.add_argument("--bind", default=None, help="loopback address")
     p_serve.add_argument("--port", type=int, default=None)
     p_serve.add_argument("--token-file", default=None)
     p_serve.add_argument("--tls-cert", default=None,
-                         help="TLS local (passthrough) : certificat PEM de l'hôte, fichier "
-                              "privé 0600 de l'utilisateur du service")
+                         help="local TLS (passthrough): host PEM certificate, private 0600 "
+                              "file of the service user")
     p_serve.add_argument("--tls-key", default=None,
-                         help="TLS local : clé privée PEM, fichier privé 0600")
+                         help="local TLS: PEM private key, private 0600 file")
     p_serve.set_defaults(func=cmd_serve)
 
-    p_enroll = sub.add_parser("enroll-link", help="lien d'enrôlement à usage unique")
+    p_enroll = sub.add_parser("enroll-link", help="single-use enrollment link")
     _common(p_enroll)
     p_enroll.add_argument("--approver", required=True, help="human:<id>")
-    p_enroll.add_argument("--ttl", type=int, default=None, help="durée de validité (s)")
+    p_enroll.add_argument("--ttl", type=int, default=None, help="validity period (s)")
     p_enroll.set_defaults(func=cmd_enroll_link)
 
-    p_token = sub.add_parser("gen-token", help="créer le jeton de service")
+    p_token = sub.add_parser("gen-token", help="create the service token")
     p_token.add_argument("--token-file", default=None,
-                         help="défaut : AMEESH_APPROVE_TOKEN_FILE ou %s" % config_mod.DEFAULT_TOKEN_FILE)
+                         help="default: AMEESH_APPROVE_TOKEN_FILE or %s" % config_mod.DEFAULT_TOKEN_FILE)
     p_token.set_defaults(func=cmd_gen_token)
     return parser
 
@@ -182,16 +182,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except ApproveConfigError as exc:
-        print("erreur de configuration : %s" % exc, file=sys.stderr)
+        print("configuration error: %s" % exc, file=sys.stderr)
         return 2
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except (db_mod.DbError, OSError, ValueError) as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

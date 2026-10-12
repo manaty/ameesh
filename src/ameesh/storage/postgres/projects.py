@@ -92,7 +92,8 @@ WITH unread AS (
                        (SELECT min(e.created_at) FROM work_item_events e
                          WHERE e.work_item_id = coalesce(ml.id, sw.id, a.id)
                            AND (e.actor IN (r.name, 'agent:' || r.name)
-                                OR position(('assigné à ' || r.name) in e.note) = 1)),
+                                OR position(('assigné à ' || r.name) in e.note) = 1
+                                OR position(('assigned to ' || r.name) in e.note) = 1)),
                        (SELECT min(m.created_at) FROM agent_mailbox m
                          WHERE m.sender = r.name
                            AND m.work_item_id = coalesce(ml.id, sw.id, a.id)::text)))::float8
@@ -152,7 +153,12 @@ SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM 
           FROM dead) AS dead_letters,
        -- L124 : les demandes de décision en attente (ligne d'en-tête de la vue)
        (SELECT coalesce(json_agg(d ORDER BY d.id), '[]'::json) FROM (__DECISIONS__) d)
-           AS decisions
+           AS decisions,
+       -- L121 (0362): the watches ameesh manages
+       (SELECT coalesce(json_agg(w ORDER BY w.agent), '[]'::json) FROM (
+            SELECT agent, every_s, host,
+                   extract(epoch from last_sent_at)::float8 AS last_sent_ts
+              FROM agent_watches) w) AS watches
 """.replace("__SESSION_REF__", _lot_ref("r.session_work_item")) \
   .replace("__MAIL_REF__", _lot_ref("c.ref")) \
   .replace("__CITED_SCAN__", str(CITED_SCAN)) \
@@ -168,4 +174,5 @@ class Projects(interface.Projects):
         row = rows[0] if rows else {}
         return {"agents": list(row.get("agents") or []), "lots": list(row.get("lots") or []),
                 "dead_letters": list(row.get("dead_letters") or []),
-                "decisions": list(row.get("decisions") or [])}
+                "decisions": list(row.get("decisions") or []),
+                "watches": list(row.get("watches") or [])}
