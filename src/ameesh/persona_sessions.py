@@ -60,10 +60,12 @@ def _write(db, best_effort, sql, params):
     # psql exits on an SQL error, so client-side SAVEPOINT recovery cannot
     # preserve the primary registry write. Bind then quote the whole statement
     # as data for EXECUTE; session IDs never become PL/pgSQL source.
+    # OTHERS excludes query_canceled: history timeouts must also stay inside
+    # this subtransaction so the accepted registry transition can commit.
     body = (
         "BEGIN PERFORM set_config('ameesh.session_history_error', '', true); "
         "BEGIN EXECUTE " + sql_literal(bind(sql, params)) + "; "
-        "EXCEPTION WHEN OTHERS THEN "
+        "EXCEPTION WHEN query_canceled OR OTHERS THEN "
         "PERFORM set_config('ameesh.session_history_error', SQLERRM, true); "
         "END; END")
     db.execute("DO " + sql_literal(body))

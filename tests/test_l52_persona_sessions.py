@@ -80,6 +80,53 @@ class SessionHistoryTest(PgTestCase):
         self.assertEqual([r["session_id"] for r in rows], ["s1"])
         self.assertIsNone(rows[0]["ended_at"])
 
+    def test_injected_history_query_canceled_preserves_registry_transitions(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        self.db.execute(
+            "CREATE FUNCTION cancel_history_write() RETURNS trigger LANGUAGE plpgsql AS "
+            "$$ BEGIN RAISE EXCEPTION 'injected history cancellation' "
+            "USING ERRCODE = '57014'; END $$")
+        self.db.execute(
+            "CREATE TRIGGER cancel_history_write BEFORE INSERT OR UPDATE ON persona_sessions "
+            "FOR EACH ROW EXECUTE FUNCTION cancel_history_write()")
+        try:
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                registry.set_session(self.db, "checker-a", "s2")
+            self.assertIn("injected history cancellation", err.getvalue())
+            self.assertEqual(registry.get(self.db, "checker-a")["session_id"], "s2")
+            self.assertEqual([r["session_id"] for r in ps.sessions(self.db, "checker-a")], ["s1"])
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+            # Close an existing history row as well as replacing it.
+            with mock.patch.object(sys, "stderr", io.StringIO()):
+                registry.set_session(self.db, "checker-a", "s1")
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                storage.of(self.db).operations.resume(
+                    "checker-a", prompt=None, forget=True, status_text="resume")
+            self.assertIn("injected history cancellation", err.getvalue())
+            self.assertIsNone(registry.get(self.db, "checker-a")["session_id"])
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+        finally:
+            self.db.execute("DROP TRIGGER cancel_history_write ON persona_sessions")
+            self.db.execute("DROP FUNCTION cancel_history_write()")
+
+    def test_locked_history_statement_timeout_preserves_registry_transition(self):
+        registry.set_session(self.db, "checker-a", "s1")
+        blocker = db_mod.connect(self.cfg)
+        try:
+            with blocker.transaction() as locked:
+                locked.query("SELECT id FROM persona_sessions WHERE persona = 'checker-a' FOR UPDATE")
+                with self.db.transaction() as tx:
+                    tx.execute("SET LOCAL statement_timeout = '100ms'")
+                    with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                        registry.set_session(tx, "checker-a", "s2")
+                    self.assertIn("statement timeout", err.getvalue())
+                    self.assertEqual(registry.get(tx, "checker-a")["session_id"], "s2")
+            self.assertEqual(registry.get(self.db, "checker-a")["session_id"], "s2")
+            self.assertEqual([r["session_id"] for r in ps.sessions(self.db, "checker-a")], ["s1"])
+            self.assertIsNone(ps.sessions(self.db, "checker-a")[0]["ended_at"])
+        finally:
+            blocker.close()
+
     def test_session_id_is_data_in_best_effort_history_sql(self):
         session_id = "s' ; $history$ \\ quoted"
         registry.set_session(self.db, "checker-a", session_id)
