@@ -151,6 +151,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 """
 from __future__ import annotations
 
+from .conversations import Conversations
+
 import abc
 from typing import Any, Callable, Protocol, Sequence
 
@@ -2486,3 +2488,4 @@ class Storage(abc.ABC):
     housekeeping: Housekeeping
     session_bindings: SessionBindings
     ci: CiResults
+    conversations: Conversations

@@ -3128,6 +3128,8 @@ class AgentWorker(threading.Thread):
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
         lignes = 0
+        conversation_recorder = None
+        conversation_usage = None
         proc = None
         #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
         #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
@@ -3179,6 +3181,16 @@ class AgentWorker(threading.Thread):
             if resume and not tue:
                 self.resume_summary = ""  # le résumé a ouvert la session neuve
             log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
+            # L78: the writer owns its connection; harness output never waits
+            # for SQL or the readable thread. ResidentWorker uses the same sink.
+            if getattr(self.db, "driver", "") != "mediated":
+                from .conversation import Recorder
+                conversation_recorder = Recorder(
+                    self.cfg, agent=self.name, turn=turn_id, session=session,
+                    project=fil.project_for(self.cfg, fil.agent_project(self.agent)),
+                    warn=log_async)
+                conversation_recorder.append("input", spec.get("prompt") or "",
+                                             author="ameesh:runner")
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
                     line = line.rstrip("\n")
@@ -3188,6 +3200,10 @@ class AgentWorker(threading.Thread):
                     events.write(line + "\n")
                     events.flush()
                     parsed = self._parse(adapter, line)
+                    if conversation_recorder is not None:
+                        conversation_recorder.on_event(line, parsed)
+                        if isinstance(parsed.get("usage"), dict):
+                            conversation_usage = parsed["usage"]
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
@@ -3306,6 +3322,16 @@ class AgentWorker(threading.Thread):
             else:
                 self._close_turn_resource(turn_id, pgid)
             self._menage_apres_tour(menage_tour, turn_id, spec)
+            if conversation_recorder is not None:
+                interrupted = (self.lease_lost.is_set() or self.preempting.is_set()
+                               or self.restarting.is_set() or clos)
+                conversation_recorder.finish(
+                    final=self.last_final or "",
+                    status="interrupted" if interrupted else (
+                        "failed" if result_code or error or sys.exc_info()[0] else "completed"),
+                    cost=cost, usage=conversation_usage,
+                    duration_s=max(0, time.time() - started))
+                conversation_recorder.close()
 
         duration = time.time() - started
         self.last_turn_seconds = duration

@@ -640,6 +640,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
 
     agent_rows = st.agents(project)
     agents = [build_agent(r, now, read_effort(cfg, r)) for r in agent_rows]
+    from . import conversation
+    conversation.attach_progress(db, agents)
     cost_rows = st.costs(since_ts=since_ts,
                          agents=[r["name"] for r in agent_rows] if project else None)
     if book is None:

@@ -50,6 +50,7 @@ CONTENUS = {
     "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
     "thread_index": {"last_excerpt"},
+    "conversation_log": {"text", "meta", "thread_text"},
     "actions": {"args", "last_note"},
     "action_events": {"note"},
     "work_items": {"body"},
