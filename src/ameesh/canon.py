@@ -2125,8 +2125,17 @@ class _Loader:
                 memory_repository = _text(memory.get("repository"))
         harnesses = self._list(fiche, "harnesses", where, "agent-harnesses-invalid", **subject)
         harness = _text(fiche.data.get("harness")) or (harnesses[0] if harnesses else None)
-        # L243 (#435): `projects:` wins over `team:`, which becomes its first
-        projects = self._list(fiche, "projects", where, "agent-projects-invalid", **subject)
+        # L243 (#435): `projects:` wins over `team:`, which becomes its first;
+        # a list only — `projects: a, b` is one string, never two projects
+        if fiche.data.get("projects") is not None \
+                and not isinstance(fiche.data.get("projects"), list):
+            self.add("agent-projects-invalid", ERROR,
+                     "`projects`: list expected (`projects: [a, b]`), not %r"
+                     % (fiche.data.get("projects"),), **where, **subject)
+            projects = None
+        else:
+            projects = self._list(fiche, "projects", where, "agent-projects-invalid",
+                                  **subject)
         if projects is not None and not all(projects):
             self.add("agent-projects-invalid", ERROR, "`projects`: empty project name",
                      **where, **subject)

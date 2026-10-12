@@ -10,10 +10,13 @@ an ephemeral agent copies both from its creator."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import unittest
 
 from ameesh import canon, canon_sync
 
+from .support import child_env
 from .test_canon import _CanonDbCase, _TmpMixin, codes, fiche, write
 
 
@@ -77,10 +80,25 @@ class ProjectsCardTest(_TmpMixin, unittest.TestCase):
         _loaded, findings = self.check(root)
         found = self.assertFinding(findings, "agent-project-duplicate", agent="orchestre")
         self.assertIn("acme-web", found[0].message)
-        write(root, "agents/orchestre.md",
-              orchestre().replace("harness:", "projects: {a: b}\nharness:"))
-        _loaded, findings = self.check(root)
-        self.assertFinding(findings, "agent-projects-invalid", agent="orchestre")
+        # a list only (#411 r1): a mapping, `a, b` or a bare name is refused,
+        # never read as a project
+        for raw in ("{a: b}", "acme-web, acme-api", "acme-web"):
+            write(root, "agents/orchestre.md",
+                  orchestre(team="acme-api").replace("harness:",
+                                                     "projects: %s\nharness:" % raw))
+            loaded, findings = self.check(root)
+            self.assertFinding(findings, "agent-projects-invalid", agent="orchestre")
+            self.assertEqual((self.agent(loaded).projects, self.agent(loaded).team),
+                             (None, "acme-api"), raw)
+            # the offline check too
+            proc = subprocess.run([sys.executable, "-m", "ameesh.main", "canon", "check",
+                                   "--json"], capture_output=True, text=True, timeout=60,
+                                  env=child_env(AMEESH_CANON=root,
+                                                AMEESH_CANON_UNTRUSTED="1",
+                                                AMEESH_DSN="postgresql://127.0.0.1:1/none"))
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("agent-projects-invalid",
+                          [f["code"] for f in json.loads(proc.stdout)["findings"]])
 
     def test_projects_unknown_is_a_warning_with_known_projects_only(self):
         root = self.example_copy()
