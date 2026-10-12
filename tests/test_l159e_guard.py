@@ -319,6 +319,28 @@ class StateTest(unittest.TestCase):
         clock[0] += self.cfg.offer.drain_seconds + guard.STOP_GRACE_S
         self.assertEqual(g.step()["state"], "stopped")
 
+    def test_stop_holds_while_the_breach_does(self):
+        # codex #211 r7: memory steadily 1 GiB under the 6 GiB minimum, drain
+        # at t=0, stop at t=120; a pressure that never cleared is no calm, so
+        # no fresh drain (and deadline) 600 s later: stopped until it clears
+        clock = [0.0]
+        readings = [dict(self.reading, mem_available_bytes=5 * GIB)]
+        g = self._guard(clock, readings)
+        self.assertEqual(g.step()["state"], "draining")
+        clock[0] = 120.0
+        self.assertEqual(g.step()["state"], "stopped")
+        while clock[0] < 120.0 + 3 * self.cfg.offer.calm_seconds:
+            clock[0] += 5
+            state = g.step()
+            self.assertEqual((state["level"], state["state"]), (4, "stopped"), clock[0])
+        # the breach gone: calm counts from there
+        readings[0]["mem_available_bytes"] = 20 * GIB
+        clock[0] += 5
+        cleared = clock[0]
+        self.assertEqual(g.step()["level"], 4)
+        clock[0] = cleared + self.cfg.offer.calm_seconds
+        self.assertEqual(g.step()["level"], 0)
+
     def test_restart_keeps_level_and_deadline(self):
         # codex #211 r1: drain at t=0 (deadline 90), restart at t=115 under
         # the same pressure: the stop still comes at 120, not 205
