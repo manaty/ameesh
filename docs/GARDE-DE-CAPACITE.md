@@ -77,6 +77,7 @@ policy:
       busy_max: 4                 # requires busy_units
     drain_seconds: 90         # deadline of the withdrawal (default 90, > 0)
     calm_seconds: 600         # hysteresis before lending again (default 600)
+    restart_after_seconds: 600   # ameesh guard only: units it stopped start again (L159e4)
 ```
 
 - Sizes are bytes or texts such as `14GiB` or `20GB`. Percentages go

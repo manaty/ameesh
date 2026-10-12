@@ -134,8 +134,9 @@ dans le canon :
 
 ```sh
 ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
-ameesh accounts use claude secondaire  # forçage manuel (plus de choix automatique)
+ameesh accounts use claude secondaire  # forçage manuel (levé seul au seuil si un autre compte est libre)
 ameesh accounts auto [claude]          # retour au choix automatique (0034)
+ameesh accounts healthy claude secondaire  # compte reconnecté : déclaré sain (L226b)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
@@ -193,3 +194,121 @@ antérieures. Quand ce compte est inutilisable (identifiants retirés, forfait
 saturé) et que la session n'est pas portable, la rotation ne peut pas résumer
 sous l'ancien compte : la session neuve s'ouvre sur un **brief de reprise
 déterministe** (voir `ameesh resume` dans [EXPLOITATION.md](EXPLOITATION.md)).
+
+## 4. Failover order and caps (L226b, owner decision 2026-10-07)
+
+"Primaries last, capped": the harness's default account (`~/.claude`,
+`~/.codex`, declared without `path`) is the owner's own and only serves as a
+last resort. Each account takes these optional settings in the host's
+`accounts` key (defaults in brackets):
+
+| setting | meaning |
+|---|---|
+| `priority` [default account 100, others 50] | rank in the failover order, lower first; the pace (L117) only breaks ties |
+| `cap` [0.50 for the default account, none otherwise] | fixed cap on **every** window: above it, the account is ineligible |
+| `overage` [`auto`] | may the account be billed beyond its plan? `auto` reads it from the harness (Claude `overageStatus`, Codex `credits.has_credits`), `allowed` or `none` declare it |
+| `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
+| `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
+
+A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
+on the short window), `cap`, and `overage_cap` when the account may be billed.
+An account **in overage** (Claude `isUsingOverage`, Codex a window at 100 %
+with credits) is never chosen, until the windows that ran out have reset (a
+spent window with no reset date keeps it out). The caps apply to session
+continuity too: a session on the primary leaves it once the primary is above
+50 % of a window. A manual force posted while a worker switches accounts is
+evaluated the same way: a forced account past its caps is not launched.
+A forced account at its threshold (pace, caps or overage) does not hold the
+agents while another healthy account is under its own: the force is lifted
+(journaled `auto`) and the automatic choice runs (bureau, 2026-10-12). With
+no other account free, the force holds and the agents pause.
+With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
+pauses, but these rules still hold: an account in overage or past `cap` /
+`overage_cap` is never chosen, and with no other account the agent is
+paused (`budget : …`) rather than launched on it.
+
+A session opened before L30 (no account recorded) ran on the harness's
+default folder: its health, gauges and caps are read under the declared
+account of that folder (the primary), not under `(défaut)`.
+
+The summary of a rotation (§ 3) runs on the **old** account only if that
+account could still be chosen apart from its pace: not `failing` (§ 5), under
+`cap` and `overage_cap`, not in overage, its gauges readable. Otherwise no
+model call: the session resumes from the deterministic brief (L39). An
+ordinary rotation (size, context cap, L11) passes the guards of a turn first
+(budget and caps, authentication) and runs only on the session's own account;
+otherwise it waits, and the account switch of the next turn rotates.
+
+For the order "Claude tertiary > secondary > primary, Codex secondary >
+primary" on a host that declared `primaire, secondaire, tertiaire`:
+
+```json
+"claude": [
+  {"name": "primaire"},
+  {"name": "secondaire", "path": "/home/me/.claude-secondary", "priority": 20},
+  {"name": "tertiaire", "path": "/home/me/.claude-tertiary", "priority": 10}
+]
+```
+
+Bureau's local sprint patch of 2026-10-11 (`~/.config/ameesh/sprint.json`,
+`short_window_cap` 0.75 for the non-default accounts, bureau 2026-10-12) is the setting
+`"short_window_cap": 0.75` on those accounts.
+
+`ameesh accounts list --json` shows `priority`, `overage` (setting, capable,
+in use) and, per gauge, the `cap` the window is held to.
+
+## 5. Authentication failure: `auth_blocked` (L226b)
+
+A credential can stop working without notice: expired or revoked OAuth token,
+"Please run /login", 401 `authentication_error`, gcloud "Reauthentication
+failed". Before L226b the turn failed, the consigne went back to pending, and
+the agent replayed the same turn until the stop after fast failures (L48).
+
+**Credential health** (table `credential_health`, migration 0060): one row
+per (host, harness, account); `account` is the declared account name, `''`
+for the default credential of a harness without accounts. `state` is
+`healthy`, `failing` or `unknown`; `source` says who wrote it: the sentinel
+(`sentinel`, L226a), a failed turn (`turn`) or a human (`manual`).
+`failing_since` keeps the start of the failure, `expires_at` the forecast
+expiry the sentinel reports.
+
+**End of turn.** A failed turn whose error, short answer (600 characters at
+most) or stderr tail (this turn's output only: `stderr.log` is appended to by
+every turn) is an authentication failure
+(`ameesh.auth_failure.classify`) is neither a fast failure nor replayed: the
+turn's account is marked `failing` (source `turn`), the consigne goes back to
+pending, the agent goes `blocked` with `status_text` "`auth_blocked:
+<harness>/<account>`" and `last_error` "`auth_blocked: <reason>`". A turn that
+fails otherwise (429, context, exit code) takes the usual path.
+
+**Failover.** The account choice (§ 2 and § 4, `accounts.choose`) is
+restricted to **healthy** accounts: a `failing` account is never chosen, not
+even by session continuity. The next turn starts on a healthy account, with
+the usual session resume or rotation, and the block is lifted.
+
+**Never a paid fallback**: an account above its cap stays out, and a
+harness with a plan account never falls back to a pay-per-token API key
+(`type: api_key_env`) automatically (`ameesh accounts use` still can). Among
+the API keys of a harness without plan accounts, failover stays possible.
+
+**No healthy account under its cap**: the agent stays `auth_blocked`. It
+consumes neither consigne nor mail, no turn is tried, and the `auth_blocked`
+alert (pushed by default, urgent) goes to the responsible human. It resumes on
+its own as soon as its account, or another, is healthy again. A forced account
+(`ameesh accounts use`) that fails is not replaced: the agent stays blocked
+until `ameesh accounts auto` or the reconnection. If the healthy accounts are
+at their cap but a failing one is not, it is `auth_blocked`: reconnecting
+unblocks. If every account is at its cap, failing or not, it is the usual
+budget pause; once it lifts, an account still failing puts the
+`auth_blocked` mark (and its alert) back.
+
+**Recovery.** After the reconnection (`claude /login` in the account's
+folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
+and records it. Without it, declare it by hand:
+
+```sh
+ameesh accounts healthy claude secondaire   # declared account
+ameesh accounts healthy claude              # harness without declared accounts
+```
+
+`ameesh accounts list --json` shows the table (`credentials`).

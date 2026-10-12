@@ -360,6 +360,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
     ]),
+    -- credential health (L226a/L226b, 0060): account NAMES and their state
+    -- (short cause and fix command), never a credential
+    ('credential_health', ARRAY[
+        'host', 'harness', 'account', 'state', 'reason', 'source', 'checked_at',
+        'failing_since', 'expires_at'
+    ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu
     -- feuille de route (L96, 0044) : engagements datés, de l'ÉTAT (quoi, pour

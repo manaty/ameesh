@@ -27,7 +27,7 @@ import stat
 import sys
 import time
 
-from . import accounts, account_turn, fil, identity, mail, platform, registry, stagnation, storage
+from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -648,16 +648,16 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={row["name"]: harness})
     # L74 (0034 §4) : la session garde son compte d'origine tant qu'il est sous
     # son seuil
-    origine = previous or next((p.name for p in items if p.home() == accounts.Profile(
-        harness=harness, name="(défaut)").home()), None)
+    # (session d'avant L30 : le compte déclaré du dossier par défaut, L226b)
+    legacy = account_turn.legacy_profile(harness, items)
+    origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("tous les comptes %s sont au seuil (%s) : l'agent reprendra "
                                "à la remise à zéro" % (harness, choice.reason))
-    old = accounts.by_name(items, previous) if previous else \
-        accounts.Profile(harness=harness, name="(défaut)")
+    old = accounts.by_name(items, previous) if previous else legacy
     out.update(previous=previous, next=nxt.name, old=old)
     if previous == nxt.name or (previous is None and old.home() == nxt.home()):
         out.update(keep=True, deterministic=False,
@@ -666,15 +666,19 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     if accounts.session_portable(harness, old, nxt):
         out.update(keep=True, deterministic=False,
                    why="la session %s (compte %s) est portable vers le compte %s : reprise"
-                   % (session, previous or "(défaut)", nxt.name))
+                   % (session, previous or old.name, nxt.name))
         return out
-    usable, raison = account_turn.summary_possible(old, book, items)
+    try:
+        sick = auth_failure.failing(db, cfg.host, harness)
+    except db_mod.DbError:
+        sick = {}
+    usable, raison = account_turn.summary_possible(old, book, items, sick=sick)
     if usable:
         out.update(keep=True, deterministic=False,
                    why="la session %s (compte %s) n'est pas portable vers %s ; l'ancien "
                        "compte reste utilisable : l'exécuteur la résumera sous %s puis "
-                       "tournera (rotation 0027)" % (session, previous or "(défaut)",
-                                                     nxt.name, previous or "(défaut)"))
+                       "tournera (rotation 0027)" % (
+                           session, previous or old.name, nxt.name, previous or old.name))
         return out
     out["why"] = ("compte d'origine %s inutilisable (%s) et session %s non portable vers %s : "
                   "session oubliée, brief de reprise déterministe"
@@ -705,6 +709,12 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     if live and row.get("status") == "stopped":
         raise RepriseError("%s est arrêté mais son bail vit encore (l'exécuteur ne l'a pas "
                            "encore rendu) : réessayez dans quelques secondes" % name)
+    if not live and row.get("status") != "stopped":
+        # #293: a runner keeps the lease of every agent it serves that is not
+        # stopped; none here means no runner serves it (gone, or holding back
+        # on battery or max_agents), and the queued instruction waits
+        warn("no runner holds %s's lease on %s: the instruction waits until a runner "
+             "serves it again" % (name, row.get("host") or "?"))
     decision = plan(cfg, db, row, fresh=fresh)
     for text in decision["warnings"]:
         warn(text)
@@ -759,7 +769,8 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
             "forgotten_session": decision["session"] if forget else None,
             "deterministic": decision["deterministic"], "why": decision["why"],
             "account": decision["previous"], "next_account": decision["next"],
-            "applied": applied, "notified": notified, "prompt_bytes": _octets(prompt)}
+            "applied": applied, "notified": notified, "prompt_bytes": _octets(prompt),
+            "runner_live": live}
 
 
 # --------------------------------------------------------------------------

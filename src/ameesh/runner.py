@@ -40,7 +40,8 @@ import threading
 import time
 import uuid
 
-from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
+from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
+from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, mail, registry, storage
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
@@ -423,6 +424,13 @@ class AgentWorker(threading.Thread):
         self._host_reason = ""
         self._host_delay = 0.0
         self._host_next = 0.0
+        #: L226b : `status_text` du blocage « auth_blocked » posé (ou hérité
+        #: d'un exécuteur précédent), '' hors blocage
+        self._auth_status = (agent.get("status_text") or "") if (
+            agent.get("status") == "blocked"
+            and str(agent.get("status_text") or "").startswith(auth_failure.STATUS_PREFIX)
+            and str(agent.get("last_error") or "").startswith(auth_failure.STATUS_PREFIX)) \
+            else ""
         #: dernière résolution du binaire journalisée (L106)
         self.resolution_seen = ""
         #: L106 : arrêt propre demandé par la garde d'alimentation (texte de la
@@ -1164,6 +1172,8 @@ class AgentWorker(threading.Thread):
             if self._held_by_pressure(self.runner.host_pressure()):
                 self.runner.pressure_delayed(self.name, rotation=True)
                 return False
+            if not self._rotation_allowed():
+                return False
         if self.rotation_forcee and self.proc is None:
             raison, self.rotation_forcee = self.rotation_forcee, None
             if self.session_policy() != "jamais" and self.current_session():
@@ -1176,6 +1186,19 @@ class AgentWorker(threading.Thread):
             return False
         return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
+
+    def _rotation_allowed(self) -> bool:
+        """L226b : le tour de résumé d'une rotation est un appel de modèle. Il
+        passe les gardes d'un tour (budget et plafonds du compte, santé de
+        l'authentification) et tourne sous le compte de la session ; sinon la
+        rotation attend : la bascule du prochain tour (`continuity`) résume
+        sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
+        if not self.budget_ok() or not self.auth_ready():
+            return False
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return False
+        return account_turn.session_on(self, compte)
 
     def turn_summary(self) -> str:
         """Le résumé rendu par le dernier tour de résumé (L218) : sa réponse
@@ -2034,14 +2057,17 @@ class AgentWorker(threading.Thread):
         """
         self._account = None
         if self.runner.budget_limits(self.db).per_hour <= 0:
-            account_turn.choose(self, None, pause=False)  # L30 : bascule sans pause
-            return True
-        # Réparation d'abord : un travail comptable en attente (marqueur
-        # persistant) doit être écrit avant d'autoriser le moindre tour ; un
-        # marqueur corrompu suspend au lieu d'autoriser.
-        self._compta_repare()
-        raison = ("comptabilité des tours indisponible" if self._compta_en_echec
-                  else self.budget_reason())
+            # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
+            # overage ou au-dessus d'un plafond fixe, quels que soient les
+            # réglages de budget — sans autre compte, pas de tour
+            raison = account_turn.choose(self, None, pause=False) or ""
+        else:
+            # Réparation d'abord : un travail comptable en attente (marqueur
+            # persistant) doit être écrit avant d'autoriser le moindre tour ;
+            # un marqueur corrompu suspend au lieu d'autoriser.
+            self._compta_repare()
+            raison = ("comptabilité des tours indisponible" if self._compta_en_echec
+                      else self.budget_reason())
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
@@ -2409,6 +2435,103 @@ class AgentWorker(threading.Thread):
             if agent is not None:
                 self.agent = agent
 
+    # -- échec d'authentification (L226b) ------------------------------------
+    def auth_ready(self) -> bool:
+        """Garde de `pick()` : le compte du prochain tour est-il sain ?
+
+        Le compte est celui que la garde de budget vient de choisir (L30 : un
+        compte en échec d'authentification n'est choisi que s'il n'en reste
+        aucun sain), ou le compte par défaut du harnais ('') sans comptes
+        déclarés. En échec : blocage `auth_blocked` (fencé), pas de tour, pas
+        d'échec rapide. Sain de nouveau : blocage levé, le tour part."""
+        # Provider credentials and their health belong to the relay server.
+        # The device has no account health authority or credential to inspect.
+        if self.runner.mediated or self.runner.dry_run:
+            return True
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return True  # `account_turn.apply` refusera le tour, avec sa raison
+        harness = self.agent.get("harness") or ""
+        account = auth_failure.account_name(compte)
+        sick = auth_failure.failing(self.db, self.cfg.host, harness).get(account)
+        if sick is None:
+            return self._auth_release()
+        self._auth_block(harness, account, sick.get("reason") or "authentification en échec")
+        return False
+
+    def _auth_block(self, harness: str, account: str, reason: str) -> None:
+        """Pose (fencé) le blocage `auth_blocked` d'un agent qui n'a pas de tour
+        en cours ; journal et fil une fois par blocage."""
+        texte = auth_failure.status_text(harness, account)
+        agent = self.agent or {}
+        if texte == self._auth_status and agent.get("status") == "blocked" \
+                and agent.get("status_text") == texte:
+            return
+        if self._auth_status and self._auth_status != texte:
+            # autre compte en échec (bascule vers un compte lui aussi en panne) :
+            # l'ancienne marque est levée pour poser la nouvelle
+            registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                        self.epoch, self._auth_status,
+                                        auth_failure.STATUS_PREFIX)
+            self._auth_status = ""
+        issue = registry.set_marked_block(
+            self.db, self.name, self.runner.runner_id, self.epoch, texte,
+            "%s %s" % (auth_failure.STATUS_PREFIX, reason), auth_failure.STATUS_PREFIX)
+        if issue == "lease":
+            self.lease_lost.set()
+            return
+        if issue == "kept":
+            return  # un autre statut (arrêt, blocage) tient : réessai au sondage suivant
+        self._auth_note(harness, account, reason, texte)
+
+    def _auth_note(self, harness: str, account: str, reason: str, texte: str,
+                   turn: bool = False) -> None:
+        self._auth_status = texte
+        if turn:
+            log_async("[%s] tour en échec d'authentification sur %s/%s : %s — compte "
+                      "noté en échec ; bascule vers un compte sain s'il y en a un, sinon "
+                      "auth_blocked" % (self.name, harness, account or "(défaut)", reason))
+            self._fil_note(
+                "Tour en échec d'authentification sur %s/%s (%s) : la consigne repart en "
+                "attente, sans relance en boucle. Le compte est noté en échec ; le tour "
+                "suivant part sur un compte %s sain s'il y en a un, sinon l'agent reste "
+                "en auth_blocked jusqu'au retour d'un compte sain."
+                % (harness, account or "(défaut)", reason, harness),
+                meta={"action": "auth_blocked", "harnais": harness, "compte": account,
+                      "raison": reason, "source": "tour"})
+            return
+        log_async("[%s] %s : %s — aucun tour tant qu'aucun compte %s n'est sain "
+                  "(sentinelle, ou « ameesh accounts healthy »)"
+                  % (self.name, texte, reason, harness))
+        self._fil_note(
+            "Authentification en échec sur %s/%s (%s) et aucun autre compte %s sain : "
+            "l'agent reste en auth_blocked, sans relance ; il reprend seul dès qu'un "
+            "compte est de nouveau sain. Jamais de repli payé au jeton."
+            % (harness, account or "(défaut)", reason, harness),
+            meta={"action": "auth_blocked", "harnais": harness, "compte": account,
+                  "raison": reason})
+
+    def _auth_release(self) -> bool:
+        """Compte sain : le blocage `auth_blocked` encore posé est levé (fencé)."""
+        if not self._auth_status:
+            return True
+        texte = self._auth_status
+        issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                            self.epoch, texte, auth_failure.STATUS_PREFIX)
+        if issue == "lease":
+            self.lease_lost.set()
+            return False
+        self._auth_status = ""
+        if issue == "kept":
+            row = registry.get(self.db, self.name)
+            if row is not None:
+                self.agent = row
+            return False
+        log_async("[%s] %s levé : compte sain — reprise" % (self.name, texte))
+        self._fil_note("Blocage %s levé : un compte sain est de nouveau disponible, "
+                       "l'agent reprend." % texte, meta={"action": "auth_reprise"})
+        return True
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
@@ -2464,6 +2587,11 @@ class AgentWorker(threading.Thread):
         # Dossier de travail absent (L35) : ni consigne ni courrier consommés,
         # pas de tour tenté à chaque sondage.
         if not self.workdir_ready():
+            return None
+        # L226b : le compte du tour est en échec d'authentification — ni
+        # consigne ni courrier consommés, aucune relance ; reprise dès qu'il
+        # (ou un autre, par la bascule de `budget_ok`) est sain.
+        if not self.auth_ready():
             return None
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
@@ -3119,8 +3247,12 @@ class AgentWorker(threading.Thread):
         echec_lancement = ""
         lignes = 0
         proc = None
+        #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
+        #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
+        stderr_debut = None
         try:
             with open(stderr_path, "ab") as stderr:
+                stderr_debut = stderr.tell()
                 try:
                     # Le moissonneur de l'exécuteur ne touche jamais un harnais,
                     # même pas pendant son lancement (voir `background`).
@@ -3388,6 +3520,32 @@ class AgentWorker(threading.Thread):
                 self.last_activity = time.monotonic()
                 if not self._power_texte:
                     self._host_not_ready(hote)
+                return False
+            # A relay failure cannot report global provider credential health
+            # or create a local credential block on a mediated device.
+            raison_auth = None if self.runner.mediated else auth_failure.classify(
+                error, self.last_final, auth_failure.stderr_tail(stderr_path, start=stderr_debut))
+            if raison_auth:
+                # L226b : le compte n'est plus authentifié — ni échec rapide ni
+                # relance en boucle : le compte est noté en échec, le tour
+                # suivant bascule vers un compte sain, sinon l'agent reste
+                # `auth_blocked` jusqu'au retour d'un compte sain.
+                self.fast_failure = False
+                nom_harnais = self.agent.get("harness") or ""
+                account = auth_failure.account_name(compte)
+                self._avec_reprise("santé du compte", auth_failure.report, self.db,
+                                   self.cfg.host, nom_harnais, account, "failing",
+                                   reason=raison_auth, source="turn")
+                if self._session_en_attente is not None:
+                    self._avec_reprise("session du tour", self._enregistre_session)
+                texte = auth_failure.status_text(nom_harnais, account)
+                self._avec_reprise(
+                    "fin de tour", registry.end_turn,
+                    self.db, self.name, self.runner.runner_id, self.epoch,
+                    status="blocked", status_text=texte,
+                    error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost)
+                self.last_activity = time.monotonic()
+                self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
             if session and adapters.child_session_refused(error):
                 # L166 : la session reprise était une session fille ; la

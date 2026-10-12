@@ -208,6 +208,17 @@ class BailEtPanneTest(MedieBase):
         agent = {"name": "inge-front", "harness": "dsh", "cwd": self.tmp, "status": "queued"}
         return AgentWorker(runner, agent, lease)
 
+    def test_provider_health_stays_on_the_relay_server(self):
+        worker = self._worker()
+        with mock.patch("ameesh.auth_failure.failing",
+                        side_effect=AssertionError("provider health read on device")):
+            self.assertTrue(worker.auth_ready())
+            self.assertTrue(worker._rotation_allowed())
+        self.assertNotIn("credentials.health", self.transport.ops())
+        with self.assertRaises(C.NotSupportedRemotely):
+            self.db.storage.credentials.report("anna-portable", "dsh", "", "failing",
+                                             source="turn")
+
     def test_bail_perdu_au_battement(self):
         worker = self._worker()
         self.responder.script["leases.renew"] = Fenced()

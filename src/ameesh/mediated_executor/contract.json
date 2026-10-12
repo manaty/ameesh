@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 310,
+  "interface_total": 313,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3688,6 +3688,7 @@
    "canon": "le canon n'est jamais lu ni écrit par l'appareil",
    "catalog": "catalogue : serveur seulement",
    "ci": "CI results (L161): mesh server only",
+   "credentials": "provider credential health: mesh server only",
    "decisions": "owner decision requests (L124): mesh server only",
    "ephemerals": "pas de création d'agent depuis l'appareil",
    "grants": "autorité (0012)",
@@ -3820,6 +3821,11 @@
     "set_failure_message",
     "set_message",
     "supersede"
+   ],
+   "credentials": [
+    "health",
+    "listing",
+    "report"
    ],
    "decisions": [
     "close",

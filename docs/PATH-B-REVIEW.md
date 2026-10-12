@@ -47,8 +47,10 @@ Host version polling and boot orphan review stay on classic hosts/server.
 The final main merge retains the optional `held=false` parameter of
 `work.move` and its open-decision-request check. Decision-source/prose reads,
 waiting-episode reads and host-history reads stay refused remotely; the
-310-operation interface is fully classified without increasing the 62
-admitted operations.
+313-operation interface is fully classified without increasing the 62
+admitted operations. Credential health operations from L226b also stay
+server-only: devices skip local provider health guards and do not report
+relay errors as global provider credential failures.
 
 ## Migrations
 
