@@ -707,10 +707,10 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
                            "encore rendu) : réessayez dans quelques secondes" % name)
     if not live and row.get("status") != "stopped":
         # #293: a runner keeps the lease of every agent it serves that is not
-        # stopped; none here means the runner is gone, and the queued
-        # instruction waits until it starts again
-        warn("no runner holds %s's lease on %s: the instruction waits until its runner "
-             "(ameesh-runner-agent@%s) starts again" % (name, row.get("host") or "?", name))
+        # stopped; none here means no runner serves it (gone, or holding back
+        # on battery or max_agents), and the queued instruction waits
+        warn("no runner holds %s's lease on %s: the instruction waits until a runner "
+             "serves it again" % (name, row.get("host") or "?"))
     decision = plan(cfg, db, row, fresh=fresh)
     for text in decision["warnings"]:
         warn(text)
