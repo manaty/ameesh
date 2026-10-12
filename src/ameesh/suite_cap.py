@@ -44,6 +44,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import platform
+from .platform.signals import CLEANUP_SIGNAL_LOCK
 
 #: the cap is checked at most this often (seconds)
 CAP_EVERY_S = 30.0
@@ -488,8 +489,9 @@ class SuiteCap:
         """SIGTERM to the suite and its descendants, each held by a handle."""
         gather(item.handles, table)
         for h in item.handles.values():
-            h.send(signal.SIGTERM)
-            h.send(signal.SIGCONT)  # a stopped process gets its SIGTERM
+            with CLEANUP_SIGNAL_LOCK:
+                h.send(signal.SIGTERM)
+                h.send(signal.SIGCONT)  # a stopped process gets its SIGTERM
 
     def _kill(self, item: Capped, table: list[dict]) -> None:
         """SIGKILL to what is left: the handles taken at SIGTERM time (a

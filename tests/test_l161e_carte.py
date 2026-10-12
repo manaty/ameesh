@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L161e — carte test → code mesurée.
 
-`scripts/carte.py` découpe le code en blocs à empreinte et fusionne les
+`scripts/map.py` découpe le code en blocs à empreinte et fusionne les
 mesures des parts (couverture par test, fichiers lus, tables touchées) en
-carte `ameesh-carte/1` ; `scripts/carte_mesure.py` relève les lectures dans
+carte `ameesh-carte/1` ; `scripts/map_measure.py` relève les lectures dans
 chaque processus ; `tests/support.py` relève les tables par classe ;
-`scripts/test-parts.py --carte` lit les durées de la carte.
+`scripts/test-parts.py --map` lit les durées de la carte.
 """
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ def _charger(nom: str, fichier: str):
     return module
 
 
-carte = _charger("carte_l161e", "carte.py")
-mesure = _charger("carte_mesure_l161e", "carte_mesure.py")
+carte = _charger("carte_l161e", "map.py")
+mesure = _charger("map_measure_l161e", "map_measure.py")
 parts = _charger("test_parts_l161e", "test-parts.py")
 
 SOURCE = textwrap.dedent('''\
@@ -69,7 +69,7 @@ SOURCE = textwrap.dedent('''\
 
 class BlocsTest(unittest.TestCase):
     def test_lignes_attribuees_au_bon_bloc(self):
-        infos, proprietaire = carte.blocs(SOURCE)
+        infos, proprietaire = carte.blocks(SOURCE)
         self.assertEqual(sorted(infos), ["<module>", "A", "A.m", "A.m#2", "f", "g"])
         self.assertEqual(proprietaire[7], "<module>")  # ligne def : exécutée à l'import
         self.assertEqual(proprietaire[8], "f")
@@ -82,40 +82,40 @@ class BlocsTest(unittest.TestCase):
         self.assertEqual(infos["f"]["lignes"], [8, 9])
 
     def test_empreinte_sans_numeros_de_ligne(self):
-        avant, _ = carte.blocs(SOURCE)
-        decale, _ = carte.blocs("# commentaire\n\n" + SOURCE)
+        avant, _ = carte.blocks(SOURCE)
+        decale, _ = carte.blocks("# commentaire\n\n" + SOURCE)
         self.assertEqual({k: v["empreinte"] for k, v in avant.items()},
                          {k: v["empreinte"] for k, v in decale.items()})
 
     def test_corps_change_seul_bloc_change(self):
-        avant, _ = carte.blocs(SOURCE)
-        apres, _ = carte.blocs(SOURCE.replace("return 2", "return 3"))
+        avant, _ = carte.blocks(SOURCE)
+        apres, _ = carte.blocks(SOURCE.replace("return 2", "return 3"))
         changes = sorted(k for k in avant if avant[k]["empreinte"] != apres[k]["empreinte"])
         self.assertEqual(changes, ["A.m#2"])
 
     def test_constante_change_le_module(self):
-        avant, _ = carte.blocs(SOURCE)
-        apres, _ = carte.blocs(SOURCE.replace("LIMITE = 3", "LIMITE = 4"))
+        avant, _ = carte.blocks(SOURCE)
+        apres, _ = carte.blocks(SOURCE.replace("LIMITE = 3", "LIMITE = 4"))
         changes = sorted(k for k in avant if avant[k]["empreinte"] != apres[k]["empreinte"])
         self.assertEqual(changes, ["<module>"])
 
     def test_ancetres(self):
-        self.assertEqual(carte._ancetres("A.B.f#2"), ["A.B", "A"])
-        self.assertEqual(carte._ancetres("f"), [])
+        self.assertEqual(carte._ancestors("A.B.f#2"), ["A.B", "A"])
+        self.assertEqual(carte._ancestors("f"), [])
 
 
 class OutilsTest(unittest.TestCase):
     def test_module_du_contexte(self):
-        self.assertEqual(carte.module_du_contexte("tests.test_x.Cl.test_y"), "test_x")
-        self.assertEqual(carte.module_du_contexte("tests.test_x"), "test_x")
-        self.assertEqual(carte.module_du_contexte("statique|tests.test_x.Cl"), "test_x")
-        self.assertIsNone(carte.module_du_contexte(""))
-        self.assertIsNone(carte.module_du_contexte("tests.support"))
+        self.assertEqual(carte.context_module("tests.test_x.Cl.test_y"), "test_x")
+        self.assertEqual(carte.context_module("tests.test_x"), "test_x")
+        self.assertEqual(carte.context_module("statique|tests.test_x.Cl"), "test_x")
+        self.assertIsNone(carte.context_module(""))
+        self.assertIsNone(carte.context_module("tests.support"))
 
     def test_chemin_relatif(self):
-        self.assertEqual(carte.chemin_relatif("/home/runner/work/a/a/src/ameesh/db.py"),
+        self.assertEqual(carte.relative_path("/home/runner/work/a/a/src/ameesh/db.py"),
                          "src/ameesh/db.py")
-        self.assertIsNone(carte.chemin_relatif("/usr/lib/python3/x.py"))
+        self.assertIsNone(carte.relative_path("/usr/lib/python3/x.py"))
 
     def test_tables_de_migration(self):
         sql = textwrap.dedent("""\
@@ -127,7 +127,7 @@ class OutilsTest(unittest.TestCase):
             grant select, insert on epsilon, zeta to ameesh_superviseur;
             update eta set x = 1;
             """)
-        self.assertEqual(carte.tables_de_migration(sql),
+        self.assertEqual(carte.migration_tables(sql),
                          ["alpha", "beta", "delta", "epsilon", "eta", "gamma", "zeta"])
 
     def test_tables_touchees(self):
@@ -149,11 +149,11 @@ class ReleveTest(unittest.TestCase):
             chemin = pathlib.Path(self.repo, nom)
             chemin.parent.mkdir(parents=True, exist_ok=True)
             chemin.write_text("x")
-        self.releve = mesure.Releve(self.dossier, repo=self.repo)
-        ancien = os.environ.get(mesure.ENV_CONTEXTE)
-        os.environ[mesure.ENV_CONTEXTE] = "tests.test_x.Cl.test_y"
-        self.addCleanup(lambda: os.environ.__setitem__(mesure.ENV_CONTEXTE, ancien)
-                        if ancien is not None else os.environ.pop(mesure.ENV_CONTEXTE, None))
+        self.releve = mesure.Logbook(self.dossier, repo=self.repo)
+        ancien = os.environ.get(mesure.ENV_MEASURE_CONTEXT)
+        os.environ[mesure.ENV_MEASURE_CONTEXT] = "tests.test_x.Cl.test_y"
+        self.addCleanup(lambda: os.environ.__setitem__(mesure.ENV_MEASURE_CONTEXT, ancien)
+                        if ancien is not None else os.environ.pop(mesure.ENV_MEASURE_CONTEXT, None))
 
     def faits(self) -> list[dict]:
         if not os.path.exists(self.releve.chemin):
@@ -181,7 +181,7 @@ class ReleveTest(unittest.TestCase):
         self.assertEqual(self.faits(), [])
 
     def test_sous_processus_sans_mesure(self):
-        env_complet = {"COVERAGE_PROCESS_START": "rc", mesure.ENV_CONTEXTE: "c"}
+        env_complet = {"COVERAGE_PROCESS_START": "rc", mesure.ENV_MEASURE_CONTEXT: "c"}
         self.releve.hook("subprocess.Popen", (None, [sys.executable, "-m", "ameesh.cli"],
                                               None, env_complet))
         self.releve.hook("subprocess.Popen", (None, ["git", "status"], None, {}))
@@ -208,8 +208,8 @@ class ReleveTest(unittest.TestCase):
         self.assertEqual(self.faits(), [])
 
     def test_ligne_pth_inerte_sans_mesure(self):
-        env = {k: v for k, v in os.environ.items() if k != mesure.ENV_DOSSIER}
-        sortie = subprocess.run([sys.executable, "-c", mesure.ligne_pth() +
+        env = {k: v for k, v in os.environ.items() if k != mesure.ENV_MEASURE_DIR}
+        sortie = subprocess.run([sys.executable, "-c", mesure.pth_line() +
                                  "import sys; print(hasattr(sys, '_ameesh_carte'))"],
                                 env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(sortie.stdout.strip(), "False", sortie.stderr)
@@ -239,7 +239,7 @@ class FusionTest(unittest.TestCase):
         precedente = {"modules": {
             "test_l1": {"echecs": [{"ts": "2026-10-01T00:00:00+00:00", "test": "vieux"}]},
             "test_l2": {"echecs": [{"ts": "2026-09-01T00:00:00+00:00", "test": "périmé"}]}}}
-        cls.c = carte.fusionner([str(part)], "abc", precedente, cls.maintenant,
+        cls.c = carte.merge([str(part)], "abc", precedente, cls.maintenant,
                                  table_durees={"psycopg": {"test_l1": 2.0}})
 
     def test_contenu(self):
@@ -264,18 +264,18 @@ class FusionTest(unittest.TestCase):
 
     def test_ecrire_lire_et_durees_pour_les_parts(self):
         chemin = self.dossier / "carte.json.gz"
-        carte.ecrire(self.c, str(chemin))
-        self.assertEqual(carte.lire(str(chemin))["commit"], "abc")
-        self.assertEqual(parts.durees_de_la_carte(chemin), {"psycopg": {"test_l1": 4.0}})
-        texte = carte.montrer(self.c, ["test_cluster", "table:agent_mailbox", "inconnu.txt"])
+        carte.write(self.c, str(chemin))
+        self.assertEqual(carte.read(str(chemin))["commit"], "abc")
+        self.assertEqual(parts.map_durations(chemin), {"psycopg": {"test_l1": 4.0}})
+        texte = carte.show(self.c, ["test_cluster", "table:agent_mailbox", "inconnu.txt"])
         self.assertIn("lit deploy/sql/role-superviseur.sql", texte)
         self.assertIn("table:agent_mailbox : test_l1", texte)
         self.assertIn("inconnu.txt : inconnu de la carte", texte)
         with gzip.open(chemin, "wt") as f:
             f.write('{"schema": "autre"}')
         with self.assertRaises(ValueError):
-            carte.lire(str(chemin))
-        self.assertEqual(parts.durees_de_la_carte(self.dossier / "absente.json.gz"), {})
+            carte.read(str(chemin))
+        self.assertEqual(parts.map_durations(self.dossier / "absente.json.gz"), {})
 
 
 def _mesure_possible() -> bool:
@@ -283,10 +283,10 @@ def _mesure_possible() -> bool:
         import coverage  # noqa: F401
     except ImportError:
         return False
-    return carte.pth_installe()
+    return carte.pth_installed()
 
 
-@unittest.skipUnless(_mesure_possible(), "coverage et scripts/carte.py installer requis")
+@unittest.skipUnless(_mesure_possible(), "coverage et scripts/map.py installer requis")
 class BoutEnBoutTest(unittest.TestCase):
     """Une part sous mesure, sous-processus compris (CLI lancée par le test)."""
 
@@ -296,17 +296,17 @@ class BoutEnBoutTest(unittest.TestCase):
         liste = pathlib.Path(dossier, "liste.txt")
         liste.write_text("test_bin_launchers\n")
         env = {k: v for k, v in os.environ.items()
-               if k not in (mesure.ENV_DOSSIER, mesure.ENV_CONTEXTE, "COVERAGE_PROCESS_START")}
+               if k not in (mesure.ENV_MEASURE_DIR, mesure.ENV_MEASURE_CONTEXT, "COVERAGE_PROCESS_START")}
         env.update(PYTHONPATH=str(REPO / "src"), AMEESH_REQUIRE_DB="0")
         m = os.path.join(dossier, "m")
         os.makedirs(m)
         sortie = subprocess.run(
-            [sys.executable, str(REPO / "scripts" / "test-parts.py"), "lancer", "--parts", "1",
-             "--part", "1", "--pilote", "psycopg", "--liste", str(liste), "--mesure", m,
-             "--durees-sortie", os.path.join(m, "durees.json")],
+            [sys.executable, str(REPO / "scripts" / "test-parts.py"), "run", "--parts", "1",
+             "--part", "1", "--driver", "psycopg", "--list", str(liste), "--measure", m,
+             "--output-durations", os.path.join(m, "durees.json")],
             env=env, capture_output=True, text=True, timeout=300)
         self.assertEqual(sortie.returncode, 0, sortie.stderr[-2000:])
-        c = carte.fusionner([m], "abc")
+        c = carte.merge([m], "abc")
         # ameesh.main n'est exécuté que dans les sous-processus des lanceurs
         self.assertEqual(c["blocs"]["src/ameesh/main.py"]["main"]["modules"],
                          ["test_bin_launchers"])

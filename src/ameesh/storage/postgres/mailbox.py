@@ -14,10 +14,11 @@ from .. import interface
 from .registry import canon_governed_sql
 
 #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
-#: gouverné par le canon, sinon son chantier (un paramètre : le nom de l'agent)
+#: gouverné par le canon, sinon son chantier, désormais `workstream` (un
+#: paramètre : le nom de l'agent)
 PROJECT_SQL = (
     "SELECT CASE WHEN " + canon_governed_sql("r")
-    + " AND coalesce(btrim(r.team), '') <> '' THEN btrim(r.team) ELSE r.chantier END"
+    + " AND coalesce(btrim(r.team), '') <> '' THEN btrim(r.team) ELSE r.workstream END"
     " FROM agent_registry r WHERE r.name = %s")
 
 MAIL_COLUMNS = """
@@ -78,8 +79,11 @@ PASSIVE_SQL = (
 class Mailbox(interface.Mailbox):
 
     def lock_recipient(self, recipient):
+        # L148 : `workstream` est le nom courant ; `chantier` reste émis, à la
+        # même valeur, pour les lecteurs qui ne sont pas encore renommés.
         rows = self.db.query(
-            "SELECT name, chantier FROM agent_registry WHERE name = %s FOR SHARE",
+            "SELECT name, workstream, workstream AS chantier"
+            " FROM agent_registry WHERE name = %s FOR SHARE",
             (recipient,))
         return rows[0] if rows else None
 

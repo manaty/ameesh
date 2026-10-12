@@ -57,11 +57,11 @@
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
-  ameesh plan add "what" --pour DATE [--projet P] [--lot N] [--source S] | list
+  ameesh plan add "what" --due DATE [--project P] [--lot N] [--source S] | list
         | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
         roadmap: dated commitments, proposals drawn from decisions,
         text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
-        task or a card: `ameesh work plan <id> --debut DATE --fin DATE --livraison DATE`;
+        task or a card: `ameesh work plan <id> --start DATE --end DATE --delivery DATE`;
   ameesh work estimates [--app P] [--json]
         L157: actual/estimated gaps of delivered work items (median, p80) by
         type and by estimate author; every work item carries an estimated
@@ -87,7 +87,7 @@
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
         mail; withdrawal by the requester; detail and proof (L124);
-  ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
+  ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);

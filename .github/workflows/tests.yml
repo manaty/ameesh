@@ -24,10 +24,10 @@
 # doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
 # fusion garde son verdict.
 #
-# L161b — chaque part écrit ses résultats au fil de l'eau (--flux, JSON lignes,
+# L161b — chaque part écrit ses résultats au fil de l'eau (--flow, JSON lignes,
 # un test par ligne, schéma ameesh-test-event/1), publiés en artefact
-# (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flux.py).
-# Les modules de test touchés par les fichiers changés (--depuis HEAD^1 : la
+# (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flow.py).
+# Les modules de test touchés par les fichiers changés (--since HEAD^1 : la
 # cible pour une PR, le commit précédent sur main) passent en premier dans
 # chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
 #
@@ -44,7 +44,7 @@
 # provisional green (P0 and P1 green in every part), kept as the `leaks`
 # artifact for the two-week review (L161i).
 #
-# L161c — pendant la part, `ci-flux.py publier` (arrière-plan) tient le check
+# L161c — pendant la part, `ci-flow.py publish` (arrière-plan) tient le check
 # run « tests (flux) <part> » de la tête poussée : chaque échec y entre dès
 # qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
 # lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
@@ -188,24 +188,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          nohup python3 scripts/ci-flux.py publier "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          nohup python3 scripts/ci-flow.py publish "$RUNNER_TEMP/flux.jsonl" --name "$FLUX_NOM"
           > "$RUNNER_TEMP/publier.log" 2>&1 &
       - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
         run: >-
-          .venv-ci/bin/python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
-          --part ${{ matrix.part }} --pilote psycopg --flux "$RUNNER_TEMP/flux.jsonl"
+          .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --driver psycopg --flow "$RUNNER_TEMP/flux.jsonl"
       - &fermer
         name: fin du check run du flux
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/ci-flux.py fermer "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          python3 scripts/ci-flow.py close "$RUNNER_TEMP/flux.jsonl" --name "$FLUX_NOM"
           cat "$RUNNER_TEMP/publier.log" 2>/dev/null || true
       - &resume
         name: résumé du flux
         if: always()
-        run: python scripts/ci-flux.py resume "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/ci-flow.py summary "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"
       - name: flux en artefact
         if: always()
         uses: actions/upload-artifact@v4
@@ -255,8 +255,8 @@ jobs:
       - *publier
       - name: part ${{ matrix.part }}
         run: >-
-          python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
-          --part ${{ matrix.part }} --pilote psql --flux "$RUNNER_TEMP/flux.jsonl"
+          python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --driver psql --flow "$RUNNER_TEMP/flux.jsonl"
       - *fermer
       - *resume
       - name: flux en artefact

@@ -933,6 +933,15 @@ class Nonces(Domain):
 # lots (`work_items`, `work_item_events`)
 # --------------------------------------------------------------------------
 
+class ReservationContention(RuntimeError):
+    """L122, #478 : le budget de réessais d'une réservation automatique est
+    épuisé — le prochain numéro libre n'a pas pu être réservé à temps sous la
+    contention. L'appelant (`ameesh.work`) la rend en `WorkError` lisible
+    (« reservation contention, retry »), jamais en DbError brute. Levée
+    seulement quand `number` est absent : un numéro explicite déjà pris garde
+    la DbError de l'index."""
+
+
 class WorkItems(Domain):
     """Lots et journal de leurs transitions (ledger de reprise)."""
 
@@ -1035,9 +1044,11 @@ class WorkItems(Domain):
         ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
         de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
         l'index unique : deux réservations simultanées ne prennent jamais le
-        même numéro. `note` peut citer `%(number)04d`. None si le lot n'est
-        plus ouvert ; DbError si `number` est pris par un autre lot.
-        `release` libère la réservation."""
+        même numéro ; la perdante réessaie avec une attente aléatoire croissante,
+        dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
+        si le lot n'est plus ouvert ; DbError si `number` est pris par un autre
+        lot ; `ReservationContention` si le budget du prochain libre est
+        épuisé. `release` libère la réservation."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
@@ -1280,9 +1291,12 @@ class WorkItems(Domain):
     def backlog_add(self, *, title: str, body: str, source: str, expected_value: str,
                     value_score: int, priority: int, team: str | None,
                     required_capabilities: list | None, package_id: str | None,
-                    package_parent: str | None, note: str, actor: str) -> dict:
+                    package_parent: str | None, note: str, actor: str,
+                    app: str = "") -> dict:
         """Crée un élément de la file : un lot `improvement` en `intake`, sans
-        assigné, et sa première ligne de journal ; rend le lot."""
+        assigné, et sa première ligne de journal ; rend le lot.
+
+        `app`: its project (L118c), empty when unknown."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int) -> list[dict]:

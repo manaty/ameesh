@@ -538,7 +538,7 @@ class ChatTest(_Base):
         for attendu in ("Tu es **chat-alice**, l'agent de conversation de **human:alice**",
                         "lance d'abord\n   `ameesh decisions`", "ameesh decide <id> <option>",
                         "--new-lot", "aucun geste en production ni irréversible",
-                        "tu ne modifies aucun dépôt", "ameesh chat --consigne",
+                        "tu ne modifies aucun dépôt", "ameesh chat --instruction",
                         "prends jamais la session d'un autre agent"):
             self.assertIn(attendu, text)
         self.assertNotIn("$human", text)

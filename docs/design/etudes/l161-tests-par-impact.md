@@ -407,7 +407,7 @@ test). In phase 2, it forces the full suite.
 
 ## The result stream
 
-`scripts/test-parts.py lancer --flux F.jsonl` writes one JSON line at the
+`scripts/test-parts.py run --flow F.jsonl` writes one JSON line at the
 end of each test (schema `ameesh-test-event/1`), plus one start line and one
 end line per part:
 
@@ -434,7 +434,7 @@ jest reporter and a vitest reporter write the same format.
 | **B. Direct push** to ameesh, authenticated by GitHub's OIDC token | ~1 s | an HTTPS endpoint on the VM that verifies the token (GitHub issuer, audience `ameesh`, repository, branch); no stored secret; this is building block A1 of the [self-repair](boucle-auto-reparation.md) study | once that endpoint exists |
 | **C. Self-hosted runner** that writes itself (`ameesh ci report`) | ~1 s | a Postgres role with insert-only rights on the results table; never the runner's role, since the PR's code runs on the CI runner | once the self-hosted fleet carries the suites |
 
-A background step of the job (`scripts/ci-flux.py publier`) follows the
+A background step of the job (`scripts/ci-flow.py publish`) follows the
 stream file and updates the "tests (flux)" check run; an `if: always()`
 step closes it with the summary. In a multi-job workflow, a job ending in
 failure is already a signal: polling forwards it without waiting for the
@@ -500,7 +500,7 @@ other jobs (2.5 to 10 min gained on Nexlink).
   the change, the classes and the matrices (read via `fromJSON` from the
   job's outputs). `plan.json` is passed to the parts as an artefact.
 * The **parts**: `needs: plan`, dynamic matrix, `--plan plan.json
-  --flux flux.jsonl`, check run publication. A job with no module is
+  --flow flux.jsonl`, check run publication. A job with no module is
   skipped by `if:`, since an empty matrix is not allowed.
 * The **`tests` aggregate**, the only required check, accepts `skipped`
   when the plan decided so. The check's name does not change, nor does
@@ -561,7 +561,7 @@ reserves its migration number at the start if it has one.
 | Lot | Content | Depends on | Duration | Proposed date |
 |---|---|---|---|---|
 | **L161a** — ameesh: PRs without code, main concurrency | minimal `plan` job (documentation only with its declared readers, version only, foundation); aggregate that accepts `skipped`; `test_version` and package build for a version PR; `cancel-in-progress` limited to PRs | — | 2 h | 2026-10-12 |
-| **L161b** — ameesh: stream and simple order | `--flux` (`ameesh-test-event/1`); order P0, P2 and "always" list; end of alphabetical order within a part; immediate retry; JUnit produced at the end | L161a | 3 h | 2026-10-12 |
+| **L161b** — ameesh: stream and simple order | `--flow` (`ameesh-test-event/1`); order P0, P2 and "always" list; end of alphabetical order within a part; immediate retry; JUnit produced at the end | L161a | 3 h | 2026-10-12 |
 | **L161c** — ameesh: real-time reporting | check run published during the tests; polling in `ameesh notify`; routing to the lot; messages per L125; inherited red; results table (migration); withdrawal on the next push; `ci_main_red`; `ameesh ci status`; prompts without `--watch` | L161b | 6 h | 2026-10-13 |
 | **L161d** — Nexlink without a map | Backend suite not run for a documentation-only push (on `develop`: verdict of the previous code commit, if the owner accepts); Windows and macOS desktop tests on pushes that touch `desktop/`; SQL: modified migration's test first | — | 4 h | 2026-10-12 |
 | **L161e** — ameesh: measured map | `carte.yml`: per-test coverage, subprocesses included; audit hook (files, directories); tables per class; block fingerprints; cache and artefact; durations kept up to date; overhead measurement | L161a | 6 h | 2026-10-14 |

@@ -114,9 +114,10 @@ It changes no code.
 
 | path                        | suggested                      | open PRs touching it   |
 |-----------------------------|--------------------------------|------------------------|
-| scripts/carte.py            | scripts/test_map.py            | —                      |
-| scripts/carte_mesure.py     | scripts/test_map_measure.py    | —                      |
-| scripts/ci-flux.py          | scripts/ci-flow.py             | —                      |
+| scripts/carte.py            | scripts/map.py (stage 2b)      | —                      |
+| scripts/carte_mesure.py     | scripts/map_measure.py (2b;    | —                      |
+|                             | old path kept as an alias)     |                        |
+| scripts/ci-flux.py          | scripts/ci-flow.py (stage 2b)  | —                      |
 | scripts/test-parallele.sh   | scripts/test-parallel.sh       | —                      |
 | deploy/mise-a-jour/         | deploy/update/                 | —                      |
 | .github/workflows/carte.yml | .github/workflows/test-map.yml | —                      |
@@ -309,7 +310,7 @@ docs outside `schema_migrations` rows.
 | --depend-de     | --depends-on                       | 4    | roadmap.py                | —                                                          |
 | --externe       | --external                         | 18   | mesh_cli.py (2)           | #194, #326, #412, #417, #420                               |
 | --fiche         | --card                             | 2    | roadmap.py                | —                                                          |
-| --organisation  | --organization                     | 2    | serve.py                  | —                                                          |
+| --organisation  | keep (British spelling, §5.4)      | 2    | serve.py                  | —                                                          |
 | --porteur       | --owner                            | 2    | roadmap.py                | —                                                          |
 | --pour          | --due                              | 14   | roadmap.py (2)            | —                                                          |
 | --projet        | --project                          | 4    | roadmap.py                | —                                                          |
@@ -369,7 +370,7 @@ collide with the module name or an English word, so a count would be meaningless
 | current                   | suggested              | comment                                                                                                                                    |
 |---------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | canon model field `fiche` | card                   | 6 dataclass fields in canon.py: Member, Agent, Host, Placement, WorkPackage, DecisionNote; the canon frontmatter itself has no `fiche` key |
-| `organisation`            | keep or `organization` | British spelling, also an OpenAPI field and --organisation; not French-only                                                                |
+| `organisation`            | keep (British spelling, §5.4) | British spelling, also an OpenAPI field and --organisation; not French-only                                                                |
 
 ### 2.7 Adjacent French identifiers: JSON/API keys and stored values
 
@@ -385,7 +386,7 @@ the most compatibility-sensitive part (the progress page and the v1 API read the
 | reprise                                                    | 5    | harness descriptor key (`reprise` argv) and runner thread meta                               |
 | debut                                                      | 5    | roadmap.py `real` object, plan_cli dest, tests                                               |
 | flux                                                       | 3    | scripts/test-parts.py result object, tests                                                   |
-| organisation                                               | 2    | serve.py /.well-known/ameesh and /api/v1/me                                                  |
+| organisation                                               | 2    | serve.py /.well-known/ameesh and /api/v1/me (kept, §5.4)                                     |
 | mesure                                                     | 2    | scripts/carte.py result object                                                               |
 | fil                                                        | 2    | fil.py thread trace meta                                                                     |
 | projet / liste / menage / jalons / fin / consigne / livree | 7    | scattered JSON keys and test fixtures                                                        |
@@ -505,7 +506,8 @@ stage 4.
 ### Stage 2 — CLI and free-file renames (3 PRs, no open-PR conflict)
 
 **2a — free CLI files.** `plan_cli.py` (`--debut/--fin/--livraison`), `roadmap.py`
-(`--pour`, `--projet`, `--porteur`, `--depend-de`, `--fiche`), `serve.py` (`--organisation`).
+(`--pour`, `--projet`, `--porteur`, `--depend-de`, `--fiche`). `serve.py` (`--organisation`) is
+out of this stage: decision §5.4 keeps the British spelling.
 Recipe: English option first, `dest=` stays the current attribute name during the transition,
 the French spelling gets its own hidden `DeprecatedAlias` argument (accepted, absent from
 `--help`, one line on stderr naming the canonical spelling):
@@ -525,10 +527,18 @@ English. A later PR swaps `dest` and the tests; the French strings leave in stag
 names (names in §2.1/§2.2/§2.5). Also update `.github/workflows/carte.yml`, `scripts/test.sh`,
 `tests/parts/*` and `scripts/version-level.py` expectations (it parses `add_parser` calls).
 Tests and CI call these scripts; do it in one PR so the workflow never sees a half-renamed tool.
+Done (2026-10-12, #147 stage 2b): `carte.py` → `map.py`, `carte_mesure.py` → `map_measure.py` (the
+old path stays as a compatibility alias for the `.pth` files installed before the rename; deleted
+at stage 7), `ci-flux.py` → `ci-flow.py`; `test-parts.py` keeps its already-English name, its 11
+functions, options and positionals are renamed. The plan's `test_map.py` / `test_map_measure.py`
+suggestions were a typo (the scripts are not tests). Dev-script options get **no** deprecated
+spelling: `scripts/version-level.py` reads only `src/ameesh/` (`SOURCES`), and every caller —
+workflows, `test-parallele.sh`, `test-plan.py`, tests, docs — is updated in the same PR.
 
 **2c — free-file function renames.** `identity.py` (`chantier_of` → `workstream_of`),
-`chat.py` (`consigne` → `instruction`), `plan_github.py` (`fiche_link` → `card_link`),
-`progress.py` (2 names), `roadmap_dev.py` (5 names), `storage/postgres/mailbox.py` (2 names).
+`chat.py` (`consigne` → `instruction`) and `watch.py` (same name), `plan_github.py`
+(`fiche_link` → `card_link`), `progress.py` (2 names), `roadmap_dev.py` (5 names).
+`storage/postgres/mailbox.py` (2 names) was already done in stage 1a (§1a, free files).
 Add aliases where the name is exported (`old = new`) and delete them in the cleanup PR.
 
 ### Stage 3 — database: `chantier` → `workstream` (2 migrations + 2 PRs)
@@ -542,9 +552,27 @@ Zero-downtime recipe, no applied migration touched:
    `alter table agent_registry add column if not exists workstream text not null default '';`
    backfill from `chantier`, then a `before insert or update` trigger keeping both columns in
    sync in both directions (last write wins on the pair). Old code keeps working unchanged.
+   **A (2026-10-12, #147)**: `src/ameesh/migrations/0410_rename_chantier_workstream.sql`
+   (number reserved by `ameesh work migration 147`) adds the column, backfills it, and
+   installs `agent_registry_workstream_sync`: whichever column is written is copied onto the
+   other, and the new name wins when one statement writes both differently. Tested by
+   `tests/test_l148_stage3_workstream.py` (both drivers).
 2. **PR B** — switch readers/writers to `workstream` in the free files first (`identity.py`,
    `projects.py`, `plan_github.py`, `stagnation.py`), and emit both `workstream` and `chantier`
    in the JSON listing (duplicate key, deprecated) so the progress page keeps working.
+   **B (2026-10-12, #147)**: the free reads of `storage/postgres/projects.py`,
+   `progress.py` and `mailbox.py` select `workstream` (plus `workstream AS chantier`, the
+   deprecated duplicate) and the project filter reads `workstream`; `decisions.py`'s
+   `register_chat` writes `workstream`. The free Python readers (`projects.agent_project`,
+   `progress.build_agent`, `decisions._project`, `plan_github.lot_project`) read `workstream`
+   then fall back to `chantier`, so a row that only carries the old key still works. The hot
+   writers/readers (`storage/postgres/registry.py`, `work.py`, `operations.py`,
+   `storage/interface.py`, `backend.py`, `fil.py`, `notify.py`, `alert_briefs.py`,
+   `exploitation.py`, `mesh_cli.py`, `reprise.py`, `runner.py`) still write and read
+   `chantier`, which the trigger mirrors; PR C switches them and drops the duplicate key.
+   Tested by
+   `tests/test_l148_stage3b_workstream_readers.py` (both drivers). `identity.py`'s
+   `chantier_of` was already renamed by stage 2c; `stagnation.py` reads no `chantier`.
 3. **PR C (later)** — switch the hot files when their PRs merge, stop emitting `chantier`, then
    **Migration D** drops the trigger and the `chantier` column after one release.
 

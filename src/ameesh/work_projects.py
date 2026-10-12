@@ -34,6 +34,19 @@ def creation_project(cfg, db, creator, explicit=None, *, parent=None):
     return inherited if explicit is None else ""
 
 
+def known_projects(cfg, db):
+    """#495: the projects an explicit project may name, as L243 knows them
+    (`github.projects`, lots' projects), plus the configured canons' work
+    package teams and agent projects."""
+    from . import canon_sync
+    names = set(canon_sync.known_projects(db, cfg))
+    for canon in work.configured_canons(cfg):
+        names.update(p.team for p in canon.packages if p.team)
+        for agent in canon.agents:
+            names.update(agent.effective_projects)
+    return {name.strip() for name in names if name and name.strip()}
+
+
 def mail_project(cfg, db, sender, recipient, explicit=None):
     """Explicit project, otherwise the sender's project, then the recipient's."""
     if explicit is not None:
