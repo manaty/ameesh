@@ -122,9 +122,33 @@ class MailProjectTests(_Base):
         event = work.events(self.db, lot["id"])[0]
         self.assertEqual((event["actor"], event["note"]), ("orch", "project 'old' → 'new'"))
 
+    def rejected_correction_identity(self, **identity_env):
+        lot = work.add(self.db, title="Unclassified")
+        events = work.events(self.db, lot["id"])
+        env = self.env(AMEESH_ALERT_ORCHESTRATORS="orch", **identity_env)
+        for command in (("set-app", str(lot["id"]), "p"),
+                        ("move", str(lot["id"]), "merged", "--correct", "wrong state")):
+            for actor in (None, "human:owner", "orch"):
+                with self.subTest(command=command[0], actor=actor):
+                    args = ("--actor", actor) if actor else ()
+                    proc = self.mesh("work", *command, *args, env=env)
+                    self.assertNotEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("correction refused: invalid session identity", proc.stderr)
+                    item = work.get(self.db, lot["id"])
+                    self.assertEqual((item["app"], item["state"]), ("", "intake"))
+                    self.assertEqual(work.events(self.db, lot["id"]), events)
+
+    def test_rejected_runner_cannot_correct_as_an_orchestrator(self):
+        self.rejected_correction_identity(AGENT_MAIL_NAME="orch",
+                                         AMEESH_RUNNER_ID="worker-runner",
+                                         AMEESH_LEASE_EPOCH="1")
+
+    def test_malformed_identity_cannot_correct_as_a_human(self):
+        self.rejected_correction_identity(AGENT_MAIL_NAME="!")
+
     def test_design_role_uses_existing_correction_guard(self):
         lot = work.add(self.db, title="Unclassified")
-        binding = SimpleNamespace(name="dev2")
+        binding = SimpleNamespace(name="dev2", ok=True, source="session")
         agent = SimpleNamespace(title="dev2", fiche=SimpleNamespace(data={"roles": ["design"]}))
         canon = SimpleNamespace(agents=[agent])
         with mock.patch("ameesh.identity.resolve_binding", return_value=binding), \
