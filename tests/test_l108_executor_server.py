@@ -292,6 +292,14 @@ class DoreTest(ServeurExecTest):
 
 
 class PorteeTest(ServeurExecTest):
+    def test_background_ownership_read_refuses_empty_admission(self):
+        token = "amx1." + "F" * 43
+        self.auth.add(token, Principal("executor", EXEC, "m", HOST,
+                                      agents_allowlist=(), expires_ts=FAR))
+        response = self.op("turn_resources.running_started_before", [HOST, FAR], token=token)
+        self.assertEqual(response.status, 403, response.body)
+        self.assertEqual(response.body["error"], "forbidden_scope")
+
     def test_background_ownership_read_scopes_before_pagination(self):
         self.agent("second", HOST, team="ingénieur")
         # Non-governed and wrong-host rows precede every visible row.

@@ -303,7 +303,7 @@ class HostScopeRules(ScopeRules):
         # Filter before LIMIT so hidden agents cannot truncate a visible page.
         agents = sorted(self.admitted_agents(principal))
         if not agents:
-            raise Immediate([])
+            raise ScopeError("forbidden_scope", "ownership registry has no admitted agents")
         limit = self._bound_limit(kw.get("limit"))
         rows = self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources"

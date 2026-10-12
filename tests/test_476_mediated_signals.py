@@ -39,6 +39,7 @@ class MediatedOwnershipTest(unittest.TestCase):
                 ("old-server", True, True, False),
                 ("registry", False, False, True),
                 ("registry", True, True, False),
+                ("empty-admission", False, True, False),
                 ("network", False, True, False)):
             with self.subTest(source=source, protected=protected):
                 self._cleanup(source, protected, orphan, killed)
@@ -56,6 +57,8 @@ class MediatedOwnershipTest(unittest.TestCase):
                         raise C.NotSupportedRemotely("old server")
                     if source == "network":
                         raise DbError("network unavailable")
+                    if source == "empty-admission":
+                        raise C.Forbidden("no admitted agents")
                     rows = ([{"id": 1, "turn_id": "foreign", "pgid": child.pid}]
                             if protected else [])
                     return C.OpResult(rows, 1.0)

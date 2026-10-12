@@ -72,6 +72,8 @@ l'hôte est forcé et une règle dédiée limite les lignes aux agents admis de
 l'exécuteur, avec la liste blanche d'invitation et les modes d'identifiants.
 Ce filtre précède la pagination (200 lignes au plus). Le Tracker utilise
 cette lecture pour protéger les processus migrés dans un autre tour vivant.
+Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
+qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
 l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
