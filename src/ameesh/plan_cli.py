@@ -24,6 +24,7 @@ import json
 import sys
 
 from . import plan_git, plan_github, work
+from .deprecated import DeprecatedAlias
 
 COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
             "plan", "estimates", "schedule", "measure")
@@ -88,8 +89,11 @@ def add_parsers(work_sub, func) -> None:
     p_plan.add_argument("--debut", "--start", dest="debut", default=None,
                         help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
     p_plan.add_argument("--fin", "--end", dest="fin", default=None, help="planned end")
-    p_plan.add_argument("--livraison", "--deploiement", "--delivery", dest="livraison",
+    p_plan.add_argument("--livraison", "--delivery", dest="livraison",
                         default=None, help="planned delivery or deployment")
+    p_plan.add_argument("--deploiement", dest="livraison", action=DeprecatedAlias,
+                        canonical="--delivery", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     p_plan.add_argument("--source", default=None,
                         help="where the date comes from (conversation, decision, message...); "
                              "also that of the estimate, failing --estimate-source")
