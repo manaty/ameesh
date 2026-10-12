@@ -218,6 +218,37 @@ class _FausseBase:
         return 1
 
 
+class _BaseTableManquante(_FausseBase):
+    """Une lecture optionnelle référence une table d'une migration absente :
+    psycopg rend l'échec en `SchemaMissing`, la sonde de schéma ayant répondu
+    oui (`_schema_ok`)."""
+
+    _schema_ok = True
+
+    def query(self, sql, params=()):
+        if "FROM optionnelle" in sql:
+            raise db_mod.SchemaMissing('relation "optionnelle" does not exist')
+        return super().query(sql, params)
+
+    def query_batch(self, items):
+        if any("FROM optionnelle" in sql for sql, _ in items):
+            raise db_mod.SchemaMissing('relation "optionnelle" does not exist')
+        return super().query_batch(items)
+
+
+class _BaseNonMigree(_FausseBase):
+    """La sonde elle-même échoue : la base n'est pas migrée, rien ne doit être
+    avalé par le préchargement."""
+
+    _schema_ok = False
+
+    def query(self, sql, params=()):
+        raise db_mod.SchemaMissing("agent-mesh schema missing: run \"ameesh migrate\"")
+
+    def query_batch(self, items):
+        raise db_mod.SchemaMissing("agent-mesh schema missing: run \"ameesh migrate\"")
+
+
 class TestLectureGroupee(unittest.TestCase):
     """`db.batched` : regroupement par niveaux, résultat d'une vraie exécution."""
 
@@ -249,6 +280,30 @@ class TestLectureGroupee(unittest.TestCase):
         avant, apres = db_mod.batched(base, lire_ecrire)
         self.assertEqual(base.ecrit, ["INSERT INTO c VALUES (1)"])  # une seule fois
         self.assertEqual((avant[0]["n"], apres[0]["n"]), (0, 1))
+
+    def test_lecture_optionnelle_absente_est_ecartee(self):
+        """L521 (échec CI psycopg) : une table optionnelle absente écarte sa
+        lecture, elle n'arrête pas la commande — la vraie passe la rend à
+        l'appelant, qui décide du repli (L160d)."""
+        base = _BaseTableManquante()
+
+        def lire(db):
+            try:
+                option = db.query("SELECT id FROM optionnelle")
+                return db.query("SELECT id FROM a"), option, None
+            except db_mod.DbError as exc:
+                return db.query("SELECT id FROM a"), [], str(exc)
+
+        ids, option, error = db_mod.batched(base, lire)
+        self.assertEqual(ids, [{"id": 1}, {"id": 2}])
+        self.assertEqual(option, [])
+        self.assertIn("optionnelle", error or "")
+
+    def test_base_non_migree_remonte(self):
+        """La sonde dit non : `SchemaMissing` n'est pas avalée."""
+        base = _BaseNonMigree()
+        with self.assertRaises(db_mod.SchemaMissing):
+            db_mod.batched(base, lambda db: db.query("SELECT id FROM a"))
 
     def test_lectures_pures(self):
         self.assertTrue(db_mod.pure_read("SELECT * FROM agent_registry WHERE updated_at > now()"))

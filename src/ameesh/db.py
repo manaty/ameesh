@@ -1491,6 +1491,30 @@ def prefetch(db, fn, *, levels: int = 4):
     return _Replay(db, _preload(db, fn, levels), owns=True)
 
 
+def _schema_migrated(db) -> bool:
+    """La sonde de schéma répond-elle oui ? Sert à distinguer une base non
+    migrée d'une lecture optionnelle qui manque une table (L521)."""
+    try:
+        require_schema(db)
+    except DbError:
+        return False
+    return True
+
+
+def _requery_faulty(db, items: list[tuple[str, tuple]]) -> list:
+    """Repli du préchargement, une requête à la fois : les fautives sont
+    écartées (`None`), une base injoignable remonte."""
+    results: list = []
+    for sql, params in items:
+        try:
+            results.append(db.query(sql, params))
+        except Unavailable:
+            raise
+        except DbError:
+            results.append(None)
+    return results
+
+
 def _preload(db, fn, levels: int) -> _Answers:
     answers = _Answers()
     for _level in range(levels):
@@ -1503,20 +1527,25 @@ def _preload(db, fn, levels: int) -> _Answers:
             break
         try:
             results = db.query_batch(recorder.misses)
-        except (SchemaMissing, Unavailable):
+        except Unavailable:
             raise
+        except SchemaMissing:
+            # `SchemaMissing` recouvre deux cas (L521) : la sonde dit que la
+            # base n'est pas migrée — à dire tout de suite —, ou une lecture
+            # optionnelle référence une table d'une migration absente. Le
+            # pilote psql rend la seconde en `DbError`, psycopg en
+            # `SchemaMissing` : sans cette distinction, `work show` échouait
+            # sous psycopg au lieu de rendre « resolutions: unavailable »
+            # (L160d). La lecture fautive est écartée ; la vraie passe la
+            # redemandera à l'appelant, qui sait quoi en faire.
+            if not _schema_migrated(db):
+                raise
+            results = _requery_faulty(db, recorder.misses)
         except DbError:
             # une requête de la passe à blanc est invalide (bâtie sur une
             # réponse vide) : le lot échoue en entier. Repli : une à une, les
             # fautives écartées — la vraie passe fera les bonnes.
-            results = []
-            for sql, params in recorder.misses:
-                try:
-                    results.append(db.query(sql, params))
-                except (SchemaMissing, Unavailable):
-                    raise
-                except DbError:
-                    results.append(None)
+            results = _requery_faulty(db, recorder.misses)
         for (sql, params), rows in zip(recorder.misses, results):
             if rows is None:
                 answers.refused.append((sql, params))
