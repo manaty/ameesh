@@ -153,18 +153,69 @@ class TransportTest(unittest.TestCase):
         reader.join(5)
         self.assertEqual([e.text for e in got[0]], ["kept"])
 
-    def test_symlinked_temporary_file_is_refused(self):
+    def test_planted_temporary_names_are_never_written_through(self):
+        """r2 P1: a symlink or a HARD LINK at a temporary name is only unlinked."""
         self.post(entry("old", 500), entry("kept", 1))
+        folder = os.path.dirname(self.path)
         outside = os.path.join(self.root, "outside")
         with open(outside, "w") as fh:
             fh.write("untouched")
-        os.symlink(outside, os.path.join(os.path.dirname(self.path), ".361.expire.tmp"))
+        os.symlink(outside, os.path.join(folder, ".361.expire.tmp"))
+        os.link(self.path, os.path.join(folder, ".361.expire.0123456789abcdef.tmp"))
         before = self.read_bytes()
-        with self.assertRaises(fil.ThreadError):
-            self.expire()
+        # the write fails: the thread must be exactly as before
+        with mock.patch.object(fil.os, "fsync", side_effect=OSError(28, "No space left")):
+            with self.assertRaises(OSError):
+                self.expire()
+        self.assertEqual(self.read_bytes(), before)
         with open(outside) as fh:
             self.assertEqual(fh.read(), "untouched")
-        self.assertEqual(self.read_bytes(), before)
+        self.assertEqual(sorted(os.listdir(folder)), ["361.md"])
+        self.assertEqual(self.expire()["dropped"], 1)
+        self.assertEqual([e.text for e in self.transport.read(THREAD)], ["kept"])
+
+    def test_unrecognised_heading_between_old_entries_is_never_deleted(self):
+        """r2 P1: a heading `_walk` does not recognise (date with a space) is
+        text we cannot date: it stays, with everything after it."""
+        ids = self.post(entry("old one", 500))
+        with open(self.path, "a") as fh:
+            fh.write("### 2026-09-20 12:00:00+00:00 — human:x → all\n\nnewer, by hand\n\n")
+        self.post(entry("old two", 450), entry("recent", 1))
+        report = self.expire()
+        self.assertEqual((report["dropped"], report["kept"]), (1, 2))
+        text = self.read_bytes().decode()
+        self.assertNotIn("old one", text)
+        self.assertIn("### 2026-09-20 12:00:00+00:00 — human:x → all\n\nnewer, by hand", text)
+        self.assertEqual([e.text for e in self.transport.read(THREAD)], ["old two", "recent"])
+        report = self.expire()  # nothing past the text, now ahead of every entry
+        self.assertEqual((report["dropped"], report["held"]),
+                         (0, "unrecognised text before the first entry"))
+        self.assertEqual([e.text for e in self.transport.read(THREAD, since=ids[0])],
+                         ["old two", "recent"])
+
+    def test_header_width_never_prevents_expiry_and_dry_run_touches_nothing(self):
+        """r2 P2: every thread size expires (no shift oscillation); a dry run
+        removes no file, even one at an old temporary name."""
+        for size in range(0, 700, 7):
+            with self.subTest(size=size):
+                root = tempfile.mkdtemp(dir=self.root)
+                transport = fil.FileTransport(root)
+                old, new = transport.post(THREAD, entry("x" * size, 500)), \
+                    transport.post(THREAD, entry("recent", 1))
+                folder = os.path.dirname(transport.location(THREAD))
+                with open(os.path.join(folder, ".361.expire.tmp"), "w") as fh:
+                    fh.write("someone else's")
+                listing = sorted(os.listdir(folder))
+                transport.expire(THREAD, NOW - YEAR, days=365, now=NOW, dry_run=True)
+                self.assertEqual(sorted(os.listdir(folder)), listing)
+                self.assertEqual(transport.expire(THREAD, NOW - YEAR, days=365,
+                                                  now=NOW)["dropped"], 1)
+                self.assertEqual([e.id for e in transport.read(THREAD)], [new])
+                self.assertEqual(transport.read(THREAD, since=old)[0].id, new)
+                # a second expiry over the note keeps ids too
+                later = transport.post(THREAD, entry("later", -400))
+                self.assertEqual(transport.expire(THREAD, NOW + 1, days=1, now=NOW)["dropped"], 1)
+                self.assertEqual([e.id for e in transport.read(THREAD)], [later])
 
     def test_failed_write_keeps_the_old_file_and_no_leftover(self):
         self.post(entry("old", 500), entry("kept", 1))
@@ -201,9 +252,14 @@ class TransportTest(unittest.TestCase):
         loaded = config_mod.load(env={"AMEESH_THREAD_RETENTION_DAYS": "30",
                                       "AMEESH_STATE": self.root})
         self.assertEqual(loaded.thread_retention_days, 30)
-        loaded = config_mod.load(env={"AMEESH_THREAD_RETENTION_DAYS": "-3",
+        # r2 P3: never truncated (0.5 would disable expiry), never negative
+        for raw in ("-3", "0.5", "1.9", "1e3", "²", "", "seven"):
+            loaded = config_mod.load(env={"AMEESH_THREAD_RETENTION_DAYS": raw,
+                                          "AMEESH_STATE": self.root})
+            self.assertEqual(loaded.thread_retention_days, 365, raw)
+        loaded = config_mod.load(env={"AMEESH_THREAD_RETENTION_DAYS": " 0 ",
                                       "AMEESH_STATE": self.root})
-        self.assertEqual(loaded.thread_retention_days, 365)
+        self.assertEqual(loaded.thread_retention_days, 0)
 
     def test_cli_dry_run_then_expire(self):
         self.post(entry("old", 500), entry("kept", 1))
@@ -270,6 +326,72 @@ class IndexAndOutboxTest(PgTestCase):
         transport = fil.transport_for(self.cfg)
         self.assertEqual(transport.read(fil.ThreadRef("acme", "10"))[0].id,
                          rows["10"]["last_entry_id"])
+
+    def index_row(self, lot):
+        rows = self.db.query("SELECT entries, last_excerpt, last_entry_id, last_mailbox_id"
+                             " FROM thread_index WHERE lot = %s", (lot,))
+        return rows[0] if rows else None
+
+    def test_indexing_after_expiry_neither_counts_nor_quotes_expired_entries(self):
+        """r2 P2: post, pause before indexing, expire, then index."""
+        transport = fil.transport_for(self.cfg)
+        thread = fil.ThreadRef("acme", "late")
+        old = entry("old secret", 500)
+        old_id = transport.post(thread, old)  # written, not yet indexed
+        self.assertEqual(fil.expire(self.cfg, self.db, now=NOW)[0]["dropped"], 1)
+        fil.index(self.db, self.cfg, transport, thread, old, old_id)
+        row = self.index_row("late")
+        self.assertEqual((row["entries"], row["last_excerpt"], row["last_entry_id"]),
+                         (0, "", None))
+        # an entry already in the thread when it expired is counted once
+        thread = fil.ThreadRef("acme", "inflight")
+        fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"], text="gone",
+                   ts=NOW - 500 * DAY, project="acme", lot="inflight")
+        fresh = entry("fresh", 1)
+        fresh.meta = {"ids": [41]}
+        fresh_id = transport.post(thread, fresh)
+        fil.expire(self.cfg, self.db, now=NOW)
+        fil.index(self.db, self.cfg, transport, thread, fresh, fresh_id, [41])
+        row = self.index_row("inflight")
+        self.assertEqual((row["entries"], row["last_excerpt"], row["last_entry_id"],
+                          row["last_mailbox_id"]), (1, "fresh", fresh_id, 41))
+        # and one written after the expiry, normally
+        fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"], text="next",
+                   ts=NOW, project="acme", lot="inflight")
+        self.assertEqual((self.index_row("inflight")["entries"],
+                          self.index_row("inflight")["last_excerpt"]), (2, "next"))
+
+    def test_expiry_waits_for_an_open_r12_drain_without_deadlock(self):
+        """The drain holds the index row through its transaction, then writes
+        the file: expiry takes the row first, then the file (same order)."""
+        fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"], text="old",
+                   ts=NOW - 500 * DAY, project="acme", lot="order")
+        fil.record(self.cfg, self.db, sender="alpha", recipients=["beta"], text="new",
+                   ts=NOW, project="acme", lot="order")
+        done, errors = threading.Event(), []
+
+        def expiry():
+            db = __import__("ameesh.db", fromlist=["connect"]).connect(self.cfg)
+            try:
+                errors.extend(r for r in fil.expire(self.cfg, db, now=NOW) if r.get("error"))
+            finally:
+                db.close()
+                done.set()
+
+        with self.db.transaction() as tx:
+            fil.record(self.cfg, tx, sender="alpha", recipients=["beta"], text="drained",
+                       ts=NOW, project="acme", lot="order")
+            worker = threading.Thread(target=expiry)
+            worker.start()
+            self.assertFalse(done.wait(0.5))  # waits on the row, not holding the file
+            fil.record(self.cfg, tx, sender="alpha", recipients=["beta"], text="drained 2",
+                       ts=NOW, project="acme", lot="order")
+        self.assertTrue(done.wait(20))
+        worker.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual([e.text for e in fil.transport_for(self.cfg).read(
+            fil.ThreadRef("acme", "order"))], ["new", "drained", "drained 2"])
+        self.assertEqual(self.index_row("order")["entries"], 3)
 
     def test_pending_r12_goes_only_past_thread_retention(self):
         log = C.Log(self.db, self.cfg, agent="worker", project="acme", lot="361")

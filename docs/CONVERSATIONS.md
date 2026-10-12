@@ -125,15 +125,21 @@ Shared threads keep **one year** of entries by default (0033 §9):
   it shortens. `ameesh fil expire [--days N] [--dry-run]` does the same by
   hand.
 * **What**: the oldest run of entries dated before the cut-off. The scan
-  stops at the first newer entry, or the first entry without a readable
-  date, so the file stays in append order; an R12 copy delivered late with
-  an old date leaves with its neighbours. Everything after the cut is kept
-  byte for byte, including a torn last entry.
+  stops at the first newer entry, the first entry without a readable date,
+  and the first text that is not a complete ameesh entry (a heading it does
+  not recognise, a hand-written note): text that cannot be dated is never
+  removed, nor anything after it. The file stays in append order; an R12
+  copy delivered late with an old date leaves with its neighbours.
+  Everything after the cut is kept byte for byte, including a torn last
+  entry. A thread whose header holds such text does not expire at all;
+  `fil expire` and the runner's log say so.
 * **How**: under the thread's exclusive lock, the kept part is written to a
-  new file in the same directory (never through a symbolic link), synced,
-  then renamed over the thread: a crash leaves the old file or the new one.
-  A writer or reader that locked the replaced file notices it no longer
-  carries the thread's name and reopens: no append is lost.
+  new file in the same directory, under an unpredictable name created
+  exclusively (never through a link; leftovers of an interrupted expiry are
+  only unlinked), synced, then renamed over the thread: a crash leaves the
+  old file or the new one. A writer or reader that locked the replaced file
+  notices it no longer carries the thread's name and reopens: no append is
+  lost.
 * **Ids**: entry ids (`<project>/<lot>#<offset>`) are logical offsets and do
   not change. The header holds the shift between logical and physical
   offsets, so `fil tail` cursors, `thread_index.last_entry_id`, mailbox
@@ -141,9 +147,13 @@ Shared threads keep **one year** of entries by default (0033 §9):
   entry. A cursor on an expired entry reads from the oldest kept one.
 * **Audit**: the header says, in plain text and in an `ameesh` comment,
   the cut-off date, the date of the last expiry and how many entries have
-  been removed in total. `thread_index.entries` loses the expired
-  entries; an emptied thread loses its last excerpt, which quoted an expired
-  entry.
+  been removed in total.
+* **Index**: expiry takes the thread's `thread_index` row lock before the
+  file lock, the order the R12 drain already uses, and indexing takes the
+  same row lock. The index then holds the number of entries kept and the
+  most recent one; an emptied thread quotes no entry. An entry expired
+  between its write and its indexing is neither counted nor quoted; one
+  already in the file when it expired is not counted twice.
 * **R12 outbox**: an undelivered copy older than thread retention is
   deleted by `Log.prune` (its thread entry would expire on arrival);
   younger ones still wait for delivery, past detail retention.

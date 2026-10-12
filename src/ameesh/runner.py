@@ -5700,8 +5700,9 @@ class Runner:
             log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
             return None
         for report in reports:
-            if report.get("error"):
-                log_async("thread expiry %s: %s" % (report["thread"], report["error"]))
+            if report.get("error") or report.get("held"):
+                log_async("thread expiry %s: %s" % (report["thread"],
+                                                     report.get("error") or report["held"]))
             if report["dropped"]:
                 log_async("thread %s: %d entr%s before %s %s, %d kept" % (
                     report["thread"], report["dropped"],

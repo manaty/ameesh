@@ -1797,8 +1797,8 @@ class Threads(Domain):
     @abc.abstractmethod
     def index(self, *, project: str, lot: str, transport: str, host: str, location: str,
               entry_id: str, mailbox_ids: Sequence[int], author: str, excerpt: str,
-              ts: float, trace: dict) -> None:
-        """Compte l'entrée dans l'index du fil et, si elle porte des messages
+              ts: float, trace: dict, count: bool = True) -> None:
+        """Compte l'entrée (sauf `count` faux) dans l'index du fil et, si elle porte des messages
         de la boîte, y note `trace` (id externe) — en une seule écriture."""
 
     @abc.abstractmethod
@@ -1806,11 +1806,18 @@ class Threads(Domain):
         """Fils indexés, du plus récemment écrit au plus ancien."""
 
     @abc.abstractmethod
+    def lock(self, *, project: str, lot: str, transport: str, host: str,
+             location: str) -> None:
+        """Verrouille la ligne du fil jusqu'à la fin de la transaction (créée
+        vide au besoin) : expiration et indexation d'un même fil passent l'une
+        après l'autre (L361)."""
+
+    @abc.abstractmethod
     def expired(self, *, project: str, lot: str, transport: str, host: str,
-                dropped: int, kept: int, before_ts: float) -> None:
-        """Après une expiration (L361) : `dropped` entrées de moins (un ajout
-        concurrent reste compté) ; fil vidé : sa dernière entrée, d'avant
-        `before_ts`, a expiré, son id et son extrait ne sont plus cités."""
+                kept: int, last: dict | None) -> None:
+        """Après une expiration (L361), sous `lock` : `kept` entrées restent ;
+        `last` (entry_id, mailbox_id, author, excerpt, ts) est la plus récente
+        gardée, None si le fil est vide (aucune entrée expirée n'est citée)."""
 
 
 # --------------------------------------------------------------------------

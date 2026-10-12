@@ -18,7 +18,8 @@ humans, including agent-to-agent exchanges (decision 0006).
 Retention (L361, 0033 §9): entries older than one year
 (`thread_retention_days`, 0 = never) are removed by `expire`, run daily by
 the runner's housekeeping and by `ameesh fil expire`. Only the oldest run
-of entries goes (the file stays in append order); the file is rewritten
+of complete ameesh entries goes (the file stays in append order; text that
+cannot be dated stops it, and stays); the file is rewritten
 whole under the thread's exclusive lock, then renamed over the old one. A
 writer or reader that locked the replaced file sees it is no longer the
 named one and reopens: no append is lost. Entry ids stay valid: they are
@@ -89,7 +90,16 @@ _REOPEN_MAX = 8
 
 _HEADING_RE = re.compile(r"^### (\S+) — (.+?) → (.*)$")
 _META_RE = re.compile(r"^<!-- ameesh (\{.*\}) -->$")
-_EXPIRED_B = re.compile(rb"^<!-- ameesh (\{\"expired\": .*\}) -->$", re.M)
+_EXPIRED_B = re.compile(rb"^<!-- ameesh (\{\"expired\": .*\}) *-->$", re.M)
+# la note d'expiration d'un en-tête, phrase lisible comprise, pour la remplacer
+_EXPIRY_BLOCK_B = re.compile(
+    rb"(?:^Entries before [^\n]*\n\n)?^<!-- ameesh \{\"expired\": [^\n]*-->\n(?:\n)?", re.M)
+#: largeur réservée au décalage dans la note : l'en-tête a la même longueur
+#: quel que soit le décalage qu'il porte (sinon point fixe parfois introuvable)
+_SHIFT_WIDTH = 24
+# dans l'en-tête d'un fil, un titre de section ou une barrière de code n'est
+# pas d'ameesh : du texte qu'on ne sait pas dater, l'expiration s'arrête
+_FOREIGN_B = re.compile(rb"^ {0,3}(?:#{2,6}[ \t]|`{3,}|~{3,})", re.M)
 _BACKTICKS_RE = re.compile(r"`+")
 # lecture d'un fil : sur les octets, pour sauter les corps sans les décoder
 _HEADING_B = re.compile(_HEADING_RE.pattern.encode("utf-8"), re.M)
@@ -404,14 +414,16 @@ def _expiry_of(head: bytes) -> tuple[int, dict]:
     return shift, note
 
 
-def _expiry_header(thread: ThreadRef, note: dict) -> bytes:
-    """L'en-tête d'un fil expiré : l'en-tête habituel, la date de coupure et
-    le nombre d'entrées retirées, lisibles, puis la note pour les outils."""
-    return (header(thread) + (
-        "Entries before %s have expired (retention of %d days): %d removed so far,"
-        " last expiry on %s.\n\n<!-- ameesh %s -->\n\n"
-        % (note["before"], note["days"], note["entries"], note["at"],
-           json.dumps({"expired": note}, ensure_ascii=False)))).encode("utf-8")
+def _expiry_block(note: dict) -> bytes:
+    """La note d'expiration de l'en-tête : la date de coupure et le nombre
+    d'entrées retirées, lisibles, puis la note pour les outils, complétée
+    d'espaces pour que sa longueur ne dépende pas du décalage."""
+    comment = json.dumps({"expired": note}, ensure_ascii=False)
+    width = len(json.dumps({"expired": dict(note, shift=0)}, ensure_ascii=False)) + _SHIFT_WIDTH
+    return ("Entries before %s have expired (retention of %d days): %d removed so far,"
+            " last expiry on %s.\n\n<!-- ameesh %s -->\n\n"
+            % (note["before"], note["days"], note["entries"], note["at"],
+               comment.ljust(width))).encode("utf-8")
 
 
 def _meta_of(line: str) -> dict | None:
@@ -769,79 +781,137 @@ class FileTransport:
             entries = [e for e in entries if int(e.id.rpartition("#")[2]) > start]
         return entries
 
+    def bounds(self, thread: ThreadRef) -> tuple[int, int] | None:
+        """Après une expiration : (première position logique gardée, fin
+        logique du fil à l'expiration) ; None si le fil n'a jamais expiré.
+
+        `index` s'en sert : une entrée d'avant la première gardée a expiré
+        avant d'être indexée ; une entrée d'avant la fin était déjà dans le fil
+        à l'expiration, l'index l'a déjà comptée.
+        """
+        try:
+            fd, _ = self._locked(thread, fcntl.LOCK_SH, write=False)
+        except FileNotFoundError:
+            return None
+        try:
+            note = _expiry_of(os.pread(fd, HEADER_SCAN, 0))[1]
+        finally:
+            os.close(fd)
+        kept, end = note.get("from"), note.get("end")
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (kept, end)):
+            return None
+        return kept, end
+
     def expire(self, thread: ThreadRef, before_ts: float, *, days: int,
                now: float | None = None, dry_run: bool = False) -> dict:
         """Retire du fil la plus longue suite d'entrées, depuis la première,
         écrites avant `before_ts` (L361).
 
-        S'arrête à la première entrée plus récente, ou sans date lisible : le
-        fil reste dans l'ordre d'ajout, et une entrée arrivée en retard avec
-        une date ancienne (file R12) part avec ses voisines. Le reste est
-        recopié à l'identique dans un fichier neuf du même dossier, synchronisé,
-        puis renommé sur l'ancien, le tout sous le verrou exclusif du fil :
-        un arrêt brutal laisse l'ancien fichier ou le nouveau, jamais un
-        mélange. Rend {"dropped", "kept", "shift"} ; un fil absent ou à jour
-        n'est pas touché.
+        S'arrête à la première entrée plus récente ou sans date lisible, et à
+        la première qui n'est pas une entrée d'ameesh complète (titre, bloc de
+        code fermé, commentaire `ameesh` facultatif, puis rien que des lignes
+        vides) : un texte qu'on ne sait pas dater n'est jamais retiré. Le fil
+        reste dans l'ordre d'ajout ; une entrée arrivée en retard avec une
+        date ancienne (file R12) part avec ses voisines. Le reste, en-tête
+        compris, est recopié à l'identique dans un fichier neuf du même
+        dossier (nom imprévisible, créé exclusivement), synchronisé, puis
+        renommé sur l'ancien, le tout sous le verrou exclusif du fil : un arrêt
+        brutal laisse l'ancien fichier ou le nouveau, jamais un mélange.
+        Rend {"dropped", "kept", "shift", "last"} (`last` : l'entrée gardée la
+        plus récente, pour l'index) ; un fil absent ou à jour n'est pas touché.
         """
-        report = {"thread": thread.key, "dropped": 0, "kept": 0, "shift": 0}
+        report = {"thread": thread.key, "dropped": 0, "kept": 0, "shift": 0, "last": None}
         try:
             fd, dir_fd = self._locked(thread, fcntl.LOCK_EX, write=False, keep_dir=True)
         except FileNotFoundError:
             return report
-        tmp = "." + thread.stem + ".expire.tmp"
+        tmp = None
         try:
             data = _pread_all(fd, os.fstat(fd).st_size)
             shift, note = _expiry_of(data[:HEADER_SCAN])
             found = _walk(data)[0]
-            dropped = 0
-            for start, heading, *_ in found:
+            dropped, cut = 0, found[0][0] if found else len(data)
+            if _FOREIGN_B.search(_EXPIRY_BLOCK_B.sub(b"", data[:cut])):
+                report.update(kept=len(found), shift=shift,
+                              held="unrecognised text before the first entry")
+                return report
+            for n, (start, heading, body, _loose, after, torn) in enumerate(found):
                 ts = _parse_iso(heading.group(1).decode("utf-8", "replace"))
-                if not 0 < ts < before_ts:
+                if not 0 < ts < before_ts or body is None or torn or after is None:
                     break
+                end = found[n + 1][0] if n + 1 < len(found) else len(data)
+                rest = after[0]
+                if _meta_of(data[after[0]:after[1]].decode("utf-8", "replace")) is not None:
+                    rest = after[1]
                 dropped += 1
-            report.update(kept=len(found) - dropped, shift=shift)
+                cut = end
+                foreign = data[rest:end]
+                if foreign.strip():
+                    # du texte hors entrée (titre non reconnu…) : on ne sait
+                    # pas le dater, il reste, et tout ce qui le suit
+                    cut = rest + len(foreign) - len(foreign.lstrip())
+                    break
+            kept = parse(data[cut:], base=cut + shift, key=thread.key)
+            report.update(kept=len(kept), shift=shift)
             if not dropped:
                 return report
-            cut = found[dropped][0] if dropped < len(found) else len(data)
             total = note.get("entries") if isinstance(note.get("entries"), int) else 0
             note = {"before": iso_local(before_ts),
                     "at": iso_local(time.time() if now is None else now),
-                    "days": int(days), "entries": total + dropped, "shift": 0}
+                    "days": int(days), "entries": total + dropped,
+                    "from": cut + shift, "end": len(data) + shift, "shift": 0}
+            # l'en-tête d'avant (première entrée exclue) reste, sa note remplacée
+            preamble = _EXPIRY_BLOCK_B.sub(b"", data[:found[0][0]])
+            if preamble and not preamble.endswith(b"\n\n"):
+                preamble = preamble.rstrip(b"\n") + b"\n\n"
             # l'id d'une entrée gardée ne change pas : sa position logique
-            # (cut + shift) devient la fin du nouvel en-tête plus le décalage,
-            # écrit dans cet en-tête (point fixe : sa largeur compte)
-            for _ in range(4):
-                head = _expiry_header(thread, note)
-                if len(head) + note["shift"] == cut + shift:
-                    break
-                note["shift"] = cut + shift - len(head)
-            else:
-                raise ThreadError("%s: expiry offset does not settle" % thread.key)
-            report.update(dropped=dropped, shift=note["shift"], before=note["before"])
+            # (cut + shift) devient la fin du nouvel en-tête plus le décalage ;
+            # la longueur de la note ne dépend pas du décalage
+            head_len = len(preamble) + len(_expiry_block(note))
+            note["shift"] = cut + shift - head_len
+            head = preamble + _expiry_block(note)
+            if len(head) != head_len:
+                raise ThreadError("%s: expiry note width changed, refused" % thread.key)
+            report.update(dropped=dropped, shift=note["shift"], before=note["before"],
+                          last=max(kept, key=lambda e: e.ts) if kept else None)
             if dry_run:
                 return report
-            out = _open_at(dir_fd, tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            self._sweep_temporaries(dir_fd, thread)
+            tmp = ".%s.expire.%s.tmp" % (thread.stem, os.urandom(8).hex())
+            out = _open_at(dir_fd, tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                            os.path.join(self.root, thread.project, tmp))
             try:
-                if not stat.S_ISREG(os.fstat(out).st_mode):
-                    raise ThreadError("%s: not a regular file, refused" % tmp)
-                os.fchmod(out, 0o600)
                 _write_all(out, head + data[cut:])
                 os.fsync(out)
             finally:
                 os.close(out)
             os.rename(tmp, thread.stem + ".md", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            tmp = None
             os.fsync(dir_fd)
             return report
         except BaseException:
-            try:
-                os.unlink(tmp, dir_fd=dir_fd)
-            except OSError:
-                pass
+            if tmp is not None:  # seulement le fichier que cet appel a créé
+                try:
+                    os.unlink(tmp, dir_fd=dir_fd)
+                except OSError:
+                    pass
             raise
         finally:
             os.close(fd)  # libère le verrou, après le renommage
             os.close(dir_fd)
+
+    @staticmethod
+    def _sweep_temporaries(dir_fd: int, thread: ThreadRef) -> None:
+        """Les restes d'une expiration interrompue (arrêt brutal) de ce fil :
+        retirer le NOM suffit (un lien n'est jamais suivi, ni sa cible touchée)."""
+        prefix, suffix = ".%s.expire." % thread.stem, ".tmp"
+        with os.scandir(dir_fd) as it:
+            names = [e.name for e in it if e.name.startswith(prefix) and e.name.endswith(suffix)]
+        for name in names:
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
 
     def threads(self) -> list[ThreadRef]:
         """Les fils présents sur disque (liens symboliques ignorés, jamais suivis)."""
@@ -976,25 +1046,46 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
 def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_id: str,
           mailbox_ids: Sequence[int] = ()) -> None:
     """Met à jour `thread_index` et note l'id externe dans `agent_mailbox.meta`
-    (une seule écriture : `storage.of(db).threads.index`)."""
+    (une seule écriture : `storage.of(db).threads.index`).
+
+    L361 : sous le verrou de la ligne du fil (`threads.lock`), que `expire`
+    prend aussi. Une entrée expirée entre son écriture et son indexation
+    n'est ni comptée ni citée ; une entrée déjà dans le fil quand il a expiré
+    a été comptée par l'expiration, elle n'est pas comptée deux fois.
+    """
     host = cfg.host if transport.name == "file" else ""
-    storage.of(db).threads.index(
-        project=thread.project, lot=thread.lot or "", transport=transport.name, host=host,
-        location=(transport.location(thread) if hasattr(transport, "location")
-                  else thread.key),
-        entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
-        excerpt=excerpt(entry.text), ts=float(entry.ts),
-        trace={"fil": {"transport": transport.name, "id": external_id, "host": host}})
+    key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
+               host=host, location=(transport.location(thread)
+                                    if hasattr(transport, "location") else thread.key))
+    with db.transaction() as tx:
+        threads = storage.of(tx).threads
+        threads.lock(**key)
+        bounds = transport.bounds(thread) if hasattr(transport, "bounds") else None
+        offset = _offset_of(external_id)
+        if bounds is not None and offset is not None and offset < bounds[0]:
+            return
+        threads.index(
+            **key, entry_id=external_id, mailbox_ids=mailbox_ids, author=entry.author,
+            excerpt=excerpt(entry.text), ts=float(entry.ts),
+            trace={"fil": {"transport": transport.name, "id": external_id, "host": host}},
+            count=not (bounds is not None and offset is not None and offset < bounds[1]))
+
+
+def _offset_of(entry_id: str) -> int | None:
+    offset = str(entry_id).rpartition("#")[2]
+    return int(offset) if offset.isascii() and offset.isdigit() else None
 
 
 def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None,
            dry_run: bool = False, transport: FileTransport | None = None) -> list[dict]:
     """Expiration de tous les fils de cet hôte (L361, 0033 §9).
 
-    `days` : `thread_retention_days` par défaut ; 0 = rien. L'index
-    (`thread_index.entries`) perd les entrées expirées ; un fil vidé y perd
-    son extrait, qui citait une entrée expirée. Un fil en erreur est
-    signalé dans son rapport (`error`), les autres expirent quand même.
+    `days` : `thread_retention_days` par défaut ; 0 = rien. Avec une base,
+    chaque fil expire sous le verrou de sa ligne d'index (pris AVANT le
+    verrou du fichier, dans le même ordre que l'écriture différée des fils
+    R12) ; l'index reprend alors le nombre d'entrées gardées et la plus
+    récente, et un fil vidé ne cite plus d'entrée expirée. Un fil en erreur
+    est signalé dans son rapport (`error`), les autres expirent quand même.
     """
     days = cfg.thread_retention_days if days is None else days
     if not isinstance(days, int) or isinstance(days, bool) or days < 0:
@@ -1003,27 +1094,44 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
         return []
     now = time.time() if now is None else float(now)
     transport = transport or transport_for(cfg)
+    host = cfg.host if transport.name == "file" else ""
     reports = []
     for thread in transport.threads():
+        run = lambda: transport.expire(thread, now - days * 86400, days=days, now=now,
+                                       dry_run=dry_run)
         try:
-            report = transport.expire(thread, now - days * 86400, days=days, now=now,
-                                      dry_run=dry_run)
+            if db is None or dry_run:
+                report = run()
+            else:
+                key = dict(project=thread.project, lot=thread.lot or "",
+                           transport=transport.name, host=host)
+                with db.transaction() as tx:
+                    threads = storage.of(tx).threads
+                    threads.lock(**key, location=transport.location(thread))
+                    report = run()
+                    if report["dropped"]:
+                        threads.expired(**key, kept=report["kept"],
+                                        last=_index_row(report["last"]))
         except (OSError, ThreadError) as exc:
             reports.append({"thread": thread.key, "dropped": 0,
                             "error": " ".join(str(exc).split())[:200]})
             continue
+        except Exception as exc:
+            from . import db as db_mod
+            reports.append({"thread": thread.key, "dropped": 0,
+                            "error": "thread index: %s" % db_mod.explain(exc, 200)})
+            continue
         reports.append(report)
-        if report["dropped"] and db is not None and not dry_run:
-            try:
-                storage.of(db).threads.expired(
-                    project=thread.project, lot=thread.lot or "", transport=transport.name,
-                    host=cfg.host if transport.name == "file" else "",
-                    dropped=report["dropped"], kept=report["kept"],
-                    before_ts=now - days * 86400)
-            except Exception as exc:
-                from . import db as db_mod
-                report["error"] = "index not updated: %s" % db_mod.explain(exc, 200)
     return reports
+
+
+def _index_row(entry: Entry | None) -> dict | None:
+    """La plus récente entrée gardée, telle que l'index la cite."""
+    if entry is None:
+        return None
+    ids = [i for i in entry.meta.get("ids") or () if isinstance(i, int) and not isinstance(i, bool)]
+    return {"entry_id": entry.id, "author": entry.author, "excerpt": excerpt(entry.text),
+            "ts": entry.ts, "mailbox_id": max(ids) if ids else None}
 
 
 def v0_recorded(cfg: Config) -> set[str]:
@@ -1164,6 +1272,8 @@ def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
         if report.get("error"):
             failed += 1
             print("%s: %s" % (report["thread"], report["error"]), file=sys.stderr)
+        if report.get("held"):
+            print("%s: not expired, %s" % (report["thread"], report["held"]), file=sys.stderr)
         if report["dropped"]:
             print("%s: %d entr%s %s before %s, %d kept" % (
                 report["thread"], report["dropped"], "y" if report["dropped"] == 1 else "ies",
