@@ -85,6 +85,65 @@ class PackagerTests(l231._Base):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(text)["items"][0]["status"], "linked")
 
+    def test_script_detection_uses_command_positions_and_preserves_links_for_arguments(self):
+        pkg = self.package()
+        root = Path(pkg).parent
+        l231._git(str(root), "init", "-q", "-b", "main")
+        deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+        target = os.readlink(os.path.join(pkg, "node_modules"))
+        for script in ("tsc --outDir pkg", "echo electron-builder", "echo npx pkg",
+                       "echo npm exec electron-builder", "node foo.js nexe",
+                       'echo ";" electron-builder', "npm pkg set version=1",
+                       "npx tsc --outDir pkg", "npm exec -- tsc --outDir pkg"):
+            with self.subTest(script=script):
+                Path(root, "package.json").write_text(json.dumps({"scripts": {"x": script}}))
+                self.assertEqual(deps._packagers(pkg), [])
+                self.assertEqual(deps.link_ready(pkg, self.cache), [])
+                self.assertEqual(os.readlink(os.path.join(pkg, "node_modules")), target)
+        for script in ("electron-builder --linux", "true && electron-builder",
+                       "true; electron-builder", "true | electron-builder",
+                       "true || electron-builder", "true\nelectron-builder",
+                       "npx --yes electron-builder@26", "npm exec -- electron-builder",
+                       "npm exec --yes --package electron-builder -- electron-builder",
+                       "MODE=release electron-builder", '"electron-builder" --linux'):
+            with self.subTest(script=script):
+                Path(root, "package.json").write_text(json.dumps({"scripts": {"x": script}}))
+                self.assertEqual(deps._packagers(pkg), ["electron-builder"])
+
+    def test_turn_start_removes_nested_legacy_link_despite_root_lockfile(self):
+        root = Path(self.package())
+        child = l231._package(str(root / "packages"))
+        l231._git(str(root), "init", "-q", "-b", "main")
+        deps.link_package(child, self.cache, installer=l231.FakeInstaller())
+        Path(child, "package.json").write_text(json.dumps(dict(l231.MANIFEST, build={})))
+        done = deps.link_ready(str(root), self.cache)
+        self.assertIn((child, "unlinked"), [(item["package"], item["status"]) for item in done])
+        self.assertFalse(os.path.lexists(os.path.join(child, "node_modules")))
+
+    def test_unlink_discovers_children_under_locked_and_unlocked_root_manifest(self):
+        for command, locked in (("unlink", False), ("local", True)):
+            with self.subTest(command=command, locked=locked):
+                root = l231._package(os.path.join(self.base, command))
+                good = l231._package(os.path.join(root, "packages"), name="good")
+                missing = l231._package(os.path.join(root, "packages"), name="missing")
+                for pkg in (root, good, missing):
+                    deps.link_package(pkg, self.cache, installer=l231.FakeInstaller())
+                Path(missing, deps.LOCKFILE).unlink()
+                if not locked:
+                    Path(root, deps.LOCKFILE).unlink()
+                installer = l231.FakeInstaller()
+                original = deps.make_local
+                with mock.patch.object(deps, "make_local", side_effect=lambda p: original(
+                        p, installer=installer)):
+                    code, output = self.cli(command, root, "--json")
+                self.assertEqual(code, 1)
+                items = {item["package"]: item["status"] for item in json.loads(output)["items"]}
+                self.assertEqual(items, {root: "local" if locked else "no-lockfile",
+                                         good: "local", missing: "no-lockfile"})
+                self.assertEqual(installer.calls, [root, good] if locked else [good])
+                self.assertTrue(Path(missing, "node_modules").is_symlink())
+                self.assertFalse(Path(good, "node_modules").is_symlink())
+
     def test_root_and_sibling_tooling_guard_the_app_without_their_own_lockfile(self):
         pkg = self.package()
         root = Path(pkg).parent

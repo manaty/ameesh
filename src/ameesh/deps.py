@@ -866,7 +866,10 @@ def link_ready(top: str, cache_root: str) -> list[dict]:
     if not root or is_review_worktree(top):
         return []
     out = []
-    for pkg in find_packages(root):
+    for pkg in _walk(root, SEARCH_DEPTH):
+        if not (os.path.isfile(os.path.join(pkg, LOCKFILE)) or
+                os.path.isfile(os.path.join(pkg, "package.json"))):
+            continue
         if is_review_worktree(pkg):
             continue
         if worktree_root(pkg) != root:      # another worktree nested in this one
@@ -1543,10 +1546,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command in ("local", "unlink"):
         items = []
         for top in paths:
-            packages = [os.path.abspath(top)] if os.path.isfile(
-                os.path.join(top, "package.json")) else [
-                    p for p in _walk(top, SEARCH_DEPTH)
-                    if os.path.isfile(os.path.join(p, "package.json"))]
+            packages = [p for p in _walk(top, SEARCH_DEPTH)
+                        if os.path.isfile(os.path.join(p, "package.json")) or
+                        os.path.isfile(os.path.join(p, LOCKFILE))]
             items += [make_local(p) for p in packages] if packages else [
                 dict(package=os.path.abspath(top), status="no-lockfile",
                      error="no package-lock.json found in this path")]

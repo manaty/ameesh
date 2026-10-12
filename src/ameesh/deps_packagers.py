@@ -15,6 +15,46 @@ BUILDER_CONFIGS = ("electron-builder.yml", "electron-builder.yaml",
 DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 
 
+def _script_commands(script):
+    """Command positions in simple shell pipelines and npm/npx invocations.
+
+    Keep quotes until after splitting: an echoed ';' is not a separator.
+    This is declaration detection, not an interpreter for shell programs.
+    """
+    lexer = shlex.shlex(script, posix=False, punctuation_chars=";&|()\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    segments = [[]]
+    for word in lexer:
+        if word and all(char in ";&|()\n" for char in word):
+            segments.append([])
+        else:
+            segments[-1].append(word)
+    for segment in segments:
+        words = [shlex.split(word)[0] if word[:1] in ("'", '"') else word
+                 for word in segment]
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)  # leading environment assignments
+        if not words:
+            continue
+        command = words.pop(0)
+        if command == "npm":
+            if not words or words.pop(0) not in ("exec", "x"):
+                continue
+        elif command != "npx":
+            yield command
+            continue
+        # npm exec/npx: flags precede the command, not arbitrary arguments.
+        while words and words[0].startswith("-"):
+            option = words.pop(0)
+            if option == "--":
+                break
+            if option in ("-p", "--package", "--cache", "--userconfig") and words:
+                words.pop(0)
+        if words:
+            yield words[0]
+
+
 def packagers(pkg_dir):
     """Read declarations and script commands, without running package code.
 
@@ -50,18 +90,12 @@ def packagers(pkg_dir):
     for script in scripts.values():
         if not isinstance(script, str):
             raise ValueError("package.json script must be a string")
-        lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        words = list(lexer)
-        for index, word in enumerate(words):
+        for word in _script_commands(script):
             command = word.rsplit("/.bin/", 1)[-1]
             if command.startswith("./"):
                 command = command[2:]
             if "@" in command[1:]:
                 command = command.rsplit("@", 1)[0]
-            # `npm pkg set` edits metadata; it is not the `pkg` packager.
-            if command == "pkg" and index and words[index - 1] == "npm":
-                continue
             command = COMMANDS.get(command, command)
             if command in PACKAGERS:
                 found.add(command)

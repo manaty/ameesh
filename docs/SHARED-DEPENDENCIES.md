@@ -99,7 +99,10 @@ A PATH is a worktree (its packages are found down to depth 3, never through
 `deps link` refuses packages declaring `electron-builder`, `electron-packager`,
 `@electron/packager`, `pkg`, `@yao-pkg/pkg`, `nexe` or `@vercel/ncc`, including npm
 dependency aliases. It also detects their command names in `package.json`
-scripts (`ncc` for `@vercel/ncc`). Electron-builder's `build` manifest key and
+scripts (`ncc` for `@vercel/ncc`), at command positions: the start of a command,
+after shell separators or through `npx` / `npm exec`. Arguments such as
+`tsc --outDir pkg` or `echo electron-builder` do not trigger detection.
+Electron-builder's `build` manifest key and
 `electron-builder.{yml,yaml,json,json5,js,cjs,ts}` files also trigger the guard,
 even when the tool is invoked externally through `npx`. Manifest configuration
 keys `pkg` and `nexe` are detected too. Within a git worktree, root and sibling
@@ -112,6 +115,7 @@ it does not make the link suitable for a release. Turn-start linking applies
 the same guard and removes existing shared-cache links in detected projects,
 without installing dependencies. Run `deps unlink` to install a local tree
 before building. Real local trees and links outside the shared cache are kept.
+The turn-start scan includes child packages even when the root has a lockfile.
 Scripts hidden in external JS or shell files without declarations or recognized
 configuration cannot be inferred.
 
@@ -128,7 +132,9 @@ peer dependencies and lifecycle scripts enabled. It reports the local
 installation, leaves the shared cache and other worktrees' links intact, and
 returns a failure if npm fails or a requested package has no lockfile, including
 mixed requests where other packages succeed. Missing lockfiles are reported
-before removing their links. A local tree already
+before removing their links. `unlink` and `local` discover the root and its
+child packages down to depth 3, even when the root has a manifest or lockfile.
+A local tree already
 present is kept; use `AMEESH_DEPS=off npm ci` to refresh it before a release.
 
 In a detected packaging project, the npm wrapper passes install commands to
