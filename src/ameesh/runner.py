@@ -4206,7 +4206,7 @@ class Runner:
         db = None
         try:
             db = db_mod.connect(self.cfg)
-            return resources_mod.collect(self.cfg, db)
+            return resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy())
         except Exception as exc:  # jamais fatal pour l'exécuteur
             log_async("resources: reading failed (%s)" % type(exc).__name__)
             return None

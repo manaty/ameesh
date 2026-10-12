@@ -84,7 +84,7 @@ from .process import (alive, ancestry, become_subreaper, boot_time,  # noqa: E40
                       command_line, environ, fd_path, holders, open_fd_count, process_table,
                       reap, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402
-from .host import (CGROUP_ROOT, btrfs_allocation, cgroup_cpu_seconds,  # noqa: E402
+from .host import (CGROUP_ROOT, btrfs_allocation, btrfs_fs_info, cgroup_cpu_seconds,  # noqa: E402
                    cgroup_memory_bytes, cpu_busy_seconds, load_average, memory, mount_of, parse_pressure,
                    power, pressure)
 
@@ -95,5 +95,5 @@ __all__ = [
     "ticks_to_epoch", "human_tty", "load_average", "memory", "mount_of", "power",
     "CGROUP_ROOT", "cgroup_cpu_seconds", "cgroup_memory_bytes", "cpu_busy_seconds",
     "parse_pressure", "pressure", "user_paths", "UserPaths",
-    "btrfs_allocation",
+    "btrfs_allocation", "btrfs_fs_info",
 ]
