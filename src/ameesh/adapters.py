@@ -81,6 +81,20 @@ HEAVY_NOTE = ("Heavy suites (full test suite, jest, SQL suites, build): run them
               "through `ameesh heavy -- <command>`; the host caps how many run at once, "
               "the command waits its turn then runs. Short, targeted tests do not "
               "need it.")
+#: L159b: heavy suites go to the lending VM when this host has one
+#: (`AMEESH_OFFLOAD_HOST` in the runner's environment)
+OFFLOAD_NOTE = ("Heavy test runs (full suite, e2e, Postgres suites, builds) go to %s: "
+                "`ameesh offload run [--profile P] -- <command>` (same output and exit "
+                "code; runs here if the VM refuses or is unreachable). Targeted tests "
+                "stay local.")
+
+
+def offload_note(env: Mapping[str, str] | None = None) -> str:
+    """The offload rule of a mail turn, empty when no VM is configured."""
+    host = (os.environ if env is None else env).get("AMEESH_OFFLOAD_HOST", "").strip()
+    return OFFLOAD_NOTE % host if host else ""
+
+
 #: rotation de session : résumé de reprise produit avant d'ouvrir une session
 #: neuve. Chaque contrainte y est attribuée à sa source (incident du
 #: 2026-10-10 : un « hold » propre à un lot, recopié sans source dans un

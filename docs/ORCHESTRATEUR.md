@@ -423,6 +423,15 @@ gardés ; à soi-même si le message nous était destiné), ou faire relancer
 l'agent par son responsable (`ameesh resume <agent>`), puis prévenir les
 expéditeurs du bon nom.
 
+## Heavy suites: `ameesh offload run` (L159b)
+
+When the runner has `AMEESH_OFFLOAD_HOST` (a lending VM), every mail turn
+reminds the agents: full suites, e2e, Postgres suites and builds run with
+`ameesh offload run [--profile P] -- <command>`, with the same output and
+exit code, and fall back to the workstation if the VM refuses. Targeted
+tests stay local. Without that variable, nothing changes. See
+[EXPLOITATION.md](EXPLOITATION.md#heavy-suites-on-a-lending-vm--ameesh-offload-l159b).
+
 ## Fichiers temporaires : `$TMPDIR`, jamais `/tmp` en dur
 
 Règle de l'orchestrateur et de chacun de ses agents, à rappeler dans tout
