@@ -416,4 +416,3 @@ class HttpTransport(ExecTransport):
     def health(self) -> dict:
         """`GET /health` (sans jeton) : version du contrat et heure du serveur."""
         return self.request("GET", self._path("health"), auth=False).body or {}
-

@@ -291,4 +291,3 @@ class RemoteStorage(SI.Storage):
 def supported(name: str) -> bool:
     """L'opération `domaine.méthode` passe-t-elle à distance ?"""
     return name in C.load().operations
-
