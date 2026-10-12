@@ -312,6 +312,17 @@ class WorkingCopyTest(_Repository):
 
 
 class IsolationPolicyTest(_Repository):
+    def test_doctor_survives_unreadable_canon_without_enabling_exception(self):
+        cfg = config_mod.Config(canon=os.path.join(self.tmp, "seed"), canon_ref="main", host="pc")
+        with mock.patch('ameesh.canon.load_configured', side_effect=OSError("PRIVATE_CANON_VALUE")), \
+                mock.patch.object(cli.db_mod, "connect", side_effect=db_mod.Unavailable("test offline")), \
+                mock.patch('sys.stdout', io.StringIO()) as out:
+            self.assertEqual(cli.cmd_doctor(cfg, notify_test=False), 1)
+        self.assertIn("UID isolation required", out.getvalue())
+        self.assertIn("approved canon unreadable; exception not verified", out.getvalue())
+        self.assertNotIn("shared-uid-accepted", out.getvalue())
+        self.assertNotIn("PRIVATE_CANON_VALUE", out.getvalue())
+
     def test_only_approved_host_setting_enables_exception_and_doctor_displays_it(self):
         seed = os.path.join(self.tmp, "seed")
         cfg = config_mod.Config(canon=seed, canon_ref="main", host="pc")
