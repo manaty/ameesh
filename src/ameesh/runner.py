@@ -4629,15 +4629,23 @@ class Runner:
     def is_critical(self, name: str, agent=None) -> bool:
         """L242b : agent critique, jamais en pause budget tant qu'un compte a
         de la marge — déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS`),
-        orchestrateur (`is_orchestrator`), conception (rôle `conception` ou
-        `design` au canon) ou auditeur (`is_auditor`)."""
+        orchestrateur (`AMEESH_ALERT_ORCHESTRATORS`, ou rôle au canon),
+        conception (rôle `conception` ou `design` au canon) ou auditeur
+        (`is_auditor`). Un rôle ne compte que dans le canon propriétaire de
+        l'agent : une fiche en conflit dans un autre canon ne le rend pas
+        critique (#324 r1)."""
         if name in (getattr(self.cfg, "critical_agents", None) or ()):
             return True
-        if self.is_orchestrator(name):
+        if name in getattr(self, "_orchestrators_declared", ()):
             return True
-        from . import sous_utilisation as su
-        if name in su.role_orchestrators(getattr(self, "_audit_canons", ()), DESIGN_ROLES):
-            return True
+        from . import auditor as auditor_mod, sous_utilisation as su
+        canons = getattr(self, "_audit_canons", ())
+        roles = su.ORCHESTRATOR_ROLES + DESIGN_ROLES
+        # le registre n'est lu que pour un nom candidat, comme `is_auditor`
+        if name in su.role_orchestrators(canons, roles):
+            row = agent if agent is not None else registry.get(self.db, name)
+            if row and auditor_mod.owned_card(row, canons, roles) is not None:
+                return True
         return self.is_auditor(name, agent)
 
     def audit_command(self, name: str, argv: list, agent=None, *,

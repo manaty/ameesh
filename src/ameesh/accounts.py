@@ -875,15 +875,18 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
 
     `critical` (L242b, agent critique : orchestrateur, conception, auditeur) :
     le choix est propre à l'agent — il n'écrit jamais le dernier choix
-    partagé et ne lève aucun forçage (un forçage au seuil ne le retient pas
-    s'il reste un compte) ; sans autre compte, le compte par défaut sert
-    au-delà de son plafond implicite de 50 % (jamais en overage, rythme et
-    `overage_cap` tenus), en dernier.
+    partagé (ni ligne initiale, ni bascule `config`) et ne lève aucun
+    forçage (un forçage au seuil ne le retient pas s'il reste un compte) ;
+    sans autre compte, le compte par défaut sert au-delà de son plafond
+    implicite de 50 % (jamais en overage ; rythme et `overage_cap` tenus,
+    même avec `paced=False`), en dernier.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
+    # L242b : un choix critique n'écrit jamais l'état partagé (#324 r1)
+    readonly = simulate or critical
     row = store.active(host, harness) or (
-        {"account": items[0].name, "forced": False} if simulate
+        {"account": items[0].name, "forced": False} if readonly
         else store.init_active(host, harness, items[0].name))
     names = [p.name for p in items]
     cache: dict[str, Evaluation] = {}
@@ -895,7 +898,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         return cache[profile.name]
 
     active_name = row.get("account")
-    if active_name not in names and simulate:
+    if active_name not in names and readonly:
         row = {"account": items[0].name, "forced": False}
         active_name = items[0].name
     if active_name not in names:
@@ -968,8 +971,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             if profile.default and profile.cap is None:
                 relaxed[profile.name] = evaluate(book, profile, items, now, environ,
                                                  record=False, critical=True)
-        ranked = rank(candidates, relaxed, now, paced=paced) or (
-            [] if paced else rank(candidates, relaxed, now, paced=False))
+        # le rythme tient ici même garde désactivée (#324 r1)
+        ranked = rank(candidates, relaxed, now)
         if ranked:
             beyond = True
             cache = relaxed

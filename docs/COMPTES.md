@@ -452,10 +452,13 @@ orchestrator and mesh-design were paused on budget.
 
 * it is declared in the host's `critical_agents` setting (list), or in
   `AMEESH_CRITICAL_AGENTS` (comma-separated);
-* it is an orchestrator for the runner (`AMEESH_ALERT_ORCHESTRATORS`, or a
-  canon Agent card with `roles: [orchestrateur]`);
+* it is declared as an orchestrator (`AMEESH_ALERT_ORCHESTRATORS`), or its
+  canon Agent card has the role `orchestrateur`;
 * its canon Agent card has the role `conception` or `design`;
 * it is an auditor (the `auditeur` agent, or the `auditeur` role).
+
+A role counts only on the card in the agent's own canon. A conflicting card
+with the same name in another canon never makes an agent critical.
 
 The canon does not give these roles today, so declare the orchestrators and
 the design agent on each host:
@@ -468,7 +471,10 @@ the design agent on each host:
 made for that agent alone:
 
 * it never writes the shared last choice (`account_active`), which is what
-  new sessions of the other agents use;
+  new sessions of the other agents use. This holds even when that row is
+  missing, or names an account removed from the configuration: the critical
+  agent starts from the first account for itself, and leaves the row and its
+  `config` switch to the next non-critical turn;
 * it never lifts a manual force. A forced account under its threshold
   applies to critical agents too. A forced account at its threshold does
   not hold them while another account has headroom; the force stays in
@@ -489,7 +495,8 @@ first two steps):
    The rules for this step:
    * it is for critical agents only, and comes last;
    * the account is never used in overage;
-   * its pace cap and `overage_cap` still hold;
+   * its pace cap and `overage_cap` still hold, even with the budget guard
+     disabled;
    * a `cap` written explicitly in the configuration still holds.
 
    As soon as another account has headroom again (for example after its

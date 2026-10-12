@@ -72,6 +72,19 @@ class PrimaireAuDelaDuPlafondTest(_Comptes):
         self.assertEqual((critique.switched["from"], critique.switched["to"]),
                          ("primaire", "secondaire"))
 
+    def test_rythme_tenu_garde_desactivee(self):
+        # #324 r1 : secondaire tenu par son plafond fixe, le primaire à 95 %
+        # (plafond de rythme 90 %) : pause, même avec paced=False
+        self.items = accounts.parse({"codex": [
+            {"name": "primaire"}, dict(self.secondaire, cap=0.9)]})["codex"]
+        self.jauge("primaire", 95)
+        self.jauge("secondaire", 96)
+        self.assertIsNone(self.choose(critical=True, paced=False).profile)
+        self.jauge("primaire", 60)
+        critique = self.choose(critical=True, paced=False)
+        self.assertEqual(critique.profile.name, "primaire")
+        self.assertIn("beyond its 50% cap", critique.why)
+
     def test_plafond_explicite_tenu(self):
         self.items = accounts.parse({"codex": [{"name": "primaire", "cap": 0.5},
                                                self.secondaire]})["codex"]
@@ -89,7 +102,7 @@ class ChoixParAgentTest(_Comptes):
         self.assertEqual(critique.profile.name, "secondaire")
         self.assertTrue(critique.per_agent)
         self.assertEqual(critique.switched["kind"], "agent")
-        self.assertEqual(self.shared()["account"], "primaire")
+        self.assertIsNone(self.shared())      # pas même la ligne initiale
         ordinaire = self.choose()
         self.assertEqual(ordinaire.profile.name, "secondaire")
         self.assertEqual(self.shared()["account"], "secondaire")
@@ -111,6 +124,29 @@ class ChoixParAgentTest(_Comptes):
         critique = self.choose(critical=True)
         self.assertTrue(critique.forced)
         self.assertEqual(critique.profile.name, "secondaire")
+
+    def test_aucune_ecriture_partagee(self):
+        # #324 r1 : ni ligne initiale, ni bascule `config` vers le primaire
+        # quand le compte partagé a disparu de la configuration
+        self.jauge("primaire", 10)
+        self.jauge("secondaire", 10)
+        self.assertEqual(self.choose(critical=True).profile.name, "secondaire")
+        self.assertIsNone(self.shared())
+        store = storage.of(self.db).accounts
+        store.init_active(self.cfg.host, "codex", "ancien")
+        accounts.force(self.db, self.cfg.host, "codex",
+                       self.items + accounts.parse({"codex": [dict(self.secondaire,
+                                                                   name="ancien")]})["codex"],
+                       "ancien", by="human:proprio")
+        avant = store.switches(self.cfg.host, "codex", 10)
+        critique = self.choose(critical=True)
+        self.assertEqual(critique.profile.name, "secondaire")
+        row = self.shared()
+        self.assertEqual((row["account"], row["forced"]), ("ancien", True))
+        self.assertEqual(store.switches(self.cfg.host, "codex", 10), avant)
+        # le tour ordinaire suivant fait la bascule `config`, comme avant
+        self.choose()
+        self.assertIn("config", [r.get("kind") for r in store.switches(self.cfg.host, "codex", 10)])
 
     def test_continuite(self):
         self.jauge("primaire", 10)
@@ -136,10 +172,9 @@ class ExecuteurTest(_L30Base):
             self.assertEqual(dernier["compte"]["CLAUDE_CONFIG_DIR"], comptes[1]["path"])
             self.assertIn("--resume", dernier["argv"])
             self.assertIn("claude-sess-1", dernier["argv"])
-            # le choix partagé n'a pas bougé : aucune bascule en base
+            # le choix partagé n'est pas écrit : aucune bascule en base
             self.assertEqual(self._bascules(), [])
-            row = storage.of(self.db).accounts.active(self.cfg.host, "claude")
-            self.assertEqual(row["account"], "primaire")
+            self.assertIsNone(storage.of(self.db).accounts.active(self.cfg.host, "claude"))
             self.assertIn("for this critical agent only", self._fil())
             self.assertEqual(registry.get(self.db, "orch")["session_account"], "secondaire")
         finally:
@@ -157,30 +192,63 @@ class _Worker:
         self.notes.append((text, meta))
 
 
+class _Canon:
+    """Canon minimal : `name` possède les agents `owned`, ses fiches portent
+    les rôles donnés."""
+
+    readable = True
+
+    def __init__(self, name, cards, owned=()):
+        self.name, self.owned = name, set(owned)
+        self.agents = [types.SimpleNamespace(
+            title=agent, fiche=types.SimpleNamespace(data={"roles": roles}))
+            for agent, roles in cards.items()]
+
+    def owns(self, row_canon):
+        return row_canon == self.name
+
+    def agent(self, name):
+        return next((a for a in self.agents if a.title == name), None)
+
+
 class IdentiteTest(unittest.TestCase):
-    def fake_runner(self, **kw):
-        fake = types.SimpleNamespace(
+    def fake(self, canons=(), rows=None, **kw):
+        rows = rows or {}
+        return types.SimpleNamespace(
             cfg=types.SimpleNamespace(critical_agents=kw.get("declared", ())),
-            _audit_canons=(), is_orchestrator=lambda n: n in kw.get("orchestras", ()),
-            is_auditor=lambda n, a=None: n == "auditeur")
-        return lambda name: runner.Runner.is_critical(fake, name)
+            db=None, _audit_canons=tuple(canons),
+            _orchestrators_declared=frozenset(kw.get("orchestras", ())),
+            is_auditor=lambda n, a=None: n == "auditeur"), rows
+
+    def critical(self, fake, name):
+        fake, rows = fake
+        with mock.patch("ameesh.registry.get", lambda db, n: rows.get(n)):
+            return runner.Runner.is_critical(fake, name)
 
     def test_qui_est_critique(self):
-        is_critical = self.fake_runner(declared=("mesh-design",), orchestras=("orchestrateur",))
-        self.assertTrue(is_critical("mesh-design"))
-        self.assertTrue(is_critical("orchestrateur"))
-        self.assertTrue(is_critical("auditeur"))
-        self.assertFalse(is_critical("dev7"))
+        fake = self.fake(declared=("mesh-design",), orchestras=("orchestrateur",))
+        self.assertTrue(self.critical(fake, "mesh-design"))
+        self.assertTrue(self.critical(fake, "orchestrateur"))
+        self.assertTrue(self.critical(fake, "auditeur"))
+        self.assertFalse(self.critical(fake, "dev7"))
 
-    def test_role_de_conception_au_canon(self):
-        fake = types.SimpleNamespace(
-            cfg=types.SimpleNamespace(critical_agents=()), _audit_canons=("canon",),
-            is_orchestrator=lambda n: False, is_auditor=lambda n, a=None: False)
-        with mock.patch("ameesh.sous_utilisation.role_orchestrators",
-                        lambda canons, roles: {"mesh-design"} if roles == runner.DESIGN_ROLES
-                        else set()):
-            self.assertTrue(runner.Runner.is_critical(fake, "mesh-design"))
-            self.assertFalse(runner.Runner.is_critical(fake, "dev7"))
+    def test_role_au_canon_proprietaire_seulement(self):
+        a = _Canon("A", {"mesh-design": ["design"], "orch": ["orchestrateur"], "dev": ["dev"]})
+        b = _Canon("B", {"dev": ["design"], "dev2": ["orchestrateur"]})
+        rows = {"mesh-design": {"name": "mesh-design", "canon": "A"},
+                "orch": {"name": "orch", "canon": "A"},
+                "dev": {"name": "dev", "canon": "A"},
+                "dev2": {"name": "dev2", "canon": "A"}}
+        fake = self.fake((a, b), rows)
+        self.assertTrue(self.critical(fake, "mesh-design"))
+        self.assertTrue(self.critical(fake, "orch"))
+        # #324 r1 : une fiche en conflit dans un autre canon ne compte pas
+        self.assertFalse(self.critical(fake, "dev"))
+        self.assertFalse(self.critical(fake, "dev2"))
+        # la ligne fraîche du worker évite la lecture du registre
+        fake[0].db = object()
+        with mock.patch("ameesh.registry.get", side_effect=AssertionError):
+            self.assertTrue(runner.Runner.is_critical(fake[0], "orch", rows["orch"]))
 
     def test_worker(self):
         self.assertTrue(account_turn.is_critical(_Worker(True)))
