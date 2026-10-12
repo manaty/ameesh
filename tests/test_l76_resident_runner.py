@@ -355,6 +355,24 @@ class ResidentRunnerTest(PgTestCase):
         self.assertTrue(_group_gone(rp.pgid))
         self.assertEqual(len(self._starts()), 1)  # the relayed turn ran on its own
 
+    def test_a_mediated_executor_never_keeps_a_resident(self):
+        # codex r8: whatever the relay (Claude is not relayed), the session
+        # token and the lease's environment never outlive a mediated turn
+        from ameesh import relay as relay_mod
+        runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self.assertIsNotNone(rp)
+        runner.mediated = True
+        self.assertIn("mediated", worker._resident_refusal(self.adapter, False))
+        with mock.patch.object(relay_mod, "apply_turn_env", return_value=False), \
+                mock.patch.object(worker, "_mediated_env"), \
+                mock.patch.object(worker, "_resolve_workdir", return_value=worker.agent["cwd"]):
+            self._turn(worker, "mediated")      # the fake speaks resident only
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertEqual(len(self._starts()), 1)
+
     def test_refusals(self):
         runner, worker = self._worker()
         self.assertEqual(worker._resident_refusal(self.adapter, False), "")

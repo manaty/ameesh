@@ -3299,6 +3299,10 @@ class AgentWorker(threading.Thread):
             return "resident=off"
         if self.runner.once:
             return "one turn only (--once)"
+        if getattr(self.runner, "mediated", False):
+            # L109 : le jeton de session et l'environnement du bail d'un
+            # exécuteur médié ne survivent jamais au tour (codex r8, #417)
+            return "mediated executor (lease-bound session token)"
         if self.runner.is_auditor(self.name, self.agent):
             return "auditor (its turns keep their own bounds)"
         if time.monotonic() < self._resident_refused_until:
