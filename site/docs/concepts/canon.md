@@ -140,6 +140,15 @@ working: it is a list of one. See
   process every canon (one block each; `{"canons": [...]}` in JSON);
   `--canon <id>` selects one. `ameesh agent spawn` refuses a name declared by
   any canon.
+- **Default names (L243, #468).** `extensions.ameesh.naming` in
+  `federation.yaml` (`org`, `projects`, `roles`) yields the new-agent name
+  `<org>-<repo>-<role>-<seq>`, or `<org>-<role>-<seq>` for a multi-project
+  agent. `ameesh agent name --role R --project P …` prints the next free one
+  (cards of every canon and every registry row, stopped agents included, are
+  reserved); `ameesh agent spawn` without a name uses the same generator.
+  `canon check` warns (`agent-name-convention`) on a card whose title starts
+  with the org prefix but does not follow the convention, only when the canon
+  declares `naming:` (existing names are left to #423).
 
 Constraints: every host that shares a database must have the **same default
 canon**; do not reorder the canons and upgrade in the same step; removing a

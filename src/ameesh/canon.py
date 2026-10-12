@@ -124,6 +124,15 @@ INFO = "info"
 #: ameesh à un ou plusieurs dossiers du bundle : `ameesh: {scope: ameesh}`
 SCOPE_KEY = "ameesh"
 SCOPE_FIELDS = ("scope", "projects")
+#: L243 (#468) : clé du nommage par défaut des nouveaux agents, admise au
+#: PREMIER niveau de `extensions.ameesh` seulement — le canon, c'est
+#: l'organisation ; l'entrée d'un membre n'a pas de nommage propre.
+NAMING_KEY = "naming"
+#: L243 (#468) : un segment de nom est en minuscules, 2 à 6 caractères.
+NAMING_SEGMENT_RE = re.compile(r"^[a-z0-9]{2,6}$")
+#: L243 (#468) : le numéro de séquence, deux chiffres puis trois après 99.
+NAMING_SEQ_RE = re.compile(r"^[0-9]{2,}$")
+NAMING_FIELDS = ("org", "projects", "roles")
 
 
 class CanonError(ValueError):
@@ -1040,6 +1049,9 @@ class Canon:
     scope_unread: set = field(default_factory=set)
     #: fiches du profil ignorées hors du périmètre, par membre (information)
     out_of_scope: dict = field(default_factory=dict)
+    #: L243 (#468) : nommage par défaut des nouveaux agents
+    #: (`extensions.ameesh.naming`) ; None = aucune convention déclarée.
+    naming: "Naming | None" = None
 
     # -- accès ---------------------------------------------------------------
     @property
@@ -1178,7 +1190,8 @@ class Canon:
                               status=w.status, **fiche(w.fiche))
                          for w in self.packages],
             "federation": {"id": (self.federation or {}).get("id"),
-                           "roles": self.roles, "review_policies": self.review_policies},
+                           "roles": self.roles, "review_policies": self.review_policies,
+                           "naming": self.naming.to_dict() if self.naming else None},
             # L43 (0031) : périmètre ameesh par membre, fiches ignorées hors périmètre
             "ameesh_scope": {member: list(dirs) for member, dirs in sorted(self.scopes.items())},
             "ameesh_scope_unread": sorted(self.scope_unread),
@@ -1570,6 +1583,152 @@ def in_scope(relpath: str, scope: Iterable[str] | None) -> bool:
     return any(s == "" or rel == s or rel.startswith(s + "/") for s in scope)
 
 
+class NamingError(ValueError):
+    """Nom par défaut impossible : configuration absente, rôle ou projet sans
+    segment, ou forme demandée incohérente (L243, #468)."""
+
+
+@dataclass(frozen=True)
+class Naming:
+    """L243 (#468) : segments du nom par défaut `<org>-<repo>-<role>-<seq>`.
+
+    `org` : segment de l'organisation ; `projects` : nom de projet/dépôt →
+    segment (un projet absent est réduit à ses 6 premiers caractères) ;
+    `roles` : rôle → segment (un rôle absent est REFUSÉ : un nom ne se
+    devine pas). Les segments sont en minuscules `[a-z0-9]{2,6}`."""
+
+    org: str
+    projects: dict = field(default_factory=dict)
+    roles: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {"org": self.org, "projects": dict(self.projects),
+                "roles": dict(self.roles)}
+
+    def project_segment(self, project: str) -> str:
+        """Segment d'un projet : le nom court déclaré, sinon le nom tronqué à 6.
+
+        Une troncature qui rejoindrait le nom court d'un AUTRE dépôt est
+        refusée (deux dépôts ne partagent jamais un segment), avec la clé
+        `naming.projects.<dépôt>` à déclarer."""
+        declared = self.projects.get(project)
+        if declared:
+            return declared
+        short = str(project)[:6]
+        if not NAMING_SEGMENT_RE.match(short):
+            raise NamingError(
+                "project %r has no usable short name (%r): declare "
+                "naming.projects.%s in the federation" % (project, short, project))
+        clash = sorted(key for key, segment in self.projects.items()
+                       if segment == short and key != project)
+        if clash:
+            raise NamingError(
+                "project %r: the 6-character name %r is already the short name of %s: "
+                "declare naming.projects.%s in the federation"
+                % (project, short, ", ".join(clash), project))
+        return short
+
+    def role_segment(self, role: str) -> str:
+        declared = self.roles.get(role)
+        if not declared:
+            known = ", ".join(sorted(self.roles)) or "none"
+            raise NamingError(
+                "role %r has no short name in naming.roles (known: %s)" % (role, known))
+        return declared
+
+    def prefix(self, role: str, projects: Iterable[str]) -> str:
+        """Préfixe du nom : `<org>-<repo>-<role>-` (un projet) ou
+        `<org>-<role>-` (plusieurs : le segment de dépôt disparaît)."""
+        projects = list(projects)
+        if not projects:
+            raise NamingError("at least one project is required to name an agent")
+        if len(set(projects)) != len(projects):
+            raise NamingError("duplicate project in the name request: %s"
+                              % ", ".join(projects))
+        parts = [self.org]
+        if len(projects) == 1:
+            parts.append(self.project_segment(projects[0]))
+        parts.append(self.role_segment(role))
+        return "-".join(parts) + "-"
+
+    def next_name(self, role: str, projects: Iterable[str], taken: Iterable[str]) -> str:
+        """Premier numéro libre pour ce préfixe, sur deux chiffres (`01`).
+
+        `taken` : tous les noms déjà pris (fiches, registre — agents arrêtés
+        compris — et alias de #423) : un numéro déjà attribué n'est jamais
+        réutilisé tant que le nom reste réservé."""
+        prefix = self.prefix(role, projects)
+        used = set()
+        for name in taken:
+            if not isinstance(name, str) or not name.startswith(prefix):
+                continue
+            rest = name[len(prefix):]
+            if NAMING_SEQ_RE.match(rest):
+                used.add(int(rest))
+        number = 1
+        while number in used:
+            number += 1
+        return prefix + ("%02d" % number if number < 100 else str(number))
+
+    def conforms(self, title: str) -> bool:
+        """Le titre suit-il la convention (forme et segments connus) ?"""
+        parts = str(title).split("-")
+        if len(parts) not in (3, 4) or parts[0] != self.org:
+            return False
+        if not NAMING_SEQ_RE.match(parts[-1]):
+            return False
+        if parts[-2] not in set(self.roles.values()):
+            return False
+        return all(NAMING_SEGMENT_RE.match(part) for part in parts[1:-1])
+
+    def describe(self) -> str:
+        return "<org>-<repo>-<role>-<seq> (org: %s)" % self.org
+
+    def example(self) -> str:
+        return "%s-<repo>-<role>-01" % self.org
+
+
+def parse_naming(value: Any) -> tuple[Naming | None, str | None]:
+    """(config, problème) d'un `extensions.ameesh.naming` (L243, #468).
+
+    `org` est obligatoire ; `projects` et `roles` sont des mappings nom →
+    segment, facultatifs. Un segment hors grammaire est refusé à la lecture."""
+    if not isinstance(value, dict):
+        return None, "mapping expected (`naming: {org: …, projects: {…}, roles: {…}}`)"
+    unknown = sorted(set(map(str, value)) - set(NAMING_FIELDS))
+    if unknown:
+        return None, "unknown key(s): %s (expected %s)" % (
+            ", ".join(unknown), ", ".join(NAMING_FIELDS))
+    org = value.get("org")
+    if not isinstance(org, str) or not NAMING_SEGMENT_RE.match(org):
+        return None, "`org` missing or not a segment (2-6 characters, [a-z0-9]): %r" % (org,)
+    out: dict[str, dict] = {"projects": {}, "roles": {}}
+    for name in ("projects", "roles"):
+        raw = value.get(name)
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            return None, "`%s`: mapping expected (name: segment)" % name
+        for key, segment in raw.items():
+            if not isinstance(key, str) or not key.strip():
+                return None, "`%s`: empty name" % name
+            if not isinstance(segment, str) or not NAMING_SEGMENT_RE.match(segment):
+                return None, "`%s.%s`: %r is not a segment (2-6 characters, [a-z0-9])" % (
+                    name, key, segment)
+            out[name][key] = segment
+        if name == "projects":
+            # deux dépôts ne partagent jamais un segment : des noms identiques
+            # à un numéro près ne diraient plus sur quel dépôt travaille l'agent.
+            seen: dict[str, str] = {}
+            for key, segment in out[name].items():
+                if segment in seen:
+                    return None, ("`projects`: %s and %s share the segment %r: "
+                                  "declare a distinct short name for one of them"
+                                  % (seen[segment], key, segment))
+                seen[segment] = key
+    return Naming(org=org, projects=out["projects"], roles=out["roles"]), None
+
+
 def _profile_type(content: bytes | None) -> str | None:
     """Type du profil ameesh déclaré dans le frontmatter, sans le valider
     (compte des fiches ignorées hors périmètre, L43) ; None sinon."""
@@ -1774,6 +1933,7 @@ class _Loader:
         if manifest is not None:
             self._members(manifest, root)
             self._scopes(manifest, root)
+            self._naming(manifest, root)
         self.canon.readable = True
         self._read_fiches()
         if self.canon.untrusted:
@@ -1921,7 +2081,10 @@ class _Loader:
                          "of %s not read" % (label, SCOPE_KEY, member), **where)
                 self.canon.scope_unread.add(member)
                 continue
-            for unknown in sorted(set(map(str, raw)) - set(SCOPE_FIELDS)):
+            allowed = set(SCOPE_FIELDS)
+            if member == root.member:
+                allowed.add(NAMING_KEY)     # L243 (#468) : le nommage est à la racine
+            for unknown in sorted(set(map(str, raw)) - allowed):
                 self.add("ameesh-key-unknown", WARNING,
                          "`%s.%s`: unknown key (ignored)" % (label, unknown), **where)
             scope, problem = parse_scope(raw.get("scope"))
@@ -1933,6 +2096,26 @@ class _Loader:
                 continue
             if scope is not None:
                 self.canon.scopes[member] = scope
+
+    def _naming(self, manifest: dict, root: Source) -> None:
+        """L243 (#468) : `extensions.ameesh.naming` au premier niveau de la
+        fédération — le canon, c'est l'organisation. Illisible : erreur, aucun
+        nom par défaut n'est produit (un nom ne se devine pas)."""
+        ext = (manifest.get("extensions") or {}) if isinstance(manifest, dict) else {}
+        ext = ext.get(SCOPE_KEY) if isinstance(ext, dict) else None
+        if not isinstance(ext, dict):
+            return
+        raw = ext.get(NAMING_KEY)
+        if raw is None:
+            return
+        naming, problem = parse_naming(raw)
+        if problem:
+            self.add("naming-invalid", ERROR,
+                     "`extensions.%s.%s`: %s — no default agent name is generated"
+                     % (SCOPE_KEY, NAMING_KEY, problem),
+                     member=root.member, path="federation.yaml")
+            return
+        self.canon.naming = naming
 
     def _scope_missing(self, source: Source, present: Iterable[str]) -> bool:
         """Un dossier du périmètre absent de la source : erreur, membre non lu."""
@@ -2737,6 +2920,16 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
             add("agent-title-invalid", ERROR,
                 "agent name %r outside the registry grammar" % agent.title, f)
             continue
+        if canon.naming is not None and not canon.naming.conforms(agent.title):
+            # L243 (#468) : on ne dit rien des noms existants (ils seront
+            # renommés par #423) ; seul un titre qui TENTE la convention
+            # (préfixe de l'organisation) et la rate est signalé.
+            if str(agent.title).startswith(canon.naming.org + "-"):
+                add("agent-name-convention", WARNING,
+                    "agent %s does not follow the naming convention %s: a new agent "
+                    "is named %s (existing names are not renamed here: see #423)"
+                    % (agent.title, canon.naming.describe(), canon.naming.example()),
+                    f, agent=agent.title)
         if not agent.responsible:
             add("agent-responsible-missing", ERROR,
                 "agent %s without `responsible` (R14: every agent has a responsible human)"

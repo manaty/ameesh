@@ -235,7 +235,8 @@ every finding and sync line is then tagged `[NON APPROUVÉ]`.
 ameesh canon check [--host H] [--json] [--canon DIR] [--ref REV] [--fetch]   # exit 1 on any error
 ameesh canon show  [--json] …                                     # cards read, and from which commit
 ameesh canon sync  [--host H] [--json] …                          # canon → registry of host H
-ameesh agent spawn <name> --by <creator> --ttl 2h [--cwd DIR] [--prompt TEXT]
+ameesh agent name  --role R [--project P …] [--json]              # next free <org>-<repo>-<role>-<seq>
+ameesh agent spawn [name] --by <creator> --ttl 2h [--role R] [--project P …] [--cwd DIR] [--prompt TEXT]
 ```
 
 | Setting | Meaning |
@@ -260,7 +261,11 @@ over. Agents registered by hand (no `canon_ref`) and ephemeral agents are left
 alone. `agent spawn` creates an ephemeral agent whose `responsible` is copied
 from its creator at creation (R14), with capabilities ⊆ `{read, propose}` (and
 ⊆ the creator's), a mandatory expiry (max 7 days, never beyond an ephemeral
-creator's). A fictitious example canon lives in [`examples/canon/`](examples/canon/).
+creator's). Without a name it takes `--role`/`--project` and generates one from
+`extensions.ameesh.naming` (`org`, `projects`, `roles` in `federation.yaml`),
+the same generator as `ameesh agent name`; the harness never appears in a name,
+and a number already attributed to a card or a registry row is never reused.
+A fictitious example canon lives in [`examples/canon/`](examples/canon/).
 
 **Canon state, fail closed (§4.1).** Every `canon sync` records the canon's
 status for the host in `canon_state`: `ok`, `invalid` (read, but an error
