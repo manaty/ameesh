@@ -5,13 +5,52 @@ Renaming a code identifier keeps the old spelling as an alias for at least
 one release (L148a plan). Removing an option string is a breaking change for
 ``scripts/version-level.py`` (L158), so the alias must stay in the syntax
 tree until the cleanup stage, which is bundled with the next major version.
-The alias stays functional and is hidden from ``--help``; using it prints
-one line on stderr naming the canonical spelling.
+The alias stays functional and is hidden from ``--help``; using it prints one
+line on stderr naming the canonical spelling, once per spelling and per parse.
 """
 from __future__ import annotations
 
 import argparse
 import sys
+
+
+class HiddenAliasParser(argparse.ArgumentParser):
+    """Parser whose hidden aliases never shadow a visible option (L148).
+
+    ``--depends-on`` and its hidden alias ``--depend-de`` broke the old
+    abbreviation ``--dep``: argparse saw two candidates and refused it. Here a
+    prefix that matches at least one visible option resolves on the visible
+    one (``--dep`` -> ``--depends-on``), and when several visible options
+    remain the ambiguity message names those only: a hidden alias never shows
+    up in an error suggestion. A prefix that matches hidden aliases only keeps
+    argparse's behaviour, so the old spelling stays usable.
+    """
+
+    def _get_option_tuples(self, option_string):  # type: ignore[override]
+        tuples = super()._get_option_tuples(option_string)
+        visible = [t for t in tuples if t[0].help is not argparse.SUPPRESS]
+        return visible or tuples
+
+
+def _append_unique(namespace, dest: str, value) -> None:
+    """Append without duplicate, keeping the order of first appearance."""
+    items = getattr(namespace, dest, None)
+    items = [] if items is None else list(items)
+    if value not in items:
+        items.append(value)
+    setattr(namespace, dest, items)
+
+
+class UniqueAppend(argparse.Action):  # type: ignore[type-arg]
+    """``action="append"`` without duplicates, order kept (L148).
+
+    The canonical ``--depends-on`` and its old spelling ``--depend-de``
+    collect in the same list; a value given twice, in any order, is stored
+    once.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _append_unique(namespace, self.dest, values)
 
 
 class DeprecatedAlias(argparse.Action):  # type: ignore[type-arg]
@@ -26,7 +65,11 @@ class DeprecatedAlias(argparse.Action):  # type: ignore[type-arg]
 
     ``append=True`` reproduces ``action="append"`` for a repeatable alias
     (``--depend-de``): the values collect in the canonical option's list,
-    whatever the order, and the canonical argument keeps the ``default=[]``.
+    whatever the order, without duplicates, and the canonical argument keeps
+    the ``default=[]``.
+
+    The warning is written once per option spelling and per parse: repeating
+    ``--depend-de`` no longer prints the line twice.
     """
 
     def __init__(self, option_strings, dest, canonical="", append=False, **kwargs):
@@ -35,13 +78,21 @@ class DeprecatedAlias(argparse.Action):  # type: ignore[type-arg]
         self.append = append
 
     def __call__(self, parser, namespace, values, option_string=None):
-        sys.stderr.write("%s is deprecated, use %s\n" % (option_string, self.canonical))
+        self._warn_once(namespace, option_string)
         if self.nargs == 0:
             setattr(namespace, self.dest, self.const if self.const is not None else True)
         elif self.append:
-            items = getattr(namespace, self.dest, None)
-            items = [] if items is None else list(items)
-            items.append(values)
-            setattr(namespace, self.dest, items)
+            _append_unique(namespace, self.dest, values)
         else:
             setattr(namespace, self.dest, values)
+
+    def _warn_once(self, namespace, option_string) -> None:
+        """One line per spelling: the same alias repeated warns once."""
+        seen = getattr(namespace, "_deprecated_spellings", None)
+        if seen is None:
+            seen = set()
+            setattr(namespace, "_deprecated_spellings", seen)
+        if option_string in seen:
+            return
+        seen.add(option_string)
+        sys.stderr.write("%s is deprecated, use %s\n" % (option_string, self.canonical))

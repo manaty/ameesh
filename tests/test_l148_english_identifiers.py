@@ -14,13 +14,15 @@ import io
 import unittest
 
 from ameesh import plan_cli, roadmap
-from ameesh.deprecated import DeprecatedAlias
+from ameesh.deprecated import DeprecatedAlias, HiddenAliasParser
 
 
 def work_parser() -> argparse.ArgumentParser:
     """The `ameesh work` parser, without the rest of the mesh CLI."""
     parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="command")
+    # même classe de sous-parseurs que le CLI (mesh_cli) : sans elle, les
+    # alias cachés capteraient les abréviations testées plus bas
+    sub = parser.add_subparsers(dest="command", parser_class=HiddenAliasParser)
     plan_cli.add_parsers(sub, lambda **kwargs: 0)
     return parser
 
@@ -81,7 +83,36 @@ class RoadmapAliasesTest(unittest.TestCase):
         self.assertEqual((namespace.due, namespace.project, namespace.owner,
                           namespace.package, namespace.depends_on),
                          ("2026-10-20", "p", "o", "F", ["L1", "L2"]))
-        self.assertEqual(len(err.splitlines()), 6)  # one line per deprecated spelling
+        # une ligne par graphie : --depend-de répété n'en écrit qu'une
+        self.assertEqual(len(err.splitlines()), 5)
+
+    def test_old_prefixes_resolve_on_the_visible_option(self):
+        """P2 : `--dep` reste l'abréviation de `--depends-on`."""
+        namespace, err = parse(self.parser, "add", "x", "--dep", "L1")
+        self.assertEqual(namespace.depends_on, ["L1"])
+        self.assertEqual(err, "")
+
+    def test_ambiguous_prefix_does_not_name_a_hidden_alias(self):
+        """P3 : le message d'ambiguïté ne cite que les options visibles."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            self.parser.parse_args(["add", "x", "--de", "L1"])
+        self.assertIn("--decision", err.getvalue())
+        self.assertNotIn("--depend-de", err.getvalue())
+
+    def test_depends_on_and_depend_de_do_not_duplicate(self):
+        """P2 : la même dépendance, dans les deux graphies, n'est gardée qu'une fois."""
+        for argv in (("--depend-de", "L1", "--depends-on", "L1"),
+                     ("--depends-on", "L1", "--depend-de", "L1")):
+            namespace, _ = parse(self.parser, "add", "x", *argv)
+            self.assertEqual(namespace.depends_on, ["L1"])
+
+    def test_repeating_a_deprecated_alias_warns_once(self):
+        """P3 : une seule ligne par graphie, même répétée."""
+        namespace, err = parse(self.parser, "add", "x", "--depend-de", "L1",
+                               "--depend-de", "L2")
+        self.assertEqual(namespace.depends_on, ["L1", "L2"])
+        self.assertEqual(err, "--depend-de is deprecated, use --depends-on\n")
 
     def test_english_spellings_are_silent(self):
         namespace, err = parse(
@@ -127,6 +158,12 @@ class WorkPlanAliasesTest(unittest.TestCase):
         namespace, err = parse(self.parser, "plan", "12", "--deploiement", "2026-10-12")
         self.assertEqual(namespace.livraison, "2026-10-12")
         self.assertIn("--deploiement is deprecated, use --delivery", err)
+
+    def test_hidden_aliases_do_not_capture_the_visible_prefix(self):
+        """P3 : `--de` va sur `--delivery`, sans citer --debut/--deploiement."""
+        namespace, err = parse(self.parser, "plan", "12", "--de", "2026-10-12")
+        self.assertEqual(namespace.livraison, "2026-10-12")
+        self.assertEqual(err, "")
 
     def test_help_shows_english_and_hides_french(self):
         text = help_text(self.parser, "plan")

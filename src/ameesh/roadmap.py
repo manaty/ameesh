@@ -52,7 +52,7 @@ from . import plan as plan_mod
 from . import roadmap_dev as dev
 from . import storage
 from . import work as work_mod
-from .deprecated import DeprecatedAlias
+from .deprecated import DeprecatedAlias, HiddenAliasParser, UniqueAppend
 
 SCHEMA = "ameesh-roadmap/1"
 #: borne de lecture des tâches de la frise
@@ -243,7 +243,10 @@ def add_commitment(db, what: str, *, due=None, decision: bool = False, owner: st
         "what": what, "due_on": day, "kind": "decision" if decision else "commitment",
         "status": "open", "owner": owner or None, "project": project or None,
         "work_item_id": item_id, "package_id": package or None, "source_kind": source_kind,
-        "source_ref": source_ref or None, "depends_on": [str(d) for d in depends_on or ()],
+        "source_ref": source_ref or None,
+        # L148 : `--depends-on` et `--depend-de` peuvent viser la même valeur,
+        # dans n'importe quel ordre ; on ne stocke qu'une fois, dans l'ordre.
+        "depends_on": list(dict.fromkeys(str(d) for d in depends_on or ())),
         "note": note or "", "created_by": actor or ""})
 
 
@@ -897,7 +900,7 @@ def format_who(view: dict, width: int) -> list[str]:
 # --------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = HiddenAliasParser(
         prog="ameesh plan", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="plan_command", required=True)
@@ -927,7 +930,7 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=SOURCE_KINDS)
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
-    p_add.add_argument("--depends-on", dest="depends_on", action="append", default=[],
+    p_add.add_argument("--depends-on", dest="depends_on", action=UniqueAppend, default=[],
                        help="dependency (task #N, commitment eN, lot Lxx); repeatable")
     p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
                        canonical="--depends-on", append=True, default=argparse.SUPPRESS,
