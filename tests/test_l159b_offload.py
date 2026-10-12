@@ -537,9 +537,12 @@ class AgentNoteTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AMEESH_OFFLOAD_HOST": "vm-tests"}):
             text = mail._assemble("mail", ["— message 1 from a:\n> x"], 0)
         self.assertIn("ameesh offload run", text)
+        # one rule for heavy suites: the VM replaces the per-host cap (L131)
+        self.assertNotIn(adapters.HEAVY_NOTE, text)
         with mock.patch.dict(os.environ, {"AMEESH_OFFLOAD_HOST": ""}):
             text = mail._assemble("mail", ["— message 1 from a:\n> x"], 0)
         self.assertNotIn("ameesh offload", text)
+        self.assertIn(adapters.HEAVY_NOTE, text)
 
 
 class InstallScriptTest(unittest.TestCase):
