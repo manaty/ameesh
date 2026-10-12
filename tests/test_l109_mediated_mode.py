@@ -59,6 +59,9 @@ class MedieBase(unittest.TestCase):
         self.transport = GoldenTransport()
         self.responder = self.transport.responder
         self.db = make_db(self.transport, cfg=self.cfg)
+        relay_health = mock.patch("ameesh.relay.credential_ready", return_value=True)
+        self.relay_health = relay_health.start()
+        self.addCleanup(relay_health.stop)
         patch = mock.patch.object(Reprise, "MINIMUM", 0.02)
         patch.start()
         self.addCleanup(patch.stop)
@@ -218,6 +221,44 @@ class BailEtPanneTest(MedieBase):
         with self.assertRaises(C.NotSupportedRemotely):
             self.db.storage.credentials.report("anna-portable", "dsh", "", "failing",
                                              source="turn")
+
+    def test_relay_health_blocks_and_recovers_without_local_credentials(self):
+        worker = self._worker()
+        worker.agent["harness"] = "deepseek"
+        self.responder.script["leases.set_marked_block"] = "done"
+        self.responder.script["leases.clear_marked_block"] = "done"
+        self.relay_health.return_value = False
+        with mock.patch("ameesh.auth_failure.failing", side_effect=AssertionError("local health")):
+            self.assertFalse(worker.auth_ready())
+            self.assertEqual(worker._auth_status, "auth_blocked: deepseek/relay")
+            self.assertIn("leases.set_marked_block", self.transport.ops())
+            self.relay_health.return_value = True
+            self.assertTrue(worker.auth_ready())
+        self.assertEqual(worker._auth_status, "")
+        self.assertIn("leases.clear_marked_block", self.transport.ops())
+        self.assertFalse(any(op.startswith("credentials.") for op in self.transport.ops()))
+
+    def test_failed_relay_turn_does_not_count_as_fast_failure(self):
+        worker = self._worker()
+        worker.agent["harness"] = "deepseek"
+        self.responder.script["leases.set_marked_block"] = "done"
+        self.responder.script["leases.end_turn"] = True
+        self.relay_health.return_value = False
+        worker.fast_failure = True
+        self.assertTrue(worker._end_relay_auth_failure(0))
+        self.assertFalse(worker.fast_failure)
+        self.assertEqual(self.transport.ops().count("leases.end_turn"), 1)
+        self.assertFalse(any(op.startswith("credentials.") for op in self.transport.ops()))
+
+    def test_healthy_relay_does_not_relabel_another_block_after_failure(self):
+        worker = self._worker()
+        worker.agent["harness"] = "deepseek"
+        worker._auth_status = "auth_blocked: old-account"
+        worker.fast_failure = True
+        self.assertFalse(worker._end_relay_auth_failure(0))
+        self.assertTrue(worker.fast_failure)
+        self.assertEqual(worker._auth_status, "auth_blocked: old-account")
+        self.assertNotIn("leases.end_turn", self.transport.ops())
 
     def test_bail_perdu_au_battement(self):
         worker = self._worker()
