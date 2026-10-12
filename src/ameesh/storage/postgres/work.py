@@ -126,35 +126,6 @@ class _Refrozen(Exception):
 
 class WorkItems(interface.WorkItems):
 
-    def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
-        with self.db.transaction() as tx:
-            rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
-                            % ITEM_COLUMNS, (int(item_id),))
-            if not rows:
-                return None
-            item = rows[0]
-            if if_empty and ((item.get("app") or "").strip()
-                             or item["state"] in ("merged", "promoted", "closed")
-                             or item.get("assignee") != assignee):
-                return None
-            if item.get("app") == app:
-                return item
-            rows = tx.query("UPDATE work_items SET app = %%s, updated_at = now()"
-                            " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
-                            (app, int(item_id)))
-            WorkItems(tx)._event(int(item_id), item["state"],
-                                 "project %r → %r" % (item.get("app"), app), actor)
-            return rows[0]
-
-    def without_project(self) -> list[dict]:
-        return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
-                             " AND state NOT IN %s ORDER BY id" % (ITEM_COLUMNS, _CLOSED))
-
-    def creator(self, item_id) -> str:
-        rows = self.db.query("SELECT actor FROM work_item_events WHERE work_item_id = %s"
-                             " ORDER BY id LIMIT 1", (int(item_id),))
-        return (rows[0].get("actor") or "") if rows else ""
-
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,

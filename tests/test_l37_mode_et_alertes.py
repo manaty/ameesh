@@ -288,7 +288,7 @@ class AlertesVivaciteTest(_Base):
         self.assertEqual(self._types(), [])
 
     def test_cli_orphan_lot_et_follow(self):
-        lot = work.add(self.db, title="inconnu", assignee="ouvrier", app="p")
+        lot = work.add(self.db, title="inconnu", assignee="ouvrier")
         self.db.execute("DELETE FROM agent_registry WHERE name = 'ouvrier'")
         proc = self.mesh("alerts", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)

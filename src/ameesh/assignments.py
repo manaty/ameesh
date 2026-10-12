@@ -93,7 +93,7 @@ def resolve_lot(db, ref: str) -> dict | None:
 
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
-                 estimate=None, app: str | None = None) -> dict:
+                 estimate=None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
@@ -143,7 +143,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             warn = estimates.check(db, sender, minutes,
                                    option="--estimate 2h à côté de --new-lot")
             from . import work_projects
-            project = work_projects.mail_project(cfg, db, sender, recipient, app)
+            project = work_projects.mail_project(cfg, db, sender, recipient)
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg, branch=branch,
                                 estimate=minutes)

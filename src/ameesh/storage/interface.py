@@ -811,19 +811,6 @@ class WorkItems(Domain):
     """Lots et journal de leurs transitions (ledger de reprise)."""
 
     @abc.abstractmethod
-    def set_app(self, item_id: int, app: str, *, actor: str,
-                if_empty: bool = False, assignee: str | None = None) -> dict | None:
-        """L118c: journaled project correction, atomically with its old value."""
-
-    @abc.abstractmethod
-    def without_project(self) -> list[dict]:
-        """L118c: open lots with empty app, once per id, including waiting_human."""
-
-    @abc.abstractmethod
-    def creator(self, item_id: int) -> str:
-        """Actor of the first journal entry, without truncating long journals."""
-
-    @abc.abstractmethod
     def add(self, *, type: str, source: str, app: str, title: str, body: str,  # noqa: A002
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
@@ -1742,10 +1729,6 @@ class Decisions(Domain):
     @abc.abstractmethod
     def get(self, decision_id: int) -> dict | None:
         """La demande `decision_id` (en attente ou close), ou None."""
-
-    @abc.abstractmethod
-    def source_mail(self, message_id: int) -> dict | None:
-        """Mail used for decision project inheritance, including work_item_id."""
 
     @abc.abstractmethod
     def pending(self, *, limit: int) -> list[dict]:
