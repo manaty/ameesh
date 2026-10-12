@@ -623,6 +623,13 @@ class Credentials(Domain):
         {state, previous} (previous: None if new), or {skipped: True}."""
 
     @abc.abstractmethod
+    def annotate(self, host: str, harness: str, account: str, reason: str, *,
+                 expect_failures: int) -> bool:
+        """#210 r4: replaces the `reason` of a `failing` row (adds the fix
+        command to a failure a turn detected), nothing else, and only if the
+        failure count is still `expect_failures`. True if written."""
+
+    @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
         checked_ts, failing_since_ts, expires_ts, last_failure_ts,

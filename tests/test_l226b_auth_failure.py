@@ -2,6 +2,7 @@
 """L226b — classification of authentication failures in failed turns."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -318,6 +319,23 @@ class CredentialsConditionalTest(_AuthBase):
                                       source="sentinel", expect_failures=0)["state"],
                          "failing")
 
+    def test_annotate_only_the_failure_it_read(self):
+        # codex r4 (6): the fix command added to a turn's failure, never over
+        # a newer failure
+        creds = storage.of(self.db).credentials
+        creds.report(self.cfg.host, "codex", "a", "failing", source="turn",
+                     reason="invalid api key", fingerprint="f1")
+        self.assertFalse(creds.annotate(self.cfg.host, "codex", "a", "x; fix: y",
+                                        expect_failures=0))
+        self.assertTrue(creds.annotate(self.cfg.host, "codex", "a",
+                                       "invalid api key; fix: codex login", expect_failures=1))
+        row = self._health("codex")["a"]
+        self.assertEqual((row["state"], row["reason"], row["source"], row["failures"],
+                          row["failing_fingerprint"]),
+                         ("failing", "invalid api key; fix: codex login", "turn", 1, "f1"))
+        creds.report(self.cfg.host, "codex", "a", "healthy", source="manual")
+        self.assertFalse(creds.annotate(self.cfg.host, "codex", "a", "z", expect_failures=1))
+
     def test_listing_reads_only_what_the_supervisor_is_granted(self):
         # #210 codex r4: the alerts read `listing()`, the supervisor role is
         # not granted the fingerprint — selecting it emptied the alerts
@@ -475,6 +493,16 @@ class RunnerTest(_AuthBase):
             sante = self._health("claude")["primaire"]
             self.assertEqual((sante["state"], sante["failing_fingerprint"]),
                              ("failing", sentinel._digest("token-A")))
+            # codex r4 (1): B, installed BEFORE A's failure, is not the token
+            # that failed — the sentinel's next healthy probe clears it
+            cfg = dataclasses.replace(worker.cfg, credential_sentinel={"probes": ["claude"]})
+            status = json.dumps({"loggedIn": True, "authMethod": "claude.ai"})
+            with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+                rows = sentinel.check(cfg, self.db, run=lambda argv, **kw: (0, status))
+            primaire = [r for r in rows if r["account"] == "primaire"]
+            self.assertEqual([(r["state"], r["previous"]) for r in primaire],
+                             [("healthy", "failing")])
+            self.assertEqual(self._health("claude")["primaire"]["state"], "healthy")
         finally:
             worker.watchdog_stop.set()
 

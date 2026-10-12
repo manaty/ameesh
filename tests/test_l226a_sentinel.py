@@ -229,8 +229,7 @@ class ReviewR1Test(unittest.TestCase):
         creds.report.assert_not_called()
         # nor a healthy probe that cannot fingerprint the credential
         rows, creds = self._check({"a": self._failing("x", NOW - 600)},
-                                  [sentinel.Verdict("codex", "a", "healthy", "ok",
-                                                    proof=NOW - 60)])
+                                  [sentinel.Verdict("codex", "a", "healthy", "ok")])
         creds.report.assert_not_called()
 
     def test_r2_compared_with_the_last_failure(self):
@@ -242,14 +241,82 @@ class ReviewR1Test(unittest.TestCase):
         rows, creds = self._check({"a": self._failing("B", t300, since=t100)}, [relogged])
         creds.report.assert_not_called()
         self.assertEqual(rows[0]["state"], "failing")
-        # a different token written before the last failure: not a login after it
+        # codex r4 (1): a different token written BEFORE the last failure —
+        # a turn started with A, the owner installed B at t200, A failed at
+        # t300 — B is not the token that failed: cleared
         rows, creds = self._check({"a": self._failing("A", t300, since=t100)}, [relogged])
-        creds.report.assert_not_called()
+        self.assertEqual(creds.report.call_args[0][3], "healthy")
         # a different token written after the last failure: cleared
         fresh = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "C"}},
                                                  mtime=NOW - 60, name="b"), NOW)
         rows, creds = self._check({"b": self._failing("B", t300, since=t100)}, [fresh])
         self.assertEqual(creds.report.call_args[0][3], "healthy")
+
+    def test_r4_launch_fingerprint_is_the_key_handed_to_the_child(self):
+        # codex r4 (2): the key file is replaced after the account was applied
+        # to the child's environment — the child runs with A
+        key = os.path.join(self.tmp, "k.key")
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write("key-A\n")
+        os.chmod(key, 0o600)
+        profile = accounts.Profile("deepseek", "k", kind="api_key_env", key_file=key,
+                                   env="DEEPSEEK_API_KEY")
+        env = {}
+        accounts.apply_env(env, profile, {})
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write("key-B")
+        self.assertEqual(sentinel.launch_fingerprint("deepseek", profile, env),
+                         sentinel._digest("key-A"))
+        self.assertEqual(sentinel.fingerprint("deepseek", profile), sentinel._digest("key-B"))
+        # an OAuth account: the store the child's environment points to
+        claude = accounts.Profile("claude", "c", path=_claude_dir(self.tmp, "c",
+                                                                  refreshToken="rt"))
+        self.assertEqual(sentinel.launch_fingerprint("claude", claude, {}),
+                         sentinel._digest("rt"))
+
+    def test_r4_transient_cli_failure_is_unknown(self):
+        # codex r4 (5): scw during a DNS outage, gh timing out — unknown; a
+        # refused credential is still failing
+        cases = [("scw", "Error: dial tcp: lookup api.scaleway.com: no such host", "unknown"),
+                 ("gh", "X Timeout trying to log in to github.com account a (default)",
+                  "unknown"),
+                 ("gh", "github.com\n  X Failed to log in to github.com account a (default)\n"
+                        "  - The token in default is invalid.\n"
+                        "  - To re-authenticate, run: gh auth login -h github.com", "failing"),
+                 ("scw", "Error: scaleway-sdk-go: http error 401 Unauthorized: "
+                         "authentication is denied", "failing"),
+                 ("scw", "Error: something unexpected", "unknown")]
+        for harness, output, state in cases:
+            with self.subTest(output=output[:40]), \
+                    mock.patch.object(sentinel.shutil, "which", return_value="/bin/x"):
+                v = sentinel.probe_cli(harness, [harness], "fix it",
+                                       mock.Mock(return_value=(1, output)))
+                self.assertEqual(v.state, state)
+        gcloud = ("ERROR: There was a problem refreshing your current auth tokens: "
+                  "Max retries exceeded (Temporary failure in name resolution)\n"
+                  "Please run:\n  $ gcloud auth login")
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/gcloud"):
+            v = sentinel.probe_gcloud({"gcloud_session_hours": 16.0}, NOW,
+                                      mock.Mock(return_value=(1, gcloud)),
+                                      environ={"CLOUDSDK_CONFIG": self.tmp})
+        self.assertEqual(v.state, "unknown")
+
+    def test_r4_turn_failure_gets_the_fix_command(self):
+        # codex r4 (6): a turn recorded `invalid api key`; the probe keeps the
+        # failure (same token) and adds the account's login command
+        failing = {"a": dict(self._failing("x", NOW - 600), reason="invalid api key")}
+        same = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "x"}}), NOW)
+        rows, creds = self._check(failing, [same])
+        creds.report.assert_not_called()
+        path = os.path.join(self.tmp, "a")
+        expected = "invalid api key; fix: CODEX_HOME=%s codex login" % path
+        creds.annotate.assert_called_once_with("h1", "codex", "a", expected,
+                                               expect_failures=2)
+        self.assertEqual(rows[0]["reason"], expected)
+        # once there, never twice
+        failing["a"]["reason"] = expected
+        rows, creds = self._check(failing, [same])
+        creds.annotate.assert_not_called()
 
     def test_r2_clearing_write_is_conditional(self):
         # codex r2 (c): a turn records a failure between the read and the

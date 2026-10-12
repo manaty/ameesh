@@ -57,6 +57,14 @@ class Credentials(interface.Credentials):
              expect_failures, expect_failures))
         return rows[0] if rows else {"skipped": True}
 
+    def annotate(self, host, harness, account, reason, *, expect_failures) -> bool:
+        rows = self.db.query(
+            "update credential_health set reason = %s"
+            " where host = %s and harness = %s and account = %s"
+            "   and state = 'failing' and failures = %s::int returning account",
+            (reason, host, harness, account or "", int(expect_failures)))
+        return bool(rows)
+
     def health(self, host, harness) -> dict:
         rows = self.db.query(_ROW + " where host = %s and harness = %s order by account",
                              (host, harness))

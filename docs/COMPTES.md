@@ -276,7 +276,10 @@ expiry the sentinel reports. Each `failing` report also stamps
 (refresh token of `.credentials.json` or `auth.json`, the key of an API-key
 account, the whole gcloud, gh or scw store), which tells two credentials
 apart without revealing either. The fingerprint is never in the supervisor
-contract.
+contract (it lives in migration 0068, additive to 0060). A failed turn
+records the fingerprint of the credential it was launched with, read from
+the child's environment at launch: an API key is the exact value handed to
+the child, even if its key file is replaced during the turn.
 
 **End of turn.** A failed turn whose error, short answer (600 characters at
 most) or stderr tail (this turn's output only: `stderr.log` is appended to by
@@ -311,9 +314,13 @@ budget pause; once it lifts, an account still failing puts the
 **Recovery.** After the reconnection (`claude /login` in the account's
 folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
 and records it — only if its probe is healthy AND the credential's
-fingerprint differs from the last failure's AND the store was written after
-that failure. Rewriting the same revoked token, or a failure recorded without
-a fingerprint, is no proof: the account stays `failing`. The sentinel's write
+fingerprint differs from the last failure's, whenever that credential was
+installed (a turn launched with A can fail after the owner installed B: B is
+cleared). Rewriting the same revoked token, or a failure recorded without
+a fingerprint, is no proof: the account stays `failing`. A failure a turn
+detected names no fix command: the sentinel's next probe adds the account's
+command to its reason (the owner's alert shows it), without touching the
+failure itself. The sentinel's write
 is conditional on the `failures` count it read, so a failure a turn records
 during the probe is never overwritten. Without the sentinel, or in those
 cases, declare it by hand:
@@ -341,7 +348,11 @@ writes the result to `credential_health` (`source = 'sentinel'`):
 A harness whose binary is missing, or whose default credential file is
 absent without declared accounts, is not used on the host: it is skipped. A
 probe that cannot conclude (timeout, unreadable file) writes `unknown`,
-which is never a verdict. The sentinel reads names, paths and dates only and
+which is never a verdict. The same goes for a CLI probe (gcloud, gh, scw)
+that exits non-zero without saying its credential is refused: a network
+error (DNS, timeout, 5xx) or an unrecognized output is `unknown`, never
+`failing` — a `failing` credential only clears with another credential, so
+a transient error must not become one. The sentinel reads names, paths and dates only and
 never prints a secret. An `api_key_env` account is checked for the presence
 of its key.
 

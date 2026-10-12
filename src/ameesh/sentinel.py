@@ -26,14 +26,21 @@ credential that is not the one which failed. Each failure records the
 fingerprint of the credential then in place (`fingerprint`: the refresh token
 of `.credentials.json` or `auth.json`, the key, or the whole gcloud
 `credentials.db`, gh `hosts.yml`, scw `config.yaml`); the failure clears only
-when the fingerprint read now differs from the one of the LAST failure, and
-the store was written after it. Rewriting the same revoked token, a probe
-without a fingerprint, or `unknown`, leaves the failure in place. The clearing
+when the fingerprint read now differs from the one of the LAST failure — not
+on the store's date: a turn that started with A can fail after the owner
+installed B (#210 r4). Rewriting the same revoked token, a probe without a
+fingerprint, or `unknown`, leaves the failure in place. The clearing
 write is conditional (`expect_failures`): a failure a turn records between
 the probe's read and its write is never overwritten.
 
+A CLI probe (gcloud, gh, scw) that exits non-zero is `failing` only when its
+output says the credential is refused; a network error (DNS, timeout, 5xx)
+or anything unrecognized is `unknown` (#210 r4): a credential failure is
+cleared only by another credential, a transient one would never clear.
+
 The `reason` of a failing credential carries the exact command that fixes it:
 the owner's alert (`credential_failing`, pushed by `ameesh notify`) shows it.
+A failure detected by a turn gets it at the next probe (`Credentials.annotate`).
 Only names, paths, dates and fingerprints (a truncated SHA-256, which does
 not reveal the credential) are written, never a secret.
 """
@@ -42,6 +49,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -67,8 +75,6 @@ class Verdict:
     reason: str = ""
     expires_at: float | None = None
     fix: str = ""         #: exact command that repairs a failing credential
-    #: mtime of the credential store: it must be later than the last failure
-    proof: float | None = None
     #: fingerprint of the credential (`fingerprint`): it must differ from the
     #: one recorded at the last failure; None = no proof possible
     fingerprint: str | None = None
@@ -91,10 +97,11 @@ def settings(cfg) -> dict:
             "warn_hours": float(raw.get("warn_hours") or DEFAULT_WARN_HOURS)}
 
 
-def _run(argv: list, env: dict | None = None,
-         whole: bool = False) -> tuple[int | None, str]:
-    """(exit code, last line of output — or the whole stdout with `whole`);
-    None on timeout or missing binary."""
+def _run(argv: list, env: dict | None = None, whole: bool = False,
+         output: bool = False) -> tuple[int | None, str]:
+    """(exit code, last line of output — or the whole stdout with `whole`,
+    or every non-empty line of stderr then stdout with `output`); None on
+    timeout or missing binary."""
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
                               env=env, stdin=subprocess.DEVNULL)
@@ -103,7 +110,42 @@ def _run(argv: list, env: dict | None = None,
     if whole:
         return proc.returncode, proc.stdout
     lines = [l.strip() for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.strip()]
+    if output:
+        return proc.returncode, "\n".join(lines)[-4000:]
     return proc.returncode, (lines[-1][:200] if lines else "")
+
+
+#: #210 r4: a failed CLI probe that could not reach its service — never a
+#: verdict on the credential (DNS, connection, timeout, server error)
+NETWORK_ERROR = re.compile(
+    r"dial tcp|no such host|name resolution|could not resolve|failed to resolve"
+    r"|max retries exceeded|failed to establish a new connection|connection (aborted|refused|reset)"
+    r"|network is unreachable|error connecting|unable to connect|timed? ?out|timeout"
+    r"|tls handshake|\b50[0234]\b|service unavailable|bad gateway", re.IGNORECASE)
+#: and what the CLIs say of a refused credential, besides the turn patterns
+#: of `auth_failure`
+CLI_REFUSED = re.compile(
+    r"token in \S+ is invalid|not logged in|no active account"
+    r"|do not currently have an active account|authentication is denied"
+    r"|invalid (access|secret) key|unauthori[sz]ed", re.IGNORECASE)
+
+
+def refused(output: str) -> str | None:
+    """Why a failed CLI probe's `output` says its credential is refused; None
+    when it says something else (network error, unrecognized): `unknown`."""
+    from . import auth_failure
+    if not output or NETWORK_ERROR.search(output):
+        return None
+    reason = auth_failure.classify(output)
+    if reason:
+        return reason
+    found = CLI_REFUSED.search(output)
+    return found.group(0).lower() if found else None
+
+
+def _last_line(output: str) -> str:
+    lines = [line for line in (output or "").splitlines() if line.strip()]
+    return lines[-1][:200] if lines else ""
 
 
 def _profiles(cfg, harness: str) -> list:
@@ -179,6 +221,19 @@ def fingerprint(harness: str, profile=None, environ=None) -> str | None:
     return None
 
 
+def launch_fingerprint(harness: str, profile, env: dict) -> str | None:
+    """#210 r4: the fingerprint of the credential a turn is launched with,
+    read from the child's environment `env` once the account is applied — an
+    API key is the exact value handed to the child (its key file may be
+    replaced before the turn fails), an OAuth store the file that
+    environment points to."""
+    if profile is not None and profile.kind == "api_key_env":
+        # the variable the child reads (`accounts.apply_env`)
+        name = profile.env or accounts_mod.default_key_env_of(harness)
+        return _digest(str(env.get(name) or "").strip()) if name else None
+    return fingerprint(harness, profile, env)
+
+
 def _key_set(profile, environ) -> bool:
     if profile.key_file:
         return os.path.isfile(profile.key_file)
@@ -216,8 +271,7 @@ def probe_claude(profile, now: float, environ=None, run=None,
         ok = _key_set(profile, environ)
         return Verdict("claude", name, "healthy" if ok else "failing",
                        "API key present" if ok else "API key missing",
-                       fix="" if ok else "set the key of account %s" % (name or "default"),
-                       proof=_mtime(profile.key_file),
+                       fix="set the key of account %s" % (name or "default"),
                        fingerprint=fingerprint("claude", profile, environ))
     home = profile.home(environ)
     path = os.path.join(home, ".credentials.json")
@@ -255,7 +309,7 @@ def probe_claude(profile, now: float, environ=None, run=None,
                        fingerprint=held)
     return Verdict("claude", name, "healthy",
                    "logged in (%s)" % (status.get("authMethod") or "?"), expires, fix,
-                   proof=_mtime(path), fingerprint=held)
+                   fingerprint=held)
 
 
 def probe_codex(profile, now: float, environ=None) -> Verdict | None:
@@ -265,8 +319,7 @@ def probe_codex(profile, now: float, environ=None) -> Verdict | None:
         ok = _key_set(profile, environ)
         return Verdict("codex", name, "healthy" if ok else "failing",
                        "API key present" if ok else "API key missing",
-                       fix="" if ok else "set the key of account %s" % (name or "default"),
-                       proof=_mtime(profile.key_file),
+                       fix="set the key of account %s" % (name or "default"),
                        fingerprint=fingerprint("codex", profile, environ))
     path = os.path.join(profile.home(environ), "auth.json")
     fix = "%scodex login" % _env_prefix("codex", profile)
@@ -284,7 +337,7 @@ def probe_codex(profile, now: float, environ=None) -> Verdict | None:
     tokens = auth.get("tokens")
     if (isinstance(tokens, dict) and tokens.get("refresh_token")) or auth.get("OPENAI_API_KEY"):
         return Verdict("codex", name, "healthy", "refresh token present", fix=fix,
-                       proof=_mtime(path), fingerprint=fingerprint("codex", profile, environ))
+                       fingerprint=fingerprint("codex", profile, environ))
     return Verdict("codex", name, "failing", "no refresh token nor API key", fix=fix)
 
 
@@ -310,16 +363,21 @@ def probe_gcloud(conf: dict, now: float, run=_run, environ=None) -> Verdict | No
     if not shutil.which("gcloud"):
         return None
     fix = "gcloud auth login --update-adc"
-    code, last = run(["gcloud", "auth", "print-access-token", "--quiet"])
+    code, out = run(["gcloud", "auth", "print-access-token", "--quiet"], output=True)
     expires = gcloud_forecast(conf["gcloud_session_hours"], environ)
     if code is None:
-        return Verdict("gcloud", "", "unknown", "probe failed: %s" % last, expires)
+        return Verdict("gcloud", "", "unknown", "probe failed: %s" % out, expires)
     store = os.path.join(gcloud_config_dir(environ), "credentials.db")
     if code != 0:
-        return Verdict("gcloud", "", "failing", last or "print-access-token failed",
+        why = refused(out)
+        if why is None:
+            return Verdict("gcloud", "", "unknown", "probe failed (exit %s): %s"
+                           % (code, _last_line(out) or "no output"), expires)
+        return Verdict("gcloud", "", "failing",
+                       "%s: %s" % (why, _last_line(out)) if out else why,
                        expires, fix, fingerprint=file_fingerprint(store))
     return Verdict("gcloud", "", "healthy", "access token issued", expires, fix,
-                   proof=gcloud_login(environ), fingerprint=file_fingerprint(store))
+                   fingerprint=file_fingerprint(store))
 
 
 def gh_store(environ=None) -> str:
@@ -337,13 +395,17 @@ def probe_cli(harness: str, argv: list, fix: str, run=_run,
               store: str | None = None) -> Verdict | None:
     if not shutil.which(argv[0]):
         return None
-    code, last = run(argv)
+    code, out = run(argv, output=True)
     if code is None:
-        return Verdict(harness, "", "unknown", "probe failed: %s" % last)
+        return Verdict(harness, "", "unknown", "probe failed: %s" % out)
     if code != 0:
-        return Verdict(harness, "", "failing", last or "%s failed" % " ".join(argv), fix=fix,
+        why = refused(out)
+        if why is None:
+            return Verdict(harness, "", "unknown", "probe failed (exit %s): %s"
+                           % (code, _last_line(out) or "no output"))
+        return Verdict(harness, "", "failing", "%s: %s" % (why, _last_line(out)), fix=fix,
                        fingerprint=file_fingerprint(store))
-    return Verdict(harness, "", "healthy", "authenticated", fix=fix, proof=_mtime(store),
+    return Verdict(harness, "", "healthy", "authenticated", fix=fix,
                    fingerprint=file_fingerprint(store))
 
 
@@ -372,15 +434,15 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
 def kept_failure(current: dict, verdict: Verdict) -> str:
     """Why `verdict` must not overwrite the `failing` row `current` ('' if it
     may): only a `failing` verdict, or a `healthy` one holding another
-    credential than the LAST failure's (fingerprints differ) and written after
-    it, replaces it. No fingerprint on either side: no proof, kept."""
+    credential than the LAST failure's (fingerprints differ), replaces it —
+    whenever that credential was installed (#210 r4: B installed while a turn
+    with A still ran, then A failed). No fingerprint on either side: no
+    proof, kept."""
     if current.get("state") != "failing" or verdict.state == "failing":
         return ""
     failed = current.get("failing_fingerprint")
-    last = current.get("last_failure_ts") or current.get("failing_since_ts")
     if verdict.state == "healthy" and failed and verdict.fingerprint \
-            and verdict.fingerprint != failed \
-            and (verdict.proof is None or last is None or verdict.proof > float(last)):
+            and verdict.fingerprint != failed:
         return ""
     return ("probe %s (%s) but no new credential since the last failure; still failing — "
             "log in again, or `ameesh accounts healthy %s%s` once repaired"
@@ -410,6 +472,17 @@ def check(cfg, db, *, now: float | None = None, run=_run, environ=None,
         kept = kept_failure(current, verdict)
         if kept:
             row.update(state="failing", previous="failing", kept=kept)
+            reason = current.get("reason") or ""
+            if verdict.fix and "fix:" not in reason:
+                # #210 r4: a failure a turn detected names no fix; the owner's
+                # alert shows the reason
+                row["reason"] = "%s; fix: %s" % (reason or "authentication failed", verdict.fix)
+                if not dry_run:
+                    storage.of(db).credentials.annotate(
+                        cfg.host, verdict.harness, verdict.account, row["reason"],
+                        expect_failures=int(current.get("failures") or 0))
+            else:
+                row["reason"] = reason or row["reason"]
             rows.append(row)
             continue
         if not dry_run:

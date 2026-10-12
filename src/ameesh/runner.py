@@ -3098,7 +3098,7 @@ class AgentWorker(threading.Thread):
                              daemon=True).start()
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
-        empreinte = sentinel.fingerprint(self.agent.get("harness") or "", compte)
+        empreinte = sentinel.launch_fingerprint(self.agent.get("harness") or "", compte, env)
         #: L106 : le harnais n'a pas pu être exécuté (binaire disparu depuis
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
