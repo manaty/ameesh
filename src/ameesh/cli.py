@@ -1371,6 +1371,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schema     : %s" % cfg.schema)
     print("host       : %s" % cfg.host)
+    from . import persona_memory
+    from . import canon as canon_mod
+    policies = [(canon.id, persona_memory.isolation_policy(cfg, canon.registry_canon))
+                for canon in canon_mod.load_configured(cfg)]
+    exceptions = [ident for ident, policy in policies if policy == "shared-uid-accepted"]
+    print("memory     : %s" % ("shared-uid-accepted (approved canon: %s; no UID isolation)"
+                               % ", ".join(exceptions) if exceptions else
+                               "UID isolation required; active host peers disable transport"))
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)

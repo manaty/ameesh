@@ -36,6 +36,44 @@ class MemoryError(RuntimeError):
     pass
 
 
+def isolation_policy(cfg, canon_id: str | None = None) -> str:
+    """Only an approved Host card can opt into shared-UID memory transport."""
+    from . import canon as canon_mod
+    for canon in canon_mod.load_configured(cfg):
+        if not canon.readable or not canon.owns(canon_id):
+            continue
+        host = canon.host(cfg.host)
+        if (host is not None and not host.fiche.untrusted
+                and host.fiche.data.get("memory_isolation") == "shared-uid-accepted"):
+            source = next((s for s in canon.sources if s.member == host.fiche.member), None)
+            if source is not None and source.mode == "git":
+                branch = canon_mod.remote_branch(source.repo, source.rev)
+                approved = canon_mod.git_commit(source.repo, branch) if branch else None
+                if approved and canon_mod.git_contains(source.repo, source.commit, approved):
+                    return "shared-uid-accepted"
+    return "required"
+
+
+def require_isolation(cfg, db, agent: str) -> None:
+    rows = db.query("SELECT canon FROM agent_registry WHERE name = %s", (agent,))
+    if not rows:
+        raise MemoryError("unknown persona")
+    if isolation_policy(cfg, rows[0].get("canon")) == "shared-uid-accepted":
+        return
+    peers = db.query(
+        "SELECT name FROM agent_registry WHERE host = %s AND name <> %s "
+        "AND (status = 'running' OR (lease_owner IS NOT NULL AND "
+        "(lease_expires_at IS NULL OR lease_expires_at > clock_timestamp())))",
+        (cfg.host, agent))
+    # The registry has no verified per-persona OS UID. All active peers on this
+    # host are conservatively treated as sharing the executor's UID; 0700 does
+    # not provide isolation between them. Actual UID isolation is separate work.
+    if peers:
+        raise MemoryError("memory transport disabled: another active persona on this host "
+                          "may share UID %s; an approved Host memory_isolation exception "
+                          "is required" % os.getuid())
+
+
 def copy_dir(state_dir: str, agent: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}", agent):
         raise MemoryError("unsafe persona name")
@@ -60,18 +98,37 @@ def _git(path: str, *args: str, env=None, check: bool = True) -> subprocess.Comp
     return proc
 
 
-def open_copy(repository: str, state_dir: str, agent: str, *, cfg_raw=None) -> str:
-    """Open or refresh a private local working copy of the persona repository."""
-    path = copy_dir(state_dir, agent)
-    env = _git_env(cfg_raw)
-    if os.path.isdir(os.path.join(path, ".git")):
+def _safe_copy(path: str, repository: str | None = None) -> None:
+    """Reject links before reading memory or asking Git to transport it."""
+    if os.path.realpath(path) != os.path.abspath(path):
+        raise MemoryError("memory copy contains a symlink in its path")
+    if not os.path.isdir(os.path.join(path, ".git")) or os.path.islink(os.path.join(path, ".git")):
+        raise MemoryError("no safe open memory copy")
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            if os.path.islink(os.path.join(root, name)):
+                raise MemoryError("memory copy contains a symlink")
+        if root == path:
+            dirs[:] = [name for name in dirs if name != ".git"]
+    if repository is not None:
         existing = _git(path, "remote", "get-url", "origin").stdout.strip()
         same = (os.path.realpath(existing) == os.path.realpath(repository)
                 if os.path.exists(repository) else existing == repository)
         if not same:
             raise MemoryError("working copy belongs to a different memory repository")
+
+
+def open_copy(repository: str, state_dir: str, agent: str, *, cfg_raw=None) -> str:
+    """Open or refresh a private local working copy of the persona repository."""
+    path = copy_dir(state_dir, agent)
+    env = _git_env(cfg_raw)
+    if os.path.lexists(path) and os.path.realpath(path) != os.path.abspath(path):
+        raise MemoryError("memory copy contains a symlink in its path")
+    if os.path.isdir(os.path.join(path, ".git")):
+        _safe_copy(path, repository)
         os.chmod(path, 0o700)
         _git(path, "pull", "--rebase", "--autostash", "-q", env=env)
+        _safe_copy(path, repository)
         return path
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     proc = subprocess.run(["git", "clone", "-q", "--", repository, path], capture_output=True,
@@ -80,14 +137,17 @@ def open_copy(repository: str, state_dir: str, agent: str, *, cfg_raw=None) -> s
         shutil.rmtree(path, ignore_errors=True)
         raise MemoryError("memory clone failed: %s" % proc.stderr.strip()[-300:])
     os.chmod(path, 0o700)
+    _safe_copy(path, repository)
     _git(path, "config", "user.name", agent)
     _git(path, "config", "user.email", "%s@personas.ameesh.invalid" % agent)
     return path
 
 
 def index_text(path: str) -> str:
+    _safe_copy(path)
     try:
-        with open(os.path.join(path, INDEX), encoding="utf-8") as fh:
+        fd = os.open(os.path.join(path, INDEX), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, encoding="utf-8") as fh:
             lines = fh.read(INDEX_MAX_BYTES).splitlines()[:INDEX_MAX_LINES]
     except OSError:
         return ""
@@ -95,6 +155,7 @@ def index_text(path: str) -> str:
 
 
 def journal_path(path: str, session: str | None) -> str:
+    _safe_copy(path)
     stamp = session or time.strftime("session-%Y%m%dT%H%M%S")
     return os.path.join(path, "journal", "%s.md" % re.sub(r"[^A-Za-z0-9._-]", "-", stamp))
 
@@ -131,11 +192,47 @@ def secrets_in(path: str) -> list[str]:
 
 
 
-def sync(path: str, message: str, *, cfg_raw=None) -> dict:
+def _destructive_deletions(path: str, deleted: set[str], baseline: str) -> bool:
+    if any(name.startswith("journal/") for name in deleted):
+        return True
+    tracked = set(filter(None, _git(path, "ls-tree", "-r", "--name-only", "-z", baseline).stdout.split("\0")))
+    return bool(tracked and tracked <= deleted)
+
+
+def _outgoing_guard(path: str) -> dict | None:
+    commits = _git(path, "rev-list", "--reverse", "@{u}..HEAD").stdout.splitlines()
+    for revision in commits:
+        # Every outgoing snapshot is transported, even if a later commit removes
+        # its secret. Inspect commits made by the persona session as well.
+        tree = _git(path, "ls-tree", "-r", "-z", revision).stdout.split("\0")
+        if any(entry.startswith("120000 ") for entry in tree):
+            raise MemoryError("outgoing memory commit contains a symlink")
+        names = _git(path, "diff-tree", "--root", "-m", "-r", "--no-commit-id",
+                     "--name-only", "--diff-filter=ACMR", "-z", revision).stdout.split("\0")
+        suspects = []
+        for name in filter(None, names):
+            content = _git(path, "show", revision + ":" + name, check=False)
+            if content.returncode or any(p.search(content.stdout) for p in SECRET_PATTERNS):
+                suspects.append(name)
+        if suspects:
+            return {"status": "secret", "files": sorted(set(suspects))}
+        deleted = set(filter(None, _git(path, "diff-tree", "-m", "-r", "--no-commit-id",
+                                        "--name-only", "--diff-filter=D", "-z", revision).stdout.split("\0")))
+        parent = _git(path, "rev-parse", revision + "^", check=False)
+        if deleted and parent.returncode == 0 and _destructive_deletions(path, deleted, parent.stdout.strip()):
+            return {"status": "destructive", "files": sorted(deleted)}
+    return None
+
+
+def sync(path: str, message: str, *, cfg_raw=None, repository: str | None = None) -> dict:
     """Commit changes and push, preserving the working copy on failure."""
-    if not os.path.isdir(os.path.join(path, ".git")):
-        raise MemoryError("no open memory copy: %s" % path)
+    _safe_copy(path, repository)
     _git(path, "add", "-A")
+    deleted = set(filter(None, _git(path, "diff", "--cached", "--name-only",
+                                    "--diff-filter=D", "-z").stdout.split("\0")))
+    if deleted and _destructive_deletions(path, deleted, "HEAD"):
+        _git(path, "reset", "-q")
+        return {"status": "destructive", "files": sorted(deleted)}
     changed = bool(_git(path, "diff", "--cached", "--quiet", check=False).returncode)
     if changed:
         suspects = secrets_in(path)
@@ -143,12 +240,20 @@ def sync(path: str, message: str, *, cfg_raw=None) -> dict:
             _git(path, "reset", "-q")
             return {"status": "secret", "files": suspects}
         _git(path, "commit", "-q", "-m", message)
+    refused = _outgoing_guard(path)
+    if refused:
+        return refused
     # Retry an earlier committed-but-unpushed turn even when no file changed.
     ahead = _git(path, "rev-list", "--count", "@{u}..HEAD", check=False)
     env = _git_env(cfg_raw)
     push = _git(path, "push", "-q", env=env, check=False)
     if push.returncode != 0:
         pull = _git(path, "pull", "--rebase", "-q", env=env, check=False)
+        if pull.returncode == 0:
+            _safe_copy(path, repository)
+            refused = _outgoing_guard(path)
+            if refused:
+                return refused
         push = _git(path, "push", "-q", env=env, check=False) if pull.returncode == 0 else pull
     if push.returncode != 0:
         return {"status": "push_rejected", "error": (push.stderr or "").strip()[-300:]}
@@ -158,11 +263,11 @@ def sync(path: str, message: str, *, cfg_raw=None) -> dict:
 
 
 
-def close(path: str, *, cfg_raw=None) -> dict:
+def close(path: str, *, cfg_raw=None, repository: str | None = None) -> dict:
     """Push remaining work and remove the copy only after confirmed synchronization."""
     if not os.path.isdir(path):
         return {"status": "absent"}
-    r = sync(path, "memory: close working copy", cfg_raw=cfg_raw)
+    r = sync(path, "memory: close working copy", cfg_raw=cfg_raw, repository=repository)
     if r["status"] in ("unchanged", "pushed"):
         ahead = _git(path, "rev-list", "--count", "@{u}..HEAD", check=False)
         if ahead.returncode == 0 and ahead.stdout.strip() == "0":
@@ -195,7 +300,7 @@ ameesh memory close <persona>         push remaining work, then remove the local
 
 def main(argv) -> int:
     import sys
-    from . import db as db_mod, mail
+    from . import db as db_mod, identity, mail
     from .config import load as load_config
     if len(argv) != 2 or argv[0] not in ("status", "consolidate", "close"):
         print(USAGE, file=sys.stderr if argv and argv[0] not in ("-h", "--help") else sys.stdout)
@@ -204,6 +309,9 @@ def main(argv) -> int:
     cfg = load_config()
     db = db_mod.connect(cfg)
     try:
+        binding = identity.resolve_binding(cfg, db)
+        if (not binding.ok or binding.source not in ("runner", "session") or binding.name != agent):
+            raise MemoryError("a verified session bound to the requested persona is required")
         rows = db.query("SELECT memory_repository FROM agent_registry WHERE name = %s", (agent,))
         if not rows:
             print("ameesh memory: unknown persona %s" % agent, file=sys.stderr)
@@ -215,6 +323,7 @@ def main(argv) -> int:
                 agent, repo or "none (no memory.repository in its persona record)",
                 path if os.path.isdir(path) else "none"))
             if os.path.isdir(os.path.join(path, ".git")):
+                _safe_copy(path, repo)
                 state = _git(path, "status", "--short", check=False).stdout.strip()
                 ahead = _git(path, "rev-list", "--count", "@{u}..HEAD", check=False).stdout.strip()
                 print("uncommitted: %s\nunpushed: %s commit(s)" % (
@@ -224,13 +333,15 @@ def main(argv) -> int:
         if not repo:
             print("ameesh memory: %s has no memory repository" % agent, file=sys.stderr)
             return 2
+        require_isolation(cfg, db, agent)
         if sub == "consolidate":
             if not os.path.isdir(os.path.join(path, ".git")):
                 path = open_copy(repo, cfg.state_dir, agent, cfg_raw=cfg.persona_memory)
+            _safe_copy(path, repo)
             mail.send(db, "memory", agent, consolidation_prompt(path), kind="request")
             print("memory turn requested for %s" % agent)
             return 0
-        r = close(path, cfg_raw=cfg.persona_memory)
+        r = close(path, cfg_raw=cfg.persona_memory, repository=repo)
         print("copy for %s: %s" % (agent, r["status"]))
         return 0 if r["status"] in ("removed", "absent") else 1
     except MemoryError as exc:

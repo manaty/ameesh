@@ -2973,12 +2973,13 @@ class AgentWorker(threading.Thread):
         memory_preface = ""
         if not session and self.agent.get("memory_repository") and not self.runner.dry_run:
             try:
+                memory_mod.require_isolation(self.cfg, self.db, self.name)
                 path = memory_mod.open_copy(self.agent["memory_repository"],
                                             self.cfg.state_dir, self.name,
                                             cfg_raw=self.cfg.persona_memory)
                 journal_id = "session-" + uuid.uuid4().hex
                 memory_preface = memory_mod.preface(path, self.name, journal_id)
-            except (memory_mod.MemoryError, OSError, subprocess.SubprocessError) as exc:
+            except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
                 log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
         resume += memory_preface
         argv = adapter.command(resume + spec["prompt"], session,
@@ -3606,6 +3607,11 @@ class AgentWorker(threading.Thread):
         """Transport the persona session's memory changes at turn end, in the background."""
         if not self.agent.get("memory_repository") or self.runner.dry_run:
             return
+        try:
+            memory_mod.require_isolation(self.cfg, self.db, self.name)
+        except (memory_mod.MemoryError, db_mod.DbError) as exc:
+            log_async("[%s] persona memory disabled: %s" % (self.name, exc))
+            return
         path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
         if not os.path.isdir(os.path.join(path, ".git")):
             return
@@ -3616,12 +3622,15 @@ class AgentWorker(threading.Thread):
         def push_memory() -> None:
             try:
                 r = memory_mod.sync(path, "memory for %s: turn end" % self.name,
-                                     cfg_raw=self.cfg.persona_memory)
+                                     cfg_raw=self.cfg.persona_memory,
+                                     repository=self.agent["memory_repository"])
                 if r["status"] == "pushed":
                     log_async("[%s] persona memory pushed (%s)" % (self.name, r["commit"]))
                 elif r["status"] == "secret":
                     log_async("[%s] memory alert: likely secret in %s; commit refused"
                         % (self.name, ", ".join(r["files"])))
+                elif r["status"] == "destructive":
+                    log_async("[%s] memory alert: destructive deletions refused; copy kept" % self.name)
                 elif r["status"] == "push_rejected":
                     log_async("[%s] memory alert: push rejected; copy kept (%s)"
                         % (self.name, r["error"]))

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import dataclasses
+import io
 import shutil
 import subprocess
 import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
-from ameesh import persona_memory as pm
+from ameesh import cli, config as config_mod, db as db_mod, persona_memory as pm
 from ameesh.runner import AgentWorker
 
 
@@ -124,6 +127,82 @@ class WorkingCopyTest(_Repository):
         self.assertIn("note.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
         self.assertEqual(pm.close(path)["status"], "removed")
 
+    def test_cloned_index_symlink_cannot_inject_credentials(self):
+        seed = os.path.join(self.tmp, "seed")
+        secret = os.path.join(self.tmp, "credential")
+        with open(secret, "w") as fh:
+            fh.write("PRIVATE_CREDENTIAL_VALUE")
+        os.unlink(os.path.join(seed, "MEMORY.md"))
+        os.symlink(secret, os.path.join(seed, "MEMORY.md"))
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "malicious index")
+        git(seed, "push", "-q")
+        with self.assertRaisesRegex(pm.MemoryError, "symlink"):
+            self.open_copy()
+
+    def test_journal_and_index_links_refused_before_read_or_write(self):
+        path = self.open_copy()
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(path, "journal"))
+        with self.assertRaisesRegex(pm.MemoryError, "symlink"):
+            pm.journal_path(path, "s1")
+        with self.assertRaisesRegex(pm.MemoryError, "symlink"):
+            pm.sync(path, "unsafe")
+        os.unlink(os.path.join(path, "journal"))
+        os.unlink(os.path.join(path, "MEMORY.md"))
+        os.symlink(os.path.join(self.tmp, "seed", "MEMORY.md"), os.path.join(path, "MEMORY.md"))
+        with self.assertRaisesRegex(pm.MemoryError, "symlink"):
+            pm.index_text(path)
+
+    def test_whole_copy_and_archive_deletions_refused(self):
+        path = self.open_copy()
+        os.unlink(os.path.join(path, "MEMORY.md"))
+        self.assertEqual(pm.sync(path, "wipe")["status"], "destructive")
+        self.assertIn("MEMORY.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
+        git(path, "restore", "MEMORY.md")
+        os.makedirs(os.path.join(path, "journal"))
+        journal = pm.journal_path(path, "s1")
+        with open(journal, "w") as fh:
+            fh.write("archived fact")
+        self.assertEqual(pm.sync(path, "archive")["status"], "pushed")
+        os.unlink(journal)
+        self.assertEqual(pm.sync(path, "erase archive")["status"], "destructive")
+        self.assertIn("journal/s1.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
+
+    def test_session_committed_secrets_scanned_even_when_later_removed(self):
+        path = self.open_copy()
+        filename = os.path.join(path, "secret.md")
+        with open(filename, "w") as fh:
+            fh.write("sk-abcdefghijklmnopqrstuvwxyz0123")
+        git(path, "add", "-A")
+        git(path, "commit", "-qm", "session secret")
+        os.unlink(filename)
+        git(path, "add", "-A")
+        git(path, "commit", "-qm", "remove secret")
+        before = git(self.bare, "rev-parse", "main")
+        self.assertEqual(pm.sync(path, "clean index")["status"], "secret")
+        self.assertEqual(git(self.bare, "rev-parse", "main"), before)
+        self.assertEqual(pm.close(path)["status"], "kept")
+
+    def test_session_committed_wipe_refused(self):
+        path = self.open_copy()
+        os.unlink(os.path.join(path, "MEMORY.md"))
+        git(path, "add", "-A")
+        git(path, "commit", "-qm", "wipe")
+        before = git(self.bare, "rev-parse", "main")
+        self.assertEqual(pm.sync(path, "clean index")["status"], "destructive")
+        self.assertEqual(git(self.bare, "rev-parse", "main"), before)
+
+    def test_sync_checks_configured_repository_before_staging(self):
+        path = self.open_copy()
+        with open(os.path.join(path, "new.md"), "w") as fh:
+            fh.write("durable fact")
+        with self.assertRaisesRegex(pm.MemoryError, "different memory repository"):
+            pm.sync(path, "wrong repository", repository=os.path.join(self.tmp, "other.git"))
+        self.assertNotIn("new.md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
+        self.assertEqual(git(path, "diff", "--cached", "--name-only"), "")
+
     def test_repository_change_does_not_reuse_old_persona_memory(self):
         path = self.open_copy()
         other = os.path.join(self.tmp, "other.git")
@@ -132,6 +211,32 @@ class WorkingCopyTest(_Repository):
             pm.open_copy(other, self.state, "verif-a")
         self.assertTrue(os.path.isdir(path))
 
+
+
+class IsolationPolicyTest(_Repository):
+    def test_only_approved_host_setting_enables_exception_and_doctor_displays_it(self):
+        seed = os.path.join(self.tmp, "seed")
+        cfg = config_mod.Config(canon=seed, canon_ref="main", host="pc")
+        self.assertEqual(pm.isolation_policy(cfg), "required")
+        os.makedirs(os.path.join(seed, "hosts"))
+        card = os.path.join(seed, "hosts", "pc.md")
+        with open(card, "w") as fh:
+            fh.write("---\ntype: Host\ntitle: pc\nmemory_isolation: shared-uid-accepted\n---\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "owner exception")
+        self.assertEqual(pm.isolation_policy(cfg), "required")
+        git(seed, "push", "-q")
+        git(seed, "fetch", "-q")
+        self.assertEqual(pm.isolation_policy(cfg), "shared-uid-accepted")
+        unapproved = os.path.join(self.tmp, "unapproved-canon")
+        shutil.copytree(seed, unapproved, ignore=shutil.ignore_patterns(".git"))
+        self.assertEqual(pm.isolation_policy(dataclasses.replace(
+            cfg, canon=unapproved, canon_untrusted=True)), "required")
+        with mock.patch.object(cli.db_mod, "connect", side_effect=db_mod.Unavailable("test offline")), \
+                mock.patch('sys.stdout', io.StringIO()) as out:
+            self.assertEqual(cli.cmd_doctor(cfg, notify_test=False), 1)
+        self.assertIn("shared-uid-accepted", out.getvalue())
+        self.assertIn("no UID isolation", out.getvalue())
 
 
 class ExecutorTest(_Repository):
@@ -143,13 +248,14 @@ class ExecutorTest(_Repository):
         logs = []
         worker = types.SimpleNamespace(
             name="verif-a", agent={"memory_repository": self.bare},
-            runner=types.SimpleNamespace(dry_run=False),
+            runner=types.SimpleNamespace(dry_run=False), db=mock.Mock(),
             cfg=types.SimpleNamespace(state_dir=self.state, persona_memory={}))
         import ameesh.runner as runner_mod
         previous = runner_mod.log_async
         runner_mod.log_async = logs.append
         self.addCleanup(setattr, runner_mod, "log_async", previous)
-        AgentWorker._sync_memory(worker)
+        with mock.patch.object(pm, "require_isolation"):
+            AgentWorker._sync_memory(worker)
         for t in threading.enumerate():
             if t.name == "verif-a-memory":
                 t.join(30)
