@@ -197,7 +197,8 @@ Free text is admitted. The following values have a fixed meaning:
 - `/run/ameesh-gate/ack/ack.json`: the acknowledgement. Its directory is
   writable by the guest. The guard reads `ack.json` only: the guest may
   keep its own files there (the classic executor keeps `slots/`, which
-  counts `caps.max_concurrent` across all its executors on the host).
+  counts `caps.max_concurrent` across all its executors on the host, and
+  `parts/`, one part of the ack per executor, merged into `ack.json`).
 
 Both files are written to a temporary file, then renamed.
 

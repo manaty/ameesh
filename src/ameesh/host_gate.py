@@ -36,7 +36,11 @@ A lending host has a `file` gate by default; a classic host has none, and
 nothing changes there.
 
 The ack echoes the `seq` of the state it answers: the guard counts
-`drained` only for the seq it is draining (L159e).
+`drained` only for the seq it is draining (L159e). Every runner of the host
+shares `ack.json`: each publishes its own part (`parts/<id>.json`, alive
+while it holds the `flock` of `parts/<id>.lock`), and `ack.json` is their
+merge, under one lock: `in_turn` and `held` united, `drained` only when every
+live part is drained for that same seq.
 """
 from __future__ import annotations
 
@@ -47,6 +51,7 @@ import fcntl
 import json
 import math
 import os
+import secrets
 import select
 import threading
 import time
@@ -217,6 +222,63 @@ def _atomic_write(path: str, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _read_json(path: str) -> Any:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _without_ts(doc: Any) -> Any:
+    return {k: v for k, v in doc.items() if k != "ts"} if isinstance(doc, dict) else doc
+
+
+def merge_parts(directory: str, own: str) -> Optional[dict]:
+    """The host's ack from the parts of its live runners (`FileGate`), under
+    the caller's lock; None without this runner's own part. A part whose
+    `.lock` is free belongs to a dead runner: removed. An unreadable live part
+    keeps the host from being said drained."""
+    live: list = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        ident = name[:-len(".json")]
+        if ident != own:
+            try:
+                fd = os.open(os.path.join(directory, ident + ".lock"), os.O_RDWR | os.O_CLOEXEC)
+            except FileNotFoundError:
+                fd = -1
+            alive = False
+            if fd >= 0:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    alive = True
+                finally:
+                    os.close(fd)
+            if not alive:
+                for dead in (name, ident + ".lock"):
+                    try:
+                        os.unlink(os.path.join(directory, dead))
+                    except OSError:
+                        pass
+                continue
+        part = _read_json(os.path.join(directory, name))
+        live.append(part if isinstance(part, dict) else None)
+    mine = _read_json(os.path.join(directory, own + ".json"))
+    if not isinstance(mine, dict):
+        return None
+    readable = [p for p in live if p is not None]
+    merged = dict(mine)
+    merged["in_turn"] = sorted({n for p in readable for n in p.get("in_turn") or ()})
+    merged["held"] = sorted({n for p in readable for n in p.get("held") or ()})
+    merged["drained"] = all(
+        p is not None and p.get("seq") == mine.get("seq") and p.get("state") == mine.get("state")
+        and p.get("drained") is True for p in live)
+    return merged
+
+
 class SlotPool:
     """`caps.max_concurrent` per HOST, not per runner: each agent running on
     the host holds one slot, a file locked with `flock` in a folder every
@@ -343,6 +405,8 @@ class FileGate:
         self._clock = clock
         self._closed = threading.Event()
         self._rendered: tuple | None = None
+        #: this runner's part of the shared ack: (id, fd holding its flock)
+        self._part: tuple[str, int] | None = None
         self._last_seq = -1
         self._last_error = ""
         self._wake_r, self._wake_w = os.pipe()
@@ -407,20 +471,65 @@ class FileGate:
             self._sleep(min(left, self.poll))
 
     def acknowledge(self, ack: GateAck) -> bool:
-        """Writes the ack; never raises. False when it was not written: the
-        controller tries again at its next tick."""
+        """Writes this runner's part of the ack, then the merged ack; never
+        raises. False when it was not written: the controller tries again at
+        its next tick."""
         body = dataclasses.replace(ack, ts=ack.ts or self._clock()).to_json()
+        return self._publish(body)
+
+    def merge(self) -> bool:
+        """Rewrites the merged ack when another runner's part changed or
+        died (called at each tick); never raises."""
+        return self._publish(None) if self._part is not None else True
+
+    def _publish(self, body: dict | None) -> bool:
+        parts = os.path.join(os.path.dirname(self.ack_path) or ".", "parts")
+        lock = -1
         try:
-            _atomic_write(self.ack_path, body)
+            os.makedirs(parts, mode=0o700, exist_ok=True)
+            lock = os.open(os.path.join(parts, ".lock"),
+                           os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._part is None:
+                ident = "%d-%s" % (os.getpid(), secrets.token_hex(4))
+                fd = os.open(os.path.join(parts, ident + ".lock"),
+                             os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._part = (ident, fd)
+            if body is not None:
+                _atomic_write(os.path.join(parts, self._part[0] + ".json"), body)
+            merged = merge_parts(parts, self._part[0])
+            if merged is not None:
+                merged["ts"] = self._clock()
+                if _without_ts(_read_json(self.ack_path)) != _without_ts(merged):
+                    _atomic_write(self.ack_path, merged)
         except OSError as exc:
             self._log("host gate: ack not written (%s)" % exc)
             return False
+        finally:
+            if lock >= 0:
+                os.close(lock)
         return True
+
+    def _drop_part(self) -> None:
+        if self._part is None:
+            return
+        ident, fd = self._part
+        self._part = None
+        parts = os.path.join(os.path.dirname(self.ack_path) or ".", "parts")
+        for name in (ident + ".json", ident + ".lock"):
+            try:
+                os.unlink(os.path.join(parts, name))
+            except OSError:
+                pass
+        os.close(fd)
 
     def close(self) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
+        # the other runners' next merge leaves this one out
+        self._drop_part()
         try:
             os.write(self._wake_w, b"x")
         except OSError:
@@ -691,12 +800,19 @@ class GateController:
         key = (ack.seq, ack.state, ack.in_turn, ack.held, ack.drained)
         # published only once written: a failed write (full disk, folder
         # briefly missing) is retried at the next tick, `drained` included
-        if key != self._ack_key and self.gate.acknowledge(ack):
-            self._ack_key = key
-            self.acks = (self.acks + [ack])[-20:]
-            if drained:
-                self._log("host gate: drained (seq %d), no lease held, no background work"
-                          % state.seq)
+        if key != self._ack_key:
+            if self.gate.acknowledge(ack):
+                self._ack_key = key
+                self.acks = (self.acks + [ack])[-20:]
+                if drained:
+                    self._log("host gate: drained (seq %d), no lease held, no background "
+                              "work here" % state.seq)
+        else:
+            # the ack is shared by the host's runners: another one's part
+            # changed, or it died
+            merge = getattr(self.gate, "merge", None)
+            if merge is not None:
+                merge()
         return ack
 
 

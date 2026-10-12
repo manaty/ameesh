@@ -172,6 +172,56 @@ class FileGateTest(unittest.TestCase):
         self.assertTrue(any(sorted(v) == sorted(ack) for v in valid))
 
 
+    def read_ack(self) -> dict:
+        with open(self.ack, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_an_idle_runner_never_says_drained_for_a_busy_one(self):
+        # codex r2 #279: ack.json is shared by the host's runners, `drained`
+        # was computed by each alone: an idle one overwrote a busy one's ack
+        code = ("import sys, time; sys.path.insert(0, %r)\n"
+                "from ameesh import host_gate\n"
+                "gate = host_gate.FileGate(%r, %r, lending=True, fallback='stopped',"
+                " use_inotify=False)\n"
+                "gate.acknowledge(host_gate.GateAck(seq=3, state='draining',"
+                " in_turn=('busy',), held=('busy',)))\n"
+                "print('acked', flush=True)\n"
+                "time.sleep(60)\n" % (os.path.join(REPO, "src"), self.path, self.ack))
+        busy = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(busy.stdout.close)
+        self.addCleanup(busy.wait)
+        self.addCleanup(busy.kill)
+        self.assertEqual(busy.stdout.readline().strip(), "acked")
+        idle = self.gate(True)
+        self.addCleanup(idle.close)
+        self.assertTrue(idle.acknowledge(host_gate.GateAck(seq=3, state="draining",
+                                                           drained=True)))
+        ack = self.read_ack()
+        self.assertEqual((ack["seq"], ack["drained"], ack["held"], ack["in_turn"]),
+                         (3, False, ["busy"], ["busy"]))
+        # the busy runner dies: its part goes, the next merge says drained
+        busy.kill()
+        busy.wait()
+        self.assertTrue(idle.merge())
+        ack = self.read_ack()
+        self.assertEqual((ack["drained"], ack["held"]), (True, []))
+        parts = os.listdir(os.path.join(self.tmp, "ack", "parts"))
+        self.assertEqual(len([n for n in parts if n.endswith(".json")]), 1)  # the dead part went
+
+    def test_a_part_for_an_older_seq_is_not_drained(self):
+        first, second = self.gate(True), self.gate(True)
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        first.acknowledge(host_gate.GateAck(seq=2, state="draining", drained=True))
+        second.acknowledge(host_gate.GateAck(seq=3, state="draining", drained=True))
+        self.assertEqual((self.read_ack()["seq"], self.read_ack()["drained"]), (3, False))
+        first.acknowledge(host_gate.GateAck(seq=3, state="draining", drained=True))
+        self.assertTrue(self.read_ack()["drained"])
+        # a runner leaving (gate closed) takes its part away
+        first.close()
+        second.acknowledge(host_gate.GateAck(seq=4, state="draining", drained=True))
+        self.assertEqual((self.read_ack()["seq"], self.read_ack()["drained"]), (4, True))
+
 class SlotPoolTest(unittest.TestCase):
     """`caps.max_concurrent` per host: two runners share the cap."""
 
