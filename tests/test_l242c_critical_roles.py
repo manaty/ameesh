@@ -300,15 +300,17 @@ class Relecture424r2Test(unittest.TestCase):
         self.assertEqual(notify.key_of(un[0]), notify.key_of(deux[0]))
 
 
-class Relecture424r3Test(unittest.TestCase):
-    """#424 r3 : le cache des verdicts, fail-closed (une épreuve par P1)."""
+class _Cache(unittest.TestCase):
+    """Le cache des verdicts dans un dossier d'état neuf."""
 
     def setUp(self):
         import tempfile
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
         self.cfg = types.SimpleNamespace(critical_agents=(), canon="home", state_dir=self.tmp)
-        self.path = os.path.join(self.tmp, su.CRITICAL_MEMORY)
+        self.dir = os.path.join(self.tmp, su.CRITICAL_DIR)
+        self.path = os.path.join(self.dir, su.CRITICAL_DATA)
+        os.makedirs(self.dir, 0o700, exist_ok=True)
         self.rows = _rows()
 
     def fake(self, canons):
@@ -331,6 +333,10 @@ class Relecture424r3Test(unittest.TestCase):
                 else {"side_effect": OSError("git")})), \
                 mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
             return reprise._critical(self.cfg, self.rows[name])
+
+
+class Relecture424r3Test(_Cache):
+    """#424 r3 : le cache des verdicts, fail-closed (une épreuve par P1)."""
 
     def test_resume_rafraichit_le_cache(self):
         self.assertTrue(su.remember_critical(self.cfg, "codex1", False))
@@ -393,8 +399,97 @@ class Relecture424r3Test(unittest.TestCase):
         for f in fils:
             f.join()
         self.assertEqual(sorted(su.critical_memory(self.cfg)), noms)
-        self.assertEqual([f for f in os.listdir(self.tmp)
-                          if f not in (su.CRITICAL_MEMORY, su.CRITICAL_MEMORY + ".lock")], [])
+        self.assertEqual(os.listdir(self.dir), [su.CRITICAL_DATA])
+
+
+class Relecture424r4Test(_Cache):
+    """#424 r4 : une épreuve par P1 (corrompu jamais réécrit, absent vaut
+    inconnu, comparaison au disque, dossier validé, verrou jamais remplacé)."""
+
+    def write(self, text):
+        with open(self.path, "w") as fh:
+            fh.write(text)
+        os.chmod(self.path, 0o600)
+
+    def test_cache_corrompu_jamais_reecrit(self):
+        self.write("{pas du json")
+        self.assertFalse(su.remember_critical(self.cfg, "dev7", False))
+        with open(self.path) as fh:
+            self.assertEqual(fh.read(), "{pas du json")
+        self.assertTrue(self.outage("codex1"))
+        # une valeur invalide est gardée telle quelle : codex1 reste inconnu
+        self.write('{"codex1": null}')
+        self.assertTrue(su.remember_critical(self.cfg, "dev7", False))
+        self.assertTrue(self.outage("codex1"))
+        self.assertFalse(self.outage("dev7"))
+
+    def test_cache_absent_vaut_inconnu(self):
+        self.assertTrue(su.remember_critical(self.cfg, "codex1", True))
+        os.unlink(self.path)                              # effacé, ou masqué
+        self.assertTrue(self.outage("codex1"))
+        self.assertTrue(self.outage("dev7"))
+        import shutil
+        shutil.rmtree(self.dir)
+        self.assertTrue(self.outage("codex1"))
+
+    def test_l_executeur_compare_au_disque(self):
+        fake = self.fake([_Canon("A", CARTES)])
+        self.assertTrue(self.critical(fake, "codex1"))
+        # `resume` voit le rôle retiré et écrit False ; le rôle revient
+        self.assertFalse(self.resume("codex1", [_Canon("A", dict(CARTES, codex1=["dev"]))]))
+        self.assertFalse(su.critical_memory(self.cfg)["codex1"])
+        self.assertTrue(self.critical(fake, "codex1"))
+        self.assertTrue(su.critical_memory(self.cfg)["codex1"])
+        self.assertTrue(self.outage("codex1"))            # redémarré, en panne
+
+    def test_dossier_lie_ou_ouvert_aux_autres(self):
+        import shutil
+        ailleurs = os.path.join(self.tmp, "ailleurs")
+        os.mkdir(ailleurs, 0o700)
+        with open(os.path.join(ailleurs, su.CRITICAL_DATA), "w") as fh:
+            fh.write('{"codex1": false}')
+        os.chmod(os.path.join(ailleurs, su.CRITICAL_DATA), 0o600)
+        shutil.rmtree(self.dir)
+        os.symlink(ailleurs, self.dir)                    # parent lié : authentique, à nous
+        self.assertTrue(self.outage("codex1"))
+        self.assertFalse(su.remember_critical(self.cfg, "dev7", False))
+        os.unlink(self.dir)
+        os.rename(ailleurs, self.dir)
+        self.assertFalse(self.outage("codex1"))
+        os.chmod(self.dir, 0o755)                         # ouvert aux autres
+        self.assertTrue(self.outage("codex1"))
+        self.assertFalse(su.remember_critical(self.cfg, "dev7", False))
+
+    def test_verrou_jamais_remplace(self):
+        import json
+        import threading
+        self.assertTrue(su.remember_critical(self.cfg, "dev7", False))
+        en_pause, reprends = threading.Event(), threading.Event()
+        real = json.dump
+
+        def lent(obj, fh, **kw):
+            if "codex1" in obj and threading.current_thread().name == "A":
+                en_pause.set()
+                reprends.wait(5)
+            return real(obj, fh, **kw)
+        with mock.patch("json.dump", side_effect=lent):
+            a = threading.Thread(target=su.remember_critical, name="A",
+                                 args=(self.cfg, "codex1", True))
+            a.start()
+            self.assertTrue(en_pause.wait(5))
+            for dossier in (self.tmp, self.dir):          # le chemin du verrou remplacé
+                for nom in os.listdir(dossier):
+                    if nom.endswith("lock"):
+                        os.unlink(os.path.join(dossier, nom))
+            b = threading.Thread(target=su.remember_critical, name="B",
+                                 args=(self.cfg, "rev", True))
+            b.start()
+            b.join(1)
+            reprends.set()
+            a.join(5)
+            b.join(5)
+        memoire = su.critical_memory(self.cfg)
+        self.assertEqual((memoire["codex1"], memoire["rev"]), (True, True))
 
 
 if __name__ == "__main__":

@@ -114,8 +114,8 @@ CRITICAL_FALLBACK = ("orchestrateur", "mesh-design", "auditeur")
 #: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
 READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
 #: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
-#: relus par un exécuteur redémarré et par `ameesh resume`
-CRITICAL_MEMORY = "critical-known.json"
+#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
+#: leur dossier, `CRITICAL_DIR`)
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -432,52 +432,108 @@ def fully_read(canon) -> bool:
                    for f in getattr(canon, "load_findings", None) or ())
 
 
-#: L242c (#424 r3) : verdict perdu (cache illisible, corrompu, valeur invalide,
-#: fichier dont on ne peut pas se fier) — « inconnu » vaut critique
+#: L242c (#424 r3) : verdict perdu (cache absent, illisible, corrompu, valeur
+#: invalide, fichier ou dossier dont on ne peut se fier) — « inconnu » vaut
+#: critique
 UNKNOWN = "unknown"
+#: #424 r4 : le dossier du cache (0700, à nous ; verrouillé lui-même) et ses
+#: données (renommées seules)
+CRITICAL_DIR, CRITICAL_DATA = "critical-known", "known.json"
+
+
+class _Untrusted(OSError):
+    """#424 r4 : le dossier du cache n'est pas digne de confiance."""
 
 
 def _memory_path(cfg) -> str | None:
     state = getattr(cfg, "state_dir", None)
-    return os.path.join(state, CRITICAL_MEMORY) if state else None
+    return os.path.join(state, CRITICAL_DIR) if state else None
 
 
-def critical_memory(cfg) -> dict | None:
-    """Les derniers verdicts lus (`CRITICAL_MEMORY`) : {agent: True|False|None},
-    None pour une valeur invalide. {} sans fichier (rien n'a jamais été lu).
-    None (#424 r3, fail-closed) : fichier illisible, corrompu, ou dont on ne
-    peut se fier — lien symbolique (`O_NOFOLLOW`), pas un fichier ordinaire,
-    pas à nous, ou lisible par d'autres que nous."""
+def _memory_dir(cfg, *, create: bool) -> int | None:
+    """#424 r4 : le dossier du cache, ouvert sans suivre de lien
+    (`O_DIRECTORY|O_NOFOLLOW`, relatif au dossier d'état), à nous et en 0700 —
+    tout le reste s'ouvre relativement à lui (`dir_fd`) : un parent remplacé ou
+    lié ne redirige rien. None s'il n'existe pas (et `create` faux) ;
+    `_Untrusted` s'il n'est pas digne de confiance."""
+    import stat
+    state = os.open(cfg.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if create:
+            try:
+                os.mkdir(CRITICAL_DIR, 0o700, dir_fd=state)
+            except FileExistsError:
+                pass
+        try:
+            fd = os.open(CRITICAL_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, dir_fd=state)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:      # ELOOP / ENOTDIR : un lien, un fichier
+            raise _Untrusted("critical cache dir: %s" % exc) from exc
+    finally:
+        os.close(state)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        os.close(fd)
+        raise _Untrusted("critical cache dir: not ours, or not 0700")
+    return fd
+
+
+def _read_memory(folder: int):
+    """#424 r4 : `(état, données)` du cache dans le dossier `folder` : `missing`,
+    `ok` (le dict tel qu'écrit, valeurs invalides comprises) ou `corrupt`
+    (illisible, pas du JSON objet, lien, pas un fichier ordinaire, pas à nous,
+    lisible par d'autres)."""
     import json
     import stat
-    path = _memory_path(cfg)
-    if path is None:
-        return {}
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(CRITICAL_DATA, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=folder)
     except FileNotFoundError:
-        return {}
+        return "missing", None
     except OSError:
-        return None
+        return "corrupt", None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
                 or st.st_mode & 0o077:
-            return None
+            return "corrupt", None
         with os.fdopen(fd, "rb", closefd=False) as fh:
             data = json.loads(fh.read().decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
-        return None
+        return "corrupt", None
     finally:
         os.close(fd)
-    if not isinstance(data, dict):
+    return ("ok", data) if isinstance(data, dict) else ("corrupt", None)
+
+
+def critical_memory(cfg) -> dict | None:
+    """Les derniers verdicts lus : {agent: True|False|None}, None pour une
+    valeur invalide. {} sans dossier d'état configuré (la mémoire du processus
+    seule). None (fail-closed, tout y est inconnu) : cache absent (#424 r4 :
+    effacé ou masqué, jamais « rien n'a été lu »), illisible, corrompu, ou
+    dont on ne peut se fier (`_memory_dir`, `_read_memory`)."""
+    if _memory_path(cfg) is None:
+        return {}
+    try:
+        folder = _memory_dir(cfg, create=False)
+    except OSError:
+        return None
+    if folder is None:
+        return None
+    try:
+        state, data = _read_memory(folder)
+    finally:
+        os.close(folder)
+    if state != "ok":
         return None
     return {str(k): v if isinstance(v, bool) else None for k, v in data.items()}
 
 
 def remembered(memory: dict | None, name: str):
-    """Le dernier verdict lu de `name` : True, False, None (jamais lu), ou
-    `UNKNOWN` (perdu : vaut critique, `critical_verdict`)."""
+    """Le dernier verdict lu de `name` : True, False, None (jamais lu dans un
+    cache sain), ou `UNKNOWN` (perdu : vaut critique, `critical_verdict`)."""
     if memory is None:
         return UNKNOWN
     if name not in memory:
@@ -487,47 +543,53 @@ def remembered(memory: dict | None, name: str):
 
 
 def remember_critical(cfg, name: str, verdict: bool) -> bool:
-    """Retient le verdict lu de `name` ; vrai une fois écrit. Sous un verrou
-    (`flock`) : relecture, mise à jour, fichier temporaire unique, fsync,
-    renommage, mode 0600 (#424 r3). Ne lève jamais : l'appelant réessaie au
-    sondage suivant (sa mémoire ne suit qu'une écriture réussie)."""
+    """Retient le verdict lu de `name` ; vrai quand le disque le porte (déjà,
+    ou une fois écrit) — comparé au disque, jamais à la mémoire du processus
+    (#424 r4). Sous un verrou (`flock` sur le dossier lui-même, ouvert une
+    fois : aucun chemin de verrou à remplacer) : relecture, mise à jour, fichier temporaire exclusif, fsync, renommage des
+    seules données, fsync du dossier, mode 0600. Un cache corrompu n'est
+    jamais réécrit (il reste « inconnu », critique) ; ses valeurs invalides
+    sont gardées telles quelles. Ne lève jamais : l'appelant réessaie."""
     import fcntl
     import json
-    import tempfile
-    path = _memory_path(cfg)
-    if path is None:
+    if _memory_path(cfg) is None:
         return False
     try:
-        lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        folder = _memory_dir(cfg, create=True)
     except OSError:
         return False
+    if folder is None:
+        return False
+    tmp = None
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        known = critical_memory(cfg) or {}
+        fcntl.flock(folder, fcntl.LOCK_EX)
+        state, known = _read_memory(folder)
+        if state == "corrupt":
+            return False
+        known = dict(known or {})
         if known.get(name) is verdict:
             return True
         known[name] = verdict
-        fd, tmp = tempfile.mkstemp(prefix=".%s." % CRITICAL_MEMORY,
-                                   dir=os.path.dirname(path))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({k: v for k, v in known.items() if isinstance(v, bool)}, fh,
-                          sort_keys=True)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            return False
+        tmp = ".%s.%d.%s" % (CRITICAL_DATA, os.getpid(), os.urandom(6).hex())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o600, dir_fd=folder)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(known, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CRITICAL_DATA, src_dir_fd=folder, dst_dir_fd=folder)
+        tmp = None
+        os.fsync(folder)
         return True
     except OSError:
         return False
     finally:
-        os.close(lock)
+        if tmp is not None:
+            try:
+                os.unlink(tmp, dir_fd=folder)
+            except OSError:
+                pass
+        os.close(folder)
 
 
 def critical_by_role(row, canons) -> bool | None:

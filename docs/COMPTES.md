@@ -474,15 +474,24 @@ or was read only in part (a card or the manifest could not be read:
 criticality is never lowered silently: the last verdict read is kept, and
 without one, `orchestrateur`, `mesh-design` and the `auditeur` agent stay
 critical (plus `critical_agents`). The last verdicts are kept in the host's
-state (`critical-known.json`), so a restarted runner and `ameesh resume`
-read them too; `ameesh resume` refreshes them when the canon is readable.
-The file fails closed: unreadable, corrupt, an invalid value, or a file
-that cannot be trusted (a symbolic link, not a regular file, not owned by
-the runner's user, readable by others) means "last verdict unknown", which
-counts as critical. It is written under a lock (`critical-known.json.lock`),
-read-modify-write, through a unique temporary file, fsync, rename, mode
-0600; the runner trusts a verdict only once written, and tries again at the
-next poll otherwise. `ameesh alerts` raises `critical_roles_unreadable` for each
+state (`critical-known/known.json`), so a restarted runner and `ameesh resume`
+read them too; `ameesh resume` refreshes them when the canon is readable,
+and the runner compares each verdict it reads with the disk (never with its
+own memory). The cache fails closed: missing (deleted or hidden), unreadable,
+corrupt, an invalid value, or a file that cannot be trusted (a symbolic
+link, not a regular file, not owned by the runner's user, readable by
+others) means "last verdict unknown", which counts as critical. Its
+directory `critical-known/` is opened without following links, relative to
+the state directory, and must be owned by the runner's user with mode 0700;
+the data is opened relative to it, so a replaced or linked parent redirects
+nothing. It is written under a lock on that directory itself (`flock` on the
+descriptor already opened: no lock path to replace; only the data file is
+renamed), read-modify-write, through
+an exclusive temporary file, fsync, rename, fsync of the directory, mode
+0600; a corrupt file is never rewritten (delete it to start again: while it
+is missing, every agent counts as critical) and invalid values are kept as
+they are. The runner trusts a verdict only once written, and tries again
+at the next poll otherwise. `ameesh alerts` raises `critical_roles_unreadable` for each
 configured canon that cannot be read in full on the host; it stays one
 alert while the outage lasts.
 

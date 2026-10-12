@@ -5224,9 +5224,10 @@ class Runner:
             configured=bool(canon_mod.configured(self.cfg)), known=last)
         if not unknown:
             # #424 r3 : la mémoire ne suit qu'une écriture réussie (sinon
-            # nouvel essai au sondage suivant)
-            if last is not verdict and (su.remember_critical(self.cfg, name, verdict)
-                                        or su._memory_path(self.cfg) is None):
+            # nouvel essai au sondage suivant) ; #424 r4 : comparé au disque
+            # à chaque verdict, jamais à la mémoire (`resume` a pu l'écrire)
+            if (su.remember_critical(self.cfg, name, verdict)
+                    or su._memory_path(self.cfg) is None):
                 known[name] = verdict     # sans dossier d'état : la mémoire seule
         elif self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
             self._critical_held[name] = verdict
