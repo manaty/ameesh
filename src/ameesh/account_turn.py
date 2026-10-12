@@ -385,6 +385,14 @@ def continuity(worker) -> None:
     pas une session pour rien.
     """
     harness = _harness(worker)
+    session = worker.current_session()
+    if session and session_harness(worker) != harness:
+        # L242b (3) : la session a tourné sous un autre harnais (repli d'un
+        # agent critique, ou retour au sien) — jamais reprenable : rotation
+        # avec résumé sous l'ancien harnais, s'il y a du travail
+        if worker.peek():
+            rotate_harness(worker, session_harness(worker), harness, session)
+        return
     try:
         items = accounts.profiles(worker.cfg, harness)
     except accounts.AccountError:
@@ -475,14 +483,43 @@ def summary_possible(old, book, items, now: float | None = None, *,
     return True, ""
 
 
-def rotate(worker, harness: str, old, new, session: str) -> bool:
-    """Rotation avec résumé de reprise (mécanisme L11) pour une bascule de compte."""
-    nom_ancien = old.name if old is not None else "(removed)"
-    _log("[%s] account switch %s: session %s (account %s) cannot be resumed under %s — "
-         "rotation with summary" % (worker.name, harness, session, nom_ancien, new.name))
+def rotate_harness(worker, old_harness: str, new_harness: str, session: str) -> bool:
+    """L242b (3) : rotation avec résumé au changement de harnais. Le résumé se
+    fait sous l'ANCIEN harnais et le compte de la session (sans compte
+    déclaré : son environnement par défaut), seul à pouvoir la reprendre."""
+    try:
+        items = accounts.profiles(worker.cfg, old_harness)
+    except accounts.AccountError:
+        items = []
+    old = None
+    if items:
+        previous = _session_account(worker)
+        old = accounts.by_name(items, previous) if previous else legacy_profile(
+            old_harness, items)
+    new = getattr(worker, "_account", None)
+    new_label = "%s/%s" % (new_harness, new.name if new is not None else "(default)")
+    return rotate(worker, old_harness, old, new, session, new_label=new_label,
+                  undeclared=not items)
+
+
+def rotate(worker, harness: str, old, new, session: str, *, new_label: str | None = None,
+           undeclared: bool = False) -> bool:
+    """Rotation avec résumé de reprise (mécanisme L11) pour une bascule de compte.
+
+    L242b (3) : `new_label` (« codex/secondaire ») dit un changement de
+    harnais — `harness` est alors l'ANCIEN, sous lequel se fait le résumé ;
+    `undeclared` : l'ancien harnais n'a pas de compte déclaré (le résumé
+    tourne sous son environnement par défaut)."""
+    switch = new_label is not None
+    nom_ancien = old.name if old is not None else ("(default)" if undeclared else "(removed)")
+    nom_nouveau = new_label if switch else new.name
+    _log("[%s] %s %s: session %s (account %s) cannot be resumed under %s — "
+         "rotation with summary" % (worker.name, "harness switch from" if switch
+                                    else "account switch", harness, session, nom_ancien,
+                                    nom_nouveau))
     resume = ""
-    possible = old is not None and not accounts.check(old)
-    if possible:
+    possible = (old is not None and not accounts.check(old)) or (undeclared and old is None)
+    if possible and old is not None:
         # L39 : une jauge saturée de l'ancien compte ferait échouer le résumé ;
         # L226b : ni compte en échec d'authentification, ni plafond fixe
         # dépassé, ni overage — dans le doute, pas d'appel de modèle (brief
@@ -498,18 +535,22 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
         if not possible:
             _log("[%s] no summary under account %s: %s" % (worker.name, nom_ancien, raison))
     if possible:
-        # le résumé se fait sous l'ANCIEN compte, qui seul peut reprendre la session
+        # le résumé se fait sous l'ANCIEN compte (et l'ancien harnais), qui
+        # seul peut reprendre la session
         worker._account_override = old
+        if switch:
+            worker._harness_override = harness
         try:
             if worker.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT,
                                 "ids": []}):
                 resume = worker.turn_summary()  # L218 : entier, borné
         finally:
             worker._account_override = None
+            worker._harness_override = None
     sans_resume = not resume
     note = resume
     if sans_resume:
-        note = FALLBACK_RESUME % (session, nom_ancien, new.name)
+        note = FALLBACK_RESUME % (session, nom_ancien, nom_nouveau)
         # L39 (0030) : ancien compte inutilisable ou résumé en échec — brief de
         # reprise DÉTERMINISTE (registre, lots, fil, courrier, transcript), sans
         # appel de modèle ; le fil n'en garde que la mention.
@@ -519,7 +560,9 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
             resume = note + "\n\n" + reprise.deterministic_brief(
                 worker.cfg, worker.db, registry.get(worker.db, worker.name) or worker.agent,
                 session=session, account=old,
-                reason="account switch %s: %s → %s" % (harness, nom_ancien, new.name),
+                reason="%s %s: %s → %s" % ("harness switch from" if switch
+                                           else "account switch", harness, nom_ancien,
+                                           nom_nouveau),
                 consigne="This turn's instruction follows this brief: resume your work "
                          "from there, and end each turn with a clear status.")
         except Exception as exc:  # un brief manquant ne bloque jamais la rotation
@@ -540,6 +583,16 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
     worker.session_turns = 0
     worker.session_tokens = 0.0
     worker._compte_session = None
+    if switch:
+        worker._fil_note(
+            "Harness switch: session %s, opened under %s/%s, cannot be resumed under %s "
+            "(L242b: critical agent fallback, or back to its own harness). Rotation with "
+            "resume summary (L11)%s; the old id is kept in `session-history.jsonl`.\n\n%s"
+            % (session, harness, nom_ancien, nom_nouveau,
+               " — summary unavailable, resuming from a deterministic brief (L39)"
+               if sans_resume else "", note),
+            meta={"action": "harnais", "session": session, "continuite": "rotation"})
+        return True
     worker._fil_note(
         "Account switch %s: session %s, opened under account %s, cannot be "
         "resumed under account %s (separate session storage). Rotation with resume "
