@@ -239,6 +239,79 @@ class OfferTest(unittest.TestCase):
                 self.assertTrue(any(key in p for p in problems), problems)
                 self.assertEqual(unknown, [])
 
+    def test_disk_paths_are_absolute_normalized_and_unique(self):
+        # codex #459 r1: a relative, traversing, unnormalized or duplicated
+        # path reached the disk probe unchanged; each watched filesystem is
+        # named once, by an absolute normalized path (surrounding blanks are
+        # stripped, as for the other keys)
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for paths in (["../../outside"], ["srv/ameesh"], ["/", "/"],
+                      ["/srv/../etc"], ["/srv/"], ["//srv"], ["/srv//guest"], ["/."]):
+            with self.subTest(paths=paths):
+                offer, problems, unknown = capacity_guard.parse_lend(
+                    dict(base, reclaim={"disk_paths": paths}))
+                self.assertIsNone(offer)
+                self.assertTrue(any("disk_paths" in p for p in problems), problems)
+                self.assertEqual(unknown, [])
+        offer, problems, _ = capacity_guard.parse_lend(
+            dict(base, reclaim={"disk_paths": [" / ", "/srv/ameesh-guest"]}))
+        self.assertEqual(problems, [])
+        self.assertEqual(offer["reclaim"]["disk_paths"], ["/", "/srv/ameesh-guest"])
+
+    def test_disk_paths_refuse_nul(self):
+        # codex #459 r1: `disk_paths: ["/\u0000"]` was accepted, then
+        # `resources.disk_free` raised an uncaught ValueError ("embedded null
+        # byte") while measuring; the reader refuses it
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for path in ("/\x00", "/srv\x00/guest"):
+            with self.subTest(path=repr(path)):
+                offer, problems, _ = capacity_guard.parse_lend(
+                    dict(base, reclaim={"disk_paths": [path]}))
+                self.assertIsNone(offer)
+                self.assertTrue(any("disk_paths" in p for p in problems), problems)
+
+    def test_reclaim_sizes_are_positive_whole_bytes(self):
+        # codex #459 r1: `disk_free_min: 0` and `"0.5B"` were accepted as 0,
+        # and 0 free bytes were still above it: disk reclaim was disabled; a
+        # threshold is a size > 0, with a whole number of bytes
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for key in ("disk_free_min", "memory_available_min"):
+            for value in (0, 0.0, "0B", "0.5B", "1.5B", -1):
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertIsNone(offer)
+                    self.assertTrue(any(key in p for p in problems), problems)
+            offer, problems, _ = capacity_guard.parse_lend(
+                dict(base, reclaim={key: "4.5GiB"}))
+            self.assertEqual(problems, [])
+            self.assertEqual(offer["reclaim"][key], int(4.5 * GIB))
+
+    def test_reclaim_explicit_nulls_are_refused(self):
+        # codex #459 r1: an explicit null is not an absent key: a null
+        # `io_pressure_max` disabled the threshold and null disk keys fell
+        # back to the defaults, silently
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for key in ("io_pressure_max", "disk_free_min", "disk_paths",
+                    "memory_available_min", "cpu_pressure_max", "memory_pressure_max",
+                    "busy_units", "busy_max"):
+            with self.subTest(key=key):
+                offer, problems, unknown = capacity_guard.parse_lend(
+                    dict(base, reclaim={key: None}))
+                self.assertIsNone(offer)
+                self.assertTrue(any(key in p for p in problems), problems)
+                self.assertEqual(unknown, [])
+
+    def test_percent_is_a_single_sign(self):
+        # codex #459 r1: '20%%' parsed as 20% (rstrip removed every sign); the
+        # sign is single, and only at the end
+        self.assertEqual(resources.parse_percent("20%"), 20.0)
+        self.assertEqual(resources.parse_percent(" 20 % "), 20.0)
+        self.assertEqual(resources.parse_percent("20"), 20.0)
+        for text in ("20%%", "20 % %", "%%", "%20", "2%0", "20%%%"):
+            with self.subTest(text=text):
+                self.assertIsNone(resources.parse_percent(text))
+
     def test_parse_helpers_never_overflow(self):
         # codex #212 r4: the resources helpers the contract uses
         for value in (10 ** 400, "1" + "0" * 400, float("inf"), float("nan"), "inf", "nan"):

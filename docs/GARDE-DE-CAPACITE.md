@@ -95,10 +95,14 @@ policy:
   more digits than a float holds, `reclaim` included: the host lends nothing until its fiche is fixed. An unknown key
   is a `host-lend-unknown` warning, and the key is ignored.
 - Three `reclaim` keys drive the ameesh guard (L159e): `io_pressure_max`
-  (a percentage), `disk_free_min` (a size) and `disk_paths` (a non-empty
-  list of paths whose free space is watched). The reader knows and
-  validates them (L479), so they are no warning; a reader that does not
-  use them ignores them.
+  (a percentage), `disk_free_min` (a size > 0, with a whole number of
+  bytes) and `disk_paths` (a non-empty list of absolute, normalized
+  paths, without `..` or NUL, each filesystem watched once) whose free
+  space is watched. The reader knows and validates them (L479), so they
+  are no warning; a reader that does not use them ignores them. An
+  explicit null is refused for every `reclaim` key: it is not an absent
+  key, and it used to disable a threshold or fall back to a default,
+  silently. A `%` sign is single (`20%%` is not 20).
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 

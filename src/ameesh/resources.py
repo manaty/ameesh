@@ -187,10 +187,17 @@ def finite_float(value) -> float | None:
 
 
 def parse_percent(value) -> float | None:
-    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None."""
+    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None. Le signe
+    `%` est unique et à la fin (codex #459 r1 : « 20%% » n'est pas 20)."""
     if isinstance(value, str):
-        value = value.strip().rstrip("%").strip()
-    number = finite_float(value)
+        text = value.strip()
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        if "%" in text:
+            return None
+        number = finite_float(text)
+    else:
+        number = finite_float(value)
     if number is None or not 0.0 <= number <= 100.0:
         return None
     return number

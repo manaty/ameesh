@@ -91,12 +91,38 @@ class OfferTest(unittest.TestCase):
                {"cpu_max": float("nan")}, {"drain_seconds": True},
                {"reclaim": {"io_pressure_max": "120%"}},
                {"reclaim": {"disk_paths": "/"}},
+               # codex #459 r1: the reader refuses what the guard used to fix up
+               {"reclaim": {"disk_paths": ["/", "/"]}},
+               {"reclaim": {"disk_paths": ["../etc"]}},
+               {"reclaim": {"disk_paths": ["/\x00"]}},
+               {"reclaim": {"disk_free_min": 0}},
+               {"reclaim": {"io_pressure_max": None}},
                # L159e4: whole seconds >= 0
                {"restart_after_seconds": -1}, {"restart_after_seconds": 1.5},
                {"restart_after_seconds": True}, {"restart_after_seconds": "600"}]
         for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
             with self.assertRaises(guard.GuardError, msg=offer):
                 guard.parse_offer(offer)
+
+    def test_config_refuses_duplicate_json_keys(self):
+        # codex #459 r1: a duplicate JSON key silently overwrote ('10GiB'
+        # then 0: disk reclaim disabled); the config reader refuses
+        # duplicates, as the canon's YAML reader does
+        doc = ('{"host": "vm", "lend": {"cpu_max": 1, "memory_max": "1GiB",'
+               ' "disk_max": "1GiB", "reclaim": {"disk_free_min": "10GiB",'
+               ' "disk_free_min": 0}}}')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "guard.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            with self.assertRaises(guard.GuardError) as caught:
+                guard.load_config(path)
+            self.assertIn("duplicate key", str(caught.exception))
+            self.assertIn("disk_free_min", str(caught.exception))
+            # the same key once: the config loads, with the value read
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc.replace(', "disk_free_min": 0', ""))
+            self.assertEqual(guard.load_config(path).offer.disk_free_min, 10 * GIB)
 
     def test_exactly_the_offers_of_the_contract(self):
         # codex #211 r6: the guard reads the offer with the contract's reader;

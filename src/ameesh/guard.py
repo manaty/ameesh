@@ -301,11 +301,24 @@ class GuardConfig:
     work_path: str = DEFAULT_WORK_PATH
 
 
+def _strict_object(pairs):
+    """`object_pairs_hook` of the configuration reader: a duplicate key is an
+    error, never a silent overwrite (codex #459 r1: `disk_free_min` written
+    twice loaded as the last value, 0, which disables disk reclaim). The
+    canon's YAML reader refuses duplicates the same way."""
+    found: dict = {}
+    for key, value in pairs:
+        if key in found:
+            raise ValueError("duplicate key %r" % key)
+        found[key] = value
+    return found
+
+
 def load_config(path: str | None = None) -> GuardConfig:
     path = path or os.environ.get("AMEESH_GUARD_CONFIG") or DEFAULT_CONFIG
     try:
         with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
+            raw = json.load(fh, object_pairs_hook=_strict_object)
     except OSError as exc:
         raise GuardError("configuration %s unreadable: %s" % (path, exc.strerror or exc))
     except ValueError as exc:

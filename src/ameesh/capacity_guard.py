@@ -22,6 +22,7 @@ The guard itself (`ameesh guard`, L159e) and the common measure
 """
 from __future__ import annotations
 
+import os
 import re
 
 from . import resources as resources_mod
@@ -242,18 +243,39 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
     return (None if problems else offer), problems, unknown
 
 
+def _reclaim_path(value) -> str | None:
+    """One path of `disk_paths`: absolute, normalized, without `..` or NUL
+    (codex #459 r1). `resources.disk_free` probes it as written, so a
+    relative or traversing path would watch another filesystem than the one
+    the fiche names, and a NUL raises while measuring. Blanks around it are
+    stripped, as for the other keys."""
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if not path.startswith("/") or path.startswith("//") or "\x00" in path:
+        return None
+    if os.path.normpath(path) != path:
+        return None
+    return path
+
+
 def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
     """The thresholds of the application at which the guest gives way."""
     if not isinstance(raw, dict):
         return {}, ["mapping expected"], []
     out: dict = {}
     problems: list[str] = []
+    for key in RECLAIM_KEYS:
+        if key in raw and raw[key] is None:
+            # an explicit null is not an absent key: it used to disable the
+            # threshold or fall back to a default, silently (codex #459 r1)
+            problems.append("`%s`: value expected, explicit null refused" % key)
     for key in ("memory_available_min", "disk_free_min"):
         if raw.get(key) is None:
             continue
-        octets = resources_mod.parse_bytes(raw[key])
-        if octets is None:
-            problems.append("`%s`: size in bytes expected (e.g. %s)"
+        octets = resources_mod.parse_bytes(raw[key], decimal_ok=False)
+        if octets is None or octets <= 0:
+            problems.append("`%s`: size in bytes > 0 expected (e.g. %s)"
                             % (key, "6GiB" if key == "memory_available_min" else "10GiB"))
         else:
             out[key] = octets
@@ -267,11 +289,19 @@ def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
             out[key] = percent
     if raw.get("disk_paths") is not None:
         paths = raw["disk_paths"]
-        if not isinstance(paths, list) or not paths or not all(
-                isinstance(p, str) and p.strip() for p in paths):
-            problems.append("`disk_paths`: non-empty list of paths expected")
+        if not isinstance(paths, list) or not paths:
+            problems.append("`disk_paths`: non-empty list of absolute, normalized paths "
+                            "expected (e.g. [\"/\", \"/srv/ameesh-guest\"])")
         else:
-            out["disk_paths"] = [p.strip() for p in paths]
+            clean = [_reclaim_path(p) for p in paths]
+            if any(p is None for p in clean):
+                problems.append("`disk_paths`: absolute, normalized paths expected, "
+                                "without `..` or NUL (e.g. [\"/\", \"/srv/ameesh-guest\"])")
+            elif len(set(clean)) != len(clean):
+                problems.append("`disk_paths`: duplicate paths (each filesystem is "
+                                "watched once)")
+            else:
+                out["disk_paths"] = clean
     if raw.get("busy_units") is not None:
         units = raw["busy_units"]
         if isinstance(units, str):
