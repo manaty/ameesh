@@ -6,31 +6,41 @@
 # `disk_max 40GiB`. Run by the owner; an agent never changes a host's disks.
 # Every step is idempotent: run again, it does only what is missing.
 #
-#   volume-pilot.sh create [--dry-run]       from a workstation with `scw`:
+#   volume-pilot.sh create --project-id P [--dry-run]
+#                                            from a workstation with `scw`:
 #                                            the volume, then attached
 #   sudo volume-pilot.sh mount --volume-id ID [--dry-run]
 #                                            on the host: ext4 if the disk
 #                                            is blank, /etc/fstab, mounted
 #   sudo volume-pilot.sh check [--volume-id ID]  on the host: what is in place
 # Rollback, in this order (after `install-pilot.sh --uninstall`):
-#   sudo volume-pilot.sh unmount [--dry-run] on the host: unmounted, its
+#   sudo volume-pilot.sh unmount --volume-id ID [--dry-run]
+#                                            on the host: unmounted, its
 #                                            /etc/fstab line removed; the
 #                                            data stays on the volume
-#   volume-pilot.sh detach [--delete] [--dry-run]
+#   volume-pilot.sh detach --project-id P [--delete] [--dry-run]
 #                                            from the workstation: detached;
 #                                            --delete also deletes it (data
 #                                            lost, billing stops)
 #
 # Options:
 #   --dry-run            print every command and file, change nothing
+#   --project-id P       the ameesh Scaleway project (`scw account project
+#                        list`): every list is filtered by it and every
+#                        server or volume checked against it; never the
+#                        CLI's default project
 #   --volume-id ID       the volume (printed by `create`)
 #   --server NAME        the instance (default ameesh-agents-1)
 #   --zone Z             default fr-par-1
 #   --root DIR           mount point (default /srv/ameesh-guest)
 #
 # The disk is found by the volume's id (/dev/disk/by-id/scsi-0SCW_sbs_volume-ID),
-# never guessed. It is formatted only when it carries no signature at all;
-# an ext4 labelled ameesh-guest is kept as is; anything else is refused.
+# never guessed. It is formatted only when both probes (blkid, wipefs)
+# succeed and find no signature at all; a probe that fails refuses. An ext4
+# labelled ameesh-guest is kept as is; anything else is refused. /etc/fstab
+# is written last, once every check passed. `unmount` and `detach --delete`
+# act only on the pilot's volume: its name, project and size checked first,
+# the mounted filesystem's source and UUID too.
 # `disk_max` is not changed here: 40GiB is already install-pilot.sh's default
 # offer and the canon's (manaty/home#24); `check` compares it with the size.
 set -euo pipefail
@@ -42,6 +52,7 @@ SERVER=ameesh-agents-1
 ZONE=fr-par-1
 ROOT=/srv/ameesh-guest
 OPTS=defaults,nofail,x-systemd.device-timeout=30s
+PROJECT=
 VOLID=
 DRY=0
 DELETE=0
@@ -62,6 +73,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1; shift ;;
     --delete) DELETE=1; shift ;;
+    --project-id) PROJECT=${2:?}; shift 2 ;;
     --volume-id) VOLID=${2:?}; shift 2 ;;
     --server) SERVER=${2:?}; shift 2 ;;
     --zone) ZONE=${2:?}; shift 2 ;;
@@ -69,10 +81,15 @@ while [ $# -gt 0 ]; do
     *) die "unknown option $1" ;;
   esac
 done
-case "$VOLID" in ''|[0-9a-f]*-*-*-*-*) ;; *) die "invalid --volume-id $VOLID" ;; esac
-case "$VOLID" in *[!0-9a-f-]*) die "invalid --volume-id $VOLID" ;; esac
+uuid_like() {  # uuid_like OPTION VALUE: empty, or a lowercase UUID
+  case "$2" in ''|[0-9a-f]*-*-*-*-*) ;; *) die "invalid $1 $2" ;; esac
+  case "$2" in *[!0-9a-f-]*) die "invalid $1 $2" ;; esac
+}
+uuid_like --volume-id "$VOLID"
+uuid_like --project-id "$PROJECT"
 case "$ROOT" in /srv/?*) ;; *) die "--root under /srv expected" ;; esac
 case "$ROOT" in *[!A-Za-z0-9/._-]*|*/..*|*//*|*/) die "invalid --root $ROOT" ;; esac
+case "$SERVER" in ''|*[!A-Za-z0-9._-]*) die "invalid --server $SERVER" ;; esac
 [ "$DELETE" = 0 ] || [ "$MODE" = detach ] || die "--delete goes with detach"
 # the tests' dry runs read files of their own; a real run reads only these
 if [ "$DRY" = 1 ]; then
@@ -80,6 +97,8 @@ if [ "$DRY" = 1 ]; then
   BYID=${VOLUME_TEST_BYID:-$BYID}
   GUARD=${VOLUME_TEST_GUARD:-$GUARD}
 fi
+DIR=$ROOT   # the mount point's directory, read and removed
+[ "$DRY" = 0 ] || DIR=${VOLUME_TEST_DIR:-$DIR}
 
 # run CMD…: executes, or prints it under --dry-run
 run() {
@@ -88,24 +107,52 @@ run() {
 need_root() {
   [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 }
-# json EXPR: reads JSON on stdin, prints python's EXPR of it (`d`)
-json() { python3 -I -c "import json, sys; d = json.load(sys.stdin); print($1)"; }
+# json CODE ARG…: python CODE on the JSON read from stdin (`d`, the args `a`);
+# a shape it does not expect raises, and the script stops (set -e, pipefail)
+json() {
+  local code=$1; shift
+  python3 -I -c "import json, sys
+d = json.load(sys.stdin); a = sys.argv[1:]
+$code" "$@"
+}
 
 # ---- workstation (scw) ----------------------------------------------------
 
-# the volume's id, by its exact name; empty when there is none
+# the volumes named $NAME in the project, one id a line
 find_volume() {
-  scw block volume list name="$NAME" zone="$ZONE" -o json \
-    | json "'\n'.join(v['id'] for v in (d or []) if v['name'] == '$NAME')"
+  scw block volume list name="$NAME" project-id="$PROJECT" zone="$ZONE" -o json \
+    | json "assert isinstance(d, list), 'a list of volumes expected'
+print('\n'.join(v['id'] for v in d if v['name'] == a[0] and v['project_id'] == a[1]))" \
+      "$NAME" "$PROJECT"
 }
 find_server() {
-  scw instance server list name="$SERVER" zone="$ZONE" -o json \
-    | json "'\n'.join(s['id'] for s in (d or []) if s['name'] == '$SERVER')"
+  scw instance server list name="$SERVER" project-id="$PROJECT" zone="$ZONE" -o json \
+    | json "assert isinstance(d, list), 'a list of servers expected'
+print('\n'.join(s['id'] for s in d if s['name'] == a[0] and s['project'] == a[1]))" \
+      "$SERVER" "$PROJECT"
 }
-# the ids of the volumes attached to the server
+# the ids of the volumes attached to the server, which must be ours: a
+# failed fetch or another shape stops the script, never reads as "none"
 server_volumes() {
   scw instance server get "$1" zone="$ZONE" -o json \
-    | json "'\n'.join(v['id'] for v in (d.get('volumes') or {}).values())"
+    | json "assert d['id'] == a[0] and d['name'] == a[1] and d['project'] == a[2], \
+    'server %s is not %s in the project' % (d.get('id'), a[1])
+vols = d['volumes']
+assert isinstance(vols, dict), 'volumes: a mapping expected'
+ids = [v['id'] for v in vols.values()]
+assert all(isinstance(i, str) and i for i in ids), 'volume ids expected'
+print('\n'.join(ids))" "$1" "$SERVER" "$PROJECT"
+}
+# pilot_volume ID: the volume is the pilot's (name, project, size), or stop;
+# prints its status
+pilot_volume() {
+  scw block volume get "$1" zone="$ZONE" -o json \
+    | json "bad = [k for k, want in (('id', a[0]), ('name', a[1]), ('project_id', a[2]),
+                               ('size', int(a[3]))) if d.get(k) != want]
+if bad:
+    sys.exit('volume-pilot: volume %s is not the pilot volume (%s): refused'
+             % (a[0], ', '.join('%s %r' % (k, d.get(k)) for k in bad)))
+print(d['status'])" "$1" "$NAME" "$PROJECT" "$((SIZE_GB * 1000 ** 3))"
 }
 one() {  # one WHAT IDS: exactly one id, or none
   local n
@@ -115,23 +162,28 @@ one() {  # one WHAT IDS: exactly one id, or none
 
 if [ "$MODE" = create ] || [ "$MODE" = detach ]; then
   command -v scw >/dev/null || die "scw not found (a workstation with the scw CLI)"
+  [ -n "$PROJECT" ] || die "--project-id P (scw account project list): the CLI's default project is not used"
   srv=$(find_server); one servers "$srv"
-  [ -n "$srv" ] || die "no server $SERVER in $ZONE"
-  vol=${VOLID:-$(find_volume)}; one volumes "$vol"
+  [ -n "$srv" ] || die "no server $SERVER in $ZONE in project $PROJECT"
+  if [ -n "$VOLID" ]; then vol=$VOLID; else vol=$(find_volume); one volumes "$vol"; fi
+  status=
+  [ -z "$vol" ] || status=$(pilot_volume "$vol")
+  vols=$(server_volumes "$srv")
   attached=0
-  if [ -n "$vol" ] && server_volumes "$srv" | grep -qxF "$vol"; then attached=1; fi
+  if [ -n "$vol" ] && printf '%s\n' "$vols" | grep -qxF "$vol"; then attached=1; fi
 fi
 
 if [ "$MODE" = create ]; then
   if [ -z "$vol" ]; then
     run scw block volume create name="$NAME" perf-iops="$IOPS" \
-      from-empty.size="${SIZE_GB}GB" zone="$ZONE"
+      from-empty.size="${SIZE_GB}GB" project-id="$PROJECT" zone="$ZONE"
     if [ "$DRY" = 1 ]; then vol="<volume-id>"; else
       vol=$(find_volume); one volumes "$vol"
       [ -n "$vol" ] || die "volume $NAME not found after its creation"
+      pilot_volume "$vol" >/dev/null
     fi
   else
-    echo "volume $NAME: $vol (already there)"
+    echo "volume $NAME: $vol (already there, $status)"
   fi
   run scw block volume wait "$vol" zone="$ZONE"
   if [ "$attached" = 1 ]; then
@@ -145,15 +197,18 @@ if [ "$MODE" = create ]; then
 fi
 
 if [ "$MODE" = detach ]; then
-  [ -n "$vol" ] || { echo "no volume $NAME in $ZONE: nothing to do"; exit 0; }
+  [ -n "$vol" ] || { echo "no volume $NAME in $ZONE in project $PROJECT: nothing to do"; exit 0; }
   if [ "$attached" = 1 ]; then
-    echo "(on $SERVER first: sudo deploy/guest/volume-pilot.sh unmount)"
-    run scw instance server detach-volume volume-id="$vol" zone="$ZONE"
+    echo "(on $SERVER first: sudo deploy/guest/volume-pilot.sh unmount --volume-id $vol)"
+    run scw instance server detach-volume server-id="$srv" volume-id="$vol" zone="$ZONE"
   else
-    echo "volume $vol: not attached to $SERVER"
+    echo "volume $vol: not attached to $SERVER ($status)"
   fi
   if [ "$DELETE" = 1 ]; then
-    run scw block volume wait "$vol" zone="$ZONE"
+    # in use elsewhere: Scaleway refuses the deletion, it is refused here first
+    [ "$attached" = 1 ] || [ "$status" = available ] \
+      || die "volume $vol is $status, not attached to $SERVER: not deleted"
+    run scw block volume wait "$vol" terminal-status=available zone="$ZONE"
     run scw block volume delete "$vol" zone="$ZONE"
   fi
   exit 0
@@ -163,6 +218,12 @@ fi
 
 # our fstab line, for the filesystem UUID
 fstab_line() { printf 'UUID=%s %s ext4 %s 0 2\n' "$1" "$ROOT" "$OPTS"; }
+# not_ours UUID < fstab: the lines that are neither ours for UUID nor the
+# by-hand line of PILOT-ameesh-agents-1.md (LABEL=ameesh-guest, same options)
+not_ours() {
+  awk -v u="UUID=$1" -v l="LABEL=$NAME" -v p="$ROOT" -v o="$OPTS" \
+    '!(($1 == u || $1 == l) && $2 == p && $3 == "ext4" && $4 == o)'
+}
 # the fstab lines that mount something on $ROOT
 fstab_root() { awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p' "$FSTAB" 2>/dev/null || true; }
 # write_fstab < content: /etc/fstab replaced atomically, the first original
@@ -179,14 +240,35 @@ write_fstab() {
   mv -f "$FSTAB.tmp" "$FSTAB"
 }
 mounted_source() { findmnt -n -o SOURCE --mountpoint "$ROOT" 2>/dev/null || true; }
+# the UUID of the filesystem mounted on $ROOT; empty when none
+mounted_uuid() { findmnt -n -o UUID --mountpoint "$ROOT" 2>/dev/null || true; }
+# probe DEV: sets fstype, label and uuid from blkid's low-level probe; all
+# empty only when blkid says it found nothing (exit 2). Any other failure
+# (I/O error, ambiguous signatures, blkid missing) stops the script.
+probe() {
+  local out rc=0
+  fstype= label= uuid=
+  out=$(blkid -p -o export "$1" 2>&1) || rc=$?
+  case "$rc" in
+    0) ;;
+    2) return 0 ;;
+    *) die "$1: blkid failed ($rc): ${out:-no output}; refused" ;;
+  esac
+  fstype=$(printf '%s\n' "$out" | sed -n 's/^TYPE=//p')
+  label=$(printf '%s\n' "$out" | sed -n 's/^LABEL=//p')
+  uuid=$(printf '%s\n' "$out" | sed -n 's/^UUID=//p')
+  [ -n "$fstype" ] || die "$1: blkid found a signature without a type: refused"
+}
+# volume_dev: the volume's disk, by its id
+volume_dev() { printf '%s\n' "$BYID/scsi-0SCW_sbs_volume-$VOLID"; }
 
-if [ "$MODE" = mount ] || [ "$MODE" = check ]; then
+if [ "$MODE" != create ] && [ "$MODE" != detach ]; then
   [ "$MODE" = check ] || [ -n "$VOLID" ] || die "--volume-id ID (printed by create)"
 fi
 
 if [ "$MODE" = mount ]; then
   need_root
-  link=$BYID/scsi-0SCW_sbs_volume-$VOLID
+  link=$(volume_dev)
   for _ in $(seq 30); do [ -e "$link" ] && break; sleep 1; done
   [ -e "$link" ] || die "$link absent: is the volume attached (volume-pilot.sh create)?"
   dev=$(realpath -- "$link")
@@ -195,35 +277,47 @@ if [ "$MODE" = mount ]; then
   size=$(blockdev --getsize64 "$dev")
   [ "$size" -ge $((SIZE_GB * 1000 ** 3 * 95 / 100)) ] && [ "$size" -le $((SIZE_GB * 1000 ** 3 * 105 / 100)) ] \
     || die "$dev holds $size bytes, ${SIZE_GB} GB expected: refused"
-  fstype=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null || true)
-  label=$(blkid -p -s LABEL -o value "$dev" 2>/dev/null || true)
-  if [ -z "$fstype" ] && ! wipefs -n "$dev" 2>/dev/null | grep -q .; then
-    # nothing on it, not even a partition table: the new volume
-    run mkfs.ext4 -L "$NAME" "$dev"
+  probe "$dev"
+  format=0
+  if [ -z "$fstype" ]; then
+    # blkid found nothing; wipefs must succeed and list nothing either
+    sigs=$(wipefs -n "$dev" 2>&1) || die "$dev: wipefs failed: ${sigs:-no output}; refused"
+    [ -z "$sigs" ] || die "$dev carries a signature ($sigs): not formatted, refused"
+    format=1   # nothing on it, not even a partition table: the new volume
   elif [ "$fstype" = ext4 ] && [ "$label" = "$NAME" ]; then
-    echo "$dev: ext4 $NAME already there (kept)"
+    [ -n "$uuid" ] || die "$dev: ext4 without a UUID: refused"
   else
-    die "$dev carries ${fstype:-a signature} (label '${label}'): not formatted, refused"
+    die "$dev carries $fstype (label '${label}'): not formatted, refused"
   fi
-  uuid=$(blkid -p -s UUID -o value "$dev" 2>/dev/null || true)
-  [ -n "$uuid" ] || { [ "$DRY" = 1 ] && uuid="<uuid>"; } || die "$dev: no filesystem UUID"
-  want=$(fstab_line "$uuid")
+  # every check before anything changes: the mount point, its directory, fstab
   have=$(fstab_root)
+  src=$(mounted_source)
+  if [ -n "$src" ]; then
+    [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is already a mount point of $src"
+  elif [ -d "$DIR" ] && [ -n "$(ls -A -- "$DIR")" ]; then
+    die "$ROOT is not empty on the root disk: the volume would hide it; move it first"
+  fi
+  if [ "$format" = 1 ]; then
+    [ -z "$have" ] || die "$FSTAB already mounts something on $ROOT: $have"
+    run mkfs.ext4 -L "$NAME" "$dev"
+    if [ "$DRY" = 1 ]; then uuid="<uuid>"; else
+      probe "$dev"
+      [ "$fstype" = ext4 ] && [ -n "$uuid" ] || die "$dev: no ext4 UUID after mkfs"
+    fi
+  else
+    echo "$dev: ext4 $NAME already there (kept)"
+  fi
+  want=$(fstab_line "$uuid")
   if [ "$have" = "$want" ]; then
     echo "$FSTAB: $ROOT already there"
   elif [ -n "$have" ]; then
     die "$FSTAB already mounts something else on $ROOT: $have"
-  else
-    { cat "$FSTAB"; printf '%s\n' "$want"; } | write_fstab
   fi
-  src=$(mounted_source)
+  # fstab last, then the mount
+  [ "$have" = "$want" ] || { cat "$FSTAB"; printf '%s\n' "$want"; } | write_fstab
   if [ -n "$src" ]; then
-    [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is already a mount point of $src"
     echo "$ROOT: already mounted"
   else
-    if [ -d "$ROOT" ] && [ -n "$(ls -A "$ROOT")" ]; then
-      die "$ROOT is not empty on the root disk: the volume would hide it; move it first"
-    fi
     run install -d -m 0755 "$ROOT"
     run systemctl daemon-reload
     run mount "$ROOT"
@@ -235,18 +329,27 @@ fi
 if [ "$MODE" = check ]; then
   ok=1
   src=$(mounted_source)
+  muuid=
   if [ -z "$src" ]; then
     echo "$ROOT: NOT mounted"; ok=0
   else
     echo "$ROOT: mounted, $src, $(findmnt -n -o FSTYPE,SIZE --mountpoint "$ROOT")"
-    if [ -n "$VOLID" ] && [ "$(realpath -- "$src")" != "$(realpath -m -- "$BYID/scsi-0SCW_sbs_volume-$VOLID")" ]; then
+    if [ -n "$VOLID" ] && [ "$(realpath -- "$src")" != "$(realpath -m -- "$(volume_dev)")" ]; then
       echo "$ROOT: NOT the volume $VOLID"; ok=0
     fi
+    muuid=$(mounted_uuid)
+    [ -n "$muuid" ] || { echo "$ROOT: NO filesystem UUID"; ok=0; }
   fi
-  case "$(fstab_root | grep -c .)" in
-    1) echo "$FSTAB: $(fstab_root)" ;;
-    *) echo "$FSTAB: NOT one line for $ROOT"; ok=0 ;;
-  esac
+  lines=$(fstab_root)
+  if [ "$(printf '%s' "$lines" | grep -c . || true)" != 1 ]; then
+    echo "$FSTAB: NOT one line for $ROOT"; ok=0
+  elif [ -n "$muuid" ] && [ "$lines" != "$(fstab_line "$muuid")" ]; then
+    # the line must mount the filesystem mounted now, with our options
+    echo "$FSTAB: $lines"
+    echo "$FSTAB: NOT the mounted filesystem's line, expected: $(fstab_line "$muuid")"; ok=0
+  else
+    echo "$FSTAB: $lines"
+  fi
   if [ -r "$GUARD" ] && [ -n "$src" ]; then
     size=$(findmnt -bn -o SIZE --mountpoint "$ROOT")
     python3 -I - "$GUARD" "$size" <<'EOF' || ok=0
@@ -269,18 +372,27 @@ if [ "$MODE" = unmount ]; then
   need_root
   active=$(systemctl list-units 'ameesh-guest-runner@*' --state=active --no-legend 2>/dev/null || true)
   [ -z "$active" ] || die "guest runners still active (install-pilot.sh --uninstall first): $active"
-  if [ -n "$(mounted_source)" ]; then
-    run umount "$ROOT"
-  else
-    echo "$ROOT: not mounted"
+  # the volume's filesystem, by its disk: what is mounted on $ROOT and the
+  # fstab line must be that one, or nothing is touched
+  link=$(volume_dev)
+  [ -e "$link" ] || die "$link absent: the volume is not attached here; $FSTAB and $ROOT left as they are"
+  dev=$(realpath -- "$link")
+  probe "$dev"
+  [ "$fstype" = ext4 ] && [ "$label" = "$NAME" ] && [ -n "$uuid" ] \
+    || die "$dev is not the ext4 $NAME (${fstype:-no signature}, label '${label}'): nothing touched"
+  src=$(mounted_source)
+  if [ -n "$src" ]; then
+    [ "$(realpath -- "$src")" = "$dev" ] || die "$ROOT is a mount point of $src, not of the volume $VOLID: nothing touched"
+    [ "$(mounted_uuid)" = "$uuid" ] || die "$ROOT: mounted UUID $(mounted_uuid), not $uuid: nothing touched"
   fi
-  # only our line: its mount point, type and options
+  # the fstab lines on $ROOT must all be ours before anything changes
+  others=$(not_ours "$uuid" < "$FSTAB" | awk -v p="$ROOT" '$1 !~ /^#/ && $2 == p')
+  [ -z "$others" ] || die "$FSTAB mounts something else on $ROOT: $others; nothing touched"
+  if [ -n "$src" ]; then run umount "$ROOT"; else echo "$ROOT: not mounted"; fi
   if [ -n "$(fstab_root)" ]; then
-    awk -v p="$ROOT" -v o="$OPTS" '!($1 ~ /^UUID=/ && $2 == p && $3 == "ext4" && $4 == o)' "$FSTAB" \
-      | write_fstab
+    not_ours "$uuid" < "$FSTAB" | write_fstab
     run systemctl daemon-reload
   fi
-  [ -z "$(fstab_root)" ] || [ "$DRY" = 1 ] || die "$FSTAB still mounts something on $ROOT (not ours): left as is"
-  if [ -d "$ROOT" ] && [ -z "$(ls -A "$ROOT")" ]; then run rmdir "$ROOT"; fi
-  echo "next, from the workstation: deploy/guest/volume-pilot.sh detach [--delete]"
+  if [ -d "$DIR" ] && [ -z "$(ls -A -- "$DIR")" ]; then run rmdir "$ROOT"; fi
+  echo "next, from the workstation: deploy/guest/volume-pilot.sh detach --project-id P [--delete]"
 fi

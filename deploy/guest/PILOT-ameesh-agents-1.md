@@ -48,19 +48,24 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   first:
 
   ```sh
-  deploy/guest/volume-pilot.sh create                     # workstation, scw
+  deploy/guest/volume-pilot.sh create --project-id <project-id>   # workstation, scw
   sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>   # host
   sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
   ```
 
-  It finds the disk by the volume's id, formats it only when blank, and
-  writes the fstab line with the filesystem's UUID. By hand, from a
+  `--project-id` is the ameesh project (`scw account project list`): every
+  list is filtered by it, the server and the volume checked against it,
+  never the CLI's default project. It finds the disk by the volume's id,
+  formats it only when both probes (`blkid`, `wipefs`) succeed and find
+  nothing, and writes the fstab line with the filesystem's UUID last, once
+  the mount point is checked free and empty. By hand, from a
   workstation with the `scw` CLI configured for the ameesh project:
 
   ```sh
-  scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB zone=fr-par-1
+  scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB \
+    project-id=<project-id> zone=fr-par-1
   scw block volume wait <volume-id> zone=fr-par-1          # until "available"
-  scw instance server list name=ameesh-agents-1 zone=fr-par-1
+  scw instance server list name=ameesh-agents-1 project-id=<project-id> zone=fr-par-1
   scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
     volume-type=sbs_volume zone=fr-par-1
   ```
@@ -72,7 +77,7 @@ sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
   lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
   sudo mkfs.ext4 -L ameesh-guest /dev/<new disk>
   sudo mkdir -p /srv/ameesh-guest
-  echo 'LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2' \
+  echo "UUID=$(sudo blkid -p -s UUID -o value /dev/<new disk>) /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2" \
     | sudo tee -a /etc/fstab
   sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
   findmnt /srv/ameesh-guest                                # the volume, 40 GB
@@ -160,6 +165,9 @@ through a symbolic link is refused: give the resolved path. The install refuses 
 holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
 deepseek6 and deepseek1 back on manaty-mesh-1 (its `max_agents` back to 2) and removes `policy.lend`, and
 the host's login role (L56) is dropped. The volume: `sudo
-deploy/guest/volume-pilot.sh unmount` on the host, then
-`deploy/guest/volume-pilot.sh detach [--delete]` from the workstation
-(`--delete`: its data lost, its billing stopped).
+deploy/guest/volume-pilot.sh unmount --volume-id <volume-id>` on the host
+(only that volume's filesystem, by its source and UUID; its fstab line, or
+an older by-hand `LABEL=ameesh-guest` one), then
+`deploy/guest/volume-pilot.sh detach --project-id <project-id> [--delete]`
+from the workstation (`--delete`: its data lost, its billing stopped; only
+the pilot's volume, its name, project and size checked).
