@@ -308,6 +308,47 @@ class StateTest(unittest.TestCase):
         clock[0] = 40.0 + self.cfg.offer.calm_seconds
         self.assertEqual(g.step()["level"], 0)
 
+    def test_ack_never_blocks_the_guard(self):
+        # codex #211 r3: the guest replaces ack.json with a FIFO and keeps its
+        # writer open; a symlink or a huge file is refused too
+        import threading
+        os.makedirs(os.path.dirname(self.cfg.ack_path))
+        os.mkfifo(self.cfg.ack_path)
+        writer = os.open(self.cfg.ack_path, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, writer)
+        result = []
+        reader = threading.Thread(target=lambda: result.append(
+            guard.read_ack(self.cfg.ack_path)), daemon=True)
+        reader.start()
+        reader.join(2.0)
+        self.assertFalse(reader.is_alive(), "read_ack blocked on a FIFO")
+        self.assertEqual(result, [None])
+        os.remove(self.cfg.ack_path)
+        target = os.path.join(self.tmp, "elsewhere.json")
+        with open(target, "w") as fh:
+            json.dump({"schema": "ameesh-host-ack/1", "seq": 3, "drained": True}, fh)
+        os.symlink(target, self.cfg.ack_path)
+        self.assertIsNone(guard.read_ack(self.cfg.ack_path))
+        os.remove(self.cfg.ack_path)
+        with open(self.cfg.ack_path, "w") as fh:
+            json.dump({"schema": "ameesh-host-ack/1", "seq": 3,
+                       "in_turn": ["x" * 1000] * 100}, fh)
+        self.assertIsNone(guard.read_ack(self.cfg.ack_path))
+        self._ack(seq=3, drained=True)
+        self.assertEqual(guard.read_ack(self.cfg.ack_path)["seq"], 3)
+
+    def test_measure_keeps_what_the_guard_measured(self):
+        # codex #211 r3: L159d leaves busy and app_disk_free_bytes null; the
+        # guard's own readings are published
+        if getattr(guard.resources, "measure", None) is None:
+            self.skipTest("resources.measure comes with L159d")
+        reading = dict(self.reading, busy=5, app_disk_free_bytes=GIB)
+        state = guard.build_state(self.cfg, guard.Decision(1, "app_busy", 0.0), 1, 100.0,
+                                  reading=reading)
+        self.assertEqual((state["measure"]["busy"], state["measure"]["app_disk_free_bytes"]),
+                         (5, GIB))
+        self.assertEqual(state["measure"]["cpu_count"], 8)
+
     def test_ill_typed_ack_counts_as_none(self):
         # codex #211 r1: the guest writes the acknowledgement; `"in_turn": 1`
         # used to raise a TypeError that killed the guard

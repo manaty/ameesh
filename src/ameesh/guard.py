@@ -52,6 +52,7 @@ import datetime as dt
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -514,9 +515,16 @@ def measure_of(reading: dict) -> dict:
     found = getattr(resources, "measure", None)
     if found is not None:
         try:
-            return found(reading, None)
+            out = dict(found(reading, None))
         except Exception:  # noqa: BLE001
-            pass
+            out = None
+        if out is not None:
+            # what the guard measured itself (busy units, application disks)
+            # and L159d leaves null
+            for key, value in out.items():
+                if value is None and not isinstance(reading.get(key), (dict, type(None))):
+                    out[key] = reading[key]
+            return out
     keys = ("cpu_count", "mem_total_bytes", "mem_available_bytes", "swap_used_bytes",
             "disk_free_bytes", "app_disk_free_bytes", "busy", "guest_mem_bytes",
             "app_cpu", "guest_cpu")
@@ -581,10 +589,40 @@ def write_state(path: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
+#: the largest acknowledgement the guard reads (a real one is under 1 KiB)
+ACK_MAX_BYTES = 64 * 1024
+
+
+def read_guest_json(path: str, limit: int = ACK_MAX_BYTES) -> dict | None:
+    """A JSON object from a file the guest may replace: never blocks (no
+    FIFO, device or symlink: a regular file only, opened without waiting),
+    never reads more than `limit` bytes. None otherwise."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, limit + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        return None
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def read_ack(path: str) -> dict | None:
     """The guest's acknowledgement (`ameesh-host-ack/1`), None if absent,
     unreadable or ill-typed: the guest writes it, the guard never trusts it."""
-    ack = read_json(path)
+    ack = read_guest_json(path)
     if not ack or ack.get("schema") != SCHEMA_HOST_ACK:
         return None
     seq, in_turn = ack.get("seq"), ack.get("in_turn")
