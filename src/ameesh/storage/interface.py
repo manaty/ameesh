@@ -99,6 +99,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    open_lots_activity turns record_gauges gauge_history
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
+   lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
    watches         put delete list deliver
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
@@ -221,9 +222,12 @@ class Agents(Domain):
         """Note l'instant du dernier réveil d'événements."""
 
     @abc.abstractmethod
-    def set_session(self, name: str, session_id: str, account: str | None = None) -> None:
+    def set_session(self, name: str, session_id: str, account: str | None = None, *,
+                    harness: str | None = None, cwd: str | None = None) -> None:
         """Enregistre la session du harnais et le compte sous lequel elle tourne
-        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré)."""
+        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré).
+        #408 : `harness`/`cwd` donnés, ceux de son ouverture (`session_origin`
+        = la session) ; sinon son origine est inconnue."""
 
     @abc.abstractmethod
     def set_session_account(self, name: str, account: str | None) -> bool:
@@ -467,7 +471,9 @@ class TurnCosts(Domain):
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
                cum_output_tokens: int | None, account: str | None = None,
-               spend_key: str | None = None, void_reason: str | None = None,
+               spend_key: str | None = None, source: str | None = None,
+               executor: str | None = None, lease_owner: str | None = None,
+               lease_epoch: int | None = None, void_reason: str | None = None,
                price_fallback: str | None = None,
                cache_write_tokens: int | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
@@ -478,14 +484,20 @@ class TurnCosts(Domain):
         migration 0043) : la ligne naît écartée des sommes ; `price_fallback`
         (L225, migration 0059) : tour facturé au repli prudent ;
         `cache_write_tokens` (L225, 0059) : écritures de cache Claude du tour ;
-        None = colonne non écrite. Vrai si la ligne est écrite."""
+        None = colonne non écrite. Vrai si la ligne est écrite.
+        `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
+        0064) : `relay` pour la mesure du relais de modèle, `device` pour la
+        déclaration d'un appareil médié (hors plafond) ; None = colonnes non
+        écrites (`source` vaut alors `harness`)."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
               harnesses: Sequence[str] | None, account: str | None = None) -> float:
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
-        ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+        ces harnais seulement si donnés, de ce compte seulement si donné (L30).
+        Les lignes `source = 'device'` (L111) ne comptent jamais : la dépense
+        d'un appareil médié est celle que le relais a mesurée."""
 
     @abc.abstractmethod
     def spent_between(self, from_ts: float, to_ts: float, *,
@@ -661,7 +673,7 @@ class Credentials(Domain):
                fingerprint: str | None = None,
                expect_failures: int | None = None) -> dict:
         """Records `state` (healthy | failing | unknown) from `source`
-        (sentinel | turn | manual); `failing_since` is kept while failing and
+        (sentinel | turn | manual | relay); `failing_since` is kept while failing and
         cleared otherwise; `expires_at` (epoch, None = unknown) is the
         credential's forecast expiry, overwritten on each report. A `failing`
         report stamps `last_failure_at`, stores `fingerprint` (of the
@@ -1016,17 +1028,20 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
-    def reserve_migration(self, item_id: int, number: int | None, floor: int, *,
-                          note: str, actor: str, release: bool = False) -> dict | None:
-        """L122 : réserve un numéro de migration au lot ouvert (journalisé) :
-        `number` s'il est donné, sinon le prochain libre, au moins `floor`
-        et au-delà des numéros déjà réservés, sous verrou. `note` peut citer `%(number)04d`. None si le
-        lot n'est plus ouvert ; DbError si le numéro est pris par un autre.
+    def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
+                          floor: int, *, note: str, actor: str,
+                          release: bool = False) -> dict | None:
+        """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
+        ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
+        de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
+        l'index unique : deux réservations simultanées ne prennent jamais le
+        même numéro. `note` peut citer `%(number)04d`. None si le lot n'est
+        plus ouvert ; DbError si `number` est pris par un autre lot.
         `release` libère la réservation."""
 
     @abc.abstractmethod
-    def migration_holder(self, number: int) -> dict | None:
-        """L122 : le lot (id, titre, état) qui a réservé ce numéro."""
+    def migration_holder(self, number: int, repo: str) -> dict | None:
+        """L122 : le lot (id, titre, état) qui a réservé ce numéro du dépôt."""
 
     @abc.abstractmethod
     def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,
@@ -2077,7 +2092,7 @@ class Operations(Domain):
 
     #: colonnes réglables par `set_settings` (liste fermée)
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
-                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds")
+                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "lot_wake")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds")
@@ -2542,6 +2557,68 @@ class SessionBindings(Domain):
 
 
 # --------------------------------------------------------------------------
+# sessions mises de côté par lot et réveils sur lot actionnable (L165b, #408)
+# --------------------------------------------------------------------------
+
+class LotSessions(Domain):
+    """Une ligne par (agent, lot) : la session mise de côté pour ce lot
+    (`session_id` et le harnais, le compte et le dossier sous lesquels seuls
+    elle se reprend), et les réveils de l'exécuteur sur ce lot (règle 1).
+    La session ACTIVE reste au registre (`session_id`, `session_work_item`)."""
+
+    #: lots que la règle 1 reprend
+    ACTIONABLE_STATES = ("intake", "build")
+    #: note de lot qui retient le réveil (`ameesh work note N "hold: …"`)
+    HOLD_PREFIX = "hold:"
+
+    @abc.abstractmethod
+    def switch(self, name: str, owner: str, epoch: int, *, to_lot: str,
+               harness: str | None, account: str | None, cwd: str | None,
+               current: str | None = None) -> dict | None:
+        """Change le lot de la session active, **fencé par le bail**, en une
+        transaction : la session active `current` est mise de côté pour le lot
+        de session noté au registre (s'il est un lot encore ouvert et assigné
+        à l'agent), avec l'origine notée à son OUVERTURE (`session_harness`,
+        `session_cwd`, `session_account` si `session_origin` est `current` ;
+        inconnue sinon, elle ne sera pas reprise) ; puis celle mise de côté
+        pour `to_lot` devient active si ce lot est encore ouvert et assigné à
+        l'agent et qu'elle a été ouverte sous les harnais `harness`, compte
+        `account` (celui du prochain tour) et dossier `cwd` (sinon elle est
+        écartée et la session active est vide : une session neuve s'ouvrira).
+        Rend `{resumed, parked, discarded, discard_reason}` (identifiants ou
+        None ; raison `origin` ou `lot`), ou None si le bail n'est plus le
+        nôtre (rien n'est écrit)."""
+
+    @abc.abstractmethod
+    def listing(self, name: str | None = None) -> list[dict]:
+        """Les lignes (d'un agent), avec `parked_ts`, `last_wake_ts`,
+        `wake_activity_ts`."""
+
+    @abc.abstractmethod
+    def actionable(self, name: str, *, today: str | None = None) -> list[dict]:
+        """Les lots de l'agent que la règle 1 peut reprendre, par priorité
+        puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
+        `today`, ni en attente d'une décision (demande non lue, jalon de
+        décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
+        (la dernière note du lot). Chaque ligne : `id`, `title`, `state`,
+        `priority`, `activity_ts` (dernier signe de vie du lot : lot, journal,
+        pointe de branche, courrier sur le lot), `wakes`, `last_wake_ts`,
+        `wake_activity_ts`."""
+
+    @abc.abstractmethod
+    def note_wake(self, name: str, lot: int, activity_ts: float | None) -> dict:
+        """Note un réveil de l'agent sur le lot, horloge de la base : le
+        compte repart à 1 si le lot a vécu depuis le réveil précédent
+        (`activity_ts` plus récent que `wake_activity_at`), sinon il croît.
+        Rend la ligne."""
+
+    @abc.abstractmethod
+    def purge(self, name: str | None = None) -> list[dict]:
+        """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
+        sont plus assignés à leur agent ; rend les lignes supprimées."""
+
+
+# --------------------------------------------------------------------------
 # résultats de CI relevés en direct (`ci_runs`, `ci_test_failures`, L161c)
 # --------------------------------------------------------------------------
 
@@ -2702,6 +2779,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
     action_source: ActionSource

@@ -37,10 +37,16 @@ from __future__ import annotations
 
 from .interface import Storage
 from .postgres import PostgresStorage
+from .remote.client import RemoteDb
 
 __all__ = ["Storage", "PostgresStorage", "of"]
 
 
 def of(db) -> Storage:
-    """Le stockage lié à cette connexion (ou à cette transaction ouverte)."""
+    """Le stockage lié à cette connexion (ou à cette transaction ouverte).
+
+    L109 : une connexion d'exécuteur médié (`storage.remote`) rend son
+    stockage distant (`/api/exec/v1`)."""
+    if isinstance(db, RemoteDb):
+        return db.storage
     return PostgresStorage(db)

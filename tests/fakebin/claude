@@ -97,7 +97,8 @@ def main() -> int:
         time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
     if os.environ.get("AMEESH_TEST_KILL_SELF"):
         os.kill(os.getpid(), signal.SIGKILL)
-    session = "claude-sess-1"
+    # #408 : une session neuve peut porter un autre id (une session par lot)
+    session = os.environ.get("AMEESH_TEST_NEW_SESSION") or "claude-sess-1"
     if "--resume" in args:
         session = args[args.index("--resume") + 1]
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session,

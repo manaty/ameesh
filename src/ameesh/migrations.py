@@ -73,6 +73,73 @@ def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
 
 #: chemin des migrations dans le dépôt ameesh
 REPO_PATH = "src/ameesh/migrations"
+#: le dépôt d'ameesh lui-même : seul à compter aussi les migrations du paquet
+AMEESH_REPO = "manaty/ameesh"
+#: un numéro pris dans un dépôt : tout nom qui commence par des chiffres et `_`,
+#: quel que soit le reste (`377_receipt+fix.sql`, `360_restore.sql`)
+_REPO_FILE_RE = re.compile(r"^(\d+)_")
+#: `owner/repo` GitHub, sans le suffixe `.git`
+_SLUG_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+#: l'URL courte ssh : `[user@]github.com:owner/repo[.git]`
+_SCP_RE = re.compile(r"^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):(?!/)(.+)$")
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Où un dépôt range ses migrations, et sur combien de chiffres (#443)."""
+
+    repo: str
+    directory: str
+    width: int = 4
+
+    def label(self, number: int) -> str:
+        return "%0*d" % (self.width, number)
+
+    def file(self, number: int) -> str:
+        return "%s/%s_<name>.sql" % (self.directory, self.label(number))
+
+
+#: dépôts connus ; un autre se déclare dans `radar.projects.<p>` (`github`,
+#: `migrations`) de la configuration de l'hôte
+LAYOUTS = {
+    AMEESH_REPO: Layout(AMEESH_REPO, REPO_PATH, 4),
+    "manaty/nexlink": Layout("manaty/nexlink", "supabase/migrations", 3),
+}
+
+
+def repo_key(repo: str | None) -> str:
+    """La clé d'un dépôt `owner/repo` : sans espaces, en minuscules (GitHub ne
+    distingue pas la casse ; une seule suite par dépôt)."""
+    return (repo or "").strip().lower()
+
+
+def layout_for(repo: str, cfg=None) -> Layout | None:
+    """La disposition des migrations du dépôt `owner/repo`, ou None."""
+    repo = repo_key(repo)
+    known = LAYOUTS.get(repo)
+    for project in _radar_projects(cfg):
+        if repo_key(project.github) == repo and project.migrations:
+            return Layout(repo, project.migrations, known.width if known else 4)
+    return known
+
+
+def _radar_projects(cfg) -> list:
+    if cfg is None:
+        return []
+    from . import radar
+
+    try:
+        return list(radar.settings_of(cfg).projects.values())
+    except radar.SettingsError:
+        return []
+
+
+def checkout_for(repo: str, cfg=None) -> str | None:
+    """Un clone local de `repo` déclaré à l'hôte (`radar.projects.<p>.repo`)."""
+    for project in _radar_projects(cfg):
+        if repo_key(project.github) == repo_key(repo) and os.path.isdir(project.repo):
+            return project.repo
+    return None
 
 
 def numbered(names) -> dict[int, list[str]]:
@@ -95,22 +162,70 @@ def _git(repo: str, *args: str) -> str:
         return ""
 
 
-def highest_known(repo: str | None = None, directory: str = MIGRATIONS_DIR) -> int:
-    """Le plus haut numéro de migration connu : celles du paquet installé et,
-    dans le dépôt `repo` (défaut : le dépôt git courant s'il contient
-    `src/ameesh/migrations`), celles de l'arbre de travail et de TOUTES les
-    branches locales et distantes — une PR ouverte compte, même sans
-    réservation (lots antérieurs à L122). Rien n'est récupéré (pas de fetch)."""
-    names = [n for n in os.listdir(directory)] if os.path.isdir(directory) else []
-    top = _git(repo or os.getcwd(), "rev-parse", "--show-toplevel").strip()
-    if top and os.path.isdir(os.path.join(top, REPO_PATH)):
-        names += os.listdir(os.path.join(top, REPO_PATH))
-        refs = _git(top, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
-        for ref in refs.split():
-            if ref.endswith("/HEAD"):
-                continue
-            names += _git(top, "ls-tree", "--name-only", ref, REPO_PATH + "/").split()
-    return max(numbered(names) or [0])
+def github_repo(url: str) -> str | None:
+    """Le dépôt `owner/repo` (minuscules) d'une URL git dont l'hôte est
+    exactement github.com : https, ssh:// ou forme courte `git@github.com:`.
+    None pour tout autre hôte ou chemin (pas de recherche de sous-chaîne)."""
+    from urllib.parse import urlsplit
+
+    url = (url or "").strip()
+    if "://" in url:
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "http", "ssh", "git"):
+            return None
+        host, path = (parts.hostname or ""), parts.path.lstrip("/")
+    else:
+        match = _SCP_RE.match(url)
+        if not match:
+            return None
+        host, path = match.group(1), match.group(2)
+    if host.lower() != "github.com":
+        return None
+    match = _SLUG_RE.match(path)
+    return repo_key("%s/%s" % match.groups()) if match else None
+
+
+def origin_repo(checkout: str) -> str | None:
+    """Le dépôt GitHub `owner/repo` de l'`origin` d'un clone, ou None."""
+    return github_repo(_git(checkout, "remote", "get-url", "origin"))
+
+
+def toplevel(path: str) -> str:
+    return _git(path, "rev-parse", "--show-toplevel").strip()
+
+
+def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = None,
+                 package: str = MIGRATIONS_DIR) -> dict[int, list[str]]:
+    """Numéro → endroits où il existe dans le dépôt : l'arbre de travail et
+    TOUTES les branches locales et distantes du clone (une PR ouverte compte,
+    même sans réservation) ; pour ameesh, le paquet installé aussi. Les refs
+    de la branche `skip_branch` (celle du lot) ne comptent pas, ni l'arbre de
+    travail s'il est sur elle. Rien n'est récupéré (pas de fetch)."""
+    found: dict[int, list[str]] = {}
+
+    def add(names, where):
+        for name in names:
+            match = _REPO_FILE_RE.match(os.path.basename(name))
+            if match:
+                found.setdefault(int(match.group(1)), []).append(
+                    "%s:%s" % (where, os.path.basename(name)))
+
+    if layout.repo == AMEESH_REPO and os.path.isdir(package):
+        add(os.listdir(package), "package")
+    skip = {"refs/heads/" + skip_branch} if skip_branch else set()
+    head = _git(checkout, "symbolic-ref", "-q", "HEAD").strip()
+    directory = os.path.join(checkout, layout.directory)
+    if os.path.isdir(directory) and head not in skip:
+        add(os.listdir(directory), "worktree")
+    refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+    for ref in refs.split():
+        if ref.endswith("/HEAD") or ref in skip or (
+                skip_branch and ref.startswith("refs/remotes/")
+                and ref.split("/", 3)[-1] == skip_branch):
+            continue
+        add(_git(checkout, "ls-tree", "--name-only", ref, layout.directory + "/").split(),
+            ref.split("/", 2)[-1])
+    return found
 
 
 def applied(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:

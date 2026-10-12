@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """`ameesh --version`, `ameesh version` et la ligne de version de `ameesh
-doctor` : la version du paquet, read par importlib.metadata (repli sur le
+doctor` : la version du paquet, lue par importlib.metadata (repli sur le
 pyproject.toml de l'arbre source)."""
 from __future__ import annotations
 

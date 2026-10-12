@@ -1,0 +1,91 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "family": "actions",
+ "cases": [
+  {
+   "name": "actions.get/ok",
+   "op": "actions.get",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "actions.get",
+     "args": [
+      "act_01J9ZK3B7EQ4M8RTXW2HC5NVDA"
+     ],
+     "kwargs": {
+      "with_receipts": false
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "action_id": "act_01J9ZK3B7EQ4M8RTXW2HC5NVDA",
+      "state": "proposed",
+      "connector": "github",
+      "operation": "merge_pr",
+      "proposed_by": "inge-front"
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "actions.propose/ok",
+   "op": "actions.propose",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "1e2c3872-9e35-5823-bb8b-fc16594fb7d3"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "actions.propose",
+     "args": [],
+     "kwargs": {
+      "action_id": "act_01J9ZK3B7EQ4M8RTXW2HC5NVDA",
+      "project": "site",
+      "work_item": 812,
+      "proposed_by": "inge-front",
+      "connector": "github",
+      "operation": "merge_pr",
+      "target": "owner/repo#812",
+      "args_json": "{}",
+      "action_class": "reversible",
+      "amount": null,
+      "currency": null,
+      "policy_version": "1",
+      "digest": "sha256:3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e",
+      "dedupe": "guaranteed",
+      "requires_receipt": true,
+      "approvers_json": "[]",
+      "note": "fusion après revue"
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}
