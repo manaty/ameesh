@@ -251,7 +251,7 @@ class ReponseTest(_Base):
         self.assertEqual(decisions.pending(self.db), [])
         notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
         self.assertTrue(any("decision #1 answered by human:alice (cli): option a" in n
-                            and "le lot revient en build" in n for n in notes), notes)
+                            and "the work item returns to build" in n for n in notes), notes)
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "b")
         self.assertIn("already answered by human:alice", str(ctx.exception))
@@ -344,7 +344,7 @@ class SignatureTest(_Base):
         agent_key = self.owner_key("relais", role="agent")
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "a", key_path=agent_key, approver="relais")
-        self.assertIn("clé propriétaire", str(ctx.exception))
+        self.assertIn("owner key", str(ctx.exception))
         # dans le chat : jamais de signature
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "a", channel="chat", key_path=agent_key)
@@ -445,9 +445,9 @@ class IdentiteTest(_Base):
         cas = [({}, {}, "unknown chat session"),
                ({"pid": os.getpid()}, {"AMEESH_CHAT_PID": "x"}, "without a process"),
                ({"started_at": 12.0}, {}, "PID reused"),
-               ({"human": BOB}, {}, "celui de human:bob"),
-               ({}, {"AMEESH_RUNNER_ID": "r1"}, "incohérente"),
-               ({}, {"AGENT_MAIL_NAME": "orch"}, "incohérente")]
+               ({"human": BOB}, {}, "belongs to human:bob"),
+               ({}, {"AMEESH_RUNNER_ID": "r1"}, "inconsistent chat session"),
+               ({}, {"AGENT_MAIL_NAME": "orch"}, "inconsistent chat session")]
         for record, env, attendu in cas:
             with self.subTest(attendu=attendu):
                 path = self.chat_record(**record) if record else None

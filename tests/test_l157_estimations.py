@@ -223,7 +223,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertIsNotNone(item["estimate_ts"])
         hist = storage.of(self.db).work.estimates(item["id"])
         self.assertEqual([(h["minutes"], h["estimated_by"]) for h in hist], [(90, "orch")])
-        self.assertIn("estimation : 1 h 30", work.events(self.db, item["id"])[0]["note"])
+        self.assertIn("estimate: 1 h 30", work.events(self.db, item["id"])[0]["note"])
         # un humain : avertissement, pas refus
         proc = self.mesh("work", "add", "--title", "par un humain", "--actor", "human:o")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -336,7 +336,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(everything["excluded"]["no_estimate"], 1)
         proc = self.mesh("work", "estimates", "--app", "p")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("PAR AUTEUR D'ESTIMATION", proc.stdout)
+        self.assertIn("BY ESTIMATE AUTHOR", proc.stdout)
 
     def test_projects_colonne_duree(self):
         lot = work.add(self.db, title="Vue", assignee="dev1", estimate="1h")

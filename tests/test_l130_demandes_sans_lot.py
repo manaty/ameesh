@@ -147,7 +147,7 @@ class UnrecordedTest(PgTestCase):
         self.assertIn("ameesh work add", proc.stdout)
         proc = self.mesh("work", "unrecorded", "--since", "hier")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("--since illisible", proc.stderr)
+        self.assertIn("unreadable --since", proc.stderr)
         # aucune écriture : la commande ne touche ni au courrier ni aux lots
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM work_items")[0]["n"], 0)
 
