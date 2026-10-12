@@ -148,6 +148,8 @@ BOOT_SETTLE_MAX_S = 1800.0
 BOOT_REVIEW_EVERY_S = 60.0
 #: #220 r3 : lignes revues au plus par passage (la suite au passage suivant)
 BOOT_REVIEW_MAX_ROWS = 2000
+#: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
+BOOT_REVIEW_START = ("running", 0)
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -899,6 +901,26 @@ class AgentWorker(threading.Thread):
     # -- choix du travail --------------------------------------------------
     def idle_due(self) -> bool:
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
+
+    def _moved_before_turn(self, spec: dict) -> bool:
+        """L147b (codex r4 de #220, r1 de #283) : le placement est relu après
+        `pick()`, juste avant le tour de travail — une rotation (taille, lot,
+        bascule de compte dans `pick()`) a pu y faire un tour de résumé, pendant
+        lequel le canon a placé l'agent ailleurs ; aucun tour de travail ne part
+        alors d'ici. La consigne prise par `pick()` est remise en attente (le
+        courrier n'est pas consommé par `pick()`), y compris si la base tombe
+        pendant ce contrôle (`_consigne_a_restaurer`, repris au retour de la
+        base). Vrai : le worker rend son bail."""
+        self._consigne_a_restaurer = spec.get("kind") == "prompt"
+        ailleurs = self.placed_elsewhere()
+        if ailleurs and self._consigne_a_restaurer:
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        self._consigne_a_restaurer = False
+        if not ailleurs:
+            return False
+        log("[%s] placed on host %s, not %s, before the work turn: no turn here, "
+            "lease released" % (self.name, ailleurs, self.runner.host))
+        return True
 
     def placed_elsewhere(self) -> str:
         """L147: the host the registry places this agent on, when it is not
@@ -3517,6 +3539,10 @@ class AgentWorker(threading.Thread):
             self.maybe_rotate()
             spec = self.rotate_for_lot(self.pick())
             if spec:
+                # #283 r2 : la même garde que `run()` — une rotation a pu
+                # déplacer l'agent ; la consigne reste alors en attente
+                if self._moved_before_turn(spec):
+                    return False
                 self.run_turn(spec)
                 return True
             if self.stopping.is_set() or time.monotonic() >= deadline:
@@ -3550,6 +3576,8 @@ class AgentWorker(threading.Thread):
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
                     spec = self.rotate_for_lot(self.pick())
+                    if spec is not None and self._moved_before_turn(spec):
+                        break
                 except db_mod.Unavailable as exc:
                     self._panne_de_base(exc, "choosing the turn")
                     continue
@@ -3718,8 +3746,8 @@ class Runner:
         #: L147 (#220 r2) : prochaine revue des lignes d'avant le démarrage
         #: (horloge monotone), tant que leur solde attend les conteneurs
         self.boot_review_at: float | None = None
-        #: et l'id d'où reprend la revue suivante (0 : depuis le début)
-        self._boot_review_after = 0
+        #: et où reprend la revue suivante (phase, dernier id)
+        self._boot_review_after = BOOT_REVIEW_START
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -4830,26 +4858,34 @@ class Runner:
             return []
         try:
             turns = storage.of(self.db).turn_resources
-            after = self._boot_review_after
-            rows = turns.stale_running(max(0.0, time.time() - boot), self.host) \
-                if not after else []
+            # L147b : les lignes `running` puis les `orphan`, page par page,
+            # toutes deux dans la même limite par passage
+            phase, after = self._boot_review_after
+            rows: list = []
             more = False
             while True:
-                if len(rows) >= BOOT_REVIEW_MAX_ROWS:
+                room = BOOT_REVIEW_MAX_ROWS - len(rows)
+                if room <= 0:
                     more = True
                     break
-                page = turns.orphans_started_before(self.host, boot, after, BOOT_ORPHAN_PAGE)
+                size = min(BOOT_ORPHAN_PAGE, room)
+                lister = (turns.running_started_before if phase == "running"
+                          else turns.orphans_started_before)
+                page = lister(self.host, boot, after, size)
                 rows += page
-                if len(page) < BOOT_ORPHAN_PAGE:
+                if len(page) < size:
+                    if phase == "running":
+                        phase, after = "orphan", 0
+                        continue
                     break
                 after = int(page[-1]["id"])
             if not rows:
-                self._boot_review_after = 0
+                self._boot_review_after = BOOT_REVIEW_START
                 return []
             if not self._boot_settle_ready(time.time() - boot):
                 # #220 r3 : ni relevé du moteur ni écriture avant le feu vert —
                 # un relevé vide pris pendant le démarrage solderait à tort
-                self._boot_review_after = 0
+                self._boot_review_after = BOOT_REVIEW_START
                 self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
                 log("%d turn(s) from before the reboot: review deferred, containers "
                     "may still be restarted (host booted %ds ago); next "
@@ -4884,10 +4920,10 @@ class Runner:
                     % (len(kept) - len(newly)))
             if more:
                 # la suite au prochain passage de la boucle, sans attendre
-                self._boot_review_after = after
+                self._boot_review_after = (phase, after)
                 self.boot_review_at = time.monotonic()
             else:
-                self._boot_review_after = 0
+                self._boot_review_after = BOOT_REVIEW_START
             return kept
         except db_mod.DbError as exc:
             log_async("resources from before the reboot not checked (%s); next "
