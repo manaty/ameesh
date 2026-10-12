@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Proof provenance is isolated from caller-supplied evidence and worker code."""
 import json
+import contextlib
 import os
 from pathlib import Path
 import tempfile
@@ -46,7 +47,7 @@ class ProofHelperTest(unittest.TestCase):
             result = proof_service.produce(mock.Mock(), self.payload(), actor="uid:1000", execution_user="worker")
         self.assertEqual(result, {"id": 17})
         prove.assert_called_once_with(mock.ANY, 1, "/artifact", actor="uid:1000", runner=None,
-                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None)
+                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None, snapshot_limits=None)
 
     def test_cli_uses_fixed_privileged_entry_without_evidence_or_config_arguments(self):
         process = mock.Mock(returncode=0, stdout=json.dumps({"milestone": {"id": 17}}))
@@ -71,7 +72,8 @@ class ProofHelperTest(unittest.TestCase):
                 mock.patch("os.geteuid", return_value=0), \
                 mock.patch("subprocess.Popen", return_value=process) as popen, \
                 mock.patch.object(proof_service, "private_path", return_value=folder.name), \
-                mock.patch("os.seteuid"), mock.patch("os.setegid"), mock.patch("os.setgroups"):
+                mock.patch("os.seteuid"), mock.patch("os.setegid"), mock.patch("os.setgroups"), \
+                mock.patch("ameesh.modules.it.snapshot_limits.store_lock", side_effect=lambda root, deadline: contextlib.nullcontext()):
             execute(artifact, execution_user="worker", snapshot_root=folder.name)
         _, options = popen.call_args
         self.assertEqual(options["user"], 65534)

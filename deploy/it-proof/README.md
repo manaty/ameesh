@@ -42,6 +42,12 @@ it or executes an artifact.
      "driver": "psycopg",
      "execution_user": "ameesh-it-run",
      "snapshot_root": "/var/lib/ameesh-it-proof",
+     "snapshot_limits": {
+       "max_bytes": 134217728,
+       "total_bytes": 536870912,
+       "min_free_bytes": 536870912,
+       "copy_seconds": 15
+     },
      "runners": ["/usr/bin/python3"]
    }
    ```
@@ -51,12 +57,27 @@ it or executes an artifact.
    Create the root-owned `snapshot_root` on disk, mode 0755, with all parent
    directories root-owned and unmodifiable by agents. Never place it in an
    executor-owned TMPDIR. Each request streams the artifact from an O_NOFOLLOW
-   descriptor opened with the worker’s read permissions into a helper-owned copy, makes that copy mode 0555, hashes it,
+   descriptor opened with the worker’s read permissions into a helper-owned copy,
+   makes that copy mode 0555, hashes it,
    checks the declared digest and executes only the copy. The helper never
    rereads the original path after copying. It deletes the snapshot at exit;
    proof keeps its digest and actual command. Source substitution cannot change
    the executed bytes. Artifact-relative dependencies must be bundled or passed
    explicitly; a sibling directory of the original artifact is not copied.
+   Limits are private project settings, never request parameters. Defaults are
+   128 MiB per artifact, 512 MiB for all live/stale snapshots in this store,
+   512 MiB free on its volume, and 15 seconds to admit/copy. The requested
+   execution timeout also bounds the copy; its remaining time is used for the
+   process. The helper checks descriptor `st_size` before allocating a copy,
+   counts bytes to detect growing files, and checks free space before/after
+   every block. The main-thread timer interrupts blocking copy I/O. Copy-lock
+   waits consume the same deadline. Copies are serialized for admission/copy;
+   already admitted executions may run concurrently. Projects sharing a volume
+   should use the same protected store so admission counts all their snapshots.
+   A failed copy removes its partial snapshot and never records proof. A crash
+   can leave a stale copy; it remains charged against the total until the
+   operator confirms it is inactive and removes it. Raise limits only in the
+   protected project configuration when the expected artifact requires it.
    Direct executable artifacts need no runner. The worker account's environment
    contains only PATH, HOME and LANG, and it runs from `/`; provide any needed
    test inputs as explicit artifact arguments.

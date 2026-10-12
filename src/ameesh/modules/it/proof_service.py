@@ -37,7 +37,8 @@ def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
     return response["milestone"]
 
 
-def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_root=None):
+def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_root=None,
+            snapshot_limits=None):
     from . import item, prove
     if not isinstance(payload, dict) or set(payload) != {
             "project", "lot", "artifact", "runner", "arguments", "timeout"}:
@@ -59,7 +60,8 @@ def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_
         raise ValueError("proof helper project does not own this lot")
     return prove(db, payload["lot"], payload["artifact"], actor=actor,
                  runner=payload["runner"], arguments=payload["arguments"],
-                 timeout=float(payload["timeout"]), execution_user=execution_user, snapshot_root=snapshot_root)
+                 timeout=float(payload["timeout"]), execution_user=execution_user, snapshot_root=snapshot_root,
+                 snapshot_limits=snapshot_limits)
 
 
 def private_path(path, *, directory=False):
@@ -109,7 +111,7 @@ def main():
             raise ValueError("helper requires the isolated nonadministrative IT proof database role")
         result = produce(db, payload, actor="uid:%s" % os.environ.get("SUDO_UID", "0"),
                          execution_user=execution_user, allowed_runners=settings.get("runners", []),
-                         snapshot_root=snapshot_root)
+                         snapshot_root=snapshot_root, snapshot_limits=settings.get("snapshot_limits"))
         print(json.dumps({"milestone": result}, default=str))
     finally:
         db.close()

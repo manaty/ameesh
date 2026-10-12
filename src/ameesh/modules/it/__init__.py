@@ -46,7 +46,7 @@ def declare(db, item_id, artifact, *, actor):
 
 
 def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60, execution_user=None,
-          snapshot_root=None):
+          snapshot_root=None, snapshot_limits=None):
     from .execution import execute
     from ..storage import ModuleStore
     item(db, item_id)
@@ -56,7 +56,7 @@ def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60
         raise ValueError("declare the delivered artifact before running its proof")
     evidence = execute(artifact, runner=runner, arguments=arguments, timeout=timeout,
                        execution_user=execution_user, snapshot_root=snapshot_root,
-                       expected_sha=delivery["subject"])
+                       expected_sha=delivery["subject"], snapshot_limits=snapshot_limits)
     if evidence["sha256"] != delivery["subject"]:
         raise ValueError("executed artifact differs from the declared delivery")
     # The database rechecks this exact declaration under the item lock.

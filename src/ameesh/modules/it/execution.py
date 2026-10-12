@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import stat
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import threading
 import time
 
@@ -53,26 +53,57 @@ def digest(artifact):
 
 
 @contextmanager
-def snapshot(artifact, *, root=None, reader=None):
-    # Root helpers use a separately validated, root-owned parent. They never
-    # put authoritative snapshots in an executor-owned directory or TMPDIR.
-    path, stream = open_artifact(artifact, reader=reader)
-    with stream, tempfile.TemporaryDirectory(prefix="execution-", dir=root) as folder:
-        copied = Path(folder, Path(path).name)
-        sha = hashlib.sha256()
-        with copied.open("xb") as target:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                target.write(block)
-                sha.update(block)
-        os.chmod(copied, 0o555)
+def snapshot(artifact, *, root=None, reader=None, limits=None, deadline=None):
+    from . import snapshot_limits as budget
+    limits = budget.settings(limits)
+    deadline = deadline if deadline is not None else time.monotonic() + limits["copy_seconds"]
+    with ExitStack() as cleanup:
+        # Non-authoritative library calls use a disposable private store.
+        # Installed helpers always provide their shared protected on-disk root.
+        if root is None:
+            root = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="snapshot-store-"))
+        with budget.copy_timer(deadline), budget.store_lock(root, deadline):
+            path, stream = open_artifact(artifact, reader=reader)
+            cleanup.enter_context(stream)
+            size = os.fstat(stream.fileno()).st_size
+            if size > limits["max_bytes"]:
+                raise ValueError("artifact snapshot size limit exceeded; nothing copied")
+            used = budget.used_bytes(root)
+            budget.check_storage(root, used, 0, limits, incoming=size)
+            folder = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="execution-", dir=root))
+            copied = Path(folder, Path(path).name)
+            sha = hashlib.sha256()
+            count = 0
+            with copied.open("xb") as target:
+                while True:
+                    budget.check_time(deadline)
+                    block = stream.read(min(1024 * 1024, limits["max_bytes"] - count + 1))
+                    budget.check_time(deadline)
+                    if not block:
+                        break
+                    if count + len(block) > limits["max_bytes"]:
+                        raise ValueError("artifact snapshot copied-byte limit exceeded; no proof recorded")
+                    budget.check_storage(root, used, count, limits, incoming=len(block))
+                    target.write(block)
+                    target.flush()
+                    count += len(block)
+                    sha.update(block)
+                    budget.check_time(deadline)
+                    budget.check_storage(root, used, count, limits)
+            budget.check_time(deadline)
+            budget.check_storage(root, used, count, limits)
+            os.chmod(copied, 0o555)
         yield path, str(copied), sha.hexdigest()
 
 
 def execute(artifact, *, runner=None, arguments=(), timeout=60, execution_user=None,
-            snapshot_root=None, expected_sha=None):
+            snapshot_root=None, expected_sha=None, snapshot_limits=None):
     if not math.isfinite(timeout) or not 0 < timeout <= 3600:
         raise ValueError("execution timeout must be between 0 and 3600 seconds")
     started = time.monotonic()
+    from .snapshot_limits import settings
+    limits = settings(snapshot_limits)
+    copy_deadline = started + min(timeout, limits["copy_seconds"])
     isolation = {}
     account = None
     if execution_user is not None:
@@ -87,9 +118,13 @@ def execute(artifact, *, runner=None, arguments=(), timeout=60, execution_user=N
         isolation = dict(user=account.pw_uid, group=account.pw_gid, extra_groups=[],
                          cwd="/", env={"PATH": "/usr/bin:/bin", "HOME": account.pw_dir,
                                        "LANG": "C.UTF-8"}, umask=0o077)
-    with snapshot(artifact, root=snapshot_root, reader=account) as (source, path, sha):
+    with snapshot(artifact, root=snapshot_root, reader=account, limits=limits,
+                  deadline=copy_deadline) as (source, path, sha):
         if expected_sha is not None and sha != expected_sha:
             raise ValueError("artifact differs from the declared delivery; nothing executed")
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise ValueError("artifact execution timed out before launch; no proof recorded")
         # Keep the copy private until its digest was admitted.
         os.chmod(Path(path).parent, 0o755)  # worker traversal, never worker write
         command = ([runner] if runner else []) + [path] + list(arguments)
@@ -107,7 +142,7 @@ def execute(artifact, *, runner=None, arguments=(), timeout=60, execution_user=N
             reader = threading.Thread(target=drain, daemon=True)
             reader.start()
             try:
-                status = process.wait(timeout=timeout)
+                status = process.wait(timeout=max(0, timeout - (time.monotonic() - started)))
             except subprocess.TimeoutExpired:
                 _kill(process)
                 raise ValueError("artifact execution timed out; no proof recorded")

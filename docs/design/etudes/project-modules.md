@@ -76,3 +76,17 @@ modify or replace the snapshot. Evidence retains the source path, executed
 snapshot path and argv; the copy is removed when execution finishes. Tests
 replace A by B at Popen then restore A, assert A output, refuse symlinks and
 check that a source mutation cannot alter the snapshot binding.
+
+# Review r3 correction (12 October 2026, mesh-design mail 9548)
+
+Unbounded copying of a huge sparse file could consume the helper's disk before
+digest refusal. Project-private snapshot_limits now cap logical source size,
+actual copied bytes, aggregate live/stale copies, minimum volume reserve and
+copy time. The source descriptor's st_size is checked before target creation;
+stream counting also rejects growth after that check. A store lock serializes
+admission/copy, and the live snapshot remains counted after the lock is released
+for execution. Volume space is checked before/after every block. Lock waits and
+blocking copy I/O are bounded by a main-thread timer and monotonic checks;
+copy consumes the requested execution timeout instead of preceding it. Error
+cleanup removes partial copies. Tests use a small sparse file and reduced caps,
+never allocate a huge file, and exercise growth, expiry, reserve and total budget.
