@@ -252,19 +252,24 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, note, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor,
+               states=None) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
-        en cours est effacée (issue `annulee` au registre)."""
+        en cours est effacée (issue `annulee` au registre). `states` (L233b) :
+        le lot doit encore être dans l'un de ces états."""
+        wanted = None if states is None else json.dumps(list(states))
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE work_items SET assignee = %%s, updated_at = now(),"
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                 " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
                 "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                "   AND (%%s::jsonb IS NULL"
+                "        OR state IN (SELECT jsonb_array_elements_text(%%s::jsonb)))"
                 " RETURNING %s" % ITEM_COLUMNS,
-                (assignee, int(item_id), current))
+                (assignee, int(item_id), current, wanted, wanted))
             if not rows:
                 return None
             tx.query(
@@ -905,6 +910,34 @@ class WorkItems(interface.WorkItems):
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
             " LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+
+    def handoff_lots(self, assignee, limit) -> list[dict]:
+        return self.db.query(
+            "SELECT w.*, k.team AS package_team,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       EXISTS (SELECT 1 FROM agent_mailbox b"
+            "                WHERE b.delivered_at IS NULL AND b.kind = 'request'"
+            "                  AND (b.payload -> 'decision') IS NOT NULL"
+            "                  AND btrim(b.work_item_id) = w.id::text) AS pending_decision,"
+            "       EXISTS (SELECT 1 FROM commitments c"
+            "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
+            "                  AND c.status IN ('proposed', 'open')) AS decision_milestone,"
+            "       (SELECT extract(epoch from max(m.at))::float8 FROM work_item_milestones m"
+            "         WHERE m.work_item_id = w.id AND m.kind = 'frozen') AS frozen_ts"
+            "  FROM (SELECT %s,"
+            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+            "          FROM work_items"
+            "         WHERE assignee = %%s AND state IN ('intake', 'build')"
+            "           AND type <> 'improvement') w"
+            "  LEFT JOIN work_packages k ON k.id = w.package_id"
+            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
+            "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
+            "          w.created_ts, w.id"
+            " LIMIT %%s" % ITEM_COLUMNS, (assignee, int(limit)))
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def issue_feed(self, limit) -> list[dict]:

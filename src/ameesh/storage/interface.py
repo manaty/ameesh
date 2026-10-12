@@ -1126,10 +1126,11 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
-               actor: str) -> dict | None:
+               actor: str, states: Sequence[str] | None = None) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
-        L40 : efface la délégation en cours (issue `annulee`)."""
+        L40 : efface la délégation en cours (issue `annulee`). `states`
+        (L233b) : seulement si le lot est encore dans l'un de ces états."""
 
     # -- délégation à échéance (L40, décision 0030 point 5) -------------------
     @abc.abstractmethod
@@ -1271,6 +1272,15 @@ class WorkItems(Domain):
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et
         `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+
+    @abc.abstractmethod
+    def handoff_lots(self, assignee: str, limit: int) -> list[dict]:
+        """L233b : les lots `intake` et `build` de `assignee`, hors file
+        d'amélioration, dans l'ordre de `unassigned_lots`. Chaque ligne ajoute
+        `lot_team`, `pending_decision`, `decision_milestone` (comme
+        `unassigned_lots`), `package_team` (équipe de la fiche, pour
+        `projects.lot_project`) et `frozen_ts` (dernier jalon de gel, None
+        sans gel)."""
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod

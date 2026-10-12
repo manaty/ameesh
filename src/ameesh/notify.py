@@ -6,6 +6,7 @@
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N] [--take-paid]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
+                [--handoff-max-per-hour N] [--handoff-idle S]
         follows the operations alerts (`ameesh alerts --follow`, same
         thresholds, same dedupe keys) and sends each raised alert and each
         resolution to the responsible human, on their channels.
@@ -16,6 +17,10 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
+        L233b: before any take, the intake and build lots of a non-critical
+        Claude agent paused on budget go to a free DeepSeek agent of the
+        same project (`ameesh.handoff.budget_handoff`);
+        `--handoff-max-per-hour 0` turns it off.
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
         (`ameesh.plan_github.Projector`) and polls the running CI: each
@@ -957,10 +962,13 @@ class Notifier:
 
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
-                 take: dict | None = None):
+                 take: dict | None = None, handoff: dict | None = None):
         self.cfg, self.ncfg = cfg, ncfg
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
+        #: L233b : réglages de la reprise sur pause budget
+        #: (`handoff.budget_handoff`) ; None la coupe
+        self.handoff = handoff
         self.state = state if state is not None else empty_state()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
@@ -1036,6 +1044,8 @@ class Notifier:
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
+        if self.handoff:
+            self._budget_handoff(db, now)
         if self.take:
             self._auto_take(db, current, now)
         self._github_issues(db, now)
@@ -1139,6 +1149,23 @@ class Notifier:
                      "source": "lot de l'équipe" if take.get("kind") == "lot"
                      else "file d'amélioration"}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
+
+    def _budget_handoff(self, db, now: float) -> None:
+        from . import handoff
+        try:
+            moved = handoff.budget_handoff(self.cfg, db, now=now, dry_run=self.dry_run,
+                                           **self.handoff)
+        except db_mod.DbError:
+            raise
+        except Exception as exc:     # la reprise ne fait jamais tomber les alertes
+            self.log("budget handoff failed: %s" % _clean(exc, 200))
+            return
+        for move in moved:
+            item = move["item"]
+            entry = {"alert": {"type": "budget_handoff", "agent": move["agent"],
+                               "lot": int(item["id"]), "title": item.get("title")},
+                     "human": None, "source": "pause budget de %s" % move["previous"]}
+            self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
 
     # -- levée ----------------------------------------------------------------
     def _raise(self, entry: dict, router: Router, now: float) -> None:
@@ -1518,7 +1545,7 @@ def _format(record: dict) -> str:
     who = record.get("human") or "—"
     what = "[%s] %s" % (record.get("type"), _subject(record))
     event = {"raised": "raised", "resolved": "resolved", "summary": "summary",
-             "auto_take": "auto-take"}.get(
+             "auto_take": "auto-take", "budget_handoff": "budget handoff"}.get(
         record["event"], record["event"])
     channels = ", ".join("%s %s" % (k, v) for k, v in sorted(record["channels"].items()))
     delivery = record["delivery"]
@@ -1571,7 +1598,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="send a test message on each of this human's channels")
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
-    from . import backlog
+    from . import backlog, handoff
     parser.add_argument("--take-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_IDLE",
                                                         backlog.DEFAULT_TAKE_IDLE_S),
@@ -1598,7 +1625,28 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
                         help="maximum team lots taken per rolling hour, for the whole mesh "
                              "(default 6)")
+    # L233b : reprise des lots d'un agent Claude en pause budget
+    parser.add_argument("--handoff-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_HANDOFF_MAX_PER_HOUR", handoff.DEFAULT_MAX_PER_HOUR)),
+                        help="maximum lots handed per rolling hour from non-critical Claude "
+                             "agents paused on budget to free DeepSeek agents of the same "
+                             "project (default 4; 0 turns this off)")
+    parser.add_argument("--handoff-idle", type=float,
+                        default=exploitation._env_float("AMEESH_HANDOFF_IDLE",
+                                                        handoff.DEFAULT_IDLE_S),
+                        help="a DeepSeek agent takes a handed lot once idle for S seconds "
+                             "(default 300)")
     return parser
+
+
+def handoff_settings(args) -> dict | None:
+    """Réglages de `handoff.budget_handoff` lus des options ; None si coupée."""
+    most = int(getattr(args, "handoff_max_per_hour", 0) or 0)
+    if most <= 0:
+        return None
+    return {"max_per_hour": most,
+            "idle_s": max(0.0, float(getattr(args, "handoff_idle", 0) or 0))}
 
 
 def take_settings(args) -> dict | None:
@@ -1669,7 +1717,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             print(_format(record), flush=True)
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
-                        take=take_settings(args))
+                        take=take_settings(args), handoff=handoff_settings(args))
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
