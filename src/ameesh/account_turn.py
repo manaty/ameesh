@@ -25,7 +25,7 @@ import os
 import sys
 import time
 
-from . import accounts, adapters, cost as cost_mod, db as db_mod, registry
+from . import accounts, adapters, auth_failure, cost as cost_mod, db as db_mod, registry
 
 #: compte indisponible (configuration ou base) : le tour ne part pas
 INVALID = object()
@@ -295,7 +295,8 @@ def continuity(worker) -> None:
     rotate(worker, harness, old, new, session)
 
 
-def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, str]:
+def summary_possible(old, book, items, now: float | None = None, *,
+                     sick: dict | None = None) -> tuple[bool, str]:
     """L'ancien compte peut-il encore porter le tour de résumé d'une rotation ?
     (L39, décision 0030) `(vrai, "")` ou `(faux, raison)`.
 
@@ -304,21 +305,37 @@ def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, 
     est SATURÉE (100 %, fenêtre non remise à zéro) : le fournisseur refuserait
     le tour. Un compte seulement « au seuil » de rythme (garde 0019) reste
     utilisable pour un résumé — c'est la règle de 0027.
+
+    L226b : non plus s'il est en échec d'authentification (`sick`, les lignes
+    de `auth_failure.failing`), en overage, ou au-dessus d'un plafond fixe
+    (`accounts.fixed_caps` : 50 % d'un primaire, plafond d'overage) — aucun
+    appel de modèle sur un compte que le choix exclut hors rythme.
     """
     if old is None:
         return False, "compte retiré de la configuration"
     problems = accounts.check(old)
     if problems:
         return False, "; ".join(problems)
+    if sick and old.name in sick:
+        return False, "authentification en échec (%s)" % (
+            sick[old.name].get("reason") or "?")
     now = time.time() if now is None else now
     try:
         gauges = accounts.gauges_of(book, old, items) if book is not None else []
     except Exception:
         gauges = []
+    if accounts.in_overage(gauges, now):
+        return False, "forfait %s en overage (facturé au-delà du forfait)" % old.harness
+    fixed = accounts.fixed_caps(old, gauges)
     for gauge in gauges:
-        if float(gauge.used_at(now) or 0.0) >= 1.0:  # échue : 0 % (L71)
+        used = float(gauge.used_at(now) or 0.0)  # échue : 0 % (L71)
+        if used >= 1.0:
             return False, "forfait %s %s saturé (%.0f %%)" % (
                 old.harness, gauge.key, float(gauge.used) * 100)
+        for cap, label in fixed:
+            if used >= cap:
+                return False, "forfait %s %s : %.0f %% (%s %.0f %%)" % (
+                    old.harness, gauge.key, used * 100, label, cap * 100)
     return True, ""
 
 
@@ -330,14 +347,20 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
     resume = ""
     possible = old is not None and not accounts.check(old)
     if possible:
-        # L39 : une jauge saturée de l'ancien compte ferait échouer le résumé
+        # L39 : une jauge saturée de l'ancien compte ferait échouer le résumé ;
+        # L226b : ni compte en échec d'authentification, ni plafond fixe
+        # dépassé, ni overage — dans le doute, pas d'appel de modèle (brief
+        # déterministe)
         try:
             book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=None,
                                      tools={worker.name: harness})
-            possible, _raison = summary_possible(old, book,
-                                                 accounts.profiles(worker.cfg, harness))
-        except Exception:
-            possible = True
+            possible, raison = summary_possible(
+                old, book, accounts.profiles(worker.cfg, harness),
+                sick=auth_failure.failing(worker.db, worker.cfg.host, harness))
+        except Exception as exc:
+            possible, raison = False, "état de l'ancien compte illisible (%s)" % exc
+        if not possible:
+            _log("[%s] pas de résumé sous le compte %s : %s" % (worker.name, nom_ancien, raison))
     if possible:
         # le résumé se fait sous l'ANCIEN compte, qui seul peut reprendre la session
         worker._account_override = old

@@ -213,8 +213,16 @@ last resort. Each account takes these optional settings in the host's
 A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
 on the short window), `cap`, and `overage_cap` when the account may be billed.
 An account **in overage** (Claude `isUsingOverage`, Codex a window at 100 %
-with credits) is never chosen. The caps apply to session continuity too: a
-session on the primary leaves it once the primary is above 50 % of a window.
+with credits) is never chosen, until the windows that ran out have reset (a
+spent window with no reset date keeps it out). The caps apply to session
+continuity too: a session on the primary leaves it once the primary is above
+50 % of a window. A manual force posted while a worker switches accounts is
+evaluated the same way: a forced account past its caps is not launched.
+
+The summary of a rotation (§ 3) runs on the **old** account only if that
+account could still be chosen apart from its pace: not `failing` (§ 5), under
+`cap` and `overage_cap`, not in overage. Otherwise no model call: the session
+resumes from the deterministic brief (L39).
 
 For the order "Claude tertiary > secondary > primary, Codex secondary >
 primary" on a host that declared `primaire, secondaire, tertiaire`:
@@ -250,7 +258,8 @@ for the default credential of a harness without accounts. `state` is
 expiry the sentinel reports.
 
 **End of turn.** A failed turn whose error, short answer (600 characters at
-most) or stderr tail is an authentication failure
+most) or stderr tail (this turn's output only: `stderr.log` is appended to by
+every turn) is an authentication failure
 (`ameesh.auth_failure.classify`) is neither a fast failure nor replayed: the
 turn's account is marked `failing` (source `turn`), the consigne goes back to
 pending, the agent goes `blocked` with `status_text` "`auth_blocked:

@@ -3023,8 +3023,12 @@ class AgentWorker(threading.Thread):
         echec_lancement = ""
         lignes = 0
         proc = None
+        #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
+        #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
+        stderr_debut = None
         try:
             with open(stderr_path, "ab") as stderr:
+                stderr_debut = stderr.tell()
                 try:
                     # Le moissonneur de l'exécuteur ne touche jamais un harnais,
                     # même pas pendant son lancement (voir `background`).
@@ -3269,7 +3273,7 @@ class AgentWorker(threading.Thread):
                     self._host_not_ready(hote)
                 return False
             raison_auth = auth_failure.classify(
-                error, self.last_final, auth_failure.stderr_tail(stderr_path))
+                error, self.last_final, auth_failure.stderr_tail(stderr_path, start=stderr_debut))
             if raison_auth:
                 # L226b : le compte n'est plus authentifié — ni échec rapide ni
                 # relance en boucle : le compte est noté en échec, le tour

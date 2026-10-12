@@ -58,15 +58,18 @@ def classify(error: str | None = None, result: str | None = None,
     return None
 
 
-def stderr_tail(path: str | None, limit: int = STDERR_TAIL_BYTES) -> str:
-    """The last `limit` bytes of a stderr file, decoded leniently; '' if none."""
-    if not path:
+def stderr_tail(path: str | None, limit: int = STDERR_TAIL_BYTES, *,
+                start: int | None = 0) -> str:
+    """The last `limit` bytes of a stderr file from offset `start` (the
+    turn's own output in a log opened in append mode), decoded leniently;
+    '' if none, or if `start` is None (the turn never opened the log)."""
+    if not path or start is None:
         return ""
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
-            fh.seek(max(0, size - limit))
+            fh.seek(max(start, size - limit))
             return fh.read().decode("utf-8", errors="replace")
     except OSError:
         return ""

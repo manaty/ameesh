@@ -27,7 +27,7 @@ import stat
 import sys
 import time
 
-from . import accounts, account_turn, fil, identity, mail, platform, registry, stagnation, storage
+from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -668,7 +668,11 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
                    why="la session %s (compte %s) est portable vers le compte %s : reprise"
                    % (session, previous or "(défaut)", nxt.name))
         return out
-    usable, raison = account_turn.summary_possible(old, book, items)
+    try:
+        sick = auth_failure.failing(db, cfg.host, harness)
+    except db_mod.DbError:
+        sick = {}
+    usable, raison = account_turn.summary_possible(old, book, items, sick=sick)
     if usable:
         out.update(keep=True, deterministic=False,
                    why="la session %s (compte %s) n'est pas portable vers %s ; l'ancien "

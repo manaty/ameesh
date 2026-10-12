@@ -588,6 +588,19 @@ def overage_capable(profile: Profile, overage) -> bool:
     return bool(overage is not None and overage.capable)
 
 
+def fixed_caps(profile: Profile, gauges) -> list[tuple[float, str]]:
+    """[(cap, label)]: the caps that hold on every window of the account
+    whatever its pace (L226b): its fixed cap (`account_cap`), and
+    `overage_cap` when it may be billed beyond its plan."""
+    fixed = []
+    cap = account_cap(profile)
+    if cap is not None:
+        fixed.append((cap, "primary cap" if profile.cap is None else "account cap"))
+    if overage_capable(profile, getattr(gauges, "overage", None)):
+        fixed.append((profile.overage_cap, "overage cap"))
+    return fixed
+
+
 def limits(profile: Profile, gauges, now: float) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
@@ -596,12 +609,7 @@ def limits(profile: Profile, gauges, now: float) -> dict:
     * the account's fixed cap (`account_cap`: 50 % for the primary);
     * `overage_cap` (80 %) when the account may be billed beyond its plan.
     """
-    fixed = []
-    cap = account_cap(profile)
-    if cap is not None:
-        fixed.append((cap, "primary cap" if profile.cap is None else "account cap"))
-    if overage_capable(profile, getattr(gauges, "overage", None)):
-        fixed.append((profile.overage_cap, "overage cap"))
+    fixed = fixed_caps(profile, gauges)
     out = {}
     for gauge in gauges:
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
@@ -626,12 +634,13 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
-    overage = getattr(result.gauges, "overage", None)
-    if overage is not None and overage.in_use:
+    if in_overage(result.gauges, now):
         # L226b: an account in overage is never chosen (no spending beyond the plan)
         result.reason = "%s plan: in overage (billed beyond the plan)" % profile.harness
-        resets = [g.resets_at for g in result.gauges if g.resets_at and g.resets_at > now]
-        result.until = max(resets) if resets else None
+        # eligible again once the windows that ran out have reset
+        spent = result.gauges.spent()
+        resets = [g.resets_at for g in spent if g.resets_at]
+        result.until = max(resets) if len(resets) == len(spent) else None
         return result
     result.limits = limits(profile, result.gauges, now)
     depasses = []
@@ -856,13 +865,16 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
     # échec d'authentification est rendu tel quel : la garde de l'exécuteur
     # bloque l'agent, elle ne bascule pas contre un geste humain)
-    if row.get("forced"):
-        current = ev(active)
+    def forced(profile: Profile) -> Choice:
+        current = ev(profile)
         if current.ok:
-            return Choice(active, active, forced=True,
+            return Choice(profile, profile, forced=True,
                           why="forcé (ameesh accounts use)")
-        return Choice(None, active, reason="compte %s forcé (ameesh accounts use) : %s"
-                      % (active.name, current.reason), forced=True)
+        return Choice(None, profile, reason="compte %s forcé (ameesh accounts use) : %s"
+                      % (profile.name, current.reason), forced=True)
+
+    if row.get("forced"):
+        return forced(active)
 
     # 2. continuité : la session garde son compte tant qu'il est sous son seuil
     # (les autres comptes ne sont alors pas relus : rien à choisir)
@@ -906,10 +918,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         store.release(host, harness, target.name)  # retenue d'avant 0034, s'il en reste
         return Choice(target, target, switched=switched, why=why)
     # course : un autre worker a changé le dernier choix entre-temps ; un
-    # forçage posé entre-temps prime, sinon notre choix tient
+    # forçage posé entre-temps prime, évalué comme en 1 (L226b : un primaire
+    # au-dessus de son plafond ou un compte en overage n'est pas lancé)
     fresh = store.active(host, harness) or {}
     if fresh.get("forced"):
-        return _reread(store, host, harness, items, active)
+        return forced(by_name(items, fresh.get("account")) or active)
     return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
 
 
@@ -922,14 +935,6 @@ def healthy(items: list[Profile], sick: dict) -> list[Profile]:
     if any(p.kind != "api_key_env" for p in items):
         sains = [p for p in sains if p.kind != "api_key_env"]
     return sains
-
-
-def _reread(store, host: str, harness: str, items: list[Profile], fallback: Profile) -> Choice:
-    """Course perdue contre un forçage : on prend le compte en place."""
-    row = store.active(host, harness) or {}
-    profile = by_name(items, row.get("account")) or fallback
-    return Choice(profile, profile, forced=bool(row.get("forced")),
-                  why="forcé (ameesh accounts use)" if row.get("forced") else "")
 
 
 def current(db, host: str, harness: str, items: list[Profile]) -> Profile:
@@ -1010,7 +1015,7 @@ def report(cfg, db, book, *, now: float | None = None,
                 "hourly_usd": profile.hourly_usd,
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
-                "overage": _overage_row(profile, result.gauges),
+                "overage": _overage_row(profile, result.gauges, now),
                 "gauges": [
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
                     # relevé reste lisible (`last_used`)
@@ -1026,11 +1031,16 @@ def report(cfg, db, book, *, now: float | None = None,
     return rows
 
 
-def _overage_row(profile: Profile, gauges) -> dict:
+def in_overage(gauges, now: float) -> bool:
+    """Is the account in overage at `now` (a plain list of gauges: no)?"""
+    return bool(getattr(gauges, "in_overage", None) and gauges.in_overage(now))
+
+
+def _overage_row(profile: Profile, gauges, now: float) -> dict:
     """The overage flags of an account, for `ameesh accounts list --json`."""
     read = getattr(gauges, "overage", None)
     return {"setting": profile.overage, "capable": overage_capable(profile, read),
-            "in_use": bool(read is not None and read.in_use)}
+            "in_use": in_overage(gauges, now)}
 
 
 def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:

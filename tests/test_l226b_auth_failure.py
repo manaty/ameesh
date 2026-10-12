@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import accounts, auth_failure, cost, exploitation, registry, storage
+from ameesh import account_turn, accounts, auth_failure, cost, exploitation, registry, storage
 
 from .support import FAKEBIN
 from .test_l30_accounts import _Base, _codex_rollout
@@ -99,9 +99,8 @@ class _Book:
         return 0
 
 
-class CapsAndOrderTest(unittest.TestCase):
-    """L226b, owner decision 2026-10-07: primaries last and capped at 50 %,
-    overage-capable accounts capped at 80 %, never an account in overage."""
+class _CapsBase(unittest.TestCase):
+    """Claude accounts (primary, secondary, tertiary) and their gauges."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l226b-")
@@ -127,6 +126,11 @@ class CapsAndOrderTest(unittest.TestCase):
     def _ev(self, items, gauges, now):
         book = _Book(gauges)
         return {p.name: accounts.evaluate(book, p, items, now) for p in items}
+
+
+class CapsAndOrderTest(_CapsBase):
+    """L226b, owner decision 2026-10-07: primaries last and capped at 50 %,
+    overage-capable accounts capped at 80 %, never an account in overage."""
 
     def test_settings_parsed_and_checked(self):
         items = self._items(tertiaire={"priority": 1, "overage": "allowed",
@@ -465,6 +469,145 @@ class CliTest(_AuthBase):
         proc = self.mesh("accounts", "healthy", "claude", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._health("claude")[""]["state"], "healthy")
+
+
+class StaleOverageTest(_CapsBase):
+    """Codex review r1 (P2): an overage reading goes stale once the windows
+    that ran out have reset, or an unused account would stay excluded."""
+
+    def _reading(self, now, five_reset):
+        return cost.Gauges([
+            cost.Gauge("claude", "five_hour", 1.0, five_reset, 5 * HOUR),
+            cost.Gauge("claude", "seven_day", 0.30, now + 0.1 * WEEK, WEEK)],
+            cost.Overage(capable=True, in_use=True))
+
+    def test_in_overage_until_the_spent_window_resets(self):
+        now = 1_800_000_000.0
+        items = self._items(tertiaire={"overage": "none"})
+        running = self._reading(now, now + HOUR)
+        evs = self._ev(items, {"tertiaire": running}, now)
+        self.assertFalse(evs["tertiaire"].ok)
+        self.assertIn("in overage", evs["tertiaire"].reason)
+        self.assertEqual(evs["tertiaire"].until, now + HOUR)  # not the 7-day reset
+        evs = self._ev(items, {"tertiaire": self._reading(now, now - 60)}, now)
+        self.assertTrue(evs["tertiaire"].ok, evs["tertiaire"].reason)
+        # a spent window with no reset date keeps the flag
+        undated = self._reading(now, None)
+        self.assertTrue(undated.in_overage(now))
+        self.assertFalse(cost.Gauges(list(undated)).in_overage(now))
+
+
+class ForcedRaceTest(_AuthBase):
+    """Codex review r1 (P1): a manual force posted while `choose` switches is
+    evaluated like any forced account, never launched past its caps."""
+
+    def test_forced_primary_above_its_cap_is_not_launched(self):
+        secondaire = self._codex_comptes()[1]
+        home = os.path.join(self.tmp, "codex-default")
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        items = accounts.parse({"codex": [{"name": "primaire"}, secondaire]})["codex"]
+        now = time.time()
+        store_type = type(storage.of(self.db).accounts)
+        original = store_type.switch
+
+        def switch(store, host, harness, *, expected, to, kind, reason, agent, **kw):
+            # the owner forces the primary between our read and our switch
+            original(store, host, harness, expected=None, to="primaire", kind="manuel",
+                     reason="forçage manuel", agent=None, forced=True)
+            return False
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+            book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+            _codex_rollout(home, 60, now + 1800)  # above the primary cap (50 %)
+            with mock.patch.object(store_type, "switch", switch):
+                choix = accounts.choose(self.db, self.cfg.host, "codex", items, book,
+                                        now=now)
+        self.assertTrue(choix.forced)
+        self.assertIsNone(choix.profile)
+        self.assertEqual(choix.active.name, "primaire")
+        self.assertIn("primary cap 50%", choix.reason)
+
+
+class RotationSummaryTest(_CapsBase):
+    """Codex review r1 (P1): the summary of a failover rotation runs on the
+    old account only if the choice could still take it apart from pace — no
+    model call on an account in auth failure, past a fixed cap or in overage."""
+
+    def test_summary_possible(self):
+        now = 1_800_000_000.0
+        items = self._items()
+        primaire, secondaire = items[0], items[1]
+        quiet = self._gauges(0.30, 0.10, now)
+        ok, why = account_turn.summary_possible(primaire, _Book({"primaire": quiet}), items,
+                                                now=now)
+        self.assertTrue(ok, why)
+        # pace cap only (0027): still usable for a summary
+        paced = self._gauges(0.95, 0.10, now, five_elapsed=0.3)
+        ok, why = account_turn.summary_possible(secondaire, _Book({"secondaire": paced}),
+                                                items, now=now)
+        self.assertTrue(ok, why)
+        ok, why = account_turn.summary_possible(primaire, _Book({"primaire": quiet}), items,
+                                                now=now, sick={"primaire": {
+                                                    "reason": "invalid api key"}})
+        self.assertFalse(ok)
+        self.assertIn("invalid api key", why)
+        ok, why = account_turn.summary_possible(
+            primaire, _Book({"primaire": self._gauges(0.60, 0.10, now)}), items, now=now)
+        self.assertFalse(ok)
+        self.assertIn("primary cap 50", why)
+        ok, why = account_turn.summary_possible(
+            secondaire, _Book({"secondaire": self._gauges(0.10, 0.10, now, cost.Overage(
+                capable=True, in_use=True))}), items, now=now)
+        self.assertFalse(ok)
+        self.assertIn("overage", why)
+        ok, why = account_turn.summary_possible(
+            secondaire, _Book({"secondaire": self._gauges(0.85, 0.10, now, cost.Overage(
+                capable=True))}), items, now=now)
+        self.assertFalse(ok)
+        self.assertIn("overage cap 80", why)
+
+    def test_rotation_off_a_failing_account_makes_no_model_call(self):
+        items = self._items()
+        worker = mock.Mock()
+        worker.name = "rot"
+        worker.cfg.state_dir = self.tmp
+        worker.cfg.host = "h"
+        with mock.patch.object(accounts, "profiles", return_value=items), \
+                mock.patch.object(auth_failure, "failing",
+                                  return_value={"primaire": {"reason": "http 401"}}), \
+                mock.patch.object(registry, "clear_session", return_value=False):
+            account_turn.rotate(worker, "claude", items[0], items[1], "sess-1")
+        worker.run_turn.assert_not_called()
+
+
+class TurnStderrTest(_AuthBase):
+    """Codex review r1 (P2): a turn is classified on its own stderr, never on
+    an earlier turn's message left in the append-mode log."""
+
+    def test_stderr_tail_from_the_turn_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "stderr.log")
+            with open(path, "wb") as fh:
+                fh.write(b"Invalid API key \xc2\xb7 Please run /login\n")
+                start = fh.tell()
+                fh.write(b"rate_limit_error: 429\n")
+            self.assertEqual(auth_failure.stderr_tail(path, start=start),
+                             "rate_limit_error: 429\n")
+            self.assertEqual(auth_failure.stderr_tail(path, start=None), "")
+            self.assertIn("/login", auth_failure.stderr_tail(path))
+
+    def test_earlier_auth_message_does_not_block_a_later_429(self):
+        runner, worker = self._worker("r429", "claude", {})
+        try:
+            with open(worker._path("stderr.log"), "ab") as fh:
+                fh.write(b"Invalid API key \xc2\xb7 Please run /login\n")
+            self._tour(worker, AMEESH_TEST_RESULT="rate_limit_error: 429",
+                       AMEESH_TEST_EXIT="1")
+            ligne = registry.get(self.db, "r429")
+            self.assertFalse((ligne["status_text"] or "").startswith("auth_blocked"))
+            self.assertEqual(self._health("claude"), {})
+        finally:
+            worker.watchdog_stop.set()
 
 
 if __name__ == "__main__":

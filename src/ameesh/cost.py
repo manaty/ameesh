@@ -146,6 +146,21 @@ class Gauges(list):
         super().__init__(items)
         self.overage = overage
 
+    def in_overage(self, now: float) -> bool:
+        """Is the account billed beyond its plan at `now`? A reading in
+        overage goes stale once the windows that ran out have reset (L71):
+        the next window is fresh, and an unused account would otherwise never
+        publish the reading that clears the flag. A saturated window with no
+        reset date keeps the flag (never overage when in doubt)."""
+        if self.overage is None or not self.overage.in_use:
+            return False
+        spent = self.spent()
+        return not spent or any(not g.reset_passed(now) for g in spent)
+
+    def spent(self) -> list:
+        """The windows that ran out (all of them if the reading names none)."""
+        return [g for g in self if g.used >= 1.0] or list(self)
+
 
 class CostError(Exception):
     """Erreur de comptabilité (repère illisible, base absente)."""
