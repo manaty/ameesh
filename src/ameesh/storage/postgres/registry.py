@@ -132,7 +132,7 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
     # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
     # que ses propres agents et leurs éphémères (qui portent son canon)
-    return """(NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
+    return """(ameesh_host_claims_open(%(a)s.host) AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
        OR (EXISTS (SELECT 1 FROM canon_state s
                     WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
                       AND s.status = 'ok')
@@ -763,6 +763,7 @@ class Leases(interface.Leases):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.pending_prompt IS NOT NULL
                AND NOT verrou.handoff_fenced
+               AND ameesh_host_claims_open(r.host)
                AND verrou.status <> 'stopped'
                AND verrou.lease_expires_at > clock_timestamp()
             RETURNING verrou.pending_prompt
@@ -785,6 +786,7 @@ class Leases(interface.Leases):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
                AND NOT verrou.handoff_fenced
+               AND ameesh_host_claims_open(r.host)
                AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
             """,

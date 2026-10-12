@@ -277,6 +277,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'host', 'harness', 'path', 'version', 'raw', 'observed_at'
     ]),
     -- L232a (0371) : état et réservations ; plans et preuves dans le rôle contenus
+    -- L232e (0380): withdrawal intent and agent origins; refusals in contents role
+    ('host_lifecycle', ARRAY[
+        'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at'
+    ]),
+    ('host_lifecycle_agents', ARRAY[
+        'host', 'generation', 'agent', 'critical', 'operation'
+    ]),
     ('host_handoffs', ARRAY[
         'id', 'agent', 'source', 'target', 'state', 'fenced',
         'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'

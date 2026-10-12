@@ -2211,6 +2211,31 @@ class Operations(Domain):
 # ressources des hôtes (lot L31, décision 0028, migration 0029)
 # --------------------------------------------------------------------------
 
+class HostLifecycle(Domain):
+    """Durable withdrawal and return intent for admitted hosts (L232e)."""
+
+    @abc.abstractmethod
+    def get(self, host: str) -> dict | None:
+        """Current host mode/generation and scheduled return."""
+
+    @abc.abstractmethod
+    def listing(self) -> list[dict]:
+        """Persistent host controls, including withdrawn hosts."""
+
+    @abc.abstractmethod
+    def drain(self, host: str, *, actor: str, duration: int | None = None,
+              critical: Sequence[str] = ()) -> dict:
+        """Close claims/enable atomically and retain agents' original host."""
+
+    @abc.abstractmethod
+    def undrain(self, host: str, *, actor: str) -> dict | None:
+        """Request agents' return; retained origin rows survive this request."""
+
+    @abc.abstractmethod
+    def agents(self, host: str, generation: int) -> list[dict]:
+        """Agent origins ordered critical first, with progress/refusals."""
+
+
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
 
@@ -2688,6 +2713,7 @@ class Storage(abc.ABC):
     roadmap: Roadmap
     operations: Operations
     hosts: HostResources
+    host_lifecycle: HostLifecycle
     turn_resources: TurnResources
     visibility: Visibility
     housekeeping: Housekeeping

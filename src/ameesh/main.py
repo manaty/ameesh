@@ -239,6 +239,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L84: read API, local mode
         from . import serve
         return serve.main(rest)
+    if command == "host":
+        from . import host_lifecycle
+        return host_lifecycle.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap
