@@ -13,6 +13,12 @@ kernel releases it when the holder dies, so a killed turn never keeps a slot.
 The holder (pid, agent, command, start) is written in the slot file for
 `ameesh heavy --status`. The command runs under `nice` (default 10), so the
 runner and the orchestrator's short turns stay responsive.
+
+The command inherits the locked slot descriptor (codex review r1, P2): the
+slot lives as long as the command, even if the wrapper is killed, and a
+process the command leaves behind keeps it until it exits too. SIGTERM,
+SIGINT and SIGHUP sent to the wrapper are relayed to the command, which the
+wrapper then waits for.
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ import fcntl
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -27,6 +34,8 @@ import time
 DEFAULT_NICE = 10
 POLL_S = 5.0
 WAIT_LOG_S = 60.0
+#: signals the wrapper relays to the command it runs
+RELAYED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 def limit(cfg) -> int:
@@ -124,22 +133,53 @@ def release(fh) -> None:
         fh.close()                  # closing drops the flock
 
 
+def _note_child(fh, pid: int) -> None:
+    """Adds the command's pid to the holder written in the slot file."""
+    try:
+        fh.seek(0)
+        holder = json.loads(fh.read() or "{}")
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps(dict(holder, child=pid)))
+        fh.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
-    """Runs `argv` holding a heavy slot; its exit code (127 if not found)."""
+    """Runs `argv` holding a heavy slot; its exit code (127 if not found,
+    128 + n if killed by signal n)."""
     command = shlex.join(argv)
     held = acquire(cfg, command=command,
                    log=lambda text: print(text, file=sys.stderr, flush=True))
     slot, fh = held
+    child = None
+    pending: list = []
+
+    def relay(signum, frame):
+        if child is None:
+            pending.append(signum)
+        elif child.poll() is None:
+            child.send_signal(signum)
+
+    previous = {sig: signal.signal(sig, relay) for sig in RELAYED}
     try:
         def lower():
             if nice:
                 os.nice(nice)
         try:
-            return subprocess.run(argv, preexec_fn=lower).returncode
+            child = subprocess.Popen(argv, preexec_fn=lower, pass_fds=(fh.fileno(),))
         except FileNotFoundError:
             print("ameesh heavy: command not found: %s" % argv[0], file=sys.stderr)
             return 127
+        _note_child(fh, child.pid)
+        for signum in pending:
+            relay(signum, None)
+        code = child.wait()
+        return code if code >= 0 else 128 - code
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         release(fh)
 
 
@@ -152,8 +192,11 @@ def cmd_heavy(cfg, args) -> int:
             return 0
         for row in rows:
             if row["busy"]:
+                pid = row.get("pid")
+                if row.get("child"):
+                    pid = "%s (command %s)" % (pid, row["child"])
                 print("slot %d  busy  %s  pid %s  since %s  %s" % (
-                    row["slot"], row.get("agent") or "?", row.get("pid"),
+                    row["slot"], row.get("agent") or "?", pid,
                     time.strftime("%H:%M:%S", time.localtime(row.get("since") or 0)),
                     row.get("command") or ""))
             else:

@@ -4,9 +4,11 @@ live in a temporary state directory, no database."""
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -88,6 +90,87 @@ class SlotsTest(unittest.TestCase):
                                    nice=0), 3)
         self.assertEqual(heavy.run(self.cfg, ["ameesh-no-such-command"], nice=0), 127)
         self.assertEqual([s["busy"] for s in heavy.status(self.cfg)], [False, False])
+
+
+class RunChildTest(unittest.TestCase):
+    """`heavy.run` through a real wrapper and a real command (codex review r1,
+    P2 `heavy.py:138`): the slot lives as long as the command."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="ameesh-l131-run-")
+        self.one = SimpleNamespace(state_dir=self.state, max_heavy_suites=1)
+        env = mock.patch.dict(os.environ, {"AMEESH_MAX_HEAVY_SUITES": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _wrapper(self):
+        """The wrapper process and the pid of its command, once started."""
+        env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
+        child = "import os, time; print(os.getpid(), flush=True); time.sleep(60)"
+        code = ("import sys, types; from ameesh import heavy; "
+                "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1); "
+                "raise SystemExit(heavy.run(cfg, [sys.executable, '-c', sys.argv[2]], nice=0))")
+        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child],
+                                stdout=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        pid = int(proc.stdout.readline())
+        self.addCleanup(self._kill, pid)
+        return proc, pid
+
+    @staticmethod
+    def _kill(pid: int) -> None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def _gone(pid: int, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = 0          # not ours: probe it
+                try:
+                    os.kill(pid, 0)
+                    with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
+                        if fh.read().split(") ")[-1].startswith("Z"):
+                            return True
+                except (ProcessLookupError, FileNotFoundError):
+                    return True
+            if waited:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_killed_wrapper_keeps_the_slot_while_the_command_runs(self):
+        proc, pid = self._wrapper()
+        self.assertEqual(heavy.status(self.one)[0].get("child"), pid)
+        proc.kill()
+        proc.wait(timeout=10)
+        # the command still runs: no other suite may start
+        self.assertFalse(self._gone(pid, timeout=0.2))
+        self.assertIsNone(heavy.acquire(self.one, max_wait_s=0))
+        self._kill(pid)
+        self.assertTrue(self._gone(pid))
+        got = heavy.acquire(self.one, max_wait_s=0)
+        self.assertIsNotNone(got)
+        heavy.release(got[1])
+
+    def test_sigterm_and_sigint_are_relayed_to_the_command(self):
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=signum):
+                proc, pid = self._wrapper()
+                proc.send_signal(signum)
+                code = proc.wait(timeout=10)
+                self.assertTrue(self._gone(pid))
+                # SIGINT: Python's KeyboardInterrupt exits with 1
+                self.assertIn(code, (128 + signum, 1))
+                got = heavy.acquire(self.one, max_wait_s=0)
+                self.assertIsNotNone(got)
+                heavy.release(got[1])
 
 
 class NoteTest(unittest.TestCase):
