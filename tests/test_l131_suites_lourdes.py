@@ -103,20 +103,31 @@ class RunChildTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def _wrapper(self):
-        """The wrapper process and the pid of its command, once started."""
+    def _wrapper(self, child: str = "import os, time; print(os.getpid(), flush=True); "
+                                    "time.sleep(60)", *, grace: float = 10.0, pids: int = 1):
+        """The wrapper process and the pid(s) its command prints, once started."""
         env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
-        child = "import os, time; print(os.getpid(), flush=True); time.sleep(60)"
         code = ("import sys, types; from ameesh import heavy; "
+                "heavy.GROUP_GRACE_S = float(sys.argv[3]); "
                 "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1); "
                 "raise SystemExit(heavy.run(cfg, [sys.executable, '-c', sys.argv[2]], nice=0))")
-        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child],
+        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child, str(grace)],
                                 stdout=subprocess.PIPE, text=True, env=env)
         self.addCleanup(proc.stdout.close)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        pid = int(proc.stdout.readline())
-        self.addCleanup(self._kill, pid)
-        return proc, pid
+        found = [int(proc.stdout.readline()) for _ in range(pids)]
+        for pid in found:
+            self.addCleanup(self._kill, pid)
+        return (proc, found[0]) if pids == 1 else (proc, found)
+
+    #: a suite that starts a worker (which does not inherit the slot
+    #: descriptor) and waits for it; `ignore`: the worker ignores SIGTERM
+    SUITE = ("import os, subprocess, sys; "
+             "worker = subprocess.Popen([sys.executable, '-c', "
+             "'import os, signal, sys, time; '"
+             "'signal.signal(signal.SIGTERM, signal.SIG_IGN) if sys.argv[1] == \"1\" else None; '"
+             "'print(os.getpid(), flush=True); time.sleep(60)', '%s']); "
+             "print(os.getpid(), flush=True); worker.wait()")
 
     @staticmethod
     def _kill(pid: int) -> None:
@@ -171,6 +182,49 @@ class RunChildTest(unittest.TestCase):
                 got = heavy.acquire(self.one, max_wait_s=0)
                 self.assertIsNotNone(got)
                 heavy.release(got[1])
+
+    def test_sigterm_reaches_the_suite_s_workers_and_the_slot_waits_for_them(self):
+        # codex r2: the worker of a Python suite, which closes the inherited
+        # slot descriptor, must not keep running on a released slot
+        proc, (suite, worker) = self._wrapper(self.SUITE % "0", pids=2)
+        self.assertEqual(os.getpgid(worker), suite)
+        self.assertNotEqual(os.getpgid(suite), os.getpgid(0))
+        proc.send_signal(signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertTrue(self._gone(suite))
+        self.assertTrue(self._gone(worker))
+        got = heavy.acquire(self.one, max_wait_s=0)
+        self.assertIsNotNone(got)
+        heavy.release(got[1])
+
+    def test_a_worker_ignoring_sigterm_keeps_the_slot_until_sigkill(self):
+        proc, (suite, worker) = self._wrapper(self.SUITE % "1", grace=1.5, pids=2)
+        proc.send_signal(signal.SIGTERM)
+        self.assertTrue(self._gone(suite))
+        # the suite is gone, its worker is not: the slot stays held
+        self.assertFalse(self._gone(worker, timeout=0.3))
+        self.assertIsNone(proc.poll())
+        self.assertIsNone(heavy.acquire(self.one, max_wait_s=0))
+        self.assertEqual(proc.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertTrue(self._gone(worker))
+        got = heavy.acquire(self.one, max_wait_s=0)
+        self.assertIsNotNone(got)
+        heavy.release(got[1])
+
+    def test_what_the_command_leaves_running_ends_with_it(self):
+        # the command exits 0 and leaves a worker: part of the suite, stopped
+        # before the slot is released; the command's exit code is kept
+        left = ("import os, subprocess, sys; "
+                "worker = subprocess.Popen([sys.executable, '-c', "
+                "'import os, time; print(os.getpid(), flush=True); time.sleep(60)'], "
+                "stdout=subprocess.PIPE, text=True); "
+                "print(os.getpid(), worker.stdout.readline(), sep='\\n', end='', flush=True)")
+        proc, (command, worker) = self._wrapper(left, pids=2)
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertTrue(self._gone(worker))
+        got = heavy.acquire(self.one, max_wait_s=0)
+        self.assertIsNotNone(got)
+        heavy.release(got[1])
 
 
 class NoteTest(unittest.TestCase):

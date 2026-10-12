@@ -15,10 +15,13 @@ The holder (pid, agent, command, start) is written in the slot file for
 runner and the orchestrator's short turns stay responsive.
 
 The command inherits the locked slot descriptor (codex review r1, P2): the
-slot lives as long as the command, even if the wrapper is killed, and a
-process the command leaves behind keeps it until it exits too. SIGTERM,
-SIGINT and SIGHUP sent to the wrapper are relayed to the command, which the
-wrapper then waits for.
+slot lives as long as the command, even if the wrapper is killed. The command
+runs in its own process group (codex review r2, P2): SIGTERM, SIGINT and
+SIGHUP sent to the wrapper are relayed to the whole group — a suite's workers
+too, which do not inherit the descriptor (Python closes it) — and the
+wrapper keeps the slot until no process of the group is left. What the
+command started and left running when it ended is part of the suite: it gets
+SIGTERM, then SIGKILL after `GROUP_GRACE_S`, before the slot is released.
 """
 from __future__ import annotations
 
@@ -36,6 +39,8 @@ POLL_S = 5.0
 WAIT_LOG_S = 60.0
 #: signals the wrapper relays to the command it runs
 RELAYED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+#: seconds the command's process group has after SIGTERM, then after SIGKILL
+GROUP_GRACE_S = 10.0
 
 
 def limit(cfg) -> int:
@@ -146,6 +151,54 @@ def _note_child(fh, pid: int) -> None:
         pass
 
 
+def _killpg(pgid: int, signum: int) -> bool:
+    """Signals the command's process group; False once it has no process."""
+    try:
+        os.killpg(pgid, signum)
+    except ProcessLookupError:
+        return False
+    except PermissionError:         # a member changed its credentials: still there
+        pass
+    return True
+
+
+def _group_alive(pgid: int) -> bool:
+    """A process of the group `pgid` still runs. A zombie does not count: its
+    reaper (init, a subreaper) may take its time, the process is gone."""
+    if not _killpg(pgid, 0):
+        return False
+    try:
+        pids = [name for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return True                 # no /proc: kill(0) is all there is
+    for pid in pids:
+        try:
+            with open("/proc/%s/stat" % pid, encoding="utf-8") as fh:
+                fields = fh.read().rsplit(") ", 1)[-1].split()
+        except OSError:
+            continue
+        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] not in ("Z", "X"):
+            return True
+    return False
+
+
+def _drain_group(pgid: int, *, grace: float | None = None, sleep=time.sleep,
+                 clock=time.monotonic) -> bool:
+    """Waits until no process of the group `pgid` is left: SIGTERM to what
+    the command left running, SIGKILL after `grace`, then `grace` more. True
+    when the group is gone."""
+    grace = GROUP_GRACE_S if grace is None else grace
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        if not _group_alive(pgid) or not _killpg(pgid, signum):
+            return True
+        deadline = clock() + grace
+        while clock() < deadline:
+            if not _group_alive(pgid):
+                return True
+            sleep(0.1)
+    return not _group_alive(pgid)
+
+
 def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
     """Runs `argv` holding a heavy slot; its exit code (127 if not found,
     128 + n if killed by signal n)."""
@@ -159,12 +212,15 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
     def relay(signum, frame):
         if child is None:
             pending.append(signum)
-        elif child.poll() is None:
-            child.send_signal(signum)
+        else:
+            _killpg(child.pid, signum)  # the group, even once the command is gone
 
     previous = {sig: signal.signal(sig, relay) for sig in RELAYED}
     try:
         def lower():
+            # its own process group (pgid = its pid), set before exec — Popen
+            # returns after the exec, the group exists when signals are relayed
+            os.setpgid(0, 0)
             if nice:
                 os.nice(nice)
         try:
@@ -176,6 +232,9 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE) -> int:
         for signum in pending:
             relay(signum, None)
         code = child.wait()
+        if not _drain_group(child.pid):
+            print("ameesh heavy: processes of the command (group %d) survive SIGKILL; "
+                  "slot released" % child.pid, file=sys.stderr)
         return code if code >= 0 else 128 - code
     finally:
         for sig, handler in previous.items():
