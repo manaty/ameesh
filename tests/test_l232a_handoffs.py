@@ -463,6 +463,14 @@ class HandoffTest(PgTestCase):
         for _ in range(8): op = self.advance(op)
         self.assertEqual(op["state"], "verified")
 
+    def test_destination_checkout_path_changed_before_enable_holds(self):
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        self.db.execute("UPDATE agent_registry SET cwd='/other/worktree' WHERE name='dev'")
+        held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
+
 
 class PublishedCheckoutTest(unittest.TestCase):
     def test_actual_remote_identity_clean_exact_pushed_commit(self):

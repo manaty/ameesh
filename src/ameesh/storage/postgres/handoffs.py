@@ -203,7 +203,7 @@ class Handoffs(interface.Handoffs):
                 return None
             agent = rows[0]
             if ((agent["canon"] or "") != plan["canon"] or agent["mode"] != "execute"
-                    or agent["harness"] != plan["harness"]
+                    or agent["harness"] != plan["harness"] or (agent["cwd"] or "") != plan["source_cwd"]
                     or agent["host"] != op["source"] or agent["status"] in ("running", "stopped", "paused")
                     or agent["lease_epoch"] not in (plan["epoch"], plan["epoch"]+1)
                     or agent["lease_owner"] not in (None, plan["owner"])
@@ -243,12 +243,12 @@ class Handoffs(interface.Handoffs):
             if state in ("activated", "verified"):
                 allowed = tx.query("SELECT name FROM agent_registry r WHERE name=%s AND host=%s"
                                    " AND mode='execute' AND status NOT IN ('paused','stopped')"
-                                   " AND coalesce(canon,'')=%s AND harness=%s"
+                                   " AND coalesce(canon,'')=%s AND harness=%s AND cwd=%s"
                                    " AND %s=ANY(admitted_hosts) AND " + placement_admitted_sql("r")
                                    + " AND EXISTS (SELECT 1 FROM canon_state s"
                                    " WHERE s.host=r.host AND s.canon=coalesce(r.canon,'') AND s.status='ok'"
                                    " AND s.last_good_commit=%s)",
-                                   (op["agent"],op["target"],op["plan"]["canon"],op["plan"]["harness"],
+                                   (op["agent"],op["target"],op["plan"]["canon"],op["plan"]["harness"],op["evidence"].get("cwd"),
                                     op["target"],op["plan"]["canon_revision"]))
                 if not allowed:
                     return None
