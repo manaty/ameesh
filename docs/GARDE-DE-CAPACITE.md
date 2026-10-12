@@ -113,13 +113,15 @@ policy:
   la garde démarre, et l'opérateur corrige la fiche. Une taille que le
   lecteur précédent tronquait est tronquée de la même façon et signalée
   aussi (`"0.001KiB"` vaut 1 octet, `6442450944.5` vaut 6442450944) :
-  l'offre que main acceptait reste valide. Ce qui reste refusé doit être
-  corrigé **avant** la mise à jour, sinon la garde sort au démarrage : un
-  chemin relatif (il serait sondé depuis le dossier de la garde), un `..`
-  (à travers un lien symbolique, `/srv/../etc` n'est pas `/etc`), un NUL,
-  et une taille qui n'est pas > 0 (`0`, `"0.5B"`, ou ce qui tronque à
-  0 octet : le lecteur précédent lisait `0` comme « pas de reclaim
-  disque », ce qui désactivait le seuil en silence).
+  l'offre que main acceptait reste valide. Un `disk_paths` refusé fait
+  tomber l'offre de l'hôte : la garde démarre quand même et ne prête rien,
+  et le message nomme la clé — chemin relatif (sondé depuis le dossier de
+  la garde), `..` (à travers un lien symbolique, `/srv/../etc` n'est pas
+  `/etc`), NUL. Une taille qui n'est pas > 0 (`0`, `"0.5B"`, ou ce qui
+  tronque à 0 octet : le lecteur précédent lisait `0` comme « pas de
+  reclaim disque », ce qui désactivait le seuil en silence) doit être
+  corrigée **avant** la mise à jour : elle laisse l'offre illisible et la
+  garde sort au démarrage.
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 

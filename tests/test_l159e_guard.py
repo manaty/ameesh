@@ -92,16 +92,31 @@ class OfferTest(unittest.TestCase):
                {"reclaim": {"io_pressure_max": "120%"}},
                {"reclaim": {"disk_paths": "/"}},
                # codex #459 r1: the reader refuses what the guard used to fix up
-               {"reclaim": {"disk_paths": ["../etc"]}},
-               {"reclaim": {"disk_paths": ["/\x00"]}},
                {"reclaim": {"disk_free_min": 0}},
                {"reclaim": {"io_pressure_max": None}},
                # L159e4: whole seconds >= 0
                {"restart_after_seconds": -1}, {"restart_after_seconds": 1.5},
                {"restart_after_seconds": True}, {"restart_after_seconds": "600"}]
-        for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
+        for offer in [{}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
             with self.assertRaises(guard.GuardError, msg=offer):
                 guard.parse_offer(offer)
+        # mesh-design #459 r4b: an absent offer, or one whose only problem is
+        # a refused path (relative, `..`, NUL), does not stop the guard: it
+        # starts and lends nothing, with a message naming the key
+        for offer in (None,
+                      lend(reclaim={"disk_paths": ["../etc"]}),
+                      lend(reclaim={"disk_paths": ["/\x00"]}),
+                      lend(reclaim={"disk_paths": ["/srv", "rel/x"]})):
+            with self.subTest(offer=offer):
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    got = guard.parse_offer(offer)
+                text = err.getvalue()
+                self.assertEqual(got.published, {})
+                self.assertEqual(got.disk_paths, ("/",))
+                self.assertEqual(got.disk_free_min, 0)
+                self.assertIn("lends nothing", text)
+                if offer is not None and offer.get("reclaim"):
+                    self.assertIn("disk_paths", text)
         # codex #459 r3: a path named twice (`/` and `/`) is collapsed, not
         # refused — the guard starts on an offer main accepted
         offer = guard.parse_offer(lend(reclaim={"disk_paths": ["/", "/"]}))

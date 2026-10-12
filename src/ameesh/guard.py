@@ -255,8 +255,23 @@ def parse_offer(lend: Any) -> Offer:
     """`Offer` from the `lend` object, read by the contract's own reader
     (`capacity_guard.parse_lend`): the guard accepts exactly the offers the
     canon accepts (codex #211 r6), the reclaim keys of `GUARD_RECLAIM_KEYS`
-    included. `GuardError` on any problem."""
-    parsed, problems, _unknown = capacity_guard.parse_lend(lend)
+    included. `GuardError` on any problem.
+
+    Two cases do not stop the guard, which then starts and lends nothing:
+    an absent offer (`lend: null`), and an offer whose only problem is a
+    refused `disk_paths` (relative path, `..`, NUL). The message names the
+    key; the canon still reports the fiche (mesh-design #459 r4b)."""
+    warnings: list[str] = []
+    parsed, problems, _unknown = capacity_guard.parse_lend(lend, warnings)
+    for warning in warnings:
+        print("ameesh guard: lend: %s" % warning, file=sys.stderr)
+    if parsed is None and (lend is None or capacity_guard.refused_paths_only(problems)):
+        print("ameesh guard: no lend offer, the guard starts and lends nothing: %s"
+              % ("absent" if lend is None else "; ".join(problems)), file=sys.stderr)
+        # inert: no cap, no reclaim threshold (0 free bytes watches nothing),
+        # so the guard publishes, answers a manual drain, and never stops a
+        # unit on an offer it could not read
+        return Offer(disk_free_min=0, published={})
     if problems or parsed is None:
         raise GuardError("lend: %s" % "; ".join(problems or ["unreadable"]))
     reclaim = parsed.get("reclaim") or {}

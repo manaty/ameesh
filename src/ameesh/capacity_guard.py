@@ -343,9 +343,13 @@ def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list[s
         else:
             clean = [_reclaim_path(p, warnings) for p in paths]
             unique = list(dict.fromkeys(clean))
-            if any(p is None for p in clean):
-                problems.append("`disk_paths`: absolute, normalized paths expected, "
-                                "without `..` or NUL (e.g. [\"/\", \"/srv/ameesh-guest\"])")
+            refused = [p for p, kept in zip(paths, clean) if kept is None]
+            if refused:
+                # mesh-design #459 r4b: a relative path, `..` and NUL stay
+                # refused (security); the offer falls, but the guard starts
+                problems.append("`disk_paths`: refused path(s) %s (absolute, without "
+                                "`..` or NUL expected, e.g. [\"/\", \"/srv/ameesh-guest\"])"
+                                % ", ".join(repr(p) for p in refused))
             else:
                 if len(unique) != len(clean) and warnings is not None:
                     warnings.append("`reclaim.disk_paths`: duplicate paths collapsed to %s "
@@ -370,3 +374,16 @@ def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list[s
     if "busy_max" in out and "busy_units" not in out:
         problems.append("`busy_max` without `busy_units`")
     return out, problems, sorted(str(k) for k in raw if k not in RECLAIM_KEYS)
+
+
+#: mark of a `disk_paths` problem that drops the offer without stopping the
+#: guard (mesh-design #459 r4b)
+REFUSED_PATH_MARK = "refused path"
+
+
+def refused_paths_only(problems) -> bool:
+    """True when every problem is a refused `disk_paths` entry (relative
+    path, `..`, NUL): the offer falls and the guard starts anyway
+    (mesh-design #459 r4b)."""
+    return bool(problems) and all(
+        "disk_paths`" in p and REFUSED_PATH_MARK in p for p in problems)
