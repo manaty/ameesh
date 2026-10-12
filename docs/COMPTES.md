@@ -442,3 +442,59 @@ Then declare the account with the `oauth_token` type (after the lot above).
 To rotate a token, run the same steps again and revoke the old token in the
 claude.ai settings.
 
+
+## 7. Critical agents: never paused while an account has headroom (L242b)
+
+Owner requirement (2026-10-12, 09:55 and 10:00). On 2026-10-12 at 09:50 the
+orchestrator and mesh-design were paused on budget.
+
+**Who is critical.** An agent is critical when any of these holds:
+
+* it is declared in the host's `critical_agents` setting (list), or in
+  `AMEESH_CRITICAL_AGENTS` (comma-separated);
+* it is an orchestrator for the runner (`AMEESH_ALERT_ORCHESTRATORS`, or a
+  canon Agent card with `roles: [orchestrateur]`);
+* its canon Agent card has the role `conception` or `design`;
+* it is an auditor (the `auditeur` agent, or the `auditeur` role).
+
+The canon does not give these roles today, so declare the orchestrators and
+the design agent on each host:
+
+```json
+"critical_agents": ["orchestrateur", "mesh-design"]
+```
+
+**Per-agent choice.** For a critical agent, the account choice of § 2–4 is
+made for that agent alone:
+
+* it never writes the shared last choice (`account_active`), which is what
+  new sessions of the other agents use;
+* it never lifts a manual force. A forced account under its threshold
+  applies to critical agents too. A forced account at its threshold does
+  not hold them while another account has headroom; the force stays in
+  place for the others.
+
+A switch is portable when the session moves within the same harness (Claude
+with a shared `projects/`, § 1). It is then made in the same session, before
+the turn and before any pause. The runner journal and the team thread say
+"Account switch claude for this critical agent only: A → B (…)", once per
+change. No `account_switches` row is written, since the shared choice did not
+change.
+
+**Fallback order for a critical agent at its threshold** (this PR covers the
+first two steps):
+
+1. another plan account of the same harness with headroom (§ 4 order);
+2. the harness's default account (`~/.claude`) beyond its implicit 50 % cap.
+   The rules for this step:
+   * it is for critical agents only, and comes last;
+   * the account is never used in overage;
+   * its pace cap and `overage_cap` still hold;
+   * a `cap` written explicitly in the configuration still holds.
+
+   As soon as another account has headroom again (for example after its
+   window resets), the agent leaves the default account: continuity only keeps
+   a session on an account that is under its ordinary threshold;
+3. another plan harness (Codex), then an API-key harness (DeepSeek), via a
+   rotation with summary. This step is not done yet (lot #340, next PR);
+4. pause, once all of the above are exhausted.

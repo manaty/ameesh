@@ -597,12 +597,18 @@ def overage_capable(profile: Profile, overage) -> bool:
     return bool(overage is not None and overage.capable)
 
 
-def fixed_caps(profile: Profile, gauges) -> list[tuple[float, str]]:
+def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tuple[float, str]]:
     """[(cap, label)]: the caps that hold on every window of the account
     whatever its pace (L226b): its fixed cap (`account_cap`), and
-    `overage_cap` when it may be billed beyond its plan."""
+    `overage_cap` when it may be billed beyond its plan.
+
+    `critical` (L242b, owner decision 2026-10-12 10:00): the implicit 50 %
+    cap of the default account does not hold for a critical agent; a `cap`
+    set in the configuration and `overage_cap` still do."""
     fixed = []
     cap = account_cap(profile)
+    if critical and profile.cap is None:
+        cap = None
     if cap is not None:
         fixed.append((cap, "primary cap" if profile.cap is None else "account cap"))
     if overage_capable(profile, getattr(gauges, "overage", None)):
@@ -610,15 +616,17 @@ def fixed_caps(profile: Profile, gauges) -> list[tuple[float, str]]:
     return fixed
 
 
-def limits(profile: Profile, gauges, now: float) -> dict:
+def limits(profile: Profile, gauges, now: float, *, critical: bool = False) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
       `short_window_cap` when set (it replaces the pace cap there);
     * the account's fixed cap (`account_cap`: 50 % for the primary);
     * `overage_cap` (80 %) when the account may be billed beyond its plan.
+
+    `critical` (L242b): see `fixed_caps`.
     """
-    fixed = fixed_caps(profile, gauges)
+    fixed = fixed_caps(profile, gauges, critical=critical)
     out = {}
     for gauge in gauges:
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
@@ -630,10 +638,12 @@ def limits(profile: Profile, gauges, now: float) -> dict:
 
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
-             environ=None, *, record: bool = True) -> Evaluation:
+             environ=None, *, record: bool = True, critical: bool = False) -> Evaluation:
     """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
 
-    `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit."""
+    `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
+    `critical` (L242b) : pour un agent critique, sans le plafond implicite de
+    50 % du compte par défaut (`fixed_caps`)."""
     result = Evaluation(profile)
     result.problems = check(profile, environ)
     if result.problems:
@@ -653,7 +663,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
-    result.limits = limits(profile, result.gauges, now)
+    result.limits = limits(profile, result.gauges, now, critical=critical)
     depasses = []
     for gauge in result.gauges:
         # fenêtre remise à zéro depuis le relevé : vierge (L71 : `used_at`
@@ -661,7 +671,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         if gauge.used_at(now) >= result.limits[gauge.key][0]:
             depasses.append(gauge)
     if depasses:
-        fixed = fixed_caps(profile, result.gauges)
+        fixed = fixed_caps(profile, result.gauges, critical=critical)
         hard = [(g, pair) for g in depasses for pair in fixed if g.used_at(now) >= pair[0]]
         result.hard = bool(hard)
         # an absolute cap first in the reason: the pace may be lower, it is
@@ -722,6 +732,9 @@ class Choice:
     #: échec d'authentification, que la garde de l'exécuteur ne lance pas
     #: (l'agent reste `auth_blocked`)
     auth_blocked: bool = False
+    #: L242b : choix propre à un agent critique — le dernier choix partagé
+    #: (`account_active`) n'a pas bougé, aucun forçage n'a été levé
+    per_agent: bool = False
 
 
 def _label(evaluations: dict) -> str:
@@ -840,7 +853,7 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
-           paced: bool = True) -> Choice:
+           paced: bool = True, critical: bool = False) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -859,6 +872,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     n'est sous son seuil, le rythme est levé — mais jamais les règles
     absolues de L226b (overage, plafonds fixes : décision du propriétaire du
     2026-10-07). Aucun compte hors de ces règles : pause, comme avec la garde.
+
+    `critical` (L242b, agent critique : orchestrateur, conception, auditeur) :
+    le choix est propre à l'agent — il n'écrit jamais le dernier choix
+    partagé et ne lève aucun forçage (un forçage au seuil ne le retient pas
+    s'il reste un compte) ; sans autre compte, le compte par défaut sert
+    au-delà de son plafond implicite de 50 % (jamais en overage, rythme et
+    `overage_cap` tenus), en dernier.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -910,9 +930,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # the force is lifted (journaled `auto`) and the automatic choice runs
         free = [p for p in candidates if p.name != active.name
                 and (ev(p).ok if paced else ev(p).unpaced_ok)]
-        if not free:
+        if critical:
+            pass        # L242b : choix propre à l'agent, le forçage reste aux autres
+        elif not free:
             return held
-        if not simulate and not store.set_auto(
+        elif not simulate and not store.set_auto(
                 host, harness, expected=active.name,
                 reason="forced account %s at threshold (%s); %s free"
                 % (active.name, cache[active.name].reason, free[0].name)):
@@ -937,6 +959,20 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # L226b: past its pace a healthy account stays usable, never past an
         # absolute rule
         ranked = rank(candidates, cache, now, paced=False)
+    beyond = False
+    if not ranked and critical:
+        # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
+        # agent critique seulement, en dernier (jamais en overage)
+        relaxed = dict(cache)
+        for profile in candidates:
+            if profile.default and profile.cap is None:
+                relaxed[profile.name] = evaluate(book, profile, items, now, environ,
+                                                 record=False, critical=True)
+        ranked = rank(candidates, relaxed, now, paced=paced) or (
+            [] if paced else rank(candidates, relaxed, now, paced=False))
+        if ranked:
+            beyond = True
+            cache = relaxed
     if not ranked:
         blocked = [p for p in items if p.name in sick
                    and (cache[p.name].ok if paced else cache[p.name].unpaced_ok)]
@@ -954,12 +990,24 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                       % (harness, _label(cache)))
     target = ranked[0]
     why = reason_of(ranked, cache, now)
+    if beyond:
+        why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
+               "threshold (owner decision 2026-10-12); %s" % (
+                   target.name, PRIMARY_CAP * 100, why))
     left = own if own is not None else (active if target.name != active.name else None)
     if left is not None and left.name in sick:
         why = "%s authentication failing (%s); %s" % (
             left.name, sick[left.name].get("reason") or "?", why)
     elif left is not None and not cache[left.name].ok:
         why = "%s at threshold (%s); %s" % (left.name, cache[left.name].reason, why)
+    if critical:
+        # L242b : jamais le dernier choix partagé ; la bascule est celle de
+        # l'agent (depuis le compte de sa session, sinon le choix partagé)
+        origin = own if own is not None else active
+        moved = None
+        if target.name != origin.name:
+            moved = {"from": origin.name, "to": target.name, "kind": "agent", "reason": why}
+        return Choice(target, active, switched=moved, why=why, per_agent=True)
     if target.name == active.name:
         return Choice(target, active, why=why)
     switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}

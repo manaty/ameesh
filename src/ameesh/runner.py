@@ -138,6 +138,9 @@ JOURNAL_CLOSE_TIMEOUT = 2.0
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
+#: L242b : rôles de conception au canon (agents critiques, avec les
+#: orchestrateurs et les auditeurs)
+DESIGN_ROLES = ("conception", "design")
 #: L147 (#220 r2) : un conteneur relancé par sa politique (unité du
 #: gestionnaire utilisateur, podman-restart) peut démarrer après l'exécuteur —
 #: aucune ligne n'est soldée moins de BOOT_SETTLE_S après le démarrage de
@@ -4622,6 +4625,20 @@ class Runner:
             return False
         row = agent if agent is not None else registry.get(self.db, name)
         return bool(row and name in auditor_mod.cards([row], canons))
+
+    def is_critical(self, name: str, agent=None) -> bool:
+        """L242b : agent critique, jamais en pause budget tant qu'un compte a
+        de la marge — déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS`),
+        orchestrateur (`is_orchestrator`), conception (rôle `conception` ou
+        `design` au canon) ou auditeur (`is_auditor`)."""
+        if name in (getattr(self.cfg, "critical_agents", None) or ()):
+            return True
+        if self.is_orchestrator(name):
+            return True
+        from . import sous_utilisation as su
+        if name in su.role_orchestrators(getattr(self, "_audit_canons", ()), DESIGN_ROLES):
+            return True
+        return self.is_auditor(name, agent)
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:
