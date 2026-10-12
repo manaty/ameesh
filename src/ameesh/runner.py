@@ -1746,11 +1746,15 @@ class AgentWorker(threading.Thread):
                 pass
             try:
                 from . import reprise
-                self._resume_keep(reprise.deterministic_brief(
+                brief = reprise.deterministic_brief(
                     self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
                     session=refusee, reason=motif,
                     consigne="This turn's instruction follows this brief: resume your "
-                             "work from there."), "ameesh")
+                             "work from there.")
+                if not self._resume_keep(brief, "ameesh"):
+                    # #389 r3 : la session refusée ne se garde pas — le brief,
+                    # au moins en mémoire, ouvre le tour
+                    self.resume_summary, self.resume_origin = brief, "ameesh"
             except Exception as exc:  # un brief manquant n'empêche pas l'oubli
                 log_async("[%s] deterministic resume brief unavailable (%s)"
                           % (self.name, exc))
