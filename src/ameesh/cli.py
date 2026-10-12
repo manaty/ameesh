@@ -1339,20 +1339,29 @@ def host_measures_line(cfg: Config, reading: dict | None = None) -> str:
     """L64: the host measures this OS, or this host, cannot give, read on a
     fresh reading (never the published one, which may come from before an
     upgrade) of the filesystems the guard watches (work roots, state, caches,
-    tmp, docker, `/`: a btrfs work root is not the state dir's filesystem).
-    Informative: the verdict does not change."""
+    tmp, docker, `/`: a btrfs work root is not the state dir's filesystem),
+    under the guard's effective housekeeping policy (the canons' Host card:
+    a cache root of its own); the default one, said, when the canons cannot
+    be read. Informative: the verdict does not change."""
+    from . import canon as canon_mod
+    from . import menage as menage_mod
     from . import resources
+    note = ""
     try:
         if reading is None:
-            reading = resources.sample(cfg.host, paths=resources.disk_paths(cfg),
-                                       tmp=resources.tmp_paths(cfg))
+            try:
+                policy = menage_mod.effective(canon_mod.load_configured(cfg), cfg.host or "")
+            except Exception:
+                policy, note = menage_mod.Policy(), " [default policy: canon unreadable]"
+            reading = resources.sample(cfg.host, paths=resources.disk_paths(cfg, policy),
+                                       tmp=resources.tmp_paths(cfg, policy))
         missing = resources.unmeasured(reading)
     except Exception as exc:  # a reading never breaks the doctor
         return "measures   : host not read (%s)" % (" ".join(str(exc).split())[:120],)
     if not missing:
-        return "measures   : every host measure is read (%s)" % platform.SYSTEM
-    return "measures   : not given on this host (%s): %s" % (platform.SYSTEM,
-                                                             ", ".join(missing))
+        return "measures   : every host measure is read (%s)%s" % (platform.SYSTEM, note)
+    return "measures   : not given on this host (%s): %s%s" % (platform.SYSTEM,
+                                                               ", ".join(missing), note)
 
 
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,

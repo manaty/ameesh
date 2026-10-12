@@ -112,6 +112,22 @@ class CommandsTest(PgTestCase):
         self.assertEqual(code_fail, code_full)
         self.assertEqual(code, code_full)
 
+    def test_doctor_reads_the_effective_policy(self):
+        """Review #392 r2: the cache root of the canon's Host card is sampled
+        (the guard's policy); an unreadable canon falls back, said."""
+        from ameesh import canon, menage
+        cache = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, cache)
+        with mock.patch.object(canon, "load_configured", return_value=[]), \
+                mock.patch.object(menage, "effective",
+                                  return_value=menage.Policy(cache_root=cache)):
+            _code, text = self._doctor(self.cfg, return_value=FULL)
+        self.assertIn(cache, self.calls[0].kwargs["paths"])
+        self.assertNotIn("default policy", text)
+        with mock.patch.object(canon, "load_configured", side_effect=OSError("canon")):
+            _code, text = self._doctor(self.cfg, return_value=FULL)
+        self.assertIn("[default policy: canon unreadable]", text)
+
     def test_hosts_text_and_json(self):
         self.db.execute("DELETE FROM host_resources")
         storage.of(self.db).hosts.record(dict(
