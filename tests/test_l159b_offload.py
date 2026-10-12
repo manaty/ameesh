@@ -147,6 +147,27 @@ class RunTest(OffloadBase):
         self.assertEqual(name, "sub")
         self.assertTrue(tmpdir.startswith(os.path.join(self.vm, "jobs")))
 
+    def test_snapshot_is_exactly_the_working_tree(self):
+        # sparse checkout: a tracked credentials file absent from the working
+        # tree never reaches the guest; assume-unchanged: the file's real
+        # contents travel, not the index's
+        os.makedirs(os.path.join(self.repo, "secret"))
+        with open(os.path.join(self.repo, "secret", "creds"), "w") as fh:
+            fh.write("token\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "creds")
+        git(self.repo, "sparse-checkout", "set", "--no-cone", "/*", "!/secret/")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "secret", "creds")))
+        git(self.repo, "update-index", "--assume-unchanged", "tracked.txt")
+        with open(os.path.join(self.repo, "tracked.txt"), "w") as fh:
+            fh.write("edited\n")
+        before = git(self.repo, "ls-files", "-v")
+        snap = offload.snapshot(self.repo)
+        files = git(self.repo, "ls-tree", "-r", "--name-only", snap).split()
+        self.assertNotIn("secret/creds", files)
+        self.assertEqual(git(self.repo, "show", snap + ":tracked.txt"), "edited")
+        self.assertEqual(git(self.repo, "ls-files", "-v"), before)  # agent's index untouched
+
     def test_second_push_is_differential_and_unchanged_tree_not_resent(self):
         self.assertEqual(self.offload("run", "--", "true").returncode, 0)
         top = self.repo

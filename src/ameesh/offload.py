@@ -78,8 +78,20 @@ def snapshot(top: str) -> str:
                 dst.write(src.read())
         except FileNotFoundError:
             pass
-        _git(top, "add", "-A", env=env)
-        tree = _git(top, "write-tree", env=env)
+        # exactly the working tree: a skip-worktree entry (sparse checkout,
+        # absent from disk) or an assume-unchanged one (contents not looked
+        # at) of the copied index would otherwise travel as the index has it
+        full = ("-c", "core.sparseCheckout=false", "-c", "index.sparse=false")
+        entries = _git(top, *full, "ls-files", "-v", "-z", env=env).split("\0")
+        # one flag per call: update-index applies only the last of the two
+        for flag, flagged in (
+                ("--no-skip-worktree", [e[2:] for e in entries if e[:1] in ("S", "s")]),
+                ("--no-assume-unchanged", [e[2:] for e in entries if e[:1].islower()])):
+            if flagged:
+                _git(top, *full, "update-index", flag, "-z", "--stdin", env=env,
+                     input="\0".join(flagged) + "\0")
+        _git(top, *full, "add", "-A", env=env)
+        tree = _git(top, *full, "write-tree", env=env)
     # no parent: the history (a secret deleted since, or now ignored) never
     # travels; fixed date: the same tree always gives the same snapshot
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
