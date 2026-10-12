@@ -1,26 +1,26 @@
 ---
 type: Decision
-title: "Toute parole est signée ; pas de procédure provisoire avant ameesh v1"
-description: "Les messages des humains et des agents doivent être signés pour faire preuve ; nos sessions actuelles restent sans signature."
+title: "Every statement is signed; no interim procedure before ameesh v1"
+description: "Messages from humans and agents must be signed to count as proof; our current sessions remain unsigned."
 status: stable
 tags: [securite, signature, autorite]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-mesh-design transmettait à l'orchestrateur des « décisions du propriétaire » que rien ne prouvait ; l'orchestrateur les croyait.
+mesh-design passed on to the orchestrator "owner decisions" that nothing proved; the orchestrator believed them.
 
-# Décision
+# Decision
 
-- Ce que disent les auteurs, **humains comme agents**, doit être **signé** pour faire preuve : signature de **provenance** sur chaque message, signature d'**autorité** explicite pour une décision.
-- **Pas de règle provisoire** : tant qu'ameesh v1 n'est pas en service, les sessions actuelles restent sans signature (« c'est pas sécurisé, c'est pas grave »).
+- What authors say, **humans and agents alike**, must be **signed** to count as proof: a **provenance** signature on every message, an explicit **authority** signature for a decision.
+- **No interim rule**: as long as ameesh v1 is not in service, the current sessions remain unsigned ("it's not secure, it doesn't matter").
 
-# Conséquences
+# Consequences
 
-- Prérequis : une clé par agent que les autres ne peuvent pas lire (utilisateur Unix ou conteneur par agent, ou signature faite par l'exécuteur au nom de l'agent).
-- Une décision rapportée par un agent n'est une preuve que si l'humain l'a signée (ameesh-approve, passkey sur le téléphone) ; elle est alors enregistrée comme `Decision` avec sa signature.
-- Dans Slack, Teams ou Google Chat, l'identité de la plateforme reste un indice, jamais une preuve.
+- Prerequisite: one key per agent that the others cannot read (a Unix user or container per agent, or a signature made by the runner on the agent's behalf).
+- A decision reported by an agent is proof only if the human signed it (ameesh-approve, passkey on the phone); it is then recorded as a `Decision` with its signature.
+- In Slack, Teams or Google Chat, the platform identity remains a clue, never a proof.

@@ -1,41 +1,41 @@
 ---
 type: Decision
-title: "ameesh-approve est joignable par le téléphone via une page Nexlink"
-description: "Pour la bascule du chantier, le service d'approbation est exposé en HTTPS par une page Nexlink."
+title: "ameesh-approve is reachable from the phone via a Nexlink page"
+description: "For the project switchover, the approval service is exposed over HTTPS by a Nexlink page."
 status: stable
 tags: [ameesh-approve, nexlink, bascule, reseau]
 decided_by: human:smichea
 decision_date: 2026-10-04
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T02:10:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-WebAuthn exige un contexte sécurisé (HTTPS) et un domaine stable (RP ID) ; le
-téléphone n'atteint pas le `localhost` du PC. Trois options : réseau privé avec
-certificat, page Nexlink, domaine dédié ([bascule v1](../bascule-v1.md), étape 3).
+WebAuthn requires a secure context (HTTPS) and a stable domain (RP ID); the
+phone cannot reach the PC's `localhost`. Three options: private network with
+certificate, Nexlink page, dedicated domain ([v1 switchover](../bascule-v1.md), step 3).
 
-# Décision
+# Decision
 
-Pour la bascule du chantier, **ameesh-approve est exposé via une page Nexlink**.
+For the project switchover, **ameesh-approve is exposed via a Nexlink page**.
 
-# Conséquences
+# Consequences
 
-- Le RP ID est le domaine de la page Nexlink ; un changement de domaine oblige à
-  réenrôler les passkeys (ou à déclarer des origines liées, WebAuthn L3).
-- Côté Nexlink : la page doit pouvoir servir (ou relayer en HTTPS) le service
-  d'approbation qui tourne sous l'utilisateur dédié — à instruire avec
-  l'orchestrateur Nexlink (lien avec la remarque « toute infrastructure
-  existante devient une page Nexlink »).
-- Rien n'est exposé avant que le service ait passé sa revue de sécurité (L7) ;
-  la mise en ligne reste un acte du propriétaire.
+- The RP ID is the domain of the Nexlink page; a domain change forces
+  re-enrolling the passkeys (or declaring related origins, WebAuthn L3).
+- On the Nexlink side: the page must be able to serve (or relay over HTTPS) the approval
+  service that runs under the dedicated user — to be examined with
+  the Nexlink orchestrator (link with the remark "any existing
+  infrastructure becomes a Nexlink page").
+- Nothing is exposed before the service has passed its security review (L7);
+  putting it online remains an act of the owner.
 
-# Précision (2026-10-05)
+# Clarification (2026-10-05)
 
-Décision du propriétaire, rapportée par mesh-design : la page est **la page
-d'ameesh** (le service ameesh-approve, pas une page de contenu Nexlink),
-**servie par Nexlink sur `ameesh.nexlink.ph`**. RP ID `ameesh.nexlink.ph`,
-origine `https://ameesh.nexlink.ph`. Le service reste sur la boucle locale du
-PC (127.0.0.1:8765, utilisateur `ameesh-approve`) ; le relais HTTPS et le moyen
-d'atteindre le PC sans connexion entrante sont fournis côté Nexlink.
+Owner decision, reported by mesh-design: the page is **ameesh's
+page** (the ameesh-approve service, not a Nexlink content page),
+**served by Nexlink on `ameesh.nexlink.ph`**. RP ID `ameesh.nexlink.ph`,
+origin `https://ameesh.nexlink.ph`. The service stays on the PC's loopback
+(127.0.0.1:8765, user `ameesh-approve`); the HTTPS relay and the means of
+reaching the PC without an inbound connection are provided on the Nexlink side.

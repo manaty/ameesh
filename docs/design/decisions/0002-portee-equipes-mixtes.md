@@ -1,24 +1,24 @@
 ---
 type: Decision
-title: "Portée : coordonner des équipes mixtes humains + agents pour tout travail de bureau"
-description: "ameesh ne sert pas qu'au développement logiciel : il coordonne humains et agents, sur appareils et serveurs, pour tout métier de bureau."
+title: "Scope: coordinate mixed teams of humans + agents for any office work"
+description: "ameesh is not only for software development: it coordinates humans and agents, on devices and servers, for any office trade."
 status: stable
 tags: [portee, metiers]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-La v1 a été conçue pour le chantier Nexlink : des agents de code dans des worktrees git, un orchestrateur, un board.
+v1 was designed for the Nexlink project: code agents in git worktrees, an orchestrator, a board.
 
-# Décision
+# Decision
 
-ameesh coordonne le travail d'**équipes mixtes d'humains et d'agents IA**, tournant sur des **appareils** (téléphones, PC) et des **serveurs**. Le développement logiciel est **un cas parmi d'autres**. Cas cibles cités par le propriétaire : une **équipe de SAV** qui répond aux mails entrants ; des **coordinateurs de transport** (enlèvements, réception, emballage, expédition) ; plus généralement **tout métier où l'humain n'utilise qu'un ordinateur**.
+ameesh coordinates the work of **mixed teams of humans and AI agents**, running on **devices** (phones, PCs) and **servers**. Software development is **one case among others**. Target cases cited by the owner: an **after-sales support team** answering incoming e-mails; **transport coordinators** (pickups, receiving, packing, shipping); more generally **any trade where the human uses nothing but a computer**.
 
-# Conséquences
+# Consequences
 
-- Les notions propres au dev se généralisent : agents → membres (humains ou agents) ; worktree → espace de travail ; cycle intake→build→qa→merged→promoted → un modèle de pipeline parmi d'autres ; gel/revue/fusion → livrable/revue/décision.
-- Nouvelles interfaces : canal entrant, canal sortant, outils métier, action proposée signée, politique d'autonomie (voir [l'étude métiers](../etudes/metiers-sav-transport.md)).
+- Dev-specific notions are generalised: agents → members (humans or agents); worktree → workspace; intake→build→qa→merged→promoted cycle → one pipeline model among others; freeze/review/merge → deliverable/review/decision.
+- New interfaces: inbound channel, outbound channel, business tools, signed proposed action, autonomy policy (see [the trades study](../etudes/metiers-sav-transport.md)).

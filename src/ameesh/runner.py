@@ -4058,6 +4058,7 @@ class Runner:
 
     def _housekeeping_pass(self) -> dict | None:
         from . import menage as menage_mod
+        from . import build_artifacts
         from . import resources as resources_mod
         db = None
         try:
@@ -4070,7 +4071,9 @@ class Runner:
             report = menage_mod.run_pass(
                 self.cfg, db, self.housekeeping_policy(), host=self.host,
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
-                runtime=self.container_runtime())
+                runtime=self.container_runtime(),
+                # L230: the worktrees are walked at most every few hours
+                artifact_scan=build_artifacts.due(time.time()))
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("ménage : %s" % " ; ".join(
@@ -4728,6 +4731,22 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
     log_async("[%s] harnais arrêté (%s)" % (name or "?", reason))
 
 
+def _attach_permission_mode(cfg: Config, name: str) -> str:
+    """L223: the permission mode set for the agent (`ameesh set <agent>
+    permission_mode=…`, local state of its host), '' when unset; an unreadable
+    setting (permissions, invalid bytes) is ignored with a warning."""
+    path = os.path.join(cfg.agent_dir(name), "permission_mode")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError
+        print("ameesh attach: unreadable permission_mode setting (%s: %s), ignored"
+              % (path, exc), file=sys.stderr)
+        return ""
+
+
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                ttl: float | None = None) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
@@ -4821,20 +4840,24 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             stop.wait(max(0.05, min(0.5, reste)))
 
     thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
-    thread.start()
     veille = threading.Thread(target=veilleur, daemon=True, name="%s-attach-veilleur" % name)
-    veille.start()
-    argv = adapter.interactive_command(agent.get("session_id"))
-    env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
-    env.update(adapter.env())
-    holds: list = []
-    env.update(_attach_tmp_env(cfg, name, env, holds))
-    cwd = agent.get("cwd") or None
-    if cwd and not os.path.isdir(cwd):
-        cwd = None
     proc: subprocess.Popen | None = None
     code = 0
+    holds: list = []
     try:
+        # codex verdict #182 (P2): everything after taking the lease is under the
+        # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
+        # slow `claude --help`) still releases the lease
+        thread.start()
+        veille.start()
+        argv = adapter.interactive_command(agent.get("session_id"),
+                                           permission_mode=_attach_permission_mode(cfg, name))
+        env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
+        env.update(adapter.env())
+        env.update(_attach_tmp_env(cfg, name, env, holds))
+        cwd = agent.get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
             return 1  # le `finally` rend le bail
         log_async("[%s] session interactive : %s" % (name, " ".join(argv)))
@@ -4853,12 +4876,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         if proc is not None:
             stop_group_now(proc, "interruption (attach)", name=name)
             code = proc.wait()
+        else:
+            code = 130  # interrupted before the harness was launched
     finally:
         stop.set()
         for hold in holds:          # L219: the session is over
             hold.release()
-        thread.join(timeout=5)
-        veille.join(timeout=5)
+        for worker in (thread, veille):
+            if worker.ident is not None:    # started (L223)
+                worker.join(timeout=5)
         try:
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:
