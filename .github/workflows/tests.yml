@@ -27,6 +27,10 @@
 # doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
 # fusion garde son verdict.
 #
+# #833 — le filtre s'applique aussi à une poussée vers main, sur le diff de
+# toute la poussée (`github.event.before` → tête, jamais HEAD^1 seul). Une
+# poussée vers release/** ou une histoire réécrite garde la suite complète.
+#
 # L161b — chaque part écrit ses résultats au fil de l'eau (--flow, JSON lignes,
 # un test par ligne, schéma ameesh-test-event/1), publiés en artefact
 # (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flow.py).
@@ -91,6 +95,13 @@ jobs:
     name: plan
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    env:
+      # #833 : sur une poussée, le diff va du commit d'avant la poussée
+      # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
+      # La référence distingue main (filtre doc) des branches release (suite
+      # complète, quel que soit le contenu).
+      AMEESH_CI_BASE: ${{ github.event_name == 'push' && github.event.before || 'HEAD^1' }}
+      AMEESH_CI_REF: ${{ github.ref }}
     outputs:
       version_only: ${{ steps.plan.outputs.version_only }}
       docs_only: ${{ steps.plan.outputs.docs_only }}
