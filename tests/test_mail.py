@@ -58,6 +58,26 @@ class MailTest(PgTestCase):
         self.assertEqual(history[0]["status"], "delivered")
         self.assertIsNotNone(history[0]["delivered_ts"])
 
+    def test_remise_horodatee_par_message(self):
+        """#796 : chaque message remis porte SON instant de remise (l'instant
+        réel où il entre dans le contexte), pas l'horodatage de transaction
+        partagé par tout un lot — c'est ce qui rend le délai de réaction
+        mesurable message par message."""
+        registry.upsert(self.db, "beta", harness="codex", host="autre")
+        ids = [mail.send(self.db, "alpha", "beta", "message %d" % i, host="laptop")
+               for i in range(5)]
+        avant = time.time()
+        self.assertEqual(mail.mark_delivered(self.db, ids), len(ids))
+        stamps = [row["delivered_ts"] for row in self.db.query(
+            "select extract(epoch from delivered_at)::float8 as delivered_ts"
+            " from agent_mailbox where id in (%s) order by id"
+            % ", ".join(str(int(i)) for i in ids))]
+        self.assertEqual(len(stamps), len(ids))
+        # l'instant de chaque message, dans la fenêtre de la remise...
+        self.assertTrue(all(avant <= s <= time.time() + 1 for s in stamps), stamps)
+        # ...et pas une valeur unique recopiée sur tout le lot
+        self.assertGreater(len(set(stamps)), 1, stamps)
+
     def test_normalize_forme_commune(self):
         mail.send(self.db, "alpha", "beta", "coucou", host="laptop")
         row = mail.normalize(mail.unread(self.db, "beta")[0])

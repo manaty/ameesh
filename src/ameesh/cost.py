@@ -1171,7 +1171,9 @@ class CostBook:
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
-               key: str | None = None) -> TurnUsage:
+               key: str | None = None, work_item_id: int | None = None,
+               started_at: float | None = None,
+               turn_id: str | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -1184,6 +1186,14 @@ class CostBook:
         `key` (L60) : la clé du marqueur comptable du tour. Un marqueur rejoué
         après une écriture réussie mais pas effacée (exécuteur arrêté entre les
         deux) ne réécrit pas la ligne : avant L60, il la doublait.
+
+        `work_item_id` et `started_at` (#796) : le lot servi par le tour et son
+        instant de début (epoch, horloge de la base), lus sur le marqueur
+        comptable. Ils viennent du **marqueur**, jamais de la mémoire de
+        l'appelant : une réparation par un autre worker écrit la même
+        attribution, ou aucune si elle n'y était pas. `turn_id` (#796) :
+        l'identifiant du tour (`turn_resources.turn_id`), même provenance, pour
+        relier la ligne à ses ressources.
         """
         if self.db is None:
             raise CostError("record without a database: the cumulative baseline lives in turn_costs")
@@ -1220,7 +1230,12 @@ class CostBook:
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
             account=account, spend_key=key, void_reason=usage.void_reason,
             price_fallback=usage.price_fallback,
-            cache_write_tokens=usage.cache_write_tokens)
+            cache_write_tokens=usage.cache_write_tokens,
+            # #796 (0422) : le lot du tour et son début, portés par le marqueur
+            work_item_id=None if work_item_id is None else int(work_item_id),
+            started_at=None if started_at is None else float(started_at),
+            # #796 (0422) : l'identifiant du tour, pour le relier à ses ressources
+            turn_id=turn_id)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:

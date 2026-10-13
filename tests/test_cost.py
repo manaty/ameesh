@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import cost
+from ameesh import cost, work
 
 from .support import PgTestCase
 
@@ -767,6 +767,35 @@ class CostDbTest(Sandbox, PgTestCase):
         self.db.execute("update turn_costs set recorded_at = now() - interval '2 hours'")
         self.assertEqual(book.spent("all", 3600), 0.0)
         self.assertAlmostEqual(book.spent("all", 86400), 0.55)
+
+    def test_record_porte_le_lot_et_le_debut_du_tour(self):
+        """#796 : la ligne du grand livre dit le lot servi, l'instant de début
+        et l'identifiant du tour, tels que le marqueur comptable les a donnés."""
+        lot = work.add(self.db, title="mesuré")
+        book = self.book()
+        self.agent("a1", "deepseek")
+        self.write_events("a1", {"type": "status", "phase": "step_end",
+                                 "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
+                                           "outputTokens": 0}})
+        debut = time.time() - 120
+        book.record("a1", turn="t-1", work_item_id=int(lot["id"]), started_at=debut,
+                    turn_id="tour-1")
+        row = self.db.query(
+            "select work_item_id, turn_id,"
+            " extract(epoch from started_at)::float8 as start_ts,"
+            " extract(epoch from recorded_at)::float8 as end_ts"
+            " from turn_costs where agent = 'a1' order by id desc limit 1")[0]
+        self.assertEqual((row["work_item_id"], row["turn_id"]), (int(lot["id"]), "tour-1"))
+        self.assertAlmostEqual(row["start_ts"], debut, places=3)
+        self.assertGreaterEqual(row["end_ts"], row["start_ts"])
+        # sans lot ni début (relais, ligne d'avant 0422) : colonnes laissées NULL
+        book.record("a1", turn="t-2")
+        row = self.db.query(
+            "select work_item_id, started_at, turn_id from turn_costs"
+            " where agent = 'a1' order by id desc limit 1")[0]
+        self.assertIsNone(row["work_item_id"])
+        self.assertIsNone(row["started_at"])
+        self.assertIsNone(row["turn_id"])
 
     def test_over_dit_le_rythme_du_forfait_puis_le_budget_horaire(self):
         book = self.book(hourly_usd=0.10)

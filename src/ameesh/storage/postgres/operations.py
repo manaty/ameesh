@@ -339,8 +339,9 @@ class Operations(interface.Operations):
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
-               " input_tokens, cached_input_tokens, output_tokens,"
-               " extract(epoch from recorded_at)::float8 AS recorded_ts"
+               " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " extract(epoch from recorded_at)::float8 AS recorded_ts,"
+               " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
                " AND void_reason IS NULL")
         params: list = [float(since_s)]

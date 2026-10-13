@@ -50,7 +50,34 @@ class SplitTest(unittest.TestCase):
         # (the rest of the runs is in review); agent the rest
         self.assertEqual(out, {"total_minutes": 180.0, "agent_minutes": 80.0,
                                "ci_minutes": 20.0, "review_minutes": 60.0,
-                               "human_minutes": 20.0, "ci_runs": 2})
+                               "human_minutes": 20.0, "ci_runs": 2,
+                               "agent_source": "states"})
+
+    def test_turns_are_the_agent_time_and_the_rest_is_unattended(self):
+        """#796 : quand des tours sont attribués au lot, le temps d'agent est
+        leur union — pas le reste de la chronologie d'états."""
+        runs = [{"start_ts": 90 * M, "end_ts": 105 * M}]
+        # tours : 10–25 (agent), 40–45 (dans l'attente humaine : priorité
+        # humaine), 95–100 (dans le CI : priorité CI), 170–185 (déborde la
+        # fenêtre, dont 150–180 en review)
+        turns = [(10 * M, 25 * M), (40 * M, 45 * M), (95 * M, 100 * M),
+                 (170 * M, 185 * M)]
+        out = lot_measures.split(0, 180 * M, events=self.events, milestones=self.milestones,
+                                 ci_runs=runs, turns=turns)
+        self.assertEqual(out["agent_source"], "turns")
+        # 15 min du premier tour ; le reste est humain, review, CI ou sans tour
+        self.assertEqual(out["agent_minutes"], 15.0)
+        self.assertEqual((out["human_minutes"], out["review_minutes"], out["ci_minutes"]),
+                         (20.0, 60.0, 10.0))
+        # total = agent + CI + review + human (bureau, #796) : le temps qu'aucun
+        # tour ne couvre (25–30, 50–90, 100–150) n'est compté nulle part
+        self.assertEqual(out["total_minutes"], 105.0)
+
+    def test_turns_absent_keep_the_states_rule(self):
+        out = lot_measures.split(0, 180 * M, events=self.events, milestones=self.milestones,
+                                 ci_runs=[], turns=None)
+        self.assertEqual(out["agent_source"], "states")
+        self.assertEqual(out["agent_minutes"], 100.0)
 
     def test_ci_unknown_stays_agent_time(self):
         out = lot_measures.split(0, 180 * M, events=self.events, milestones=self.milestones,
@@ -91,6 +118,10 @@ class SplitTest(unittest.TestCase):
         self.assertFalse(v["size_match"])
         self.assertEqual(lot_measures.describe_phases(v),
                          "agent 1 h 10 · CI unknown · review 35 min · human 0 min")
+        # #796 : le temps d'agent dit sa source
+        v["agent_source"] = "turns"
+        self.assertEqual(lot_measures.describe_phases(v),
+                         "agent 1 h 10 (turns) · CI unknown · review 35 min · human 0 min")
         self.assertEqual(lot_measures.describe_size(v),
                          "declared m · measured l (612 lines, 9 files) — differs")
         self.assertIsNone(lot_measures.view(None))
@@ -616,6 +647,8 @@ class MeasurePgTest(PgTestCase):
                              (50.0, 10.0, 40.0, 0.0, 100.0))
             self.assertEqual((m["diff_files"], m["measured_size"], m["declared_size"],
                               m["size_match"], m["merge_sha"]), (2, "m", "s", False, sha))
+            # aucun tour attribué (lot d'avant 0422) : règle des états
+            self.assertEqual(m["agent_source"], "states")
             # measured once: the next pass has nothing to do
             self.assertEqual(lot_measures.measure(self.db, None, repos=[repo], ci=ci), [])
             # measured again on demand, without a repository: the diff is kept
@@ -626,8 +659,8 @@ class MeasurePgTest(PgTestCase):
 
             proc = self.mesh("work", "show", str(lid))
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("phases   : agent 50 min · CI 10 min · review 40 min · human 0 min",
-                          proc.stdout)
+            self.assertIn("phases   : agent 50 min (states) · CI 10 min · review 40 min"
+                          " · human 0 min", proc.stdout)
             self.assertIn("size     : declared s · measured m (150 lines, 2 files) — differs",
                           proc.stdout)
             proc = self.mesh("work", "show", str(lid), "--json")
@@ -691,6 +724,87 @@ class MeasurePgTest(PgTestCase):
         self.db.execute("UPDATE work_items SET started_at = NULL WHERE id = %s",
                         (int(lot["id"]),))
         self.assertEqual(lot_measures.measure(self.db, None, repos=[], ci=None), [])
+
+    def test_attributed_turns_give_agent_minutes(self):
+        """#796 : quand des tours portent le lot, le temps d'agent est l'union
+        de leurs intervalles (jamais comptée deux fois), et les tours d'un
+        autre lot ou sans lot ne comptent pas."""
+        lot = work.add(self.db, title="turns", branch="lot/t")
+        lid = int(lot["id"])
+        work.move(self.db, lid, "build")
+        work.merged(self.db, lid, sha="abcdef1")
+        self.t0 = float(self.db.query(
+            "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
+        self._at("UPDATE work_items SET started_at = to_timestamp(%s) WHERE id = %s", 0, lid)
+        self._at("UPDATE work_item_events SET created_at = to_timestamp(%s)"
+                 " WHERE work_item_id = %s AND state = 'build'", 0, lid)
+        self._at("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                 " WHERE work_item_id = %s AND kind = 'merged'", 100, lid)
+        # deux tours du lot (10–25 et 40–80) dont un recouvrement (50–60), et
+        # deux tours étrangers : un autre lot, et un sans lot (relais)
+        for start, end in ((10, 25), (40, 80), (50, 60)):
+            self.db.execute(
+                "INSERT INTO turn_costs (agent, harness, model, usd, started_at,"
+                " recorded_at, work_item_id) VALUES ('dev1','claude','claude-opus-4',"
+                " 0.1, to_timestamp(%s), to_timestamp(%s), %s)",
+                (self.t0 + start * M, self.t0 + end * M, lid))
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, started_at, recorded_at,"
+            " work_item_id) VALUES ('dev2','claude','claude-opus-4', 0.1,"
+            " to_timestamp(%s), to_timestamp(%s), %s)",
+            (self.t0 + 20 * M, self.t0 + 30 * M, self._other_lot()))
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, started_at, recorded_at)"
+            " VALUES ('dev1','claude','claude-opus-4', 0.1, to_timestamp(%s),"
+            " to_timestamp(%s))", (self.t0 + 20 * M, self.t0 + 90 * M))
+        rows = lot_measures.measure(self.db, [lid], repos=[], ci=lambda r, b: [])
+        m = lot_measures.view(rows[0])
+        # union des tours du lot : 10–25 (15 min) + 40–80 (40 min) = 55 min
+        self.assertEqual((m["agent_minutes"], m["agent_source"]), (55.0, "turns"))
+        # aucun `turn_resources` : le début du tour est celui du marqueur
+        self.assertEqual(storage.of(self.db).work.turn_spans(lid), [
+            {"start_ts": self.t0 + 10 * M, "end_ts": self.t0 + 25 * M, "turn_id": None},
+            {"start_ts": self.t0 + 40 * M, "end_ts": self.t0 + 80 * M, "turn_id": None},
+            {"start_ts": self.t0 + 50 * M, "end_ts": self.t0 + 60 * M, "turn_id": None},
+        ])
+
+    def test_lot_start_is_the_first_attributed_turn(self):
+        """#796 : le début mesuré du lot est celui de son premier tour attribué,
+        pris sur `turn_resources.started_at` quand le tour y est relié — la
+        date déclarée, posée à la prise en main, arrive souvent après le début
+        du travail. Le temps d'agent reste l'union des tours."""
+        lot = work.add(self.db, title="late start", branch="lot/late")
+        lid = int(lot["id"])
+        work.move(self.db, lid, "build")
+        work.merged(self.db, lid, sha="abcdef1")
+        self.t0 = float(self.db.query(
+            "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
+        self._at("UPDATE work_item_events SET created_at = to_timestamp(%s)"
+                 " WHERE work_item_id = %s AND state = 'build'", 0, lid)
+        self._at("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                 " WHERE work_item_id = %s AND kind = 'merged'", 100, lid)
+        # déclaré à 30 (prise en main tardive) ; le tour a pris la main à 20
+        self._at("UPDATE work_items SET started_at = to_timestamp(%s) WHERE id = %s", 30, lid)
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, started_at, recorded_at,"
+            " turn_id, work_item_id) VALUES ('dev1','claude','claude-opus-4', 0.1,"
+            " to_timestamp(%s), to_timestamp(%s), 'tour-1', %s)",
+            (self.t0 + 25 * M, self.t0 + 50 * M, lid))
+        self.db.execute(
+            "INSERT INTO turn_resources (turn_id, agent, host, started_at)"
+            " VALUES ('tour-1','dev1','h1', to_timestamp(%s))", (self.t0 + 20 * M,))
+        rows = lot_measures.measure(self.db, [lid], repos=[], ci=lambda r, b: [])
+        m = lot_measures.view(rows[0])
+        # le tour 20–50 : 30 min d'agent, et rien d'autre (pas de review, pas de CI)
+        self.assertEqual((m["agent_minutes"], m["agent_source"]), (30.0, "turns"))
+        # le début stocké est celui de la ressource du tour, pas la date déclarée
+        self.assertAlmostEqual(rows[0]["started_ts"], self.t0 + 20 * M, places=3)
+        self.assertAlmostEqual(m["total_minutes"], 30.0, places=3)
+        self.assertEqual(storage.of(self.db).work.turn_spans(lid), [
+            {"start_ts": self.t0 + 20 * M, "end_ts": self.t0 + 50 * M, "turn_id": "tour-1"}])
+
+    def _other_lot(self):
+        return int(work.add(self.db, title="other")["id"])
 
 
 if __name__ == "__main__":
