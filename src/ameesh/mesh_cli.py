@@ -143,15 +143,11 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # C4 : verdict de placement de chaque agent (0022)
     placement.annotate(db, rows)
     # L26 : champs d'exploitation (schéma `ameesh-agent/1`,
-    # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
+    # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes ;
+    # #1070 : `paused_on_budget` en fait partie (pause budget distincte d'un
+    # `blocked` d'une autre cause)
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
-    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
-    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
-    # pas à déchiffrer un `status_text` français.
-    from . import progress
-    for row in rows:
-        row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
 
 
