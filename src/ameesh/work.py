@@ -797,7 +797,7 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
-           force: str | None = None) -> dict:
+           force: str | None = None, claim: bool = False) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -806,7 +806,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
     la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
     du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
-    pas son propre travail."""
+    pas son propre travail.
+
+    #1026 : `claim` n'attribue le lot que s'il est **sans assigné**. Un lot
+    déjà pris est refusé en nommant son porteur, et l'écriture est
+    conditionnelle à `assignee` encore vide : deux prises concurrentes, une
+    seule gagne, l'autre refuse sans changer la main."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -815,6 +820,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     previous = item.get("assignee")
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+    if claim and previous:
+        raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
+                        % (item_id, previous))
     if previous == check["assignee"]:
         if branch:
             row = set_branch(db, item_id, branch, branch_target, actor=actor)
@@ -829,11 +837,16 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         if item.get("delegated_by") and item.get("due_ts") else "")
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
-    row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
+    row = storage.of(db).work.assign(item_id, check["assignee"],
+                                     current=None if claim else previous, note=note,
                                      actor=actor, queued_note=queued,
                                      forced_note=queued and _forced_note(check, note, force,
                                                                          actor))
     if row is None:
+        if claim:
+            holder = (get(db, item_id) or {}).get("assignee")
+            raise WorkError("lot %s taken in the meantime%s: claim refused, nothing changed"
+                            % (item_id, " by %s" % holder if holder else ""))
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     behind = row.get("queued_behind")
     if branch:

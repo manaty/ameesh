@@ -655,7 +655,7 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             parts.append("No open lot without an agent.")
         parts.append("Give them work tied to a lot: ameesh mail send <agent> "
                      "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
-                     "<agent>.")
+                     "<agent> --claim.")
         out[orch] = " ".join(parts)
     return out
 
