@@ -62,6 +62,8 @@ def job(name="psql 1/1", status="completed", conclusion="cancelled"):
 
 
 class FauxGitHub:
+    _listed = ciflux.GitHub._listed
+
     def __init__(self, checks=(), jobs=None, run_state=None, refus=False,
                  ready=True, tete=TETE, par_execution=None, par_suite=None,
                  suite_executions=None, refus_suite=False):
@@ -113,6 +115,66 @@ def args(sha=TETE):
 
 
 class ReconciliationTest(unittest.TestCase):
+    def test_execution_active_avec_job_terminal_conclut_cancelled(self):
+        gh = FauxGitHub([check(details=False)], run_state=run("in_progress"))
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual([item[2] for item in gh.maj], ["cancelled"])
+
+    def test_execution_sans_statut_avec_job_terminal_non_conclue(self):
+        gh = FauxGitHub([check(details=False)], run_state={"id": EXECUTION})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_check_suite_lit_toutes_les_pages_candidates(self):
+        class Pages(ciflux.GitHub):
+            def __init__(self):
+                super().__init__(env={})
+                self.paths = []
+
+            def read(self, path):
+                self.paths.append(path)
+                if "page=2" in path:
+                    return {"total_count": 101, "workflow_runs": [{"id": 101}]}
+                return {"total_count": 101,
+                        "workflow_runs": [{"id": n} for n in range(1, 101)]}
+
+        gh = Pages()
+        self.assertEqual([r["id"] for r in gh.runs_of_suite(SUITE)],
+                         list(range(1, 102)))
+        self.assertEqual(len(gh.paths), 2)
+
+    def test_check_suite_page_manquante_non_conclue(self):
+        gh = FauxGitHub([check(details=False)])
+        gh.runs_of_suite = ciflux.GitHub.runs_of_suite.__get__(gh)
+        gh.read = lambda path: (
+            {"total_count": 2, "workflow_runs": []} if "page=2" in path
+            else {"total_count": 2, "workflow_runs": [{"id": EXECUTION}]})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_check_suite_total_absent_non_conclu(self):
+        gh = FauxGitHub([check(details=False)])
+        gh.runs_of_suite = ciflux.GitHub.runs_of_suite.__get__(gh)
+        gh.read = lambda path: {"workflow_runs": [{"id": EXECUTION}]}
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_reponse_jobs_absente_non_conclue(self):
+        gh = FauxGitHub([check(details=False)])
+        gh.jobs = ciflux.GitHub.jobs.__get__(gh)
+        gh.read = lambda path: {}
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_jobs_page_manquante_non_conclue(self):
+        gh = FauxGitHub([check(details=False)])
+        gh.jobs = ciflux.GitHub.jobs.__get__(gh)
+        gh.read = lambda path: (
+            {"total_count": 2, "jobs": []} if "page=2" in path
+            else {"total_count": 2, "jobs": [job()]})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
     def test_job_terminal_conclut_cancelled_jamais_success(self):
         gh = FauxGitHub([check()])
         self.assertEqual(ciflux.sweep(args(), gh=gh), 0)
