@@ -6935,7 +6935,13 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
     (`created_ts`): deleting the agent and recreating it under the same name,
     with its state directory kept, does not inherit the previous authorization.
     A legacy plain-text file (written before L685) carries neither and is
-    refused (fail-closed), with the same warning."""
+    refused (fail-closed), with the same warning.
+
+    L719: the harness and the incarnation are those of the registration
+    **claimed** by `attach_claim` (read under its row lock), never of the read
+    that preceded it; the caller passes an unmatchable incarnation when the two
+    differ, so a registration replaced while the attach was starting inherits
+    nothing."""
     path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -7044,6 +7050,22 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         return 1
     epoch = int(lease["lease_epoch"])
     log_async("[%s] attach lease taken (epoch %d)" % (name, epoch))
+    # L719 : le mode de permission est vérifié contre la registration
+    # **revendiquée** par `attach_claim` (harnais et created_ts lus sous son
+    # verrou), jamais contre la lecture qui a précédé la prise du bail : un
+    # enregistrement supprimé puis recréé entre les deux n'hérite pas de
+    # l'autorisation précédente. L'adaptateur, lui, vient de la lecture
+    # antérieure : si la registration revendiquée en diffère, aucun mode ne
+    # peut lui être lié — incarnation vide, donc jamais de correspondance.
+    incarnation_revendiquee = agent_incarnation(lease)
+    if (incarnation_revendiquee
+            and (lease.get("harness") or "") == (agent.get("harness") or "")
+            and incarnation_revendiquee == agent_incarnation(agent)):
+        harness_revendique = lease.get("harness") or ""
+        mode_incarnation = incarnation_revendiquee
+    else:
+        harness_revendique = lease.get("harness") or (agent.get("harness") or "")
+        mode_incarnation = ""
     stop = threading.Event()
     perdu = threading.Event()
     etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
@@ -7098,7 +7120,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
-                cfg, name, agent.get("harness") or "", agent_incarnation(agent)))
+                cfg, name, harness_revendique, mode_incarnation))
         env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
