@@ -76,12 +76,13 @@ Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
 qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
-l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
-L96), `turn_costs.correct`, `ledger`, `spent_between` (grand livre, L95),
-`operations.assigners`, `latest_gauges` (sous-utilisation, L94),
-`hosts.usage` et `turn_resources.get`. Un exécuteur médié ne fait ni ménage
-local ni passage périodique de ménage : son dossier de travail est effacé en
-fin de bail.
+l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
+`roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
+`spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
+(sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
+`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
+exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
+dossier de travail est effacé en fin de bail.
 
 Les deux opérations de L31b (`leases.hold_note`, `leases.release_hold` :
 l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
