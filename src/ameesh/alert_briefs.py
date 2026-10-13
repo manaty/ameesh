@@ -49,8 +49,10 @@ def auditors(listing: list, canons=None, *, explicit_only=False) -> list:
     return sorted(n for n in found if n in names)
 
 
-def _team(by_name: dict, name) -> str:
-    return ((by_name.get(name) or {}).get("team") or "").strip()
+def _projects(by_name: dict, name) -> set:
+    """L243 : les projets d'un agent (`projects`, sinon son équipe)."""
+    from . import projects as projects_mod
+    return set(projects_mod.agent_projects(by_name.get(name) or {}))
 
 
 def _workstream(row: dict) -> str:
@@ -60,11 +62,12 @@ def _workstream(row: dict) -> str:
 
 
 def _of_teams(orchestras, by_name: dict, teams: set) -> list:
-    """Les orchestrateurs d'une des équipes (ou sans équipe) ; sans équipe
-    connue, tous."""
+    """Les orchestrateurs d'un des projets (ou sans projet) ; sans projet
+    connu, tous."""
     if not teams:
         return list(orchestras)
-    return [o for o in orchestras if not _team(by_name, o) or _team(by_name, o) in teams]
+    return [o for o in orchestras if not _projects(by_name, o)
+            or _projects(by_name, o) & teams]
 
 
 def _of_project(orchestras, by_name: dict, project, teams: set) -> list:
@@ -293,7 +296,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         if "assignee" in roles and alert.get("agent") in by_name:
             out[alert["agent"]] = text
         if "pilot" in roles:
-            teams = {_team(by_name, alert.get("agent"))} - {""}
+            teams = _projects(by_name, alert.get("agent"))
             for name in _of_teams(orchestras, by_name, teams):
                 out.setdefault(name, text)
         if "bureau" in roles and "bureau" in by_name:
@@ -314,21 +317,22 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             # doit en désigner un.
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
-            teams = {_team(by_name, alert.get("agent"))} - {""}
+            teams = _projects(by_name, alert.get("agent"))
             if reviewer and str(reviewer) in by_name:
                 extra[str(reviewer)] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
-            teams = {_team(by_name, alert.get("agent"))} - {""}
+            teams = _projects(by_name, alert.get("agent"))
         elif kind == "waiting_without_question":
             text = _waiting_without_question(alert)
-            teams = {_team(by_name, alert.get("agent"))} - {""}
+            teams = _projects(by_name, alert.get("agent"))
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
-            teams = {_team(by_name, alert.get("agent"))} - {""}
+            teams = _projects(by_name, alert.get("agent"))
         else:
             text = _plan_underused(alert)
-            teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
+            teams = {p for n in alert.get("idle_agents") or ()
+                     for p in _projects(by_name, n)}
         if no_reviewer:
             out = {o: text for o in _of_project(orchestras, by_name,
                                                 alert.get("project"), teams)}
