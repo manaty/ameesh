@@ -128,7 +128,9 @@ jobs:
         name: plan of the run
         run: |
           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
-            --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT" \
+            --event "${{ github.event_name }}" \
+            --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
+            --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - uses: actions/upload-artifact@v4
         with:
