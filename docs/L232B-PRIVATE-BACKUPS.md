@@ -35,9 +35,15 @@ or deletion. Failed restore, comparison or cleanup produces no verified proof.
 The restore identity therefore needs permission to create its disposable
 database; runner credentials are not a substitute for that capability.
 
-`upload --file ARCHIVE --host HOST` uses a private curl configuration, disables
+`upload --file ARCHIVE --host HOST [--receipt RECEIPT]` uses a private curl
+configuration, disables
 the user's curl configuration and removes upload keys from the child
-environment. Upload success alone cannot prove remote recovery. The server script
+environment. The controller companion
+(`sauvegarde-release.py`, below) calls the same function with an explicit
+credential document (`storage_credentials(path)`, exact private
+`access_key`/`secret_key`/`bucket`/`region`) and an explicit private on-disk
+staging directory, so an upload never depends on inherited `SCW_*` variables or
+a shared tmpfs. Upload success alone cannot prove remote recovery. The server script
 runs catalog-based local expiry only after all required dump/upload steps
 succeed. Backups without a registered policy remain protected.
 
@@ -196,5 +202,7 @@ CLI or daily job. These remain closed for remote expiry without an explicitly
 supplied adapter. Tests simulate the HTTP transport, including credentials and
 argv canaries, concurrent new versions, lost replies, quota/size failures and
 version holds. No authenticated Scaleway request or provider-policy pilot has
-been performed. Host enrollment and controller/installer integration remain
+been performed. `sauvegarde-release.py` now binds `backup`, `pin` and `accept`
+to these primitives (see `L232B-RELEASE-CONTROLLER.md`); host enrollment,
+installer wiring and the authenticated pilot remain
 unfinished; the presence of this module is not deployment authority.

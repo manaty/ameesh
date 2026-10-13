@@ -393,9 +393,10 @@ final file/readiness observations before each effect.
 Activation requires an active independent controller in `system.slice` and a
 root-private readiness receipt bound to host/enrollment, current boot/systemd
 invocation and verified read-only runtime/source trees. The service coordinator,
-fixed unit and pinned host factory are now prepared as described below; the
-recovery-set and health companions still refuse activation until they are
-installed. There is no installed bootstrap CLI, automatic
+fixed unit, pinned host factory and its two pinned companions are now prepared
+as described below; the recovery-set and health companions refuse admission
+until their enrolled documents and private state exist. There is no installed
+bootstrap CLI, automatic
 root executor or runtime/credential enrollment. No real root/account/SSH/systemd
 effect is executed by this work. Tests combine disposable filesystem copies with
 simulated accounts/services and synthetic real signatures on disposable PostgreSQL
@@ -453,8 +454,10 @@ not a launched system service or authenticated host pilot.
 loaded by the service, never a module named by a job, transport message or
 enrollment document. It composes the protected documents under
 `/etc/ameesh-release` — `card.json` (effective configuration card),
-`destinations.json` (bounded destination map) and `transport.json` (SSH restart
-endpoint) — with the fixed private state under `/var/lib/ameesh-release` and the
+`destinations.json` (bounded destination map), `transport.json` (SSH restart
+endpoint) and `backup.json` (recovery identities, retention window and optional
+remote references) — with the fixed private state under `/var/lib/ameesh-release`
+and the
 versioned release store under `/opt/ameesh-release/store`. Enrollment, database
 and operation documents keep the exact shapes checked by the dispatcher and the
 service. A missing, linked, group/world-writable or inexact document refuses the
@@ -465,8 +468,9 @@ enter an error.
 after the real checks: exact enrollment and host binding, restart policy
 validation, host-card validation, every enrolled runner unit inside that card,
 configuration destinations, the SSH endpoint files and their host-key digest,
-private state directories, fixed root-owned `systemctl`/`systemd-analyze` paths,
-a live database ping and a read of the release-fence receipt table. Admission
+private configuration/backup/retention state directories, fixed root-owned
+`systemctl`/`systemd-analyze` paths, a live database ping and a read of the
+release-fence receipt table. Admission
 is honest: every `prepare`, `backup`, `pin`, `fence`, `migrate`, `configure`,
 `activate`, `restart`, `health`, `accept`, `unfence` and recovery step must be
 bound to a concrete capability, and the service refuses a partial set instead of
@@ -478,21 +482,50 @@ steps to the signed fence, `restart` and `recovery_restart` to the pinned SSH
 transport, `configure` and `rollback` to the configuration journal plus the
 effective systemd/caps/guard verification, `activate`/`rollback` to the versioned
 release pointer, `prepare` to the completed release receipt, destination
-inventory, unit allowlist and disk floor, and `migrate` to the release source's
+inventory, unit allowlist and disk floor, `backup`/`pin`/`accept` to the pinned
+recovery set and `health`/`recovery_health` to the pinned health probe, and
+`migrate` to the release source's
 migration directory with unconditional additive-only election. A definitive
 refusal becomes the controller's `ok: false`; an ambiguous or unauthorized
 failure raises so the durable intent reconciles instead of repeating an effect.
 Provider exceptions and their text are replaced by a generic category.
 
-Two companion pinned sources remain to be supplied: `sauvegarde-release.py`
-exposing `RecoverySet(db, store=, root=, retention=)` for `backup`, `pin` and
-`accept`, and `sante-release.py` exposing `HealthProbe(db, store=, card=,
-system=)` for `health` and `recovery_health`. Both answer True after verified
-completion or raise; the factory refuses admission and operation construction
-while either is absent. Installer/provider wiring and the authenticated host
-pilot therefore remain build work. Tests use real disposable documents and a
-real versioned store with simulated systemd, database and companions; no root,
-SSH, migration or production effect is executed.
+The two companion pinned sources are supplied by this work: `sauvegarde-release.py`
+exposing `RecoverySet(db, store=, root=, retention=, config=)` for `backup`,
+`pin` and `accept`, and `sante-release.py` exposing `HealthProbe(db, store=,
+card=, system=)` for `health` and `recovery_health`. Both answer True after
+verified completion, False on a definitive refusal, or raise for an ambiguous
+effect; the factory refuses admission while either is absent or its enrollment
+is missing.
+
+Recovery sets use an optional protected `backup.json` document (exact keys
+`dsn`, `restore_dsn`, `retention_seconds`, `remote`): the dump and the isolated
+disposable restore use separate identities, `remote` (when enrolled) names the
+object host plus one private upload credential file and one private recovery
+credential file, and no credential value enters a receipt, an argument, the
+child environment or an error. `backup` publishes the dump and its pinned row
+inventory in the private retention root, proves an isolated restore against
+that inventory, proves a configured remote copy can be retrieved with the
+recovery identity, and records the verified set in a private receipt. `pin`
+registers those exact bytes before migration with the manifest rollback deadline
+and the enrolled retention window; an unaccepted set is never expired. `accept`
+records release acceptance and drops the transient receipt, preserving an
+explicit operator hold. An interrupted publication is recreated from the live
+source; a verified receipt survives a lost reply without a second dump, restore
+or upload.
+
+`HealthProbe` rederives the active release's own completed receipt, checks the
+versioned pointer (`health`: the activated release; `recovery_health`: the prior
+release restored by rollback), the released schema against the release source's
+migrations, the effective card units, declared capabilities and guard, and runs
+`doctor --probe` from that release's own pinned interpreter with a private
+credential file, scrubbed environment and bounded deadline. The study's
+controlled authenticated turn needs the enrolled runner identity: it is the
+authenticated health/rollback pilot's work and this module never claims it.
+Installer/provider wiring and that pilot therefore remain build work. Tests use
+real disposable documents, release trees and private roots with simulated
+systemd, database and provider effects; no root, SSH, migration or production
+effect is executed.
 
 ## Operation-specific code and environment recovery
 
@@ -546,10 +579,10 @@ field. The host adapter must still validate syntax, reconcile daemon reloads and
 verify effective units, caps and guard policy before returning a full configure
 or rollback receipt; `verification-release.py` (below) now supplies that
 effectiveness half and the pinned factory binds both halves. The recovery-set and
-health companions, installer wiring and the authenticated health/rollback pilot
-remain unfinished. Targeted tests exercise real disposable files with
-simulated signed authority and database gates; no real host configuration or
-service is changed.
+health companions are supplied too (above); installer wiring and the authenticated
+health/rollback pilot remain unfinished. Targeted tests exercise real disposable
+files with simulated signed authority and database gates; no real host
+configuration or service is changed.
 
 ## Effective configuration verification
 

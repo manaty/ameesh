@@ -242,9 +242,37 @@ def header_version(path):
     return object_version(values[0])
 
 
-def upload(archive, host, *, receipt=None):
-    access, secret, bucket, region = (os.environ[name] for name in
-                                     ("SCW_ACCESS_KEY", "SCW_SECRET_KEY", "SCW_BUCKET", "SCW_REGION"))
+def storage_credentials(path):
+    """Private storage credential document, read without exposing its values.
+
+    A caller (the enrolled release controller) supplies this file instead of the
+    process environment; uploads then never depend on inherited SCW variables.
+    """
+    with Path(path).open("r") as stream:
+        metadata = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_nlink != 1):
+            raise BackupError("storage credentials need a private owned regular file")
+        value = json.load(stream)
+    if not isinstance(value, dict) or set(value) != {"access_key", "secret_key", "bucket", "region"}:
+        raise BackupError("invalid storage credential document")
+    if (not all(isinstance(value[key], str) and value[key] for key in value)
+            or any(c in value["access_key"] + value["secret_key"] for c in "\r\n\x00")
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value["bucket"])
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value["region"])):
+        raise BackupError("invalid storage credentials")
+    return value
+
+
+def upload(archive, host, *, receipt=None, credentials=None, staging=None):
+    if credentials is None:
+        access, secret, bucket, region = (os.environ[name] for name in
+                                         ("SCW_ACCESS_KEY", "SCW_SECRET_KEY", "SCW_BUCKET", "SCW_REGION"))
+    else:
+        if not isinstance(credentials, dict) or set(credentials) != {"access_key", "secret_key", "bucket", "region"}:
+            raise BackupError("invalid upload credentials")
+        access, secret, bucket, region = (credentials[key] for key in
+                                          ("access_key", "secret_key", "bucket", "region"))
     if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value) for value in (bucket, region, host)):
         raise BackupError("invalid storage location")
     if any(c in access + secret for c in "\r\n\x00"):
@@ -260,22 +288,22 @@ def upload(archive, host, *, receipt=None):
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise BackupError("private owned receipt directory required")
         sha = digest(archive)
-    # The caller provides TMPDIR on disk; never fall back to a shared tmpfs.
-    staging_root = Path(os.environ["TMPDIR"])
+    # The caller provides on-disk staging; never fall back to a shared tmpfs.
+    staging_root = Path(staging) if staging is not None else Path(os.environ["TMPDIR"])
     staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     staging_root.chmod(0o700)
-    with tempfile.TemporaryDirectory(prefix="backup-upload-", dir=staging_root) as staging:
-        credentials = Path(staging) / "curl.conf"
-        with credentials.open("x") as stream:
-            credentials.chmod(0o600)
+    with tempfile.TemporaryDirectory(prefix="backup-upload-", dir=staging_root) as workspace:
+        curl_config = Path(workspace) / "curl.conf"
+        with curl_config.open("x") as stream:
+            curl_config.chmod(0o600)
             stream.write("user = " + json.dumps(access + ":" + secret, ensure_ascii=False) + "\n")
         env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-        headers = Path(staging) / "headers"
+        headers = Path(workspace) / "headers"
         extra = ["--dump-header", str(headers)] if receipt is not None else []
         if extra:
             descriptor = os.open(headers, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
-        run(["curl", "--disable", "--config", str(credentials), "--fail", "--silent", "--show-error", "--retry", "3",
+        run(["curl", "--disable", "--config", str(curl_config), "--fail", "--silent", "--show-error", "--retry", "3",
              "--proto", "=https", *extra, "--upload-file", str(archive), "--aws-sigv4", "aws:amz:" + region + ":s3",
              "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + archive.name], env=env)
         if receipt is not None:
@@ -284,7 +312,7 @@ def upload(archive, host, *, receipt=None):
                 raise BackupError("uploaded archive changed")
             value = {"object_id": host + "/" + archive.name, "sha256": sha,
                      "version_id": version_id, "bucket": bucket, "region": region}
-            candidate = Path(staging) / "receipt.json"
+            candidate = Path(workspace) / "receipt.json"
             descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w") as stream:
                 json.dump(value, stream, sort_keys=True)

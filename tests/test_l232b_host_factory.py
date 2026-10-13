@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -30,6 +31,8 @@ class Authority:
 
 class Database:
     reachable=True
+    def __init__(self,dsn='postgresql://controller@localhost/fixture-db'):
+        self.cfg=SimpleNamespace(dsn=dsn)
     def ping(self):
         if not self.reachable: raise OSError('fixture database unavailable')
     def query(self,sql,params=()):
@@ -204,9 +207,29 @@ class HostFactoryTest(unittest.TestCase):
     def test_missing_pinned_companions_name_every_unbound_step(self):
         value=factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
             store=self.store,configuration_journal=self.journal,backup_root=self.backup,
-            retention_root=self.retention,system=self.system,capabilities={})
+            retention_root=self.retention,system=self.system,
+            capabilities={'sauvegarde-release':None,'sante-release':None})
         with self.assertRaisesRegex(factory.FactoryError,'accept,backup,health,pin,recovery_health'):
             value.admit(self.enrollment)
+
+    def test_real_companions_admit_only_with_their_enrolled_backup_document(self):
+        # The pinned modules now exist: an unenrolled recovery document must
+        # refuse admission instead of binding a backend without credentials.
+        value=factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
+            store=self.store,configuration_journal=self.journal,backup_root=self.backup,
+            retention_root=self.retention,system=self.system,capabilities={})
+        with self.assertRaisesRegex(factory.FactoryError,'sauvegarde-release'):
+            value.admit(self.enrollment)
+        self.document('backup',dict(dsn='postgresql://backup@localhost/fixture-db',
+            restore_dsn='postgresql://restore@localhost/fixture-db',
+            retention_seconds=1209600,remote=None))
+        value=factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
+            store=self.store,configuration_journal=self.journal,backup_root=self.backup,
+            retention_root=self.retention,system=self.system,capabilities={})
+        self.assertEqual(value.admit(self.enrollment),factory.REQUIRED)
+        adapter=value.for_operation(dict(operation='release-fixture'),self.authority)
+        self.assertTrue(callable(getattr(adapter.recovery_set,'perform',None)))
+        self.assertTrue(callable(getattr(adapter.health,'perform',None)))
 
     def test_every_controller_step_returns_exactly_request_plus_ok(self):
         adapter=self.adapter()

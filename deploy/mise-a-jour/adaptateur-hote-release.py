@@ -9,7 +9,8 @@ contract:
 
 - protected documents under `/etc/ameesh-release` (root-owned, private, exact
   keys): `card.json` (effective configuration card), `destinations.json`
-  (configuration destination map) and `transport.json` (SSH restart endpoint);
+  (configuration destination map), `transport.json` (SSH restart endpoint) and
+  `backup.json` (recovery credential references and retention policy);
 - fixed private state directories under `/var/lib/ameesh-release` and the
   versioned release store under `/opt/ameesh-release/store`.
 
@@ -18,8 +19,8 @@ capability, and a missing or incomplete backend refuses the whole service
 rather than simulating it. Steps whose concrete adapter is a separate pinned
 companion source stay unbound until that source is installed:
 
-- `sauvegarde-release.py` with `RecoverySet(db, store=, root=, retention=)`
-  binds `backup`, `pin` and `accept`;
+- `sauvegarde-release.py` with `RecoverySet(db, store=, root=, retention=,
+  config=)` binds `backup`, `pin` and `accept`;
 - `sante-release.py` with `HealthProbe(db, store=, card=, system=)` binds
   `health` and `recovery_health`.
 
@@ -136,6 +137,12 @@ class Documents:
         if exact is not None and (not isinstance(value, dict) or set(value) != set(exact)):
             raise FactoryError('invalid enrolled document: ' + name)
         return value
+
+    def optional(self, name, *, exact=None):
+        """An absent optional document is None; a present unsafe one is refused."""
+        if not os.path.lexists(self.path(name)):
+            return None
+        return self.json(name, exact=exact)
 
 
 def release_document(store, release_id):
@@ -303,7 +310,7 @@ class HostFactory:
         self.capabilities = {} if capabilities is None else dict(capabilities)
         self.clock = clock
         self.enrollment = json.loads(json.dumps(enrollment))
-        self.card = self.destinations = self.policy = None
+        self.card = self.destinations = self.policy = self.backup_config = None
         self.companions = {}
         self._load_documents()
 
@@ -328,12 +335,20 @@ class HostFactory:
         if any(unit not in self.card['units'] for unit in self.policy['units']):
             raise FactoryError('restart units outside enrolled host card')
         self.transport_enrollment = self.documents.json('transport')
+        # Optional only while a companion is supplied for tests/alternate
+        # backends; the pinned recovery companion refuses a missing enrollment.
+        self.backup_config = self.documents.optional('backup')
 
     def _companion(self, name):
         if name in self.companions:
             return self.companions[name]
-        supplied = self.capabilities.get(name)
-        if supplied is not None:
+        if name in self.capabilities:
+            # An explicit None marks a deliberately absent backend so a test or
+            # a partial installation names the unbound steps.
+            supplied = self.capabilities[name]
+            if supplied is None:
+                self.companions[name] = None
+                return None
             self.companions[name] = supplied
             return supplied
         path = Path(__file__).with_name(name + '.py')
@@ -344,7 +359,8 @@ class HostFactory:
         try:
             if name == 'sauvegarde-release':
                 value = module_value.RecoverySet(self.db, store=self.store,
-                    root=self.backup_root, retention=self.retention_root)
+                    root=self.backup_root, retention=self.retention_root,
+                    config=self.backup_config)
             else:
                 value = module_value.HealthProbe(self.db, store=self.store,
                     card=self.card, system=self.system)
@@ -360,6 +376,8 @@ class HostFactory:
             raise FactoryError('factory enrollment changed')
         self._tree(self.store, private=True)
         self._tree(self.configuration_journal, private=True, create=True)
+        self._tree(self.backup_root, private=True, create=True)
+        self._tree(self.retention_root, private=True, create=True)
         self._system_executables()
         # The SSH transport revalidates its private endpoint files here.
         try:
