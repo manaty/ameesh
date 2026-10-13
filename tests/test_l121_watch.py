@@ -5,6 +5,7 @@ watch recorded in the database (0362) and shown in `ameesh projects`."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import stat
 import subprocess
@@ -377,6 +378,187 @@ class WatchTest(PgTestCase):
         self.assertIn("watch: every 30m on laptop, never sent", text)
         narrow = "\n".join(projects.format_lines(view, 50, show_inactive=True))
         self.assertIn("watch: every 30m on laptop", narrow)
+
+
+class WakeTest(PgTestCase):
+    """#1020: the one-shot wake carries the identity of its agent BY
+    CONSTRUCTION, and the witness reads the installed unit back."""
+
+    def setUp(self) -> None:
+        self.register("w121", "claude")
+        self.units = tempfile.mkdtemp(prefix="ameesh-1020-")
+        self.addCleanup(shutil.rmtree, self.units, True)
+        self.env = {watch.UNIT_DIR_ENV: self.units, "PATH": "/usr/bin:/bin",
+                    "AMEESH_DSN": "postgres://u:secret@db/x", "AMEESH_HOST": "laptop"}
+        self.here = dataclasses.replace(self.cfg, host="laptop")
+        patcher = mock.patch.object(watch.platform, "is_linux", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.calls: list = []
+        self.unit_env = 'PATH=/usr/bin:/bin AGENT_MAIL_NAME=w121'
+        self.exec_start = ("{ path=/usr/bin/env ; "
+                           "argv[]=/usr/bin/env AGENT_MAIL_NAME=w121 "
+                           "/home/u/.local/bin/ameesh watch fire --agent w121 "
+                           "--wake deadline ; ignore_errors=no ; status=0/0 }")
+        self.timer_state = "active"
+
+    def run_(self, argv, **kw):
+        self.calls.append(argv[2:])
+        if argv[2:4] == ["show", "-p"]:
+            prop = argv[4]
+            if prop == "Environment":
+                return mock.Mock(returncode=0, stdout=self.unit_env, stderr="")
+            if prop == "ExecStart":
+                return mock.Mock(returncode=0, stdout=self.exec_start, stderr="")
+            if prop == "ActiveState":
+                return mock.Mock(returncode=0, stdout=self.timer_state + "\n", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def arm(self, message="REVEIL #1020 : verifier le temoin", **kw):
+        return watch.arm(self.here, self.db, "w121", "deadline", 1800, message,
+                         run=self.run_, env=self.env, actor="human:owner", **kw)
+
+    def test_the_unit_declares_and_applies_the_identity(self):
+        found = watch.wake_units("w121", "deadline", 1800,
+                                 "/home/u/.local/bin/ameesh", "/usr/bin:/bin", "/units")
+        self.assertEqual(sorted(found),
+                         ["ameesh-watch-w121-deadline.service",
+                          "ameesh-watch-w121-deadline.timer"])
+        service = found["ameesh-watch-w121-deadline.service"]
+        # declared, and applied on the exec line: systemd's EnvironmentFile
+        # overrides Environment=, so env(1) is what the child really carries
+        self.assertIn('Environment="AGENT_MAIL_NAME=w121"', service)
+        self.assertIn('ExecStart="%s" "AGENT_MAIL_NAME=w121" '
+                      '"/home/u/.local/bin/ameesh" watch fire '
+                      '--agent w121 --wake deadline' % watch._env_binary(), service)
+        # the environment files come before the exec line that pins the identity
+        self.assertLess(service.index("EnvironmentFile=-%h/.config/ameesh/env"),
+                        service.index('ExecStart='))
+        self.assertLess(service.index("EnvironmentFile=-/units/ameesh-watch-w121-deadline.env"),
+                        service.index('ExecStart='))
+        self.assertIn("Restart=on-failure", service)   # a failed firing retries
+        timer = found["ameesh-watch-w121-deadline.timer"]
+        self.assertIn("OnActiveSec=1800\n", timer)
+        self.assertIn("AccuracySec=1s\n", timer)
+        self.assertNotIn("OnUnitActiveSec", timer)     # one shot, not a period
+
+    def test_parse_wake_delay(self):
+        self.assertEqual(watch.parse_wake_delay("45m", None), 2700)
+        self.assertEqual(watch.parse_wake_delay("2h", None), 7200)
+        self.assertEqual(watch.parse_wake_delay(None, "2026-10-13T20:00:00Z",
+                                                now=1791918000.0), 3600)
+        for argv in [("45m", "2026-10-13T20:00:00Z"), (None, None),
+                     ("5", None), (None, "2026-10-13T20:00:00")]:
+            with self.assertRaises(watch.WatchError, msg=argv):
+                watch.parse_wake_delay(argv[0], argv[1], now=1791918000.0)
+
+    def test_arm_fire_and_the_identity_witness(self):
+        text = self.arm()
+        self.assertIn("AGENT_MAIL_NAME=w121 pinned", text)
+        self.assertEqual(sorted(os.listdir(self.units)),
+                         ["ameesh-watch-w121-deadline.env",
+                          "ameesh-watch-w121-deadline.service",
+                          "ameesh-watch-w121-deadline.timer",
+                          "ameesh-watch-w121-deadline.wake.json"])
+        state = os.path.join(self.units, "ameesh-watch-w121-deadline.wake.json")
+        self.assertEqual(stat.S_IMODE(os.stat(state).st_mode), 0o600)
+        with open(state, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["message"], "REVEIL #1020 : verifier le temoin")
+        self.assertIn(["daemon-reload"], self.calls)
+        self.assertIn(["start", "ameesh-watch-w121-deadline.timer"], self.calls)
+        # the identity is read back from systemd, not trusted: declared, and
+        # applied on the exec line (the one an environment file cannot take)
+        self.assertIn(["show", "-p", "Environment", "--value",
+                       "ameesh-watch-w121-deadline.service"], self.calls)
+        self.assertIn(["show", "-p", "ExecStart", "--value",
+                       "ameesh-watch-w121-deadline.service"], self.calls)
+        # a firing without the identity is refused by the witness: this is the
+        # failure that muted the seven watches
+        with self.assertRaisesRegex(watch.WatchError, "AGENT_MAIL_NAME"):
+            watch.fire(self.here, self.db, "w121", "deadline", run=self.run_,
+                       env={watch.UNIT_DIR_ENV: self.units})
+        # with it, the message is delivered to the agent, from the agent
+        with mock.patch.object(watch.fil, "record") as thread:
+            self.assertEqual(watch.fire(self.here, self.db, "w121", "deadline",
+                                        run=self.run_,
+                                        env={"AGENT_MAIL_NAME": "w121",
+                                             watch.UNIT_DIR_ENV: self.units}),
+                             "wake deadline fired: message sent to w121")
+        [message] = [m for m in storage.of(self.db).mailbox.unread("w121", 200)
+                     if m["sender"] == "w121"]
+        self.assertEqual(message["body"], "REVEIL #1020 : verifier le temoin")
+        self.assertEqual(thread.call_args.kwargs["meta"],
+                         {"action": "wake", "wake": "deadline", "host": "laptop",
+                          "audit": "watch"})
+        self.assertEqual(thread.call_args.kwargs["mailbox_ids"], [int(message["id"])])
+        # fired once: the wake is removed
+        self.assertEqual(os.listdir(self.units), [])
+
+    def test_arm_refuses_a_unit_that_does_not_carry_the_identity(self):
+        self.unit_env = "PATH=/usr/bin:/bin"     # what a hand-made unit shows
+        with self.assertRaisesRegex(watch.WatchError, "does not carry"):
+            self.arm()
+        self.assertEqual(os.listdir(self.units), [])            # nothing left armed
+        self.assertIn(["stop", "ameesh-watch-w121-deadline.timer"], self.calls)
+
+    def test_arm_refuses_a_unit_whose_exec_does_not_apply_the_identity(self):
+        # the declaration alone is not enough: an EnvironmentFile overrides
+        # Environment= (systemd), so a host file could take the identity away
+        # from the child — the witness must read the pinned exec line.
+        self.exec_start = ("{ path=/home/u/.local/bin/ameesh ; "
+                           "argv[]=/home/u/.local/bin/ameesh watch fire --agent w121 "
+                           "--wake deadline ; ignore_errors=no ; status=0/0 }")
+        with self.assertRaisesRegex(watch.WatchError, "does not apply"):
+            self.arm()
+        self.assertEqual(os.listdir(self.units), [])
+        self.assertIn(["stop", "ameesh-watch-w121-deadline.timer"], self.calls)
+
+    def test_arm_refuses_a_timer_that_is_not_active(self):
+        self.timer_state = "inactive"
+        with self.assertRaisesRegex(watch.WatchError, "timer is 'inactive'"):
+            self.arm()
+        self.assertEqual(os.listdir(self.units), [])
+
+    def test_cancel(self):
+        self.arm()
+        self.calls.clear()
+        self.assertEqual(watch.disarm(self.here, self.db, "w121", "deadline",
+                                      run=self.run_, env=self.env,
+                                      actor="human:owner"),
+                         "wake deadline of w121 cancelled by human:owner")
+        self.assertEqual(os.listdir(self.units), [])
+        with self.assertRaisesRegex(watch.WatchError, "no wake deadline of w121"):
+            watch.disarm(self.here, self.db, "w121", "deadline", run=self.run_,
+                         env=self.env, actor="human:owner")
+
+    def test_refusals(self):
+        with self.assertRaises(watch.WatchError):
+            watch.arm(self.here, self.db, "nobody", "deadline", 1800, "m",
+                      run=self.run_, env=self.env, actor="human:owner")
+        for slug in ("", "Deadline", "a b", "-"):
+            with self.assertRaises(watch.WatchError, msg=slug):
+                watch.arm(self.here, self.db, "w121", slug, 1800, "m",
+                          run=self.run_, env=self.env, actor="human:owner")
+        with self.assertRaises(watch.WatchError):
+            self.arm(message="   ")
+
+    def test_who_arms_the_wake_of_another_agent(self):
+        # the rule of `watch enable`: an agent arms its own wake
+        from ameesh import assignments, identity
+        def as_(name, orchestrator=False):
+            return mock.patch.multiple(
+                identity, resolve_binding=mock.Mock(return_value=SimpleNamespace(name=name))), \
+                mock.patch.object(assignments, "is_orchestrator", return_value=orchestrator)
+        who, role = as_("dev9")
+        with who, role, self.assertRaisesRegex(watch.WatchError, "only its own watch"):
+            watch.arm(self.here, self.db, "w121", "deadline", 1800, "m",
+                      run=self.run_, env=self.env)
+        self.assertEqual((os.listdir(self.units), self.calls), ([], []))
+        who, role = as_("mesh-design", orchestrator=True)
+        with who, role:
+            watch.arm(self.here, self.db, "w121", "deadline", 1800, "m",
+                      run=self.run_, env=self.env)
+        self.assertEqual(len(os.listdir(self.units)), 4)
 
 
 if __name__ == "__main__":
