@@ -255,6 +255,49 @@ guard snapshots, installer wiring and authenticated health/rollback pilot are
 still required. This checkpoint implements neither user-mode systemd nor other
 root operations and grants no root authority to an agent.
 
+## Pinned SSH restart transport
+
+`transport-release.py.SSHRestartTransport` implements only the `restart` and
+`recovery_restart` transport calls. The independent controller must supply its
+protected enrollment: logical host, DNS/IPv4 address, port, dedicated
+`ameesh-release` user, host-key alias, private known-hosts file and its exact
+SHA-256, private identity file, and a 5–360 second exchange budget. Key and
+known-host files must be owned by the controller identity, mode 0600 beneath
+ancestors owned by root or that identity without group/other write access.
+Linked paths, changed known-host contents and caller-selected endpoints fail
+before connection. Enrollment itself is not supplied by an action request.
+
+The fixed `/usr/bin/ssh` invocation ignores account SSH configuration and the
+global known-hosts store, requires the enrolled host-key match, disables host-key
+updates, password/interactive authentication, identity agents, certificates,
+forwarding, connection sharing and proxy commands, and uses one connection
+attempt with bounded connect/liveness settings. The child receives a minimal
+environment. Only the stable operation/action/step/digest JSON crosses stdin;
+no remote command, shell, unit, manifest, credential value or path is sent.
+An administrator must first install a forced command on the dedicated account
+which invokes the fixed root dispatcher with the narrowly scoped sudo policy.
+The dispatcher still checks its own protected manifest, signed authority, live
+fence, cgroups and independent controller intent. A transport key is not release
+authority. This module provides no enrollment or administrative installation.
+
+Pipe input/output and process exit share the exchange deadline. Receipt output
+is capped at 64 KiB; stderr is discarded. Deadline or output overflow kills and
+reaps the local SSH process. That does not cancel an already submitted remote
+systemd action: an exception leaves the controller intent unresolved. There is
+no internal retry and no timeout-to-failure conversion. The next controller pass
+uses the same action id and the helper reconciles its retained action/receipt.
+Only a complete exact typed receipt, including a boolean outcome and the full
+matching manifest, can advance the protocol; duplicate JSON keys are refused.
+An exact `ok: false` remains a definitive helper failure for controller recovery.
+
+Tests exercise local pipe peers for EOF, environment, flooding, nonzero exit,
+stalled input/output and process exit after closing stdout. Controller/transport/
+helper simulations lose a reply after both release and recovery restart, retain
+the fence and intent, and complete on retry without a second systemd submission.
+No SSH connection, authenticated host-key check or real systemd action is run.
+This remains source-only and requires the bootstrap/runtime/forced command,
+independent service and complete release adapter before a real host pilot.
+
 ## Operation-specific code and environment recovery
 
 Before configuration changes, the controller can use
