@@ -126,6 +126,10 @@
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
         mediated executor API (/api/exec/v1, L108): an executor on a
         device without database access (docs/EXECUTEUR-MEDIEE.md).
+  ameesh github read <chemin> [--ttl SECONDES]
+        a GitHub REST read for the agents' watch scripts, through the host's
+        shared reads cache (#848, #860): a conditional request costs no quota,
+        and exit code 3 says the quota is exhausted with nothing cached.
 
 The human approval service (spec §9) is a separate command,
 `ameesh-approve` (python -m ameesh.approve), run under its own
@@ -276,6 +280,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "github":
+        # #860 : lectures GitHub des veilles par le cache partagé de l'hôte
+        from . import github_cli
+        return github_cli.main(rest)
     if command == "sessions":
         # L52 (0032 §2): current and past persona sessions.
         from . import persona_sessions
