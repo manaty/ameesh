@@ -761,19 +761,28 @@ class _PsqlTransaction:
 class _PsqlListener:
     """Écoute LISTEN/NOTIFY avec `psql` (sans psycopg).
 
-    Deux contraintes de psql, vérifiées sur le conteneur :
+    Trois contraintes de psql, vérifiées sur le conteneur :
 
     * il ne vide son stdout (bloqué en `pg_sleep`) qu'à la fin de la requête ;
     * il n'imprime les notifications qu'en mode interactif, au tour de boucle
-      suivant.
+      suivant ;
+    * il lit ses instructions de façon asynchrone : `LISTEN` n'est effectif
+      qu'une fois la ligne exécutée par le processus, pas quand on l'a écrite.
 
     D'où ce montage : `psql` tourne sur un pty (stdin+stdout), on lui envoie un
     battement `SELECT 1` deux fois par seconde, et on filtre la sortie sur la
     ligne « Asynchronous notification … ». La latence de réveil est donc de
-    ~0,5 s, contre 5 s pour le sondage de repli.
+    ~0,5 s, contre 5 s pour le sondage de repli. `subscribe` attend en outre la
+    sonde `pg_listening_channels()` (lot #681) : sans elle, un `NOTIFY` émis
+    juste après l'abonnement pouvait précéder le `LISTEN` et être perdu.
     """
 
     HEARTBEAT = 0.5
+    #: en-tête de la sonde d'activation (voir `_await_ready`) ; le séparateur
+    #: des canaux est le caractère d'unité (31), absent des identifiants
+    READY_PREFIX = "__ameesh_listener_ready__"
+    READY_SEP = chr(31)
+    READY_TIMEOUT = 10.0
 
     def __init__(self, driver: PsqlDriver, channels: list[str]):
         self.channels = channels
@@ -781,6 +790,8 @@ class _PsqlListener:
         self._lines: list[str] = []
         self._down = threading.Event()
         self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._ready_channels: list[str] = []
         self._buf = ""
         self.master, slave = pty.openpty()
         try:
@@ -799,7 +810,27 @@ class _PsqlListener:
             "\\set PROMPT1 ''\n\\set PROMPT2 ''\n"
             + driver._bootstrap
             + "".join("LISTEN %s;\n" % quote_ident(c) for c in channels)
+            + ("SELECT '%s' || coalesce(string_agg(c, chr(31)), '') "
+               "FROM pg_listening_channels() c;\n" % self.READY_PREFIX)
         )
+        if not self._await_ready():
+            detail = self.error
+            self.close()
+            raise Unavailable("psql listener not ready after %gs%s"
+                              % (self.READY_TIMEOUT, ": " + detail if detail else ""))
+
+    def _await_ready(self) -> bool:
+        """Attend que psql ait exécuté les `LISTEN` (sonde) ; False si la
+        session est tombée ou si le délai est dépassé."""
+        deadline = time.monotonic() + self.READY_TIMEOUT
+        while not self._ready.is_set():
+            if self._down.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._ready.wait(min(0.05, remaining))
+        return True
 
     def _write(self, text: str) -> None:
         try:
@@ -831,6 +862,16 @@ class _PsqlListener:
                     match = _NOTIFY_RE.match(line)
                     if match:
                         self._queue.put({"channel": match.group(1), "payload": match.group(2)})
+                    elif line.startswith(self.READY_PREFIX):
+                        self._ready_channels = [
+                            c for c in line[len(self.READY_PREFIX):].split(self.READY_SEP) if c]
+                        if set(self.channels) <= set(self._ready_channels):
+                            self._ready.set()
+                        else:
+                            self._lines.append("psql listening on [%s] only, wanted [%s]"
+                                               % (",".join(self._ready_channels),
+                                                  ", ".join(self.channels)))
+                            del self._lines[:-20]
                     else:
                         self._lines.append(line)
                         del self._lines[:-20]
