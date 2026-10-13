@@ -44,5 +44,7 @@ class Conversations(abc.ABC):
         """Acknowledge a thread post; retry can produce an auditable duplicate."""
 
     @abc.abstractmethod
-    def prune(self, agent: str, *, before_ts: float) -> int:
-        """Delete old detail for this agent, preserving pending R12 entries and cursor."""
+    def prune(self, agent: str, *, before_ts: float,
+              thread_before_ts: float | None = None) -> int:
+        """Delete old detail for this agent, preserving the cursor and pending
+        R12 entries, unless older than `thread_before_ts` (thread retention)."""
