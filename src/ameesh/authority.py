@@ -33,12 +33,16 @@ import time
 from dataclasses import dataclass
 
 from . import signing, storage
-from .db import Db
+from .db import Db, DbError
 
 DOMAIN = "agent-mesh/v1"
 #: rôles de clé : seul 'owner' porte l'autorité du propriétaire
 KEY_ROLES = ("owner", "agent")
 DEFAULT_KEY_ROLE = "agent"
+#: nom d'un détenteur de clé (même règle que agent_registry.name)
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# a refusal of the key_holders guard (0364), as psql reports it
+_GUARD_RE = re.compile(r"[^\n:]*(?:key|holder)[^\n]*own gesture[^\n]*")
 DEFAULT_TTL = 24 * 3600.0
 MAX_TTL = 30 * 24 * 3600.0
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -173,6 +177,20 @@ def key_info(db: Db, agent: str) -> dict | None:
     return storage.of(db).keys.info(agent)
 
 
+def _refused(exc: DbError) -> None:
+    """A refusal of the key guards of 0364 is an AuthorityError; any other
+    database error goes up as is."""
+    if "key_holders_one_owner" in str(exc):
+        raise AuthorityError(
+            "an owner key holder already exists: one at a time — replace its key "
+            "(key register --human <its id> --replace, with the owner's database "
+            "role)") from exc
+    refused = _GUARD_RE.search(str(exc))
+    if not refused:
+        raise exc
+    raise AuthorityError(refused.group(0).strip()) from exc
+
+
 def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_ROLE,
                  note: str | None = None) -> dict:
     """Enregistre la clé PUBLIQUE d'un agent.
@@ -181,21 +199,94 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
     `role='agent'` (défaut) n'authentifie qu'un agent et ne donne aucune
     autorité. Enregistrer une clé propriétaire pour un agent revient à lui
     déléguer l'autorité du propriétaire : à ne faire qu'en connaissance de cause.
-    """
+    C'est le geste du propriétaire (#326 r2) : la base (0364) le refuse hors
+    de son rôle de base, comme toute pose, tout changement ou tout retour
+    d'une clé owner sur un agent ; une clé `agent` reste libre."""
     if len(public) != 32:
         raise AuthorityError("Ed25519 public key: 32 bytes expected")
     if role not in KEY_ROLES:
         raise AuthorityError("unknown key role: %r (%s)" % (role, ", ".join(KEY_ROLES)))
     fingerprint = signing.fingerprint(public)
-    found = storage.of(db).keys.register(agent, b64(public), fingerprint, role, note)
+    keys = storage.of(db).keys
+    if (keys.info(agent) or {}).get("holder") == "human":
+        raise AuthorityError(
+            "%s holds a human's key: ameesh key register --human %s --public-key … "
+            "--role %s" % (agent, agent, role))
+    try:
+        found = keys.register(agent, b64(public), fingerprint, role, note)
+    except DbError as exc:
+        _refused(exc)
     if not found:
         raise AuthorityError(
-            "agent %s not in the registry: declare it before registering its key" % agent)
+            "agent %s not in the registry: declare it before registering its key; "
+            "a human's key (the owner's) is registered without any agent: "
+            "ameesh key register --human %s --public-key <file.pub> --role owner"
+            % (agent, agent))
     return {"agent": agent, "fingerprint": fingerprint, "role": role}
+
+
+def register_human_key(db: Db, human: str, public: bytes, *,
+                       role: str = DEFAULT_KEY_ROLE, replace: bool = False) -> dict:
+    """Enregistre la clé PUBLIQUE d'un humain (#330) : `human` est
+    `human:<id>` ou `<id>` ; la clé est rangée sous `<id>` dans `key_holders`,
+    une identité qui ne détient qu'une clé — jamais un agent (ni exécutable,
+    ni réveillable, ni dans un projet, une alerte ou une prise L165). C'est le
+    nom que `decide --key` prend par défaut (`human:<id>` → `<id>`). Refusé si
+    un agent porte ce nom : la clé du propriétaire ne s'attache jamais à
+    l'identité d'un agent.
+
+    Une clé existante n'est jamais écrasée (#326 r1) : seule une première clé
+    s'enregistre, et une première clé owner seulement s'il n'en existe aucune
+    (alerte `owner_key_registered`). Remplacer ou faire tourner une clé, même
+    révoquée, est le geste du propriétaire : `replace`, avec le rôle de base
+    du propriétaire — la base (0364) refuse tout autre rôle. `status` vaut
+    `created` ou `replaced`."""
+    name = human.split(":", 1)[1] if human.startswith("human:") else human
+    if len(public) != 32:
+        raise AuthorityError("Ed25519 public key: 32 bytes expected")
+    if role not in KEY_ROLES:
+        raise AuthorityError("unknown key role: %r (%s)" % (role, ", ".join(KEY_ROLES)))
+    if not _NAME_RE.match(name):
+        raise AuthorityError("invalid name for a key holder: %r" % name)
+    fingerprint = signing.fingerprint(public)
+    try:
+        status = storage.of(db).keys.register_human(
+            name, "human:" + name, b64(public), fingerprint, role, replace=replace)
+    except DbError as exc:
+        _refused(exc)
+    if status == "agent":
+        raise AuthorityError(
+            "an agent is named %s: a human's key never sits on an agent's identity "
+            "(choose another name, then decide … --as <name>)" % name)
+    if status == "exists":
+        raise AuthorityError(
+            "%s already holds a key: it is never overwritten; replacing or rotating it "
+            "is the owner's own gesture (key register --human %s --replace, with the "
+            "owner's database role)" % (name, name))
+    return {"agent": name, "human": "human:" + name, "fingerprint": fingerprint,
+            "role": role, "status": status}
 
 
 def revoke_key(db: Db, agent: str) -> bool:
     return storage.of(db).keys.revoke(agent)
+
+
+def confirm_key(db: Db, name: str) -> int:
+    """Le propriétaire confirme les enregistrements de la clé de `name`
+    (#326 r3) : l'alerte `owner_key_registered` d'une clé owner posée sans son
+    geste s'éteint. Geste du propriétaire, refusé par la base hors de son
+    rôle ; rend l'id de l'événement `confirmed`."""
+    try:
+        event = storage.of(db).keys.confirm(name)
+    except DbError as exc:
+        if "key_events is written" not in str(exc):
+            raise
+        raise AuthorityError(
+            "confirming a key is the owner's own gesture: run it with the owner's "
+            "database role") from exc
+    if not event:
+        raise AuthorityError("no key registered for %s" % name)
+    return event
 
 
 def _valid_key(db: Db, agent: str, expected_fingerprint: str | None) -> tuple[dict | None, Verdict]:
