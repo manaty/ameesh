@@ -646,8 +646,10 @@ class WorkItems(interface.WorkItems):
             value, params = "NULL", ()
         elif number is None:
             value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
-                     "               WHERE migration_repo = %s))")
-            params = (int(floor), repo)
+                     "               WHERE migration_repo = %s),"
+                     " (SELECT coalesce(max(number), 0) + 1 FROM work_migration_reservations"
+                     " WHERE target_repo = %s AND status = 'reserved'))")
+            params = (int(floor), repo, "github.com/" + repo)
         else:
             value, params = "%s", (int(number),)
         deadline = time.monotonic() + _RESERVE_BUDGET_S
@@ -669,7 +671,8 @@ class WorkItems(interface.WorkItems):
                     return rows[0]
             except DbError as exc:
                 if (number is not None or release
-                        or not is_unique_violation(exc, MIGRATION_INDEX)):
+                        or not (is_unique_violation(exc, MIGRATION_INDEX)
+                                or is_unique_violation(exc, "work_migration_reservations_active_idx"))):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

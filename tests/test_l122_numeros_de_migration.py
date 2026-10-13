@@ -276,12 +276,14 @@ class ReservationTest(PgTestCase):
     def _rejoue_0390(self, *rows):
         """Les réservations `rows` (migration, dépôt, issue) posées avant 0390,
         puis 0390 rejouée : son déclencheur, sa contrainte et son index sont
-        retirés d'abord, la colonne reste (un dépôt déjà donné). Le schéma de la
+        retirés d'abord, ainsi que le trigger de projection #711 qui
+        n'existait pas avant 0390 ; la colonne reste (un dépôt déjà donné). Le schéma de la
         classe est rendu tel quel ensuite, réservations libérées."""
         path = os.path.join(migrations.MIGRATIONS_DIR, "0390_work_item_migration_repo.sql")
         with open(path, encoding="utf-8") as fh:
             sql = fh.read()
-        undo = ("DROP TRIGGER IF EXISTS work_items_migration_repo_fill ON work_items;"
+        undo = ("DROP TRIGGER IF EXISTS work_items_migration_slot_sync ON work_items;"
+                " DROP TRIGGER IF EXISTS work_items_migration_repo_fill ON work_items;"
                 " ALTER TABLE work_items DROP CONSTRAINT IF EXISTS work_items_migration_repo_check;"
                 " DROP INDEX IF EXISTS work_items_migration_repo_idx;")
         ids = []
@@ -292,6 +294,10 @@ class ReservationTest(PgTestCase):
                 self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
                                 " WHERE id = %s", (i,))
             self.db.script(sql)
+            self.db.script("CREATE TRIGGER work_items_migration_slot_sync"
+                           " AFTER INSERT OR UPDATE OF migration, migration_repo, app, branch_target, state"
+                           " ON work_items FOR EACH ROW"
+                           " EXECUTE FUNCTION work_items_migration_slot_sync();")
 
         self.addCleanup(restore)
         self.db.script(undo)
