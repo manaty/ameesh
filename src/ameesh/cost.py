@@ -239,9 +239,16 @@ class Gauge:
             return 1.0
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
-    def pace_cap(self, now: float) -> float:
-        """Le plafond de rythme : min(90 %, part écoulée + 10 points)."""
-        return min(PACE_CEILING, self.elapsed(now) + PACE_MARGIN)
+    def pace_cap(self, now: float, multiplier: float = 1.0) -> float:
+        """Le plafond de rythme : min(90 %, part écoulée × `multiplier` + 10 points).
+
+        `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
+        compte (`accounts`, `pace_multiplier`, défaut 1.0), posé à 2.0 sur le
+        compte principal Codex pour consommer sa réserve de forfait sans
+        remise à zéro. Il ne touche que la part écoulée : l'utilisation
+        relevée, les remises à zéro et les plafonds fixes ne changent pas.
+        """
+        return min(PACE_CEILING, self.elapsed(now) * multiplier + PACE_MARGIN)
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
