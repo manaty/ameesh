@@ -803,6 +803,64 @@ class MeasurePgTest(PgTestCase):
         self.assertEqual(storage.of(self.db).work.turn_spans(lid), [
             {"start_ts": self.t0 + 20 * M, "end_ts": self.t0 + 50 * M, "turn_id": "tour-1"}])
 
+    def test_turn_end_is_the_resource_end_not_the_late_repair(self):
+        """#796 : la fin d'un tour attribué est celle de sa ressource
+        (`turn_resources.ended_at`) quand elle est connue ; `recorded_at`,
+        écrit plus tard par la réparation d'une panne, ne rallonge plus la
+        durée d'un tour déjà terminé."""
+        lot = work.add(self.db, title="late repair", branch="lot/lr")
+        lid = int(lot["id"])
+        work.move(self.db, lid, "build")
+        work.merged(self.db, lid, sha="abcdef1")
+        self.t0 = float(self.db.query(
+            "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
+        self._at("UPDATE work_items SET started_at = to_timestamp(%s) WHERE id = %s", 0, lid)
+        self._at("UPDATE work_item_events SET created_at = to_timestamp(%s)"
+                 " WHERE work_item_id = %s AND state = 'build'", 0, lid)
+        self._at("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                 " WHERE work_item_id = %s AND kind = 'merged'", 100, lid)
+        # la ressource dit la fin réelle (30) ; la ligne du grand livre n'a été
+        # écrite qu'à 50, par la réparation d'une panne
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, started_at, recorded_at,"
+            " turn_id, work_item_id) VALUES ('dev1','claude','claude-opus-4', 0.1,"
+            " to_timestamp(%s), to_timestamp(%s), 'tour-lr', %s)",
+            (self.t0 + 20 * M, self.t0 + 50 * M, lid))
+        self.db.execute(
+            "INSERT INTO turn_resources (turn_id, agent, host, started_at, ended_at, status)"
+            " VALUES ('tour-lr','dev1','h1', to_timestamp(%s), to_timestamp(%s), 'done')",
+            (self.t0 + 20 * M, self.t0 + 30 * M))
+        self.assertEqual(storage.of(self.db).work.turn_spans(lid), [
+            {"start_ts": self.t0 + 20 * M, "end_ts": self.t0 + 30 * M, "turn_id": "tour-lr"}])
+        rows = lot_measures.measure(self.db, [lid], repos=[], ci=lambda r, b: [])
+        m = lot_measures.view(rows[0])
+        # 20–30 = 10 min d'agent, pas les 30 min de la réparation tardive
+        self.assertEqual((m["agent_minutes"], m["agent_source"]), (10.0, "turns"))
+
+    def test_kept_measure_keeps_its_source(self):
+        """#796 : quand les phases d'une mesure connue (CI lue) sont gardées
+        faute de CI relisible, leur provenance de minutes d'agent est gardée
+        avec elles : `states` ne devient pas `turns` sans que `agent_minutes`
+        soit recalculé par la même règle."""
+        lot = work.add(self.db, title="kept source")
+        lid = int(lot["id"])
+        st = storage.of(self.db).work
+        base = dict(started_ts=1000.0, merged_ts=2000.0, total_minutes=60.0,
+                    agent_minutes=42.0, ci_minutes=10.0, review_minutes=5.0,
+                    human_minutes=3.0, agent_source="states")
+        st.save_measure(lid, base)
+        # mesure suivante sans CI : ses phases (et sa source) ne remplacent pas
+        # celles déjà mesurées avec une CI connue
+        st.save_measure(lid, dict(base, agent_minutes=7.0, ci_minutes=None,
+                                  total_minutes=7.0, agent_source="turns"))
+        m = st.measure(lid)
+        self.assertEqual((m["agent_minutes"], m["agent_source"], m["ci_minutes"]),
+                         (42.0, "states", 10.0))
+        # CI relue : la nouvelle mesure remplace phases et source ensemble
+        st.save_measure(lid, dict(base, agent_minutes=7.0, agent_source="turns"))
+        m = st.measure(lid)
+        self.assertEqual((m["agent_minutes"], m["agent_source"]), (7.0, "turns"))
+
     def _other_lot(self):
         return int(work.add(self.db, title="other")["id"])
 

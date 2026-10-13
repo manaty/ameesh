@@ -1335,7 +1335,13 @@ class WorkItems(interface.WorkItems):
                 " THEN work_item_measures.%s ELSE excluded.%s END" % (c, c, c)
                 for c in ("total_minutes", "agent_minutes", "ci_minutes", "review_minutes",
                           "human_minutes", "ci_runs")) + ","
-            "  agent_source = excluded.agent_source,"
+            # même garde pour la provenance des minutes d'agent : garder les
+            # phases d'une mesure connue (ci_minutes non nul) garde leur
+            # source — 'states' ne devient jamais 'turns' (ni l'inverse) sans
+            # que agent_minutes soit recalculé par la même règle
+            "  agent_source = CASE WHEN excluded.ci_minutes IS NULL"
+            " AND work_item_measures.ci_minutes IS NOT NULL"
+            " THEN work_item_measures.agent_source ELSE excluded.agent_source END,"
             "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
             "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
             "  diff_insertions = coalesce(excluded.diff_insertions,"
@@ -1365,13 +1371,15 @@ class WorkItems(interface.WorkItems):
         du début. `start_ts` = `turn_resources.started_at` quand le tour y est
         relié (le tour a pris la main), sinon `turn_costs.started_at` (le
         marqueur, posé avant le lancement) — jamais None : un tour sans aucun
-        des deux est omis. `end_ts` = écriture de la ligne : la fin du tour, ou
-        plus tard si la ligne a été réparée après une panne (durée majorée,
-        jamais silencieuse)."""
+        des deux est omis. `end_ts` = `turn_resources.ended_at` quand le tour a
+        rendu ses ressources (la fin réelle), sinon l'écriture de la ligne : une
+        ligne réparée après une panne n'allonge donc plus la durée d'un tour
+        dont la ressource dit déjà quand il s'est terminé."""
         return self.db.query(
             "SELECT extract(epoch from coalesce(tr.started_at, tc.started_at))::float8"
             "         AS start_ts,"
-            "       extract(epoch from tc.recorded_at)::float8 AS end_ts,"
+            "       extract(epoch from coalesce(tr.ended_at, tc.recorded_at))::float8"
+            "         AS end_ts,"
             "       tc.turn_id AS turn_id"
             "  FROM turn_costs tc"
             "  LEFT JOIN turn_resources tr ON tr.turn_id = tc.turn_id"
