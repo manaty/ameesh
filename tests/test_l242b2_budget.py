@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import unittest
 from unittest import mock
 
 from ameesh import (account_turn, accounts, alert_briefs, budget, config, cost, exploitation,
@@ -310,3 +311,12 @@ class MarqueDeLExecuteurTest(_L30Base):
                              "budget : pause (x) until 14:20")
         finally:
             worker.watchdog_stop.set()
+
+
+class EtiquetteDeFinTest(unittest.TestCase):
+    def test_la_date_n_apparait_que_si_la_fin_n_est_pas_aujourd_hui(self):
+        # #373 r2 : l'heure seule tant que la remise tombe aujourd'hui ; la
+        # date au-delà — près de minuit, une remise dans 30 min est demain.
+        midi = time.mktime((2026, 10, 12, 12, 0, 0, 0, 0, -1))
+        self.assertEqual(cost.until_label(midi + 1800, midi), "12:30")
+        self.assertEqual(cost.until_label(midi + 86400, midi), "13/10 12:00")
