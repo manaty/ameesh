@@ -1734,6 +1734,64 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
         self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
 
+    def test_canon_illisible_ne_deplace_pas_le_checkout(self):
+        """#814 (R2 cx2) : la source racine est ajoutée avant la lecture des
+        membres et des fiches ; une erreur ultérieure rend le canon illisible
+        sans vider `sources`. Rien n'a pu être vérifié : un `--ref` descendant
+        non fusionné ne doit pas avancer HEAD avant le refus CanonUnreadable —
+        registre, journal, HEAD et arbre inchangés."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        git(self.clone, "checkout", "-q", "-b", "feature")
+        write(self.clone, "note-feature.md", "feature non revue\n")
+        commit_all(self.clone, "feature non revue", push=False)
+        git(self.clone, "checkout", "-q", "main")
+        arbre = git(self.clone, "status", "--porcelain")
+        before, journal = self.rows(), self.journal()
+        with mock.patch.object(canon._Loader, "_read_fiches",
+                               side_effect=OSError(13, "permission denied")):
+            illisible = canon.load(self.clone, ref="feature")
+        self.assertTrue(illisible.sources)          # source Git conservée
+        self.assertFalse(illisible.readable)
+        with self.assertRaises(canon_sync.CanonUnreadable):
+            canon_sync.sync(self.db, illisible, "atelier", bootstrap_ref="main",
+                            trusted_ref="")
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.journal(), journal)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
+        self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
+
+    def test_canon_devenu_illisible_a_la_relecture_ne_deplace_pas_le_checkout(self):
+        """#814 (R2 cx2, delta auditeur) : lisible à l'entrée, le canon peut
+        devenir illisible à la relecture du rattrapage (fetch puis lecture en
+        échec). Le checkout ne suit pas une révision que rien n'a vérifiée : le
+        refus CanonUnreadable suit, HEAD et arbre restent sur la canonique."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        stale = canon.load(self.clone)              # lisible, origin/main = first
+        self.assertTrue(stale.readable and stale.sources)
+        # un autre chemin applique un commit de plus au journal : le clone
+        # principal ne connaît pas `second`, le rattrapage relit (fetch)
+        other = os.path.join(self.workspace, "autre-chemin")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        second = self.commit_members(other, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        self.assertEqual(self.sync(other).authenticators.status, "synced")
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+        arbre = git(self.clone, "status", "--porcelain")
+        before = self.rows()
+        with mock.patch.object(canon._Loader, "_read_fiches",
+                               side_effect=OSError(13, "permission denied")):
+            with self.assertRaises(canon_sync.CanonUnreadable):
+                canon_sync.sync(self.db, stale, "atelier", bootstrap_ref="main",
+                                trusted_ref="")
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
+        self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
+
     def test_hote_en_retard_ne_reactive_rien(self):
         """Deux hôtes, une base : celui qui n'a pas vu le retrait ne le défait pas.
 

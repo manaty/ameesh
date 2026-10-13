@@ -745,11 +745,13 @@ def _catch_up_needed(canon: Canon, last: dict) -> tuple[bool, bool]:
 
 def _follow_checkout(canon: Canon) -> str:
     """Le clone canonique contient-il la révision lue ? Sinon, l'avance
-    (fast-forward seulement) ; rend le refus, à ne pas écrire au registre."""
+    (fast-forward seulement) ; rend le refus, à ne pas écrire au registre.
+
+    Un canon illisible ne suit jamais : rien n'a pu être vérifié (R2 cx2)."""
     if not canon.sources:
         return ""
     root = canon.sources[0]
-    if root.mode != "git" or root.prefix or canon.untrusted:
+    if root.mode != "git" or root.prefix or canon.untrusted or not canon.readable:
         return ""                      # clone dédié seulement : jamais un dépôt partagé
     head = canon_mod.git_commit(root.repo, "HEAD")
     if head and canon_mod.git_contains(root.repo, root.commit, head):
@@ -795,7 +797,10 @@ def catch_up(db: Db, canon: Canon, host: str, key: str | None = None, *,
     (`canon.git_fast_forward`, fast-forward seulement) — mais seulement après
     les contrôles de confiance et de monotonie (`_verify`) sur le canon relu :
     une révision non fusionnée lue par `--ref` ne doit pas avancer le checkout
-    avant d'être refusée (relecture R1/R2 du 13/10). `trusted_ref` (None : la
+    avant d'être refusée (relecture R1/R2 du 13/10). Un canon illisible, à
+    l'entrée comme après la relecture, n'avance jamais le checkout : la lecture
+    en échec conserve la source racine, mais rien n'a pu être vérifié et le
+    refus `CanonUnreadable` suit (R2 cx2, 13/10). `trusted_ref` (None : la
     configuration de l'hôte pour ce canon) et `bootstrap_ref` sont ceux de
     l'appelant ; ils refont foi sous le verrou (`_sync_locked`). Rend
     `(canon, refus)` : `refus` n'est non vide que si le canon relu ne passe
@@ -818,7 +823,15 @@ def catch_up(db: Db, canon: Canon, host: str, key: str | None = None, *,
     # L814 (R1/R2) : contrôles AVANT toute mutation du checkout — sinon un ref
     # non fusionné, descendant du dernier appliqué, avance HEAD puis se fait
     # refuser : registre intact mais canon local modifié.
-    if canon.readable and not canon.untrusted and canon.sources:
+    if not canon.readable:
+        # R2 cx2 : la source racine est ajoutée avant la lecture des membres et
+        # des fiches ; une GitError/OSError ultérieure rend `readable` faux sans
+        # vider `sources`. Rien n'a pu être vérifié (ni branche canonique, ni
+        # monotonie) : le checkout ne bouge pas, la passe refuse ensuite
+        # (CanonUnreadable). Un `--ref` descendant non fusionné ne déplace donc
+        # jamais HEAD.
+        return canon, ""
+    if not canon.untrusted and canon.sources:
         try:
             _verify(canon, last, trusted_ref, bootstrap_ref)
         except _Refused as exc:
