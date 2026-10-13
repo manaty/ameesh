@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import io
+import json
 import os
 import tempfile
 import threading
@@ -752,6 +753,9 @@ class RecountTest(PgTestCase):
     transaction ; un recomptage plus récent n'est jamais écrasé."""
 
     PROJ, LOT, HOST = "acme", "361b", "host-1"
+    #: la plus récente d'un census d'indexation (L361c)
+    LAST = {"entry_id": "acme/361b#30", "author": "agent:a", "excerpt": "trois",
+            "ts": 2.0, "mailbox_id": None}
 
     def setUp(self):
         super().setUp()
@@ -762,7 +766,8 @@ class RecountTest(PgTestCase):
 
     def row(self):
         rows = self.db.query(
-            "SELECT entries, last_entry_id, last_excerpt, counted_until FROM thread_index"
+            "SELECT location, entries, last_entry_id, last_excerpt, counted_until"
+            "  FROM thread_index"
             " WHERE project = %s AND lot = %s AND transport = 'file' AND host = %s",
             (self.PROJ, self.LOT, self.HOST))
         return rows[0] if rows else None
@@ -822,6 +827,49 @@ class RecountTest(PgTestCase):
                                               last=None, end=100), 120)
         row = self.row()
         self.assertEqual((row["entries"], row["counted_until"]), (3, 120))
+
+    def test_an_index_census_at_equal_end_is_stale_after_the_expiry(self):
+        """L361c, témoin inverse : l'expiration préserve la fin logique
+        (`end`), donc un census d'indexation lu avant elle a le même `end`.
+        Arrivé après le recount de l'expiration, il est périmé : il ne
+        ressuscite ni les entrées ni `last_*`."""
+        self.threads.recount(**self.key, location="x", kept=3, last=dict(self.LAST), end=120)
+        # l'expiration, de même fin logique : le fil ne garde qu'une entrée
+        self.assertEqual(self.threads.recount(**self.key, location="x", kept=1,
+                                              last=None, end=120), 120)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["last_excerpt"]),
+                         (1, None, ""))
+        # le census d'indexation, lu avant l'expiration, arrive après elle
+        self.assertEqual(self.threads.recount(**self.key, location="x", kept=3,
+                                              last=dict(self.LAST), end=120), 120)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["last_excerpt"],
+                          row["counted_until"]), (1, None, "", 120))
+
+    def test_a_trace_write_counts_nothing_and_quotes_nothing(self):
+        """L361c : la trace de la boîte (`count` faux) écrit `meta` et
+        `location`, jamais `entries` ni `last_*` : une entrée retirée par une
+        expiration passée avant l'écriture de trace ne reste pas citée."""
+        msg = self.db.query("INSERT INTO agent_mailbox (sender, recipient, body)"
+                            " VALUES ('agent:a', 'agent:b', 'x') RETURNING id")[0]["id"]
+        self.threads.recount(**self.key, location="x", kept=1,
+                             last={"entry_id": "acme/361b#20", "author": "agent:a",
+                                   "excerpt": "deux", "ts": 1.0, "mailbox_id": None},
+                             end=120)
+        before = self.row()
+        self.threads.index(**self.key, location="y", entry_id="acme/361b#30",
+                           mailbox_ids=[msg], author="agent:a", excerpt="trois",
+                           ts=3.0, trace={"fil": {"id": "acme/361b#30"}}, count=False)
+        row = self.row()
+        self.assertEqual((row["entries"], row["last_entry_id"], row["last_excerpt"],
+                          row["counted_until"]),
+                         (before["entries"], before["last_entry_id"],
+                          before["last_excerpt"], before["counted_until"]))
+        self.assertEqual(row["location"], "y")  # la trace rafraîchit `location`
+        meta = self.db.query("SELECT meta FROM agent_mailbox WHERE id = %s", (msg,))[0]["meta"]
+        meta = meta if isinstance(meta, dict) else json.loads(meta)
+        self.assertEqual(meta.get("fil"), {"id": "acme/361b#30"})
 
 
 if __name__ == "__main__":

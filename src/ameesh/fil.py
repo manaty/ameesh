@@ -1123,9 +1123,12 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
     fichier (`threads.recount`, portée H), la même opération serveur que
     l'expiration — un `+1` local ne peut plus compter en double une entrée
     déjà reprise par un recomptage, ni être écrasé par un recomptage plus
-    court. La trace de la boîte reste écrite par `threads.index` (`count`
-    faux : elle ne compte pas), portée B et auteur membre du fil, quand
-    l'entrée porte des messages.
+    court. Un census de même fin logique qu'un recomptage plus court est
+    périmé (le recount ne reprend pas un census qui rallonge la ligne) :
+    la trace de la boîte reste écrite par `threads.index` (`count` faux),
+    portée B et auteur membre du fil, quand l'entrée porte des messages ;
+    elle ne touche ni le compte ni `last_*`, donc une entrée expirée
+    entre-temps n'est jamais ressuscitée par sa trace.
     """
     host = cfg.host if transport.name == "file" else ""
     key = dict(project=thread.project, lot=thread.lot or "", transport=transport.name,
@@ -1133,10 +1136,12 @@ def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_
                                     if hasattr(transport, "location") else thread.key))
     if storage.is_remote(db):
         # exécuteur médié : un verrou ne tiendrait pas d'une requête à
-        # l'autre. L361c : le compte vient du census du fichier, par la même
-        # opération serveur que l'expiration (`threads.recount`, portée H),
-        # et non plus d'un `+1` local en course avec un recomptage. La trace
-        # de la boîte reste une écriture à part, sans comptage.
+        # l'autre. L361c : le compte vient du census du fichier (à suivre ou
+        # à venir), par la même opération serveur que l'expiration
+        # (`threads.recount`, portée H), et non plus d'un `+1` local en
+        # course avec un recomptage. La trace de la boîte reste une écriture
+        # à part, sans comptage ni citation (`count` faux : ni `entries` ni
+        # `last_*`).
         census = _census(transport, thread) if hasattr(transport, "census") else None
         if census is None or mailbox_ids:
             storage.of(db).threads.index(

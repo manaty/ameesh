@@ -2056,7 +2056,12 @@ class Threads(Domain):
               entry_id: str, mailbox_ids: Sequence[int], author: str, excerpt: str,
               ts: float, trace: dict, count: bool = True) -> None:
         """Compte l'entrée (sauf `count` faux) dans l'index du fil et, si elle porte des messages
-        de la boîte, y note `trace` (id externe) — en une seule écriture."""
+        de la boîte, y note `trace` (id externe) — en une seule écriture.
+
+        `count` faux (L361c) : la trace seule — la boîte est marquée et
+        `location` rafraîchie, jamais `entries` ni `last_*`. Le census du
+        fichier (`recount`) est alors le seul à écrire l'index : la trace d'une
+        entrée expirée entre-temps ne peut pas la ressusciter."""
 
     @abc.abstractmethod
     def indexed(self) -> list[dict]:
@@ -2080,8 +2085,10 @@ class Threads(Domain):
         récente, `end` la fin logique du fil) : sous le verrou de la ligne
         (`lock`), l'index reprend ce census (`expired`) si son `counted_until`
         n'est pas déjà AU-DELÀ de `end` — un recomptage plus récent fait foi.
-        Un `counted_until` égal à `end` est repris : à fin logique constante,
-        seule une expiration change le fil (moins d'entrées gardées). Rend le
+        Un `counted_until` égal à `end` n'est repris que si le census ne
+        rallonge pas la ligne (`kept <= entries`) : à fin logique constante,
+        seule une expiration change le fil (moins d'entrées gardées), donc un
+        census plus long a été lu avant elle et est périmé (L361c). Rend le
         `counted_until` retenu."""
 
     @abc.abstractmethod
