@@ -79,6 +79,11 @@ human decision (by the card's lead), unblocking. An action of the lot
 waiting for a human (approval, reconciliation) takes precedence over everything; a
 blocking verdict only counts if it follows the last freeze. When ameesh does not know
 who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of guessing.
+The reviewer of a review can be **designated on entry to `qa`** (#705):
+`ameesh work move <id> qa --reviewer <agent>` — a registry name, or a human
+(`human:…`). The wait then names that reviewer before any verdict, and the
+`stale_lot` alert reaches them; a `qa` lot with no designated reviewer alerts
+the project's orchestrators, who must designate one.
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
@@ -88,7 +93,7 @@ duration, and the timeline no longer draws it as active.
 These rules live in a single module, `ameesh.stagnation`, called by
 `ameesh progress`, `ameesh work list/show` and the `stale_lot` alert of
 `ameesh alerts` (which keeps its one-word `waiting_for` field and adds
-`waiting`, the detailed form).
+`waiting`, the detailed form, and `project`).
 
 ## Observed merge: automatic closing
 

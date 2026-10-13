@@ -317,6 +317,7 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   w.app, w.workstream, w.reviewer,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

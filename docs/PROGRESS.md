@@ -163,7 +163,7 @@ read without limit (full log, all its actions).
 | `milestones_source` | `milestones` (lot milestones table, L10) \| `events` (deduction) |
 | `blocked_verdicts` | number of blocking verdicts (integer; null if the source does not know) |
 | `blocks` | number of holds (`blocked`, `waiting_human`) |
-| `assignee`, `reviewer` | author; author of the retained verdict (approver for a merge action) |
+| `assignee`, `reviewer` | author; the designated reviewer (`work move … qa --reviewer`, #705) while the review is open, otherwise the author of the retained verdict (approver for a merge action) |
 | `qa_loops` | `qa → build` round trips counted by `work_items` |
 | `updated_ts`, `budget_usd`, `spent_usd` | last modification, lot budget |
 | `actions` | ids of the actions linked to the lot |

@@ -6,12 +6,16 @@ du dernier verdict) : un lot en qa attendait « verdict d'un relecteur (non
 désigné) », donc personne. `work move <id> qa --reviewer <agent>` le désigne ;
 l'attente, la vue de progrès et `work show` le nomment ; un verdict courant
 garde son auteur réel, et la revue suivante peut redésigner quelqu'un.
+
+L'alerte `stale_lot` suit : elle part au relecteur désigné (le verdict lui est
+dû) ; sans relecteur, elle part aux orchestrateurs du projet du lot et demande
+d'en désigner un.
 """
 from __future__ import annotations
 
 import unittest
 
-from ameesh import plan, progress, work
+from ameesh import alert_briefs, exploitation, notify, plan, progress, storage, work
 
 from .support import PgTestCase
 
@@ -53,15 +57,91 @@ class ReviewerMilestonesTest(unittest.TestCase):
         self.assertIsNone(jalons["reviewer"])
 
 
+class ReviewerBriefsTest(unittest.TestCase):
+    """#705 : routage de l'alerte `stale_lot` d'un lot en qa (textes et destinataires)."""
+
+    LISTING = [{"name": "auteur", "team": "ameesh"},
+               {"name": "relecteur", "team": "ameesh"},
+               {"name": "orch", "team": "ameesh"},
+               {"name": "orch-b", "team": "nexlink"},
+               {"name": "auditeur", "team": ""}]
+
+    def _alert(self, **extra):
+        alert = {"type": "stale_lot", "agent": "auteur", "lot": 42, "title": "export",
+                 "lot_state": "qa", "value": 7 * 3600, "threshold": 6 * 3600,
+                 "waiting_for": "verdict", "project": "ameesh",
+                 "waiting": {"what": "verdict", "who": None,
+                             "label": "verdict from a reviewer (none designated)"},
+                 "orchestrators": ["orch", "orch-b"]}
+        alert.update(extra)
+        return alert
+
+    def test_relecteur_designe_prevenu_du_verdict_du(self):
+        alert = self._alert(waiting={"what": "verdict", "who": "relecteur",
+                                     "label": "verdict by relecteur"})
+        briefs = alert_briefs.briefs(alert, self.LISTING, auditor_names=["auditeur"])
+        self.assertIn("relecteur", briefs)
+        self.assertIn("ameesh work milestone 42 verdict ok|blocked", briefs["relecteur"])
+        self.assertIn("orch", briefs)          # les orchestrateurs restent prévenus
+        self.assertEqual(briefs["auditeur"], briefs["orch"])
+
+    def test_sans_relecteur_l_orchestrateur_du_projet_est_prevenu(self):
+        briefs = alert_briefs.briefs(self._alert(), self.LISTING)
+        self.assertEqual(sorted(briefs), ["orch"])      # projet ameesh, pas orch-b
+        self.assertIn("ameesh work move 42 qa --reviewer <agent>", briefs["orch"])
+        self.assertIn("ameesh work milestone 42 verdict", briefs["orch"])
+
+    def test_projet_inconnu_retombe_sur_l_equipe_de_l_assigne(self):
+        alert = self._alert()
+        alert.pop("project")
+        briefs = alert_briefs.briefs(alert, self.LISTING)
+        self.assertEqual(sorted(briefs), ["orch"])
+
+    def test_autre_attente_inchangee(self):
+        # verdict bloquant courant : l'auteur doit corriger, pas le relecteur
+        alert = self._alert(waiting={"what": "fix", "who": "auteur", "label": "fix by auteur"},
+                            waiting_for="correction")
+        briefs = alert_briefs.briefs(alert, self.LISTING)
+        self.assertEqual(sorted(briefs), ["orch"])
+        self.assertIn("nudge auteur", briefs["orch"])
+        self.assertNotIn("--reviewer", briefs["orch"])
+
+    def test_alerte_sans_attente_inchangee(self):
+        alert = self._alert()
+        alert.pop("waiting")
+        alert["waiting_for"] = None
+        briefs = alert_briefs.briefs(alert, self.LISTING)
+        self.assertEqual(sorted(briefs), ["orch"])
+        self.assertIn("nudge auteur", briefs["orch"])
+
+
 class ReviewerDesignationTest(PgTestCase):
-    def _lot(self, title="un lot", assignee="auteur"):
+    def _lot(self, title="un lot", assignee="auteur", **extra):
         self.register(assignee, "claude", cwd=self.tmp)
-        return work.add(self.db, title=title, assignee=assignee)
+        return work.add(self.db, title=title, assignee=assignee, **extra)
 
     def _qa(self, lot, *args):
         proc = self.mesh("work", "move", str(lot["id"]), "build")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return self.mesh("work", "move", str(lot["id"]), "qa", *args)
+
+    def _stale(self, lot):
+        """Vieillit la ligne, les transitions et les jalons du lot (7 h)."""
+        for sql in ("UPDATE work_items SET created_at = now() - interval '8 hours',"
+                    " updated_at = now() - interval '7 hours' WHERE id = %s",
+                    "UPDATE work_item_events SET created_at = now() - interval '7 hours'"
+                    " WHERE work_item_id = %s",
+                    "UPDATE work_item_milestones SET at = now() - interval '7 hours'"
+                    " WHERE work_item_id = %s"):
+            self.db.execute(sql, (lot,))
+
+    def _stale_alert(self, lot):
+        alertes = exploitation.alerts(self.cfg, self.db,
+                                      orchestrators_declared=["orchestrateur"])
+        return next(a for a in alertes if a["type"] == "stale_lot" and a["lot"] == lot)
+
+    def _briefs(self, alert):
+        return alert_briefs.briefs(alert, storage.of(self.db).operations.listing())
 
     def test_relecteur_designe_nomme_avant_tout_verdict(self):
         self.register("relecteur", "codex", cwd=self.tmp)
@@ -134,3 +214,60 @@ class ReviewerDesignationTest(PgTestCase):
         # le journal garde la désignation
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("reviewer second" in n for n in notes), notes)
+
+    def test_alerte_stale_lot_va_au_relecteur_designe(self):
+        self.register("relecteur", "codex", cwd=self.tmp)
+        self.register("orchestrateur", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("orchestrateur",))
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._stale(lot["id"])
+
+        alert = self._stale_alert(lot["id"])
+        self.assertEqual(alert["project"], "ameesh")
+        self.assertEqual(alert["waiting"]["who"], "relecteur")
+        briefs = self._briefs(alert)
+        self.assertIn("relecteur", briefs)
+        self.assertIn("ameesh work milestone %d verdict ok|blocked" % lot["id"],
+                      briefs["relecteur"])
+        self.assertIn("orchestrateur", briefs)      # les orchestrateurs restent prévenus
+
+    def test_alerte_stale_sans_relecteur_va_a_l_orchestrateur_du_projet(self):
+        self.register("orchestrateur", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("orchestrateur",))
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._stale(lot["id"])
+
+        alert = self._stale_alert(lot["id"])
+        self.assertIsNone(alert["waiting"]["who"])
+        briefs = self._briefs(alert)
+        self.assertEqual(sorted(briefs), ["orchestrateur"])
+        self.assertIn("ameesh work move %d qa --reviewer <agent>" % lot["id"],
+                      briefs["orchestrateur"])
+
+    def test_le_courrier_de_l_alerte_part_au_relecteur(self):
+        self.register("relecteur", "codex", cwd=self.tmp)
+        self.register("orchestrateur", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("orchestrateur",))
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._stale(lot["id"])
+
+        alert = self._stale_alert(lot["id"])
+        ncfg = notify.parse_config({"default": []})
+        notifier = notify.Notifier(self.cfg, ncfg, sender=object(), log=lambda t: None)
+        notifier.run_pass(self.db, current=[alert])
+        rows = self.db.query("SELECT body, payload FROM agent_mailbox WHERE recipient = %s",
+                             ("relecteur",))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("designated reviewer", rows[0]["body"])
+        self.assertIn("ameesh work milestone %d verdict" % lot["id"], rows[0]["body"])
+        self.assertEqual(rows[0]["payload"]["alert"], "stale_lot")
+        self.assertEqual(rows[0]["payload"]["lot"], lot["id"])
