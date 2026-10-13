@@ -44,10 +44,15 @@ env:
   AMEESH_BALANCE_INTERVAL: "0"
   PYTHONPATH: src
 
+# Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
+# four runners): GitHub's free tier caps hosted jobs at 20 for the whole
+# organisation. A pull request from a fork never reaches that host (the
+# repository is public: its code would run on a shared, persistent machine);
+# it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
   mesure:
     name: mesure ${{ matrix.pilote }} ${{ matrix.part }}/${{ matrix.parts }}
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -127,7 +132,7 @@ jobs:
     name: carte
     needs: mesure
     if: always()
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

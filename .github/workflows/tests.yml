@@ -76,12 +76,17 @@ env:
   AMEESH_BALANCE_INTERVAL: "0"
   PYTHONPATH: src
 
+# Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
+# four runners): GitHub's free tier caps hosted jobs at 20 for the whole
+# organisation. A pull request from a fork never reaches that host (the
+# repository is public: its code would run on a shared, persistent machine);
+# it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # merge commit against its target) and the plan of the run, from the map
   plan:
     name: plan
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       version_only: ${{ steps.plan.outputs.version_only }}
@@ -121,7 +126,7 @@ jobs:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     needs: plan
     if: needs.plan.outputs.psycopg != '[]'
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -225,7 +230,7 @@ jobs:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     needs: plan
     if: needs.plan.outputs.psql != '[]'
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -301,7 +306,7 @@ jobs:
     name: lecteurs de la doc
     needs: plan
     if: needs.plan.outputs.docs_only == 'true'
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
@@ -319,7 +324,7 @@ jobs:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     steps:
@@ -350,7 +355,7 @@ jobs:
   version:
     name: version number
     if: github.event_name == 'pull_request'
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -368,7 +373,7 @@ jobs:
     name: tests
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
-    runs-on: [self-hosted, linux, ameesh-ci]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: bilan des parts
