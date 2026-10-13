@@ -136,11 +136,51 @@ class Project:
     #: identity; a display name is free text and renames. A release lot
     #: certifies its head with a green run of each, jobs included.
     full_suite: tuple = ()
+    #: L756 B3 (#566): per workflow, the **required jobs** — `((path, (job,
+    #: …)), …)`. A declared entry `{path = …, jobs = […]}` names them; a bare
+    #: path entry requires *all* the jobs of the run (fail-closed). A required
+    #: job must exist and be green (every matrix instance); the other jobs must
+    #: be `success` or `skipped` — a job skipped by design (`if:` on the event
+    #: or the paths) never blocks a declared suite. A name ends with " *" for a
+    #: matrix family (`psycopg *`), otherwise it matches exactly.
+    full_suite_required: tuple = ()
+    #: L756 B3 (#566): per workflow, the **tolerated jobs** — `((path, (job,
+    #: …)), …)`; their conclusion neither certifies nor blocks (the `bilan des
+    #: impactés` job is `continue-on-error: true` and "never required",
+    #: EXPLOITATION §L161). Only meaningful with a declared `jobs` list.
+    full_suite_tolerated: tuple = ()
 
 
 @dataclass
 class Settings:
     projects: dict = field(default_factory=dict)
+
+
+def _suite_jobs(declared, where: str, path, kind: str, empty_ok: bool = False) -> tuple:
+    """L756 B3 (#566): les jobs d'une entrée `full_suite` — un nom d'affichage,
+    ou « nom * » pour une famille de matrice (le préfixe est suivi d'un
+    espace : `psycopg *` couvre `psycopg 1/4`, et `tests` n'attrape pas les
+    check runs `tests (flux) …`). « * » seul ou un `*` non final est refusé."""
+    if declared is None:
+        declared = ()
+    if isinstance(declared, str):
+        declared = (declared,)
+    if not isinstance(declared, (list, tuple)) or (not declared and not empty_ok):
+        raise SettingsError("%s.full_suite: %r: a non-empty list of %s job names expected"
+                            % (where, path, kind))
+    out = []
+    for raw in declared:
+        if not isinstance(raw, str) or not raw.strip():
+            raise SettingsError("%s.full_suite: %r: %s job names expected" % (where, path, kind))
+        name = raw.strip()
+        if name == "*" or ("*" in name and not name.endswith(" *")):
+            raise SettingsError("%s.full_suite: %r: %s job %r: a name, or \"name *\" for a "
+                                "matrix family, expected" % (where, path, kind, name))
+        if name in out:
+            raise SettingsError("%s.full_suite: %r: duplicate %s job %s"
+                                % (where, path, kind, name))
+        out.append(name)
+    return tuple(out)
 
 
 def parse_settings(raw) -> Settings:
@@ -243,14 +283,34 @@ def parse_settings(raw) -> Settings:
                 isinstance(p, str) and p.strip() for p in protected):
             raise SettingsError("%s.protected: a list of target globs expected" % where)
         declared_suite = value.get("full_suite") or ()
-        if isinstance(declared_suite, str):
+        if isinstance(declared_suite, (str, dict)):
             declared_suite = (declared_suite,)
-        if not isinstance(declared_suite, (list, tuple)) or not all(
-                isinstance(p, str) and p.strip() for p in declared_suite):
+        if not isinstance(declared_suite, (list, tuple)):
             raise SettingsError("%s.full_suite: a list of workflow files expected "
                                 "(e.g. .github/workflows/backend-suite.yml)" % where)
         full_suite = []
-        for path in declared_suite:
+        required_jobs = []
+        tolerated_jobs = []
+        for item in declared_suite:
+            jobs = ()
+            tolerated = ()
+            if isinstance(item, str):
+                path = item
+            elif isinstance(item, dict) and not set(item) - {"path", "jobs", "tolerate"}:
+                path = item.get("path")
+                jobs = _suite_jobs(item.get("jobs"), where, path, "required")
+                tolerated = _suite_jobs(item.get("tolerate", ()), where, path, "tolerated",
+                                        empty_ok=True)
+                both = sorted(set(jobs) & set(tolerated))
+                if both:
+                    raise SettingsError("%s.full_suite: %r: %s is both required and tolerated"
+                                        % (where, path, both[0]))
+            else:
+                raise SettingsError("%s.full_suite: a workflow file, or "
+                                    "{\"path\": file, \"jobs\": [names], \"tolerate\": [names]} "
+                                    "expected" % where)
+            if not isinstance(path, str) or not path.strip():
+                raise SettingsError("%s.full_suite: a workflow file path expected" % where)
             path = path.strip()
             if (not path.startswith(WORKFLOW_DIR) or not path.endswith((".yml", ".yaml"))
                     or any(part in ("", ".", "..") for part in path.split("/"))):
@@ -259,6 +319,10 @@ def parse_settings(raw) -> Settings:
             if path in full_suite:
                 raise SettingsError("%s.full_suite: duplicate workflow %s" % (where, path))
             full_suite.append(path)
+            if jobs:
+                required_jobs.append((path, jobs))
+            if tolerated:
+                tolerated_jobs.append((path, tolerated))
         gates = always
         if land != "off" and not (gates or by_path):
             raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
@@ -289,7 +353,9 @@ def parse_settings(raw) -> Settings:
                                  generated=tuple(generated), path_gates=tuple(by_path),
                                  ci_required=ci_required,
                                  protected=tuple(p.strip() for p in protected),
-                                 full_suite=tuple(full_suite))
+                                 full_suite=tuple(full_suite),
+                                 full_suite_required=tuple(required_jobs),
+                                 full_suite_tolerated=tuple(tolerated_jobs))
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -936,6 +1002,27 @@ def _run_jobs(gh, run: dict, slug: str) -> list:
     return out
 
 
+def _job_matches(required: str, job_name: str) -> bool:
+    """L756 B3 (#566): a declared job name matches exactly; a trailing " *"
+    declares a matrix family — the name, a space, then the rendered values
+    (`psycopg *` covers `psycopg 1/4`). No other wildcard, so `tests` never
+    catches the flow check runs `tests (flux) …`."""
+    if required.endswith(" *"):
+        prefix = required[:-2]
+        return job_name == prefix or job_name.startswith(prefix + " ")
+    return job_name == required
+
+
+def _suite_jobs_of(project, path: str, attribute: str):
+    """The jobs a declared suite entry names for `path`, or `None` — a bare
+    path entry declares no required jobs (all of them are required) and none
+    tolerated."""
+    for declared_path, jobs in getattr(project, attribute, ()) or ():
+        if declared_path == path:
+            return tuple(jobs)
+    return None
+
+
 def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
     """L756 (#566): une exécution de la suite complète **déclarée** par le
     projet, verte, sur `sha`, jobs compris.
@@ -944,12 +1031,19 @@ def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
     projet la déclare par ses fichiers (`radar.projects.<p>.full_suite`),
     résolus en identités de workflow. Chacune doit avoir, sur le commit exact,
     une exécution `push` ou `workflow_dispatch` terminée, de conclusion
-    `success`, dont **tous les jobs** sont terminés et verts — un job
-    `skipped`, `neutral` ou illisible ne certifie rien, et une suite déclarée
-    qui n'a pas tourné n'est jamais verte (le plan impacté d'une PR, lui, ne
-    compte jamais). Rend `{runs, suites, green, pending, failed, missing}` ;
-    une lecture impossible lève `plan_github.GithubError`, jamais « pas de
-    suite complète »."""
+    `success`. Une entrée `{path = …, jobs = […], tolerate = […]}` nomme les
+    **jobs requis** : chacun doit exister et être vert, toutes ses instances de
+    matrice comprises (`psycopg *` couvre `psycopg 1/4`, `psycopg 2/4`, … ;
+    sans `*` le nom est exact) ; les autres jobs doivent être `success` ou
+    `skipped` — un job sauté par conception (`if:` sur l'événement ou les
+    chemins) ne bloque jamais, et un job **toléré** (`tolerate`, le `bilan des
+    impactés` en `continue-on-error`) ne certifie ni ne bloque. Une entrée
+    réduite au chemin exige **tous** les jobs (`skipped`, `neutral` ou
+    illisible ne certifient rien). Une suite déclarée qui n'a pas tourné n'est
+    jamais verte
+    (le plan impacté d'une PR, lui, ne compte jamais). Rend `{runs, suites,
+    green, pending, failed, missing}` ; une lecture impossible lève
+    `plan_github.GithubError`, jamais « pas de suite complète »."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
@@ -1012,11 +1106,41 @@ def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
         if (run.get("conclusion") or "").lower() != "success":
             failed.append(name)
             continue
-        for job_name, status, conclusion in _run_jobs(gh, run, slug):
+        required = _suite_jobs_of(project, path, "full_suite_required")
+        tolerated = () if required is None else (
+            _suite_jobs_of(project, path, "full_suite_tolerated") or ())
+        jobs = _run_jobs(gh, run, slug)
+        if required is None:
+            # entrée sans jobs déclarés : tous les jobs de l'exécution sont requis
+            for job_name, status, conclusion in jobs:
+                if status != "completed":
+                    pending.append("%s/%s" % (name, job_name))
+                elif conclusion != "success":
+                    failed.append("%s/%s" % (name, job_name))
+            continue
+        seen = dict.fromkeys(required, 0)
+        for job_name, status, conclusion in jobs:
+            hit = next((req for req in required if _job_matches(req, job_name)), None)
+            if hit is None:
+                if any(_job_matches(tol, job_name) for tol in tolerated):
+                    # toléré : sa conclusion ne certifie ni ne bloque
+                    if status != "completed":
+                        pending.append("%s/%s" % (name, job_name))
+                    continue
+                # job non requis : vert ou sauté par conception, jamais neutral
+                if status != "completed":
+                    pending.append("%s/%s" % (name, job_name))
+                elif conclusion not in ("success", "skipped"):
+                    failed.append("%s/%s" % (name, job_name))
+                continue
+            seen[hit] += 1
             if status != "completed":
                 pending.append("%s/%s" % (name, job_name))
             elif conclusion != "success":
                 failed.append("%s/%s" % (name, job_name))
+        for req, count in seen.items():
+            if count == 0:
+                failed.append("%s/%s (required job missing)" % (name, req))
     return {"runs": len(latest), "suites": len(suites),
             "green": bool(latest) and len(latest) == len(suites) and not pending
             and not failed and not missing,

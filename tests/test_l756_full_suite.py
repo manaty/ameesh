@@ -15,6 +15,8 @@ dispatch docs-only, puis une suite aux jobs `skipped`, passaient pour verts).
 """
 from __future__ import annotations
 
+import json
+import pathlib
 import shutil
 import tempfile
 import unittest
@@ -46,6 +48,21 @@ def _job(name="tests", conclusion="success", status="completed"):
 def _gh(rows, jobs=None, workflows=None):
     return _Gh(rows, workflows=[_wf()] if workflows is None else workflows,
                jobs={"911": [_job()]} if jobs is None else jobs)
+
+
+#: Fixture brute : `gh run view 38350245246 --repo manaty/ameesh --json jobs`
+#: (poussée `release/v1.10.0`, 27 jobs), non retouchée — sa première ligne
+#: nomme la commande et le run ; les témoins mutent des copies, jamais le
+#: fichier (B3, R2 auditeur de PR manaty/ameesh#633).
+FIXTURE = (pathlib.Path(__file__).resolve().parent / "fixtures"
+           / "l756-run-38350245246-jobs.txt")
+
+
+def _release_run_jobs():
+    """Les jobs de la fixture brute (mêmes noms d'affichage que l'API)."""
+    body = "".join(line for line in FIXTURE.read_text(encoding="utf-8").splitlines(True)
+                   if not line.startswith("#"))
+    return json.loads(body)["jobs"]
 
 
 class FullSuiteReaderTest(unittest.TestCase):
@@ -98,6 +115,112 @@ class FullSuiteReaderTest(unittest.TestCase):
         self.assertEqual(len(views), 1)
         self.assertIn("--repo", views[0])
         self.assertEqual(views[0][views[0].index("--repo") + 1], "o/ameesh")
+
+    def test_a_job_skipped_by_design_does_not_block_a_declared_suite(self):
+        # B3 (auditeur, R2 de PR manaty/ameesh#633, 12:58) : la forme réelle de
+        # tests.yml en push — « version number » (if: pull_request) et
+        # « lecteurs de la doc » (docs-only) sont skipped par conception ; ce
+        # sont les jobs requis qui prouvent la suite, pas « tous les jobs ».
+        project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,),
+                                full_suite_required=((WF, ("plan", "psycopg *", "psql *",
+                                                           "plateforme macOS", "tests")),),
+                                full_suite_tolerated=((WF, ("bilan des impactés",)),))
+        jobs = {"911": _release_run_jobs()}
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh([_row()], jobs=jobs))
+        self.assertTrue(out["green"], out)
+        # la politique « tous les jobs » (entrée réduite au chemin) refuse la
+        # même exécution : le B3 est reproduit, puis fermé par la déclaration.
+        strict = radar.full_suite_ci(self.project, "a" * 40, gh=_gh([_row()], jobs=jobs))
+        self.assertEqual((strict["green"], strict["failed"]),
+                         (False, ["tests/lecteurs de la doc", "tests/version number"]))
+        # sans astérisque, un requis ne couvre pas ses instances de matrice
+        exact = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,),
+                              full_suite_required=((WF, ("plan", "psycopg", "tests")),))
+        out = radar.full_suite_ci(exact, "a" * 40, gh=_gh([_row()], jobs=jobs))
+        self.assertFalse(out["green"])
+        self.assertIn("tests/psycopg (required job missing)", out["failed"])
+        # « tests » est exact : les check runs « tests (flux) … » du flux L161c
+        # (steps=0) ne le satisfont pas.
+        without_tests = [dict(job) for job in jobs["911"] if job["name"] != "tests"]
+        out = radar.full_suite_ci(project, "a" * 40,
+                                  gh=_gh([_row()], jobs={"911": without_tests}))
+        self.assertEqual((out["green"], out["failed"]),
+                         (False, ["tests/tests (required job missing)"]))
+
+    def test_a_tolerated_job_neither_certifies_nor_blocks(self):
+        # décision B3 (auditeur 12:58) : le « bilan des impactés » est documenté
+        # « never required » (EXPLOITATION §L161) et porte
+        # `continue-on-error: true` : sa conclusion ne certifie ni ne bloque, et
+        # son absence non plus. Un autre job non requis, lui, doit être vert ou
+        # sauté — une part de flux L161c rouge refuse la suite.
+        project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,),
+                                full_suite_required=((WF, ("plan",)),),
+                                full_suite_tolerated=((WF, ("bilan des impactés",)),))
+        jobs = _release_run_jobs()
+        bilan_red = [dict(job, conclusion="failure") if job["name"] == "bilan des impactés"
+                     else dict(job) for job in jobs]
+        self.assertTrue(radar.full_suite_ci(
+            project, "a" * 40, gh=_gh([_row()], jobs={"911": bilan_red}))["green"])
+        no_bilan = [dict(job) for job in jobs if job["name"] != "bilan des impactés"]
+        self.assertTrue(radar.full_suite_ci(
+            project, "a" * 40, gh=_gh([_row()], jobs={"911": no_bilan}))["green"])
+        flux_red = [dict(job, conclusion="failure")
+                    if job["name"] == "tests (flux) psql 1/6" else dict(job) for job in jobs]
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh([_row()], jobs={"911": flux_red}))
+        self.assertEqual((out["green"], out["failed"]),
+                         (False, ["tests/tests (flux) psql 1/6"]))
+
+    def test_required_jobs_must_exist_and_be_green(self):
+        project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,),
+                                full_suite_required=((WF, ("plan", "tests")),))
+        # un job requis sauté ne certifie rien (#876 : skipped vaut success pour
+        # un check requis — le piège que la porte refuse)
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh(
+            [_row()], jobs={"911": [_job("plan"), _job("tests", "skipped")]}))
+        self.assertEqual((out["green"], out["failed"]), (False, ["tests/tests"]))
+        # un job requis absent est un refus, jamais un vert
+        out = radar.full_suite_ci(project, "a" * 40,
+                                  gh=_gh([_row()], jobs={"911": [_job("plan")]}))
+        self.assertEqual((out["green"], out["failed"]),
+                         (False, ["tests/tests (required job missing)"]))
+        # une conclusion nulle (job encore en cours) : jamais vert
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh(
+            [_row()], jobs={"911": [_job("plan"), _job("tests", None, "in_progress")]}))
+        self.assertEqual((out["green"], out["pending"]), (False, ["tests/tests"]))
+        # un nom qui ne fait que commencer pareil ne compte pas (« tests-extra »)
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh(
+            [_row()], jobs={"911": [_job("plan"), _job("tests-extra")]}))
+        self.assertEqual((out["green"], out["failed"]),
+                         (False, ["tests/tests (required job missing)"]))
+        # une seule part de matrice rouge refuse la suite (« psycopg * »)
+        matrix_project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,),
+                                       full_suite_required=((WF, ("plan", "psycopg *")),))
+        matrix = [dict(job, conclusion="failure") if job["name"] == "psycopg 2/4"
+                  else dict(job) for job in _release_run_jobs()]
+        out = radar.full_suite_ci(matrix_project, "a" * 40,
+                                  gh=_gh([_row()], jobs={"911": matrix}))
+        self.assertEqual((out["green"], out["failed"]), (False, ["tests/psycopg 2/4"]))
+        # une famille sans aucune correspondance est un requis absent, donc rouge
+        no_matrix = [dict(job) for job in _release_run_jobs()
+                     if not job["name"].startswith("psycopg ")]
+        out = radar.full_suite_ci(matrix_project, "a" * 40,
+                                  gh=_gh([_row()], jobs={"911": no_matrix}))
+        self.assertEqual((out["green"], out["failed"]),
+                         (False, ["tests/psycopg * (required job missing)"]))
+
+    def test_a_non_required_job_is_success_or_skipped_only(self):
+        project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF,),
+                                full_suite_required=((WF, ("plan",)),))
+        base = [_job("plan")]
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh(
+            [_row()], jobs={"911": base + [_job("lint", "neutral")]}))
+        self.assertEqual((out["green"], out["failed"]), (False, ["tests/lint"]))
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh(
+            [_row()], jobs={"911": base + [_job("lint", "skipped")]}))
+        self.assertTrue(out["green"], out)
+        out = radar.full_suite_ci(project, "a" * 40, gh=_gh(
+            [_row()], jobs={"911": base + [_job("lint", None, "in_progress")]}))
+        self.assertEqual((out["green"], out["pending"]), (False, ["tests/lint"]))
 
     def test_a_missing_declared_suite_is_never_green(self):
         project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF, OTHER))
