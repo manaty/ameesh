@@ -317,7 +317,7 @@ test (three messages → three notifications) caught the bug.
   the interruption and its reason.
 * **Session rotation (0018)**: when the session exceeds
   `AMEESH_SESSION_MAX_TOKENS` (default 150,000) or a turn lasted more than
-  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 900 s), after at least
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3,600 s), after at least
   `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**, a
   summary turn is played in the session, the summary is written to the thread
   (R12), the old session id is kept in
@@ -329,6 +329,12 @@ test (three messages → three notifications) caught the bug.
   within the bound, states the cut. An empty final answer (for Codex: the
   agent's last message empty) is not a summary: the rotation is
   cancelled, and the account cutover uses the deterministic brief (L39).
+  The latency threshold has a floor of **twice the effective turn cap**
+  (`turn_max_seconds`, the agent's own setting included): a turn allowed to
+  last 1,800 s does not, by itself, make the session be forgotten; a higher
+  explicitly configured threshold is kept, and with no turn cap
+  (`turn_max_seconds=0`) the configured threshold applies alone
+  ([EXPLOITATION.md](EXPLOITATION.md#plafonds-pendant-le-tour-l105)).
   The size is read
   from the usage in each harness's stream (keys normalized by
   `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
