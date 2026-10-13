@@ -380,9 +380,13 @@ def _required_ci(project, sha: str, commit_ci=None) -> None:
 def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
     """L756 (#566): a release lot certifies its frozen head with a **full
     suite** run — a push or a manual dispatch, never the impacted-only plan of
-    a pull request, and never the empty check of a version-only PR. QueueError
-    otherwise (no run, running, red, unreadable); `full_ci` reads the runs
-    (`radar.full_suite_ci` by default when the project has a GitHub repo)."""
+    a pull request, and never the empty check of a version-only PR. The suite
+    is the one the project **declares** (`radar.projects.<p>.full_suite`,
+    workflow files resolved to identities): each declared workflow must have
+    run on the exact head, green, its jobs included (`skipped`/`neutral`/unread
+    jobs certify nothing). QueueError otherwise (no run, running, missing, red,
+    unreadable); `full_ci` reads the runs (`radar.full_suite_ci` by default
+    when the project has a GitHub repo)."""
     from . import plan_github, radar
     who = "lot #%s" % lot if lot is not None else "this lot"
     reader = full_ci
@@ -404,6 +408,10 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
     if runs.get("pending"):
         raise QueueError("the full suite on the frozen head %s is still running (%s)"
                          % (sha[:12], ", ".join(runs["pending"])))
+    if runs.get("missing"):
+        raise QueueError("%s is class release: the declared full suite did not run on the "
+                         "frozen head %s (%s) — a green run of each declared workflow is "
+                         "required" % (who, sha[:12], ", ".join(runs["missing"])))
     if runs.get("failed"):
         raise QueueError("the full suite on the frozen head %s is red (%s)"
                          % (sha[:12], ", ".join(runs["failed"])))
