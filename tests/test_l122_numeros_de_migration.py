@@ -457,15 +457,16 @@ class ReservationsSimultaneesTest(PgTestCase):
             rows = self.db.query(
                 "SELECT count(*) AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
                 " AND datname = current_database()"
-                " AND query LIKE '%UPDATE work_items SET migration = greatest(%'")
+                " AND (query LIKE '%UPDATE work_items SET migration = greatest(%'"
+                " OR query LIKE '%:migration-repo:%')")
             if rows[0]["n"]:
                 return True
             time.sleep(0.05)
         return False
 
     def test_la_perdante_recalcule(self):
-        """A tient 377 sans avoir validé ; B lit le même maximum, tente 377,
-        attend sur l'index, échoue au commit de A et prend 378."""
+        """A tient 377 sans avoir validé ; B attend sur la réservation
+        (verrou dépôt #711, ou index), puis recalcule et prend 378."""
         for holder, other in [(h, o) for h in _drivers() for o in _drivers()]:
             with self.subTest(holder=holder, other=other):
                 self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL")
@@ -498,7 +499,7 @@ class ReservationsSimultaneesTest(PgTestCase):
                 self.assertTrue(held.wait(30))
                 tb = threading.Thread(target=reserve)
                 tb.start()
-                # B est réellement bloquée sur l'index avant que A ne valide
+                # B attend réellement la réservation de A avant son commit
                 self.assertTrue(self._blocked(), "B never waited on A's reservation")
                 done.set()
                 ta.join(30)

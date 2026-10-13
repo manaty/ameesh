@@ -24,6 +24,13 @@ class ScopedReservationsTest(PgTestCase):
         self.b = self.lot('b')
 
     def lot(self, name, app='nexlink'):
+        if app is None:
+            # Historical nullable app, before the current registry contract.
+            self.db.execute('ALTER TABLE work_items ALTER COLUMN app DROP NOT NULL')
+            def restore():
+                self.db.execute("UPDATE work_items SET app = '' WHERE app IS NULL")
+                self.db.execute('ALTER TABLE work_items ALTER COLUMN app SET NOT NULL')
+            self.addCleanup(restore)
         return work.add(self.db, title=name, issue_ref='manaty/nexlink#1', app=app, actor='mesh-design')
 
     def reserve(self, lot=None, slots=('schema',), **kw):
@@ -44,7 +51,7 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(first[0]['target'], {'repo': 'github.com/manaty/nexlink', 'branch': 'develop'})
         self.assertEqual(first[0]['targetSha'], self.sha)
         self.assertEqual(self.reserve(self.b)[0]['number'], 379)
-        self.assertEqual(self.reserve(self.lot('other', 'other'))[0]['number'], 377)
+        self.assertEqual(self.reserve(self.lot('other', 'other'))[0]['number'], 380)
         self.assertEqual(work.get(self.db, self.a['id'])['migration'], None)
         self.assertIsInstance(first[0]['id'], int)
 
@@ -174,6 +181,7 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(reservations.listing(self.db, self.a['id']), [])
 
     def test_concurrent_batches_are_disjoint_and_contiguous(self):
+        self.db.execute('UPDATE work_items SET app = %s WHERE id = %s', ('other', self.b['id']))
         barrier = threading.Barrier(2)
         results, errors = [], []
         def allocate(lot):
@@ -194,6 +202,109 @@ class ScopedReservationsTest(PgTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         self.assertEqual(sorted([r['number'] for r in batch] for batch in results), [[377, 378], [379, 380]])
+
+    def test_legacy_null_target_and_project_protect_named_allocator(self):
+        legacy = self.lot('legacy unknown project', None)
+        work.reserve_migration(self.db, legacy['id'], 377, repo=self.repo)
+        self.assertEqual(self.reserve()[0]['number'], 378)
+        work.set_branch(self.db, legacy['id'], 'agent/legacy', target='develop', actor='dev')
+        self.db.execute('UPDATE work_items SET app = %s WHERE id = %s', ('nexlink', legacy['id']))
+        self.assertEqual(reservations.listing(self.db, legacy['id'])[0]['number'], 377)
+
+    def test_upgrade_null_target_and_project_reservations_protect_named_allocator(self):
+        legacy = self.lot('legacy without project', None)
+        work.reserve_migration(self.db, legacy['id'], 377, repo=self.repo)
+        self.db.execute('TRUNCATE work_migration_reservations RESTART IDENTITY')
+        migration = next(m for m in migrations.discover() if m.name == 'migration_reservation_slots')
+        self.db.script(migration.sql)
+        self.assertEqual(self.reserve()[0]['number'], 378)
+
+    def test_unknown_legacy_target_cannot_take_named_number(self):
+        self.reserve()
+        legacy = self.lot('legacy without project', None)
+        with self.assertRaises(DbError):
+            work.reserve_migration(self.db, legacy['id'], 377, repo=self.repo)
+        self.assertIsNone(work.get(self.db, legacy['id'])['migration'])
+        # A pre-0419 client writes the old projection without a repo lock.
+        # The compatibility guard still refuses the duplicate atomically.
+        with self.assertRaises(DbError) as refused:
+            self.db.execute('UPDATE work_items SET migration = 377 WHERE id = %s', (legacy['id'],))
+        self.assertEqual(refused.exception.sqlstate, '23505')
+        self.assertEqual(refused.exception.constraint, 'work_migration_reservations_active_idx')
+        self.assertIsNone(work.get(self.db, legacy['id'])['migration'])
+
+    def test_reservation_after_landing_recognizes_arrival_before_explicit_landed(self):
+        self.reserve()
+        self.advance('377_schema.sql')
+        self.assertEqual(self.reserve(self.b)[0]['number'], 378)
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+        self.assertEqual(self.reserve(action='landed')[0]['status'], 'landed')
+
+    def test_stale_clone_never_releases_newer_reservation(self):
+        old = self.sha
+        newer = self.advance('376_more.sql')
+        first = self.reserve()[0]
+        _git(self.repo, 'update-ref', 'refs/heads/develop', old)
+        self.sha = old
+        self.assertEqual(self.reserve(self.b)[0]['number'], 378)
+        self.assertEqual(reservations.listing(self.db, self.a['id']), [first])
+        with self.assertRaisesRegex(work.WorkError, 'descend'):
+            self.reserve()
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['targetSha'], newer)
+
+    def test_reservation_and_landed_race_share_one_lifecycle(self):
+        self.reserve()
+        self.advance('377_schema.sql')
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def run(lot, action):
+            conn = self.connect()
+            try:
+                barrier.wait(timeout=10)
+                results.append(reservations.update(conn, lot['id'], ['schema'], repo=self.repo,
+                                                   target_branch='develop', target_sha=self.sha,
+                                                   action=action, actor='dev'))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+        threads = [threading.Thread(target=run, args=(self.a, 'landed')),
+                   threading.Thread(target=run, args=(self.b, 'reserve'))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+        self.assertEqual(reservations.listing(self.db, self.b['id'])[0]['number'], 378)
+
+    def test_named_and_unknown_legacy_reservations_serialize_before_lot_rows(self):
+        _git(self.repo, 'branch', '-D', 'unrelated')
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def run(named):
+            conn = self.connect()
+            try:
+                barrier.wait(timeout=10)
+                if named:
+                    number = reservations.update(conn, self.a['id'], ['schema'], repo=self.repo,
+                                                 target_branch='develop', target_sha=self.sha, actor='dev')[0]['number']
+                else:
+                    number = work.reserve_migration(conn, self.b['id'], repo=self.repo)['migration']
+                results.append(number)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+        threads = [threading.Thread(target=run, args=(named,)) for named in (True, False)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [377, 378])
 
     def test_cli_json_list_and_legacy_output_compatible(self):
         args = ('work', 'migration', str(self.a['id']))
