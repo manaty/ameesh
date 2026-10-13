@@ -41,12 +41,23 @@ L233: the chat also shows decisions that agents wrote in prose in mail to
 bureau or to the human (`decisions.prose_decisions`, listed by `ameesh
 decisions`) and offers to have them filed as requests by their author
 (`ameesh decide ask --from-mail <id>`); the chat itself never files one.
+
+L480: between two messages of the human, the chat must not stay blind. When
+the input and the output are a terminal, the launcher lends it to the harness
+through a pty (`serve_pty`) and a bounded watch (`Veille`) reads the pending
+decisions of the human and the mail that would open a turn; when something
+new arrives, it serves one short `[veille ameesh] …` line into the session,
+as if the human had typed it, and the harness presents it. The watch never
+answers anything, never arms without a terminal (`--no-veille` refuses it),
+and the process anchoring of `decisions.chat_session` is untouched: the
+harness stays a child of the `ameesh chat` process.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import pty
 import queue
 import re
 import signal
@@ -71,6 +82,15 @@ STATE_SCHEMA = "ameesh-chat/1"
 #: canal NOTIFY de la conversation (L78) et canal des changements de bail
 CHANNEL_CHAT = "ameesh_chat"
 CHANNEL_LEASE = config_mod.CHANNEL_LEASE
+#: L480 : la veille du chat, la ligne qu'elle sert dans la session, ses bornes
+VEILLE_PREFIX = "[veille ameesh]"
+VEILLE_EVERY_S = 30.0
+VEILLE_MIN_INTERVAL_S = 120.0
+VEILLE_IDLE_S = 3.0
+VEILLE_MAX_DEFER_S = 900.0
+#: bornes de la période demandée par `--veille-every`
+VEILLE_EVERY_MIN_S = 5.0
+VEILLE_EVERY_MAX_S = 3600.0
 
 
 def is_chat_agent(row: dict | None) -> bool:
@@ -641,6 +661,364 @@ def client_run(cfg: Config, args, *, db=None, out=None, err=None, chain=None,
 
 
 # --------------------------------------------------------------------------
+# L480 : la veille — décisions et courrier servis entre deux messages
+# --------------------------------------------------------------------------
+
+def _count(n: int, singular: str, plural: str) -> str:
+    return "1 %s" % singular if n == 1 else "%d %s" % (n, plural)
+
+
+def _short_age(seconds: float) -> str:
+    """Un âge court : « 45s », « 12m », « 3h »."""
+    seconds = int(max(0.0, seconds))
+    if seconds >= 3600:
+        return "%dh" % (seconds // 3600)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds
+
+
+def veille_line(pending: list[dict], seen_decisions: set, inbox: list[dict],
+                seen_mail: set, *, human: str = "", now: float | None = None) -> str | None:
+    """La ligne à servir dans la session, ou None : les décisions et le
+    courrier que `seen_*` ne connaît pas encore, en une phrase courte.
+
+    Elle demande de PRÉSENTER, jamais de répondre : `$human` seul tranche
+    (§« Enregistrer une réponse » de la consigne)."""
+    from . import mail as mail_mod
+    now = time.time() if now is None else float(now)
+    new_decisions = [d for d in pending if int(d["id"]) not in seen_decisions]
+    new_mail = [m for m in inbox if int(m["id"]) not in seen_mail]
+    if not new_decisions and not new_mail:
+        return None
+    bits = []
+    if new_decisions:
+        urgent = sum(1 for d in new_decisions
+                     if d.get("urgent") or d.get("overdue")
+                     or (d.get("due_ts") is not None
+                         and float(d["due_ts"]) - now <= 3600.0))
+        text = _count(len(new_decisions), "nouvelle décision", "nouvelles décisions")
+        if urgent:
+            text += " (dont %s)" % _count(
+                urgent, "urgente ou à échéance proche", "urgentes ou à échéance proche")
+        oldest = min(float(d.get("created_ts") or now) for d in new_decisions)
+        if now - oldest >= 60.0:
+            text += ", la plus ancienne il y a %s" % _short_age(now - oldest)
+        bits.append(text)
+    if new_mail:
+        urgent = sum(1 for m in new_mail if mail_mod.is_urgent(m))
+        text = _count(len(new_mail), "nouveau courrier", "nouveaux courriers")
+        if urgent:
+            text += " (dont %s)" % _count(urgent, "urgent", "urgents")
+        bits.append(text)
+    who = " à %s" % human if human else ""
+    return "%s %s — lance `ameesh decisions`, présente-les%s, puis le courrier." % (
+        VEILLE_PREFIX, " et ".join(bits), who)
+
+
+class Veille:
+    """L480 : la veille d'une session de chat.
+
+    Un fil lit la base — décisions en attente adressées à `human`, courrier
+    non lu qui ouvrirait un tour pour `name` — et retient la ligne à servir ;
+    le proxy du terminal (`serve_pty`) la sert quand `$human` ne tape pas. La
+    première lecture est un repère : les décisions et le courrier déjà là sont
+    ceux du démarrage, que la consigne fait présenter au premier tour.
+
+    Bornes : une lecture par `every` (aucune sonde de CI), rien tant que rien
+    n'est nouveau, deux services espacés d'au moins `min_interval`, et pas
+    d'écriture dans les `idle` secondes qui suivent une frappe — au-delà de
+    `max_defer`, on sert quand même : une session occupée ne doit pas affamer
+    la veille.
+    """
+
+    def __init__(self, cfg: Config, human: str, name: str, *, every: float = VEILLE_EVERY_S,
+                 min_interval: float = VEILLE_MIN_INTERVAL_S, idle: float = VEILLE_IDLE_S,
+                 max_defer: float = VEILLE_MAX_DEFER_S, now=time.monotonic,
+                 connect=None, log=None):
+        self.cfg, self.human, self.name = cfg, human, name
+        self.every, self.min_interval = float(every), float(min_interval)
+        self.idle, self.max_defer = float(idle), float(max_defer)
+        self.now, self.connect = now, connect
+        self.log = log or (lambda text: print("ameesh chat: %s" % text, file=sys.stderr,
+                                              flush=True))
+        self._lock = threading.Lock()
+        self._seen_decisions: set[int] = set()
+        self._seen_mail: set[int] = set()
+        self._baseline = False
+        self._text: str | None = None
+        self._text_at: float | None = None
+        self._last_human = 0.0
+        self._last_served: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def observe(self, pending: list[dict], inbox: list[dict],
+                *, wall: float | None = None) -> str | None:
+        """Une lecture : met à jour les repères, retient la ligne s'il y a du
+        nouveau (la première lecture ne sert rien)."""
+        wall = time.time() if wall is None else float(wall)
+        with self._lock:
+            ids = {int(d["id"]) for d in pending}
+            mids = {int(m["id"]) for m in inbox}
+            if not self._baseline:
+                self._baseline = True
+                self._seen_decisions, self._seen_mail = ids, mids
+                return None
+            text = veille_line(pending, self._seen_decisions, inbox, self._seen_mail,
+                               human=self.human, now=wall)
+            self._seen_decisions, self._seen_mail = ids, mids
+            if text:
+                self._text, self._text_at = text, self.now()
+            return text
+
+    def note_human(self, now: float | None = None) -> None:
+        """`$human` vient de taper : on ne lui écrit pas par-dessus."""
+        self._last_human = self.now() if now is None else float(now)
+
+    def due(self, now: float | None = None) -> str | None:
+        """La ligne à servir maintenant, ou None (rien de nouveau, frappe
+        récente, ou deux services trop rapprochés). Passé `max_defer` depuis
+        l'arrivée de la nouvelle, on sert quand même : une session occupée ne
+        doit pas affamer la veille."""
+        now = self.now() if now is None else float(now)
+        with self._lock:
+            text = self._text
+            if not text:
+                return None
+            age = now - (self._text_at if self._text_at is not None else now)
+            if age < self.max_defer:
+                if now - self._last_human < self.idle:
+                    return None
+                if self._last_served is not None \
+                        and now - self._last_served < self.min_interval:
+                    return None
+            self._text, self._text_at = None, None
+            self._last_served = now
+            return text
+
+    def pending_text(self) -> str | None:
+        with self._lock:
+            return self._text
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="chat-veille", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _loop(self) -> None:
+        from . import db as db_mod
+        from . import decisions, mail
+        try:
+            db = (self.connect or db_mod.connect)(self.cfg)
+        except Exception as exc:  # noqa: BLE001 — la veille ne casse jamais la session
+            self.log("veille off: database unreachable (%s)" % exc)
+            return
+        try:
+            while not self._stop.wait(self.every):
+                try:
+                    self.observe(decisions.pending(db, human=self.human),
+                                 mail.unread_active(db, self.name))
+                except Exception as exc:  # noqa: BLE001 — on réessaiera au tour suivant
+                    self.log("veille: reading decisions and mail failed (%s)" % exc)
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------
+# L480 : le terminal prêté au harnais, la veille servie entre deux frappes
+# --------------------------------------------------------------------------
+
+def _isatty(stream) -> bool:
+    try:
+        return bool(stream) and stream.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def veille_armed(args, *, popen=None) -> bool:
+    """La veille s'arme-t-elle pour ce lancement ? Un terminal des deux côtés
+    (entrée et sortie), pas d'injection de `popen` (tests), et `--no-veille`
+    la refuse."""
+    if popen is not None or getattr(args, "veille", None) is False:
+        return False
+    return _isatty(sys.stdin) and _isatty(sys.stdout)
+
+
+def _winsize(fd) -> bytes:
+    import struct
+    size = os.get_terminal_size(fd)
+    return struct.pack("HHHH", size.lines, size.columns, 0, 0)
+
+
+def _copy_winsize(src_fd, dst_fd) -> None:
+    import fcntl
+    import termios
+    try:
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, _winsize(src_fd))
+    except (OSError, ValueError):
+        pass
+
+
+def _own_tty() -> None:
+    """Dans l'enfant (`preexec_fn`) : le pty devient son terminal de contrôle,
+    pour que Ctrl-C et le redimensionnement visent le harnais. Un échec ne
+    casse pas le lancement : le harnais tourne alors sans terminal de
+    contrôle."""
+    import fcntl
+    import termios
+    try:
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    except OSError:
+        pass
+
+
+def _drain(master, stdout_fd) -> None:
+    """Vide ce que le harnais a écrit avant de mourir : sa dernière sortie
+    n'est pas perdue."""
+    import select
+    while True:
+        try:
+            ready, _, _ = select.select([master], [], [], 0.2)
+        except (OSError, ValueError):
+            return
+        if not ready:
+            return
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            return
+        if not data:
+            return
+        try:
+            os.write(stdout_fd, data)
+        except OSError:
+            return
+
+
+def serve_pty(proc, master, *, veille=None, stdin_fd=None, stdout_fd=None,
+              poll: float = 0.2) -> None:
+    """Prête le terminal à `proc` (attaché au pty `master`) tout en laissant la
+    veille écrire dans la session entre deux frappes.
+
+    Les frappes vont au maître du pty, la sortie du harnais revient sur la
+    sortie réelle ; `Ctrl-C` est un octet relayé, que le harnais traite comme
+    dans son terminal. Le mode brut du terminal est rendu à la sortie, quoi
+    qu'il arrive."""
+    import select
+    import termios
+    import tty
+    if stdin_fd is None:
+        stdin_fd = sys.stdin.fileno()
+    if stdout_fd is None:
+        stdout_fd = sys.stdout.fileno()
+    saved = None
+    try:
+        try:
+            saved = termios.tcgetattr(stdin_fd)
+            tty.setraw(stdin_fd)
+        except (termios.error, OSError, ValueError):
+            saved = None  # pas un terminal (tests, tube) : on relaie quand même
+        resized = threading.Event()
+        stopped = threading.Event()
+
+        def on_winch(_signum, _frame):
+            resized.set()
+
+        def on_stop(_signum, _frame):
+            stopped.set()
+        previous: dict = {}
+        for sig, handler in ((signal.SIGWINCH, on_winch), (signal.SIGTERM, on_stop),
+                             (signal.SIGHUP, on_stop)):
+            try:
+                previous[sig] = signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass  # hors du fil principal (tests) : pas de signaux
+        try:
+            open_stdin = True
+            while not stopped.is_set():
+                watch = [master] + ([stdin_fd] if open_stdin else [])
+                try:
+                    ready, _, _ = select.select(watch, [], [], poll)
+                except (OSError, ValueError):
+                    break
+                now = time.monotonic()
+                if resized.is_set():
+                    resized.clear()
+                    _copy_winsize(stdin_fd, master)
+                if stdin_fd in ready:
+                    data = os.read(stdin_fd, 4096)
+                    if not data:
+                        open_stdin = False  # entrée fermée : la sortie continue
+                    else:
+                        try:
+                            os.write(master, data)
+                        except OSError:
+                            break
+                        if veille is not None:
+                            veille.note_human(now)
+                if master in ready:
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    try:
+                        os.write(stdout_fd, data)
+                    except OSError:
+                        break
+                if veille is not None:
+                    text = veille.due(now=now)
+                    if text:
+                        try:
+                            os.write(master, ("\r" + text + "\r").encode("utf-8"))
+                        except OSError:
+                            break
+                if proc.poll() is not None:
+                    break
+            _drain(master, stdout_fd)
+        finally:
+            for sig, ancien in previous.items():
+                try:
+                    signal.signal(sig, ancien)
+                except (ValueError, OSError):
+                    pass
+    finally:
+        if saved is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved)
+
+
+def _kill_group(proc) -> None:
+    """Le harnais d'une session pty vit dans sa propre session : on ne le
+    laisse pas orphelin quand le lanceur s'arrête."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+# --------------------------------------------------------------------------
 # lancement
 # --------------------------------------------------------------------------
 
@@ -685,6 +1063,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would be launched (or shown, with an agent); "
                              "launch nothing, write nothing")
+    # L480 : la veille de la session (décisions et courrier entre deux messages)
+    parser.add_argument("--veille", dest="veille", action="store_true", default=None,
+                        help="watch the pending decisions and the new mail while the "
+                             "session is open and have the harness present them without "
+                             "waiting for a message (default: on with a terminal)")
+    parser.add_argument("--no-veille", dest="veille", action="store_false",
+                        help="do not watch decisions and mail during the session")
+    parser.add_argument("--veille-every", type=float, default=VEILLE_EVERY_S, metavar="S",
+                        help="veille period in seconds (%g-%g, default %g)"
+                             % (VEILLE_EVERY_MIN_S, VEILLE_EVERY_MAX_S, VEILLE_EVERY_S))
     # L79 : options du client terminal (`ameesh chat <agent>`)
     parser.add_argument("--after", type=int, default=None, metavar="SEQ",
                         help="start at this conversation sequence")
@@ -756,6 +1144,13 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
                   % (name, decisions.CHAT_ENV, name, decisions.CHAT_PID_ENV, pid))
             print("pending decisions for %s: %d" % (human, len(waiting)))
             print("decisions written in prose in mail (not requests): %d" % len(prose))
+            if args.veille is False:
+                print("veille: off (--no-veille)")
+            elif veille_armed(args, popen=popen):
+                print("veille: on with the terminal, decisions and mail every %gs"
+                      % args.veille_every)
+            else:
+                print("veille: off (no terminal on input and output)")
             return 0
         row = storage.of(db).decisions.register_chat(
             name, human=human, host=cfg.host, harness=args.harness, cwd=cwd,
@@ -777,17 +1172,56 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
               "; %d decision(s) written in prose in mail, to convert" % len(prose)
               if prose else ""), flush=True)
     code = 1
+    proc, master, veille = None, None, None
+    if args.veille and not veille_armed(args, popen=popen):
+        print("ameesh chat: --veille needs a terminal on input and output; the "
+              "session runs without it", file=sys.stderr)
     try:
-        proc = (popen or subprocess.Popen)(command, cwd=cwd, env=env)
+        slave = None
+        if veille_armed(args, popen=popen):
+            try:
+                master, slave = pty.openpty()
+                _copy_winsize(sys.stdin.fileno(), slave)
+                veille = Veille(cfg, human, name, every=args.veille_every)
+            except OSError as exc:
+                print("ameesh chat: veille off (%s)" % exc, file=sys.stderr)
+                if slave is not None:
+                    os.close(slave)
+                if master is not None:
+                    os.close(master)
+                master, slave, veille = None, None, None
+        if veille is not None:
+            # le harnais vit dans sa propre session, sur le pty : ses
+            # permissions restent interactives, Ctrl-C et la taille le visent
+            proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=slave,
+                                    stdout=slave, stderr=slave, start_new_session=True,
+                                    preexec_fn=_own_tty)
+            os.close(slave)
+        else:
+            proc = (popen or subprocess.Popen)(command, cwd=cwd, env=env)
         # Ctrl-C est pour le harnais au premier plan, pas pour ce lanceur
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
-            code = proc.wait()
+            if veille is not None:
+                veille.start()
+                serve_pty(proc, master, veille=veille)
+                code = proc.wait()
+            else:
+                code = proc.wait()
         finally:
             signal.signal(signal.SIGINT, previous)
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         print("ameesh chat: cannot launch: %s" % exc, file=sys.stderr)
     finally:
+        if veille is not None:
+            veille.stop()
+        if master is not None:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        if veille is not None and proc is not None and proc.poll() is None:
+            _kill_group(proc)
         remove_session(path)
     return code
 
@@ -813,6 +1247,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.poll <= 0:
         print("ameesh chat: --poll must be positive", file=sys.stderr)
+        return 2
+    if not VEILLE_EVERY_MIN_S <= args.veille_every <= VEILLE_EVERY_MAX_S:
+        print("ameesh chat: --veille-every must be between %g and %g seconds"
+              % (VEILLE_EVERY_MIN_S, VEILLE_EVERY_MAX_S), file=sys.stderr)
+        return 2
+    if getattr(args, "agent", None) and args.veille is not None:
+        print("ameesh chat: --veille belongs to the chat session (`ameesh chat` without "
+              "an agent); the terminal client follows the conversation", file=sys.stderr)
         return 2
     from . import db as db_mod
     try:

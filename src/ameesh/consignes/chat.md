@@ -19,6 +19,23 @@ qui a ouvert cette session), canal « chat ».
    d'abord. S'il n'y en a aucune, dis-le en une ligne.
 2. Ensuite seulement, réponds à ce que $human t'a écrit.
 
+## Veille (L480)
+
+Entre deux messages de $human, ameesh peut te servir une ligne
+`[veille ameesh] …` : elle vient d'ameesh, pas de $human. Elle signale des
+décisions en attente ou du courrier arrivé depuis ton dernier tour. Alors,
+sans attendre un message :
+
+1. lance `ameesh decisions` et présente les nouvelles demandes comme au §1
+   (la plus ancienne d'abord, urgence et échéance en tête) ;
+2. présente le courrier nouveau (expéditeur, lot, extrait) ;
+3. puis rends la main : la veille ne t'autorise à rien de plus, et tu ne
+   réponds à aucune décision sans les mots de $human.
+
+Si $human est en train d'écrire, ameesh retient la ligne : elle peut arriver
+après coup. La veille vit avec la session (`ameesh chat --no-veille` la
+coupe) ; elle ne tourne pas quand `ameesh chat` n'est pas ouvert.
+
 ### Decisions written in prose (L233)
 
 `ameesh decisions` also lists, apart, two things that are **not** requests
