@@ -954,7 +954,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                      if r.get("created_ts")), default=None)
     targets: dict = {}
     declared: dict = {}                      # #746 : le dépôt déclare sa cible ?
-    candidates: dict = {}                    # #746 : refs d'intégration du dépôt
+    candidates: dict = {}                    # #746 : (dépôt, cible) → refs d'intégration
     implicits: dict = {}                     # #746 : branche implicite, une fois par lot
     tips: dict = {}                          # #746 : (dépôt, branche) → pointe
     hashes: dict = {}
@@ -1012,9 +1012,11 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 if repo not in declared:
                     declared[repo] = bool(declared_target(repo))
                 primary, explicit = targets[repo], declared[repo]
-            if repo not in candidates:
-                candidates[repo] = target_candidates(repo, primary)
-            off_refs = candidates[repo]
+            # #990 : la liste dépend de la cible primaire, propre au lot — un
+            # cache par dépôt la figerait pour les lots suivants
+            if (repo, primary) not in candidates:
+                candidates[(repo, primary)] = target_candidates(repo, primary)
+            off_refs = candidates[(repo, primary)]
             # une cible déclarée ne ferme jamais ailleurs : les refs hors
             # cible n'y sont examinées que pour signaler le résidu
             to_try = [(primary, False, True)]
