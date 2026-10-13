@@ -85,7 +85,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
                  "host_not_ready", "host_power_low",
-                 "host_unavailable", "host_drain_overdue", "backlog_empty", "mail_undeliverable",
+                 "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
@@ -166,6 +166,7 @@ TYPE_LABELS = {
     "decision_pending": "decision pending",
     "decision_overdue": "decision unanswered by its deadline",
     "host_unavailable": "host unavailable",
+    "lease_not_taken": "runner cannot take its lease",
     "host_drain_overdue": "host drain overdue",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
