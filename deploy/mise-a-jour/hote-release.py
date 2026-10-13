@@ -61,8 +61,8 @@ def module(name):
 
 
 def execute(request):
-    # Called only from the root-owned immutable installed runtime with -I.
-    if os.geteuid()!=0 or Path(sys.executable)!=RUNTIME or not sys.flags.isolated:
+    # Called only from the root-owned immutable installed runtime with -I -B.
+    if os.geteuid()!=0 or Path(sys.executable)!=RUNTIME or not sys.flags.isolated or not sys.flags.dont_write_bytecode:
         raise HostError('independent root runtime required')
     trusted(RUNTIME)
     trusted(Path(__file__))

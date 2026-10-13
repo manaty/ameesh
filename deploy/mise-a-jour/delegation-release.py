@@ -22,6 +22,14 @@ _spec.loader.exec_module(restart)
 WRAPPER = '/usr/local/libexec/ameesh-release-ssh'
 DISPATCHER = '/opt/ameesh-release/lib/hote-release.py'
 RUNTIME = '/opt/ameesh-release/runtime/bin/python'
+DIRECTORIES={
+    '/opt/ameesh-release':0o755,'/etc/ameesh-release':0o755,
+    '/etc/ameesh-release/operations':0o700,'/usr/local/libexec':0o755,
+    '/etc/sudoers.d':0o750,'/etc/ssh/sshd_config.d':0o755,
+    '/var/lib/ameesh-release':0o755,'/var/lib/ameesh-release/controller':0o700,
+    '/var/lib/ameesh-release/helper':0o700,'/var/lib/ameesh-release/bootstrap':0o700,
+    '/var/lib/ameesh-release/ssh':0o755,
+}
 
 
 class DelegationError(ValueError):
@@ -60,10 +68,13 @@ def validate(plan):
         raise DelegationError('invalid delegation enrollment') from None
 
 
-def render(plan):
+def render(plan, *, account_ids=None,previous_files=None):
     """Return exact install/revoke inventory; this function has no host effects."""
     plan = json.loads(json.dumps(plan))
     validate(plan)
+    if account_ids is not None and (not isinstance(account_ids,dict) or set(account_ids)!={'uid','gid'}
+            or any(type(account_ids[name]) is not int or not 100<=account_ids[name]<=60000 for name in ('uid','gid'))):
+        raise DelegationError('exact account numeric identity required')
     forced = '''#!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
 set -eu
@@ -71,11 +82,11 @@ if [ "$#" -ne 0 ] || [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
     printf '%s\\n' '{"error":"host_action_unavailable"}'
     exit 1
 fi
-exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+RUNTIME+' -I '+DISPATCHER+'\n'
+exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+RUNTIME+' -I -B '+DISPATCHER+'\n'
     sudo = ('# SPDX-License-Identifier: AGPL-3.0-only\n'
             'Defaults:ameesh-release env_reset,!setenv\n'
             'Defaults:ameesh-release secure_path="/usr/bin:/bin"\n'
-            'ameesh-release ALL=(root) NOPASSWD: '+RUNTIME+' -I '+DISPATCHER+'\n')
+            'ameesh-release ALL=(root) NOPASSWD: '+RUNTIME+' -I -B '+DISPATCHER+'\n')
     keys = ('restrict,from="'+plan['controller_source']+'",command="'+WRAPPER+'" '
             +plan['controller_key']+'\n')
     sshd = ('# SPDX-License-Identifier: AGPL-3.0-only\n'
@@ -101,8 +112,18 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+
             ('/etc/ssh/sshd_config.d/60-ameesh-release.conf',0o600,sshd)):
         files[path] = dict(owner='root',group='root',mode=mode,content=content,
                           sha256=hashlib.sha256(content.encode()).hexdigest())
+    if previous_files is None:
+        previous_files={path:None for path in files}
+    if not isinstance(previous_files,dict) or set(previous_files)!=set(files):
+        raise DelegationError('exact previous file inventory required')
+    for info in previous_files.values():
+        if info is not None and (not isinstance(info,dict) or set(info)!={'sha256','mode'}
+                or not isinstance(info['sha256'],str) or not re.fullmatch(r'[0-9a-f]{64}',info['sha256'])
+                or type(info['mode']) is not int or not 0<=info['mode']<=0o777 or info['mode'] & 0o022):
+            raise DelegationError('exact protected previous file required')
     review = dict(version=1,host=plan['host'],machine_id=plan['machine_id'],
-            plan=plan,policy_id=restart.policy_id(plan['policy']),files=files,
+            plan=plan,policy_id=restart.policy_id(plan['policy']),files=files,previous_files=previous_files,
+            directories=dict(DIRECTORIES),services=dict(ssh_reload='sshd.service',controller='ameesh-release-controller.service'),
             account=dict(name='ameesh-release',system=True,shell='/bin/sh',
                          supplementary_groups=[],password_login=False),
             prerequisites=[
@@ -119,7 +140,9 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+
             revoke=dict(remove_only_matching_sha256={path:item['sha256'] for path,item in files.items()},
                         preserve=['runtime','helper sources','database','enrollment','operations',
                                   'controller journal','helper journal','live release fences'],
-                        action='Administrator revokes controller key, verifies effective SSH configuration, then removes only exact matching delegation files. Changed files require a separate reviewed diff.'))
+                        action='Administrator restores only signed previous-file snapshots, or removes newly created files, while current contents match this exact delegation. Revoke the controller key first and verify effective SSH configuration. Changed files require a separate reviewed diff.'))
+    if account_ids is not None:
+        review['account'].update(account_ids)
     return dict(review, digest=restart.protocol.identity(review))
 
 
@@ -127,7 +150,8 @@ def question(bundle):
     """Prepare signed-decide text; do not send it or claim it was approved."""
     if not isinstance(bundle,dict) or 'digest' not in bundle:
         raise DelegationError('review bundle required')
-    expected = render(bundle['plan'])
+    numeric = {key:bundle['account'][key] for key in ('uid','gid') if key in bundle['account']}
+    expected = render(bundle['plan'],account_ids=numeric or None,previous_files=bundle.get('previous_files'))
     if restart.protocol.identity(bundle) != restart.protocol.identity(expected):
         raise DelegationError('review bundle changed')
     return ('Approve prepared root SSH/sudo delegation on '+bundle['host']+

@@ -134,7 +134,7 @@ class SSHRestartTransport:
             raise TransportError('invalid SSH transport policy')
         for name in ('known_hosts', 'identity_file'):
             if (not isinstance(value[name], str) or not value[name].startswith('/')
-                    or not re.fullmatch(r'/[A-Za-z0-9/_.-]+', value[name])
+                    or not re.fullmatch(r'/[A-Za-z0-9/_.~-]+', value[name])
                     or '..' in Path(value[name]).parts):
                 raise TransportError('invalid enrolled SSH path')
         if hashlib.sha256(protected_file(value['known_hosts'])).hexdigest() != value['known_hosts_sha256']:

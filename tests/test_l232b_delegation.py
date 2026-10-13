@@ -45,7 +45,7 @@ class DelegationTest(unittest.TestCase):
         bundle = delegation.render(self.plan)
         sudo = bundle['files']['/etc/sudoers.d/ameesh-release']['content']
         self.assertEqual([line for line in sudo.splitlines() if 'NOPASSWD:' in line],
-            ['ameesh-release ALL=(root) NOPASSWD: /opt/ameesh-release/runtime/bin/python -I /opt/ameesh-release/lib/hote-release.py'])
+            ['ameesh-release ALL=(root) NOPASSWD: /opt/ameesh-release/runtime/bin/python -I -B /opt/ameesh-release/lib/hote-release.py'])
         self.assertNotIn('*',sudo)
         self.assertIn('env_reset,!setenv',sudo)
         self.assertNotIn('systemctl',sudo)

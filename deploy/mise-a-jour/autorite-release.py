@@ -75,6 +75,11 @@ class SignedDecisionAuthority:
         now = self.clock()
         if now >= expires:
             return False
+        return self._proof_live(view, now)
+
+    def _proof_live(self, view, now):
+        """Shared proof check after a subclass verifies its exact signed scope."""
+        answer = view.get('answer') or {}
         if not decisions.verify_proof(self.db, view)[0]:
             return False
         proof = answer['proof']

@@ -317,23 +317,89 @@ the same wrapper. Account settings disable forwarding, TTY, user rc and alternat
 password/interactive authentication. The wrapper refuses arguments and any
 `SSH_ORIGINAL_COMMAND`, then clears the environment before the fixed sudo call.
 The sudo grant names only the immutable interpreter with the exact isolated
-dispatcher arguments; it grants no shell, systemctl or arbitrary Python program.
+dispatcher arguments with `-I -B`; it grants no shell, systemctl or arbitrary
+Python program. The dispatcher requires both isolated mode and disabled bytecode
+writes, preserving the pinned runtime/source inventory during startup.
 
 `question(bundle)` prepares reviewable signed-decide text including the complete
 digest-bound inventory and revocation plan. It does not send a question or
-authorize root execution. The proposed revocation removes only exact matching
-delegation files and preserves runtime, private operation/helper/controller
+authorize root execution. The proposed revocation restores only approved prior
+snapshots or removes exact newly created delegation files and preserves runtime, private operation/helper/controller
 journals, credentials and live release fences. Changed files require a separately
 reviewed diff. Revoking SSH access does not fabricate completion or reopen claims.
 
-This is a preparation component, **not the completed bootstrap installer**.
-An administrator still must establish the dedicated account, verify the full
-immutable runtime/source closure and host identity, install private enrollment,
-validate effective sudo/SSH configuration and arrange the independent service
-before enabling the key. The initial system account, runtime-copy verification,
-installation script with snapshots/undo and service/full adapter remain build
-work. Tests verify the deterministic inventory, digest binding, input refusals
-and wrapper rejection paths without executing sudo or a host action.
+The renderer remains a preparation component. It now accepts exact numeric
+account ids and a protected prior-file digest/mode inventory; absent declarations
+mean files must not already exist. Directory modes and SSH/controller service
+references enter the review digest. Rendering performs no installation.
+
+## Signed bootstrap and administrator host adapter
+
+`bootstrap-release.py` supplies a separate owner-signed bootstrap scope. Its
+compact question binds operation, host/machine-id, exact uid/gid, host key,
+controller key/network, runtime/source trees, file/prior-file inventories,
+directories, services, revocation and action scopes. The full immutable review
+bundle must be available beside that question; its digest binds the contents
+while the question stays within `decide`'s 4000-character limit. No question is
+sent. Only a signed `install` counts; current owner key, execution deadline,
+consumed nonce and the captured original approval signature/expiry are rechecked
+using the same proof validator as the release adapter. Account scope is recomputed
+from exact machine-id/operation/uid/gid; tree scopes name fixed destinations.
+
+The durable sequence is preflight → layout → runtime → sources → account →
+configuration → validate → enable. A reservation excludes another unresolved
+bootstrap; exact intents precede effects. Lost replies reconcile their original
+effects. Expiry/failure preserves reservations and receipts. Key activation is
+last. The separately signed `revoke` action is not part of installation.
+
+`installateur-bootstrap.py.BootstrapHostAdapter` connects the concrete
+tree/account/file primitives. Inputs are staged under the fixed administrator
+path `/var/lib/ameesh-release-bootstrap/OPERATION/` as `runtime` and `sources`,
+never a transport-selected path. `LinuxHost` requires root, checks machine-id and
+the SHA-256 of the SSH Ed25519 host-key wire blob, uses fixed directory/account
+commands, and validates sudo syntax and effective SSH settings before reloading
+the fixed `sshd.service`. Revocation validates/reloads the restored settings.
+The service alias, SSH drop-in inclusion and public-key login behavior must be
+verified on an admitted host. Journal directories are private; the root-owned
+SSH home is searchable without account write access.
+
+`runtime-release.py` inventories bytes and executable modes with explicit
+byte/entry limits (128 MiB and 20000 entries per tree by default). Symlinks,
+hardlinks, special files, unsafe modes/ownership, read races and low disk capacity
+fail admission. A private intent precedes copy, fsync, read-only modes and atomic
+rename. Changed inputs or partial stages remain for inspection. A rename followed
+by a lost receipt replays its own verified tree without a second copy or needing
+the original staging source. Unowned destinations are never overwritten.
+Authority is checked after slow reads/copy and before publication/replay.
+This pins supplied trees, **not completeness of external Python/ELF dependencies**;
+independently pinned immutable toolchain closure remains an administrator admission
+prerequisite. Tests use synthetic executable bytes, not a production interpreter.
+
+`compte-release.py` creates the dedicated group/account with exact numeric ids,
+no home creation or supplementary groups, a fixed forced-command shell and an
+impossible password sentinel. Shadow values are not persisted. Group/user intents
+precede commands; lost replies reconcile exact observed identities. A missing
+identity after an ambiguous command is not recreated. Existing unrelated numeric
+ids/accounts, changed shell/groups/password status or revoked authority hold the
+bootstrap. Undo never deletes an account.
+
+`fichiers-bootstrap.py` privately snapshots exact approved prior bytes/modes
+before replacement and rejects unreviewed existing files. Lost receipts reconcile
+actual installed contents. Revocation starts with the key, restores only approved
+snapshots or removes exact new files, and preserves external changes, runtime,
+account, credentials, journals and live fences. Authority is rechecked after the
+final file/readiness observations before each effect.
+
+Activation requires an active independent controller in `system.slice` and a
+root-private readiness receipt bound to host/enrollment, current boot/systemd
+invocation and verified read-only runtime/source trees. **The independent service
+and complete release adapter/readiness producer remain unfinished**, so the real
+backend holds before activation. There is no installed bootstrap CLI, automatic
+root executor or runtime/credential enrollment. No real root/account/SSH/systemd
+effect is executed by this work. Tests combine disposable filesystem copies with
+simulated accounts/services and synthetic real signatures on disposable PostgreSQL
+through both drivers. Authenticated host pilot and external toolchain admission
+remain required.
 
 ## Operation-specific code and environment recovery
 
