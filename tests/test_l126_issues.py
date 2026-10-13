@@ -54,6 +54,20 @@ class SettingsTest(unittest.TestCase):
         cfg = dataclasses.make_dataclass("Cfg", [("github", dict)])(github={})
         self.assertEqual(plan_github.settings_of(cfg), plan_github.Settings())
 
+    def test_workflows_declares(self):
+        """#1110 : les workflows suivis d'un dépôt se déclarent par projet."""
+        settings = plan_github.parse_settings({"projects": {"app": {
+            "repo": PRIVATE,
+            "workflows": [".github/workflows/backend-suite.yml", "sql-invariant.yaml",
+                          "backend-suite.yml"]}}})
+        self.assertEqual(settings.workflows_for(PRIVATE),
+                         ("backend-suite.yml", "sql-invariant.yaml"))
+        self.assertEqual(settings.workflows_for(PRIVATE.upper()), settings.workflows_for(PRIVATE))
+        self.assertIsNone(settings.workflows_for(PUBLIC))
+        self.assertIsNone(settings.workflows_for(""))
+        # forme courte : aucune liste déclarée, le veilleur découvre
+        self.assertIsNone(plan_github.parse_settings(SETTINGS).workflows_for(PUBLIC))
+
     def test_refus(self):
         for raw, needle in (
             ([], "JSON object"),
@@ -68,6 +82,11 @@ class SettingsTest(unittest.TestCase):
             ({"exclude_terms": "Globex"}, "list"),
             ({"exclude_terms": [""]}, "list"),
             ({"host": 3}, "host name"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": []}}}, "non-empty"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": "tests.yml"}}}, "non-empty"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": [""]}}}, "workflow file name"),
+            ({"projects": {"web": {"repo": PUBLIC, "workflows": ["tests.exe"]}}},
+             "not a workflow file name"),
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(plan_github.SettingsError) as ctx:

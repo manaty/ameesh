@@ -2809,8 +2809,10 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
-                 base: str, work_item_id: int | None, url: str | None) -> dict:
-        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
+                 base: str, work_item_id: int | None, url: str | None,
+                 workflow: str = "") -> dict:
+        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend.
+        `workflow` : le fichier de workflow qui l'a produite (#1110)."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:

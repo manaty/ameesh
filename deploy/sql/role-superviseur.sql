@@ -475,7 +475,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- est un CONTENU)
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
-        'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
+        'status', 'superseded_by', 'url', 'workflow', 'first_seen_at', 'concluded_at',
         'urgent_message_id', 'verdict_message_id'
     ]),
     ('ci_test_failures', ARRAY[

@@ -225,16 +225,23 @@ class RoutageTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 class FauxApi:
-    """L'API GitHub vue par le relevé : exécutions en cours, état d'une
-    exécution, check runs d'une tête."""
+    """L'API GitHub vue par le relevé : workflows publiés par le dépôt
+    (découverte, #1110), exécutions en cours, état d'une exécution, check runs
+    d'une tête."""
 
     def __init__(self):
         self.live, self.queued, self.done, self.checks = [], [], {}, {}
+        #: fichiers de workflow que le dépôt publie (découverte #1110)
+        self.workflows = ["tests.yml"]
 
     def __call__(self, path):
         if "/actions/runs?" in path:
             return {"workflow_runs": list(self.queued if "status=queued" in path
                                           else self.live)}
+        if "/actions/workflows" in path:
+            return {"workflows": [item if isinstance(item, dict) else
+                                  {"path": ".github/workflows/%s" % item, "state": "active"}
+                                  for item in self.workflows]}
         if "/actions/runs/" in path:
             return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
         if "/check-runs" in path:
@@ -243,12 +250,20 @@ class FauxApi:
         raise AssertionError(path)
 
 
-def run_view(run_id, sha, branch, *, base="main", message=""):
+def run_view(run_id, sha, branch, *, base="main", message="", workflow="tests.yml",
+             attempt=1):
     return {"id": run_id, "head_sha": sha, "head_branch": branch, "event": "pull_request"
-            if branch != "main" else "push", "path": ".github/workflows/tests.yml",
+            if branch != "main" else "push", "path": ".github/workflows/%s" % workflow,
+            "run_attempt": attempt,
             "html_url": "https://github.com/%s/actions/runs/%d" % (DEPOT, run_id),
             "pull_requests": [{"base": {"ref": base}}] if branch != "main" else [],
             "head_commit": {"message": message}}
+
+
+def completed(path, conclusion, attempt=1):
+    """L'état GitHub d'une exécution conclue (relevé par `_conclude`)."""
+    return {"status": "completed", "conclusion": conclusion, "path": path,
+            "run_attempt": attempt}
 
 
 class WatcherTest(PgTestCase):
@@ -275,6 +290,10 @@ class WatcherTest(PgTestCase):
         return self.db.query(
             "SELECT id, kind, body, payload, work_item_id, delivered_at FROM agent_mailbox"
             " WHERE recipient = %s AND sender = %s ORDER BY id", (to, work.SYSTEM_SENDER))
+
+    def payload_of(self, message):
+        payload = message["payload"]
+        return payload if isinstance(payload, dict) else json.loads(payload)
 
     def test_pas_l_hote_designe(self):
         cfg = dataclasses.replace(self.cfg, github={"projects": {"ameesh": DEPOT},
@@ -520,6 +539,153 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([o["to"] for o in out], [None])
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 701)["work_item_id"], humain["id"])
+
+    # -- #1110 : workflows suivis par projet/dépôt ---------------------------
+    def test_workflows_decouverts_sans_tests_yml(self):
+        """Un dépôt sans `tests.yml` (nexlink) voit ses suites découvertes,
+        suivies, et l'auteur réveillé à la fin exacte du workflow."""
+        repo = "manaty/nexlink"
+        cfg = dataclasses.replace(self.cfg, github={"projects": {"nexlink": repo},
+                                                    "host": self.cfg.host})
+        api = FauxApi()
+        api.workflows = ["backend-suite.yml", "sql-invariant.yml"]
+        watcher = ci.Watcher(cfg, api=api)
+        sha = "9" * 40
+        api.live = [run_view(901, sha, "lot/1-un", workflow="backend-suite.yml")]
+        self.assertEqual(watcher.tick(self.db), [])
+        row = storage.of(self.db).ci.run(repo, 901)
+        self.assertEqual((row["workflow"], row["work_item_id"]),
+                         ("backend-suite.yml", self.lot["id"]))
+        api.live = []
+        api.done[901] = completed(".github/workflows/backend-suite.yml", "success")
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"], o["to"]) for o in out],
+                         [("verdict", "success", "dev-a")])
+        (message,) = self.mails("dev-a")
+        self.assertIn("(backend-suite.yml)", message["body"])
+        self.assertIn(": green.", message["body"])
+        payload = self.payload_of(message)["ci"]
+        self.assertEqual((payload["workflow"], payload["attempt"]),
+                         ("backend-suite.yml", 1))
+
+    def test_defaut_ameesh_tests_yml_seul(self):
+        """Un dépôt qui publie `tests.yml` garde le défaut L161 : ce seul
+        workflow, même quand d'autres sont actifs."""
+        self.api.workflows = ["tests.yml", "ui.yml"]
+        self.api.live = [run_view(910, "a" * 40, "lot/1-un", workflow="ui.yml"),
+                         run_view(911, "b" * 40, "lot/1-un", workflow="tests.yml")]
+        self.watcher.tick(self.db)
+        st = storage.of(self.db)
+        self.assertIsNone(st.ci.run(DEPOT, 910))
+        self.assertEqual(st.ci.run(DEPOT, 911)["workflow"], "tests.yml")
+
+    def test_liste_declaree_prime_sur_la_decouverte(self):
+        cfg = dataclasses.replace(self.cfg, github={
+            "projects": {"ameesh": {"repo": DEPOT, "workflows": ["backend-suite.yml"]}},
+            "host": self.cfg.host})
+        api = FauxApi()
+        api.workflows = ["backend-suite.yml", "website-suite.yml"]
+        watcher = ci.Watcher(cfg, api=api)
+        api.live = [run_view(920, "c" * 40, "lot/1-un", workflow="backend-suite.yml"),
+                    run_view(921, "d" * 40, "lot/1-un", workflow="website-suite.yml")]
+        watcher.tick(self.db)
+        st = storage.of(self.db)
+        self.assertEqual(st.ci.run(DEPOT, 920)["workflow"], "backend-suite.yml")
+        self.assertIsNone(st.ci.run(DEPOT, 921))
+
+    def test_workflow_declare_absent_et_desactive(self):
+        """Un workflow déclaré mais absent du dépôt est signalé une fois ; un
+        workflow désactivé n'est pas découvert."""
+        journal = []
+        cfg = dataclasses.replace(self.cfg, github={
+            "projects": {"ameesh": {"repo": DEPOT, "workflows": ["disparu.yml"]}},
+            "host": self.cfg.host})
+        api = FauxApi()
+        api.workflows = ["tests.yml", {"path": ".github/workflows/eteint.yml",
+                                       "state": "disabled_manually"}]
+        watcher = ci.Watcher(cfg, api=api, log=journal.append)
+        api.live = [run_view(930, "e" * 40, "lot/1-un", workflow="eteint.yml")]
+        watcher.tick(self.db)
+        watcher.tick(self.db)
+        self.assertEqual([line for line in journal if "disparu.yml" in line],
+                         ["CI %s: workflow(s) declared in github.projects but absent "
+                          "from the repository: disparu.yml" % DEPOT])
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 930))
+
+    def test_multi_workflows_meme_tete_statuts_et_verdicts(self):
+        """Deux workflows d'une même tête gardent chacun leur ligne ; le
+        verdict nomme la suite et les autres workflows encore en cours."""
+        api = self.api
+        api.workflows = ["backend-suite.yml", "website-suite.yml"]
+        sha = "f" * 40
+        api.live = [run_view(940, sha, "lot/1-un", workflow="backend-suite.yml"),
+                    run_view(941, sha, "lot/1-un", workflow="website-suite.yml")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        st = storage.of(self.db)
+        self.assertEqual((st.ci.run(DEPOT, 940)["status"], st.ci.run(DEPOT, 941)["status"]),
+                         ("running", "running"))
+        # backend-suite finit verte, website-suite tourne encore : pas de vert
+        # global prématuré, le verdict nomme la suite et l'autre workflow
+        api.live = [run_view(941, sha, "lot/1-un", workflow="website-suite.yml")]
+        api.done[940] = completed(".github/workflows/backend-suite.yml", "success")
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "success")])
+        (message,) = self.mails("dev-a")
+        self.assertIn("(backend-suite.yml)", message["body"])
+        self.assertIn("still running: website-suite.yml", message["body"])
+        # website-suite finit rouge : son verdict, une seule fois
+        api.live = []
+        api.done[941] = completed(".github/workflows/website-suite.yml", "failure")
+        api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=941)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("status")) for o in out],
+                         [("failures", None), ("verdict", "failure")])
+        mails = self.mails("dev-a")
+        self.assertEqual(len(mails), 3)  # urgent, verdict backend, verdict website
+        self.assertIn("(website-suite.yml)", mails[-1]["body"])
+        self.assertNotIn("still running", mails[-1]["body"])
+        # relire ne renvoie rien : ni doublon, ni rejeu
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 3)
+        report = ci.status_of(self.db, self.lot["id"])
+        self.assertEqual({run["workflow"] for run in report["runs"]},
+                         {"backend-suite.yml", "website-suite.yml"})
+        texte = "\n".join(ci.render_status(report))
+        self.assertIn("backend-suite.yml", texte)
+        self.assertIn("website-suite.yml", texte)
+
+    def test_nouvelle_tete_remplace_tous_les_workflows(self):
+        """Une poussée remplace les workflows de l'ancienne tête ; celui qui
+        conclut après coup n'envoie rien (pas de rejeu périmé)."""
+        api = self.api
+        api.workflows = ["backend-suite.yml", "website-suite.yml"]
+        old, new = "1" * 40, "2" * 40
+        api.live = [run_view(950, old, "lot/1-un", workflow="backend-suite.yml"),
+                    run_view(951, old, "lot/1-un", workflow="website-suite.yml")]
+        self.watcher.tick(self.db)
+        api.live = [run_view(952, new, "lot/1-un", workflow="backend-suite.yml")]
+        self.watcher.tick(self.db)
+        st = storage.of(self.db)
+        self.assertEqual(st.ci.run(DEPOT, 950)["status"], "superseded")
+        self.assertEqual(st.ci.run(DEPOT, 951)["status"], "superseded")
+        api.done[951] = completed(".github/workflows/website-suite.yml", "success")
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
+
+    def test_verdict_porte_l_attempt(self):
+        """Le verdict situe la suite et l'attempt relancé (#901, #1110)."""
+        self.api.workflows = ["backend-suite.yml"]
+        sha = "3" * 40
+        self.api.live = [run_view(960, sha, "lot/1-un", workflow="backend-suite.yml")]
+        self.watcher.tick(self.db)
+        self.api.live = []
+        self.api.done[960] = completed(".github/workflows/backend-suite.yml", "success",
+                                       attempt=2)
+        self.watcher.tick(self.db)
+        (message,) = self.mails("dev-a")
+        self.assertIn("(backend-suite.yml)", message["body"])
+        self.assertIn("attempt 2", message["body"])
+        self.assertEqual(self.payload_of(message)["ci"]["attempt"], 2)
 
 
 if __name__ == "__main__":
