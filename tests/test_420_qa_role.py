@@ -18,11 +18,13 @@ import io
 import json
 import sys
 import unittest
+import uuid
 from pathlib import Path
+from unittest import mock
 
 from tests import support  # noqa: F401  (isole la config de l'hôte avant les modules)
 from tests.support import PgTestCase
-from ameesh import canon_sync, db as db_mod, modules, storage, work
+from ameesh import canon_sync, config as config_mod, db as db_mod, identity, modules, storage, work
 from ameesh.modules import it
 from ameesh.modules.storage import ModuleStore
 
@@ -54,7 +56,13 @@ class QaDeclarationTest(unittest.TestCase):
             "types": ["release", "publication"], "states": ["promoted"],
             "subject_kind": "delivery", "evidence_kind": "qa", "evidence_verdict": "ok"})
         self.assertEqual(gated["types"], plain["types"])
-        self.assertEqual(gated["schemas"]["proof"], plain["schemas"]["proof"])
+        # R2 #420 (B3) : la porte QA n'a de sens que si la preuve est
+        # attribuable à un agent lié à son exécuteur ; le reste du schéma est
+        # inchangé.
+        self.assertEqual(gated["schemas"]["proof"],
+                         dict(plain["schemas"]["proof"], runner_bound_actor=True))
+        self.assertEqual(gated["schemas"]["qa"], plain["schemas"]["qa"])
+        self.assertEqual(gated["schemas"]["delivery"], plain["schemas"]["delivery"])
 
     def test_qa_schema_binds_the_delivery_and_declares_roles_and_duties(self):
         schema = modules.declarations(federation())[0]["schemas"]["qa"]
@@ -84,6 +92,33 @@ class QaDeclarationTest(unittest.TestCase):
     def test_both_qa_states_are_accepted(self):
         rule = modules.declarations(federation(require_qa=["merged", "promoted"]))[0]["rules"][-1]
         self.assertEqual(rule["states"], ["merged", "promoted"])
+
+
+class RequireBoundTest(unittest.TestCase):
+    """R2 #420 (N2) : une signature de droits exige une identité liée."""
+
+    def test_unbound_and_explicit_identities_are_refused(self):
+        cfg = config_mod.Config()
+        explicit = identity.Binding(name="qa-1", source="explicit", ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=explicit):
+            with self.assertRaisesRegex(ValueError, "not bound"):
+                identity.require_bound(cfg, None, what="the QA verdict")
+        unbound = identity.Binding(reason="AGENT_MAIL_NAME not set")
+        with mock.patch.object(identity, "resolve_binding", return_value=unbound):
+            with self.assertRaisesRegex(ValueError, "bound session identity.*AGENT_MAIL_NAME not set"):
+                identity.require_bound(cfg, None, what="the QA verdict")
+
+    def test_runner_and_session_bindings_are_accepted(self):
+        cfg = config_mod.Config()
+        runner = identity.Binding(name="qa-1", source="runner", runner_id="r", epoch=2, ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=runner):
+            self.assertEqual(identity.require_bound(cfg, None).name, "qa-1")
+        session = identity.Binding(name="qa-1", source="session", ok=True)
+        with mock.patch.object(identity, "resolve_binding", return_value=session):
+            self.assertEqual(identity.require_bound(cfg, None).name, "qa-1")
+        with mock.patch.object(identity, "resolve_binding", return_value=runner):
+            with self.assertRaisesRegex(ValueError, "not bound"):
+                identity.require_bound(cfg, None, sources=("session",))
 
 
 class RolesPersistenceTest(PgTestCase):
@@ -131,6 +166,15 @@ class RolesSyncTest(_CanonDbCase):
         self.sync()
         self.assertIsNone(self.roles())
 
+    def test_declared_roles_are_normalized_and_role_is_accepted(self):
+        """N1 (#420 R2) : `roles` est normalisé, `role` au singulier est lu."""
+        write(self.root, "agents/orchestre.md", card(roles=["QA", " qa ", "Relecture"]))
+        self.sync()
+        self.assertEqual(self.roles(), ["qa", "relecture"])
+        write(self.root, "agents/orchestre.md", card(role="Qa"))
+        self.sync()
+        self.assertEqual(self.roles(), ["qa"])
+
 
 class QaEvidenceTest(PgTestCase):
     """Rôle, projet, séparation des devoirs et porte, par le garde SQL."""
@@ -147,26 +191,54 @@ class QaEvidenceTest(PgTestCase):
         self.register("dev-1", roles=["implementation"], projects=["acme"])
         self.register("reviewer-1", roles=["relecture"], projects=["acme"])
 
-    def register(self, name, roles=None, projects=None, team=""):
+    def register(self, name, roles=None, projects=None, team="", runner_id=None, epoch=2):
         def param(values):
             return (None, None) if values is None else (json.dumps(values), json.dumps(values))
         roles_a, roles_b = param(roles)
         projects_a, projects_b = param(projects)
         self.db.execute(
-            "INSERT INTO agent_registry(name, team, roles, projects) VALUES "
+            "INSERT INTO agent_registry(name, team, roles, projects, lease_owner, lease_epoch) VALUES "
             "(%s, %s, CASE WHEN %s::jsonb IS NULL THEN NULL "
             "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END, "
             "CASE WHEN %s::jsonb IS NULL THEN NULL "
-            "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END) "
+            "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END, %s, %s) "
             "ON CONFLICT (name) DO UPDATE SET team = excluded.team, roles = excluded.roles, "
-            "projects = excluded.projects",
-            (name, team, roles_a, roles_b, projects_a, projects_b))
+            "projects = excluded.projects, lease_owner = excluded.lease_owner, "
+            "lease_epoch = excluded.lease_epoch",
+            (name, team, roles_a, roles_b, projects_a, projects_b,
+             "runner-%s" % name if runner_id is None else runner_id, epoch))
 
     def deliver(self, actor="dev-1"):
         return it.declare(self.db, self.lot, self.artifact, actor=actor)
 
-    def prove(self, actor="dev-1"):
-        return it.prove(self.db, self.lot, self.artifact, actor=actor, runner=sys.executable)
+    def prove(self, actor="dev-1", runner_id=None, epoch=2):
+        """Une preuve attribuable (R2 #420, B3) : l'agent, lié à son exécuteur."""
+        return it.prove(self.db, self.lot, self.artifact, actor=actor, runner=sys.executable,
+                        identity={"agent": actor,
+                                  "runner_id": runner_id or "runner-%s" % actor,
+                                  "lease_epoch": epoch})
+
+    def isolated_qa_role(self):
+        """Un rôle QA isolé, avec les seuls droits de `role-module-writers.sql`."""
+        role = "t_qa_writer_%s" % uuid.uuid4().hex[:8]
+        q = db_mod.quote_ident
+        self.db.execute("CREATE ROLE %s NOLOGIN" % q(role))
+        self.addCleanup(self.drop_role, role)
+        with self.db.transaction() as tx:
+            tx.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(role)))
+            tx.execute("GRANT SELECT ON work_items, project_modules, work_module_milestones "
+                       "TO %s" % q(role))
+            tx.execute("GRANT UPDATE (id) ON work_items TO %s" % q(role))
+            tx.execute("GRANT INSERT ON work_module_milestones TO %s" % q(role))
+            tx.execute("GRANT USAGE ON SEQUENCE work_module_milestones_id_seq TO %s" % q(role))
+            tx.execute("GRANT EXECUTE ON FUNCTION ameesh_module_agent(text) TO %s" % q(role))
+        return role
+
+    def drop_role(self, role):
+        q = db_mod.quote_ident
+        if self.db.query("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
+            self.db.execute("DROP OWNED BY %s" % q(role))
+            self.db.execute("DROP ROLE %s" % q(role))
 
     def current_delivery(self):
         return ModuleStore(self.db).latest(self.lot, "it", "delivery")
@@ -248,6 +320,46 @@ class QaEvidenceTest(PgTestCase):
         with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
             self.qa(actor="qa-1")
 
+    def test_a_proof_after_the_verdict_by_its_author_is_refused(self):
+        """R2 #420 (B3) : une preuve écrite APRÈS le verdict, par son auteur."""
+        self.deliver()
+        self.prove(actor="dev-1")
+        self.qa(actor="qa-1")
+        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
+            self.prove(actor="qa-1")
+
+    def test_the_gate_rechecks_the_separation_of_duties(self):
+        """R2 #420 (B3) : la porte revérifie la séparation, pas seulement l'écriture.
+
+        La preuve est insérée hors du garde (comme une ligne héritée ou une
+        course) : la promotion doit la refuser."""
+        self.deliver()
+        self.prove(actor="dev-1")
+        self.qa(actor="qa-1")
+        self.go_and_merge()
+        self.db.execute("ALTER TABLE work_module_milestones "
+                        "DISABLE TRIGGER ameesh_module_milestone_guard")
+        try:
+            self.prove(actor="qa-1")
+        finally:
+            self.db.execute("ALTER TABLE work_module_milestones "
+                            "ENABLE TRIGGER ameesh_module_milestone_guard")
+        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
+            work.move(self.db, self.lot, "promoted")
+
+    def test_a_qa_gated_proof_must_be_runner_bound(self):
+        """R2 #420 (B3) : sous `require_qa`, la preuve nomme l'agent lié."""
+        self.deliver()
+        with self.assertRaisesRegex(db_mod.DbError, "identity-required"):
+            it.prove(self.db, self.lot, self.artifact, actor="dev-1", runner=sys.executable)
+        with self.assertRaisesRegex(db_mod.DbError, "identity-unbound"):
+            it.prove(self.db, self.lot, self.artifact, actor="dev-1", runner=sys.executable,
+                     identity={"agent": "dev-1", "runner_id": "runner-other",
+                               "lease_epoch": 2})
+        proof = self.prove()
+        self.assertEqual(proof["payload"]["agent"], "dev-1")
+        self.assertEqual(proof["payload"]["runner_id"], "runner-dev-1")
+
     # -- porte et nouvelle livraison -------------------------------------
 
     def test_promotion_needs_a_current_ok_verdict(self):
@@ -268,6 +380,18 @@ class QaEvidenceTest(PgTestCase):
         with self.assertRaises(db_mod.DbError):
             work.move(self.db, self.lot, "promoted")
         self.qa()
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+
+    def test_ok_then_blocked_keeps_the_gate_closed(self):
+        """R2 #420 (B1) : c'est le DERNIER verdict qui décide, pas un ok ancien."""
+        self.deliver()
+        self.prove()
+        self.go_and_merge()
+        self.qa()  # ok
+        self.qa(verdict="blocked")
+        with self.assertRaises(db_mod.DbError):
+            work.move(self.db, self.lot, "promoted")
+        self.qa()  # un ok ultérieur rouvre la porte
         self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
 
     def test_a_new_declaration_invalidates_the_verdict_even_for_same_bytes(self):
@@ -319,8 +443,11 @@ class QaEvidenceTest(PgTestCase):
     def test_cli_records_the_verdict_and_its_scope(self):
         self.deliver()
         self.prove()
+        binding = identity.Binding(name="qa-1", source="runner", runner_id="runner-qa-1",
+                                   epoch=2, ok=True)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with mock.patch.object(identity, "require_bound", return_value=binding), \
+                contextlib.redirect_stdout(out):
             code = it.main(self.db, ["qa", str(self.lot), "--sha256",
                                      self.current_delivery()["subject"], "--verdict", "ok",
                                      "--scope", "install, login", "--report", "https://qa.test/cli"],
@@ -330,6 +457,43 @@ class QaEvidenceTest(PgTestCase):
         self.assertEqual(row["kind"], "qa")
         self.assertEqual(row["payload"]["scope"], ["install", "login"])
         self.assertEqual(row["payload"]["report"], "https://qa.test/cli")
+
+    def test_cli_signs_with_the_bound_session_not_the_declared_name(self):
+        """R2 #420 (N2) : le nom auto-déclaré ne signe pas à la place du bail."""
+        self.deliver()
+        self.prove()
+        binding = identity.Binding(name="qa-1", source="runner", runner_id="runner-qa-1",
+                                   epoch=2, ok=True)
+        with mock.patch.object(identity, "require_bound", return_value=binding), \
+                self.assertRaisesRegex(ValueError, "signed by the bound session"):
+            it.main(self.db, ["qa", str(self.lot), "--sha256",
+                              self.current_delivery()["subject"], "--verdict", "ok",
+                              "--report", "https://qa.test/impostor"], actor="qa-other")
+
+    # -- rôle QA isolé (R2 #420, B2) --------------------------------------
+
+    def test_isolated_qa_writer_records_the_verdict(self):
+        """Un rôle QA avec les seuls droits de `role-module-writers.sql`.
+
+        Le garde lit le registre par `ameesh_module_agent` (SECURITY DEFINER,
+        search_path figé) : une lecture directe `FOR SHARE` exigerait UPDATE
+        sur `agent_registry`, que ce rôle n'a pas (R2 #420, B2)."""
+        role = self.isolated_qa_role()
+        entries = modules.declarations(federation(require_qa=["promoted"]))
+        entries[0]["schemas"]["qa"]["writer_role"] = role
+        with self.db.transaction() as tx:
+            ModuleStore(tx).replace("", entries)
+        self.deliver()
+        self.prove()
+        delivery = self.current_delivery()
+        q = db_mod.quote_ident
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            row = it.record_qa(tx, self.lot, sha256=delivery["subject"], verdict="ok",
+                               scope=["install"], report="https://qa.test/isolated",
+                               actor="qa-1")
+        self.assertEqual(row["actor"], "qa-1")
+        self.assertEqual(row["payload"]["verdict"], "ok")
 
     # -- audit ------------------------------------------------------------
 

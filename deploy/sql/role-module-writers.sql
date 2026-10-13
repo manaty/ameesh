@@ -26,8 +26,13 @@ SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module
 SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('GRANT USAGE ON SEQUENCE %I.work_module_milestones_id_seq TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
--- The QA guard reads the actor's declared roles and projects under a share lock.
-SELECT format('GRANT SELECT ON %I.agent_registry TO ameesh_it_qa', :'schema') \gexec
+-- L244 (#420): the QA guard reads the actor's declared roles and projects
+-- under a share lock through ameesh_module_agent (SECURITY DEFINER, fixed
+-- search_path, migration 0427). The isolated role needs EXECUTE, not SELECT:
+-- FOR SHARE on agent_registry requires UPDATE, which it must not have.
+SELECT format('GRANT EXECUTE ON FUNCTION %I.ameesh_module_agent(text) TO ameesh_it_qa', :'schema')
+ WHERE EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = :'schema' AND p.proname = 'ameesh_module_agent') \gexec
 DO $audit$
 DECLARE r record;
 BEGIN

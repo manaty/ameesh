@@ -27,34 +27,40 @@ def descriptor(options=None):
     rules = [{"types": list(TYPES), "states": ["merged", "promoted"],
               "milestones": {"verdict": ["ok"]},
               "subject_kind": "delivery", "evidence_kind": "proof"}]
+    schemas = {
+        "delivery": {"strings": ["artifact", "sha256"], "subject_field": "sha256",
+                     "patterns": {"sha256": "^[0-9a-f]{64}$"}},
+        "proof": {"strings": ["artifact", "sha256", "output"],
+                  "arrays": ["command"], "equals": {"exit_code": 0},
+                  "subject_field": "sha256", "binding_kind": "delivery",
+                  "writer_role": "ameesh_it_proof",
+                  "patterns": {"sha256": "^[0-9a-f]{64}$"}},
+        "qa": {"strings": ["sha256", "verdict", "report"],
+               "arrays": ["scope"],
+               "patterns": {"sha256": "^[0-9a-f]{64}$", "verdict": "^(ok|blocked)$"},
+               "subject_field": "sha256", "binding_kind": "delivery",
+               "writer_role": "ameesh_it_qa",
+               # L244 : le verdict vient d'un porteur du rôle `qa`, distinct
+               # de l'assigne, de l'auteur de la livraison et de celui de la
+               # preuve (séparation des devoirs, refus `qa-same-actor`).
+               "actor_role": "qa",
+               "separation_of_duties": {"assignee": True, "declaration": True,
+                                        "evidence": "proof"}},
+    }
     if require_qa:
         # The gate reads the current delivery and demands a matching QA verdict
         # `ok`; a `blocked` verdict or an older delivery keeps it closed.
         rules.append({"types": list(TYPES), "states": list(require_qa),
                       "subject_kind": "delivery", "evidence_kind": "qa",
                       "evidence_verdict": "ok"})
+        # R2 #420 (B3) : la séparation d'avec l'auteur de la preuve n'a de sens
+        # que si la preuve est attribuable. L'assistant sudo écrivait
+        # `uid:<SUDO_UID>` : un projet gardé par `require_qa` exige donc une
+        # preuve signée par l'agent lié à son exécuteur.
+        schemas["proof"]["runner_bound_actor"] = True
     return {
         "types": list(TYPES),
-        "schemas": {
-            "delivery": {"strings": ["artifact", "sha256"], "subject_field": "sha256",
-                         "patterns": {"sha256": "^[0-9a-f]{64}$"}},
-            "proof": {"strings": ["artifact", "sha256", "output"],
-                      "arrays": ["command"], "equals": {"exit_code": 0},
-                      "subject_field": "sha256", "binding_kind": "delivery",
-                      "writer_role": "ameesh_it_proof",
-                      "patterns": {"sha256": "^[0-9a-f]{64}$"}},
-            "qa": {"strings": ["sha256", "verdict", "report"],
-                   "arrays": ["scope"],
-                   "patterns": {"sha256": "^[0-9a-f]{64}$", "verdict": "^(ok|blocked)$"},
-                   "subject_field": "sha256", "binding_kind": "delivery",
-                   "writer_role": "ameesh_it_qa",
-                   # L244 : le verdict vient d'un porteur du rôle `qa`, distinct
-                   # de l'assigne, de l'auteur de la livraison et de celui de la
-                   # preuve (séparation des devoirs, refus `qa-same-actor`).
-                   "actor_role": "qa",
-                   "separation_of_duties": {"assignee": True, "declaration": True,
-                                            "evidence": "proof"}},
-        },
+        "schemas": schemas,
         "rules": rules,
     }
 
@@ -81,7 +87,7 @@ def declare(db, item_id, artifact, *, actor):
 
 
 def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60, execution_user=None,
-          snapshot_root=None, snapshot_limits=None):
+          snapshot_root=None, snapshot_limits=None, identity=None, invoker=None):
     from .execution import execute
     from ..storage import ModuleStore
     item(db, item_id)
@@ -94,6 +100,13 @@ def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60
                        expected_sha=delivery["subject"], snapshot_limits=snapshot_limits)
     if evidence["sha256"] != delivery["subject"]:
         raise ValueError("executed artifact differs from the declared delivery")
+    # R2 #420 (B3) : l'identité liée de l'agent demandeur, pour que la preuve
+    # soit attribuable (la séparation des devoirs du verdict QA la compare) ;
+    # `invoker` garde la trace de l'uid qui a demandé l'exécution.
+    if identity:
+        evidence.update(identity)
+    if invoker:
+        evidence["invoker"] = invoker
     # The database rechecks this exact declaration under the item lock.
     return store.record(item_id, NAME, "proof", evidence["sha256"], evidence,
                         actor=actor, binding_id=delivery["id"])
@@ -151,15 +164,31 @@ def main(db, argv, *, actor):
     elif args.operation == "delivery":
         row = declare(db, args.lot, args.artifact, actor=actor)
     elif args.operation == "qa":
+        # L244 (N2 #420) : une signature de droits exige une identité liée
+        # (bail du runner, ou liaison de session L41), jamais un nom seulement
+        # auto-déclaré par `AGENT_MAIL_NAME`.
+        from ... import config as config_mod, identity
+        binding = identity.require_bound(config_mod.load(), db, what="the QA verdict")
+        if actor and actor != binding.name:
+            raise ValueError("the QA verdict is signed by the bound session %s, not %s"
+                             % (binding.name, actor))
         scope = [s.strip() for s in args.scope.split(",")]
         row = record_qa(db, args.lot, sha256=args.sha256, verdict=args.verdict,
-                        scope=scope, report=args.report, actor=actor)
+                        scope=scope, report=args.report, actor=binding.name)
     else:
+        from ... import config as config_mod, identity
         from .proof_service import request
         project_row = item(db, args.lot)
         project = project_row.get("app") or project_row.get("workstream") or ""
+        # R2 #420 (B3) : le helper sudo ne voyait que `uid:<SUDO_UID>` ; l'agent
+        # demandeur est lié à son exécuteur, et cette identité part avec la
+        # demande d'exécution pour rendre la preuve attribuable.
+        binding = identity.require_bound(config_mod.load(), db, what="the IT proof",
+                                         sources=("runner",))
         row = request(project, args.lot, args.artifact, runner=args.runner,
-                      arguments=arguments, timeout=args.timeout)
+                      arguments=arguments, timeout=args.timeout,
+                      identity={"agent": binding.name, "runner_id": binding.runner_id,
+                                "lease_epoch": binding.epoch})
     print(json.dumps(row, ensure_ascii=False, default=str))
     return 0
 
