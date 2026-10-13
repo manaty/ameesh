@@ -54,6 +54,13 @@ FIL_MAX_BYTES = 8000
 FIL_ENTRY_CHARS = 400
 LOTS_MAX = 40
 
+#: #538 : part qu'un texte accompagné de règles garde au plus du plafond. Le
+#: bloc de règles est réservé D'ABORD, le texte (résumé, brief préparé) est
+#: tronqué ensuite — jamais l'inverse, sinon un résumé plein fait disparaître
+#: les règles (verdict codex #510 r3, P2) ; mais les règles ne l'effacent pas
+#: pour autant : le texte plus court que cette part reste entier.
+BRIEF_TEXT_MIN_BYTES = BRIEF_MAX_BYTES // 4
+
 #: #538 : les règles de travail des fiches Process du canon ouvrent le brief
 #: (nouvelle session, rotation, reprise), avant le rôle et la consigne.
 PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
@@ -270,11 +277,19 @@ def _octets(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+#: #538 : marque de troncature ; sa place est comprise dans la borne de `_clip`.
+_CLIP_MARK = " […]"
+
+
 def _clip(text: str, limit: int) -> str:
+    """`text` borné à `limit` octets UTF-8, marque de troncature comprise."""
     data = text.encode("utf-8")
     if len(data) <= limit:
         return text
-    return data[: max(0, limit - 4)].decode("utf-8", "ignore") + " […]"
+    marge = len(_CLIP_MARK.encode("utf-8"))
+    if limit <= marge:
+        return data[: max(0, limit)].decode("utf-8", "ignore")
+    return data[: limit - marge].decode("utf-8", "ignore") + _CLIP_MARK
 
 
 def _rules_unreadable(charge) -> bool:
@@ -338,9 +353,18 @@ def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
 
 
 def _clip_rules(rules: str, place: int) -> str:
-    """Les règles coupées pour occuper `place` octets au plus (`_clip` ajoute
-    « […] », deux octets de plus que la limite demandée : on lui laisse la marge)."""
-    return _clip(rules, max(0, place - 2)) if _octets(rules) > place else rules
+    """Les règles coupées pour occuper `place` octets au plus (marque comprise)."""
+    return _clip(rules, place) if _octets(rules) > place else rules
+
+
+def _rules_bloc(rules: str, limit: int) -> str:
+    """#538 : le bloc de règles (en-tête, règles, pied) borné à `limit` octets,
+    ou "" quand l'en-tête et le pied n'y tiennent déjà pas."""
+    entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
+    place = limit - _octets(entete) - _octets(pied)
+    if place <= 6:
+        return ""
+    return entete + _clip_rules(rules, place) + pied
 
 
 def process_rules_block(cfg: Config, *, agent: str = "", canon_id: str | None = None,
@@ -356,38 +380,49 @@ def process_rules_block(cfg: Config, *, agent: str = "", canon_id: str | None = 
         rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
     except Exception:
         return ""
-    if not rules:
-        return ""
-    entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
-    place = limit - _octets(entete) - _octets(pied)
-    if place <= 6:
-        return ""
-    return entete + _clip_rules(rules, place) + pied
+    return _rules_bloc(rules, limit) if rules else ""
+
+
+def _join_without_rules(avant: str, apres: str) -> str:
+    """Deux morceaux de texte recollés après retrait d'un bloc de règles."""
+    avant, apres = avant.rstrip("\n"), apres.lstrip("\n")
+    return avant + "\n\n" + apres if avant and apres else avant + apres
 
 
 def _strip_process_rules(text: str) -> str:
-    """#538 : le texte sans le bloc de règles déjà posé (`text` peut l'avoir en
-    tête, ou après une note d'ameesh). Sans pied reconnaissable, le texte est
-    rendu tel quel : on ne coupe pas un bloc qu'on ne sait pas délimiter."""
-    debut = text.find(PROCESS_RULES_HEADER)
-    if debut < 0:
-        return text
-    fin = text.find(PROCESS_RULES_FOOTER, debut)
-    if fin < 0:
-        return text
-    avant = text[:debut].rstrip("\n")
-    apres = text[fin + len(PROCESS_RULES_FOOTER):].lstrip("\n")
-    if avant and apres:
-        return avant + "\n\n" + apres
-    return avant + apres
+    """#538 : le texte sans AUCUN bloc de règles déjà posé (`text` peut l'avoir
+    en tête, après une note d'ameesh, ou en porter plusieurs).
+
+    Un bloc délimité par le pied est retiré en entier. Un en-tête sans pied est
+    un bloc indélimitable : un texte forgé peut s'y faire passer pour les règles
+    du canon, il est donc retiré lui aussi (verdict codex #510 r3, P2) — jusqu'à
+    la prochaine section de premier niveau (`\\n## `) ou la fin, pour ne pas
+    emporter la consigne qui suit."""
+    out = text
+    while True:
+        debut = out.find(PROCESS_RULES_HEADER)
+        if debut < 0:
+            return out
+        fin = out.find(PROCESS_RULES_FOOTER, debut)
+        if fin >= 0:
+            coupe = fin + len(PROCESS_RULES_FOOTER)
+            out = _join_without_rules(out[:debut], out[coupe:])
+            continue
+        suite = out.find("\n## ", debut + len(PROCESS_RULES_HEADER))
+        out = _join_without_rules(out[:debut], out[suite:] if suite >= 0 else "")
 
 
 def with_process_rules(cfg: Config, text: str, *, agent: str = "",
                        canon_id: str | None = None, host: str = "") -> str:
     """#538 : ouvre `text` sur les règles du canon de `agent`, sans doubler ni
     couper la consigne. Un bloc déjà posé est RELU (une fiche retirée ne reste
-    pas dans un brief préparé) : les règles sont bornées pour tenir dans
-    `BRIEF_MAX_BYTES` avec le texte, la consigne prime toujours.
+    pas dans un brief préparé).
+
+    La place du bloc est réservée D'ABORD : le texte (résumé de rotation, brief
+    préparé) prend ce qui reste et se laisse tronquer, jamais les règles — un
+    résumé plein ne fait plus disparaître les règles en silence (verdict codex
+    #510 r3, P2). Le texte garde au plus `BRIEF_TEXT_MIN_BYTES` : les règles ne
+    l'effacent pas, la consigne d'un brief court reste entière.
 
     Ne lève jamais (revue codex #510 r1, P1)."""
     try:
@@ -395,11 +430,14 @@ def with_process_rules(cfg: Config, text: str, *, agent: str = "",
         rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
         if not rules:
             return corps
-        entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
-        place = BRIEF_MAX_BYTES - _octets(corps) - _octets(entete) - _octets(pied) - 2
-        if place <= 6:
+        garde = min(_octets(corps), BRIEF_TEXT_MIN_BYTES)
+        bloc = _rules_bloc(rules, BRIEF_MAX_BYTES - 2 - garde)
+        if not bloc:
             return corps
-        return entete + _clip_rules(rules, place) + pied + "\n\n" + corps
+        reste = BRIEF_MAX_BYTES - _octets(bloc) - 2
+        if _octets(corps) > reste:
+            corps = _clip(corps, reste)
+        return bloc + "\n\n" + corps if corps else bloc
     except Exception:
         return text
 
