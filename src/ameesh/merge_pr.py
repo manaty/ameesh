@@ -15,14 +15,15 @@ branche, checks requis).
 
 Le geste, et ses gardes (toutes vérifiées AVANT toute écriture) :
 
-1. **une seule identité de dépôt** (#1003 B/P1, R1 delta) : le checkout, le
-   `--repo` de la PR, `--fetch-url` et `--push-url` doivent désigner le MÊME
-   dépôt — clé `owner/repo` pour GitHub, chemin réel pour un transport local —
-   et le checkout doit porter cette identité (son `origin`). Une divergence,
-   ou une identité non vérifiable (pas d'`origin`, URL inconnue), refuse
-   avant la première lecture : depuis un clone de A, `--repo B` avec les
-   remotes de B ne peut pas faire admettre A par les conditions de B, ni
-   l'inverse ;
+1. **une seule identité de dépôt** (#1003 B/P1, R1 delta puis delta cx3) : le
+   checkout, le `--repo` de la PR, `--fetch-url` et `--push-url` doivent
+   désigner le MÊME dépôt — clé `owner/repo` pour GitHub, chemin réel pour un
+   transport local — et le checkout doit porter cette identité (son `origin`).
+   Les deux formes ne se mélangent pas : un transport local ne prouve pas une
+   clé GitHub (ni l'inverse), c'est le même refus. Une divergence, ou une
+   identité non vérifiable (pas d'`origin`, URL inconnue), refuse avant la
+   première lecture : depuis un clone de A, `--repo B` avec les remotes de B
+   ne peut pas faire admettre A par les conditions de B, ni l'inverse ;
 2. **le lot** (`--lot`, obligatoire) est le porteur de l'autorisation : il doit
    être gelé sur `--head` et porter un verdict de relecture `ok` sur ce même
    commit (classe lue par la file : un lot léger en est dispensé). C'est
@@ -107,6 +108,9 @@ _HTTPS = re.compile(r"^https?://", re.I)
 #: une URL qui porte des identifiants (`https://user:jeton@…`) : jamais
 #: affichée telle quelle, ni dans un constat ni dans une erreur
 _CREDENTIALS = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@")
+#: une clé GitHub nue `owner/repo` (le `--repo` de la PR) : exactement deux
+#: segments, sans espaces ni chemin absolu
+_GITHUB_KEY = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 def _redact(text: str) -> str:
     """Retire les identifiants d'une URL avant de la citer ou de l'écrire."""
@@ -269,17 +273,34 @@ def _remote_identity(url: str):
     return None
 
 
+def _slug_identity(slug: str):
+    """L'identité du dépôt que `--repo` désigne : `("path", chemin réel)`
+    quand c'est un chemin local existant, `("github", owner/repo)` quand
+    c'est une clé GitHub nue, None quand elle n'est pas vérifiable. Une
+    identité non vérifiable ne s'accepte pas, et deux formes différentes ne
+    se lient jamais l'une à l'autre : un transport local n'est pas la preuve
+    d'une clé GitHub (R1 delta, cx3, 2026-10-13)."""
+    text = (slug or "").strip()
+    local = _remote_identity(text)
+    if local is not None:
+        return local
+    if _GITHUB_KEY.match(text):
+        return ("github", migrations.repo_key(text))
+    return None
+
+
 def _bind_repo_identity(repo: str, slug: str, fetch_url: str, push_url: str) -> tuple:
     """Une seule identité de dépôt pour la PR, le lot, l'admission, la lecture
     et le push (#1003 B/P1).
 
     Le checkout (`repo`), `--fetch-url` et `--push-url` doivent désigner le
     MÊME dépôt : clé `owner/repo` pour GitHub, chemin réel pour un transport
-    local. Le `slug` de la PR ne peut pas contredire l'identité vérifiée du
-    checkout : depuis un clone de A, `--repo B` avec des remotes de A est
-    refusé comme une divergence, même quand A et B partagent les mêmes
-    commits. Sans `origin` lisible, rien n'est vérifiable : le geste refuse
-    avant toute lecture de PR, toute admission et toute écriture."""
+    local. Le `slug` de la PR doit désigner cette même identité, dans la même
+    forme : depuis un clone de A, `--repo B` avec des remotes de A est refusé
+    comme une divergence, même quand A et B partagent les mêmes commits ; un
+    transport local avec une clé GitHub n'est pas vérifiable et refuse aussi.
+    Sans `origin` lisible, rien n'est vérifiable : le geste refuse avant toute
+    lecture de PR, toute admission et toute écriture."""
     origin_url = plan_git._out(repo, "remote", "get-url", "origin") or ""
     origin = _remote_identity(origin_url)
     if origin is None:
@@ -297,7 +318,12 @@ def _bind_repo_identity(repo: str, slug: str, fetch_url: str, push_url: str) -> 
                 "%s (%s) and this checkout's origin (%s) are not the same repository: the "
                 "lot, its admission, the PR read and the push must be one repository; "
                 "nothing written" % (what, _redact(url), _redact(origin_url)))
-    if origin[0] == "github" and migrations.repo_key(slug) != origin[1]:
+    slug_ident = _slug_identity(slug)
+    if slug_ident is None:
+        raise MergePrError(
+            "cannot verify the repository named by --repo %s: give owner/repo or the "
+            "checkout's real path; nothing written" % (slug,))
+    if slug_ident != origin:
         raise MergePrError(
             "--repo %s and this checkout's origin (%s) are not the same repository: the PR "
             "read by gh and the repository whose guards admit and whose branch is pushed "
@@ -402,9 +428,15 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError("--lot is required: the frozen lot carries the freeze and the "
                            "review verdict this gesture replays, and the merge is declared "
                            "on it")
-    slug = (slug or "").strip().lower()
+    slug = (slug or "").strip()
     if not slug:
         raise MergePrError("no GitHub repository: give --repo owner/repo")
+    slug_ident = _slug_identity(slug)
+    if slug_ident is None:
+        raise MergePrError("cannot verify the repository named by --repo %s: give owner/repo "
+                           "or the checkout's real path; nothing written" % (slug,))
+    if slug_ident[0] == "github":
+        slug = slug_ident[1]
     fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
     push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
     # #1003 B/P1 : une seule identité de dépôt, vérifiée avant la première
@@ -637,10 +669,20 @@ def run(cfg, db, args) -> int:
     import sys
     try:
         cwd = os.getcwd()
-        slug = (args.repo or migrations.origin_repo(cwd) or "").strip().lower()
+        slug = (args.repo or migrations.origin_repo(cwd) or "").strip()
         if not slug:
             raise MergePrError("cannot read the GitHub repository from origin: give --repo "
                                "owner/repo")
+        # la voie opérateur ne fusionne qu'une PR GitHub : un chemin local
+        # n'est pas vérifiable contre un slug GitHub (delta cx3) et la
+        # commande le refuse, plutôt que de laisser `gh` échouer plus loin.
+        slug_ident = _slug_identity(slug)
+        if slug_ident is None:
+            raise MergePrError("cannot verify the repository named by --repo %s: give "
+                               "owner/repo; nothing written" % (slug,))
+        if slug_ident[0] != "github":
+            raise MergePrError("--repo %s is a local transport: this command merges a GitHub "
+                               "PR, give --repo owner/repo; nothing written" % (slug,))
         origin = plan_git._out(cwd, "remote", "get-url", "origin") or ""
         fetch_url = args.fetch_url or origin or ("https://github.com/%s.git" % slug)
         push_url = check_push_url(args.push_url or ("git@github.com:%s.git" % slug))

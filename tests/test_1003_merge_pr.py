@@ -92,7 +92,10 @@ class _Base(unittest.TestCase):
         _git(self.repo, "remote", "add", "origin", self.origin)
         _git(self.repo, "push", "-q", "origin", "lot/7-work")
         _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
-        self.slug = "o/r"
+        self.slug = self.origin
+        # le banc transporte par chemins locaux : l'identité de la PR est ce
+        # même chemin ; un slug GitHub ne se lierait pas à ce transport (R1
+        # delta cx3)
         # le lot : gelé et relu sur la tête courante — l'admission de la file
         # (`readiness`) est la vraie garde, ses lectures de base sont simulées.
         self.lot = self.LOT
@@ -287,10 +290,25 @@ class IdentityTest(_Base):
     def test_remotes_of_another_repository_are_refused(self):
         twin = self._twin()
         before = _git(twin, "rev-parse", "main").lower()
-        with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
-            self.merge(self.gh(), fetch_url=twin, push_url=twin)
+        gh = self.gh()
+        with mock.patch.object(merge_pr, "_project_of",
+                               side_effect=AssertionError("admission reached")):
+            with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
+                self.merge(gh, fetch_url=twin, push_url=twin)
+        self.assertEqual(gh.calls, [])                   # rien n'a été lu
         self.assertEqual(before, _git(twin, "rev-parse", "main").lower())
         self.assertEqual(self.tip(), self.base)          # rien n'a bougé non plus
+
+    def test_a_local_origin_with_a_github_slug_is_refused_before_any_read(self):
+        """Le cas inverse du témoin R1 (cx3) : depuis un transport local, une
+        clé GitHub n'est pas vérifiable — refus avant gh, admission et push."""
+        gh = self.gh()
+        with mock.patch.object(merge_pr.merge_queue, "readiness",
+                               side_effect=AssertionError("admission reached")):
+            with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
+                self.merge(gh, slug="b/repo")
+        self.assertEqual(gh.calls, [])
+        self.assertEqual(self.tip(), self.base)
 
     def test_a_pr_of_another_repository_is_refused(self):
         _git(self.repo, "remote", "set-url", "origin", "https://github.com/a/repo.git")
@@ -536,6 +554,24 @@ class RunTest(unittest.TestCase):
             code = merge_pr.run(None, None, self.args())
         self.assertEqual(code, 1)
         self.assertIn("refusé", err.getvalue())
+
+    def test_the_operator_command_refuses_a_local_transport(self):
+        """La voie opérateur ne fusionne qu'une PR GitHub : un chemin local
+        est refusé avant tout appel, `direct_merge` n'est pas atteint."""
+        import contextlib
+        import io
+        for repo, needle in ((os.getcwd(), "local transport"),
+                             ("not-a-repo", "cannot verify")):
+            with self.subTest(repo=repo):
+                called = []
+                err = io.StringIO()
+                with mock.patch.object(merge_pr, "direct_merge",
+                                       side_effect=lambda *a, **kw: called.append(a)), \
+                        contextlib.redirect_stderr(err):
+                    code = merge_pr.run(None, None, self.args(repo=repo))
+                self.assertEqual(code, 1)
+                self.assertEqual(called, [])
+                self.assertIn(needle, err.getvalue())
 
     def test_credentials_are_never_printed(self):
         self.assertEqual(merge_pr._redact("https://user:tok3n@github.com/o/r.git"),
