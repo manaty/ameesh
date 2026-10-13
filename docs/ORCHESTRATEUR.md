@@ -605,8 +605,15 @@ restée 4 h fusionnée sans être déployée :
    suite complète se **déclare** par ses fichiers de workflow dans
    `radar.projects.<p>.full_suite` (une identité — le fichier —, jamais un nom
    d'affichage libre) ; chacun doit avoir tourné sur le commit exact, vert
-   **jobs compris** : un job `skipped`/`neutral` ou illisible ne certifie rien,
-   et le dispatch d'un workflow non déclaré (docs seul) ne compte pas. Un écart
+   **jobs compris**. Une entrée peut nommer ses jobs requis
+   (`{"path": …, "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des
+   impactés"]}`) : « nom * » couvre une famille de matrice (sinon égalité
+   stricte), un job requis doit exister et être vert, les autres doivent être
+   verts ou sautés (un job sauté par conception, `if:` sur l'événement ou les
+   chemins, ne bloque pas) et un job `tolerate` (`continue-on-error`) ne
+   certifie ni ne bloque. Une entrée réduite au chemin exige **tous** les jobs ;
+   un job illisible ne certifie rien, et le dispatch d'un workflow non déclaré
+   (docs seul) ne compte pas. Un écart
    délibéré se justifie par `ameesh release reason <lot> --text "…"` ; le
    périmètre et la raison vivent au journal du lot. La file de fusion applique
    la même porte au lot de classe release qu'elle traverse
