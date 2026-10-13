@@ -463,6 +463,19 @@ def agent_state(row: dict) -> str:
     return "idle"                       # idle, queued
 
 
+def paused_on_budget(row: dict) -> bool:
+    """#1070 : l'agent est en pause BUDGET — la pause annoncée par son
+    exécuteur (`status` `blocked`, texte « budget : … », la règle de
+    `handoff.paused`).
+
+    Distincte d'un `blocked` d'une autre cause (hôte non prêt,
+    authentification), que `agent_state` range lui aussi dans « paused » :
+    un bilan qui compte les agents en pause budget lit ce prédicat, pas le
+    préfixe d'un texte tronqué à l'affichage."""
+    return (row.get("status") == "blocked"
+            and (row.get("status_text") or "").startswith(BUDGET_PAUSE_PREFIX))
+
+
 def _excerpt(text: str | None, limit: int = TASK_CHARS) -> str | None:
     text = " ".join((text or "").split())
     if not text:
