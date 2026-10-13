@@ -47,7 +47,7 @@ def resolve(name: str, *, db=None, canon=None, cfg=None, operation: str = "looku
             canon = SimpleNamespace(agents=[a for c in canons for a in c.agents])
     if canon is not None:
         matches = [a for a in canon.agents
-                   if name == a.title or name in (a.aliases or [])]
+                   if name == a.title or name in (getattr(a, "aliases", None) or [])]
         if len({a.title for a in matches}) > 1:
             raise ValueError("ambiguous agent name: %s" % name)
         return matches[0].title if matches else name

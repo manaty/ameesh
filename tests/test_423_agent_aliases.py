@@ -238,6 +238,23 @@ class AgentAliasTest(PgTestCase):
 
 
 class CanonAliasTest(_TmpMixin, unittest.TestCase):
+    def test_optional_alias_field_in_mixed_card_lookup(self):
+        from types import SimpleNamespace
+        loaded = canon.Canon(root='/unused', agents=[
+            SimpleNamespace(title='legacy-worker'),
+            SimpleNamespace(title='worker', aliases=['old-worker']),
+        ])
+        for name, primary in (('legacy-worker', 'legacy-worker'), ('worker', 'worker'),
+                              ('old-worker', 'worker'), ('unknown', 'unknown')):
+            with self.subTest(name=name):
+                self.assertEqual(agent_names.resolve(name, canon=loaded), primary)
+        self.assertEqual(loaded.agent('old-worker').title, 'worker')
+        self.assertIsNone(loaded.agent('unknown'))
+        loaded.agents.append(SimpleNamespace(title='other-worker', aliases=['old-worker']))
+        with self.assertRaises(ValueError):
+            agent_names.resolve('old-worker', canon=loaded)
+        self.assertIsNone(loaded.agent('old-worker'))
+
     def load_aliases(self, aliases):
         root = self.example_copy()
         path = 'agents/ouvrier.md'
