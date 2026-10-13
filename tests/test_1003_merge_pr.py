@@ -1,0 +1,344 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#1003 REL-11 : fusion hors API gh d'une PR touchant `.github/workflows/**`.
+
+Le geste est testé sur de vrais dépôts git (un `origin` nu, `refs/pull/<pr>/head`
+comme GitHub) et un faux `gh` : gardes (gel, cible non déplacée, arbre, PR hors
+workflow refusée, mergeabilité et checks), commit de fusion à deux parents,
+push compare-and-swap refusé quand la cible bouge, relecture PR MERGED,
+`--dry-run`, et chemins « déjà fusionnée ».
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+from ameesh import merge_pr
+
+from .test_l160b_radar import _git
+
+
+def _write(repo, path, text):
+    full = os.path.join(repo, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+class FakeGh:
+    """`gh pr view` : la première vue (l'état de la PR à l'ouverture), puis
+    `later()` pour chaque relecture."""
+
+    def __init__(self, first: dict, later=None):
+        self.first, self.later, self.calls = first, later, []
+
+    def __call__(self, args, *, timeout=60.0):
+        self.calls.append(list(args))
+        if len(self.calls) == 1 or self.later is None:
+            data = self.first
+        else:
+            data = self.later()
+        return subprocess.CompletedProcess(["gh", *args], 0, json.dumps(data), "")
+
+
+def view(**over):
+    data = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main",
+            "baseRefOid": "", "headRefOid": "", "headRefName": "lot/7-work",
+            "mergeStateStatus": "CLEAN", "mergeCommit": None, "url": "https://x/7",
+            "title": "le lot", "statusCheckRollup": [
+                {"__typename": "CheckRun", "name": "tests", "status": "COMPLETED",
+                 "conclusion": "SUCCESS"}]}
+    data.update(over)
+    return data
+
+
+class _Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q")
+        _write(self.repo, ".github/workflows/ci.yml", "on: push\n")
+        _write(self.repo, "src/app.py", "print('base')\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        _git(self.repo, "branch", "-M", "main")
+        self.base = _git(self.repo, "rev-parse", "main")
+        self.origin = os.path.join(self.tmp, "origin.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo, self.origin],
+                       check=True, capture_output=True)
+        # la branche de la PR : un fichier de workflow ET un fichier de code
+        _git(self.repo, "checkout", "-q", "-b", "lot/7-work")
+        _write(self.repo, ".github/workflows/ci.yml", "on: push\njobs:\n  t:\n    steps: []\n")
+        _write(self.repo, "src/app.py", "print('head')\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "head")
+        self.head = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "remote", "add", "origin", self.origin)
+        _git(self.repo, "push", "-q", "origin", "lot/7-work")
+        _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
+        self.slug = "o/r"
+
+    def tip(self, ref="main"):
+        return _git(self.origin, "rev-parse", ref).lower()
+
+    def gh(self, later=None, **over):
+        over.setdefault("headRefOid", self.head)
+        return FakeGh(view(**over), later=later)
+
+    def merge(self, gh, **kw):
+        kw.setdefault("target", "main")
+        kw.setdefault("fetch_url", self.origin)
+        kw.setdefault("push_url", self.origin)
+        kw.setdefault("attempts", 2)
+        kw.setdefault("poll_s", 0)
+        kw.setdefault("sleep", lambda s: None)
+        return merge_pr.direct_merge(self.slug, 7, self.head, gh=gh, **kw)
+
+    def move_main(self):
+        """Un commit de plus sur `main` dans l'origin, hors du gel."""
+        mover = os.path.join(self.tmp, "mover")
+        if not os.path.isdir(mover):
+            subprocess.run(["git", "clone", "-q", self.origin, mover], check=True,
+                           capture_output=True)
+        _write(mover, "README.md", "moved %f\n" % time.time())
+        _git(mover, "add", "-A")
+        _git(mover, "commit", "-q", "-m", "moved")
+        _git(mover, "push", "-q", "origin", "main")
+        return _git(self.origin, "rev-parse", "main").lower()
+
+
+class GuardTest(_Base):
+    def test_dry_run_builds_the_merge_commit_without_pushing(self):
+        gh = self.gh()
+        out = self.merge(gh, dry_run=True)
+        self.assertEqual(out["state"], "dry-run", out)
+        self.assertEqual(self.tip(), self.base)          # rien n'a bougé
+        self.assertEqual(out["tree"], out["frozen_tree"])
+        self.assertEqual(out["workflow_files"], [".github/workflows/ci.yml"])
+        self.assertNotIn("ameesh-work", out["message"])  # pas de lot : pas de trailer
+        self.assertEqual([c[:2] for c in gh.calls], [["pr", "view"]])
+
+    def test_head_moved_is_refused_before_anything(self):
+        gh = self.gh(headRefOid="a" * 40)
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(gh)
+        self.assertIn("head moved", str(caught.exception))
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_pr_without_workflow_is_refused(self):
+        # une tête qui ne touche pas .github/workflows/**
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "checkout", "-q", "-b", "lot/7-code")
+        _write(self.repo, "src/app.py", "print('code only')\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "code only")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "push", "-q", "origin", "lot/7-code")
+        _git(self.origin, "update-ref", "refs/pull/7/head", head)
+        self.head = head
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh())
+        self.assertIn("does not touch .github/workflows/**", str(caught.exception))
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_blocked_pr_is_refused(self):
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh(mergeStateStatus="BLOCKED"))
+        self.assertIn("mergeStateStatus BLOCKED", str(caught.exception))
+
+    def test_checks_not_green_are_refused(self):
+        rollup = [{"__typename": "CheckRun", "name": "tests", "status": "IN_PROGRESS",
+                   "conclusion": ""}]
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh(statusCheckRollup=rollup))
+        self.assertIn("not all concluded and green", str(caught.exception))
+
+    def test_draft_is_refused(self):
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh(isDraft=True))
+        self.assertIn("draft", str(caught.exception))
+
+    def test_target_moved_since_the_freeze_is_refused(self):
+        moved = self.move_main()
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh())
+        self.assertIn("moved since the freeze", str(caught.exception))
+        self.assertEqual(self.tip(), moved)   # le commit de plus est intact
+
+    def test_a_target_that_moved_before_the_push_is_refused_by_the_lease(self):
+        gh = self.gh()
+        original = merge_pr.message
+        moved = []
+
+        def side_effect(*a, **kw):
+            moved.append(self.move_main())
+            return original(*a, **kw)
+
+        with mock.patch.object(merge_pr, "message", side_effect=side_effect):
+            with self.assertRaises(merge_pr.MergePrError) as caught:
+                self.merge(gh)
+        self.assertTrue(moved)
+        self.assertIn("push refused", str(caught.exception))
+        self.assertEqual(self.tip(), moved[-1])   # rien n'a été écrasé
+
+    def test_the_push_url_must_not_be_the_token_path(self):
+        for url in ("https://github.com/o/r.git", "http://github.com/o/r.git"):
+            with self.subTest(url=url):
+                with self.assertRaises(merge_pr.MergePrError) as caught:
+                    merge_pr.check_push_url(url)
+                self.assertIn("token", str(caught.exception))
+        self.assertEqual(merge_pr.check_push_url("git@github.com:o/r.git"),
+                         "git@github.com:o/r.git")
+        self.assertEqual(merge_pr.check_push_url(self.origin), self.origin)
+
+    def test_the_frozen_commit_must_be_a_full_sha(self):
+        for bad in ("", "abc", self.head[:12], "z" * 40):
+            with self.subTest(bad=bad):
+                with self.assertRaises(merge_pr.MergePrError):
+                    merge_pr.check_head(bad)
+        self.assertEqual(merge_pr.check_head(self.head.upper()), self.head)
+
+    def test_the_target_branch_is_validated(self):
+        with self.assertRaises(merge_pr.MergePrError):
+            self.merge(self.gh(), target="..bad")
+
+
+class MergeTest(_Base):
+    def test_merge_pushes_a_two_parent_commit_at_the_frozen_tree(self):
+        gh = self.gh(later=lambda: view(
+            state="MERGED", headRefOid=self.head,
+            mergeCommit={"oid": self.tip()}))
+        out = self.merge(gh)
+        self.assertEqual(out["state"], "merged", out)
+        tip = self.tip()
+        self.assertEqual(tip, out["merge"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main^1").lower(), self.base)
+        self.assertEqual(_git(self.origin, "rev-parse", "main^2").lower(), self.head)
+        self.assertEqual(_git(self.origin, "rev-parse", "main^{tree}").lower(),
+                         out["frozen_tree"])
+        self.assertIn("#1003/REL-11",
+                      _git(self.origin, "log", "-1", "--format=%B", "main"))
+        self.assertTrue(all(c[:2] == ["pr", "view"] for c in gh.calls), gh.calls)
+
+    def test_the_lot_trailer_names_the_lot(self):
+        gh = self.gh()
+        out = self.merge(gh, dry_run=True, lot=1003)
+        self.assertIn("ameesh-work: 1003", out["message"])
+
+    def test_a_read_back_that_stays_open_is_reported_pushed_unverified(self):
+        gh = self.gh(later=lambda: view(headRefOid=self.head))
+        out = self.merge(gh)
+        self.assertEqual(out["state"], "pushed-unverified", out)
+        self.assertTrue(out["pushed"])
+        self.assertIn("check the PR and the branch by hand", out["why"])
+        self.assertEqual(self.tip(), out["merge"])   # le push a bien eu lieu
+
+    def test_the_read_back_must_name_the_pushed_commit(self):
+        gh = self.gh(later=lambda: view(state="MERGED", headRefOid=self.head,
+                                        mergeCommit={"oid": "b" * 40}))
+        out = self.merge(gh)
+        self.assertEqual(out["state"], "pushed-unverified", out)
+        self.assertEqual(out["pr_merge"], "b" * 40)
+
+    def test_an_already_merged_pr_is_verified_without_pushing(self):
+        _git(self.origin, "update-ref", "refs/heads/main", self.head)
+        gh = self.gh(state="MERGED", mergeCommit={"oid": self.head})
+        out = self.merge(gh)
+        self.assertEqual(out["state"], "already", out)
+        self.assertTrue(out["content_verified"])
+        self.assertEqual(self.tip(), self.head)
+        self.assertEqual([c[:2] for c in gh.calls], [["pr", "view"]])
+
+    def test_an_already_merged_pr_whose_head_is_not_in_the_target_is_unverified(self):
+        gh = self.gh(state="MERGED", mergeCommit={"oid": "c" * 40})
+        out = self.merge(gh)
+        self.assertEqual(out["state"], "already-unverified", out)
+        self.assertFalse(out["content_verified"])
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_closed_pr_is_refused(self):
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh(state="CLOSED"))
+        self.assertIn("not open", str(caught.exception))
+
+
+class RunTest(unittest.TestCase):
+    """La ligne de commande : constat, enregistrement du lot, codes de sortie."""
+
+    def args(self, **over):
+        import argparse
+        data = dict(repo="o/r", fetch_url="", push_url="git@github.com:o/r.git",
+                    target=None, pr=7, head="a" * 40, dry_run=False, lot=None, json=True,
+                    actor="impl-03")
+        data.update(over)
+        return argparse.Namespace(**data)
+
+    def run_with(self, out, args=None, **patches):
+        import contextlib
+        import io
+        args = args or self.args()
+        buf = io.StringIO()
+        with mock.patch.object(merge_pr, "direct_merge", return_value=dict(out)), \
+             mock.patch.object(merge_pr.plan_git, "_out", return_value=""), \
+             mock.patch.object(merge_pr.migrations, "origin_repo", return_value="o/r"), \
+             contextlib.redirect_stdout(buf):
+            code = merge_pr.run(None, None, args)
+        return code, buf.getvalue()
+
+    def test_a_verified_merge_is_declared_on_the_lot(self):
+        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
+               "tip": "d" * 40}
+        with mock.patch.object(merge_pr.work, "merged",
+                               return_value={"result": "merged"}) as recorded:
+            code, text = self.run_with(out, args=self.args(lot=1003, json=False))
+        self.assertEqual(code, 0)
+        self.assertIn("declared merged", text)
+        self.assertEqual(recorded.call_args.kwargs["sha"], "b" * 40)
+        self.assertEqual(recorded.call_args.kwargs["actor"], "impl-03")
+
+    def test_a_lot_that_cannot_be_declared_does_not_undo_the_merge(self):
+        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
+               "tip": "d" * 40}
+        patcher = mock.patch.object(merge_pr.work, "merged",
+                                    side_effect=RuntimeError("lot closed"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        code, text = self.run_with(out, args=self.args(lot=1003, json=False))
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING lot not declared", text)
+
+    def test_exit_codes_name_the_uncertainty(self):
+        for state, expected in (("pushed-unverified", 2), ("already-unverified", 1)):
+            with self.subTest(state=state):
+                code, _ = self.run_with({"state": state, "pr": 7, "merge": "b" * 40,
+                                         "frozen": "a" * 40, "tip": "d" * 40,
+                                         "target": "main", "why": "x"})
+                self.assertEqual(code, expected)
+
+    def test_a_refusal_exits_one(self):
+        patcher = mock.patch.object(merge_pr, "direct_merge",
+                                    side_effect=merge_pr.MergePrError("refusé"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import contextlib
+        import io
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            code = merge_pr.run(None, None, self.args())
+        self.assertEqual(code, 1)
+        self.assertIn("refusé", err.getvalue())
+
+    def test_credentials_are_never_printed(self):
+        self.assertEqual(merge_pr._redact("https://user:tok3n@github.com/o/r.git"),
+                         "https://***@github.com/o/r.git")
+        self.assertEqual(merge_pr._redact("git@github.com:o/r.git"),
+                         "git@github.com:o/r.git")
