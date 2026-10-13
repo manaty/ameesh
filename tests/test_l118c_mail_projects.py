@@ -172,6 +172,83 @@ class MailProjectTests(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "bound")
 
+    def test_backlog_add_inherits_the_creator_project(self):
+        self.project("dev1", team="creator")
+        proc = self.mesh("work", "backlog", "add", "--title", "Item", "--value", "one rule",
+                         "--score", "30", "--team", "creator",
+                         env=self.env(AGENT_MAIL_NAME="dev1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.list_items(self.db)[0]
+        self.assertEqual((item["type"], item["app"]), ("improvement", "creator"))
+        self.assertNotIn(item["id"], [a["lot"] for a in work_projects.alerts(self.db)])
+        proc = self.mesh("work", "backlog", "add", "--title", "Unknown", "--value", "kept",
+                         "--score", "30", env=self.env(AGENT_MAIL_NAME="dev2"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        unknown = work.list_items(self.db)[0]
+        self.assertEqual((unknown["title"], unknown["app"]), ("Unknown", ""))
+        self.assertIn(unknown["id"], [a["lot"] for a in work_projects.alerts(self.db)])
+
+    def test_backlog_api_inherits_and_validates_the_project(self):
+        from ameesh import backlog
+        self.project("dev1", team="creator")
+        item = backlog.add(self.db, title="Api", expected_value="one rule", value_score=30,
+                           actor="dev1")
+        self.assertEqual(item["app"], "creator")
+        for app in ("unconfigured-project", " "):
+            with self.subTest(app=app), self.assertRaises(backlog.BacklogError):
+                backlog.add(self.db, title="Refused", expected_value="kept", value_score=30,
+                            actor="dev1", app=app)
+        item = backlog.add(self.db, title="Known", expected_value="kept", value_score=30,
+                           actor="dev2", app=" creator ")
+        self.assertEqual(item["app"], "creator")
+        proc = self.mesh("work", "backlog", "add", "--title", "Flag", "--value", "kept",
+                         "--score", "30", "--app", "nowhere",
+                         env=self.env(AGENT_MAIL_NAME="dev2"))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("unknown project", proc.stderr)
+        proc = self.mesh("work", "backlog", "add", "--title", "Flag", "--value", "kept",
+                         "--score", "30", "--app", "creator",
+                         env=self.env(AGENT_MAIL_NAME="dev2"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.list_items(self.db)[0]["app"], "creator")
+        self.assertNotIn("Refused", [i["title"] for i in work.list_items(self.db)])
+
+    def test_backlog_known_projects_follow_the_given_configuration(self):
+        from ameesh import backlog
+
+        class NoCfg:   # a connection without `cfg`
+            def __init__(self, db):
+                self._db = db
+
+            def __getattr__(self, name):
+                if name == "cfg":
+                    raise AttributeError(name)
+                return getattr(self._db, name)
+
+        def github(*names):
+            return SimpleNamespace(github={"projects": {n: "acme/%s" % n for n in names}})
+
+        bare = NoCfg(self.db)
+        item = backlog.add(bare, title="Alpha", expected_value="kept", value_score=30,
+                           actor="dev2", app="alpha", cfg=github("alpha"))
+        self.assertEqual(item["app"], "alpha")
+        args = SimpleNamespace(backlog_command="add", title="Run", expected_value="kept",
+                               value_score=30, priority=backlog.DEFAULT_PRIORITY, source="",
+                               team=None, requires=[], body="", package=None, actor="dev2",
+                               app="beta", json=False)
+        with self.assertRaisesRegex(backlog.BacklogError, "unknown project"):
+            backlog.add(bare, title="Beta", expected_value="kept", value_score=30,
+                        actor="dev2", app="beta")
+        self.assertEqual(backlog.run(bare, args), 2)
+        with mock.patch.object(self.db, "cfg", github("other"), create=True):
+            item = backlog.add(self.db, title="Gamma", expected_value="kept", value_score=30,
+                               actor="dev2", app="gamma", cfg=github("gamma"))
+            self.assertEqual(item["app"], "gamma")
+            with self.assertRaisesRegex(backlog.BacklogError, "unknown project"):
+                backlog.add(self.db, title="Other", expected_value="kept", value_score=30,
+                            actor="dev2", app="other", cfg=github("gamma"))
+        self.assertNotIn("Beta", [i["title"] for i in work.list_items(self.db)])
+
     def test_decision_creation_inherits_requester_then_parent(self):
         parent = work.add(self.db, title="Parent", app="parent")
         self.project("dev1", team="requester")

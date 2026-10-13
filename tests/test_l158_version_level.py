@@ -204,6 +204,17 @@ class VersionLevelTest(unittest.TestCase):
         floor, reasons = self._floor(cli, cli[:cli.rindex('    parser.add_argument')])
         self.assertEqual((floor, reasons), ("major", ["option cli:other_main --wait removed"]))
 
+    def test_project_parser_class_reads_like_argparse(self):
+        """L148 : un parseur bâti par `HiddenAliasParser(prog=…)` garde ses
+        commandes et ses options lisibles (sinon le niveau vire à `major`)."""
+        cli = ('def plan_main(argv):\n'
+               '    parser = HiddenAliasParser(prog="ameesh plan")\n'
+               '    sub = parser.add_subparsers(dest="plan_command", required=True)\n'
+               '    p_add = sub.add_parser("add")\n'
+               '    p_add.add_argument("--due")\n')
+        floor, reasons = self._floor(cli, cli.replace('    p_add.add_argument("--due")\n', "", 1))
+        self.assertEqual((floor, reasons), ("major", ["option plan add --due removed"]))
+
     def test_inlining_a_helper_changes_nothing(self):
         helper = ('def _options(p):\n    p.add_argument("--custom")\n\n\n'
                   'def build(sub):\n    p = sub.add_parser("show")\n    _options(p)\n')

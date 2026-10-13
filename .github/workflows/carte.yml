@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# L161e — carte test → code mesurée (scripts/carte.py), régénérée à chaque
+# L161e — carte test → code mesurée (scripts/map.py), régénérée à chaque
 # fusion sur main, hors du chemin critique : ce workflow n'est jamais une
 # vérification requise, et un test en échec sous mesure est noté dans la
 # carte, pas reporté.
@@ -22,8 +22,8 @@ on:
     branches: [main]
   pull_request:
     paths:
-      - scripts/carte.py
-      - scripts/carte_mesure.py
+      - scripts/map.py
+      - scripts/map_measure.py
       - scripts/test-parts.py
       - tests/support.py
       - .github/workflows/carte.yml
@@ -86,7 +86,7 @@ jobs:
           else
             .venv-carte/bin/pip install -q 'coverage>=7.10'
           fi
-          .venv-carte/bin/python scripts/carte.py installer
+          .venv-carte/bin/python scripts/map.py install
       - name: base jetable (sans fsync) et client psql
         run: |
           command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q postgresql-client; }
@@ -104,9 +104,9 @@ jobs:
           mkdir -p "$M"
           debut=$(date +%s)
           # jamais bloquant : un échec sous mesure est noté dans la carte
-          .venv-carte/bin/python scripts/test-parts.py lancer --parts ${{ matrix.parts }} \
-            --part ${{ matrix.part }} --pilote "$AMEESH_DRIVER" ${LISTE:+--liste "$LISTE"} \
-            --mesure "$M" --durees-sortie "$M/durees.json" --flux "$M/flux.jsonl" \
+          .venv-carte/bin/python scripts/test-parts.py run --parts ${{ matrix.parts }} \
+            --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" ${LISTE:+--list "$LISTE"} \
+            --measure "$M" --output-durations "$M/durees.json" --flow "$M/flux.jsonl" \
             || echo "::warning::tests en échec sous mesure (notés dans la carte)"
           echo "durée sous mesure : $(( $(date +%s) - debut )) s" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -144,8 +144,8 @@ jobs:
         run: |
           if [ -f carte/carte.json.gz ]; then mv carte/carte.json.gz carte/precedente.json.gz; fi
           mkdir -p carte
-          python scripts/carte.py fusionner --sortie carte/carte.json.gz \
-            --precedente carte/precedente.json.gz --resume "$GITHUB_STEP_SUMMARY" mesures/*
+          python scripts/map.py merge --output carte/carte.json.gz \
+            --previous carte/precedente.json.gz --summary "$GITHUB_STEP_SUMMARY" mesures/*
           rm -f carte/precedente.json.gz
       - uses: actions/upload-artifact@v4
         with:
