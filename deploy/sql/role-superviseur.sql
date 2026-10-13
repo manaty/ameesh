@@ -271,7 +271,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('thread_index', ARRAY[
         'project', 'lot', 'transport', 'host', 'location', 'last_entry_id',
-        'last_mailbox_id', 'last_author', 'last_at', 'entries',
+        'last_mailbox_id', 'last_author', 'last_at', 'entries', 'counted_until',
         'created_at', 'updated_at'
     ]),
     ('model_catalog', ARRAY[
