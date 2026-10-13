@@ -6,8 +6,11 @@ Le bilan du bureau comptait « aucun agent erreur/pause » alors que dix agents
 est tronquée à onze caractères et « blocked/budget : pause (… » devenait
 « blocked/bud », le mot « pause » disparaissant. La vue montre désormais
 « paused/… » pour une pause budget, garde « blocked/… » pour un `blocked`
-d'une autre cause (hôte non prêt, authentification), et `list --json` porte
-`paused_on_budget` (schéma `ameesh-agent/1`) pour les lecteurs machine.
+d'une autre cause (hôte non prêt, authentification), et les schémas stables
+qui publient l'état d'un agent portent `paused_on_budget` : `list --json`
+(`ameesh-agent/1`), `progress --json` (`ameesh-progress/1`) et
+`projects --json` (`ameesh-projects/1`) — le prédicat est celui de
+`handoff.paused` (L233b), pas une seconde définition.
 
 Témoin : bloqué + budget contre bloqué hors budget — aucun faux positif.
 """
@@ -57,6 +60,22 @@ class PauseBudgetVisibleTest(PgTestCase):
         # « paused » lui aussi (L13) — d'où le champ dédié.
         self.assertEqual(rows["en-pause"]["state"], "paused")
         self.assertEqual(rows["bloque"]["state"], "paused")
+
+    def test_progress_et_projets_portent_le_champ(self):
+        # #1070 : les autres schémas stables qui publient l'état d'un agent
+        env = self.env(HOME=self.tmp)
+        snap = self.mesh("progress", "--json", "--no-versions", "--no-gantt", env=env)
+        self.assertEqual(snap.returncode, 0, snap.stderr)
+        agents = {a["name"]: a for a in json.loads(snap.stdout)["agents"]}
+        self.assertTrue(agents["en-pause"]["paused_on_budget"])
+        self.assertFalse(agents["bloque"]["paused_on_budget"])
+
+        proc = self.mesh("projects", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        view = json.loads(proc.stdout)
+        agents = {a["name"]: a for p in view["projects"] for a in p["agents"]}
+        self.assertTrue(agents["en-pause"]["paused_on_budget"])
+        self.assertFalse(agents["bloque"]["paused_on_budget"])
 
     def test_predicat_strict(self):
         self.assertTrue(progress.paused_on_budget(

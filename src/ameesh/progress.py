@@ -465,15 +465,16 @@ def agent_state(row: dict) -> str:
 
 def paused_on_budget(row: dict) -> bool:
     """#1070 : l'agent est en pause BUDGET — la pause annoncée par son
-    exécuteur (`status` `blocked`, texte « budget : … », la règle de
-    `handoff.paused`).
+    exécuteur (`status` `blocked`, texte « budget : … »).
 
     Distincte d'un `blocked` d'une autre cause (hôte non prêt,
     authentification), que `agent_state` range lui aussi dans « paused » :
     un bilan qui compte les agents en pause budget lit ce prédicat, pas le
-    préfixe d'un texte tronqué à l'affichage."""
-    return (row.get("status") == "blocked"
-            and (row.get("status_text") or "").startswith(BUDGET_PAUSE_PREFIX))
+    préfixe d'un texte tronqué à l'affichage. La règle est celle de
+    `handoff.paused` (L233b), la seule définition de la pause budget : on la
+    reprend ici au lieu d'en entretenir une seconde."""
+    from . import handoff
+    return handoff.paused(row)
 
 
 def _excerpt(text: str | None, limit: int = TASK_CHARS) -> str | None:
@@ -521,6 +522,9 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),
+        # #1070 : la pause budget se distingue d'un `blocked` d'une autre cause
+        # sans déchiffrer le texte
+        "paused_on_budget": paused_on_budget(row),
         "since_ts": _round(since),
         "turn": turn,
         "turns": int(row.get("turns") or 0),
