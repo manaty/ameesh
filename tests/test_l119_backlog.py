@@ -132,17 +132,22 @@ class PriseTest(_Base):
         self.assertEqual(storage.of(self.db).work.auto_takes_since(3600, backlog.AUTO_TAKE_NOTE), 2)
 
     def test_forfait_avant_token(self):
+        # #754 : le forfait passe d'abord ; ce qu'il laisse part aux agents au
+        # token dans le même passage, sans `--take-paid` ni veto d'équipe.
         self.agent("deepseek1", "deepseek", since_s=5 * HEURE)
         self.agent("claude1", since_s=HEURE)
-        self.element("dette", 50)
-        self.element("doc", 40)
+        haut = self.element("dette", 50)
+        bas = self.element("doc", 40)
         out = self.take(max_per_hour=5)
-        self.assertEqual([t["agent"] for t in out], ["claude1"])
-        out = self.take(max_per_hour=5, allow_paid=True,
-                        alerts=[{"type": "balance_low"}])
-        self.assertEqual(out, [])
-        out = self.take(max_per_hour=5, allow_paid=True)
-        self.assertEqual([t["agent"] for t in out], ["deepseek1"])
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("claude1", haut["id"]), ("deepseek1", bas["id"])])
+
+    def test_prise_au_token_jamais_sous_balance_low(self):
+        # #754 : un agent au token reste écarté pendant une alerte
+        # `balance_low`, même sans agent au forfait libre.
+        self.agent("deepseek1", "deepseek")
+        self.element("dette", 50)
+        self.assertEqual(self.take(alerts=[{"type": "balance_low"}]), [])
 
     def test_garde_fous_budget_et_hote(self):
         self.agent("claude1")
@@ -261,8 +266,7 @@ class AlerteEtNotifyTest(_Base):
         ncfg = notify.parse_config({})
         notifier = notify.Notifier(self.cfg, ncfg, log=lambda t: None, emit=records.append,
                                    clock=lambda: self.now,
-                                   take={"idle_s": 1800.0, "max_per_hour": 2,
-                                         "allow_paid": False})
+                                   take={"idle_s": 1800.0, "max_per_hour": 2})
         notifier.run_pass(self.db, thresholds=_seuils())
         prises = [r for r in records if r["event"] == "auto_take"]
         self.assertEqual([(r["agent"], r["lot"]) for r in prises], [("claude1", item["id"])])
