@@ -392,14 +392,64 @@ final file/readiness observations before each effect.
 
 Activation requires an active independent controller in `system.slice` and a
 root-private readiness receipt bound to host/enrollment, current boot/systemd
-invocation and verified read-only runtime/source trees. **The independent service
-and complete release adapter/readiness producer remain unfinished**, so the real
-backend holds before activation. There is no installed bootstrap CLI, automatic
+invocation and verified read-only runtime/source trees. The service coordinator
+and fixed unit are now prepared as described below. **The complete host adapter
+factory remains unfinished**, so the real backend holds before activation.
+There is no installed bootstrap CLI, automatic
 root executor or runtime/credential enrollment. No real root/account/SSH/systemd
 effect is executed by this work. Tests combine disposable filesystem copies with
 simulated accounts/services and synthetic real signatures on disposable PostgreSQL
 through both drivers. Authenticated host pilot and external toolchain admission
 remain required.
+
+## Independent service coordinator
+
+`service-release.py` coordinates protected operation files from the fixed
+`/etc/ameesh-release/operations` directory and writes private controller intents,
+results and readiness under `/var/lib/ameesh-release/controller`. Each operation
+has only its stable id, positive decision id and full manifest. Host/database,
+signed policy identity and units must match independently protected enrollment;
+there are no executable, shell, handler or credential paths in a job. The service
+creates a fresh signed decision authority for each operation, and the existing
+controller checks it and live fences before effects. A held host reservation
+takes priority over other queued jobs. Uncertain replies retain that reservation
+and retry the same action after a bounded backoff; process restart reconciles
+the durable controller journal. Completed jobs do not repeat effects.
+
+The `unite-controleur.py` unit is included in the bootstrap's exact file inventory
+at `/etc/systemd/system/ameesh-release-controller.service`. It runs the fixed
+isolated interpreter with `-I -B`, root identity, private umask and `system.slice`,
+outside every allowed runner instance. Runtime/source trees are mounted read-only
+inside its namespace. No runner environment file, template instance, transport
+argument or caller-selected command changes its entrypoint. Installation and
+startup remain administrative actions; this work enables no service.
+
+The real entrypoint requires the exact runtime, protected enrollment and separate
+`service.json` containing the enrolled runtime/source tree digests. It verifies
+read-only tree inventories before importing any host factory/database components
+and clears ambient account/libpq/config/trace environment. The sole factory is
+the fixed pinned source `adaptateur-hote-release.py` with `HostFactory(db,
+enrollment)`, never a module selected by JSON. Its admission must establish all
+release and recovery capabilities after actual backend/credential/config checks;
+a boolean, partial capability set or extra arbitrary operation is refused.
+
+Before readiness publication, the process checks actual systemd MainPID against
+its own PID, loaded/active state, independent slice, current boot/invocation,
+machine-id, protected policy and exact runtime/source trees. Identity/trees are
+checked again after factory admission. Readiness is withdrawn before readmission
+and on owned shutdown; an older instance cannot remove a later instance's
+receipt. Errors emit generic categories and typed operation references, never
+private documents or provider/credential exception text.
+
+Tests use simulated factory/systemd effects and private disposable filesystem
+documents. They verify stable receipts across process replacement, failed
+admission, code drift, lost replies, reservation priority, wrong jobs, backoff,
+withdrawal ownership and generic diagnostics. They establish coordinator behavior,
+not a launched system service or authenticated host pilot. **The pinned concrete
+`adaptateur-hote-release.py` factory is not supplied yet**; real startup therefore
+fails before DB connection/readiness instead of admitting simulated backends.
+Full host adapters, health probe, release configuration/caps/guard snapshots and
+installer/provider wiring remain build work.
 
 ## Operation-specific code and environment recovery
 

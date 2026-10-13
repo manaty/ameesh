@@ -18,6 +18,9 @@ _spec = importlib.util.spec_from_file_location('delegation_restart',
         Path(__file__).with_name('helper-redemarrage.py'))
 restart = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(restart)
+_unit_spec=importlib.util.spec_from_file_location('delegation_unit',Path(__file__).with_name('unite-controleur.py'))
+unit=importlib.util.module_from_spec(_unit_spec)
+_unit_spec.loader.exec_module(unit)
 
 WRAPPER = '/usr/local/libexec/ameesh-release-ssh'
 DISPATCHER = '/opt/ameesh-release/lib/hote-release.py'
@@ -112,6 +115,8 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- '''+
             ('/etc/ssh/sshd_config.d/60-ameesh-release.conf',0o600,sshd)):
         files[path] = dict(owner='root',group='root',mode=mode,content=content,
                           sha256=hashlib.sha256(content.encode()).hexdigest())
+    files['/etc/systemd/system/ameesh-release-controller.service']=dict(owner='root',group='root',mode=0o644,
+        content=unit.UNIT,sha256=hashlib.sha256(unit.UNIT.encode()).hexdigest())
     if previous_files is None:
         previous_files={path:None for path in files}
     if not isinstance(previous_files,dict) or set(previous_files)!=set(files):
