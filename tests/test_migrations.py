@@ -14,15 +14,28 @@ from ameesh import authority, db as db_mod, mail, migrations, registry, signing
 from .support import PgTestCase
 
 
+def marque_temoin(genre: str, schema: str) -> str:
+    """Marque `application_name` d'un témoin, unique à l'invocation (#835 R2).
+
+    Le schéma porte déjà l'unicité de l'exécution (uuid4 par test). Deux
+    exécutions de la suite peuvent partager le même cluster (AMEESH_TEST_DSN
+    commun sur un hôte d'agents) : une marque constante rendrait les témoins
+    complices — chacun verrait l'attente de l'autre et passerait vert sans rien
+    prouver (relevé par cx2 et l'auditeur).
+    """
+    return "l835-%s-%s" % (genre, schema)
+
+
 def attente_vue(observateur, marque: str, evenement: str, timeout: float = 5.0) -> bool:
     """Le backend `marque` est-il *vu* par le serveur en attente d'un verrou ?
 
     `evenement` est le `wait_event` de `pg_stat_activity` : `relation` pour un
     verrou de table, `advisory` pour le verrou consultatif des migrations. Le
-    `application_name` (unique au témoin) désigne CE backend, jamais un
-    `migrate` concurrent d'un autre test. Cette preuve remplace le sleep : un
-    témoin qui n'a pas encore atteint son SQL ne peut plus passer vert à tort
-    (L835 R1).
+    `application_name` porte la marque de CETTE invocation (`marque_temoin` :
+    préfixe + schéma, lui-même unique) : jamais un `migrate` d'un autre test ni
+    d'une autre exécution de la suite sur le même cluster (R2 cx2/auditeur).
+    Cette preuve remplace le sleep : un témoin qui n'a pas encore atteint son
+    SQL ne peut plus passer vert à tort (L835 R1).
     """
     requete = (
         "SELECT count(*)::int AS n FROM pg_stat_activity "
@@ -351,7 +364,7 @@ class MigrationsTest(PgTestCase):
                                 % resultat.get("tenir"))
 
                 def migrer():
-                    con = self.connect_marque(schema, "l835-table")
+                    con = self.connect_marque(schema, marque_temoin("table", schema))
                     try:
                         resultat["done"] = [
                             m.version for m in migrations.migrate(con, directory=dossier)]
@@ -366,7 +379,7 @@ class MigrationsTest(PgTestCase):
                     # la migration est VUE en attente du verrou de table : le
                     # sleep seul pouvait passer avant qu'elle n'atteigne son SQL
                     self.assertTrue(
-                        attente_vue(db, "l835-table", "relation"),
+                        attente_vue(db, marque_temoin("table", schema), "relation"),
                         "le backend de la migration n'a pas été vu en attente du verrou de table")
                     fil2.join(15)
                 self.assertFalse(fil2.is_alive(),
@@ -439,7 +452,7 @@ class MigrationsTest(PgTestCase):
                                 % resultat.get("tenir"))
 
                 def migrer():
-                    con = self.connect_marque(schema, "l835-propre")
+                    con = self.connect_marque(schema, marque_temoin("propre", schema))
                     try:
                         resultat["done"] = [
                             m.version for m in migrations.migrate(con, directory=dossier)]
@@ -454,7 +467,7 @@ class MigrationsTest(PgTestCase):
                     fil2 = threading.Thread(target=migrer, daemon=True)
                     fil2.start()
                     self.assertTrue(
-                        attente_vue(db, "l835-propre", "relation"),
+                        attente_vue(db, marque_temoin("propre", schema), "relation"),
                         "le backend de la migration n'a pas été vu en attente du verrou de table")
                     # vu en attente : 300 ms plus tard, la migration tient
                     # toujours — son `set local lock_timeout = '10s'` a primé
@@ -516,7 +529,7 @@ class MigrationsTest(PgTestCase):
                                 % resultat.get("tenir"))
 
                 def migrer():
-                    con = self.connect_marque(schema, "l835-consult")
+                    con = self.connect_marque(schema, marque_temoin("consult", schema))
                     try:
                         resultat["done"] = [
                             m.version for m in migrations.migrate(con, directory=dossier)]
@@ -530,7 +543,7 @@ class MigrationsTest(PgTestCase):
                     fil2 = threading.Thread(target=migrer, daemon=True)
                     fil2.start()
                     self.assertTrue(
-                        attente_vue(db, "l835-consult", "advisory"),
+                        attente_vue(db, marque_temoin("consult", schema), "advisory"),
                         "le backend de la migration n'a pas été vu en attente consultative")
                     # vu en attente consultative : 300 ms plus tard, il attend
                     # toujours — la borne du mécanisme ne s'y applique pas
@@ -550,6 +563,49 @@ class MigrationsTest(PgTestCase):
             for temoin in (fil, fil2):
                 if temoin is not None:
                     temoin.join(15)
+            holder.close()
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
+    def test_marque_de_temoin_ne_voit_pas_une_autre_invocation(self):
+        """#835 R2 : une marque d'une AUTRE invocation ne compte pas.
+
+        Deux exécutions de la suite peuvent partager le cluster (AMEESH_TEST_DSN
+        commun sur un hôte d'agents). Le témoin doit exiger SA marque : un
+        backend en attente portant une autre marque ne doit jamais le faire
+        passer vert (faux vert relevé par cx2 et l'auditeur).
+        """
+        import threading
+        schema = "t_marque_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        holder = self.connect(schema)
+        fil = None
+        try:
+            db.execute('CREATE SCHEMA "%s"' % schema)
+            db.execute("create table marquee (id int primary key)")
+            marque = marque_temoin("table", schema)
+            autre = marque_temoin("table", "t_autre_%s" % uuid.uuid4().hex[:8])
+
+            def lire():
+                con = self.connect_marque(schema, marque)
+                try:
+                    con.query("SELECT * FROM marquee")
+                finally:
+                    con.close()
+
+            with holder.transaction() as tx:
+                tx.execute("LOCK TABLE marquee IN ACCESS EXCLUSIVE MODE")
+                fil = threading.Thread(target=lire, daemon=True)
+                fil.start()
+                self.assertTrue(attente_vue(db, marque, "relation"),
+                                "le backend portant SA marque n'a pas été vu en attente")
+                self.assertFalse(attente_vue(db, autre, "relation", timeout=0.3),
+                                 "une marque d'une AUTRE invocation a été comptée")
+            fil.join(10)
+            self.assertFalse(fil.is_alive(), "le lecteur bloqué n'a pas rendu la main")
+        finally:
+            if fil is not None:
+                fil.join(15)
             holder.close()
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
