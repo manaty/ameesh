@@ -44,10 +44,31 @@ class BriefsTest(unittest.TestCase):
         self.assertEqual(briefs["auditeur"], text)
 
     def test_stale_lot_sans_assigne(self):
+        # aucun exécuteur vivant : à tous (le premier revenu agit), la prise
+        # du lot restant atomique (`--claim`)
         alert = dict(STALE, agent=None)
         briefs = alert_briefs.briefs(alert, self.listing)
-        self.assertEqual(sorted(briefs), ["orch", "orch-b"])     # équipe inconnue : tous
-        self.assertIn("ameesh work assign 42 <agent>", briefs["orch"])
+        self.assertEqual(sorted(briefs), ["orch", "orch-b"])
+        self.assertIn("ameesh work assign 42 <agent> --claim", briefs["orch"])
+        # exécuteurs vivants : un seul destinataire, choisi par le lot
+        listing = _listing(("orch", "a"), ("orch-b", "b"), ("dev1", "a"),
+                           ("dev2", "b"), ("auditeur", ""))
+        for row in listing[:2]:
+            row.update(lease_live=True, lease_owner="runner-" + row["name"])
+        briefs = alert_briefs.briefs(alert, listing)
+        self.assertEqual(list(briefs), ["orch"])                 # #1026 : un seul
+        # le choix est stable et réparti : le lot suivant va à l'autre
+        self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
+                         ["orch-b"])
+        # l'auditeur garde son exemplaire, quel que soit l'orchestrateur choisi
+        briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"])
+        self.assertEqual(sorted(briefs), ["auditeur", "orch"])
+        self.assertEqual(briefs["auditeur"], briefs["orch"])
+        # un seul exécuteur vivant : c'est lui, quel que soit le lot
+        listing[0].update(lease_live=False)
+        self.assertEqual(list(alert_briefs.briefs(alert, listing)), ["orch-b"])
+        self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
+                         ["orch-b"])
 
     def test_plan_underused(self):
         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])
@@ -62,7 +83,7 @@ class BriefsTest(unittest.TestCase):
                  "orchestrators": ["orch"], "threshold": 1800.0,
                  "detail": "1 agent au repos. Action : répartir"}
         briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
-        self.assertIn("ameesh work assign", briefs["orch"])
+        self.assertIn("ameesh work assign <lot> <agent> --claim", briefs["orch"])
         self.assertIn("Action : répartir", briefs["auditeur"])
         self.assertEqual(alert_briefs.briefs({"type": "long_turn"}, self.listing), {})
 

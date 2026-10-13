@@ -59,6 +59,23 @@ def _of_teams(orchestras, by_name: dict, teams: set) -> list:
     return [o for o in orchestras if not _team(by_name, o) or _team(by_name, o) in teams]
 
 
+def _one_orchestrator(orchestras, by_name: dict, lot) -> list:
+    """Un seul orchestrateur pour un lot sans assigné (#1026).
+
+    Parmi ceux dont l'exécuteur est vivant (`sous_utilisation._awake_runner`),
+    un seul, choisi par le numéro du lot : stable d'une passe à l'autre
+    (relance comprise) et réparti. Aucun exécuteur vivant : tous — ils sont
+    arrêtés, le premier revenu agit, et la prise du lot est de toute façon
+    atomique (`ameesh work assign --claim`)."""
+    names = sorted(orchestras)
+    if not names:
+        return []
+    awake = [n for n in names if sous_utilisation._awake_runner(by_name.get(n) or {})]
+    if not awake:
+        return names
+    return [awake[int(lot or 0) % len(awake)]]
+
+
 def _stale_lot(alert: dict) -> str:
     lot = int(alert["lot"])
     who = alert.get("agent")
@@ -72,7 +89,9 @@ def _stale_lot(alert: dict) -> str:
         move = ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
                 "ameesh work assign %d <agent>" % (who, who, lot, lot))
     else:
-        move = "assign it: ameesh work assign %d <agent>" % lot
+        # #1026 : un lot sans assigné se prend (`--claim`) : deux orchestrateurs
+        # qui l'assignent en même temps ne peuvent plus se voler le lot.
+        move = "assign it: ameesh work assign %d <agent> --claim" % lot
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; otherwise %s; if it is no longer needed: ameesh work "
             "close %d --abandoned (or --superseded-by <id>)." % (head, lot, move, lot))
@@ -163,7 +182,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
+    l'équipe de l'assigné, ou **un seul** quand le lot n'a pas d'assigné
+    (#1026 : sans équipe, le brief partait à tous et deux orchestrateurs
+    traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. Auditeurs : toujours pour les autres
@@ -208,6 +229,13 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
         out = {o: text for o in _of_teams(orchestras, by_name, teams)}
+        if kind == "stale_lot" and not alert.get("agent"):
+            # #1026 : un lot sans assigné n'a pas d'équipe connue, donc `teams`
+            # est vide et `_of_teams` rend tous les orchestrateurs. Deux d'entre
+            # eux ont traité le même brief en 60 s (course #894/#895) : un seul
+            # destinataire.
+            chosen = _one_orchestrator(out, by_name, alert.get("lot"))
+            out = {name: out[name] for name in chosen}
         if kind in ("estimate_bias", "waiting_without_question") \
                 and alert.get("agent") in by_name:
             out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même
