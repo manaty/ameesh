@@ -638,6 +638,7 @@ FIN
 | « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
+| lot de dysfonctionnement (bug, cause racine) en `intake` depuis plus d'1 h (canon §6) ; ou délai §9 dépassé du triple, ou pilote lui-même en retard (escalade, niveau 3) | **réassignation** directe : `ameesh work assign <lot> <agent>` (un agent libre et capable de l'équipe du lot), `agent-mail send <agent> "…" --lot <lot>`, puis une ligne au pilote (`--ack`) | `ameesh work assign <lot> <ancien>` |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
 
 *Hors tour* : `ameesh show <agent> --json` ne dit pas `running`. Un agent en tour
@@ -647,7 +648,9 @@ l'ancienne valeur (`ameesh budget --json`) et l'écrit dans son rapport. Il ne
 relance pas deux fois le même agent dans la même heure : la deuxième fois, il
 propose. Il ne relance pas un agent arrêté à la main par un humain, ni un
 agent tenu par une session interactive, et il ne passe pas par-dessus
-l'orchestrateur qui répartit le travail (règle du 2026-10-11). Il ne démarre
+l'orchestrateur qui répartit le travail (règle du 2026-10-11), sauf dans les
+deux cas que le canon lui donne (processus de lots §6 et §9, 13/10/2026,
+lignes « réassignation » du tableau). Il ne démarre
 jamais lui-même l'exécuteur d'un autre agent (unité systemd) : il nomme le
 geste et qui doit le faire (règle du 2026-10-12). Le démarrage de la réserve
 est une dépense que 0036 permettait déjà, bornée par son arrêt après 30
@@ -857,6 +860,10 @@ le fil du projet que lit le propriétaire.
 * **Résumé quotidien**, au premier passage après 08:00 : dépense de la veille,
   capacité de forfait perdue, gestes faits, correctifs déployés, propositions
   en attente.
+* **Respect des délais (canon §9)**, dans le résumé quotidien : le taux de
+  respect de la veille par étape et par agent, mesuré sur les événements des
+  lots. Pour l'étape la moins respectée, il ouvre un lot de cause racine
+  (`ameesh work add --type bug`) et le confie à un agent libre.
 * **Résumé hebdomadaire**, le lundi au premier passage après 08:00 : la mesure
   de son utilité.
 * `agent-mail status "audit 14:00 : <une ligne>"` à la fin de chaque passage.
