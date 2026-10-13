@@ -237,12 +237,15 @@ class DoctorHooksTest(unittest.TestCase):
 
     def test_missing_command_is_ko(self):
         home = self._home()
+        # #514 R1 : jamais un chemin qui peut exister sur l'hôte — le binaire
+        # est cherché sous un dossier temporaire neuf, donc toujours absent.
+        missing = os.path.join(home, "missing-agent-mail")
         self._write(home, self._document(
-            {"PostToolUse": "/usr/local/bin/agent-mail hook deepseek"}))
+            {"PostToolUse": "%s hook deepseek" % missing}))
         out = self._lines(home)
         self.assertFalse(out["ok"])
         texte = "\n".join(out["lines"])
-        self.assertIn("/usr/local/bin/agent-mail", texte)
+        self.assertIn(missing, texte)
         self.assertIn("127", texte)
 
     def test_found_command_and_all_events(self):
