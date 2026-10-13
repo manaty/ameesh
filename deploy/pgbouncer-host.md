@@ -4,7 +4,8 @@ This recipe is for **bureau**, after review, on `agents-1` and `agents-2`,
 under the Unix user running Ameesh. The script checks the system hostname and
 real/effective UID before creating directories or dispatching any action.
 Only `ameesh-agents-1` / `ameesh` and `ameesh-agents-2` / `ameesh` are accepted;
-root and a mismatched HOME are refused. Bureau must invoke the script as that
+root and a mismatched HOME are refused (HOME and the account home are compared
+as canonical paths, and the canonical home is used). Bureau must invoke the script as that
 user, with its user-systemd environment. Agents prepare the files and tests;
 they do not install, switch configuration or restart services on these VMs.
 
@@ -74,7 +75,8 @@ configuration atomically with mode 0600. A running process keeps its original
 DSN until restart. No runner is restarted by the script.
 The socket DSN retains SQL startup options while removing upstream TLS
 negotiation, certificate and channel-binding settings and `hostaddr`;
-`sslnegotiation=direct` is never combined with local `sslmode=disable`.
+The local DSN explicitly sets `sslnegotiation=postgres` with `sslmode=disable`,
+overriding `PGSSLNEGOTIATION=direct` and libpq service defaults as well.
 
 Before/after JSON records contain server-wide client count, `max_connections`,
 counts by client IP and state, local runner count and direct TCP connections

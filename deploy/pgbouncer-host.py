@@ -41,8 +41,8 @@ def approved_home():
     account = pwd.getpwuid(uid)
     if APPROVED_OPERATORS.get(socket.gethostname()) != account.pw_name:
         raise ValueError('host/user pair is not approved')
-    home = Path(account.pw_dir)
-    if Path.home() != home:
+    home = Path(account.pw_dir).resolve()
+    if Path.home().resolve() != home:
         raise ValueError('HOME differs from the approved user home')
     return home
 
@@ -120,7 +120,9 @@ def socket_conninfo(dsn, socket_dir):
     for key in list(params):
         if key.startswith('ssl') or key in ('hostaddr', 'channel_binding'):
             del params[key]
-    params.update(host=str(socket_dir), port='6432', sslmode='disable', password='')
+    # Explicitly override PGSSLNEGOTIATION and libpq service defaults, too.
+    params.update(host=str(socket_dir), port='6432', sslmode='disable',
+                  sslnegotiation='postgres', password='')
     return psycopg.conninfo.make_conninfo(**params)
 
 

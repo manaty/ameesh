@@ -213,8 +213,45 @@ class OperatorRecipe(unittest.TestCase):
         self.assertEqual(local['host'], '/private/socket')
         self.assertEqual(local['sslmode'], 'disable')
         self.assertEqual(local['options'], '-c search_path=test_schema -c statement_timeout=12345')
-        self.assertFalse(set(local) & {'sslnegotiation', 'sslcert', 'sslkey',
+        self.assertEqual(local['sslnegotiation'], 'postgres')
+        self.assertFalse(set(local) & {'sslcert', 'sslkey',
                                       'sslrootcert', 'hostaddr', 'channel_binding'})
+
+    def test_socket_dsn_overrides_direct_negotiation_from_environment_and_service(self):
+        try:
+            import psycopg
+        except ImportError:
+            self.skipTest('operator recipe requires psycopg; covered by the psycopg job')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / 'pg_service.conf'
+            service.write_text('[upstream]\nsslnegotiation=direct\n')
+            # A nonexistent Unix socket gives a deterministic transport error.
+            # libpq must reach that stage instead of rejecting the TLS settings.
+            for upstream in ('dbname=test', 'service=upstream dbname=test'):
+                with self.subTest(upstream=upstream), mock.patch.dict(
+                        'os.environ', {'PGSSLNEGOTIATION': 'direct',
+                                       'PGSERVICEFILE': str(service)}):
+                    local = self.recipe.socket_conninfo(upstream, root / 'missing')
+                    with self.assertRaises(psycopg.OperationalError) as caught:
+                        psycopg.connect(local, connect_timeout=1)
+                    self.assertNotIn('weak sslmode', str(caught.exception))
+                    self.assertIn(str(root / 'missing'), str(caught.exception))
+
+    def test_approved_home_compares_and_returns_canonical_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_home = root / 'real-home'
+            real_home.mkdir()
+            alias = root / 'alias-home'
+            alias.symlink_to(real_home, target_is_directory=True)
+            with mock.patch.object(self.recipe.socket, 'gethostname', return_value='ameesh-agents-1'), \
+                    mock.patch.object(self.recipe.os, 'getuid', return_value=1001), \
+                    mock.patch.object(self.recipe.os, 'geteuid', return_value=1001), \
+                    mock.patch.object(self.recipe.pwd, 'getpwuid', return_value=types.SimpleNamespace(
+                        pw_name='ameesh', pw_dir=str(alias))), \
+                    mock.patch.object(Path, 'home', return_value=real_home):
+                self.assertEqual(self.recipe.approved_home(), real_home)
 
     def test_preexisting_binary_is_refused_without_execution_or_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
