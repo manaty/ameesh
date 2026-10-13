@@ -29,9 +29,22 @@ class ScopedConnections(PgTestCase):
         return self.db.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid=%s',
                              (pid,))[0]['n']
 
+    def released(self, pid, timeout=5.0):
+        """Constate la disparition du backend, en l'attendant un peu (#925).
+
+        Fermer une connexion est asynchrone côté serveur : le backend peut
+        rester quelques millisecondes dans pg_stat_activity, davantage sur un
+        runner chargé (rouge CI #499, 13/10). La session est bien libérée ; la
+        mesure ne doit pas dépendre de cet ordonnancement.
+        """
+        deadline = time.monotonic() + timeout
+        while self.present(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return self.present(pid)
+
     def test_session_released_before_external_work(self):
         pid = self.scoped.query('SELECT pg_backend_pid() AS pid')[0]['pid']
-        self.assertEqual(self.present(pid), 0)
+        self.assertEqual(self.released(pid), 0)
         self.scoped.execute('INSERT INTO scoped_values VALUES (1)')
         self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [{'n': 1}])
 
@@ -44,7 +57,7 @@ class ScopedConnections(PgTestCase):
                 self.assertEqual(tx.query('SELECT n FROM scoped_values'), [{'n': 1}])
                 self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [])
                 raise ValueError('abort')
-        self.assertEqual(self.present(pid), 0)
+        self.assertEqual(self.released(pid), 0)
         self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [])
 
     def test_nested_transaction_rollback_retains_outer_session(self):
@@ -78,6 +91,7 @@ class ScopedConnections(PgTestCase):
                     queried.wait()
             except BaseException as error:
                 errors.append(error)
+                queried.abort()
 
         threads = [threading.Thread(target=run, args=(value,)) for value in (1, 2)]
         for thread in threads:
@@ -89,13 +103,7 @@ class ScopedConnections(PgTestCase):
         self.assertEqual(len(set(pids)), 2)
         # Le backend quitte pg_stat_activity de façon asynchrone après close() :
         # on attend sa disparition (borné) au lieu de la lire une seule fois.
-        closed = False
-        for _ in range(100):
-            if not any(self.present(pid) for pid in pids):
-                closed = True
-                break
-            time.sleep(0.05)
-        self.assertTrue(closed, "session toujours ouverte après la transaction")
+        self.assertEqual([self.released(pid) for pid in pids], [0, 0])
 
     def test_capacity_query_works_with_each_driver(self):
         reading = db_capacity.read(self.db)
