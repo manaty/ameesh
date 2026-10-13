@@ -58,40 +58,21 @@ on conflict (work_item_id, slot) do nothing;
 
 create or replace function work_items_migration_slot_sync() returns trigger
 language plpgsql as $$
-declare
-    slot_status text;
 begin
     if new.migration is null then
         update work_migration_reservations set status = 'released', updated_at = now()
         where work_item_id = new.id and slot = 'default' and status = 'reserved';
     else
-        slot_status := case when new.state in ('merged', 'promoted') then 'landed'
-                            when new.state = 'closed' then 'released' else 'reserved' end;
-        -- #879 : un numéro déjà atterri ne redevient jamais `reserved` tant
-        -- qu'il ne change pas. `merged -> blocked` (TRANSITIONS) rejoue la
-        -- projection : réinsérer la ligne avec le statut `reserved` la ferait
-        -- échouer sur l'index partiel (ou la garde) avec un 23505 brut si un
-        -- autre lot a pris le numéro entre-temps. On met donc à jour la ligne
-        -- existante, et un `landed` de même numéro le reste ; une nouvelle
-        -- réservation (numéro suivant) suit, elle, son statut normal.
-        update work_migration_reservations
-           set number = new.migration, project = coalesce(new.app, ''),
-               target_repo = 'github.com/' || new.migration_repo,
-               target_branch = nullif(regexp_replace(new.branch_target, '^(refs/heads/|refs/remotes/origin/|origin/)', ''), ''),
-               status = case when work_migration_reservations.status = 'landed'
-                              and slot_status = 'reserved'
-                              and work_migration_reservations.number = new.migration
-                             then 'landed' else slot_status end,
-               updated_at = now()
-         where work_item_id = new.id and slot = 'default';
-        if not found then
-            insert into work_migration_reservations
-                (work_item_id, slot, number, project, target_repo, target_branch, status)
-            values (new.id, 'default', new.migration, coalesce(new.app, ''),
-                    'github.com/' || new.migration_repo,
-                    nullif(regexp_replace(new.branch_target, '^(refs/heads/|refs/remotes/origin/|origin/)', ''), ''),
-                    slot_status);
-        end if;
+        insert into work_migration_reservations
+            (work_item_id, slot, number, project, target_repo, target_branch, status)
+        values (new.id, 'default', new.migration, coalesce(new.app, ''),
+                'github.com/' || new.migration_repo, nullif(regexp_replace(new.branch_target, '^(refs/heads/|refs/remotes/origin/|origin/)', ''), ''),
+                case when new.state in ('merged', 'promoted') then 'landed'
+                     when new.state = 'closed' then 'released' else 'reserved' end)
+        on conflict (work_item_id, slot) do update
+            set number = excluded.number, project = excluded.project,
+                target_repo = excluded.target_repo, target_branch = excluded.target_branch,
+                status = excluded.status, updated_at = now();
     end if;
     return new;
 end $$;

@@ -530,6 +530,44 @@ class ScopedReservationsTest(PgTestCase):
         renewed = reservations.listing(self.db, self.a['id'])[0]
         self.assertEqual((renewed['number'], renewed['status']), (401, 'reserved'))
 
+    def test_landing_projection_and_null_in_one_statement_lands(self):
+        """#1022, copie #879 : la fusion qui remet la projection à NULL lande.
+
+        C'est la règle que 0420 et 0432 portent chacune en entier : un client
+        peut écrire l'état et la projection en une seule instruction."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.db.execute("UPDATE work_items SET state = 'merged', migration = NULL,"
+                        " migration_repo = NULL WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+
+    def test_landing_then_null_in_one_transaction_lands(self):
+        """#1022 : deux instructions dans une transaction — la dernière
+        écriture voit l'état `merged` et lande le créneau."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        with self.db.transaction() as tx:
+            tx.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (self.a['id'],))
+            tx.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
+                       " WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+
+    def test_release_without_landing_stays_released(self):
+        """#1022 : une libération sans atterrissage reste `released`."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
+                        " WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'released')
+
+    def test_closed_without_landing_stays_released(self):
+        """#1022 : un lot clos sans atterrissage libère sans lander."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'abandoned',"
+                        " migration = NULL, migration_repo = NULL WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'released')
+
     def test_cli_json_list_and_legacy_output_compatible(self):
         args = ('work', 'migration', str(self.a['id']))
         proc = self.mesh(*args, '--slot', 'schema', '--slot', 'backfill', '--target-branch', 'develop',

@@ -93,11 +93,16 @@ reserved SHA is an ancestor of the supplied target commit and that each
 reserved number appears in its migration directory. The consumer remains
 responsible for checking the migration contents. Repeated lifecycle transitions
 are idempotent. Released slots can reserve again; landed slots retain their
-history and cannot be released or reused. A lot returning from `merged` to
-`blocked` keeps its landed number: the projection never turns a landed record
-back into `reserved`, so the transition cannot collide with a number another
-lot reserved meanwhile. If that lot reserves a new number, the record follows
-the new number as `reserved`. Explicit cleanup and landing remain
+history and cannot be released or reused. A landing transition (`merged`,
+`promoted`) lands the slot even when `work_items.migration` is set to NULL in
+the same statement or transaction; a release without landing (lot `closed`, or
+projection cleared while the lot stays open) leaves it `released`. A lot
+returning from `merged` to `blocked` keeps its landed number: the projection
+never turns a landed record back into `reserved`, so the transition cannot
+collide with a number another lot reserved meanwhile. If that lot reserves a
+new number, the record follows the new number as `reserved`. Migration 0420
+and its copy 0432 each carry both rules in full, since unapplied files are not
+guaranteed to be applied in numeric order. Explicit cleanup and landing remain
 possible after the lot is closed or merged. The reservation stays active across
 freeze, review and lot-state changes until explicitly landed, released, or
 invalidated by target requalification.
