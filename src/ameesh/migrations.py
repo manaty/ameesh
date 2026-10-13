@@ -30,8 +30,9 @@ _LOCK = "ameesh_migrations"
 #:
 #: Le verrou consultatif qui sérialise les migrations, lui, n'est pas borné
 #: (posé avant ce réglage) : deux `migrate` concurrents s'attendent au lieu de
-#: s'échouer l'un l'autre — et l'attente du second est bornée par le premier,
-#: qui ne peut lui-même attendre un verrou de table plus de LOCK_TIMEOUT.
+#: s'échouer l'un l'autre. Cette attente dure ce que dure la migration qui
+#: tient le verrou — une migration peut être longue (statement_timeout levé) ;
+#: c'est voulu, LOCK_TIMEOUT ne la borne pas.
 LOCK_TIMEOUT = "5s"
 
 BOOTSTRAP = """
@@ -281,7 +282,8 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR, log
             # ... puis on borne l'attente des verrous de table (L835) : sans
             # cela une migration qui attend ACCESS EXCLUSIVE bloque derrière
             # elle tous les lecteurs et écrivains de la table. Posé après le
-            # verrou consultatif, qui doit pouvoir attendre son tour.
+            # verrou consultatif : celui-ci doit pouvoir attendre son tour
+            # aussi longtemps que la migration qui le tient.
             "SET LOCAL lock_timeout = '%s';\n%s\n"
             "insert into schema_migrations (version, name, checksum) values (%d, %s, %s);\n"
             % (
