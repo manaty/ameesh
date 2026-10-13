@@ -229,7 +229,10 @@ class CleanupLimitsTest(unittest.TestCase):
                     mock.patch.object(os, "waitid", side_effect=OSError(error, "unsupported")) as wait, \
                     mock.patch.object(platform, "start_time", side_effect=identity), \
                     mock.patch.object(platform, "reap", wraps=platform.reap) as reap:
-                tracker._reap_strays(platform.process_table(), [])
+                # Only this test's children: earlier modules of the same
+                # shard may leave zombies of the test process (#417 CI).
+                table = [p for p in platform.process_table() if p["pid"] in pids]
+                tracker._reap_strays(table, [])
                 self.assertFalse(ProcessHandle._wait_supported)
                 self.assertEqual(wait.call_count, 1)
                 self.assertEqual(wait.call_args.args[0], os.P_PIDFD)
