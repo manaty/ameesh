@@ -194,6 +194,7 @@ class _Handoff(_Base):
 
     def lot(self, title, assignee="claude1", *, state="intake", app="nexlink", actor=None,
             **kw):
+        kw.setdefault("force", "test: several lots for one agent (#540)")
         item = work.add(self.db, title=title, app=app, assignee=assignee,
                         actor=actor or self.orch, **kw)
         if state != "intake":

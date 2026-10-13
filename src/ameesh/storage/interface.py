@@ -993,13 +993,20 @@ class WorkItems(Domain):
             package_id: str | None = None, package_parent: str | None = None,
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
-            estimate_source: str | None = None, change_size: str | None = None) -> dict:
+            estimate_source: str | None = None, change_size: str | None = None,
+            queued_note: str | None = None, forced_note: str | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
         si `change_size`, L157b) et sa première ligne de journal ; rend le
-        lot."""
+        lot. #540 : avec `queued_note`, un `assignee` qui a déjà un lot
+        ouvert non démarré (sans `started_at`) ne le reçoit pas : le lot va
+        dans la file d'équipe (sans assigné), journalisé par `queued_note`
+        (`{lot}` : le lot déjà en attente), rendu avec `queued_behind`.
+        Avec `forced_note` aussi (`--force` motivé) : l'agent le reçoit quand
+        même, journalisé par `forced_note`, rendu avec `forced_behind`.
+        Contrôle et écriture sous le verrou de transaction de l'agent."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1209,10 +1216,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
-               actor: str) -> dict | None:
+               actor: str, queued_note: str | None = None,
+               forced_note: str | None = None) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
-        L40 : efface la délégation en cours (issue `annulee`)."""
+        L40 : efface la délégation en cours (issue `annulee`). #540 : avec
+        `queued_note`, un lot non démarré ne va pas à un `assignee` qui a déjà
+        un autre lot ouvert non démarré : il passe dans la file d'équipe
+        (sans assigné), comme `add` (`forced_note` de même)."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,

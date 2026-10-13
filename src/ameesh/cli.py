@@ -3,7 +3,7 @@
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
   agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
-                 [--estimate 2h] [--app PROJECT]] [--queue]
+                 [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
@@ -11,6 +11,9 @@
                                                  to the recipient and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
+                                                 #540: a recipient who already has a work item
+                                                 not started does not get it (team queue, the
+                                                 message is not dropped) unless --force "reason";
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
@@ -235,7 +238,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
+    force = None
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate",
+                 "--app", "--force"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -254,6 +259,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 estimate = value if value is not None else ""
             elif flag == "--app":
                 app = value if value is not None else ""
+            elif flag == "--force":
+                # #540 : forcer la file d'équipe, avec sa raison (journal du lot)
+                force = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -434,7 +442,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project)
+                estimate=estimate, app=app, new_project=new_project, force=force)
         except assignments.AssignmentError as exc:
             print("message not dropped — %s" % exc, file=sys.stderr)
             return 2

@@ -1324,7 +1324,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
-                note=introduced)
+                note=introduced,
+                force=args.force)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -1346,12 +1347,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("warning: %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_deep_analysis(item.get("deep_analysis"))
             _print_assignment(check)
+            if item.get("queue_warning"):
+                print("warning: %s" % item["queue_warning"], file=sys.stderr)
             return 0
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
-                              branch_target=args.target)
-            if out["previous"] == out["item"]["assignee"]:
+                              branch_target=args.target, force=args.force)
+            if out.get("queue_warning"):
+                print("lot #%d not assigned to %s (before: %s)" % (
+                    out["item"]["id"], args.agent, out["previous"] or "nobody"))
+                print("warning: %s" % out["queue_warning"], file=sys.stderr)
+            elif out["previous"] == out["item"]["assignee"]:
                 print("lot #%d: branch %s (assigned to %s)" % (
                     out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
             else:
@@ -2298,6 +2305,9 @@ def build_parser() -> argparse.ArgumentParser:
     work_sub = p_work.add_subparsers(dest="work_command")
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
+    pw_add.add_argument("--force", metavar="REASON",
+                        help="#540: give the lot to an assignee who already has a lot not "
+                             "started (the reason goes to the lot's journal)")
     pw_add.add_argument("--type", default="evolution",
                         help="an improvement backlog item goes through "
                              "`ameesh work backlog add` (L119)")
@@ -2389,6 +2399,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign = work_sub.add_parser(
         "assign", help="reassign a work item to a wakeable agent (L37, 0030)")
     pw_assign.add_argument("id", type=int)
+    pw_assign.add_argument("--force", metavar="REASON",
+                           help="#540: assign even though the agent already has a lot not "
+                                "started (the reason goes to the lot's journal)")
     pw_assign.add_argument("agent")
     pw_assign.add_argument("--externe", action="store_true",
                            help="force assignment to an external agent that has a "

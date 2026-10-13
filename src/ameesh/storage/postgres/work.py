@@ -76,6 +76,11 @@ MIGRATION_INDEX = "work_items_migration_repo_idx"
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
 
+#: #540 : verrou de transaction d'un agent : « a-t-il déjà un lot non démarré ? »
+#: et l'attribution qui suit passent l'une après l'autre
+PENDING_LOCK = ("SELECT pg_advisory_xact_lock("
+                "hashtextextended(current_schema() || ':pending_lot:' || %s, 0))")
+
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
 #: (`first_turn_at`), une transition ou note du lot, un jalon, une action
@@ -194,10 +199,17 @@ class WorkItems(interface.WorkItems):
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
-            estimate_source=None, change_size=None) -> dict:
+            estimate_source=None, change_size=None, queued_note=None,
+            forced_note=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
-        avec sa durée estimée (et sa ligne d'historique), en UNE transaction."""
+        avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
+        #540 : `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
+            behind = (WorkItems(tx)._pending(assignee, None)
+                      if queued_note is not None and assignee else None)
+            if behind is not None:
+                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                                  else (None, queued_note.format(lot=behind)))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -221,6 +233,8 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if behind is not None:
+                item["forced_behind" if forced_note else "queued_behind"] = behind
             return item
 
     def get(self, item_id) -> dict | None:
@@ -268,13 +282,37 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, note, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor,
+               queued_note=None, forced_note=None) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
-        en cours est effacée (issue `annulee` au registre)."""
+        en cours est effacée (issue `annulee` au registre). #540 :
+        `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
-            return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            behind = None
+            if queued_note is not None and assignee:
+                lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
+                               " WHERE id = %s FOR UPDATE", (int(item_id),))
+                if lot and lot[0]["fresh"]:
+                    behind = WorkItems(tx)._pending(assignee, int(item_id))
+            if behind is not None:
+                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                                  else (None, queued_note.format(lot=behind)))
+            row = WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            if row is not None and behind is not None:
+                row["forced_behind" if forced_note else "queued_behind"] = behind
+            return row
+
+    def _pending(self, assignee, item_id) -> int | None:
+        """#540, dans la transaction ouverte et sous le verrou de l'agent : son
+        plus ancien lot ouvert non démarré autre que `item_id`, ou None."""
+        self.db.query(PENDING_LOCK, (assignee,))
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
+            "   AND state NOT IN %s AND id <> %%s ORDER BY id LIMIT 1" % _CLOSED,
+            (assignee, int(item_id or 0)))
+        return int(rows[0]["id"]) if rows else None
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
         """`assign` dans la transaction ouverte ; `state` : celui exigé."""

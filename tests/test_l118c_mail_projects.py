@@ -43,7 +43,7 @@ class MailProjectTests(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "sender")
         self.db.execute("UPDATE agent_registry SET team = NULL WHERE name = 'orch'")
-        proc = self.send_new()
+        proc = self.send_new("--force", "test: second lot of dev1 (#540)")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "legacy")
 

@@ -194,6 +194,8 @@ def add(
     estimate_source: str | None = None,
     size: str | None = None,
     note: str = "",
+    team_queue: bool = True,
+    force: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -210,7 +212,13 @@ def add(
     L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
     clé de la table de référence des durées.
     #506: `note` is appended to the creation event (a project introduced
-    with --new-project)."""
+    with --new-project).
+
+    #540 : un agent qui a déjà un lot non démarré ne reçoit pas celui-ci : il
+    va dans la file d'équipe (`queued_behind`, `queue_warning`) ; sauf
+    `team_queue=False` (le lot d'une demande de décision, que son auteur
+    attend). `force` : la raison d'un forçage (`--force "<raison>"`), écrite
+    au journal avec son auteur ; vide, aucun forçage."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -226,25 +234,33 @@ def add(
         raise WorkError("title required")
     if priority is not None and priority not in PRIORITIES:
         raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
+    queued = None
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
-        assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
+        check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+        assignee = check["assignee"]
+        queued = check if team_queue else None
     elif externe:
         raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
+    created = ("created" + (" (plan: %s)" % package if package else "")
+               + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+               + ("; %s" % note if note else ""))
     item = storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
-        + ("; estimate: %s" % span(minutes * 60) if minutes else "")
-        + ("; %s" % note if note else ""),
+        budget_usd=budget_usd, note=created,
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
-        if minutes else None, change_size=size or None)
+        if minutes else None, change_size=size or None,
+        queued_note=queued and _queued_note(queued, created),
+        forced_note=queued and _forced_note(queued, created, force, actor))
+    if item.get("queued_behind") is not None:
+        item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
@@ -567,7 +583,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
-           cfg=None, branch: str | None = None, branch_target: str | None = None) -> dict:
+           cfg=None, branch: str | None = None, branch_target: str | None = None,
+           force: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -595,13 +612,73 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # L40 (0030) : la réassignation efface la délégation en cours
         "; delegation from %s cancelled" % item["delegated_by"]
         if item.get("delegated_by") and item.get("due_ts") else "")
+    queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
+                          % (check["assignee"], previous or "nobody"))
     row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
-                                     actor=actor)
+                                     actor=actor, queued_note=queued,
+                                     forced_note=queued and _forced_note(check, note, force,
+                                                                         actor))
     if row is None:
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    behind = row.get("queued_behind")
     if branch:
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
-    return {"item": row, "check": check, "previous": previous}
+    out = {"item": row, "check": check, "previous": previous}
+    if behind is not None:
+        row["queued_behind"] = behind
+        out["queue_warning"] = queue_warning(db, row, check["assignee"])
+    return out
+
+
+def _queued_note(check: dict, head: str) -> str | None:
+    """#540 : la note du journal d'un lot mis dans la file d'équipe faute de
+    place chez l'agent (`{lot}` : son lot déjà en attente) ; None pour un
+    humain ou un agent externe, hors de la règle."""
+    if check["externe"] or check["assignee"].startswith(HUMAN_PREFIX):
+        return None
+    return "%s; team queue (#540): %s already has lot #{lot} not started" % (
+        _braces(head), check["assignee"])
+
+
+def _forced_note(check: dict, head: str, reason: str | None, actor: str) -> str | None:
+    """#540 (canon §4, « sauf --force motivé ») : la note d'une attribution
+    forcée malgré un lot non démarré ; None sans raison (pas de forçage)."""
+    reason = " ".join(str(reason or "").split())
+    if not reason or _queued_note(check, head) is None:
+        return None
+    return ("%s; team queue (#540) forced by %s: %s already has lot #{lot} not started; "
+            "reason: %s" % (_braces(head), _braces(actor or "?"), check["assignee"],
+                            _braces(reason)))
+
+
+def _braces(text: str) -> str:
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def lot_team(db: Db, item: dict) -> str | None:
+    """L'équipe du lot comme la lit la prise L165 : la sienne, sinon celle de
+    sa fiche ou de la fiche parente, sinon son application."""
+    st = storage.of(db)
+    for value in (item.get("team"),
+                  *((st.packages.get(p) or {}).get("team")
+                    for p in (item.get("package_id"), item.get("package_parent")) if p),
+                  item.get("app")):
+        if (value or "").strip():
+            return value.strip()
+    return None
+
+
+def queue_warning(db: Db, item: dict, agent: str) -> str:
+    """#540 : ce qu'on dit à qui attribue un lot mis dans la file d'équipe."""
+    team = lot_team(db, item)
+    later = "ameesh work assign once %s starts #%s" % (agent, item["queued_behind"])
+    return ("lot #%s put in the team queue: %s already has lot #%s not started (at most one "
+            "per agent, #540); %s" % (
+                item["id"], agent, item["queued_behind"],
+                "it is %s: it waits for the orchestrator (%s)" % (item["state"], later)
+                if item.get("state") != "intake" else
+                "an idle agent of team %s will take it (L165)" % team if team else
+                "it has no team: it waits for the orchestrator (%s)" % later))
 
 
 # --------------------------------------------------------------------------

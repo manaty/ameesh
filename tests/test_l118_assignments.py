@@ -153,7 +153,9 @@ class BranchMergeTest(_Base):
         _git(self.repo, "checkout", "-q", "develop")
 
     def lot(self, branch):
-        return work.add(self.db, title="lot", assignee="dev1", branch=branch)
+        # #540 : plusieurs lots non démarrés au même agent, forcés
+        return work.add(self.db, title="lot", assignee="dev1", branch=branch,
+                        force="test: several branches of one agent")
 
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
