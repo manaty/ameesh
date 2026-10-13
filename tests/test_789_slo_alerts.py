@@ -13,8 +13,10 @@ import json
 import os
 import time
 import unittest
+from unittest import mock
 
-from ameesh import alert_briefs, exploitation, notify, registry, work, work_dependencies
+from ameesh import (alert_briefs, exploitation, notify, progress, registry, work,
+                    work_dependencies)
 
 from .support import FAKEBIN, PgTestCase
 
@@ -237,6 +239,47 @@ class NotifyLivreTest(_Base):
         self.assertEqual((bas["reason"], haut["reason"]),
                          ("intake_started/level-1", "intake_started/level-2"))
         self.assertNotEqual(notify.key_of(bas), notify.key_of(haut))
+
+
+class LotIllisibleTest(_Base):
+    """#1107 (n2 P3 de #1035) : la passe SLO isole un lot illisible.
+
+    Un instant qui n'en est pas un fait lever la conversion `float()` du
+    moteur ; sans garde, ce seul lot faisait tomber **toute** la passe
+    d'alertes. Le lot fautif est signalé (`slo_unreadable`), les lots sains
+    gardent leurs alertes."""
+
+    def _lire(self, malsain):
+        vrai = progress._work_item_milestones
+
+        def lire(item, events, actions, declared=None):
+            if int(item["id"]) == int(malsain["id"]):
+                raise ValueError("could not convert string to float: 'pas-un-instant'")
+            return vrai(item, events, actions, declared)
+        return lire
+
+    def test_lot_illisible_signale_les_autres_gardent_leurs_alertes(self):
+        self.age(1.5 * HEURE)                           # lot sain, en retard
+        sain = work.add(self.db, title="un autre lot SLO", assignee="dev1")
+        self.age(1.5 * HEURE, lot=sain)
+        malsain = work.add(self.db, title="lot illisible", assignee="dev1")
+        self.age(1.5 * HEURE, lot=malsain)
+
+        with mock.patch.object(progress, "_work_item_milestones",
+                               side_effect=self._lire(malsain)):
+            alerts = exploitation.alerts(self.cfg, self.db, now=self.now,
+                                         **_seuils(orchestrators_declared=["orch"]))
+
+        sains = {a["lot"] for a in alerts if a["type"] == "slo_breach"}
+        signaux = [a for a in alerts if a["type"] == "slo_unreadable"]
+        self.assertEqual(sains, {self.lot["id"], sain["id"]})
+        self.assertEqual([a["lot"] for a in signaux], [malsain["id"]])
+        self.assertEqual(signaux[0]["agent"], "dev1")
+        self.assertIn("ValueError", signaux[0]["detail"])
+        self.assertIn("pas-un-instant", signaux[0]["detail"])
+        # un type d'alerte non enregistré ferait tomber le tri d'`alerts()`
+        self.assertIn("slo_unreadable", exploitation.ALERT_TYPES)
+        self.assertIn("slo_unreadable", notify.TYPE_LABELS)
 
 
 if __name__ == "__main__":
