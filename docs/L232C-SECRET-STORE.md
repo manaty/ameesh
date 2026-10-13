@@ -160,7 +160,7 @@ journal carries no value, no digest and no connection string.
 
 ## Tests
 
-`tests/test_l232c_coffre.py` (46 cases, no database, no root, no network):
+`tests/test_l232c_coffre.py` (47 cases, no database, no root, no network):
 
     PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre
 
@@ -171,6 +171,7 @@ before effect, health rollback to the previous version, rotation and
 revocation, transport failure and inconsistent receipts, the refusal of an
 `install` on a managed destination (and the `rotate` authority), recovery
 after an interruption at each transaction boundary (value written without
-commit, intent without value, commit without cleanup, orphan temporary),
-concurrent rotations and rotate/revoke, an inter-process `flock` holder, and
-a subprocess canary through the helper entry point.
+commit, intent without value, rollback copy without intent, commit without
+cleanup, orphan temporary), concurrent rotations and rotate/revoke, an
+inter-process `flock` holder, and a subprocess canary through the helper
+entry point.

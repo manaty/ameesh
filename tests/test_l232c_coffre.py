@@ -407,6 +407,42 @@ class InstalleurTest(Materiel):
         self.assertEqual(sidecar, {"version": request["version"]})
         self.assertFalse(pending.exists())
 
+    def test_reprise_apres_copie_de_retour_sans_intention(self):
+        class Arret(Exception):
+            pass
+
+        _, premier = self.handle()
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        original = installeur._atomic_write
+        pending = self.key.with_name(self.key.name + ".pending")
+
+        def ecriture(path, data, destination, *, mode, owner, group):
+            if path == pending:
+                raise Arret()
+            return original(path, data, destination, mode=mode, owner=owner,
+                            group=group)
+
+        installeur._atomic_write = ecriture
+        payload, request = self.trame(value=b"sk-canary-v2", operation="rotate")
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        rollback = self.key.with_name(self.key.name + ".rollback")
+        # la copie de retour existe sans intention : l'ancien etat fait foi.
+        self.assertTrue(rollback.exists())
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.key.read_bytes(), CANARY)
+        sidecar = self.key.with_name(self.key.name + ".version")
+        self.assertEqual(json.loads(sidecar.read_bytes()), {"version": premier["version"]})
+        # la reprise rejoue la rotation et n'ecrase pas la precedente.
+        installeur._atomic_write = original
+        receipt = json.loads(installeur.handle(payload))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": request["version"], "previous": premier["version"]})
+        self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(), CANARY)
+        self.assertFalse(rollback.exists() or pending.exists())
+
     def test_reprise_apres_commit_sans_menage(self):
         class Arret(Exception):
             pass
