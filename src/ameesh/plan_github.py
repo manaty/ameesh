@@ -66,6 +66,8 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -164,6 +166,90 @@ def _lines(gh, argv: list[str]) -> list[dict]:
             except ValueError as exc:
                 raise GithubError("gh %s: unreadable line" % " ".join(argv[:3])) from exc
     return rows
+
+
+# --------------------------------------------------------------------------
+# lectures GitHub par jeton (L160f) : le client d'ameesh, sans sous-processus
+# --------------------------------------------------------------------------
+
+#: variables qui portent le jeton GitHub — les mêmes que `gh` (L160f : une
+#: vue servie par `ameesh progress --serve` n'appelle jamais la CLI `gh`)
+TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+#: base de l'API, surchargeable comme dans les flux CI (GitHub Enterprise)
+API_BASE = "https://api.github.com"
+
+
+def token_of(env=None) -> str:
+    """Le jeton GitHub de l'hôte : `GH_TOKEN`, sinon `GITHUB_TOKEN`, sinon ''."""
+    env = os.environ if env is None else env
+    for name in TOKEN_VARS:
+        value = str(env.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+class Api:
+    """Les lectures GitHub par HTTPS, avec le jeton de l'hôte (lecture seule).
+
+    `get(chemin) -> JSON` ; toute panne (réseau, refus, réponse illisible)
+    lève `GithubError`, jamais autre chose."""
+
+    def __init__(self, token=None, *, env=None, base=None, timeout=60.0):
+        env = os.environ if env is None else env
+        self.token = str(token if token is not None else token_of(env)).strip()
+        self.base = str(base or env.get("GITHUB_API_URL") or API_BASE).rstrip("/")
+        self.timeout = float(timeout)
+
+    def get(self, path: str):
+        url = "%s/%s" % (self.base, str(path).lstrip("/"))
+        request = urllib.request.Request(url, method="GET", headers={
+            "Authorization": "Bearer %s" % self.token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ameesh"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise GithubError("GitHub %s: HTTP %d" % (path, exc.code)) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise GithubError("GitHub %s: %s"
+                              % (path, " ".join(str(exc).split())[:200])) from exc
+        try:
+            return json.loads(body) if body.strip() else None
+        except ValueError as exc:
+            raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
+
+
+class GhApi:
+    """`gh api` derrière l'interface d'`Api` : le repli LOCAL, quand l'hôte
+    n'a pas de jeton (un poste de travail, jamais le serveur)."""
+
+    def __init__(self, gh):
+        self.gh = gh
+
+    def get(self, path: str):
+        return _json(self.gh, ["api", path])
+
+
+def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
+           allow_gh: bool = True):
+    """Le client de lecture GitHub : le jeton s'il est là, sinon `gh`.
+
+    `allow_gh=False` (le serveur) : sans jeton, rend None — `gh` n'est pas
+    appelé et l'appelant dit le manque."""
+    env = os.environ if env is None else env
+    if token_of(env):
+        return Api(env=env, timeout=timeout)
+    if not allow_gh:
+        return None
+    return GhApi(Gh(gh, env=env, timeout=timeout))
+
+
+def client_name(env=None) -> str:
+    """Ce que `client` utiliserait : `api` (jeton) ou `gh` (repli local)."""
+    return "api" if token_of(env) else "gh"
 
 
 # --------------------------------------------------------------------------

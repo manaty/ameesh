@@ -31,6 +31,18 @@ leases, accounting marker, `turn_costs` ledger) — never by git or the board:
   epics, tasks, milestones and commitments, planned versus actual, today
   line, delays and source of each item; shown by default, `--no-gantt`
   removes it.
+* **versions** (L160f, #497, key `versions`, schema `ameesh-versions/1`):
+  per project and product (one per version-tag stream of its repository),
+  the last published version and its date (GitHub tags and releases) and
+  the next release — its open release lots, its planned date (the plan of
+  the lots, otherwise the p80 of the L157 reference table), its state and
+  its content (the release notes of the release branch, otherwise the lots
+  merged since the last tag grouped by theme, their PR read from the
+  database). GitHub is read **read-only** with the host's token
+  (`GH_TOKEN`/`GITHUB_TOKEN`, `gh` only as a local fallback), cached 5 min
+  and shared by `--serve`; every datum says its source and read time, an
+  unreadable GitHub is said in `versions.missing` and never fails the view.
+  `--no-versions` does not read it at all.
 
 The JSON follows the versioned schema `ameesh-progress/1`
 (`docs/PROGRESS.md`). `--html` writes a self-contained static page (no
@@ -62,6 +74,7 @@ from . import estimates as estimates_mod
 from . import plan as plan_mod
 from . import stagnation
 from . import storage
+from . import versions as versions_mod
 from . import work as work_mod
 
 SCHEMA = "ameesh-progress/1"
@@ -614,17 +627,22 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
 def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
              book: cost_mod.CostBook | None = None, now: float | None = None,
              max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
-             stale_after: float | None = None, gantt: bool = True) -> dict:
+             stale_after: float | None = None, gantt: bool = True,
+             github: "versions_mod.Reader | None" = None) -> dict:
     """L'instantané `ameesh-progress/1` (voir docs/PROGRESS.md).
 
     Les bornes (`max_lots`, `max_actions`) ne limitent que le RENDU : les
     lots ouverts passent avant les fusionnés, et les jalons et l'état d'un
     lot affiché sont lus sans borne (son journal complet, toutes ses
     actions). Toute coupure est dite dans `truncated`.
+
+    `github` (L160f) : le lecteur GitHub des versions, partagé par `--serve`
+    (cache) ; None : les versions ne sont pas lues, la vue le dit.
     """
     now = time.time() if now is None else float(now)
     since_ts = parse_since(since, now)
-    st = storage.of(db).progress
+    store = storage.of(db)
+    st = store.progress
     items = st.lots(since_ts=since_ts, project=project, limit=max_lots)
     items.sort(key=lambda i: (i.get("created_ts") or 0, int(i["id"])))
     ids = [int(i["id"]) for i in items]
@@ -710,6 +728,15 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         pending = [d for d in pending if d.get("project") == project]
     overview = build_overview(by_project["projects"], lots, plan["milestones"],
                               milestone_projects(package_rows, package_items), pending)
+    # L160f (#497) : les versions des produits et leurs prochaines releases,
+    # lues en lecture seule sur GitHub ; jamais une erreur, un manque est dit
+    try:
+        version_view = versions_mod.collect(store, db, cfg, project=project,
+                                            reader=github, now=now, packages=packages,
+                                            package_items=package_items)
+    except Exception as exc:  # noqa: BLE001 - une vue ne tombe pas pour GitHub
+        version_view = versions_mod.empty(
+            "versions: unreadable (%s)" % " ".join(str(exc).split())[:200])
 
     return {
         "schema": SCHEMA,
@@ -727,6 +754,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         # L304 (champs ajoutés) : une carte par projet, décisions en attente
         "overview": overview,
         "decisions": pending,
+        # L160f (#497) : versions publiées et prochaines releases par produit
+        "versions": version_view,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -793,6 +822,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
         out.extend(projects_mod.format_lines(
             {"generated_ts": now, "projects": snap["projects"]}, width,
             show_inactive=bool(snap.get("project")), indent="  "))
+
+    if snap.get("versions"):
+        # L160f (#497) : dernières versions publiées et prochaines releases
+        out.append("")
+        out.extend(versions_mod.format_lines(snap["versions"], width))
 
     if snap.get("roadmap"):
         # L96 : la feuille de route (Gantt texte), avant le détail des lots
@@ -1030,6 +1064,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="window start: duration (16h, 2d) or ISO date (default 24h)")
     parser.add_argument("--no-gantt", action="store_true",
                         help="omit the Gantt roadmap (shown by default, L96)")
+    parser.add_argument("--no-versions", action="store_true",
+                        help="do not read GitHub tags and releases (L160f, #497)")
     parser.add_argument("--stale-after", default=None,
                         help="a lot is stale after this long without activity (default "
                              "AMEESH_STALE_AFTER, else 6h)")
@@ -1056,14 +1092,17 @@ def main(argv: list[str] | None = None) -> int:
                 raise ProgressError("--port out of range: %s" % port)
             return progress_serve.serve(cfg, port=port, since=args.since,
                                         stale_after=threshold, gantt=not args.no_gantt,
-                                        project=args.project)
+                                        project=args.project,
+                                        versions=not args.no_versions)
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db, defer=True)
+            # L160f (#497) : un lecteur GitHub par exécution (cache mémoire)
+            reader = None if args.no_versions else versions_mod.Reader()
             # L61 : lectures regroupées (db.batched) — deux allers-retours
             snap = db_mod.batched(db, lambda db: snapshot(
                 db, cfg, since=args.since, project=args.project, stale_after=threshold,
-                gantt=not args.no_gantt))
+                gantt=not args.no_gantt, github=reader))
         finally:
             db.close()
         if args.html:

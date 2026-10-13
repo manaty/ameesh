@@ -69,10 +69,11 @@ def send(
     « all » regroupé en une entrée, import déjà écrit). `after_commit` (une
     liste) : l'écriture du fil y est ajoutée, à appeler par l'appelant après
     le commit de sa transaction — un envoi annulé n'en laisse aucune trace
-    dans le fil externe. Projet du fil : celui
-    de l'expéditeur, sinon du destinataire — son équipe (`team`) s'il est
-    gouverné par le canon, sinon son chantier —, sinon AMEESH_PROJECT, sinon
-    `default` ; lot : `work_item_id`.
+    dans le fil externe. Projet du fil : celui du lot (`work_items.app`, L118c)
+    quand le message est lié à un lot, sinon celui de l'expéditeur, sinon du
+    destinataire — son équipe (`team`) s'il est gouverné par le canon, sinon
+    son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
+    `work_item_id`.
     """
     fil.ensure_readable(body, allow_structured)
     row = storage.of(db).mailbox.send(
@@ -93,7 +94,8 @@ def send(
             fil.record(
                 cfg, target, sender=sender, recipients=[recipient], text=body,
                 ts=row.get("created_ts"),
-                project=fil.project_for(cfg, row.get("sender_project"),
+                project=fil.project_for(cfg, fil.lot_project(target, work_item_id),
+                                        row.get("sender_project"),
                                         row.get("recipient_project")),
                 lot=work_item_id, mailbox_ids=[message_id], meta=meta)
         if after_commit is not None:
