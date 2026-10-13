@@ -30,6 +30,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
   vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
   jamais annulée par la fusion suivante.
+- **Concurrence par hôte de la CI** (#899, pilote, 2026-10-13) : l'occupation
+  d'un hôte de la flotte `ameesh-ci` est bornée par le nombre de runners de cet
+  hôte, fixé par une mesure de capacité (CPU, RAM, disque, PSI ; lot #824), et
+  non par le fan-out d'une exécution : borner le fan-out
+  (`strategy.max-parallel`) ne baisse pas la concurrence par hôte sur une
+  flotte occupée et allonge chaque exécution. Le découpage en parts reste le
+  levier pour passer sous le plafond du job ; chaque part déclare ce plafond
+  (`AMEESH_PLAFOND_MIN`, égal à son `timeout-minutes`) et publie une alerte à
+  80 % de celui-ci dans son check run (`scripts/ci-flow.py`, #899).
 - **Tests indépendants du poste** (L142) : le poste et la CI donnent le même
   verdict. À l'import, `tests/support.py` retire toutes les variables
   `AMEESH_*`, `AGENT_MESH_*` et `AGENT_MAIL_*` de la session (identité
