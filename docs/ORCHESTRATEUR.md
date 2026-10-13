@@ -249,9 +249,11 @@ ameesh decide ask --lot <id|RÉF> --question "Fusionner avant la démo ?" \
 Citer la branche dans le message (`agent/<agent>-<sujet>`, une seule par
 message) la pose sur le lot ; sinon `ameesh work assign <id> <agent> --branch
 agent/…`. L'exécuteur ferme alors le lot quand la branche entre dans sa cible,
-avec ou sans PR : fusion directe, avance rapide, squash. La cible par défaut
-est celle du dépôt (`git config ameesh.target develop` dans le clone si
-l'équipe n'intègre pas sur la branche par défaut), ou `--target`.
+avec ou sans PR : fusion directe, avance rapide, squash. La cible est celle
+que le lot nomme (`--target`), sinon celle que son projet déclare
+(`radar.projects.<app>.target`), sinon celle du dépôt (`git config
+ameesh.target develop` dans le clone si l'équipe n'intègre pas sur la branche
+par défaut).
 
 **Branche `lot/<id>-…`** (L118b). Un lot sans branche déclarée prend pour
 branche son unique `lot/<id>` ou `lot/<id>-<sujet>`, locale ou `origin/`.
@@ -297,11 +299,12 @@ git merge --no-ff agent/claude1-veille -m "Merge #93 COMPUTE-IDLE" -m "ameesh-wo
 * `#<id>` dans le titre du commit de fusion le désigne aussi, **si le
   dépôt l'active** (`git config ameesh.lotRef hash`) — à ne faire que si ces
   numéros sont des lots ameesh : ailleurs « (#45) » est une PR GitHub ;
-* la cible est celle du dépôt : poser une fois dans le clone `git config
-  ameesh.target origin/develop` (fusions poussées puis récupérées) ou
-  `develop` (fusions faites dans ce clone) quand l'équipe n'intègre pas sur
-  la branche par défaut. Une cible introuvable est une erreur du relevé,
-  visible dans `ameesh work sync-branches`.
+* la cible est celle du lot, sinon celle que son projet déclare
+  (`radar.projects.<app>.target`), sinon celle du dépôt : poser une fois dans
+  le clone `git config ameesh.target origin/develop` (fusions poussées puis
+  récupérées) ou `develop` (fusions faites dans ce clone) quand l'équipe
+  n'intègre pas sur la branche par défaut. Une cible introuvable est une
+  erreur du relevé, visible dans `ameesh work sync-branches`.
 
 Le relevé passe toutes les 5 min dans le dossier de travail de l'assigné :
 le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le

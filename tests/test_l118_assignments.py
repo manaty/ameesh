@@ -4,6 +4,7 @@ quand sa branche est fusionnée, avec ou sans PR ; `idle_capacity` part aussi
 à l'orchestrateur."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import time
@@ -297,6 +298,70 @@ class IdleCapacityToOrchestratorTest(_Base):
         self.assertIn("without a lot", rows[0]["body"])
         notifier.run_pass(self.db, thresholds=seuils)       # même alerte : pas de doublon
         self.assertEqual(len(self.unread("orch")), 1)
+
+
+class ProjectTargetTest(_Base):
+    """#752 : la cible déclarée du projet (`radar.projects.<app>.target`) sert
+    quand le lot n'en déclare pas — un dépôt dont la branche par défaut est
+    main mais dont le projet atterrit sur develop."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "depot-projet")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        self.commit("socle")
+        _git(self.repo, "branch", "-q", "develop")
+        self.agent("dev1", cwd=self.repo)
+        self.radar = dataclasses.replace(
+            self.cfg,
+            radar={"projects": {"p": {"repo": self.repo, "target": "develop"}}})
+
+    def commit(self, name):
+        with open(os.path.join(self.repo, name), "w") as fh:
+            fh.write(name + "\n")
+        _git(self.repo, "add", name)
+        _git(self.repo, "commit", "-q", "-m", "ajoute %s" % name)
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def branch(self, name, base, *files):
+        _git(self.repo, "checkout", "-q", "-b", name, base)
+        for f in files:
+            self.commit(f)
+        _git(self.repo, "checkout", "-q", base)
+
+    def sync_with_radar(self):
+        """Le relevé avec les réglages radar du projet, ceux de l'hôte réel."""
+        previous = self.db.cfg
+        self.db.cfg = self.radar
+        try:
+            return plan_git.sync_branches(self.db, host=self.cfg.host)
+        finally:
+            self.db.cfg = previous
+
+    def test_cible_du_projet_quand_le_lot_n_en_declare_pas(self):
+        self.branch("agent/dev1-p", "develop", "p1")
+        lot = work.add(self.db, title="lot", assignee="dev1", branch="agent/dev1-p", app="p")
+        # sans les réglages radar, la cible reste celle du dépôt (main) : la
+        # fusion sur develop n'est pas vue, le lot reste ouvert — le défaut #752
+        first = plan_git.sync_branches(self.db, host=self.cfg.host)
+        self.assertEqual((first["results"][0]["target"], first["results"][0]["result"]),
+                         ("main", "open"))
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge agent/dev1-p", "agent/dev1-p")
+        report = self.sync_with_radar()
+        self.assertEqual(report["results"][0]["target"], "develop")
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_cible_du_lot_prime_sur_celle_du_projet(self):
+        self.branch("agent/dev1-q", "main", "q1")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge agent/dev1-q", "agent/dev1-q")
+        _git(self.repo, "checkout", "-q", "develop")
+        lot = work.add(self.db, title="lot", assignee="dev1", branch="agent/dev1-q",
+                       branch_target="main", app="p")
+        report = self.sync_with_radar()
+        self.assertEqual(report["results"][0]["target"], "main")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
 
 if __name__ == "__main__":

@@ -671,7 +671,8 @@ def _read_pr_body(pr_body, repo: str, number: int, sweep: dict):
 
 
 def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = False,
-                  actor: str = "", limit: int = MAX_BRANCH_LOTS, pr_body=None) -> dict:
+                  actor: str = "", limit: int = MAX_BRANCH_LOTS, pr_body=None,
+                  cfg=None) -> dict:
     """L118 : ferme les lots ouverts dont la fusion dans leur cible est constatée.
 
     Examinés : les lots ouverts qui portent une branche ou ont un assigné.
@@ -684,6 +685,12 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     jamais de réouverture) avec le commit de fusion et une note qui dit comment
     elle a été constatée, et s'écrit dans le fil du lot. Rend le compte rendu.
 
+    #752 : la cible d'un lot est `branch_target`, sinon celle que son projet
+    déclare (`lot_class.project_target`, `radar.projects.<app>.target`),
+    sinon celle du dépôt (`default_target`). Les réglages radar sont lus dans
+    `cfg`, sinon dans la configuration portée par `db` ; sans elle, la cible
+    du projet est ignorée, comme avant ce correctif.
+
     L118b : un lot sans branche prend pour branche implicite son unique
     `lot/<id>[-…]` (`implicit_branch`), et la fusion GitHub d'une branche
     `lot/<id>-…` le désigne (« Merge pull request #N from owner/lot/<id>-… »).
@@ -695,6 +702,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
 
     from . import fil, registry
 
+    if cfg is None:
+        cfg = getattr(db, "cfg", None)
     st = storage.of(db)
     rows = st.work.open_for_sweep(limit)
     # les commits de fusion lus une fois par dépôt et par cible : depuis le
@@ -735,8 +744,15 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         try:
-            if row.get("branch_target"):
-                target = row["branch_target"]
+            declared = str(row.get("branch_target") or "").strip()
+            if not declared and cfg is not None:
+                # #752 : la cible du projet (radar.projects.<app>.target), quand
+                # le lot n'en déclare pas — un dépôt dont la branche par défaut
+                # est main mais dont le projet atterrit sur develop.
+                from . import lot_class
+                declared = lot_class.project_target(cfg, row)
+            if declared:
+                target = declared
             else:
                 if repo not in targets:
                     try:

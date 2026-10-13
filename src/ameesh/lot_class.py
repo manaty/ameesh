@@ -88,21 +88,33 @@ def repository(cfg, item: dict) -> Optional[str]:
     return getattr(project, "repo", None) or None
 
 
+def project_target(cfg, item: dict) -> str:
+    """La cible déclarée du projet du lot (`radar.projects.<app>.target`), ou "".
+
+    Le projet est celui du lot (`row["app"]`) ; jamais d'exception : des
+    réglages radar illisibles ou un projet que ces réglages ne déclarent pas
+    ne disent rien de la cible (même repli que `repository`). Sert à
+    `default_base` et à `plan_git.sync_branches`, qui doivent résoudre la
+    cible de la même façon (#752)."""
+    name = str(item.get("app") or "").strip()
+    if cfg is None or not name:
+        return ""
+    from . import radar
+    try:
+        project = radar.settings_of(cfg).projects.get(name)
+    except Exception:  # noqa: BLE001 - réglages radar illisibles : pas de cible
+        return ""
+    return str(getattr(project, "target", "") or "").strip() if project is not None else ""
+
+
 def default_base(cfg, item: dict, repo: str) -> Optional[str]:
-    """La cible du lot : `branch_target`, puis la cible du projet, puis celle
-    du dépôt (`plan_git.default_target`, `origin/HEAD` ou main/master)."""
+    """La cible du lot : `branch_target`, puis la cible du projet
+    (`project_target`), puis celle du dépôt (`plan_git.default_target`,
+    `origin/HEAD` ou main/master)."""
     explicit = str(item.get("branch_target") or "").strip()
     if explicit:
         return explicit
-    from . import radar
-    project = None
-    name = str(item.get("app") or "").strip()
-    if cfg is not None and name:
-        try:
-            project = radar.settings_of(cfg).projects.get(name)
-        except Exception:  # noqa: BLE001 - même repli que `repository`
-            project = None
-    target = str(getattr(project, "target", "") or "").strip() if project is not None else ""
+    target = project_target(cfg, item)
     if target:
         return target
     try:
