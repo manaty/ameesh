@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import mail, merge_queue, plan_github, radar, resolutions, storage, work
+from ameesh import lot_class, mail, merge_queue, plan_github, radar, resolutions, storage, work
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, make_repo
@@ -267,6 +267,80 @@ class EntryTest(_Base):
         self.fake.lots[1]["state"] = "merged"
         with self.assertRaisesRegex(merge_queue.QueueError, "nothing to merge"):
             self.enter(1)
+
+
+class LightClassTest(_Base):
+    """L539 (§8): a light lot enters without a review verdict, but keeps every
+    other gate — green CI on the frozen head, a non-draft PR, a target that is
+    not a release, and no doubt about the class (`sensitive` otherwise)."""
+
+    def freeze(self, lot):
+        tip = self.tip(lot)
+        self.marks[lot] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        return tip
+
+    def ci(self, lot, *, draft=False, green=True, number=7):
+        tip = self.tip(lot)
+        return lambda branch: {"number": number, "green": green, "head": tip,
+                               "draft": draft}
+
+    def light(self, why="policy of /canon"):
+        return mock.patch.object(lot_class, "of_lot",
+                                 return_value={"class": "light", "why": why})
+
+    def test_a_light_lot_enters_without_a_verdict(self):
+        self.freeze(1)
+        with self.light():
+            row = self.enter(1, ci=self.ci(1))
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["class"], "light")
+        self.assertIn("class light", self.fake.notes[-1][1])
+
+    def test_a_light_lot_is_refused_from_a_draft_pr(self):
+        self.freeze(1)
+        with self.light():
+            with self.assertRaisesRegex(merge_queue.QueueError, "PR #7 is a draft"):
+                self.enter(1, ci=self.ci(1, draft=True))
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_light_lot_still_needs_a_green_ci(self):
+        self.freeze(1)
+        with self.light():
+            with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
+                self.enter(1, ci=self.ci(1, green=False))
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_release_lot_keeps_the_verdict(self):
+        # the release axis (target release/* or lot type release) is read by
+        # lot_class; whatever the policy says of the files, release is never light
+        self.freeze(1)
+        release = {"class": "release", "why": "target release/1.10.0"}
+        with mock.patch.object(lot_class, "of_lot", return_value=release):
+            with self.assertRaisesRegex(merge_queue.QueueError,
+                                        r"no review verdict ok.*class: release"):
+                self.enter(1, ci=self.ci(1))
+        self.ready(1)  # a verdict ok on the freeze
+        with mock.patch.object(lot_class, "of_lot", return_value=release):
+            self.assertEqual(self.enter(1, ci=self.ci(1))["state"], "queued")
+
+    def test_a_doubt_keeps_the_verdict_and_names_the_class(self):
+        self.freeze(1)
+        with mock.patch.object(lot_class, "of_lot", return_value={
+                "class": "sensitive", "why": "no readable canon"}):
+            with self.assertRaisesRegex(merge_queue.QueueError, "class: sensitive"):
+                self.enter(1, ci=self.ci(1))
+
+    def test_without_a_readable_class_the_verdict_is_still_required(self):
+        # no patch: with no canon configured, lot_class.of_lot answers
+        # `sensitive` itself and the queue must not take the doubt for a light lot
+        self.freeze(1)
+        with self.assertRaisesRegex(merge_queue.QueueError, r"class: sensitive"):
+            self.enter(1, ci=self.ci(1))
+
+    def test_the_queue_line_shows_the_class(self):
+        rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
+                 "title": "t", "assignee": "a1", "frozen_sha": "a" * 12, "reason": ""}]
+        self.assertIn("class light", merge_queue.show_lines(rows, {1: "light"})[1])
 
 
 class OrderTest(unittest.TestCase):

@@ -193,14 +193,22 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
 
 
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
-              commit_ci=None) -> dict:
+              commit_ci=None, cfg=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
-    pr}`; QueueError says what is missing. Commit ids are resolved to full
-    ones before being compared; `ci` (`radar.github_ci(..., strict=True)`)
-    must report the PR green on the frozen commit itself, and an error
-    reading it refuses the lot. A project with `ci_required` (L160g) also
-    needs GitHub's CI green on the frozen commit itself, PR or not
-    (`commit_ci`, `radar.commit_ci` by default)."""
+    pr, class, class_why}`; QueueError says what is missing. Commit ids are
+    resolved to full ones before being compared; `ci` (`radar.github_ci(...,
+    strict=True)`) must report the PR green on the frozen commit itself, and
+    an error reading it refuses the lot. A project with `ci_required` (L160g)
+    also needs GitHub's CI green on the frozen commit itself, PR or not
+    (`commit_ci`, `radar.commit_ci` by default).
+
+    L539 (§8): a **light** lot needs no review verdict — its class comes from
+    `lot_class.of_lot` on the frozen diff — but it still needs a green CI on
+    the frozen head, a non-draft PR, and a target that is not `release/*`.
+    Any doubt about the class (unreadable canon, unreachable diff, `cfg`
+    absent) leaves the verdict requirement in place; the class and its reason
+    are traced in the queue note."""
+    from . import lot_class
     from . import plan_github, radar
     row = work.get(db, lot)
     if row is None:
@@ -236,13 +244,16 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
+    target = row.get("branch_target") or plan_git.default_target(repo)
+    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
+    light = klass.get("class") == lot_class.LIGHT
     verdict = latest_verdict(marks)
     reviewed = pinned(where, verdict["sha"]) if verdict and verdict.get("sha") else None
-    if not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip):
-        raise QueueError("lot #%d has no review verdict ok on its freeze %s%s"
+    if not light and (not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip)):
+        raise QueueError("lot #%d has no review verdict ok on its freeze %s%s (class: %s)"
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
-                            if verdict else ""))
+                            if verdict else "", klass.get("class") or "?"))
     try:
         status = ci(row["branch"]) if ci else None
     except plan_github.GithubError as exc:
@@ -256,9 +267,42 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
+        if light and status.get("draft"):
+            raise QueueError("PR #%s is a draft: a light lot merges only from a "
+                             "non-draft PR" % status.get("number"))
     if project is not None and getattr(project, "ci_required", False):
         _required_ci(project, tip, commit_ci)
-    return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"], "pr": (status or {}).get("number")}
+    return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
+            "pr": (status or {}).get("number"), "class": klass.get("class"),
+            "class_why": klass.get("why") or ""}
+
+
+def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
+              tip: str, *, cfg=None) -> dict:
+    """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
+
+    Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
+    référence de la cible y est tentée, puis le dépôt du projet. `cfg` absent
+    ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`), et la
+    file garde l'exigence de verdict."""
+    from . import lot_class
+    paths = []
+    if target:
+        base_repo = where or repo
+        for candidate in (QUEUE_REF + target, target):
+            if plan_git._commit(base_repo, candidate):
+                paths.append((base_repo, candidate))
+                break
+        if where and where != repo:
+            paths.append((repo, target))
+    if not paths:
+        return lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo, base=target, head=tip)
+    last = None
+    for path, base in paths:
+        last = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base, head=tip)
+        if last.get("class") != lot_class.DOUBT:
+            return last
+    return last
 
 
 def _required_ci(project, sha: str, commit_ci=None) -> None:
@@ -284,20 +328,25 @@ def _required_ci(project, sha: str, commit_ci=None) -> None:
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None, commit_ci=None) -> dict:
+          clone=None, commit_ci=None, cfg=None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes."""
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
     ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project,
-                      commit_ci=commit_ci)
+                      commit_ci=commit_ci, cfg=cfg)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s" % (
+        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s" % (
             ready["target"], ready["frozen_sha"][:12],
-            ", PR #%s green" % ready["pr"] if ready["pr"] else ""), actor=actor)
+            ", PR #%s green" % ready["pr"] if ready["pr"] else "",
+            ready.get("class") or "?", " (%s)" % ready["class_why"]
+            if ready.get("class_why") else ""), actor=actor)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
+    # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
+    row["class"] = ready.get("class")
+    row["class_why"] = ready.get("class_why")
     return row
 
 
@@ -755,16 +804,20 @@ def add_parser(work_sub, func) -> None:
     parser.set_defaults(func=func)
 
 
-def show_lines(rows: list[dict]) -> list[str]:
+def show_lines(rows: list[dict], classes: dict | None = None) -> list[str]:
+    """Les lignes de `ameesh work queue` ; `classes` (L539) ajoute la classe de
+    revue de chaque lot quand elle est connue ({lot: « light »…})."""
     out = []
     target = None
     for r in rows:
         if r["target"] != target:
             target = r["target"]
             out.append("queue of %s:" % target)
-        out.append("  %-3s %-8s #%d « %s » (%s, frozen %s)%s" % (
+        klass = (classes or {}).get(int(r["work_item_id"]))
+        out.append("  %-3s %-8s #%d « %s » (%s, frozen %s%s)%s" % (
             r["rank"] if r.get("rank") else "—", r["state"], int(r["work_item_id"]),
             r.get("title") or "", r.get("assignee") or "unassigned", r["frozen_sha"][:12],
+            ", class %s" % klass if klass else "",
             " : %s" % r["reason"] if r.get("reason") else ""))
     return out
 
@@ -803,10 +856,12 @@ def run(cfg, db, args) -> int:
             project = radar_project(cfg, repo)
             clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
                 if project else None
-            row = enter(db, args.id, repo=repo, actor=args.actor, project=project, clone=clone)
+            row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
+                        clone=clone, cfg=cfg)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
-                  "lot #%d queued for %s at %s; the radar orders the queue at its next pass"
-                  % (args.id, row["target"], row["frozen_sha"][:12]))
+                  "lot #%d queued for %s at %s, class %s; the radar orders the queue at its "
+                  "next pass" % (args.id, row["target"], row["frozen_sha"][:12],
+                                 row.get("class") or "?"))
             return 0
         if args.queue_command == "remove":
             done = leave(db, args.id, actor=args.actor, reason=args.message)
@@ -815,10 +870,18 @@ def run(cfg, db, args) -> int:
                                   else "was not queued"))
             return 0
         rows = storage.of(db).work.queue(args.target)
+        # L539 : la classe de chaque lot de la file (lecture seule, best effort)
+        from . import lot_class
+        classes = {}
+        for r in rows:
+            info = lot_class.of_lot(db, int(r["work_item_id"]), cfg=cfg)
+            classes[int(r["work_item_id"])] = info.get("class")
+            r["class"] = info.get("class")
+            r["class_why"] = info.get("why")
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         else:
-            print("\n".join(show_lines(rows)) if rows else "no lot queued")
+            print("\n".join(show_lines(rows, classes)) if rows else "no lot queued")
         return 0
     except (QueueError, GitError, plan_git.MergeProbeError, ValueError) as exc:
         print("error: %s" % exc, file=sys.stderr)

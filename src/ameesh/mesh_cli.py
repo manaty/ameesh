@@ -1267,6 +1267,14 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
                                   if int(r["work_item_id"]) == lot_id), None)
         except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
             item["queue"] = None
+        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
+        # doute rend `sensitive` et le dit)
+        from . import lot_class
+        try:
+            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
+                                    "why": "unreadable (%s)" % exc, "files": []}
         # L157c: actual time by phase and merged diff size, once delivered
         from . import lot_measures
         item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
