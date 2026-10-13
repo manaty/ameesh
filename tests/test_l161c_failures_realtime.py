@@ -545,7 +545,7 @@ class WatcherTest(PgTestCase):
         self.assertEqual(alerte["lot"], self.lot["id"])
         self.assertEqual(exploitation.alert_key(alerte), cle)
 
-    def test_attente_d_un_runner_separee_et_alerte(self):
+    def test_attente_d_un_runner_separee_sans_double_alerte(self):
         # #747 : 1 h 24 d'attente lue comme « psql bloqué 2 h 20 »
         import time as _time
         now = 1_800_000_000
@@ -558,12 +558,12 @@ class WatcherTest(PgTestCase):
         self.assertIsNone(row["started_ts"])
         self.assertEqual(row["created_ts"], now - 30 * 60)
         self.assertEqual(ci.wait_text(row, now), "queued 30 min")
-        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
-                     if a["type"] == "ci_queue_starved"]
-        self.assertEqual((alerte["reason"], alerte["threshold"]), (DEPOT, 1200))
-        self.assertIn("1 run(s) waiting", alerte["detail"])
-        self.assertIn("ci_queue_starved", notify.DEFAULT_TYPES)
-        # démarrée : l'attente est figée, l'alerte se résout
+        (attente,) = ci.queue_starved(self.db, now)
+        self.assertEqual((attente["repo"], attente["count"]), (DEPOT, 1))
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_queue_starved"], [])
+        self.assertNotIn("ci_queue_starved", notify.DEFAULT_TYPES)
+        # démarrée : l'attente est figée, la vue ne compte plus ce run
         self.api.queued, self.api.live = [], [dict(vue, status="in_progress")]
         self.watcher.tick(self.db)
         row = storage.of(self.db).ci.run(DEPOT, 801)
