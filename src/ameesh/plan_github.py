@@ -250,9 +250,12 @@ READS_MIN_TTL = 5.0
 READS_MAX = 2000
 #: magasins avant un élagage du cache
 READS_PRUNE_EVERY = 128
-#: en-têtes de quota lus sur chaque réponse GitHub
+#: en-têtes de quota lus sur chaque réponse GitHub (lus sans dépendre de la casse)
 QUOTA_HEADERS = {"limit": "X-RateLimit-Limit", "remaining": "X-RateLimit-Remaining",
                  "used": "X-RateLimit-Used", "reset": "X-RateLimit-Reset"}
+#: ressource d'API par défaut quand la réponse ne dit pas `X-RateLimit-Resource` :
+#: le bucket REST `core`. Le bucket GraphQL ne se confond plus avec lui (R1 #848).
+DEFAULT_RESOURCE = "core"
 #: attente imposée après un 403/429 de quota sans `X-RateLimit-Reset` (secondes)
 RATE_LIMIT_WAIT = 60.0
 
@@ -285,6 +288,43 @@ def _int_or_none(value) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def header_of(headers, name: str):
+    """La valeur d'un en-tête, sans dépendre de sa casse (R1 #848, B1).
+
+    `gh api -i` recopie la graphie de GitHub (`X-Ratelimit-Remaining`,
+    `Etag`) ; urllib rend un `HTTPMessage`, insensible à la casse. Les deux
+    doivent se lire pareil : sinon le repli `gh` ne voit ni le quota (donc
+    ne s'arrête pas au reset) ni l'ETag (donc ne revalide pas en 304)."""
+    if headers is None:
+        return None
+    items = getattr(headers, "items", None)
+    if items is not None:
+        wanted = str(name).lower()
+        try:
+            for key, value in items():
+                if str(key).lower() == wanted:
+                    return value
+        except (AttributeError, TypeError, ValueError):
+            pass
+    getter = getattr(headers, "get", None)
+    return getter(name) if getter is not None else None
+
+
+@dataclass
+class ReadMeta:
+    """Ce qu'une lecture du transport a réellement servi (R1 #848, B2).
+
+    `read_ts` : instant (epoch) de la lecture GitHub d'origine, pas celui du
+    passage en cache ; `stale` : valeur antérieure servie faute de quota ;
+    `source` : `network`, `revalidated` ou `cache`. `Api` et `GhApi`
+    l'exposent dans `last_read` pour que `versions.Reader` ne dise jamais
+    frais ce qui est périmé."""
+
+    read_ts: float
+    stale: bool = False
+    source: str = "network"
 
 
 def _atomic_write(path: str, data: dict) -> None:
@@ -426,9 +466,18 @@ class SharedReads:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def quota(self) -> dict:
-        quota = self._load().get("quota")
+    def quota(self, resource: str = DEFAULT_RESOURCE) -> dict:
+        """Le dernier quota observé pour cette ressource d'API (défaut `core`)."""
+        quota = self.quotas().get(resource)
         return dict(quota) if isinstance(quota, dict) else {}
+
+    def quotas(self) -> dict:
+        """Tous les quotas observés, par ressource d'API (`core`, `graphql`…)."""
+        quotas = self._load().get("quota")
+        if not isinstance(quotas, dict):
+            return {}
+        return {name: dict(quota) for name, quota in quotas.items()
+                if isinstance(quota, dict)}
 
     def counters(self) -> dict:
         counters = self._load().get("counters")
@@ -449,15 +498,25 @@ class SharedReads:
     def note(self, headers, *, status: int, now=None) -> float | None:
         """Enregistre le quota lu dans les en-têtes, compte la requête.
 
-        Rend l'instant (epoch) jusqu'auquel le quota est épuisé, sinon None."""
+        Le quota est rangé par ressource d'API (`X-RateLimit-Resource`, sinon
+        `core`) : le bucket REST core et le bucket GraphQL ne se confondent
+        plus (R1 #848 ; le pilote l'a demandé à 10:40Z). Rend l'instant
+        (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
         now = float(self.clock() if now is None else now)
-        values = {key: _int_or_none(headers.get(header)) if headers is not None else None
+        values = {key: _int_or_none(header_of(headers, header))
                   for key, header in QUOTA_HEADERS.items()}
-        retry = _int_or_none(headers.get("Retry-After")) if headers is not None else None
+        retry = _int_or_none(header_of(headers, "Retry-After"))
+        resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
+            or DEFAULT_RESOURCE
         try:
             with self._locked():
                 data = self._load()
-                quota = data.setdefault("quota", {})
+                quotas = data.setdefault("quota", {})
+                if not isinstance(quotas, dict):
+                    quotas = data["quota"] = {}
+                quota = quotas.setdefault(resource, {})
+                if not isinstance(quota, dict):
+                    quota = quotas[resource] = {}
                 counters = data.setdefault("counters", {})
                 counters["requests"] = int(counters.get("requests") or 0) + 1
                 if status == 304:
@@ -481,10 +540,10 @@ class SharedReads:
         except (OSError, ValueError):
             return None
 
-    def blocked(self, now=None) -> float | None:
-        """L'instant (epoch) jusqu'auquel le quota est épuisé, sinon None."""
+    def blocked(self, now=None, resource: str = DEFAULT_RESOURCE) -> float | None:
+        """L'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
         now = float(self.clock() if now is None else now)
-        until = float(self.quota().get("blocked_until") or 0.0)
+        until = float(self.quota(resource).get("blocked_until") or 0.0)
         return until if until > now else None
 
 
@@ -495,7 +554,8 @@ class Api:
     illisible) lève `GithubError`, jamais autre chose. Avec un cache partagé
     (`cache_dir` ou `reads`) : les lectures gardées sont servies du disque,
     les autres revalidées par `If-None-Match`, et le quota épuisé fait
-    répondre le cache ou lever `GithubRateLimited` sans requête."""
+    répondre le cache ou lever `GithubRateLimited` sans requête. `last_read`
+    dit ce que le dernier appel a servi (date d'origine, `stale`)."""
 
     def __init__(self, token=None, *, env=None, base=None, timeout=60.0,
                  cache_dir=None, reads: "SharedReads | None" = None,
@@ -505,6 +565,7 @@ class Api:
         self.base = str(base or env.get("GITHUB_API_URL") or API_BASE).rstrip("/")
         self.timeout = float(timeout)
         self.ttl = float(ttl)
+        self.last_read: ReadMeta | None = None
         self.clock = clock
         self.reads = reads if reads is not None else (
             SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None)
@@ -522,15 +583,18 @@ class Api:
     def get(self, path: str, *, ttl=None):
         ttl = self.ttl if ttl is None else float(ttl)
         now = float(self.clock())
+        self.last_read = None
         entry = self.reads.cached(path) if self.reads is not None else None
         if self.reads is not None and self.reads.fresh(entry, now=now, ttl=ttl):
             self.reads.count("hits")
+            self.last_read = ReadMeta(entry.read_ts, False, "cache")
             return entry.value
         if self.reads is not None:
             until = self.reads.blocked(now)
             if until:
                 if entry is not None:
                     self.reads.count("stale")
+                    self.last_read = ReadMeta(entry.read_ts, True, "cache")
                     return entry.value
                 self.reads.count("refused")
                 raise GithubRateLimited(path, until)
@@ -547,12 +611,14 @@ class Api:
                 if self.reads is not None:
                     self.reads.touch(path, read_ts=now)
                     self.reads.note(headers, status=304, now=now)
+                self.last_read = ReadMeta(now, False, "revalidated")
                 return entry.value
             until = self.reads.note(headers, status=exc.code, now=now) \
                 if self.reads is not None else None
             if until:
                 if entry is not None:
                     self.reads.count("stale")
+                    self.last_read = ReadMeta(entry.read_ts, True, "cache")
                     return entry.value
                 self.reads.count("refused")
                 raise GithubRateLimited(path, until) from exc
@@ -565,9 +631,10 @@ class Api:
         except ValueError as exc:
             raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
         if self.reads is not None:
-            etag = headers.get("ETag") if headers is not None else None
+            etag = header_of(headers, "ETag")
             self.reads.note(headers, status=200, now=now)
             self.reads.store(path, value, etag=etag, read_ts=now)
+        self.last_read = ReadMeta(now, False, "network")
         return value
 
 
@@ -585,20 +652,26 @@ class GhApi:
         self.reads = reads
         self.ttl = float(ttl)
         self.clock = clock
+        self.last_read: ReadMeta | None = None
 
     def get(self, path: str, *, ttl=None):
         ttl = self.ttl if ttl is None else float(ttl)
         now = float(self.clock())
+        self.last_read = None
         if self.reads is None:
-            return _json(self.gh, ["api", path])
+            value = _json(self.gh, ["api", path])
+            self.last_read = ReadMeta(now, False, "network")
+            return value
         entry = self.reads.cached(path)
         if self.reads.fresh(entry, now=now, ttl=ttl):
             self.reads.count("hits")
+            self.last_read = ReadMeta(entry.read_ts, False, "cache")
             return entry.value
         until = self.reads.blocked(now)
         if until:
             if entry is not None:
                 self.reads.count("stale")
+                self.last_read = ReadMeta(entry.read_ts, True, "cache")
                 return entry.value
             self.reads.count("refused")
             raise GithubRateLimited(path, until)
@@ -607,11 +680,13 @@ class GhApi:
         if status == 304 and entry is not None:
             self.reads.touch(path, read_ts=now)
             self.reads.note(headers, status=304, now=now)
+            self.last_read = ReadMeta(now, False, "revalidated")
             return entry.value
         until = self.reads.note(headers, status=status, now=now)
         if until and status in (403, 429):
             if entry is not None:
                 self.reads.count("stale")
+                self.last_read = ReadMeta(entry.read_ts, True, "cache")
                 return entry.value
             self.reads.count("refused")
             raise GithubRateLimited(path, until)
@@ -621,7 +696,8 @@ class GhApi:
             value = json.loads(body) if body.strip() else None
         except ValueError as exc:
             raise GithubError("gh api %s: unreadable response" % path) from exc
-        self.reads.store(path, value, etag=headers.get("ETag"), read_ts=now)
+        self.reads.store(path, value, etag=header_of(headers, "ETag"), read_ts=now)
+        self.last_read = ReadMeta(now, False, "network")
         return value
 
 
@@ -650,9 +726,10 @@ def client_name(env=None) -> str:
 def quota_stats(state_dir) -> dict:
     """Le quota et les compteurs partagés de l'hôte (#848), pour les vues.
 
-    Rend `{"quota": {...}, "counters": {...}}`, vide sans cache encore écrit."""
+    Rend `{"quota": {ressource: {...}}, "counters": {...}}`, vide sans cache
+    encore écrit : `core` et `graphql` ne se confondent pas."""
     reads = SharedReads(state_dir)
-    return {"quota": reads.quota(), "counters": reads.counters()}
+    return {"quota": reads.quotas(), "counters": reads.counters()}
 
 
 # --------------------------------------------------------------------------

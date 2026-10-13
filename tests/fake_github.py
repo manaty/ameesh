@@ -29,9 +29,12 @@ import re
 
 WRITE_METHODS = ("POST", "PATCH", "DELETE", "PUT")
 
-#: en-têtes de quota du faux `gh api -i` (#848) ; reset lointain et fixe
-QUOTA_HEAD = ("X-RateLimit-Limit: 5000", "X-RateLimit-Remaining: 4999",
-              "X-RateLimit-Used: 1", "X-RateLimit-Reset: 4102444800")
+#: en-têtes de quota du faux `gh api -i` (#848) ; reset lointain et fixe.
+#: Graphie réelle de `gh` (Go : `X-Ratelimit-*`, `Etag`), pas la camel-case
+#: de l'API : le repli doit lire sans dépendre de la casse (R1 #848, B1).
+QUOTA_HEAD = ("X-Ratelimit-Limit: 5000", "X-Ratelimit-Remaining: 4999",
+              "X-Ratelimit-Used: 1", "X-Ratelimit-Reset: 4102444800",
+              "X-Ratelimit-Resource: core")
 
 
 def _with_headers(argv: list, code: int, out: str, err: str) -> tuple[int, str, str]:
@@ -54,7 +57,7 @@ def _with_headers(argv: list, code: int, out: str, err: str) -> tuple[int, str, 
         status = 404 if "404" in err else 502
         head = ["HTTP/2.0 %d Error" % status, *QUOTA_HEAD]
         return code, "\r\n".join(head) + "\r\n\r\n", err
-    head = ["HTTP/2.0 200 OK", *QUOTA_HEAD, "ETag: %s" % etag]
+    head = ["HTTP/2.0 200 OK", *QUOTA_HEAD, "Etag: %s" % etag]
     return 0, "\r\n".join(head) + "\r\n\r\n" + out, ""
 
 
