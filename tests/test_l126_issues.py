@@ -214,6 +214,11 @@ class LotViewTest(unittest.TestCase):
                              issue_of=lambda n: 40 if n == 13 else None)
         self.assertEqual(replaced.closing,
                          "Work item 12 superseded by work item 13 (#40): issue closed by ameesh.")
+        # #988 : livré hors cible = terminé (completed), pas « non prévu »
+        delivered = self.view(True, state="closed", close_reason="delivered")
+        self.assertEqual((delivered.state, delivered.state_reason), ("closed", "completed"))
+        self.assertEqual(delivered.closing,
+                         "Work item 12 delivered outside the target: issue closed by ameesh.")
         self.assertIsNone(self.view(True).closing)
 
     def test_projet_d_un_lot(self):

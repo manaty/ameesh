@@ -40,6 +40,7 @@ class BriefsTest(unittest.TestCase):
         self.assertIn('#42 "export"', text)
         self.assertIn('ameesh mail send dev1 "…" --lot 42', text)
         self.assertIn("ameesh work merged 42 --sha", text)
+        self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
         self.assertEqual(briefs["auditeur"], text)
 

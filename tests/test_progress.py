@@ -73,6 +73,17 @@ class JalonsTest(unittest.TestCase):
         self.assertEqual(j["blocks"], 1)              # blocked → waiting_human = une attente
         self.assertIsNone(j["merged"])
 
+    def test_livre_hors_cible(self):
+        """#988 : le jalon `delivered` date un lot livré hors cible ; `merged`
+        reste nul (la livraison n'est pas une fusion)."""
+        item = {"id": 2, "created_ts": 100.0, "state": "closed",
+                "close_reason": "delivered"}
+        j = progress._jalons_de_lot(item, [
+            ev("intake", 100), ev("build", 110), ev("closed", 400)], [], [
+            {"kind": "delivered", "at_ts": 400.0, "actor": "dev1"}])
+        self.assertEqual(j["delivered"], 400.0)
+        self.assertIsNone(j["merged"])
+
     def test_action_git_merge(self):
         actions = [{"connector": "git-merge", "state": "confirmed",
                     "approved_ts": 400.0, "finished_ts": 450.0},
@@ -329,7 +340,8 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["lot bloqué"]["blocks"], 1)
         m = lots["lot fusionné"]["milestones"]
         self.assertTrue(m["requested"] <= m["frozen"] <= m["verdict"] <= m["merged"])
-        self.assertEqual(set(m), {"requested", "frozen", "verdict", "merged"})
+        self.assertEqual(set(m), {"requested", "frozen", "verdict", "merged", "delivered"})
+        self.assertIsNone(m["delivered"])          # #988 : livré hors cible seulement
         self.assertEqual([x["id"] for x in snap["actions"]], [act])
 
         agents = {x["name"]: x for x in snap["agents"]}

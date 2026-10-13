@@ -704,7 +704,9 @@ class MergeSweepTest(_Base):
         stale = [a for a in exploitation.alerts(self.cfg, self.db) if a["type"] == "stale_lot"]
         self.assertEqual([a["lot"] for a in stale], [lot["id"]])
         self.assertIn("merged? close it: ameesh work merged %d --sha <merge commit>; "
-                      "otherwise nudge claude1" % lot["id"], stale[0]["detail"])
+                      "delivered outside the target? close it: ameesh work close %d "
+                      "--delivered --sha <reviewed head>; otherwise nudge claude1"
+                      % (lot["id"], lot["id"]), stale[0]["detail"])
         self.assertEqual(stale[0]["action"], exploitation.stale_action(stale[0] | {
             "id": lot["id"], "assignee": "claude1"}))
         self.merge("feature/z", "Merge #%d\n\nameesh-work: %d" % (lot["id"], lot["id"]))

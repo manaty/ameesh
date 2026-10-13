@@ -164,6 +164,16 @@ class PlanUnitTest(unittest.TestCase):
         self.assertEqual(plan.package_status([{"state": "closed"}, {"state": "merged"}]),
                          "merged")
         self.assertEqual(plan.package_status([{"state": "merged"}, {"state": "build"}]), "open")
+        # #988 : un lot livré hors cible compte comme livré, pas comme abandonné
+        self.assertEqual(plan.item_unit_status("closed", "delivered"), "merged")
+        self.assertEqual(plan.item_unit_status("closed", "abandoned"), "abandoned")
+        self.assertEqual(
+            plan.package_status([{"state": "closed", "close_reason": "delivered"}]),
+            "merged")
+        self.assertEqual(
+            plan.package_status([{"state": "closed", "close_reason": "delivered"},
+                                 {"state": "closed", "close_reason": "superseded"}]),
+            "merged")
 
     def test_stagnation(self):
         now = 100_000.0

@@ -1080,7 +1080,9 @@ def lot_issue_state(item: dict) -> tuple[str, str | None]:
     if state in work_mod.MERGED_STATES:
         return "closed", "completed"
     if state == "closed":
-        return "closed", "not_planned"
+        # #988 : livré hors cible = terminé, pas « non prévu »
+        return "closed", ("completed" if item.get("close_reason") == "delivered"
+                          else "not_planned")
     return "open", None
 
 
@@ -1261,6 +1263,8 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of) -> str | None:
     if state == "promoted":
         return "Work item %d delivered: issue closed by ameesh." % n
     if state == "closed":
+        if item.get("close_reason") == "delivered":
+            return "Work item %d delivered outside the target: issue closed by ameesh." % n
         other = item.get("superseded_by")
         if item.get("close_reason") == "superseded" and other:
             number = issue_of(int(other))

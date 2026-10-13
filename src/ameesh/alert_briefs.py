@@ -74,8 +74,10 @@ def _stale_lot(alert: dict) -> str:
     else:
         move = "assign it: ameesh work assign %d <agent>" % lot
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
-            "--sha <merge commit>; otherwise %s; if it is no longer needed: ameesh work "
-            "close %d --abandoned (or --superseded-by <id>)." % (head, lot, move, lot))
+            "--sha <merge commit>; if it was delivered outside the target (report, note, head "
+            "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
+            "--sha <reviewed head>; otherwise %s; if it is no longer needed: ameesh work "
+            "close %d --abandoned (or --superseded-by <id>)." % (head, lot, lot, move, lot))
 
 
 def _plan_underused(alert: dict) -> str:

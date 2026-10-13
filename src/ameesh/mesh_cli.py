@@ -1249,8 +1249,9 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
                            for k in ("start", "end", "delivery", "source", "by")}
         # L157 : durée estimée, réel mesuré, écart ; historique des estimations
         from . import estimates
+        delays = item["delays"] or {}
         item["estimate"] = estimates.view(
-            item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+            item, merged_ts=delays.get("merged_ts") or delays.get("delivered_ts"))
         item["estimates"] = storage.of(db).work.estimates(lot_id)
         # L157b : estimation de référence (lecture de la table publiée)
         item["estimate_reference"] = estimates.proposal(
@@ -1492,8 +1493,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
                     for e in item["estimates"]))
             if item.get("state") == "closed":
-                print("closed   : %s" % ("abandoned" if item.get("close_reason") == "abandoned"
-                                         else "superseded by #%s" % item.get("superseded_by")))
+                delivered = next((m.get("sha") for m in item.get("milestones", [])
+                                  if m.get("kind") == "delivered" and m.get("sha")), "")
+                print("closed   : %s%s" % (
+                    work.close_label(item),
+                    " (head %s)" % delivered[:12] if delivered else ""))
             if item.get("pr_ref"):
                 print("PR       : %s" % item["pr_ref"])
             if item.get("branch"):
