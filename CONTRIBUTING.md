@@ -29,6 +29,13 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
   vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
   jamais annulée par la fusion suivante.
+- **Release : la suite sur une autre classe de système de fichiers** (#748) :
+  la PR de release (branche `release/**` en tête ou en base) rejoue les parts
+  psycopg avec les racines temporaires sur l'autre classe que celle du runner
+  (tmpfs ↔ disque, lue à l'exécution) ; ce job compte alors dans le check
+  « tests ». Un test qui ne tient que sur la classe ordinaire s'y révèle : le
+  corriger à la source (horodatages, renommage entre périphériques, `TMPDIR`),
+  jamais en le relançant.
 - **Tests indépendants du poste** (L142) : le poste et la CI donnent le même
   verdict. À l'import, `tests/support.py` retire toutes les variables
   `AMEESH_*`, `AGENT_MESH_*` et `AGENT_MAIL_*` de la session (identité

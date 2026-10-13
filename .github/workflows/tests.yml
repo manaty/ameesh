@@ -49,6 +49,13 @@
 # qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
 # lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
 # fourche), rien n'est publié et la part n'en est pas affectée.
+#
+# #748 — à la release (branche `release/**`, ou PR dont la tête ou la base
+# l'est) et à la main, les parts psycopg sont rejouées une fois sur l'autre
+# classe de système de fichiers que celle du défaut du runner (tmpfs ↔ disque,
+# lue à l'exécution) : un test qui ne tient que sur la classe ordinaire
+# (horodatages, renommage entre périphériques, inodes, blocs) se révèle là. Le
+# job « autre système de fichiers » est alors exigé par le check agrégé.
 name: tests
 
 on:
@@ -281,6 +288,126 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # #748 : la suite rejouée sur une AUTRE classe de système de fichiers que
+  # celle du défaut du runner (tmpfs ↔ disque), à la release seulement. Un test
+  # qui ne tient que sur la classe ordinaire (horodatages, renommage entre
+  # périphériques, inodes, blocs, montage) se révèle ici, là où la suite
+  # ordinaire ne le voit pas. La classe par défaut est lue à l'exécution
+  # (`stat -f`), donc le job reste vrai si l'hôte change de défaut ; la racine
+  # temporaire des tests (`TMPDIR`) est posée sur l'autre classe et vérifiée.
+  # Une release dont la suite n'est pas verte sur les deux classes ne fusionne
+  # pas (canon §3 : un test dépendant de l'environnement est bloquant).
+  fs-class:
+    name: autre système de fichiers ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+    needs: plan
+    if: >-
+      needs.plan.outputs.code == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && startsWith(github.ref_name, 'release/')) ||
+       (github.event_name == 'pull_request' &&
+        (startsWith(github.head_ref, 'release/') || startsWith(github.base_ref, 'release/'))))
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.psycopg) }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ameesh
+          POSTGRES_PASSWORD: ameesh-ci
+          POSTGRES_DB: ameesh
+        ports: ["5432"]
+        options: >-
+          --tmpfs /var/lib/postgresql/data
+          --health-cmd "pg_isready -U ameesh"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c : check run « tests (flux) »
+    env:
+      AMEESH_DRIVER: psycopg
+      FLUX_NOM: tests (flux) autre-FS ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+    steps:
+      - uses: actions/checkout@v4
+      - *dsn
+      - id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv-ci
+          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
+      - name: dépendances (pilote psycopg)
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv-ci
+          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+      - *base
+      - *git
+      - *plan
+      - name: racine temporaire sur l'autre classe de système de fichiers
+        run: |
+          set -eu
+          defaut=$(stat -f -c %T "${TMPDIR:-/tmp}")
+          mini=$((1024 * 1024))            # 1 GiB libres, en KiB : de quoi loger la part
+          racine=""; meilleur=0
+          for candidat in "/dev/shm/ameesh-autre-fs-${GITHUB_RUN_ID}-${{ matrix.part }}" \
+                          "${RUNNER_TEMP:?}/ameesh-autre-fs"; do
+            mkdir -p "$candidat" 2>/dev/null || continue
+            classe=$(stat -f -c %T "$candidat" 2>/dev/null || echo inconnu)
+            libre=$(df -Pk "$candidat" 2>/dev/null | awk 'NR==2 {print $4}')
+            [ "$classe" != "$defaut" ] && [ "$classe" != inconnu ] || continue
+            [ "${libre:-0}" -ge "$mini" ] || continue
+            if [ "$libre" -gt "$meilleur" ]; then racine="$candidat"; meilleur=$libre; fi
+          done
+          if [ -z "$racine" ]; then
+            echo "::error::aucune autre classe de système de fichiers utilisable (défaut=$defaut) : /dev/shm et RUNNER_TEMP sont le même système, absents, ou sous 1 GiB libres"
+            exit 1
+          fi
+          classe=$(stat -f -c %T "$racine")
+          df -h "$racine" | tail -1
+          echo "TMPDIR=$racine" >> "$GITHUB_ENV"
+          echo "AMEESH_AUTRE_FS=$classe" >> "$GITHUB_ENV"
+          echo "système de fichiers : défaut=$defaut, cette part=$classe ($racine)"
+          {
+            echo "### #748 — autre système de fichiers (part ${{ matrix.part }})"
+            echo "- défaut du runner : \`$defaut\`"
+            echo "- cette part : \`$classe\` (\`$racine\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - *publier
+      - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+        run: >-
+          .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --driver psycopg --flow "$RUNNER_TEMP/flux.jsonl"
+      - *fermer
+      - *resume
+      - name: flux en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # hors du motif `flux-*` : le bilan (L161f) agrège ces flux-là, une
+          # seconde part du même plan y fausserait le vert provisoire
+          name: autre-fs-${{ matrix.part }}
+          path: ${{ runner.temp }}/flux.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+      # en dernier : `TMPDIR` reste posé sur l'autre classe pour les étapes
+      # suivantes, et une action Node (artefact) écrirait dans une racine déjà
+      # supprimée
+      - name: ménage de la racine temporaire (hôte persistant)
+        if: always()
+        run: |
+          case "${TMPDIR:-}" in
+            /dev/shm/ameesh-autre-fs-*|*/ameesh-autre-fs) rm -rf -- "$TMPDIR" ;;
+          esac
+
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
   # parts psql (sans psutil) par le repli /proc.
@@ -369,11 +496,13 @@ jobs:
   # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
   # L161a : ou que de la documentation, et ses lecteurs sont verts ;
   # L161f : une part que le plan n'a pas prévue est sautée ;
-  # L158: on a PR, the version number check must pass)
+  # L158: on a PR, the version number check must pass;
+  # #748 : la part « autre système de fichiers », quand elle tourne — release
+  # ou exécution à la main — compte comme les autres)
   tests:
     name: tests
     if: always()
-    needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
+    needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -384,6 +513,7 @@ jobs:
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
           echo "macOS   : ${{ needs.platform-macos.result }}"
+          echo "autre FS: ${{ needs.fs-class.result }}"
           echo "version : ${{ needs.version.result }}"
           test "${{ needs.plan.result }}" = success
           # L158: on a PR, the version number check passes (skipped elsewhere)
@@ -402,3 +532,6 @@ jobs:
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
           test "${{ needs.platform-macos.result }}" = success
+          # #748 : la part sur l'autre système de fichiers n'existe que pour une
+          # release (ou à la main) ; quand elle a tourné, elle compte
+          test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped
