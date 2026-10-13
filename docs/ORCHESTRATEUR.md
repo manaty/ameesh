@@ -418,9 +418,11 @@ courrier les rappelle) :
   « go », « d'accord » restent des réponses, qui réveillent.
 * **`--urgent` seulement quand l'attente bloque** : le destinataire doit agir
   avant de continuer (build cassé sur la branche commune, fusion à arrêter,
-  question sans laquelle il tourne à vide). D'un expéditeur habilité
-  (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même un tour en cours :
-  à réserver aux vraies urgences.
+  question sans laquelle il tourne à vide). De l'owner (`human:*`) ou d'un
+  expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même
+  un tour en cours : à réserver aux vraies urgences. Depuis #795, la fin de CI
+  d'un lot (première alerte, verdict vert ou rouge) est elle-même un urgent
+  vérifié en base qui interrompt le tour de l'agent du lot.
 * **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
   prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
   l'équipe, rarement.

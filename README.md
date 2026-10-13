@@ -164,7 +164,8 @@ une diffusion à « all » sont lus au tour suivant, sans réveil. Les
 **événements** (`--kind event`) réveillent l'agent comme un message, mais un
 lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
 (défaut 120) ; `--urgent` perce le regroupement. Un `--urgent` venu d'un
-expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`, demain une capacité du canon)
+expéditeur habilité (l'owner, un événement de CI vérifié en base, ou
+`AMEESH_INTERRUPT_SENDERS` ; demain une capacité du canon)
 **interrompt le tour en cours** : le harnais est arrêté, la consigne repart en
 attente et le message passe en tête. La **rotation de session** (résumé de
 reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
