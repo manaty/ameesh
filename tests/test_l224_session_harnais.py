@@ -508,7 +508,11 @@ class CodexTest(_Verifie):
 
 
 def _session_dsh(home: str, session: str) -> None:
-    os.makedirs(os.path.join(home, "sessions", "-work", "session-" + session))
+    """Dossier de session dsh : l'id RÉEL porte déjà `session-` (l'incident
+    #724 : les dossiers s'appellent `session-<uuid>`). Un id nu reste accepté
+    et reçoit le préfixe (repli)."""
+    nom = session if session.startswith("session-") else "session-" + session
+    os.makedirs(os.path.join(home, "sessions", "-work", nom))
 
 
 class DeepSeekTest(_Verifie):
@@ -529,6 +533,78 @@ class DeepSeekTest(_Verifie):
         self._avec_session(worker, CLAUDE)  # un id claude retenu à tort
         self.assertTrue(self._tour(worker, DSH_HOME=home))
         self.assertIsNone(self._reprise("--session-id"))
+
+
+class DeepSeekRepriseDeBoutEnBoutTest(_Verifie):
+    """#806, suite de #724 : le tour complet, de bout en bout.
+
+    L'exécuteur reprend la session dsh RÉELLE (`session-<uuid>`, celle que
+    l'harnais écrit dans son stockage) et le courrier déjà remis reste dans
+    cette session : le tour suivant n'ouvre pas de session neuve sur le brief
+    de reprise, qui ne porte que le courrier NON REMIS.
+
+    Avant le correctif, `find_session` cherchait `session-session-<uuid>` :
+    la session était jugée inconnue, écartée, et chaque tour repartait d'une
+    session neuve — les messages déjà remis étaient oubliés (incident du
+    2026-10-13, messages 15222, 15262, 15424, 15432)."""
+
+    #: id tel que dsh le pose dans le registre (l'incident : `session-b126155c-…`)
+    SESSION = "session-b126155c-0d1e-4f2a-9b3c-5d6e7f809a1b"
+    #: deux corps distincts : le second tour ne remet pas le premier message
+    PREMIER = "Message déjà remis au premier tour."
+    SECOND = "Message du second tour."
+
+    def _home(self) -> str:
+        home = os.path.join(self.tmp, "dsh-e2e")
+        _session_dsh(home, self.SESSION)  # le dossier réel du stockage dsh
+        return home
+
+    def _tour(self, worker, home: str) -> dict:
+        """Le tour que l'exécuteur choisit lui-même (courrier compris), lancé
+        dans le dossier de sessions du tour."""
+        spec = worker.pick()
+        self.assertIsNotNone(spec, "aucun tour choisi")
+        with mock.patch.dict(os.environ, {
+                "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                "DSH_HOME": home, "AMEESH_SESSION_STORE_CHECK": "1"}):
+            self.assertTrue(worker.run_turn(spec))
+        return spec
+
+    def _remis(self, ident: int) -> str | None:
+        """L'instant de remise du message (`None` : jamais remis)."""
+        return self.db.query(
+            "SELECT delivered_at::text AS remis FROM agent_mailbox WHERE id = %s",
+            (ident,))[0]["remis"]
+
+    def test_deux_tours_de_courrier_dans_la_meme_session_dsh(self):
+        home = self._home()
+        _runner, worker = self._worker("ds-e2e", harness="deepseek")
+        self._avec_session(worker, self.SESSION)
+        premier = mail.send(self.db, "orchestrateur", "ds-e2e", self.PREMIER)
+
+        # 1er tour : le courrier est remis DANS la session réelle, reprise
+        spec = self._tour(worker, home)
+        self.assertEqual(spec["kind"], "mail")
+        self.assertIn(self.PREMIER, self.turns()[-1]["argv"][-1])
+        self.assertEqual(self._reprise("--session-id"), self.SESSION)
+        self.assertEqual(registry.get(self.db, "ds-e2e")["session_id"], self.SESSION)
+        remise = self._remis(premier)
+        self.assertIsNotNone(remise)
+
+        # 2e tour : un courrier neuf, toujours dans la même session ; le
+        # message déjà remis n'est ni remis une seconde fois, ni perdu dans
+        # une session neuve
+        self.clear_turns()
+        second = mail.send(self.db, "orchestrateur", "ds-e2e", self.SECOND)
+        self._tour(worker, home)
+        prompt = self.turns()[-1]["argv"][-1]
+        self.assertIn(self.SECOND, prompt)
+        self.assertNotIn(self.PREMIER, prompt)  # pas re-livré
+        self.assertNotIn("Your previous session is not resumed", prompt)
+        self.assertEqual(self._reprise("--session-id"), self.SESSION)
+        self.assertEqual(registry.get(self.db, "ds-e2e")["session_id"], self.SESSION)
+        self.assertEqual(self._remis(premier), remise)  # remise inchangée
+        self.assertIsNotNone(self._remis(second))
 
 
 if __name__ == "__main__":
