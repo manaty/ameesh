@@ -273,7 +273,8 @@ class OperatorRecipe(unittest.TestCase):
             self.skipTest('operator recipe requires psycopg')
         from ameesh import config as config_mod
         for failure in ('dsn', 'cleanup', 'version', 'write', 'verify', 'start'):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.dict('os.environ', {'TMPDIR': directory}):
                 home = Path(directory)
                 original = home / '.config/ameesh/config.json'
                 original.parent.mkdir(parents=True)
