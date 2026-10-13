@@ -578,10 +578,26 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+
+    # #804 : la place restante est relue avant **chaque** prise, pas une fois
+    # par passe. Les compteurs sont en base et partagés par tous les
+    # exécuteurs ; avec plusieurs passes simultanées (un exécuteur par hôte),
+    # une lecture unique laissait chacune consommer la même place. La relecture
+    # ramène la fenêtre à la durée d'une attribution ; la place reste une
+    # lecture hors de la transaction d'écriture, donc deux passes strictement
+    # simultanées peuvent encore se dépasser de leur nombre — les passes
+    # suivantes, elles, voient le compteur à jour.
+    def lot_place() -> int:
+        return int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                                LOT_TAKE_NOTE)
+
+    def place() -> int:
+        return int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                            AUTO_TAKE_NOTE)
+
     lot_room = 0
     if lot_idle_s > 0 and lot_max_per_hour > 0:
-        lot_room = int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
-                                                                    LOT_TAKE_NOTE)
+        lot_room = lot_place()
     lots = st.work.unassigned_lots(200) if lot_room > 0 else []
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
     today = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -661,7 +677,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # L165b : un agent dont tous les lots attendent un autre est libre
         pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
         for row in pool:
-            if len(taken) >= lot_room or not lots:
+            # #804 : place relue avant chaque prise (compteur partagé)
+            if not lots or len(taken) >= lot_room or lot_place() <= 0:
                 break
             if not within_budget(row):
                 continue
@@ -688,6 +705,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     taken.append({"item": item, "agent": row["name"], "message_id": None,
                                   "kind": "lot", "notified": notified})
                     lots.remove(item)
+                    break
+                # #804 : la place est relue juste avant l'écriture — une passe
+                # concurrente a pu consommer la place depuis la sélection.
+                if lot_place() <= 0:
                     break
                 try:
                     check = work.check_assignee(db, row["name"], cfg=cfg)
@@ -729,7 +750,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         return taken
     pool = candidates(idle_s)
     for row in pool:
-        if len(taken) >= room or not queue:
+        # #804 : place relue avant chaque prise (compteur partagé)
+        if not queue or len(taken) >= room or place() <= 0:
             break
         if not within_budget(row):
             continue
@@ -754,6 +776,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
                               "kind": "backlog", "notified": []})
                 queue.remove(item)
+                break
+            # #804 : la place est relue juste avant l'écriture — une passe
+            # concurrente a pu consommer la place depuis la sélection.
+            if place() <= 0:
                 break
             try:
                 check = work.check_assignee(db, row["name"], cfg=cfg)
