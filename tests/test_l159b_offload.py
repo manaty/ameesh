@@ -110,6 +110,17 @@ class OffloadBase(unittest.TestCase):
         self.config["gate"] = {"mode": "file", "path": path}
         self.save_config()
 
+    def drop_the_ssh(self, client: subprocess.Popen) -> None:
+        """The "network" drops: this session's ssh dies, its remote side too.
+
+        The kill is scoped to the client's own child (`-P`): CI runs several
+        jobs on one host, each running this module, and the global `-f` pattern
+        used before (`fake-offload-ssh .*run acme-widget`) reached a concurrent
+        job's fake ssh, reddening it with `ssh exit -9` (lot #959).
+        """
+        subprocess.run(["pkill", "-KILL", "-P", str(client.pid), "-f",
+                        "fake-offload-ssh"])
+
 
 class RunTest(OffloadBase):
     def test_output_exit_code_and_exact_snapshot(self):
@@ -309,7 +320,7 @@ class FallbackTest(OffloadBase):
         while time.time() < deadline and not self.running_jobs():
             time.sleep(0.2)
         time.sleep(1)  # the look-alike line is out
-        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run acme-widget"])
+        self.drop_the_ssh(client)
         _out, err = client.communicate(timeout=30)
         self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
         self.assertIn(fake, err)  # relayed as the command's output
@@ -617,6 +628,11 @@ class FallbackTest(OffloadBase):
 
     def test_lost_connection_during_the_job_is_never_rerun_locally(self):
         marker = os.path.join(self.tmp, "local-run")
+        # a concurrent CI job runs this module on the same host: its fake ssh
+        # carries the same command line and must survive our own drop (#959)
+        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                                  FAKE_SSH, "vm", "run", "acme-widget"])
+        self.addCleanup(decoy.kill)
         client = subprocess.Popen(
             [AMEESH, "offload", "run", "--", "sh", "-c",
              'case "$PWD" in %s*) sleep 30;; *) touch %s;; esac' % (self.vm, marker)],
@@ -627,12 +643,13 @@ class FallbackTest(OffloadBase):
         while time.time() < deadline and not self.running_jobs():
             time.sleep(0.2)
         self.assertTrue(self.running_jobs())
-        # the "network" drops: the ssh process dies, its remote side with it
-        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run acme-widget"])
+        # the "network" drops: this session's ssh dies, its remote side too
+        self.drop_the_ssh(client)
         _out, err = client.communicate(timeout=30)
         self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
         self.assertIn("not rerun on this machine", err)
         self.assertFalse(os.path.exists(marker))
+        self.assertIsNone(decoy.poll(), "the fake ssh of a concurrent job was killed")
         deadline = time.time() + 15
         while time.time() < deadline and self.running_jobs():
             time.sleep(0.2)
