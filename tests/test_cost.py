@@ -432,8 +432,22 @@ class TurnAccountingTest(Sandbox, PgTestCase):
                     {"type": "status", "phase": "step_end",
                      "usage": {"inputTokens": 0, "cacheReadTokens": 0, "outputTokens": 1_000_000}})
         usage = self.book().turn_usage("a1")
-        self.assertAlmostEqual(usage.usd, 0.27 + 1.10, places=9)
+        self.assertAlmostEqual(usage.usd, 0.30 + 1.20, places=9)
         self.assertEqual(usage.input_tokens, 1_000_000)
+
+    def test_deepseek_flash_at_the_providers_price(self):
+        # #475: a real deepseek3 turn of 2026-10-12, mostly cache reads, at
+        # DeepSeek's official peak price for deepseek-flash, per million:
+        # cache miss $0.30, cache hit $0.006, output $1.20
+        # (https://api-docs.deepseek.com/quick_start/pricing, read 2026-10-12)
+        self.agent("a1", "deepseek", "deepseek-flash")
+        self.events("a1",
+                    {"type": "status", "phase": "step_end",
+                     "usage": {"inputTokens": 115_819, "cacheReadTokens": 14_932_096,
+                               "outputTokens": 99_522}})
+        usage = self.book().turn_usage("a1")
+        self.assertAlmostEqual(
+            usage.usd, (115_819 * 0.30 + 14_932_096 * 0.006 + 99_522 * 1.20) / 1e6, places=9)
 
     def test_bareme_modifiable_et_repli(self):
         self.agent("a1", "deepseek", "deepseek-pro")

@@ -130,9 +130,14 @@ def _capabilities(values) -> list:
 def add(db: Db, *, title: str, expected_value: str, value_score: int,
         priority: int = DEFAULT_PRIORITY, source: str = "", team: str | None = None,
         required_capabilities=None, body: str = "", package: str | None = None,
-        actor: str = "") -> dict:
+        actor: str = "", app: str | None = None, creator: str | None = None,
+        cfg=None) -> dict:
     """Ajoute un élément à la file. La valeur attendue est obligatoire : la
-    file ne reçoit pas de travail pour occuper."""
+    file ne reçoit pas de travail pour occuper.
+
+    `app` (L118c, #495): the item's project. Omitted, it is inherited from
+    `creator` (default `actor`) as `work add` does; given, it must be a known
+    project (`work_projects.known_projects`)."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -148,9 +153,19 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         raise BacklogError("value score out of range: %d (1 to 100)" % value_score)
     if int(priority) not in PRIORITIES:
         raise BacklogError("priority 1 (high), 2 (normal) or 3 (low): %r" % priority)
+    from . import work, work_projects
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    try:
+        project = work_projects.creation_project(cfg, db, creator or actor, app)
+        if app is not None and not project:
+            raise BacklogError("--app: empty project")
+        if app is not None and project not in work_projects.known_projects(cfg, db):
+            raise BacklogError("unknown project %r (--app): neither a configured canon's "
+                               "nor `github.projects` nor a lot's project" % project)
+    except work.WorkError as exc:
+        raise BacklogError(str(exc)) from None
     fiche = None
     if package:
-        from . import work
         fiche = work._package(db, package)
     return storage.of(db).work.backlog_add(
         title=title, body=body or "", source=source or "", expected_value=expected_value,
@@ -159,7 +174,7 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         note="improvement backlog (value %d): %s" % (value_score, expected_value),
-        actor=actor)
+        actor=actor, app=project)
 
 
 def items(db: Db, *, open_only: bool = True, limit: int = 100) -> list:
@@ -522,6 +537,8 @@ def add_parsers(work_sub, func) -> None:
     p_add.add_argument("--body", default="")
     p_add.add_argument("--package", default=None, help="WorkPackage sheet (L29)")
     p_add.add_argument("--actor", default="")
+    p_add.add_argument("--app", default=None,
+                       help="its project (L118c); default: the creator's project")
     p_add.add_argument("--json", action="store_true")
     p_add.set_defaults(func=func)
     p_list = sub.add_parser("list", help="the backlog, in take order")
@@ -546,16 +563,23 @@ def _line(item: dict) -> str:
         item.get("expected_value") or "")
 
 
-def run(db: Db, args) -> int:
+def run(db: Db, args, cfg=None) -> int:
     import sys
     command = getattr(args, "backlog_command", None)
     if command == "add":
+        from . import identity
+        cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+        # L118c: the creator is this session, whatever `--actor` says (`work add`)
+        binding = identity.resolve_binding(cfg, db) if cfg is not None else None
         try:
             item = add(db, title=args.title, expected_value=args.expected_value,
                        value_score=args.value_score, priority=args.priority,
                        source=args.source, team=args.team,
                        required_capabilities=args.requires, body=args.body,
-                       package=args.package, actor=args.actor)
+                       package=args.package, actor=args.actor,
+                       app=getattr(args, "app", None),
+                       creator=binding.name if binding is not None and binding.ok
+                       else args.actor, cfg=cfg)
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2

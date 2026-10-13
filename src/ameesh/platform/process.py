@@ -472,6 +472,17 @@ def children(pid: int | None = None) -> list[dict]:
     raise NotAvailable("enfants d'un processus", "ni liste du noyau ni psutil")
 
 
+def exited_child(pid: int) -> bool:
+    """Observe an exited direct child without consuming its wait status."""
+    if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
+        return False
+    try:
+        info = os.waitid(os.P_PID, int(pid), os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        return info is not None and info.si_pid == int(pid)
+    except (ChildProcessError, OSError):
+        return False
+
+
 def reap(pid: int) -> int | None:
     """Moissonne `pid` s'il est un enfant TERMINÉ de ce processus : rend son
     code de sortie (négatif : tué par ce signal). None s'il tourne encore,

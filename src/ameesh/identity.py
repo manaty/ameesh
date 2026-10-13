@@ -176,11 +176,15 @@ def _session_binding(cfg: Config, db, harness: str | None,
     return Binding(name=row["agent"], source="session", session=row, ok=True)
 
 
-def chantier_of(name: str, cfg: Config) -> str:
+def workstream_of(name: str, cfg: Config) -> str:
     for _path, alias, chantier in aliases(cfg):
         if alias == name:
             return chantier
     return ""
+
+
+#: L148 (stage 2c): old spelling kept for the callers not yet renamed.
+chantier_of = workstream_of
 
 
 def write_alias(cfg: Config, name: str, directory: str, chantier: str = "") -> str:

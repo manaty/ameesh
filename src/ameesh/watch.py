@@ -71,10 +71,14 @@ class WatchError(Exception):
     """A refused or failed watch command (exit 1)."""
 
 
-def consigne(agent: str) -> str:
+def instruction(agent: str) -> str:
     """The instruction sent to `agent`, from the versioned text."""
     with open(CONSIGNE_PATH, encoding="utf-8") as fh:
         return string.Template(fh.read()).safe_substitute(agent=agent).strip()
+
+
+#: L148 (stage 2c): old spelling kept for the callers not yet renamed.
+consigne = instruction
 
 
 def parse_every(text: str) -> int:
@@ -342,7 +346,7 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
     message in the transaction (tests). What happened, in words."""
     from . import mail, undeliverable
     host = cfg.host or ""
-    text = consigne(agent)
+    text = instruction(agent)
     rows = storage.of(db).watches.list(agent)
     # the project of the thread, read BEFORE the delivery (codex #303 r3): once
     # the message is committed, nothing may fail the firing (the timer would

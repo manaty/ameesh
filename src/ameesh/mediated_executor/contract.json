@@ -2660,6 +2660,70 @@
    ]
   },
   {
+   "name": "turn_resources.running_started_before",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "before_ts",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": true
+    },
+    {
+     "name": "after_id",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": false,
+     "default": 0
+    },
+    {
+     "name": "limit",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": false,
+     "default": 500
+    }
+   ],
+   "result": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "admitted_agents",
+    "host forced; only admitted agents, including invitation allowlist and credential modes; filter before pagination; limit capped at 200"
+   ]
+  },
+  {
    "name": "hosts.record",
    "write": true,
    "transport": "op",
@@ -3700,7 +3764,7 @@
   }
  ],
  "refused": {
-  "interface_total": 359,
+  "interface_total": 374,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3737,7 +3801,8 @@
    "work": "hors du sous-ensemble de l'exécuteur médié",
    "watches": "CI watches: mesh server only",
    "handoffs": "host handoff controller: mesh server only",
-   "lot_sessions": "sessions put aside per lot and lot wakes (#408): runner of the mesh server only"
+   "lot_sessions": "sessions put aside per lot and lot wakes (#408): runner of the mesh server only",
+   "host_lifecycle": "host withdrawal and loss recovery: mesh server only"
   },
   "operations": {
    "accounts": [
@@ -4003,7 +4068,6 @@
     "open_by_agent",
     "orphans",
     "orphans_started_before",
-    "running_started_before",
     "settle",
     "settle_many",
     "settle_unchanged",
@@ -4042,6 +4106,8 @@
     "handoff_lots",
     "issue_feed",
     "items",
+    "land_lock",
+    "land_unlock",
     "link_package",
     "lock_deep_analysis",
     "mark_started",
@@ -4087,6 +4153,7 @@
    "handoffs": [
     "active",
     "begin_effect",
+    "cancellation_guard",
     "controller",
     "cooling",
     "drain",
@@ -4096,6 +4163,8 @@
     "hold",
     "occupancy",
     "prepare_reconcile",
+    "promote_loss",
+    "recover_source",
     "renew",
     "reserve",
     "switch",
@@ -4108,6 +4177,18 @@
     "note_wake",
     "purge",
     "switch"
+   ],
+   "host_lifecycle": [
+    "agents",
+    "complete_return",
+    "demand",
+    "detect_losses",
+    "drain",
+    "expire_returns",
+    "get",
+    "listing",
+    "progress",
+    "undrain"
    ]
   }
  },

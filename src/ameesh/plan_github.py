@@ -66,6 +66,8 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -164,6 +166,90 @@ def _lines(gh, argv: list[str]) -> list[dict]:
             except ValueError as exc:
                 raise GithubError("gh %s: unreadable line" % " ".join(argv[:3])) from exc
     return rows
+
+
+# --------------------------------------------------------------------------
+# lectures GitHub par jeton (L160f) : le client d'ameesh, sans sous-processus
+# --------------------------------------------------------------------------
+
+#: variables qui portent le jeton GitHub — les mêmes que `gh` (L160f : une
+#: vue servie par `ameesh progress --serve` n'appelle jamais la CLI `gh`)
+TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+#: base de l'API, surchargeable comme dans les flux CI (GitHub Enterprise)
+API_BASE = "https://api.github.com"
+
+
+def token_of(env=None) -> str:
+    """Le jeton GitHub de l'hôte : `GH_TOKEN`, sinon `GITHUB_TOKEN`, sinon ''."""
+    env = os.environ if env is None else env
+    for name in TOKEN_VARS:
+        value = str(env.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+class Api:
+    """Les lectures GitHub par HTTPS, avec le jeton de l'hôte (lecture seule).
+
+    `get(chemin) -> JSON` ; toute panne (réseau, refus, réponse illisible)
+    lève `GithubError`, jamais autre chose."""
+
+    def __init__(self, token=None, *, env=None, base=None, timeout=60.0):
+        env = os.environ if env is None else env
+        self.token = str(token if token is not None else token_of(env)).strip()
+        self.base = str(base or env.get("GITHUB_API_URL") or API_BASE).rstrip("/")
+        self.timeout = float(timeout)
+
+    def get(self, path: str):
+        url = "%s/%s" % (self.base, str(path).lstrip("/"))
+        request = urllib.request.Request(url, method="GET", headers={
+            "Authorization": "Bearer %s" % self.token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ameesh"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise GithubError("GitHub %s: HTTP %d" % (path, exc.code)) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise GithubError("GitHub %s: %s"
+                              % (path, " ".join(str(exc).split())[:200])) from exc
+        try:
+            return json.loads(body) if body.strip() else None
+        except ValueError as exc:
+            raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
+
+
+class GhApi:
+    """`gh api` derrière l'interface d'`Api` : le repli LOCAL, quand l'hôte
+    n'a pas de jeton (un poste de travail, jamais le serveur)."""
+
+    def __init__(self, gh):
+        self.gh = gh
+
+    def get(self, path: str):
+        return _json(self.gh, ["api", path])
+
+
+def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
+           allow_gh: bool = True):
+    """Le client de lecture GitHub : le jeton s'il est là, sinon `gh`.
+
+    `allow_gh=False` (le serveur) : sans jeton, rend None — `gh` n'est pas
+    appelé et l'appelant dit le manque."""
+    env = os.environ if env is None else env
+    if token_of(env):
+        return Api(env=env, timeout=timeout)
+    if not allow_gh:
+        return None
+    return GhApi(Gh(gh, env=env, timeout=timeout))
+
+
+def client_name(env=None) -> str:
+    """Ce que `client` utiliserait : `api` (jeton) ou `gh` (repli local)."""
+    return "api" if token_of(env) else "gh"
 
 
 # --------------------------------------------------------------------------
@@ -354,7 +440,7 @@ def _edited(issue: dict, recorded: str | None) -> list[str]:
     return [k for k, d in zip(_FIELD_NAMES, parts) if _digest(now[k]) != d]
 
 
-def fiche_link(canon_ref: str | None, base: str | None) -> str:
+def card_link(canon_ref: str | None, base: str | None) -> str:
     """Lien vers la fiche : `base/<chemin>` (`{commit}` remplacé), sinon la réf."""
     ref = canon_ref or ""
     member_path, _, commit = ref.rpartition("@")
@@ -363,6 +449,10 @@ def fiche_link(canon_ref: str | None, base: str | None) -> str:
         url = base.replace("{commit}", commit).rstrip("/") + "/" + path
         return "[%s](%s) (`%s`)" % (path, url, ref)
     return "`%s`" % ref if ref else "—"
+
+
+#: L148 (stage 2c): old spelling kept for the callers not yet renamed.
+fiche_link = card_link
 
 
 def lot_state(items: list[dict]) -> tuple[str | None, str]:
@@ -417,7 +507,7 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
         epic = plan_mod.epic_of(pid, by_id)
         body = "\n".join([
             _HEADER, "",
-            "- Package: %s" % fiche_link(p.get("canon_ref"), canon_url),
+            "- Package: %s" % card_link(p.get("canon_ref"), canon_url),
             "- Epic: %s" % ("`%s`" % epic if epic else "—"),
             "- Owner: %s" % (p.get("responsible") or "—"),
             "- ameesh state: %s%s" % (
@@ -438,7 +528,7 @@ def desired_views(packages: list[dict], items: list[dict], *, canon_url: str | N
         done = e["lots_total"] and e["lots_merged"] == e["lots_total"] - e["lots_abandoned"]
         body = "\n".join([
             _HEADER, "",
-            "- Package: %s" % fiche_link(p.get("canon_ref"), canon_url),
+            "- Package: %s" % card_link(p.get("canon_ref"), canon_url),
             "- Milestone: %s" % ("`%s`" % e["milestone"] if e["milestone"] else "—"),
             "- Owner: %s" % (p.get("responsible") or "—"),
             "- Progress: %d/%d work items merged%s" % (
@@ -948,10 +1038,11 @@ def _ref_parts(ref: str | None) -> tuple[str, int] | None:
 
 
 def lot_project(item: dict) -> str | None:
-    """Le projet d'un lot, comme `ameesh projects` (L62) : `app`, chantier,
+    """Le projet d'un lot, comme `ameesh projects` (L62) : `app`, `workstream`,
     équipe de sa fiche du plan (à défaut, son équipe : file d'amélioration,
-    L119), projet (équipe ou chantier) de son assigné."""
+    L119), projet (équipe ou `workstream`) de son assigné."""
     agent = projects_mod.agent_project({"team": item.get("assignee_team"),
+                                        "workstream": item.get("assignee_workstream"),
                                         "chantier": item.get("assignee_chantier")})
     lot = dict(item, package_team=item.get("package_team") or item.get("team"))
     return projects_mod.lot_project(lot, {item.get("assignee") or "": agent})
