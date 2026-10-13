@@ -8,7 +8,7 @@ Auteur de la résolution : bureau (Codex). Avis indépendant : impl-08 (DeepSeek
 
 ## Verdict
 
-**GO contenu : 0 B / 0 P2 / 1 N P3.** Le couplage #777 x #1075 est résolu sans perte et l'invariant de libération est exact.
+**GO contenu : 0 B / 0 P2 ; 2 P3 non bloquants.** Le couplage #777 x #1075 est résolu sans perte et l'invariant de libération est exact sur tout le domaine de production (`reserve` ∈ {0 ; 0,10}).
 
 ## Vérifications
 
@@ -18,9 +18,14 @@ Auteur de la résolution : bureau (Codex). Avis indépendant : impl-08 (DeepSeek
 4. **Plancher (#1028 N2)** : sur 16 462 cas bloqués à réserve 0,1 de la grille, `max(share, PACE_MARGIN)` n'est jamais actif (une fenêtre bloquée a `used >= held_cap >= marge`) ; placé avant la division, il ne crée aucun retard m=2. Sans effet comportemental, confirmé ; le lot #1028 (P3) reste le suivi.
 5. **Chemins de rythme** : `evaluate` / `limits` / `_release` / `rank` / `explain` passent le multiplicateur (directement ou via `result.limits`) ; `pace_exceeded`, `over(pace=True)` et le compte par défaut restent nominaux et ne sont appelés que sans comptes déclarés (runner, mesh_cli, account_turn). Les témoins de #1075 (`test_reserve_floor_survives_multiplier`, bisection `exceeded(free ± 1)`) et les 4 ajouts de `test_l242b2_budget.py` couvrent le couplage ; lus, non rejoués.
 
-## N P3 (non bloquant, lot de suite possible)
+## Addendum — contre-exemple docs-01 (23:00), domaine du plancher
 
-`CostBook.report`, `progress` (plans) et `sous_utilisation` affichent ou comparent encore `pace_cap(now)` nominal pour un compte à multiplicateur ×2 ou ×0,5 ; aucun effet sur une pause ni sur un choix de compte (les décisions passent par `accounts`). Observabilité seulement.
+Le contre-exemple est exact : `reserve=0,02`, `m=2`, `used=0,13`, `écoulé=0,02`, fenêtre 7 j -> `held_cap=0,12` (bloqué), vraie levée à 0,84 h, code publié 5,04 h (plancher `max(share, PACE_MARGIN)` actif car `used + reserve < 2 x PACE_MARGIN`). Il sort du domaine de production : le seul `reserve` non nul de l'arbre est `RESERVE = 0,10 = PACE_MARGIN` (accounts.limits/`_release` : `RESERVE if reserve else 0` ; `runner.over` : `RESERVE if margin else 0` ; `pace_exceeded` : défaut 0). Pour `reserve` ∈ {0 ; 0,10}, le plancher est inopérant sur une fenêtre bloquée (`used >= held_cap >= PACE_MARGIN`) et la formule publiée est exacte — contre-vérifié : `reserve=0,10`, `m=2`, `used=0,15`, `écoulé=0,01` -> 10,92 h annoncées = 10,92 h réelles. Le défaut est donc latent, sur une branche morte en production ; il relève du suivi #1028 (N2, P3). Si le pilote veut la lettre de la résolution décrite (retrait du plancher), c'est une ligne -> nouvelle tête, nouveau gel, nouvelle QA ; sinon la tête gelée est exacte pour la production.
+
+## Points P3 (non bloquants)
+
+(a) plancher `max(share, PACE_MARGIN)` latent hors domaine de production — déjà suivi par #1028 (N2, P3), sans effet sur la tête gelée ;
+(b) `CostBook.report`, `progress` (plans) et `sous_utilisation` affichent ou comparent encore `pace_cap(now)` nominal pour un compte à multiplicateur ×2 ou ×0,5 ; aucun effet sur une pause ni sur un choix de compte (les décisions passent par `accounts`). Observabilité seulement, lot de suite possible.
 
 ## Limites
 
