@@ -110,7 +110,10 @@ class HostFactoryTest(unittest.TestCase):
             host_key_alias='fixture-host-key',known_hosts=str(self.known_hosts),
             known_hosts_sha256=hashlib.sha256(self.known_hosts.read_bytes()).hexdigest(),
             identity_file=str(self.identity),seconds=30)
-        self.documents=dict(card=self.card,destinations=self.destinations,transport=self.transport)
+        self.turn=dict(agent='one',unit='ameesh-runner@one.service',account='ameesh',
+                       home='/home/ameesh',seconds=30)
+        self.documents=dict(card=self.card,destinations=self.destinations,transport=self.transport,
+                            turn=self.turn)
         for name,value in self.documents.items():
             path=self.enrollment_root/(name+'.json')
             path.write_text(json.dumps(value,sort_keys=True)); path.chmod(0o600)

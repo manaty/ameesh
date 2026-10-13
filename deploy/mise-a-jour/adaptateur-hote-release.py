@@ -9,8 +9,9 @@ contract:
 
 - protected documents under `/etc/ameesh-release` (root-owned, private, exact
   keys): `card.json` (effective configuration card), `destinations.json`
-  (configuration destination map), `transport.json` (SSH restart endpoint) and
-  `backup.json` (recovery credential references and retention policy);
+  (configuration destination map), `transport.json` (SSH restart endpoint),
+  `turn.json` (enrolled probe agent and executor account) and `backup.json`
+  (recovery credential references and retention policy);
 - fixed private state directories under `/var/lib/ameesh-release` and the
   versioned release store under `/opt/ameesh-release/store`.
 
@@ -21,8 +22,10 @@ companion source stay unbound until that source is installed:
 
 - `sauvegarde-release.py` with `RecoverySet(db, store=, root=, retention=,
   config=)` binds `backup`, `pin` and `accept`;
-- `sante-release.py` with `HealthProbe(db, store=, card=, system=)` binds
-  `health` and `recovery_health`.
+- `sante-release.py` with `HealthProbe(db, store=, card=, system=, turn=)`
+  binds `health` and `recovery_health`; the required `turn` is the
+  `pilote-sante.py` `HealthTurn(db, enrollment=, host=, system=)` running the
+  enrolled probe through `TurnRunner`'s fixed one-turn command.
 
 Companion objects expose `perform(step, request, release)` and answer True
 after verified completion, False for a definitive refusal, or raise. The factory
@@ -335,6 +338,10 @@ class HostFactory:
         if any(unit not in self.card['units'] for unit in self.policy['units']):
             raise FactoryError('restart units outside enrolled host card')
         self.transport_enrollment = self.documents.json('transport')
+        # The enrolled probe turn is part of admission: without it the health
+        # step has no authenticated turn and must stay unbound.
+        self.turn_enrollment = self.documents.json(
+            'turn', exact=('agent', 'unit', 'account', 'home', 'seconds'))
         # Optional only while a companion is supplied for tests/alternate
         # backends; the pinned recovery companion refuses a missing enrollment.
         self.backup_config = self.documents.optional('backup')
@@ -362,8 +369,11 @@ class HostFactory:
                     root=self.backup_root, retention=self.retention_root,
                     config=self.backup_config)
             else:
+                pilot = module('pilote-sante')
                 value = module_value.HealthProbe(self.db, store=self.store,
-                    card=self.card, system=self.system)
+                    card=self.card, system=self.system,
+                    turn=pilot.HealthTurn(self.db, enrollment=self.turn_enrollment,
+                        host=self.enrollment['host'], system=pilot.TurnRunner()))
         except Exception:
             raise FactoryError('pinned host capability unavailable: ' + name) from None
         if not callable(getattr(value, 'perform', None)):

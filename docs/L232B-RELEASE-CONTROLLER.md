@@ -252,7 +252,8 @@ or enabled as a service. Tests simulate systemd and cgroup filesystem fixtures;
 they do not prove a real host restart. The administrator bootstrap and helper
 runtime, restricted SSH/sudo enrollment, independent service, config/caps/guard
 snapshots and the controller's own installer wiring are prepared but not
-installed; the authenticated health/rollback pilot is still required. This
+installed; a real-host pilot, including the enrollment of the probe turn
+(`turn.json`), is still required. This
 checkpoint implements neither user-mode systemd nor other root operations and
 grants no root authority to an agent.
 
@@ -496,13 +497,14 @@ refusal becomes the controller's `ok: false`; an ambiguous or unauthorized
 failure raises so the durable intent reconciles instead of repeating an effect.
 Provider exceptions and their text are replaced by a generic category.
 
-The two companion pinned sources are supplied by this work: `sauvegarde-release.py`
+The three companion pinned sources are supplied by this work: `sauvegarde-release.py`
 exposing `RecoverySet(db, store=, root=, retention=, config=)` for `backup`,
-`pin` and `accept`, and `sante-release.py` exposing `HealthProbe(db, store=,
-card=, system=)` for `health` and `recovery_health`. Both answer True after
-verified completion, False on a definitive refusal, or raise for an ambiguous
-effect; the factory refuses admission while either is absent or its enrollment
-is missing.
+`pin` and `accept`; `sante-release.py` exposing `HealthProbe(db, store=,
+card=, system=, turn=)` for `health` and `recovery_health`; and
+`pilote-sante.py` exposing `HealthTurn(db, enrollment=, host=, system=)` for
+the controlled authenticated turn. All answer True after verified completion,
+False on a definitive refusal, or raise for an ambiguous effect; the factory
+refuses admission while any is absent or its enrollment is missing.
 
 Recovery sets use an optional protected `backup.json` document (exact keys
 `dsn`, `restore_dsn`, `retention_seconds`, `remote`): the dump and the isolated
@@ -525,13 +527,22 @@ versioned pointer (`health`: the activated release; `recovery_health`: the prior
 release restored by rollback), the released schema against the release source's
 migrations, the effective card units, declared capabilities and guard, and runs
 `doctor --probe` from that release's own pinned interpreter with a private
-credential file, scrubbed environment and bounded deadline. The study's
-controlled authenticated turn needs the enrolled runner identity: it is the
-authenticated health/rollback pilot's work and this module never claims it.
-The controller's own installer wiring and that pilot therefore remain build
-work. Tests use real disposable documents, release trees and private roots with
-simulated systemd, database and provider effects; no root, SSH, migration or
-production effect is executed.
+credential file, scrubbed environment and bounded deadline. It then requires the
+controlled authenticated turn from `HealthTurn` and never claims one it did not
+receive.
+
+`turn.json` names the enrolled probe agent, its own runner unit, the executor
+account and home, and a bounded deadline (5 to 120 seconds). `TurnRunner` builds
+the fixed one-turn command from them: the active release's own
+`agent-runner --once --wait N` as that account, through the fixed `runuser`, no
+shell, scrubbed environment and a bounded process. `HealthTurn` refuses to
+disturb a live lease or a running turn, and accepts the turn only with exactly
+one more completed turn, a newer claim generation, a completion timestamp and a
+closed turn resource, with nothing of the probe left running. A missing runner,
+a no-turn exit or divergent evidence is a definitive refusal; an ambiguous
+result raises. Tests use real disposable documents, release trees and private
+roots with simulated systemd, database and provider effects; no root, SSH,
+migration or production effect is executed.
 
 ## Operation-specific code and environment recovery
 
@@ -584,10 +595,11 @@ These are **file receipts only**, deliberately without the controller's `ok`
 field. The host adapter must still validate syntax, reconcile daemon reloads and
 verify effective units, caps and guard policy before returning a full configure
 or rollback receipt; `verification-release.py` (below) now supplies that
-effectiveness half and the pinned factory binds both halves. The recovery-set and
-health companions are supplied too (above); the controller's own installer wiring
-and the authenticated health/rollback pilot remain unfinished (the daily
-retention provider is wired separately, `L232B-PRIVATE-BACKUPS.md`). Targeted
+effectiveness half and the pinned factory binds both halves. The recovery-set,
+health and authenticated-turn companions are supplied too (above); the
+controller's own installer wiring and the real-host enrollment of the probe turn
+remain unfinished (the daily retention provider is wired separately,
+`L232B-PRIVATE-BACKUPS.md`). Targeted
 tests exercise real disposable files with simulated signed authority and database
 gates; no real host configuration or service is changed.
 

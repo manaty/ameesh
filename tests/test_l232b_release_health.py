@@ -39,6 +39,19 @@ class System:
         return dict(self.states[unit])
 
 
+class Turn:
+    """The pinned authenticated turn companion, simulated here."""
+
+    def __init__(self, result=True):
+        self.result, self.calls = result, []
+
+    def one_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
 class HealthProbeTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ameesh-release-health-')
@@ -55,6 +68,7 @@ class HealthProbeTest(unittest.TestCase):
             'ameesh-guard.service': {'LoadState': 'loaded', 'NeedDaemonReload': 'no',
                                      'ActiveState': 'active'}}
         self.system = System(self.states)
+        self.turn = Turn()
         self.target_document = dict(commit='a' * 40, python='/fixture/python',
                                     python_sha256='f' * 64, wheels=[], configuration={})
         self.previous_document = dict(commit='b' * 40, python='/fixture/python',
@@ -117,7 +131,7 @@ class HealthProbeTest(unittest.TestCase):
 
     def value(self, db=None):
         return health.HealthProbe(db or self.db, store=self.store, card=self.card,
-                                  system=self.system)
+                                  system=self.system, turn=self.turn)
 
     def perform(self, step, document=None, db=None, release=None):
         document = document or self.target_document
@@ -210,6 +224,28 @@ class HealthProbeTest(unittest.TestCase):
             self.value().perform('health', broken, self.target_document)
         with self.assertRaises(health.HealthError):
             self.value().perform('health', dict(request, manifest_digest='0' * 64), self.target_document)
+
+    def test_health_runs_one_authenticated_turn_after_the_local_probe(self):
+        self.assertTrue(self.perform('health'))
+        self.assertEqual(len(self.turn.calls), 1)
+        call = self.turn.calls[0]
+        self.assertEqual(call['operation'], 'release-fixture')
+        self.assertEqual(call['step'], 'health')
+        self.assertEqual(call['release'], self.target)
+        self.assertEqual(Path(call['root']), self.store / self.target)
+        self.assertIsNotNone(self.probe(self.target_document)['args'])
+
+    def test_a_refused_turn_or_a_missing_backend_never_completes_health(self):
+        self.turn.result = False
+        self.assertFalse(self.perform('health'))
+        bare = health.HealthProbe(self.db, store=self.store, card=self.card, system=self.system)
+        with self.assertRaisesRegex(health.HealthError, 'authenticated turn'):
+            bare.perform('health', self.request('health', self.target), self.target_document)
+
+    def test_an_ambiguous_turn_raises_instead_of_claiming_health(self):
+        self.turn.result = health.HealthError('controlled turn unavailable')
+        with self.assertRaises(health.HealthError):
+            self.perform('health')
 
 
 if __name__ == '__main__':

@@ -19,9 +19,10 @@
   interpreter with a private credential file, a scrubbed environment and a
   bounded deadline.
 
-The study's full health step also runs one controlled authenticated turn. That
-turn needs the enrolled runner identity and is the authenticated health/rollback
-pilot's work; this module never claims it and never fabricates its receipt.
+The study's full health step also runs one controlled authenticated turn. It is
+provided by the pinned `pilote-sante.py` companion (`HealthTurn`), through the
+enrolled backend's `one_turn(...)`; this module requires that companion and
+never claims a turn it did not receive.
 
 This module is source only: it is not installed, no service is enabled and no
 root, SSH, systemd, PostgreSQL migration or production effect is executed by
@@ -66,9 +67,11 @@ class HealthError(ValueError):
 class HealthProbe:
     """One release's health evidence; no caller-supplied command or path."""
 
-    def __init__(self, db, *, store, card, system, clock=time.time):
+    def __init__(self, db, *, store, card, system, turn=None, clock=time.time):
         if not callable(getattr(system, 'show', None)):
             raise HealthError('enrolled system adapter required')
+        if turn is not None and not callable(getattr(turn, 'one_turn', None)):
+            raise HealthError('enrolled authenticated turn required')
         try:
             self.card = verification.validate_card(card)
         except verification.VerificationError:
@@ -80,6 +83,7 @@ class HealthProbe:
         self.db = db
         self.store = Path(store)
         self.system = system
+        self.turn = turn
         self.dsn = dsn
         self.clock = clock
 
@@ -103,7 +107,16 @@ class HealthProbe:
             return False
         if not self._configuration():
             return False
-        return self._probe(root)
+        if not self._probe(root):
+            return False
+        return self._turn(request, active, root)
+
+    def _turn(self, request, active, root):
+        """One controlled authenticated turn; never claimed without a backend."""
+        if self.turn is None:
+            raise HealthError('authenticated turn unavailable')
+        return self.turn.one_turn(operation=request['operation'], step=request['step'],
+                                  release=active, root=root) is True
 
     @staticmethod
     def _validate(request, step):
