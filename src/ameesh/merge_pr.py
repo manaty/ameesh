@@ -9,39 +9,62 @@ est reproductible, mais il doit être encadré : il écrit directement sur la
 branche cible, donc il peut contourner ce que l'API vérifie (protection de
 branche, checks requis).
 
-    ameesh work merge-pr <pr> --head <sha gelé> [--repo owner/repo]
+    ameesh work merge-pr <pr> --head <sha gelé> --lot N [--repo owner/repo]
                           [--target branche] [--fetch-url URL] [--push-url URL]
-                          [--lot N] [--dry-run] [--json]
+                          [--dry-run] [--json]
 
 Le geste, et ses gardes (toutes vérifiées AVANT toute écriture) :
 
-1. **la PR** est lue par `gh` : elle est ouverte, non brouillon, sa base est
+1. **le lot** (`--lot`, obligatoire) est le porteur de l'autorisation : il doit
+   être gelé sur `--head` et porter un verdict de relecture `ok` sur ce même
+   commit (classe lue par la file : un lot léger en est dispensé). C'est
+   l'admission **de la file de fusion elle-même** (`merge_queue.readiness`)
+   qui est rejouée ici — cible protégée, gel, verdict, classe, CI verte sur la
+   tête gelée — et non une copie : cette voie n'est jamais plus faible que la
+   file ;
+2. **le projet** est résolu par la configuration radar (`merge_queue.
+   radar_project`) : ses conditions (`protected`, `ci_required`, `gates`)
+   s'appliquent. Une cible protégée est refusée (c'est le geste de
+   l'orchestrateur, hors de cette commande) ; `ci_required` exige la CI verte
+   du commit gelé (`radar.commit_ci`), et les `gates` du projet tournent sur
+   l'arbre fusionné avant le push ;
+3. **la PR** est lue par `gh` : elle est ouverte, non brouillon, sa base est
    la cible, sa tête est le SHA gelé donné, son `mergeStateStatus` est
    `CLEAN`/`HAS_HOOKS` et tous ses checks sont terminés et verts
    (`radar.ci_green`) — rien n'est affaibli : une PR bloquée, en retard
    (`BEHIND`) ou dont un check n'est pas vert est refusée ;
-2. **le diff** est calculé localement (`merge-base` puis `diff --name-only`) :
+4. **le diff** est calculé localement (`merge-base` puis `diff --name-only`) :
    la PR doit toucher au moins un chemin `.github/workflows/**` — cette voie
    ne remplace donc jamais la fusion par l'API pour les autres PR ;
-3. **le SHA gelé** est relu sur le dépôt distant (`refs/pull/<pr>/head`) et
+5. **le SHA gelé** est relu sur le dépôt distant (`refs/pull/<pr>/head`) et
    doit être exactement `--head` ;
-4. **la cible n'a pas bougé** : la tête fraîche de la cible est un ancêtre du
+6. **la cible n'a pas bougé** : la tête fraîche de la cible est un ancêtre du
    gel (`merge-base --is-ancestor`) ; sinon rien n'est écrit et il faut
    refusionner la cible dans la branche, refaire CI et relecture ;
-5. **l'arbre du commit de fusion est identique à l'arbre du gel** : le
+7. **l'arbre du commit de fusion est identique à l'arbre du gel** : le
    `merge --no-ff` local doit produire exactement l'arbre relu ; deux
    parents (tête de cible, gel), message qui nomme la PR et les gardes ;
-6. **le push est un compare-and-swap** : `--force-with-lease=<ref>:<tête>`
+8. **garde fraîche juste avant l'écriture** : la PR est relue une seconde
+   fois (état, tête, base, mergeabilité, checks), l'admission de la file est
+   rejouée sur cette vue, et `refs/pull/<pr>/head` comme la tête de la cible
+   sont relus sur le distant. Toute mutation depuis la construction du commit
+   de fusion arrête le geste sans écrire. La fenêtre entre cette dernière
+   lecture et le push n'est pas fermable par git seul : le compare-and-swap
+   ci-dessous ferme la course sur la cible, pas une fermeture de PR ou un
+   check devenu rouge dans cet instant — la relecture finale le constate et
+   ne déclare jamais le lot sur une PR non `MERGED` ;
+9. **le push est un compare-and-swap** : `--force-with-lease=<ref>:<tête>`
    sur un remote **hors jeton** (SSH) ; si la cible a bougé entre la lecture
    et le push, git refuse — jamais `--force` ;
-7. **relecture** : la PR est relue jusqu'à `MERGED`, son commit de fusion doit
+10. **relecture** : la PR est relue jusqu'à `MERGED`, son commit de fusion doit
    être celui poussé, la tête de la cible relue doit être ce commit ; le lot
-   (`--lot`) n'est déclaré fusionné qu'après cette relecture.
+   n'est déclaré fusionné qu'après cette relecture.
 
 Le remote de lecture peut rester celui du jeton (lire un workflow ne demande
-pas le scope) ; seul le push doit être hors jeton. `--dry-run` déroule 1 à 5
-et construit le commit de fusion sans rien pousser ni déclarer : c'est la
-vérification que la relecture peut exiger d'un geste de fusion.
+pas le scope) ; seul le push doit être hors jeton. `--dry-run` déroule toutes
+les gardes (y compris la garde fraîche) et construit le commit de fusion sans
+rien pousser ni déclarer : c'est la vérification que la relecture peut exiger
+d'un geste de fusion.
 
 Sans remote hors jeton (pas de clé SSH sur l'hôte), la commande s'arrête
 avant toute écriture et nomme la décision owner : `gh auth refresh -s
@@ -58,7 +81,7 @@ import shutil
 import tempfile
 import time
 
-from . import land, migrations, plan_git, radar, resolutions, work
+from . import land, merge_queue, migrations, plan_git, radar, resolutions, work
 from .canon import FETCH_TIMEOUT, GitError
 
 #: le chemin qui fait refuser la fusion par l'API
@@ -143,6 +166,84 @@ def check_head(head: str) -> str:
     return text
 
 
+def _branch_name(target: str) -> str:
+    """`origin/main`, `refs/heads/main`, `main` : le même nom de branche."""
+    text = (target or "").strip()
+    if text.startswith("refs/heads/"):
+        text = text[len("refs/heads/"):]
+    if text.startswith("origin/"):
+        text = text.split("/", 1)[1]
+    return text
+
+
+def _pr_guards(view: dict, pr: int, head: str, target: str) -> None:
+    """Les gardes portées par la vue de la PR, rejouées avant toute écriture."""
+    state = (view.get("state") or "").upper()
+    if state != "OPEN":
+        raise MergePrError("PR #%d is %s, not open: nothing to merge" % (pr, state or "?"))
+    if view.get("isDraft"):
+        raise MergePrError("PR #%d is a draft: mark it ready for review first" % pr)
+    if not _same(view.get("headRefOid"), head):
+        raise MergePrError("PR #%d head moved: it is at %s, the freeze is %s; nothing "
+                           "written — refreeze and re-review the new head"
+                           % (pr, (view.get("headRefOid") or "?")[:12], head[:12]))
+    base = (view.get("baseRefName") or "").strip()
+    if base and _branch_name(base) != _branch_name(target):
+        raise MergePrError("PR #%d targets %s, not %s" % (pr, base, target))
+    merge_state = (view.get("mergeStateStatus") or "").upper()
+    if merge_state not in ("CLEAN", "HAS_HOOKS"):
+        raise MergePrError(
+            "PR #%d is not mergeable now (mergeStateStatus %s): the direct path never "
+            "weakens what the API checks — required checks, reviews or the base state "
+            "must be settled first" % (pr, merge_state or "?"))
+    if not radar.ci_green(view.get("statusCheckRollup") or []):
+        raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
+                           % (pr, head[:12]))
+
+
+def _project_of(cfg, repo: str):
+    """Le projet radar du dépôt, ou None (comme la file : pas de conditions
+    déclarées). Une configuration illisible ou ambiguë refuse, jamais ne
+    suppose l'absence de conditions."""
+    try:
+        return merge_queue.radar_project(cfg, repo)
+    except merge_queue.QueueError as exc:
+        raise MergePrError("cannot read the landing conditions of %s: %s" % (repo, exc)) \
+            from exc
+
+
+def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict) -> dict:
+    """L'admission de la file de fusion, rejouée telle quelle (#1003 B1) :
+    gel, verdict `ok` sur la tête (classe lue sur le diff gelé), cible non
+    protégée, CI verte de la PR sur cette tête, `ci_required` du projet. La
+    clone radar est le dépôt de travail de ce geste : `readiness` y lit la
+    branche du lot sur le distant, jamais dans le checkout de l'auteur."""
+    branch = (view.get("headRefName") or "").strip()
+
+    def ci_status(name: str):
+        if not branch or name != branch:
+            return None
+        return {"number": view.get("number"), "url": view.get("url") or "",
+                "head": (view.get("headRefOid") or "").lower(),
+                "green": radar.ci_green(view.get("statusCheckRollup") or []),
+                "draft": bool(view.get("isDraft"))}
+
+    clone = resolutions.Replayer(repo, owner)
+    try:
+        ready = merge_queue.readiness(db, lot, repo, ci=ci_status, clone=clone,
+                                      project=project, cfg=cfg)
+    except merge_queue.QueueError as exc:
+        raise MergePrError("lot #%d is not admitted by the merge queue: %s" % (lot, exc)) \
+            from exc
+    return ready
+
+
+def _ls_remote_ref(owner: str, url: str, ref: str) -> str:
+    """La valeur d'une ref sur le distant, en minuscules ; "" si illisible."""
+    text = _out(owner, "ls-remote", url, ref)
+    return text.split()[0].lower() if text.split() else ""
+
+
 def pr_view(slug: str, pr: int, gh=land._gh) -> dict:
     """La PR lue par `gh` : état, base, tête, mergeabilité, checks."""
     proc = gh(["pr", "view", str(pr), "--repo", slug, "--json",
@@ -222,17 +323,24 @@ def _already(slug: str, pr: int, head: str, view: dict, *, target: str,
 # le geste
 # --------------------------------------------------------------------------
 
-def direct_merge(slug: str, pr: int, head: str, *, target: str | None = None,
+def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None, cfg=None,
+                 project=None, target: str | None = None,
                  fetch_url: str | None = None, push_url: str | None = None,
-                 gh=land._gh, dry_run: bool = False, lot: int | None = None,
+                 gh=land._gh, dry_run: bool = False,
                  attempts: int | None = None, poll_s: float | None = None,
                  sleep=time.sleep, work_dir: str | None = None) -> dict:
-    """Fusionne la PR `pr` (tête `head`) sur `target` par commit local et push
-    compare-and-swap hors jeton, avec les gardes du module. Rien n'est écrit
-    avant la garde 5 ; `dry_run` s'arrête avant le push. Rend le constat
-    (`state`: merged | already | already-unverified | dry-run |
+    """Fusionne la PR `pr` (tête `head`, lot `lot`) sur `target` par commit
+    local et push compare-and-swap hors jeton, avec les gardes du module —
+    dont l'admission de la file (`merge_queue.readiness`), rejouée avant
+    toute écriture puis une seconde fois juste avant le push. Rien n'est
+    écrit avant la garde fraîche ; `dry_run` s'arrête avant le push. Rend le
+    constat (`state`: merged | already | already-unverified | dry-run |
     pushed-unverified)."""
     head = check_head(head)
+    if lot is None:
+        raise MergePrError("--lot is required: the frozen lot carries the freeze and the "
+                           "review verdict this gesture replays, and the merge is declared "
+                           "on it")
     slug = (slug or "").strip().lower()
     if not slug:
         raise MergePrError("no GitHub repository: give --repo owner/repo")
@@ -245,7 +353,7 @@ def direct_merge(slug: str, pr: int, head: str, *, target: str | None = None,
         target = plan_git.check_ref(target, "target")
     except ValueError as exc:
         raise MergePrError(str(exc)) from exc
-    if branch and branch != target:
+    if branch and _branch_name(branch) != _branch_name(target):
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
 
     owner = work_dir or _scratch()
@@ -255,24 +363,19 @@ def direct_merge(slug: str, pr: int, head: str, *, target: str | None = None,
         if state == "MERGED":
             return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
                             owner=owner)
-        if state != "OPEN":
-            raise MergePrError("PR #%d is %s, not open: nothing to merge" % (pr, state or "?"))
-        if view.get("isDraft"):
-            raise MergePrError("PR #%d is a draft: mark it ready for review first" % pr)
-        if not _same(view.get("headRefOid"), head):
-            raise MergePrError("PR #%d head moved: it is at %s, the freeze is %s; nothing "
-                               "written — refreeze and re-review the new head"
-                               % (pr, (view.get("headRefOid") or "?")[:12], head[:12]))
+        if project is None:
+            project = _project_of(cfg, repo)
+        _pr_guards(view, pr, head, target)
+        ready = _admission(db, cfg, lot, repo, project, owner, view)
+        if not _same(ready.get("frozen_sha"), head):
+            raise MergePrError("lot #%d is admitted on %s, not on the freeze %s: refreeze and "
+                               "re-review" % (lot, (ready.get("frozen_sha") or "?")[:12],
+                                              head[:12]))
+        if _branch_name(ready.get("target")) != _branch_name(target):
+            raise MergePrError("lot #%d is queued for %s, not %s: merge it on its own target"
+                               % (lot, ready.get("target") or "?", target))
         api_base = (view.get("baseRefOid") or "").lower()
         merge_state = (view.get("mergeStateStatus") or "").upper()
-        if merge_state not in ("CLEAN", "HAS_HOOKS"):
-            raise MergePrError(
-                "PR #%d is not mergeable now (mergeStateStatus %s): the direct path never "
-                "weakens what the API checks — required checks, reviews or the base state "
-                "must be settled first" % (pr, merge_state or "?"))
-        if not radar.ci_green(view.get("statusCheckRollup") or []):
-            raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
-                               % (pr, head[:12]))
 
         tip, fetched = _fetch(owner, fetch_url, target, pr)
         if not _same(fetched, head):
@@ -328,7 +431,44 @@ def direct_merge(slug: str, pr: int, head: str, *, target: str | None = None,
                     "frozen": head, "tip": tip, "api_base": api_base, "merge": merge_sha,
                     "tree": tree, "frozen_tree": frozen_tree,
                     "workflow_files": touched, "changed_files": len(files),
-                    "merge_state": merge_state, "message": text}
+                    "merge_state": merge_state,
+                    "admission": {"target": ready.get("target") or "",
+                                  "class": ready.get("class") or "",
+                                  "class_why": ready.get("class_why") or ""},
+                    "message": text}
+        # #1003 B1 : les gates du projet radar, sur l'arbre fusionné, comme la
+        # file les fait avant de pousser (aucun gate déclaré : rien à lancer).
+        if project is not None and (getattr(project, "gates", ())
+                                    or getattr(project, "path_gates", ())):
+            checked = land.gates(project, owner, files=files)
+            if not checked["ok"]:
+                _run(owner, "merge", "--abort")
+                raise MergePrError("gate `%s` failed on the merged tree: %s"
+                                   % (checked["gate"], checked["output"]))
+            evidence["gates"] = {"ok": True, "gate": checked["gate"]}
+        # #1003 B2 : garde fraîche juste avant l'écriture — la PR, l'admission
+        # de la file et les deux refs distantes sont relues ; toute mutation
+        # depuis la construction du commit de fusion arrête sans écrire.
+        fresh = pr_view(slug, pr, gh=gh)
+        _pr_guards(fresh, pr, head, target)
+        ready = _admission(db, cfg, lot, repo, project, owner, fresh)
+        if not _same(ready.get("frozen_sha"), head) \
+                or _branch_name(ready.get("target")) != _branch_name(target):
+            raise MergePrError("lot #%d moved during the gesture (admission now %s on %s): "
+                               "nothing written — refreeze and re-review"
+                               % (lot, (ready.get("frozen_sha") or "?")[:12],
+                                  ready.get("target") or "?"))
+        remote_pr = _ls_remote_ref(owner, fetch_url, "refs/pull/%d/head" % pr)
+        if not _same(remote_pr, head):
+            raise MergePrError("the remote PR head is now %s, the freeze is %s: nothing "
+                               "written — refreeze and re-review the new head"
+                               % (remote_pr[:12] or "?", head[:12]))
+        remote_target = _ls_remote(owner, fetch_url, target)
+        if not _same(remote_target, tip):
+            raise MergePrError("%s moved to %s during the gesture (read %s): nothing written "
+                               "— refusion %s into the branch, rerun the exact CI and the "
+                               "review, freeze again"
+                               % (target, remote_target[:12] or "?", tip[:12], target))
         if dry_run:
             evidence.update(state="dry-run", pushed=False, remote_tip="")
             return evidence
@@ -394,8 +534,9 @@ def add_parser(work_sub, func) -> None:
                         help="remote read for the PR and the target (default: origin)")
     parser.add_argument("--push-url", default=None,
                         help="non-token remote pushed to (default: git@github.com:owner/repo.git)")
-    parser.add_argument("--lot", type=int, default=None,
-                        help="also declare the merge on this lot, after the read-back")
+    parser.add_argument("--lot", type=int, required=True,
+                        help="the frozen lot that authorizes the gesture (freeze, review "
+                             "verdict, admission); the merge is declared on it")
     parser.add_argument("--dry-run", action="store_true",
                         help="run every guard and build the merge commit; push nothing")
     parser.add_argument("--json", action="store_true")
@@ -439,10 +580,10 @@ def run(cfg, db, args) -> int:
         origin = plan_git._out(cwd, "remote", "get-url", "origin") or ""
         fetch_url = args.fetch_url or origin or ("https://github.com/%s.git" % slug)
         push_url = check_push_url(args.push_url or ("git@github.com:%s.git" % slug))
-        out = direct_merge(slug, args.pr, args.head, target=args.target,
-                           fetch_url=fetch_url, push_url=push_url, dry_run=args.dry_run,
-                           lot=args.lot)
-        if args.lot and out.get("state") in ("merged", "already"):
+        out = direct_merge(slug, args.pr, args.head, lot=args.lot, repo=cwd, db=db, cfg=cfg,
+                           target=args.target, fetch_url=fetch_url, push_url=push_url,
+                           dry_run=args.dry_run)
+        if out.get("state") in ("merged", "already"):
             out["lot"] = args.lot
             sha = out.get("merge") or out.get("tip") or ""
             try:

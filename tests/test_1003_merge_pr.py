@@ -18,7 +18,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import merge_pr
+from ameesh import merge_pr, merge_queue, radar, work
 
 from .test_l160b_radar import _git
 
@@ -31,18 +31,24 @@ def _write(repo, path, text):
 
 
 class FakeGh:
-    """`gh pr view` : la première vue (l'état de la PR à l'ouverture), puis
-    `later()` pour chaque relecture."""
+    """`gh pr view` : la vue initiale, puis `fresh` (la garde fraîche juste
+    avant l'écriture, la vue initiale par défaut), puis `later()` pour chaque
+    relecture d'après le push."""
 
-    def __init__(self, first: dict, later=None):
-        self.first, self.later, self.calls = first, later, []
+    def __init__(self, first: dict, fresh=None, later=None):
+        self.first, self.fresh, self.later, self.calls = first, fresh, later, []
 
     def __call__(self, args, *, timeout=60.0):
         self.calls.append(list(args))
-        if len(self.calls) == 1 or self.later is None:
+        rank = len(self.calls)
+        if rank == 1:
             data = self.first
-        else:
+        elif rank == 2:
+            data = self.fresh if self.fresh is not None else self.first
+        elif self.later is not None:
             data = self.later()
+        else:
+            data = self.first
         return subprocess.CompletedProcess(["gh", *args], 0, json.dumps(data), "")
 
 
@@ -58,6 +64,9 @@ def view(**over):
 
 
 class _Base(unittest.TestCase):
+    LOT = 1003
+    BRANCH = "lot/7-work"
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -84,13 +93,39 @@ class _Base(unittest.TestCase):
         _git(self.repo, "push", "-q", "origin", "lot/7-work")
         _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
         self.slug = "o/r"
+        # le lot : gelé et relu sur la tête courante — l'admission de la file
+        # (`readiness`) est la vraie garde, ses lectures de base sont simulées.
+        self.lot = self.LOT
+        self.lot_branch = self.BRANCH
+        self.lot_target = "main"
+        self.lot_marks = []
+        self.ready_marks()
+        for patch in (
+                mock.patch.object(work, "get", side_effect=self._lot_row),
+                mock.patch.object(work, "milestones",
+                                  side_effect=lambda db, n, *a, **kw: list(self.lot_marks))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _lot_row(self, db, lot, *a, **kw):
+        return {"id": int(lot), "state": "build", "branch": self.lot_branch,
+                "branch_target": self.lot_target, "title": "le lot", "app": "ameesh"}
+
+    def ready_marks(self, head=None, *, verdict="ok", sha=None):
+        """Le lot gelé sur `head` et son verdict ; `sha` déplace le verdict."""
+        head = head or self.head
+        self.lot_marks = [
+            {"id": 1, "kind": "frozen", "sha": head, "at_ts": 1.0},
+            {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha or head,
+             "at_ts": 2.0},
+        ]
 
     def tip(self, ref="main"):
         return _git(self.origin, "rev-parse", ref).lower()
 
-    def gh(self, later=None, **over):
+    def gh(self, later=None, fresh=None, **over):
         over.setdefault("headRefOid", self.head)
-        return FakeGh(view(**over), later=later)
+        return FakeGh(view(**over), fresh=fresh, later=later)
 
     def merge(self, gh, **kw):
         kw.setdefault("target", "main")
@@ -99,6 +134,10 @@ class _Base(unittest.TestCase):
         kw.setdefault("attempts", 2)
         kw.setdefault("poll_s", 0)
         kw.setdefault("sleep", lambda s: None)
+        kw.setdefault("lot", self.lot)
+        kw.setdefault("repo", self.repo)
+        kw.setdefault("db", None)
+        kw.setdefault("cfg", None)
         return merge_pr.direct_merge(self.slug, 7, self.head, gh=gh, **kw)
 
     def move_main(self):
@@ -122,8 +161,9 @@ class GuardTest(_Base):
         self.assertEqual(self.tip(), self.base)          # rien n'a bougé
         self.assertEqual(out["tree"], out["frozen_tree"])
         self.assertEqual(out["workflow_files"], [".github/workflows/ci.yml"])
-        self.assertNotIn("ameesh-work", out["message"])  # pas de lot : pas de trailer
-        self.assertEqual([c[:2] for c in gh.calls], [["pr", "view"]])
+        self.assertIn("ameesh-work: %d" % self.lot, out["message"])
+        # la vue initiale puis la garde fraîche, aucune relecture d'après push
+        self.assertEqual([c[:2] for c in gh.calls], [["pr", "view"], ["pr", "view"]])
 
     def test_head_moved_is_refused_before_anything(self):
         gh = self.gh(headRefOid="a" * 40)
@@ -133,7 +173,8 @@ class GuardTest(_Base):
         self.assertEqual(self.tip(), self.base)
 
     def test_a_pr_without_workflow_is_refused(self):
-        # une tête qui ne touche pas .github/workflows/**
+        # une tête qui ne touche pas .github/workflows/** : une branche montée
+        # depuis main, déclarée comme branche du lot (gelée et relue)
         _git(self.repo, "checkout", "-q", "main")
         _git(self.repo, "checkout", "-q", "-b", "lot/7-code")
         _write(self.repo, "src/app.py", "print('code only')\n")
@@ -143,8 +184,10 @@ class GuardTest(_Base):
         _git(self.repo, "push", "-q", "origin", "lot/7-code")
         _git(self.origin, "update-ref", "refs/pull/7/head", head)
         self.head = head
+        self.lot_branch = "lot/7-code"
+        self.ready_marks(head)
         with self.assertRaises(merge_pr.MergePrError) as caught:
-            self.merge(self.gh())
+            self.merge(self.gh(headRefName="lot/7-code"))
         self.assertIn("does not touch .github/workflows/**", str(caught.exception))
         self.assertEqual(self.tip(), self.base)
 
@@ -172,7 +215,7 @@ class GuardTest(_Base):
         self.assertIn("moved since the freeze", str(caught.exception))
         self.assertEqual(self.tip(), moved)   # le commit de plus est intact
 
-    def test_a_target_that_moved_before_the_push_is_refused_by_the_lease(self):
+    def test_a_target_that_moves_before_the_fresh_guard_is_refused(self):
         gh = self.gh()
         original = merge_pr.message
         moved = []
@@ -182,6 +225,22 @@ class GuardTest(_Base):
             return original(*a, **kw)
 
         with mock.patch.object(merge_pr, "message", side_effect=side_effect):
+            with self.assertRaises(merge_pr.MergePrError) as caught:
+                self.merge(gh)
+        self.assertTrue(moved)
+        self.assertIn("during the gesture", str(caught.exception))
+        self.assertEqual(self.tip(), moved[-1])   # rien n'a été écrasé
+
+    def test_a_target_that_moves_after_the_fresh_guard_is_refused_by_the_lease(self):
+        gh = self.gh()
+        original, moved = merge_pr._run, []
+
+        def side_effect(cwd, *args, **kw):
+            if args and args[0] == "push":
+                moved.append(self.move_main())
+            return original(cwd, *args, **kw)
+
+        with mock.patch.object(merge_pr, "_run", side_effect=side_effect):
             with self.assertRaises(merge_pr.MergePrError) as caught:
                 self.merge(gh)
         self.assertTrue(moved)
@@ -269,13 +328,110 @@ class MergeTest(_Base):
         self.assertIn("not open", str(caught.exception))
 
 
+class AdmissionGuardTest(_Base):
+    """#1003 B1 : l'admission de la file (`readiness`) est rejouée telle quelle
+    — lot gelé, verdict `ok` sur la tête, cible protégée, cible du lot,
+    `ci_required` — et rien n'est écrit quand elle refuse."""
+
+    def test_the_lot_is_required(self):
+        with self.assertRaisesRegex(merge_pr.MergePrError, "lot is required"):
+            self.merge(self.gh(), lot=None)
+
+    def test_no_verdict_on_the_freeze_is_refused(self):
+        self.lot_marks = [{"id": 1, "kind": "frozen", "sha": self.head, "at_ts": 1.0}]
+        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_blocked_verdict_is_refused(self):
+        self.ready_marks(verdict="blocked")
+        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_verdict_on_another_commit_is_refused(self):
+        self.ready_marks(sha=self.base)
+        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_branch_that_moved_after_the_freeze_is_refused(self):
+        _write(self.repo, "src/more.py", "x\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "after freeze")
+        self.head = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "push", "-q", "origin", self.lot_branch)
+        _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
+        with self.assertRaisesRegex(merge_pr.MergePrError, "not at its freeze"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_protected_target_is_refused(self):
+        project = radar.Project(name="p", repo=self.repo, github="o/r",
+                                protected=("main",))
+        with self.assertRaisesRegex(merge_pr.MergePrError, "protected target"):
+            self.merge(self.gh(), project=project)
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_target_the_lot_is_not_queued_for_is_refused(self):
+        self.lot_target = "develop"
+        with self.assertRaisesRegex(merge_pr.MergePrError, "queued for"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+
+    def test_ci_required_red_on_the_frozen_commit_is_refused(self):
+        project = radar.Project(name="p", repo=self.repo, github="o/r", ci_required=True)
+        red = {"runs": 1, "green": False, "pending": [], "failed": ["tests"]}
+        with mock.patch.object(merge_pr.radar, "commit_ci", return_value=red):
+            with self.assertRaisesRegex(merge_pr.MergePrError, "is red"):
+                self.merge(self.gh(), project=project)
+        self.assertEqual(self.tip(), self.base)
+
+
+class FreshGuardTest(_Base):
+    """#1003 B2 : la garde fraîche juste avant l'écriture — toute mutation
+    depuis la construction du commit de fusion arrête sans pousser."""
+
+    def test_a_head_that_moves_after_the_merge_commit_is_refused_before_the_push(self):
+        gh = self.gh(fresh=view(headRefOid="b" * 40))
+        with self.assertRaisesRegex(merge_pr.MergePrError, "head moved"):
+            self.merge(gh)
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_check_that_turns_red_is_refused_before_the_push(self):
+        fresh = view(headRefOid=self.head, statusCheckRollup=[
+            {"__typename": "CheckRun", "name": "tests", "status": "COMPLETED",
+             "conclusion": "FAILURE"}])
+        with self.assertRaisesRegex(merge_pr.MergePrError, "not all concluded and green"):
+            self.merge(self.gh(fresh=fresh))
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_pr_closed_after_the_merge_commit_is_refused_before_the_push(self):
+        with self.assertRaisesRegex(merge_pr.MergePrError, "not open"):
+            self.merge(self.gh(fresh=view(state="CLOSED")))
+        self.assertEqual(self.tip(), self.base)
+
+    def test_a_verdict_withdrawn_after_the_merge_commit_is_refused_before_the_push(self):
+        gh = self.gh()
+        original = merge_pr.message
+
+        def side_effect(*a, **kw):
+            self.ready_marks(verdict="blocked")
+            return original(*a, **kw)
+
+        with mock.patch.object(merge_pr, "message", side_effect=side_effect):
+            with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+                self.merge(gh)
+        self.assertEqual(self.tip(), self.base)
+
+
 class RunTest(unittest.TestCase):
     """La ligne de commande : constat, enregistrement du lot, codes de sortie."""
 
     def args(self, **over):
         import argparse
         data = dict(repo="o/r", fetch_url="", push_url="git@github.com:o/r.git",
-                    target=None, pr=7, head="a" * 40, dry_run=False, lot=None, json=True,
+                    target=None, pr=7, head="a" * 40, dry_run=False, lot=1003, json=True,
                     actor="impl-03")
         data.update(over)
         return argparse.Namespace(**data)
