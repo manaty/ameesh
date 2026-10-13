@@ -501,6 +501,41 @@ class WatcherTest(PgTestCase):
         self.assertEqual(alerte["lot"], self.lot["id"])
         self.assertEqual(exploitation.alert_key(alerte), cle)
 
+    def test_attente_d_un_runner_separee_et_alerte(self):
+        # #747 : 1 h 24 d'attente lue comme « psql bloqué 2 h 20 »
+        import time as _time
+        now = _time.time()
+        cree = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now - 30 * 60))
+        vue = dict(run_view(801, "9" * 40, "lot/1-un"), status="queued", created_at=cree)
+        self.api.queued = [vue]
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertIsNone(row["started_ts"])
+        self.assertAlmostEqual(row["created_ts"], now - 30 * 60, delta=2)
+        self.assertEqual(ci.wait_text(row, now), "queued 30 min")
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                     if a["type"] == "ci_queue_starved"]
+        self.assertEqual((alerte["reason"], alerte["threshold"]), (DEPOT, 1200))
+        self.assertIn("1 run(s) waiting", alerte["detail"])
+        self.assertIn("ci_queue_starved", notify.DEFAULT_TYPES)
+        # démarrée : l'attente est figée, l'alerte se résout
+        self.api.queued, self.api.live = [], [dict(vue, status="in_progress")]
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertIsNotNone(row["started_ts"])
+        self.assertTrue(ci.wait_text(row, now + 60).startswith("queued 30 min, ran "))
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_queue_starved"], [])
+        report = ci.status_of(self.db, self.lot["id"])
+        self.assertIn("(queued 30 min, ran ", "\n".join(ci.render_status(report)))
+
+    def test_attente_courte_sans_alerte(self):
+        vue = dict(run_view(802, "a1" * 20, "lot/1-un"), status="queued")
+        self.api.queued = [vue]
+        self.watcher.tick(self.db)
+        self.assertEqual(ci.queue_starved(self.db, storage.of(self.db).ci.run(
+            DEPOT, 802)["first_seen_ts"] + 60), [])
+
     def test_extrait_illisible_part_sans_extrait(self):
         sha = "7" * 40
         self.api.live = [run_view(601, sha, "lot/1-un")]
