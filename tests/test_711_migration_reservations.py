@@ -1,0 +1,211 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#711: target-only floors, atomic slots, legacy coexistence and lifecycle."""
+from __future__ import annotations
+
+import json
+import os
+import threading
+from unittest import mock
+
+from ameesh import migration_reservations as reservations, migrations, storage, work
+from ameesh.db import DbError
+
+from .support import PgTestCase
+from .test_l122_numeros_de_migration import _commit, _depot, _git, NEXLINK
+
+
+class ScopedReservationsTest(PgTestCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = _depot(os.path.join(self.tmp, 'repo'), 'manaty/nexlink', NEXLINK.directory,
+                           ['375_base.sql', '376_base.sql'], {'unrelated': ['9000_future.sql']})
+        self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
+        self.a = self.lot('a')
+        self.b = self.lot('b')
+
+    def lot(self, name, app='nexlink'):
+        return work.add(self.db, title=name, issue_ref='manaty/nexlink#1', app=app, actor='mesh-design')
+
+    def reserve(self, lot=None, slots=('schema',), **kw):
+        return reservations.update(self.db, (lot or self.a)['id'], list(slots), repo=self.repo,
+                                   target_branch=kw.pop('target_branch', 'develop'),
+                                   target_sha=kw.pop('target_sha', self.sha), actor='dev', **kw)
+
+    def advance(self, *names):
+        _commit(self.repo, NEXLINK.directory, *names)
+        self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
+        return self.sha
+
+    def test_target_only_floor_multi_slot_json_and_idempotence(self):
+        first = self.reserve(slots=('schema', 'backfill'))
+        self.assertEqual([row['number'] for row in first], [377, 378])
+        self.assertEqual(first, self.reserve(slots=('schema', 'backfill')))
+        self.assertEqual(set(first[0]), {'lot', 'slot', 'id', 'number', 'project', 'target', 'targetSha', 'status'})
+        self.assertEqual(first[0]['target'], {'repo': 'github.com/manaty/nexlink', 'branch': 'develop'})
+        self.assertEqual(first[0]['targetSha'], self.sha)
+        self.assertEqual(self.reserve(self.b)[0]['number'], 379)
+        self.assertEqual(self.reserve(self.lot('other', 'other'))[0]['number'], 377)
+        self.assertEqual(work.get(self.db, self.a['id'])['migration'], None)
+        self.assertIsInstance(first[0]['id'], int)
+
+    def test_normalized_source_and_branch_share_allocator(self):
+        _git(self.repo, 'remote', 'set-url', 'origin', 'https://github.com/MANATY/NEXLINK.git')
+        self.assertEqual(self.reserve(target_branch='origin/develop')[0]['number'], 377)
+        self.assertEqual(self.reserve(self.b, target_branch='refs/heads/develop')[0]['number'], 378)
+        _git(self.repo, 'checkout', '-qb', 'release')
+        self.assertEqual(self.reserve(self.b, slots=('release',), target_branch='release')[0]['number'], 377)
+        _git(self.repo, 'remote', 'set-url', 'origin', 'ssh://git@github.com:2222/MANATY/NEXLINK.git')
+        port = self.reserve(self.lot('port'))[0]
+        self.assertEqual(port['target']['repo'], 'github.com:2222/manaty/nexlink')
+        self.assertEqual(port['number'], 377)
+
+    def test_legacy_reservations_and_new_slots_use_one_allocator(self):
+        work.set_branch(self.db, self.b['id'], 'agent/b', target='origin/develop', actor='dev')
+        legacy = work.reserve_migration(self.db, self.b['id'], 400, repo=self.repo, actor='dev')
+        self.assertEqual(legacy['migration'], 400)
+        self.assertEqual(self.reserve()[0]['number'], 401)
+        default = reservations.listing(self.db, self.b['id'])[0]
+        self.assertEqual((default['slot'], default['number'], default['target']['branch']), ('default', 400, 'develop'))
+        work.reserve_migration(self.db, self.b['id'], release=True)
+        self.assertEqual(reservations.listing(self.db, self.b['id'])[0]['status'], 'released')
+        # Legacy next-free scans other source branches as before, plus slots.
+        high = self.reserve(self.lot('high'), slots=('high',), target_branch='unrelated',
+                            target_sha=reservations._git(self.repo, 'rev-parse', 'unrelated'))[0]
+        self.assertEqual(high['number'], 9001)
+        self.assertEqual(work.reserve_migration(self.db, self.lot('legacy')['id'], repo=self.repo)['migration'], 9002)
+
+    def test_upgrade_backfills_legacy_records_and_replays_additively(self):
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='refs/heads/develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        work.reserve_migration(self.db, self.b['id'], 401, repo=self.repo)
+        work.close(self.db, self.b['id'], abandoned=True, actor='dev')
+        self.db.execute('TRUNCATE work_migration_reservations RESTART IDENTITY')
+        migration = next(m for m in migrations.discover() if m.name == 'migration_reservation_slots')
+        self.assertEqual(migrations.non_additive(migration), [])
+        self.db.script(migration.sql)
+        first = reservations.listing(self.db, self.a['id'])
+        self.assertEqual(first[0]['status'], 'reserved')
+        self.assertEqual(first[0]['target'], {'repo': 'github.com/manaty/nexlink', 'branch': 'develop'})
+        self.assertIsNone(first[0]['targetSha'])
+        self.assertEqual(reservations.listing(self.db, self.b['id'])[0]['status'], 'released')
+        self.db.script(migration.sql)
+        self.assertEqual(reservations.listing(self.db, self.a['id']), first)
+
+    def test_unique_index_blocks_legacy_explicit_collision(self):
+        work.set_branch(self.db, self.b['id'], 'agent/b', target='develop', actor='dev')
+        self.reserve()
+        with self.assertRaises(DbError):
+            work.reserve_migration(self.db, self.b['id'], 377, repo=self.repo)
+        self.assertIsNone(work.get(self.db, self.b['id'])['migration'])
+
+    def test_target_advance_releases_other_lots_and_requalifies_slots(self):
+        old = self.reserve(slots=('schema', 'backfill'))
+        self.reserve(self.b)
+        self.advance('380_other.sql')
+        with self.assertRaisesRegex(work.WorkError, 'advanced'):
+            self.reserve(target_sha=old[0]['targetSha'])
+        refreshed = self.reserve(slots=('schema', 'backfill'))
+        self.assertEqual([r['number'] for r in refreshed], [381, 382])
+        self.assertEqual([r['id'] for r in refreshed], [r['id'] for r in old])
+        self.assertEqual(reservations.listing(self.db, self.b['id'])[0]['status'], 'released')
+        self.assertEqual(self.reserve(self.b)[0]['number'], 383)
+
+    def test_landed_requires_numbers_in_descendant_target_and_keeps_history(self):
+        first = self.reserve(slots=('schema', 'backfill'))
+        with self.assertRaisesRegex(work.WorkError, 'absent'):
+            self.reserve(slots=('schema', 'backfill'), action='landed')
+        self.advance('377_schema.sql', '378_backfill.sql')
+        landed = self.reserve(slots=('schema', 'backfill'), action='landed',
+                              reservation_ids=[r['id'] for r in first])
+        self.assertEqual([r['status'] for r in landed], ['landed', 'landed'])
+        self.assertEqual(landed, self.reserve(slots=('schema', 'backfill'), action='landed'))
+        self.assertEqual(self.reserve(self.b)[0]['number'], 379)
+        with self.assertRaisesRegex(work.WorkError, 'landed'):
+            self.reserve(slots=('schema', 'backfill'), action='release', target_sha=first[0]['targetSha'])
+        with self.assertRaisesRegex(work.WorkError, 'landed'):
+            self.reserve(slots=('schema', 'backfill'))
+
+    def test_release_and_rereserve_then_finished_lot(self):
+        first = self.reserve()[0]
+        with self.assertRaisesRegex(work.WorkError, 'id does not match'):
+            self.reserve(action='release', reservation_ids=[first['id'] + 1])
+        self.assertEqual(self.reserve(action='release')[0]['status'], 'released')
+        self.assertEqual(self.reserve(action='release')[0]['status'], 'released')
+        self.assertEqual(self.reserve()[0]['number'], first['number'])
+        work.close(self.db, self.a['id'], abandoned=True, note='done', actor='dev')
+        with self.assertRaisesRegex(work.WorkError, 'finished'):
+            self.reserve(slots=('new',))
+        # Explicit cleanup remains possible after closing the lot.
+        self.assertEqual(self.reserve(action='release')[0]['status'], 'released')
+
+    def test_batch_rejections_and_exhaustion_are_atomic(self):
+        self.reserve(slots=('one',))
+        before = reservations.listing(self.db, self.a['id'])
+        for slots in [('one', 'two'), ('x', 'x'), ('default',), ('invalid space',)]:
+            with self.assertRaises(work.WorkError):
+                self.reserve(slots=slots)
+            self.assertEqual(reservations.listing(self.db, self.a['id']), before)
+        self.advance('9998_end.sql')
+        with self.assertRaisesRegex(work.WorkError, 'exhausted'):
+            self.reserve(self.b, slots=('one', 'two'))
+        self.assertEqual(reservations.listing(self.db, self.a['id']), before)
+        self.assertEqual(reservations.listing(self.db, self.b['id']), [])
+
+    def test_batch_database_failure_rolls_back_records_and_journal(self):
+        events = len(work.events(self.db, self.a['id']))
+        self.db.script("""CREATE FUNCTION reject_second_slot() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN IF NEW.slot = 'fail' THEN RAISE EXCEPTION 'injected failure'; END IF; RETURN NEW; END $$;
+            CREATE TRIGGER reject_second BEFORE INSERT ON work_migration_reservations
+            FOR EACH ROW EXECUTE FUNCTION reject_second_slot();""")
+        with self.assertRaises(DbError):
+            self.reserve(slots=('ok', 'fail'))
+        self.assertEqual(reservations.listing(self.db, self.a['id']), [])
+        self.assertEqual(len(work.events(self.db, self.a['id'])), events)
+
+    def test_target_moves_during_transaction_rolls_back(self):
+        actual = reservations._tip
+        calls = []
+        def moving(repo, branch):
+            calls.append(1)
+            return actual(repo, branch) if len(calls) == 1 else 'f' * 40
+        with mock.patch.object(reservations, '_tip', side_effect=moving):
+            with self.assertRaisesRegex(work.WorkError, 'during reservation'):
+                self.reserve(slots=('one', 'two'))
+        self.assertEqual(reservations.listing(self.db, self.a['id']), [])
+
+    def test_concurrent_batches_are_disjoint_and_contiguous(self):
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+        def allocate(lot):
+            conn = self.connect()
+            try:
+                barrier.wait(timeout=10)
+                results.append(reservations.update(conn, lot['id'], ['one', 'two'], repo=self.repo,
+                                                   target_branch='develop', target_sha=self.sha, actor='dev'))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+        threads = [threading.Thread(target=allocate, args=(lot,)) for lot in (self.a, self.b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted([r['number'] for r in batch] for batch in results), [[377, 378], [379, 380]])
+
+    def test_cli_json_list_and_legacy_output_compatible(self):
+        args = ('work', 'migration', str(self.a['id']))
+        proc = self.mesh(*args, '--slot', 'schema', '--slot', 'backfill', '--target-branch', 'develop',
+                         '--target-sha', self.sha, '--repo', self.repo, '--json')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        records = json.loads(proc.stdout)
+        proc = self.mesh(*args, '--list', '--json')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), records)
+        proc = self.mesh(*args, '--list', '--release')
+        self.assertNotEqual(proc.returncode, 0)
+        proc = self.mesh('work', 'migration', str(self.b['id']), '--repo', self.repo, '--json')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)['migration'], 9001)
