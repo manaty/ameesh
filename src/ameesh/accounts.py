@@ -541,7 +541,7 @@ class Evaluation:
     profile: Profile
     reason: str = ""                     #: '' = sous le seuil
     gauges: list = field(default_factory=list)
-    until: float | None = None           #: remise à zéro attendue si au seuil
+    until: float | None = None           #: heure de libération si au seuil (#777)
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
@@ -633,13 +633,15 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
     non-critical agent): the pace cap, or the short window cap that replaces
     it, is lowered by `RESERVE`, and never exceeds the pace cap minus
-    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered.
+    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered. #777 :
+    la réserve ne s'applique pas sous `PACE_MARGIN` d'écoulé — le plafond de
+    rythme y vaut `max(écoulé, marge)`, il ne bloque pas le début de fenêtre.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
     out = {}
     for gauge in gauges:
-        pace = (max(0.0, gauge.pace_cap(now) - cut), "pace cap")
+        pace = (gauge.held_cap(now, cut), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
             if reserve:
@@ -650,6 +652,29 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
             base = pace
         out[gauge.key] = min([base, *fixed], key=lambda pair: pair[0])
     return out
+
+
+def _release(depasses, hard, now: float, cut: float) -> tuple[float | None, object | None]:
+    """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
+
+    Une fenêtre tenue par un plafond fixe (`hard`) ne se libère qu'à sa remise
+    à zéro : rien ne la rattrape. Une fenêtre tenue par le rythme se libère
+    quand l'écoulé rejoint l'usage (`Gauge.free_at`, #777), pas à la remise à
+    zéro. `(None, None)` si l'une des fenêtres qui bloquent n'est pas datée :
+    aucune heure annoncée (#373 r2).
+    """
+    dated = []
+    for gauge in depasses:
+        if not gauge.resets_at:
+            return None, None
+        if any(gauge is held for held, _ in hard):
+            free = float(gauge.resets_at)
+        else:
+            free = gauge.free_at(now, cut)
+            if free is None:
+                return None, None
+        dated.append((free, gauge))
+    return max(dated, key=lambda pair: pair[0])
 
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
@@ -706,12 +731,10 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                 profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
         if reserve and not hard:
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
-        resets = [g.resets_at for g in depasses if g.resets_at]
-        result.until = max(resets) if len(resets) == len(depasses) else None
-        if result.until is not None:
-            # #373 r2 : la pause affichée est celle de la fenêtre qui bloque
-            # le plus longtemps
-            late = max(depasses, key=lambda g: float(g.resets_at))
+        # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
+        # plus longtemps ; #777 : à l'heure où elle libère vraiment.
+        result.until, late = _release(depasses, hard, now, RESERVE if reserve else 0.0)
+        if late is not None:
             result.held = (late.key, late.used)
         return result
     if profile.hourly_usd > 0 and book.db is not None:

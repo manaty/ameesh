@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -18,7 +19,7 @@ from ameesh import (account_turn, accounts, alert_briefs, budget, config, cost, 
 
 from .support import PgTestCase
 from .test_l242b_critical_accounts import _Comptes
-from .test_l30_accounts import _Base as _L30Base
+from .test_l30_accounts import _Base as _L30Base, _codex_rollout
 
 HEURE = 3600.0
 
@@ -37,13 +38,16 @@ class ReserveForfaitTest(_Comptes):
         self.assertEqual(self.choose().profile.name, "secondaire")
 
     def test_le_plafond_court_ne_depasse_pas_le_rythme_reserve(self):
-        # #373 r1 : plafond court 90 %, 1 % de la fenêtre écoulé
+        # #373 r1 : plafond court 90 %, 1 % de la fenêtre écoulé. #777 : à
+        # moins de 10 % d'écoulé la réserve ne s'applique pas, le plafond de
+        # rythme vaut la marge (décision du propriétaire du 2026-10-13) — le
+        # plafond court ne le dépasse donc pas non plus.
         profil = accounts.parse({"codex": [
             {"name": "primaire"}, dict(self.secondaire, short_window_cap=0.9)]})["codex"][1]
         jauge = cost.Gauge("codex", "codex-300min", 0.20, self.now + 0.99 * 5 * HEURE,
                            5 * HEURE)
         cap, label = accounts.limits(profil, [jauge], self.now, reserve=True)["codex-300min"]
-        self.assertAlmostEqual(cap, 0.01, places=3)
+        self.assertAlmostEqual(cap, 0.10, places=3)
         self.assertEqual(label, "pace cap")
         cap, label = accounts.limits(profil, [jauge], self.now)["codex-300min"]
         self.assertEqual((cap, label), (0.9, "short window cap"))
@@ -85,6 +89,101 @@ class ReserveForfaitTest(_Comptes):
         limits = accounts.limits(self.items[1], [], self.now, reserve=True)
         self.assertEqual(limits, {})
         self.assertEqual(accounts.RESERVE, 0.10)
+
+
+class DebutDeFenetreTest(unittest.TestCase):
+    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début
+    (décision du propriétaire du 2026-10-13, option b : « pas de réserve sur
+    une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »), et
+    la pause annonce l'heure où le rythme rattrape l'usage, pas la remise à
+    zéro (remarque de l'auditeur)."""
+
+    SEPT_JOURS = 7 * 86400.0
+
+    def setUp(self) -> None:
+        self.now = time.time()
+
+    def jauge(self, used, ecoule, window=None):
+        window = self.SEPT_JOURS if window is None else window
+        return cost.Gauge("codex", "seven_day", used,
+                          self.now + window * (1.0 - ecoule), window)
+
+    def test_sous_dix_pour_cent_d_ecoule_le_plafond_est_la_marge(self):
+        jeune = self.jauge(0.05, 0.01)
+        self.assertAlmostEqual(jeune.held_cap(self.now, accounts.RESERVE),
+                               cost.PACE_MARGIN, places=6)
+        self.assertFalse(jeune.exceeded(self.now, accounts.RESERVE))
+        self.assertTrue(self.jauge(0.12, 0.01).exceeded(self.now, accounts.RESERVE))
+        # passé la marge d'écoulé, la réserve reprend ses dix points
+        self.assertAlmostEqual(self.jauge(0.0, 0.5).held_cap(self.now, accounts.RESERVE),
+                               0.5, places=6)
+        # un agent sans réserve (critique) garde le plafond de rythme entier
+        self.assertAlmostEqual(self.jauge(0.0, 0.01).held_cap(self.now), 0.11, places=6)
+
+    def test_l_heure_de_pause_est_celle_ou_le_rythme_rattrape_l_usage(self):
+        avance = self.jauge(0.15, 0.01)
+        fin = avance.free_at(self.now, accounts.RESERVE)
+        self.assertAlmostEqual(fin - self.now, 0.14 * self.SEPT_JOURS, places=1)
+        self.assertLess(fin, avance.resets_at)
+        # un usage que le rythme ne rattrape plus : seule la remise libère
+        pleine = self.jauge(0.85, 0.5)
+        self.assertEqual(pleine.free_at(self.now, accounts.RESERVE), pleine.resets_at)
+        # sans réserve, la libération est plus tôt : de 1 % à 5 % d'écoulé
+        # pour 15 % d'usage
+        self.assertAlmostEqual(self.jauge(0.15, 0.01).free_at(self.now) - self.now,
+                               0.04 * self.SEPT_JOURS, places=1)
+        # fenêtre non datée : aucune heure annoncée
+        self.assertIsNone(cost.Gauge("codex", "seven_day", 0.5, None,
+                                     self.SEPT_JOURS).free_at(self.now, accounts.RESERVE))
+
+    def test_la_pause_d_un_forfait_annonce_la_liberation(self):
+        book = cost.CostBook(state_dir=tempfile.mkdtemp(prefix="ameesh-l777-"), db=None)
+        avance = self.jauge(0.15, 0.01)
+        with mock.patch.object(book, "gauges", return_value=[avance]), \
+                mock.patch.object(book, "clock", return_value=self.now):
+            raison = book.pace_exceeded("codex", accounts.RESERVE)
+        fin = avance.free_at(self.now, accounts.RESERVE)
+        self.assertTrue(raison.startswith(
+            "pause (account (default), seven_day 15 %%) until %s; plan codex seven_day"
+            % cost.until_label(fin, self.now)), raison)
+        self.assertIn("pace cap 10%", raison)
+
+
+class PauseDebutDeFenetreTest(_Comptes):
+    """#777, avec des comptes déclarés : une fenêtre jeune ne bloque plus un
+    non-critique, et la pause dit quand le rythme la libère."""
+
+    def rollout(self, name, pct, ecoule):
+        home = self.home if name == "primaire" else self.secondaire["path"]
+        _codex_rollout(home, pct, self.now + (1.0 - ecoule) * 5 * HEURE)
+
+    def test_une_fenetre_jeune_ne_bloque_plus_un_non_critique(self):
+        # le primaire est au seuil, le secondaire vient d'ouvrir sa fenêtre :
+        # c'est lui qui sert, la réserve ne bloque plus son début
+        self.rollout("primaire", 96, 0.9)
+        self.rollout("secondaire", 5, 0.01)
+        self.assertEqual(self.choose().profile.name, "secondaire")
+        # 15 % utilisés à 1 % d'écoulé : la réserve tient, la pause est réelle
+        self.rollout("secondaire", 15, 0.01)
+        pause = self.choose()
+        self.assertIsNone(pause.profile)
+        self.assertIn("pace cap 10%", pause.reason)
+
+    def test_la_pause_dit_quand_le_rythme_rattrape_l_usage(self):
+        self.rollout("secondaire", 15, 0.01)
+        ev = accounts.evaluate(self.book, self.items[1], self.items, self.now, reserve=True)
+        self.assertFalse(ev.ok)
+        self.assertEqual(ev.held, ("codex-300min", 0.15))
+        self.assertAlmostEqual(ev.until, self.now + 0.14 * 5 * HEURE, places=3)
+        self.assertIn("10 points kept for critical agents", ev.reason)
+
+    def test_un_plafond_fixe_libre_a_la_remise_a_zero(self):
+        # le plafond implicite de 50 % du compte par défaut ne bouge pas avec
+        # l'écoulé : rien ne le rattrape, la pause annonce la remise à zéro
+        self.rollout("primaire", 60, 0.01)
+        ev = accounts.evaluate(self.book, self.items[0], self.items, self.now, reserve=True)
+        self.assertTrue(ev.hard)
+        self.assertAlmostEqual(ev.until, self.now + 0.99 * 5 * HEURE, places=3)
 
 
 class AffichageDeLaPauseTest(_Comptes):
