@@ -11,7 +11,7 @@ filtre absent n'est jamais un paramètre NULL typé par le serveur.
 from __future__ import annotations
 
 from .. import interface
-from .work import ITEM_COLUMNS
+from .work import item_columns
 
 #: états d'action qui attendent encore quelque chose (non terminaux)
 _OPEN_ACTION_STATES = ("proposed", "approved", "launched", "unknown")
@@ -37,7 +37,7 @@ class Progress(interface.Progress):
     def lots(self, *, since_ts, project, limit) -> list[dict]:
         sql = ("SELECT %s, count(*) OVER ()::bigint AS total FROM work_items"
                " WHERE (state NOT IN ('merged', 'promoted', 'closed')"
-               "        OR updated_at >= to_timestamp(%%s))" % ITEM_COLUMNS)
+               "        OR updated_at >= to_timestamp(%%s))" % item_columns(self.db))
         params: list = [float(since_ts)]
         if project:
             sql += " AND (app = %s OR workstream = %s)"

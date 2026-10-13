@@ -1201,17 +1201,25 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
-             actor: str, held: bool = False, reviewer: str | None = None) -> dict | None:
+             actor: str, held: bool = False) -> dict | None:
         """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et
         journalise ; None (rien d'écrit) s'il n'est plus en `current`.
 
         `held` (L233): also require an open decision request for the lot, in
         the same statement, the request row locked: an answer closing it
         concurrently waits for this move (then releases the lot) or makes it
-        fail (None) — the lot never ends waiting with no request.
+        fail (None) — the lot never ends waiting with no request."""
 
-        `reviewer` (#705): the reviewer designated when the lot enters `qa`;
-        None keeps the one already known (a later review reuses the name)."""
+    @abc.abstractmethod
+    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str) -> dict | None:
+        """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
+        et journalise ; None (rien d'écrit) si le lot n'est plus en `qa`.
+
+        La colonne vient de la migration 0421 : avant elle, la lecture s'en
+        passe (`item_columns`) et l'écriture est refusée avec la marche à
+        suivre. Un exécuteur médié ne désigne jamais de relecteur (opération
+        refusée au contrat L107/L109) : la désignation est un geste
+        d'orchestrateur ou d'humain (`work.designate_reviewer`)."""
 
     @abc.abstractmethod
     def waiting_episodes(self, item_ids: Sequence[int]) -> dict[int, dict]:

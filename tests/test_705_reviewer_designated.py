@@ -13,11 +13,12 @@ d'en désigner un.
 """
 from __future__ import annotations
 
+import os
 import unittest
 
 from ameesh import alert_briefs, exploitation, notify, plan, progress, storage, work
 
-from .support import PgTestCase
+from .support import REPO, PgTestCase
 
 
 class ReviewerMilestonesTest(unittest.TestCase):
@@ -88,7 +89,7 @@ class ReviewerBriefsTest(unittest.TestCase):
     def test_sans_relecteur_l_orchestrateur_du_projet_est_prevenu(self):
         briefs = alert_briefs.briefs(self._alert(), self.LISTING)
         self.assertEqual(sorted(briefs), ["orch"])      # projet ameesh, pas orch-b
-        self.assertIn("ameesh work move 42 qa --reviewer <agent>", briefs["orch"])
+        self.assertIn("ameesh work reviewer 42 <agent>", briefs["orch"])
         self.assertIn("ameesh work milestone 42 verdict", briefs["orch"])
 
     def test_projet_inconnu_retombe_sur_l_equipe_de_l_assigne(self):
@@ -118,12 +119,21 @@ class ReviewerBriefsTest(unittest.TestCase):
 class ReviewerDesignationTest(PgTestCase):
     def _lot(self, title="un lot", assignee="auteur", **extra):
         self.register(assignee, "claude", cwd=self.tmp)
+        # #705 : la désignation est un geste de pilote (`work.corrector`) : les
+        # tests désignent en tant qu'orchestrateur déclaré, jamais en tant
+        # qu'assigné du lot.
+        self.register("chef", "claude", cwd=self.tmp)
         return work.add(self.db, title=title, assignee=assignee, **extra)
 
+    def _env(self):
+        return self.env(AMEESH_ALERT_ORCHESTRATORS="chef")
+
     def _qa(self, lot, *args):
-        proc = self.mesh("work", "move", str(lot["id"]), "build")
+        proc = self.mesh("work", "move", str(lot["id"]), "build",
+                         env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        return self.mesh("work", "move", str(lot["id"]), "qa", *args)
+        return self.mesh("work", "move", str(lot["id"]), "qa", *args, "--actor", "chef",
+                         env=self._env())
 
     def _stale(self, lot):
         """Vieillit la ligne, les transitions et les jalons du lot (7 h)."""
@@ -183,7 +193,7 @@ class ReviewerDesignationTest(PgTestCase):
         proc = self.mesh("work", "move", str(lot["id"]), "build")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("work", "move", str(lot["id"]), "qa",
-                         "--reviewer", "fantome")
+                         "--reviewer", "fantome", "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 1)
         self.assertIn("not in the registry", proc.stderr)
         item = work.get(self.db, lot["id"])
@@ -205,7 +215,7 @@ class ReviewerDesignationTest(PgTestCase):
         proc = self.mesh("work", "move", str(lot["id"]), "build")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("work", "move", str(lot["id"]), "qa",
-                         "--reviewer", "second")
+                         "--reviewer", "second", "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "second")
         rows = work.list_items(self.db, limit=10)
@@ -247,7 +257,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertIsNone(alert["waiting"]["who"])
         briefs = self._briefs(alert)
         self.assertEqual(sorted(briefs), ["orchestrateur"])
-        self.assertIn("ameesh work move %d qa --reviewer <agent>" % lot["id"],
+        self.assertIn("ameesh work reviewer %d <agent>" % lot["id"],
                       briefs["orchestrateur"])
 
     def test_le_courrier_de_l_alerte_part_au_relecteur(self):
@@ -271,3 +281,105 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertIn("ameesh work milestone %d verdict" % lot["id"], rows[0]["body"])
         self.assertEqual(rows[0]["payload"]["alert"], "stale_lot")
         self.assertEqual(rows[0]["payload"]["lot"], lot["id"])
+
+    def test_auto_relecture_refusee(self):
+        """#705 (revue r1, P2-2) : l'assigné ne peut pas être son relecteur."""
+        lot = self._lot()
+        proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "move", str(lot["id"]), "qa",
+                         "--reviewer", "auteur", "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("holds lot", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "build")
+
+    def test_designation_refusee_a_un_non_orchestrateur(self):
+        """#705 (revue r1, P2-2) : désigner est un geste de pilote, pas d'agent."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self.mesh("work", "move", str(lot["id"]), "build")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "move", str(lot["id"]), "qa",
+                         "--reviewer", "relecteur", "--actor", "auteur")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("designation refused", proc.stderr)
+
+    def test_work_reviewer_designe_un_lot_deja_en_qa(self):
+        """#705 (revue r1, P2-5) : changer le relecteur d'un lot en qa, sans
+        aller-retour build/qa, et l'alerte recommande cette commande."""
+        self.register("premier", "codex", cwd=self.tmp)
+        self.register("second", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "premier")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "second",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reviewer second", proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "second")
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "verdict")
+        self.assertEqual(rows[0]["waiting_for"]["who"], "second")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("reviewer second" in n for n in notes), notes)
+
+        self._stale(lot["id"])
+        alert = self._stale_alert(lot["id"])
+        self.assertEqual(alert["waiting"]["who"], "second")
+        briefs = self._briefs(alert)
+        self.assertIn("ameesh work milestone %d verdict" % lot["id"], briefs["second"])
+
+    def test_work_reviewer_refuse_hors_qa(self):
+        """#705 : la commande ne désigne que dans une revue en cours."""
+        lot = self._lot()
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "chef",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not qa", proc.stderr)
+
+    def _restore_reviewer_column(self):
+        self.db.execute("ALTER TABLE work_items ADD COLUMN IF NOT EXISTS"
+                        " reviewer text NOT NULL DEFAULT ''")
+        self.db.__dict__.pop("_has_reviewer", None)
+
+    def test_lectures_avant_la_migration_0421(self):
+        """#705 (revue r1, P2-3) : la prod peut être en 0373 ; sans la colonne,
+        lectures, vue et alertes fonctionnent (le relecteur est alors inconnu)."""
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
+        self.addCleanup(self._restore_reviewer_column)
+        self.db.__dict__.pop("_has_reviewer", None)
+
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["reviewer"], "")
+        rows = work.list_items(self.db, limit=10)
+        self.assertEqual(rows[0]["id"], lot["id"])
+        listing = storage.of(self.db).operations.open_lots_activity(10)
+        self.assertIn(lot["id"], [r["id"] for r in listing])
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("waiting  : verdict from a reviewer (none designated)",
+                      proc.stdout)
+        # l'alerte lit la même jointure : sans la colonne, elle est quand même
+        # collectée (le relecteur est simplement inconnu), #705 P2-3
+        self._stale(lot["id"])
+        alertes = exploitation.alerts(self.cfg, self.db,
+                                      orchestrators_declared=["orchestrateur"])
+        alerte = next(a for a in alertes
+                      if a["type"] == "stale_lot" and a["lot"] == lot["id"])
+        self.assertIsNone(alerte["waiting"]["who"])
+
+
+class ReviewerGrantTest(unittest.TestCase):
+    """#705 (revue r1, P2-4) : le GRANT du superviseur porte la colonne lue."""
+
+    def test_role_superviseur_lit_reviewer(self):
+        path = os.path.join(REPO, "deploy/sql/role-superviseur.sql")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        block = text.split("('work_items', ARRAY[", 1)[1].split("]),", 1)[0]
+        self.assertIn("'reviewer'", block)

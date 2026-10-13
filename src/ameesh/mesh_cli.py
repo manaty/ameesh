@@ -1574,6 +1574,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
             return 0
+        if args.work_command == "reviewer":
+            # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
+            # sans aller-retour build/qa ; c'est la commande que l'alerte
+            # `stale_lot` recommande à l'orchestrateur du projet.
+            item = work.designate_reviewer(cfg, db, args.id, args.agent, actor=args.actor)
+            print("lot #%d: reviewer %s (state %s, designated by %s)" % (
+                item["id"], item["reviewer"], item["state"],
+                args.actor or "the bound identity"))
+            return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
                                actor=args.actor)
@@ -2402,6 +2411,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "when moving to qa: waiting(), the progress view and the stale_lot "
                               "alert name them before any verdict")
     pw_move.set_defaults(func=cmd_work)
+    pw_reviewer = work_sub.add_parser(
+        "reviewer",
+        help="#705: designate (or change) the reviewer of a lot already in qa, "
+             "without a build/qa round trip")
+    pw_reviewer.add_argument("id", type=int)
+    pw_reviewer.add_argument("agent", metavar="AGENT",
+                             help="a registry agent, or human:<id>; never the lot's assignee")
+    pw_reviewer.add_argument("--actor", default="",
+                             help="who designates: the session's bound identity by default; "
+                                  "a human or an orchestrator (same authority as --correct)")
+    pw_reviewer.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
                        "on the target): any open state → merged, merged milestone with the commit")

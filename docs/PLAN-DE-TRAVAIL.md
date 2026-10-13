@@ -81,9 +81,12 @@ blocking verdict only counts if it follows the last freeze. When ameesh does not
 who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of guessing.
 The reviewer of a review can be **designated on entry to `qa`** (#705):
 `ameesh work move <id> qa --reviewer <agent>` — a registry name, or a human
-(`human:…`). The wait then names that reviewer before any verdict, and the
-`stale_lot` alert reaches them; a `qa` lot with no designated reviewer alerts
-the project's orchestrators, who must designate one.
+(`human:…`). A lot already in `qa` gets its reviewer with `ameesh work reviewer
+<id> <agent>`, without a build/`qa` round trip; only a human, an orchestrator or
+a design agent designates, never the lot's assignee. The wait then names that
+reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
+with no designated reviewer alerts the project's orchestrators, who must
+designate one.
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,

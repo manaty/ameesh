@@ -83,7 +83,7 @@ def _reviewer_missing(alert: dict) -> str:
     title = alert.get("title")
     return ("No reviewer designated: lot #%d%s (%s) has been waiting for a verdict for %s "
             "with no designated reviewer, so the wait belongs to nobody. Expected action: "
-            "designate the reviewer: ameesh work move %d qa --reviewer <agent>; or take the "
+            "designate the reviewer: ameesh work reviewer %d <agent>; or take the "
             "review yourself and give the verdict: ameesh work milestone %d verdict "
             "ok|blocked --note \"…\"." % (
                 lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
