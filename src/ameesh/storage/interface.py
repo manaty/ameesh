@@ -864,7 +864,8 @@ class Wakeups(Domain):
 # --------------------------------------------------------------------------
 
 class Keys(Domain):
-    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`)."""
+    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`) et
+    des humains (`key_holders`, #330), lues ensemble dans la vue `mesh_keys`."""
 
     @abc.abstractmethod
     def info(self, agent: str) -> dict | None:
@@ -876,13 +877,40 @@ class Keys(Domain):
         """Enregistre la clé publique (base64) ; faux si l'agent est inconnu."""
 
     @abc.abstractmethod
+    def register_human(self, name: str, human: str, public_key: str, fingerprint: str,
+                       role: str, *, replace: bool = False) -> str:
+        """Enregistre la clé d'un humain sous `name`, hors du registre des
+        agents (`key_holders`, #330) : `created` ; `exists` si le détenteur
+        existe déjà (sans `replace`) ; `agent` si un agent porte ce nom.
+        `replace` (geste du propriétaire, #326 r1) remplace la clé, même
+        révoquée : `replaced` ; la base le refuse hors du rôle propriétaire.
+        Les règles sont celles de la base (0364) : une erreur de la base
+        remonte telle quelle. La ligne de contournement du 12/10 (`smichea`)
+        quitte le registre."""
+
+    @abc.abstractmethod
     def revoke(self, agent: str) -> bool:
         """Révoque la clé active ; faux s'il n'y en avait pas."""
 
     @abc.abstractmethod
+    def owner_registrations(self, since: float) -> list[dict]:
+        """Clés owner enregistrées ou remplacées (#326 r2-r3), lues dans le
+        journal `key_events`, qu'aucune révocation n'efface : par le geste du
+        propriétaire, depuis `since` ; sans ce geste, tant que le propriétaire
+        ne les a pas confirmées (`confirm`). id, name, holder, event,
+        fingerprint, db_user, owner_gesture, at_ts."""
+
+    @abc.abstractmethod
+    def confirm(self, name: str) -> int:
+        """Le propriétaire confirme les enregistrements de la clé de `name`
+        (#326 r3) : un événement `confirmed`, que la base refuse hors de son
+        geste (rôle propriétaire) ; rend son id, 0 sans clé de ce nom."""
+
+    @abc.abstractmethod
     def registered(self) -> list[dict]:
-        """Agents qui ont une clé publique (révoquée comprise), par nom :
-        name, public_key_fingerprint, key_role, key_updated_ts, key_revoked_ts."""
+        """Détenteurs d'une clé publique (révoquée comprise), par nom : name,
+        holder (`human` ou `agent`), public_key_fingerprint, key_role,
+        key_updated_ts, key_revoked_ts."""
 
 
 class Approvals(Domain):
