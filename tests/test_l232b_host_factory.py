@@ -55,9 +55,9 @@ class System:
 
 
 class Fence:
-    def __init__(self): self.steps=[]
-    def perform(self,step,request,*,drain_seconds=0):
-        self.steps.append(step); return dict(request,ok=True)
+    def __init__(self): self.steps=[]; self.probes=[]
+    def perform(self,step,request,*,drain_seconds=0,probe=None):
+        self.steps.append(step); self.probes.append(probe); return dict(request,ok=True)
     def fenced(self,request): return True
     @contextmanager
     def guard(self,request):
@@ -100,7 +100,7 @@ class HostFactoryTest(unittest.TestCase):
         self.policy=dict(host=self.host,units=['ameesh-runner@one.service'],
                          controller_unit='ameesh-release-controller.service',restart_seconds=30)
         self.enrollment_root=self.temp/'enrolled'; self.enrollment_root.mkdir(mode=0o700)
-        self.store=self.temp/'store'; self.store.mkdir(mode=0o700)
+        self.store=self.temp/'store'; self.store.mkdir(mode=0o700); self.store.chmod(0o711)
         self.journal=self.temp/'configuration'; self.journal.mkdir(mode=0o700)
         self.backup=self.temp/'backup'; self.backup.mkdir(mode=0o700)
         self.retention=self.temp/'retention'; self.retention.mkdir(mode=0o700)
@@ -152,8 +152,11 @@ class HostFactoryTest(unittest.TestCase):
     def _install(self,document,release_id):
         root=self.store/release_id; (root/'source/src/ameesh/migrations').mkdir(parents=True,mode=0o700)
         (root/'venv/bin').mkdir(parents=True,mode=0o700)
-        (root/'venv/bin/python').write_text('fixture'); (root/'venv/bin/python').chmod(0o700)
+        (root/'venv/bin/python').write_text('fixture'); (root/'venv/bin/python').chmod(0o755)
         (root/'ready.json').write_text(json.dumps(document,sort_keys=True))
+        # Same traversable modes as environnement-versionne's store: the pinned
+        # factory runs this release's own runner as the enrolled executor.
+        for directory in (root,root/'venv',root/'venv/bin'): directory.chmod(0o711)
         return root
 
     def _completed_releases(self):
@@ -258,6 +261,9 @@ class HostFactoryTest(unittest.TestCase):
                 receipt=adapter.perform(step,request)
                 self.assertEqual(receipt,dict(request,ok=True),step)
         self.assertEqual(self.fence.steps,['fence','unfence','recovery_fence','recovery_unfence'])
+        # B2 witness: the host's enrolled probe agent reaches every fence step,
+        # and never leaks into the signed request or its receipt.
+        self.assertEqual(self.fence.probes,[self.turn['agent']]*4)
         self.assertEqual(self.transport_fake.steps,['restart','recovery_restart'])
         # activate switched to the signed target, rollback restored the pinned prior pair
         self.assertEqual(os.readlink(self.store/'current'),self.releases['previous'])

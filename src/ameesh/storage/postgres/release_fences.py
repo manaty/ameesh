@@ -5,10 +5,14 @@ Not exposed through the mediated executor API. Its enrolled controller caller
 must validate signed authority before writes; these methods do not grant it.
 """
 import json
+import re
 from contextlib import contextmanager
 
 from ... import db as db_mod
 from .hosts import Hosts
+
+#: Enrolled probe identity, same shape as the runner's agent names.
+PROBE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
 
 
 class FenceError(db_mod.DbError):
@@ -66,12 +70,17 @@ class ReleaseFences:
                    (request['action_id'], request['operation'], request['step'], json.dumps(receipt)))
         return receipt
 
-    def close(self, request, *, authorize):
+    def close(self, request, *, authorize, probe):
         """Commit closure immediately; receipt only when registered turns drain.
 
-        None means still draining. No turn, lease, prompt, placement or session
-        is interrupted or mutated. Retry with the same request after a deadline.
+        `probe` is the host's enrolled probe agent: the fence records it so the
+        controller's own one-turn health check stays admissible while every
+        other claim of the host is closed. None means still draining. No turn,
+        lease, prompt, placement or session is interrupted or mutated. Retry
+        with the same request after a deadline.
         """
+        if not isinstance(probe, str) or PROBE.fullmatch(probe) is None:
+            raise FenceError('enrolled probe agent required')
         host = request['manifest']['host']
         with self.db.transaction() as tx:
             self._lock(tx, host)
@@ -83,11 +92,12 @@ class ReleaseFences:
             old = self._receipt(tx, request)
             if old is not None:
                 return old
-            rows = tx.query('SELECT operation FROM host_release_fences WHERE host=%s', (host,))
-            if rows and rows[0]['operation'] != request['operation']:
+            rows = tx.query('SELECT operation,probe FROM host_release_fences WHERE host=%s', (host,))
+            if rows and rows[0] != {'operation': request['operation'], 'probe': probe}:
                 raise FenceError('host has another release fence')
-            tx.execute('INSERT INTO host_release_fences(host,operation) VALUES (%s,%s) ON CONFLICT(host) DO NOTHING',
-                       (host, request['operation']))
+            tx.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)'
+                       ' ON CONFLICT(host) DO NOTHING',
+                       (host, request['operation'], probe))
             if not self._quiet(tx, host):
                 return None
             return self._save(tx, request)

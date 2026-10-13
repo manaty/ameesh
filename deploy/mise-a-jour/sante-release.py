@@ -154,8 +154,13 @@ class HealthProbe:
             info = root.lstat()
         except OSError:
             return False
+        # 0711, owned, never writable by others: the enrolled executor
+        # traverses this release to run its own runner (see
+        # environnement-versionne's store contract), so `0o077` would wrongly
+        # refuse every release prepared since L232b.
         if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o022 or not info.st_mode & 0o001):
             return False
         try:
             document = json.loads((root / 'ready.json').read_text())

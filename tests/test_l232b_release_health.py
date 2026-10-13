@@ -58,7 +58,7 @@ class HealthProbeTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.store = self.base / 'store'
-        self.store.mkdir(mode=0o700)
+        self.store.mkdir(mode=0o700); self.store.chmod(0o711)
         self.card = dict(units=['ameesh-runner@one.service'],
                          properties={'ameesh-runner@one.service': {'MemoryMax': '2G'}},
                          guard='ameesh-guard.service', seconds=30)
@@ -96,9 +96,12 @@ class HealthProbeTest(unittest.TestCase):
                               "stat -c '%%a' \"$AMEESH_CONFIG\" > '%s.mode'\n"
                               "cp \"$AMEESH_CONFIG\" '%s.config'\n"
                               "exit %d\n" % (prefix, prefix, prefix, prefix, exit_code))
-        executable.chmod(0o700)
+        executable.chmod(0o755)
         (root / 'ready.json').write_text(json.dumps(document, sort_keys=True))
-        root.chmod(0o700)
+        # Same traversable modes as environnement-versionne's store: the
+        # controller runs this release's own runner as the enrolled executor.
+        for directory in (root, root / 'venv', root / 'venv/bin'):
+            directory.chmod(0o711)
         return release
 
     def applied(self, document):

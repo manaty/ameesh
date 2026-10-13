@@ -288,8 +288,8 @@ class RoleExecutorTest(PgTestCase):
                 tx.query('SELECT name FROM agent_registry WHERE name=%s FOR UPDATE',('release-worker',))
                 tx.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
                            ('controller-fixture','synthetic-host','a'*64))
-                tx.execute('INSERT INTO host_release_fences(host,operation) VALUES (%s,%s)',
-                           ('synthetic-host','controller-fixture'))
+                tx.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
+                           ('synthetic-host','controller-fixture','synthetic-probe'))
                 for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending'):
                     tx.query('SELECT * FROM '+q(relation)+' LIMIT 0')
                 tx.query('SELECT * FROM mesh_approvals_status LIMIT 0')

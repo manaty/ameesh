@@ -45,6 +45,8 @@ class ReleaseFenceTest(PgTestCase):
         decisions.answer(self.cfg, self.db, self.view['id'], 'apply', human='human:fixture-owner',
                          channel='cli', signed=True)
         registry.upsert(self.db, 'dev', harness='codex', host='release-host')
+        self.probe = 'release-probe'
+        registry.upsert(self.db, self.probe, harness='codex', host='release-host')
         self.lease = registry.claim(self.db, 'dev', 'runner', ttl_seconds=300)
         self.adapter = fence.SignedReleaseFence(self.db, self.auth)
 
@@ -53,7 +55,7 @@ class ReleaseFenceTest(PgTestCase):
                     action_id=self.operation+':'+step, manifest=self.manifest, step=step)
 
     def perform(self, step='fence'):
-        return self.adapter.perform(step, self.request(step))
+        return self.adapter.perform(step, self.request(step), probe=self.probe)
 
     def test_close_preserves_running_turn_then_drains_without_next_prompt(self):
         registry.set_pending_prompt(self.db, 'dev', 'next work remains pending')
@@ -80,6 +82,39 @@ class ReleaseFenceTest(PgTestCase):
         self.assertIsNone(registry.claim(self.db, 'new', 'new-runner', ttl_seconds=300))
         self.assertFalse(registry.begin_turn(self.db, 'dev', 'runner', self.lease['lease_epoch'], 'new'))
 
+    def test_live_fence_admits_only_the_enrolled_probe_and_its_turn(self):
+        self.perform()
+        self.assertFalse(self.db.query(
+            "SELECT ameesh_host_claims_open('release-host') AS open")[0]['open'])
+        self.assertTrue(self.db.query(
+            "SELECT ameesh_agent_claims_open('release-host',%s) AS open", (self.probe,))[0]['open'])
+        # Scheduling decisions stay strict: the probe is never offered or placed.
+        self.assertEqual(registry.claimable(self.db, 'release-host'), [])
+        # Any other identity of the fenced host is still refused.
+        registry.upsert(self.db, 'other', harness='codex', host='release-host')
+        self.assertIsNone(registry.claim(self.db, 'other', 'other-runner', ttl_seconds=300))
+        # The enrolled probe claims and starts its bounded health turn.
+        lease = registry.claim(self.db, self.probe, 'probe-runner', ttl_seconds=300)
+        self.assertIsNotNone(lease)
+        self.assertTrue(registry.begin_turn(self.db, self.probe, 'probe-runner',
+                                            lease['lease_epoch'], 'health'))
+        registry.release(self.db, self.probe, 'probe-runner', lease['lease_epoch'])
+        # Unfencing restores the strict predicate for everyone.
+        self.perform('unfence')
+        self.assertTrue(self.db.query(
+            "SELECT ameesh_host_claims_open('release-host') AS open")[0]['open'])
+
+    def test_fence_requires_a_well_formed_probe_and_keeps_the_first_one(self):
+        with self.assertRaisesRegex(fence.FenceError, 'enrolled probe'):
+            self.adapter.perform('fence', self.request(), probe=None)
+        with self.assertRaisesRegex(fence.FenceError, 'enrolled probe'):
+            self.adapter.perform('fence', self.request(), probe='not a probe')
+        self.assertEqual(self.db.query('SELECT * FROM host_release_fences'), [])
+        expected = self.perform()
+        # A same-action replay never rewrites the enrolled probe.
+        self.assertEqual(self.adapter.perform('fence', self.request(), probe='other-probe'), expected)
+        self.assertEqual(self.db.query('SELECT probe FROM host_release_fences')[0]['probe'], self.probe)
+
     def test_expired_running_and_orphan_resources_are_not_drained(self):
         registry.begin_turn(self.db, 'dev', 'runner', self.lease['lease_epoch'], 'current')
         self.db.execute("UPDATE agent_registry SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE name='dev'")
@@ -99,14 +134,16 @@ class ReleaseFenceTest(PgTestCase):
         self.assertFalse(self.adapter.fenced(self.request('migrate')))
         self.db.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
                         ('another','release-host','c'*64))
-        self.db.execute('INSERT INTO host_release_fences(host,operation) VALUES (%s,%s)', ('release-host','another'))
+        self.db.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
+                        ('release-host','another','another-probe'))
         self.assertEqual(self.perform('unfence'), expected)
         self.assertEqual(self.db.query('SELECT operation FROM host_release_fences')[0]['operation'], 'another')
 
     def test_foreign_fence_and_changed_receipt_hold_release(self):
         self.db.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
                         ('another','release-host','c'*64))
-        self.db.execute('INSERT INTO host_release_fences(host,operation) VALUES (%s,%s)', ('release-host','another'))
+        self.db.execute('INSERT INTO host_release_fences(host,operation,probe) VALUES (%s,%s,%s)',
+                        ('release-host','another','another-probe'))
         with self.assertRaisesRegex(fence.FenceError, 'reconcile'):
             self.perform()
         self.db.execute('DELETE FROM host_release_fences')
@@ -168,7 +205,7 @@ class ReleaseFenceTest(PgTestCase):
 
         def close():
             try:
-                adapter.perform('fence', self.request())
+                adapter.perform('fence', self.request(), probe=self.probe)
             except fence.FenceError as exc:
                 result.append(str(exc))
 
@@ -203,7 +240,7 @@ class ReleaseFenceTest(PgTestCase):
                 thread.start()
                 self.assertTrue(started.wait(10))
                 # Existing row lock is held through publication and commit.
-                fence.SignedReleaseFence(tx, self.auth).perform('fence', self.request())
+                fence.SignedReleaseFence(tx, self.auth).perform('fence', self.request(), probe=self.probe)
             thread.join(10)
             self.assertFalse(thread.is_alive())
             self.assertEqual(result, [False])
@@ -265,7 +302,7 @@ class ReleaseFenceTest(PgTestCase):
         decisions.answer(self.cfg,self.db,view['id'],'apply',human='human:fixture-owner',channel='cli',signed=True)
         signed = release.SignedDecisionAuthority(self.db,view['id'],self.operation,self.manifest)
         gate = fence.SignedReleaseFence(self.db,signed)
-        gate.perform('fence',self.request())
+        gate.perform('fence',self.request(),probe=self.probe)
         system = System()
         engine = helper.RestartHelper(Path(self.tmp)/'signed-helper',policy,authority=signed,fence=gate,system=system)
         expected = dict(self.request('restart'),ok=True)

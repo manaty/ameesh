@@ -82,7 +82,7 @@ CONTENUS = {
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
 HORS_CONTRAT = {
     "host_release_operations": {"operation", "host", "manifest_digest", "created_at"},
-    "host_release_fences": {"operation", "created_at"},
+    "host_release_fences": {"operation", "probe", "created_at"},
     "host_release_fence_receipts": {"action_id", "operation", "step", "receipt",
                                     "completed_at"},
 }

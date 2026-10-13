@@ -111,6 +111,25 @@ class VersionedEnvironmentTest(unittest.TestCase):
         self.assertEqual(self.calls, calls)
         self.assertFalse((self.store / "current").exists())
 
+    def test_store_is_traversable_while_private_receipts_stay_private(self):
+        identity = self.prepare()
+        release_id = self.store / identity
+        # 0711: the enrolled executor traverses the chain, nobody lists it.
+        self.assertEqual(self.store.stat().st_mode & 0o777, 0o711)
+        self.assertEqual(release_id.stat().st_mode & 0o777, 0o711)
+        self.assertTrue((release_id / "venv").stat().st_mode & 0o001)
+        self.assertTrue((release_id / "venv/bin").stat().st_mode & 0o001)
+        # Private contents keep their explicit modes.
+        for private in (release_id / "ready.json", self.store / ".lock"):
+            self.assertEqual(private.stat().st_mode & 0o077, 0)
+        for private in (release_id / "source", release_id / "wheels"):
+            self.assertEqual(private.stat().st_mode & 0o077, 0)
+        # A release the enrolled executor cannot traverse is never activated.
+        (release_id / "venv/bin").chmod(0o700)
+        with self.assertRaisesRegex(release.ReleaseError, 'runnable by the executor'):
+            release.activate(self.store, identity, fenced=True)
+        self.assertFalse((self.store / "current").exists())
+
     def test_atomic_pair_and_rollback_preserve_old_environment(self):
         a, b = self.prepare(), self.prepare(self.b)
         release.activate(self.store, a, fenced=True)

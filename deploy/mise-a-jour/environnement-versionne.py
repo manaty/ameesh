@@ -41,14 +41,29 @@ def run(args, *, env=None, cwd=None):
         raise ReleaseError("release subprocess failed") from None
 
 
+#: The release store stays root-owned and non-writable for anyone else, but its
+#: directory chain must be traversable by the enrolled executor account: the
+#: controller runs the active release's own runner under that account
+#: (`runuser -u <account> -- <store>/<release>/venv/bin/agent-runner`). 0711
+#: grants traverse without listing; private receipts stay 0600/0700.
+STORE_MODE = 0o711
+
+
 @contextmanager
 def locked(store):
     store = Path(store).absolute()
     if store.is_symlink():
         raise ReleaseError("release store cannot be a symlink")
-    store.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if store.stat().st_uid != os.geteuid() or store.stat().st_mode & 0o077:
-        raise ReleaseError("release store must be private and owned")
+    store.mkdir(mode=STORE_MODE, parents=True, exist_ok=True)
+    info = store.stat()
+    if info.st_uid != os.geteuid() or not stat.S_ISDIR(info.st_mode):
+        raise ReleaseError("release store must be owned")
+    if info.st_mode & 0o022:
+        # A store another account can write is refused, never silently repaired.
+        raise ReleaseError("release store must not be writable by others")
+    os.chmod(store, STORE_MODE)
+    if not store.stat().st_mode & 0o001:
+        raise ReleaseError("release store must be traversable by the executor")
     descriptor = os.open(store / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -104,14 +119,31 @@ def prepare(store, repository, manifest):
         raise ReleaseError("repository commit mismatch")
     identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
     release_id = commit + "-" + identity
-    with locked(store) as root:
+    # The venv tree must be readable and executable by the enrolled executor
+    # account (health runs the release's own runner under it). Private files
+    # keep their explicit 0600/0700 modes below; a 0022 umask only widens the
+    # venv's own default modes, never the store's private ones.
+    previous_umask = os.umask(0o022)
+    try:
+        return _build_release(repository=repository, commit=commit, manifest=manifest,
+                              wheels=wheels, python=python, release_id=release_id,
+                              root_store=store)
+    finally:
+        os.umask(previous_umask)
+
+
+def _build_release(*, root_store, repository, commit, manifest, wheels, python, release_id):
+    with locked(root_store) as root:
         destination = root / release_id
         if os.path.lexists(destination):
+            if destination.is_dir() and not destination.is_symlink():
+                os.chmod(destination, STORE_MODE)
             completed(root, release_id)
             if json.loads((destination / "ready.json").read_text()) != manifest:
                 raise ReleaseError("release receipt mismatch")
             return release_id
-        destination.mkdir(mode=0o700)
+        destination.mkdir(mode=STORE_MODE)
+        os.chmod(destination, STORE_MODE)
         try:
             source = destination / "source"
             source.mkdir(mode=0o700)
@@ -178,6 +210,18 @@ def prepare(store, repository, manifest):
             raise
 
 
+def _executor_traversable(path):
+    """The enrolled executor must traverse the venv it is asked to run."""
+    for directory in (path, path / "bin"):
+        try:
+            info = directory.stat()
+        except OSError:
+            return False
+        if not stat.S_ISDIR(info.st_mode) or not info.st_mode & 0o001:
+            return False
+    return True
+
+
 def completed(root, release_id):
     if not isinstance(release_id, str) or not re.fullmatch(r"[0-9a-f]{40}-[0-9a-f]{64}", release_id):
         raise ReleaseError("invalid release identity")
@@ -187,6 +231,13 @@ def completed(root, release_id):
             or (path / "source").is_symlink() or not (path / "source").is_dir()
             or (path / "venv").is_symlink() or not (path / "venv/bin/python").is_file()):
         raise ReleaseError("release has no completed receipt")
+    info = path.stat()
+    if (info.st_uid != os.geteuid() or info.st_mode & 0o022
+            or not info.st_mode & 0o001
+            or not _executor_traversable(path / "venv")):
+        # A release whose runner the enrolled executor cannot traverse must
+        # never be activated or declared healthy.
+        raise ReleaseError("release tree not runnable by the executor")
     manifest = json.loads(receipt.read_text())
     identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
     if release_id != manifest.get("commit", "") + "-" + identity:

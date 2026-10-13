@@ -175,13 +175,16 @@ class HostAdapter:
 
     def __init__(self, *, db, authority, destinations, card, policy,
                  store, configuration_journal, transport_enrollment, system,
-                 root='/', recovery_set=None, health=None):
+                 root='/', recovery_set=None, health=None, probe=None):
         self.db, self.authority = db, authority
         self.destinations, self.card = destinations, card
         self.policy, self.store = policy, Path(store)
         self.configuration_journal = Path(configuration_journal)
         self.system = system
         self.recovery_set, self.health = recovery_set, health
+        # Enrolled probe agent of the host: recorded on the fence so the
+        # controller's health turn stays admissible on a drained host.
+        self.probe = probe
         self.fence = fences.SignedReleaseFence(db, authority)
         self.files = configuration.ConfigurationFiles(
             self.configuration_journal, destinations, authority=authority, gate=self.fence, root=root)
@@ -209,7 +212,8 @@ class HostAdapter:
             raise FactoryError('host action authority denied')
         try:
             if step in ('fence', 'unfence', 'recovery_fence', 'recovery_unfence'):
-                return self.fence.perform(step, request, drain_seconds=DRAIN_SECONDS)
+                return self.fence.perform(step, request, drain_seconds=DRAIN_SECONDS,
+                                          probe=self.probe)
             if step in ('restart', 'recovery_restart'):
                 return self.transport.perform(step, request)
             if step in ('health', 'recovery_health'):
@@ -402,7 +406,7 @@ class HostFactory:
     def admit(self, enrollment):
         if json.loads(json.dumps(enrollment)) != self.enrollment:
             raise FactoryError('factory enrollment changed')
-        self._tree(self.store, private=True)
+        self._tree(self.store, private=False, traversable=True)
         self._tree(self.configuration_journal, private=True, create=True)
         self._tree(self.backup_root, private=True, create=True)
         self._tree(self.retention_root, private=True, create=True)
@@ -425,15 +429,20 @@ class HostFactory:
             raise FactoryError('independent release database unavailable') from None
         return frozenset(REQUIRED)
 
-    def _tree(self, path, *, private, create=False):
+    def _tree(self, path, *, private, create=False, traversable=False):
         path = Path(path)
         if create and not path.exists():
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
         trusted(path)
         if not path.is_dir() or path.is_symlink():
             raise FactoryError('enrolled private state required')
-        if private and path.stat().st_mode & 0o077:
+        mode = path.stat().st_mode
+        if private and mode & 0o077:
             raise FactoryError('enrolled private state required')
+        if traversable and not mode & 0o001:
+            # The release store is 0711: the enrolled executor traverses it to
+            # run the active release's own runner; nothing else is relaxed.
+            raise FactoryError('release store not traversable by the executor')
 
     def _system_executables(self):
         for name in ('systemctl', 'analyze'):
@@ -456,4 +465,5 @@ class HostFactory:
             store=self.store, configuration_journal=self.configuration_journal,
             transport_enrollment=self.transport_enrollment, system=self.system, root=self.root,
             recovery_set=self._companion('sauvegarde-release'),
-            health=self._companion('sante-release'))
+            health=self._companion('sante-release'),
+            probe=self.turn_enrollment['agent'])

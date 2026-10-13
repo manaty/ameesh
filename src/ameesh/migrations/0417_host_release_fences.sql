@@ -9,6 +9,10 @@ CREATE TABLE host_release_operations (
 CREATE TABLE host_release_fences (
     host text PRIMARY KEY,
     operation text NOT NULL UNIQUE REFERENCES host_release_operations(operation),
+    -- Enrolled probe agent of the host: the only identity a live fence still
+    -- admits, so the controller can run its one authenticated health turn on a
+    -- drained host. Every other claim stays closed (see ameesh_agent_claims_open).
+    probe text NOT NULL CHECK (probe ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE TABLE host_release_fence_receipts (
@@ -24,6 +28,22 @@ BEGIN
     RETURN NOT EXISTS (SELECT 1 FROM host_lifecycle
                        WHERE host=wanted_host AND mode IN ('draining','lost'))
        AND NOT EXISTS (SELECT 1 FROM host_release_fences WHERE host=wanted_host);
+END $$;
+-- A live fence closes every claim of the host (placement, wakeable, attach),
+-- except the exact identity the enrolled controller must run for its health
+-- turn: the fence's own probe agent. `host_claims_open` stays the strict
+-- predicate for scheduling decisions; this one is only used on the per-agent
+-- claim and turn paths, where a normal agent still compares equal to strict.
+CREATE FUNCTION ameesh_agent_claims_open(wanted_host text, wanted_agent text)
+RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    IF ameesh_host_claims_open(wanted_host) THEN
+        RETURN true;
+    END IF;
+    RETURN NOT EXISTS (SELECT 1 FROM host_lifecycle
+                       WHERE host=wanted_host AND mode IN ('draining','lost'))
+       AND EXISTS (SELECT 1 FROM host_release_fences
+                   WHERE host=wanted_host AND probe=wanted_agent);
 END $$;
 -- Default executor grants must not confer release-controller writes.
 -- Leave SELECT available to the invoker-rights claim predicate, revoke every

@@ -59,19 +59,27 @@ class SignedReleaseFence:
             raise FenceError('fence authority denied')
         return True
 
-    def perform(self, step, request, *, drain_seconds=0, poll_seconds=0.2):
+    def perform(self, step, request, *, drain_seconds=0, poll_seconds=0.2, probe=None):
         request = json.loads(json.dumps(request))
         if step != request.get('step') or step not in ('fence','unfence','recovery_fence','recovery_unfence'):
             raise FenceError('invalid fence step')
         if (type(drain_seconds) not in (int, float) or not 0 <= drain_seconds <= 7200
                 or type(poll_seconds) not in (int, float) or not 0.01 <= poll_seconds <= 1):
             raise FenceError('invalid drain deadline')
+        if step in ('fence','recovery_fence'):
+            # The closure names the host's enrolled probe: it is the only
+            # identity a live fence still admits for the health turn.
+            if not isinstance(probe, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', probe) is None:
+                raise FenceError('enrolled probe agent required')
         deadline = time.monotonic() + drain_seconds
         while True:
             self._authorized(request)
             try:
-                method = self.store.close if step in ('fence','recovery_fence') else self.store.open
-                receipt = method(request, authorize=lambda: self._authorized(request))
+                if step in ('fence','recovery_fence'):
+                    receipt = self.store.close(request, authorize=lambda: self._authorized(request),
+                                               probe=probe)
+                else:
+                    receipt = self.store.open(request, authorize=lambda: self._authorized(request))
             except Exception:
                 raise FenceError('fence outcome unavailable; reconcile request') from None
             if receipt is not None:
