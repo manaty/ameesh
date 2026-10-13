@@ -219,17 +219,25 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                             % (int(item["id"]), current, recipient, int(item["id"]),
                                recipient))
                     else:
-                        try:
+                        # #858 : un refus de la garde d'attribution qui ne
+                        # tient qu'au DESTINATAIRE (profil divergé en attendant
+                        # le prochain canon sync, responsable manquant, agent
+                        # externe…) est différé : le message part quand même,
+                        # rattaché au lot, l'attribution est reportée.
+                        # R1 mesh-design (13/10 23:10) : une erreur du LOT ou
+                        # de la course CAS (« already merged », « changed in
+                        # the meantime ») n'est PAS un refus d'attribution —
+                        # elle remonte (AssignmentError, rien n'est déposé) au
+                        # lieu d'un faux avertissement différé. On ne juge donc
+                        # le destinataire qu'avant l'appel, et `assign` n'est
+                        # pas enveloppé.
+                        refusal = _assignee_refusal(db, recipient, cfg)
+                        if refusal:
+                            out["warnings"].append(
+                                _assignment_deferred(item, recipient, refusal))
+                        else:
                             done = work_mod.assign(db, int(item["id"]), recipient,
                                                    actor=sender, cfg=cfg)
-                        except work_mod.WorkError as exc:
-                            # #858 : refus d'attribution propre au DESTINATAIRE
-                            # (profil divergé en attendant le prochain canon
-                            # sync…) : le message part quand même, rattaché au
-                            # lot ; l'attribution est différée, pas perdue.
-                            out["warnings"].append(
-                                _assignment_deferred(item, recipient, str(exc)))
-                        else:
                             item = done["item"]
                             out["assigned"] = True
                             if done["check"].get("warning"):

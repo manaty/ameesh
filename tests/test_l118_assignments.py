@@ -138,6 +138,37 @@ class MailLinksLotsTest(_Base):
         self.assertIsNone(rows[0]["branch"])       # pas la branche d'un lot non attribué
         self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(rows[0]["id"]))
 
+    def test_erreur_du_lot_ou_course_non_avalee_comme_refus_destinataire(self):
+        """#858/R1 (mesh-design 23:10) : `assign` lève aussi pour une raison du
+        LOT ou de la course CAS (« already merged », « changed in the
+        meantime ») ; ce n'est pas un refus du DESTINATAIRE — l'erreur remonte
+        et rien n'est déposé, au lieu d'un faux « lot not assigned … » différé."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        for why in ("lot %d already merged: nothing to reassign" % lot["id"],
+                    "lot %d changed in the meantime: retry" % lot["id"]):
+            with mock.patch.dict(os.environ,
+                                 {"AMEESH_ALERT_ORCHESTRATORS": "orch"}), \
+                    mock.patch.object(assignments.work_mod, "assign",
+                                      side_effect=work.WorkError(why)):
+                with self.assertRaises(assignments.AssignmentError) as ctx:
+                    assignments.link_message(self.cfg, self.db, sender="orch",
+                                             recipient="dev1", lot=str(lot["id"]))
+            self.assertIn(why, str(ctx.exception))
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("dev1"), [])
+
+    def test_lot_deja_livre_refuse_avant_depot(self):
+        """#858/R1 : un lot fermé/fusionné n'est pas un destinataire non
+        réveillable ; le rattachement refuse avant tout dépôt."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        work.merged(self.db, lot["id"], sha="a" * 40)
+        proc = self.send("dev1", "Reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("already merged", proc.stderr)
+        self.assertEqual(self.unread("dev1"), [])
+
     def test_garde_d_attribution_rien_n_est_depose(self):
         proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",
                          "--estimate", "1h")
