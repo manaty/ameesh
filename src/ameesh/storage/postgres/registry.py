@@ -44,7 +44,7 @@ AGENT_COLUMNS = """
     responsible, team, projects, provider, credential_mode, capabilities, canon_ref, canon,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
-    session_policy, effort, tier, session_work_item,
+    session_policy, effort, tier, session_work_item, session_cwd, session_origin,
     extract(epoch from status_since)::float8         as status_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
