@@ -10,9 +10,15 @@ test en échec au schéma `ameesh-test-event/1` (L161b). `ameesh notify`, sur
 l'hôte que désigne `github.host` (comme les issues des lots, L126), fait à
 chaque passage un relevé (`Watcher.tick`) :
 
-1. les exécutions en cours ou en attente du workflow des tests (`WORKFLOWS`) de chaque dépôt
-   de `github.projects` (une requête par dépôt) ; chacune est rattachée à un
-   lot : par sa branche (`work_items.branch`, L118), sinon par la ligne
+1. les exécutions en cours ou en attente des workflows suivis de chaque dépôt
+   de `github.projects` (une requête par dépôt) ; les workflows suivis d'un
+   dépôt sont ceux que déclare `github.projects.<projet>.workflows`, sinon —
+   quand le dépôt ne publie pas `tests.yml` — les workflows actifs découverts
+   (`actions/workflows`) : un dépôt dont les suites portent d'autres noms
+   (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est plus ignoré en
+   silence (#1110). Chaque exécution porte son fichier de workflow, pour que
+   le verdict nomme la suite concernée ; chacune est rattachée à un lot : par
+   sa branche (`work_items.branch`, L118), sinon par la ligne
    `ameesh-work: <id>` de son commit de tête (une fusion dans main) ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
@@ -32,7 +38,9 @@ L125 :
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
   fenêtre de 90 s du courrier) ;
 * verdict (vert, ou rouge avec la liste) : un événement ordinaire ; rien pour
-  une exécution annulée ou remplacée ;
+  une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
+  d'autres workflows de la même tête tournent encore, le dit — un vert de
+  `backend-suite.yml` n'est pas « la CI est verte » ;
 * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
   de la base (la cible de la PR, sinon main ; pour main, l'exécution
   précédente de main) n'est jamais imputé à l'auteur : pas d'urgent, une ligne
@@ -51,8 +59,14 @@ import time
 
 from . import storage
 
-#: workflows dont les exécutions sont suivies (nom du fichier)
+#: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
+#: workflow des tests L161 : comportement historique, compatible ameesh.
+#: Un dépôt qui ne le publie pas fait l'objet d'une découverte (#1110).
 WORKFLOWS = ("tests.yml",)
+#: découverte des workflows d'un dépôt : durée de validité du cache, et délai
+#: avant de réessayer après un échec de l'API
+DISCOVERY_TTL = 3600.0
+DISCOVERY_RETRY = 300.0
 #: états GitHub d'une exécution pas encore conclue que le relevé lit : une
 #: exécution en attente d'un runner est vue dès la poussée, avant que
 #: l'exécution qu'elle remplace soit annulée
@@ -81,6 +95,11 @@ class CiError(RuntimeError):
 # --------------------------------------------------------------------------
 # lecture des check runs
 # --------------------------------------------------------------------------
+
+def workflow_of(path: str | None) -> str:
+    """Le fichier de workflow d'une exécution (`…/backend-suite.yml`), ou ""."""
+    return str(path or "").rsplit("/", 1)[-1].strip()
+
 
 def events_of(check_runs, run_id: int) -> list[dict]:
     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
@@ -156,8 +175,13 @@ def _short(sha: str) -> str:
 
 def _head(run: dict, lot: dict | None) -> str:
     where = "lot #%d \"%s\"" % (lot["id"], lot.get("title") or "") if lot else "no lot"
-    return "CI of %s, head %s on %s (%s)" % (where, _short(run["head_sha"]), run["branch"],
-                                          run.get("url") or "run %s" % run["run_id"])
+    workflow = workflow_of(run.get("workflow") or run.get("path"))
+    attempt = int(run.get("run_attempt") or 1)
+    return "CI of %s%s, head %s on %s%s (%s)" % (
+        where, " (%s)" % workflow if workflow else "",
+        _short(run["head_sha"]), run["branch"],
+        ", attempt %d" % attempt if attempt > 1 else "",
+        run.get("url") or "run %s" % run["run_id"])
 
 
 def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
@@ -195,30 +219,42 @@ def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bo
     return "\n".join(lines)
 
 
-def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict]) -> str:
-    """Le message de fin d'une exécution."""
+def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
+                 pending: list[dict] | None = None) -> str:
+    """Le message de fin d'une exécution. `pending` : les autres workflows de
+    la même tête encore en cours — le verdict les nomme, pour qu'un vert d'une
+    suite ne soit pas pris pour un vert de toute la CI (#1110)."""
     head = _head(run, lot)
     own = [f for f in failures if not f.get("inherited")]
     inherited = [f for f in failures if f.get("inherited")]
+    others = sorted({workflow_of(r.get("workflow") or r.get("path")) or "?"
+                     for r in pending or ()
+                     if int(r.get("run_id") or 0) != int(run.get("run_id") or 0)})
     if status == "success" and not failures:
-        return "%s: green." % head
-    lines = []
-    if status == "success":
-        lines.append("%s: green, despite failures seen along the way "
-                     "(retried or tolerated)." % head)
-    elif not own and inherited:
-        lines.append("%s: red, but only failures inherited from %s (already red "
-                     "before your push): nothing is charged to you."
-                     % (head, run.get("base") or "main"))
-    elif not failures:
-        lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
-                     "timeout or another job): see the run." % head)
+        first = "%s: green." % head
     else:
-        lines.append("%s: red, %d failure(s)%s." % (
-            head, len(own), ", and %d inherited from the base" % len(inherited) if inherited else ""))
-    lines.append("")
-    lines += _failure_lines(own + inherited, detail=False)
-    return "\n".join(lines).rstrip()
+        lines = []
+        if status == "success":
+            lines.append("%s: green, despite failures seen along the way "
+                         "(retried or tolerated)." % head)
+        elif not own and inherited:
+            lines.append("%s: red, but only failures inherited from %s (already red "
+                         "before your push): nothing is charged to you."
+                         % (head, run.get("base") or "main"))
+        elif not failures:
+            lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
+                         "timeout or another job): see the run." % head)
+        else:
+            inherited_note = (", and %d inherited from the base" % len(inherited)
+                              if inherited else "")
+            lines.append("%s: red, %d failure(s)%s." % (head, len(own), inherited_note))
+        lines.append("")
+        lines += _failure_lines(own + inherited, detail=False)
+        first = "\n".join(lines).rstrip()
+    if others:
+        first += ("\n\nOther workflow(s) of this head are still running: %s — their "
+                  "verdicts will follow." % ", ".join(others))
+    return first
 
 
 def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
@@ -273,16 +309,74 @@ class Watcher:
         self.log = log or (lambda _text: None)
         self.clock = clock or time.time
         self.dry_run = bool(dry_run)
+        #: découverte des workflows par dépôt : (horodatage, ttl, noms)
+        self._workflows_cache: dict[str, tuple] = {}
+        #: avertissements déjà journalisés par ce passage de service
+        self._warned_workflows: set = set()
 
-    def repos(self) -> list[str]:
+    def settings(self):
+        """Les réglages `github` validés, ou None (déjà journalisé)."""
         from . import plan_github
         try:
-            settings = plan_github.settings_of(self.cfg)
+            return plan_github.settings_of(self.cfg)
         except plan_github.SettingsError:
+            return None
+
+    def repos(self) -> list[str]:
+        settings = self.settings()
+        if settings is None:
             return []  # déjà journalisé par la projection des issues
         if not settings.projects or settings.host != getattr(self.cfg, "host", None):
             return []
         return sorted(set(settings.projects.values()))
+
+    def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
+        """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
+        l'API ne répond pas. Le résultat est gardé : une découverte par heure,
+        une nouvelle tentative après un échec."""
+        now = float(self.clock())
+        cached = self._workflows_cache.get(repo)
+        if cached is not None and now - cached[0] < cached[1]:
+            return cached[2]
+        ttl, found = DISCOVERY_TTL, None
+        try:
+            data = self.api("repos/%s/actions/workflows?per_page=100" % repo) or {}
+            files = []
+            for item in data.get("workflows") or ():
+                if str(item.get("state") or "active") != "active":
+                    continue
+                name = workflow_of(item.get("path"))
+                if name and name not in files:
+                    files.append(name)
+            found = tuple(sorted(files))
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            ttl = DISCOVERY_RETRY
+            self.log("CI %s: workflow discovery failed (%s)"
+                     % (repo, " ".join(str(exc).split())[:200]))
+        self._workflows_cache[repo] = (now, ttl, found)
+        return found
+
+    def followed_workflows(self, repo: str) -> tuple[str, ...]:
+        """Les workflows suivis d'un dépôt : la liste déclarée
+        (`github.projects.<projet>.workflows`) si elle existe, sinon le défaut
+        L161 tant que le dépôt publie `tests.yml`, sinon les workflows actifs
+        découverts — un dépôt dont les suites portent d'autres noms n'est
+        jamais ignoré en silence (#1110)."""
+        settings = self.settings()
+        declared = settings.workflows_for(repo) if settings else None
+        found = self.discovered_workflows(repo)
+        if declared is not None:
+            missing = tuple(w for w in declared if found is not None and w not in found)
+            if missing and (repo, missing) not in self._warned_workflows:
+                self._warned_workflows.add((repo, missing))
+                self.log("CI %s: workflow(s) declared in github.projects but absent "
+                         "from the repository: %s" % (repo, ", ".join(missing)))
+            return declared
+        if not found:
+            return WORKFLOWS
+        if WORKFLOWS[0] in found:
+            return WORKFLOWS
+        return found
 
     def tick(self, db) -> list[dict]:
         """Un relevé de chaque dépôt ; rend les envois et retraits."""
@@ -302,20 +396,36 @@ class Watcher:
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
+        followed = set(self.followed_workflows(repo))
         live = {}
         for status in LIVE_STATUSES:
             data = self.api("repos/%s/actions/runs?status=%s&per_page=50" % (repo, status)) or {}
             for r in data.get("workflow_runs") or ():
-                if str(r.get("path") or "").rsplit("/", 1)[-1] in WORKFLOWS:
+                if workflow_of(r.get("path")) in followed:
                     live.setdefault(int(r["id"]), r)
         lots = [r for r in st.work.open_for_sweep(500) if r.get("branch")]
         out: list[dict] = []
         for run_id in sorted(live):
             out += self._follow(db, repo, live[run_id], lots)
-        for row in st.ci.running(repo):
+        # les lignes que ce passage conclut sont figées AVANT les envois : le
+        # verdict d'un workflow ne cite pas comme « encore en cours » un
+        # workflow conclu dans le même passage (#1110)
+        running = st.ci.running(repo)
+        finishing: dict[int, dict] = {}
+        for row in running:
+            if int(row["run_id"]) in live:
+                continue
+            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+            if (run.get("status") or "") == "completed":
+                finishing[int(row["run_id"])] = run
+        for row in running:
             out += self._failures(db, repo, row)
-            if int(row["run_id"]) not in live:
-                out += self._conclude(db, repo, row)
+            run = finishing.get(int(row["run_id"]))
+            if run is None:
+                continue
+            others = [r for r in running if int(r["run_id"]) not in finishing
+                      and int(r["run_id"]) != int(row["run_id"])]
+            out += self._conclude(db, repo, row, run=run, pending=others)
         return out
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
@@ -329,7 +439,7 @@ class Watcher:
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
                        base=base_of(run), work_item_id=lot_of_run(run, lots),
-                       url=run.get("html_url"))
+                       url=run.get("html_url"), workflow=workflow_of(run.get("path")))
         branch = run.get("head_branch") or ""
         if not branch or branch in BASE_BRANCHES:
             return []
@@ -388,6 +498,7 @@ class Watcher:
                              detail=False)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "failure",
+                          "workflow": row.get("workflow") or workflow_of(row.get("path")),
                           "tests": [f["test"] for f in own]}}
         if unknown_base:
             payload["ci_passif"] = True
@@ -401,11 +512,15 @@ class Watcher:
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
-    def _conclude(self, db, repo: str, row: dict) -> list[dict]:
-        """Une exécution qui n'est plus en cours : son verdict."""
+    def _conclude(self, db, repo: str, row: dict, *, run: dict | None = None,
+                  pending: list[dict] | None = None) -> list[dict]:
+        """Une exécution qui n'est plus en cours : son verdict. `run` : son
+        dernier état GitHub, déjà relevé ; `pending` : les autres workflows de
+        la même tête encore en cours, que le verdict nomme."""
         from . import work
         st = storage.of(db)
-        run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+        if run is None:
+            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
         if (run.get("status") or "") != "completed":
             return []  # en attente d'un runner, ou relancée : au prochain relevé
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
@@ -420,9 +535,15 @@ class Watcher:
         if not to:
             return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
                      "status": status, "to": None}]
-        text = verdict_text(row, lot, status, failures)
+        # le verdict situe la suite : fichier du workflow et attempt du dernier
+        # état GitHub, quand la ligne ne les porte pas encore (#901, #1110)
+        view = dict(row, run_attempt=run.get("run_attempt") or row.get("run_attempt") or 1,
+                    path=run.get("path") or row.get("path") or "")
+        text = verdict_text(view, lot, status, failures, pending=pending)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "verdict", "status": status,
+                          "workflow": view.get("workflow") or workflow_of(view.get("path")),
+                          "attempt": int(view.get("run_attempt") or 1),
                           "failures": len([f for f in failures if not f.get("inherited")]),
                           "inherited": len([f for f in failures if f.get("inherited")])}}
         message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
@@ -497,8 +618,9 @@ def render_status(report: dict) -> list[str]:
             state += " by %s" % _short(run["superseded_by"])
         own = [f for f in run["failures"] if not f.get("inherited")]
         inherited = len(run["failures"]) - len(own)
-        lines.append("  %s  %s  %s  %s%s%s" % (
-            local_time(run["first_seen_ts"]), _short(run["head_sha"]), state,
+        lines.append("  %s  %s  %s  %s  %s%s%s" % (
+            local_time(run["first_seen_ts"]), _short(run["head_sha"]),
+            run.get("workflow") or "—", state,
             "%d failure(s)" % len(own), ", %d inherited" % inherited if inherited else "",
             "  %s" % run["url"] if run.get("url") else ""))
         for f in own[:10]:

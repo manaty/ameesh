@@ -9,6 +9,7 @@ from .. import interface
 
 RUN_COLUMNS = """
     repo, run_id, head_sha, branch, event, base, work_item_id, status, superseded_by, url,
+    workflow,
     extract(epoch from first_seen_at)::float8 AS first_seen_ts,
     extract(epoch from concluded_at)::float8 AS concluded_ts,
     urgent_message_id, verdict_message_id
@@ -33,17 +34,20 @@ class CiResults(interface.CiResults):
         return rows[0] if rows else None
 
     def open_run(self, repo, run_id, *, head_sha, branch, event, base, work_item_id,
-                 url) -> dict:
+                 url, workflow="") -> dict:
         rows = self.db.query(
             """
-            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id, url)
-            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
+            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id,
+                                 url, workflow)
+            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
             ON CONFLICT (repo, run_id) DO UPDATE
-               SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id)
+               SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id),
+                   workflow = coalesce(nullif(excluded.workflow, ''), ci_runs.workflow)
             RETURNING %s
             """ % RUN_COLUMNS,
             (repo, int(run_id), head_sha, branch, event or "", base or "main",
-             int(work_item_id) if work_item_id is not None else None, url))
+             int(work_item_id) if work_item_id is not None else None, url,
+             workflow or ""))
         return rows[0]
 
     def running(self, repo) -> list[dict]:

@@ -786,7 +786,11 @@ BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
 SETTINGS_KEYS = ("projects", "host", "interval", "exclude_terms")
-PROJECT_KEYS = ("repo",)
+#: forme longue d'un projet : `repo`, et les workflows suivis par le veilleur
+#: de CI (#1110, `ci.Watcher`)
+PROJECT_KEYS = ("repo", "workflows")
+#: suffixes admis pour un fichier de workflow (`.github/workflows/…`)
+WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
 MIN_INTERVAL = 60.0
 #: cache de la visibilité d'un dépôt (secondes) ; un dépôt illisible vaut
@@ -837,6 +841,9 @@ class Settings:
     interval: float = DEFAULT_INTERVAL
     #: termes que l'organisation ne publie jamais (noms de clients…), sans casse
     exclude_terms: tuple = ()
+    #: {dépôt: (fichiers de workflow, …)} — les workflows que le veilleur de CI
+    #: suit dans ce dépôt (#1110) ; sans entrée, il découvre ceux du dépôt
+    workflows: dict = field(default_factory=dict)
 
     def project_name(self, project: str | None) -> str | None:
         """Le nom configuré d'un projet (sans casse), ou None."""
@@ -848,6 +855,14 @@ class Settings:
     def repo_for(self, project: str | None) -> str | None:
         name = self.project_name(project)
         return self.projects[name] if name else None
+
+    def workflows_for(self, repo: str | None) -> tuple | None:
+        """Les workflows déclarés pour un dépôt, ou None (découverte)."""
+        key = (repo or "").strip().casefold()
+        if not key:
+            return None
+        return next((tuple(files) for name, files in self.workflows.items()
+                     if name.casefold() == key), None)
 
 
 def parse_settings(raw) -> Settings:
@@ -865,6 +880,7 @@ def parse_settings(raw) -> Settings:
     if not isinstance(declared, dict):
         raise SettingsError("`github.projects`: object {\"project\": \"owner/repo\"} expected")
     projects: dict = {}
+    workflows: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`github.projects.%s`" % name
@@ -872,15 +888,33 @@ def parse_settings(raw) -> Settings:
             raise SettingsError("`github.projects`: empty project name")
         if any(other.casefold() == name.casefold() for other in projects):
             raise SettingsError("%s: project declared twice (case-insensitive)" % where)
+        files = None
         if isinstance(value, dict):
             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
             if extra:
                 raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
+            files = value.get("workflows")
             value = value.get("repo")
         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
             raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
         projects[name] = value.strip()
+        if files is not None:
+            where = "%s.workflows" % where
+            if not isinstance(files, list) or not files:
+                raise SettingsError("%s: non-empty list of workflow file names expected" % where)
+            names = []
+            for item in files:
+                if not isinstance(item, str) or not item.strip():
+                    raise SettingsError("%s: workflow file name expected, not %r" % (where, item))
+                filename = item.strip().rsplit("/", 1)[-1]
+                if not filename.endswith(WORKFLOW_SUFFIXES):
+                    raise SettingsError("%s: %r is not a workflow file name (…%s)"
+                                        % (where, item, "/".join(WORKFLOW_SUFFIXES)))
+                if filename not in names:
+                    names.append(filename)
+            key = projects[name]
+            workflows[key] = tuple(dict.fromkeys(workflows.get(key, ()) + tuple(names)))
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
         raise SettingsError("`github.host`: host name expected")
@@ -895,7 +929,8 @@ def parse_settings(raw) -> Settings:
         raise SettingsError("`github.exclude_terms`: list of non-empty terms expected")
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval),
-                    exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)))
+                    exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
+                    workflows=workflows)
 
 
 def settings_of(cfg) -> Settings:
