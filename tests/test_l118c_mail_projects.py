@@ -203,8 +203,10 @@ class MailProjectTests(_Base):
     def test_new_project_introduces_it_and_journals_who_did(self):
         for path, project, actor in (("work add", "alpha", "dev1"), ("mail", "beta", "orch"),
                                      ("backlog", "gamma", "dev1")):
+            # #540: three lots for dev1 through mail, none started
+            force = ("--force", "test: lots of dev1 (#540)") if path == "mail" else ()
             with self.subTest(path=path):
-                proc = self.create(path, project, "--new-project")
+                proc = self.create(path, project, "--new-project", *force)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 lot = work.list_items(self.db)[0]
                 self.assertEqual(lot["app"], project)
@@ -212,9 +214,9 @@ class MailProjectTests(_Base):
                 self.assertIn("project '%s' introduced by %s (--new-project)"
                               % (project, actor), notes)
                 # known from now on: no flag needed, and no second introduction
-                proc = self.create(path, project)
+                proc = self.create(path, project, *force)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
-                proc = self.create(path, project, "--new-project")
+                proc = self.create(path, project, "--new-project", *force)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 again = work.list_items(self.db)[0]
                 self.assertNotIn("introduced", " ".join(

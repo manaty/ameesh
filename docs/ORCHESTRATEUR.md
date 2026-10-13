@@ -85,6 +85,10 @@ un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
   message n'est pas déposé** (code 2), pour qu'un agent ne travaille pas un
   lot que L165 peut confier à un autre. Renvoyer le message sans `--lot`, ou
   après le début de #M.
+* Forcer, pour tout appelant : `--force "<raison>"` (sur `work add`, `work
+  assign` et `agent-mail send`) donne le lot malgré tout. La raison et son
+  auteur sont écrits au journal du lot ; une raison vide ne force rien (même
+  sortie que sans `--force`).
 * Hors de la règle : un lot déjà démarré (réassigner un travail en cours reste
   permis), un humain (`human:…`) ou un agent externe (`--externe`), le lot
   d'une demande de décision (`ameesh decide ask --new-lot`, que son auteur
