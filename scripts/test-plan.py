@@ -84,8 +84,14 @@ MAX_AGE_H = 48
 PHASE2_MAX_AGE_H = 24
 #: failures under measure younger than this make a module P2
 RECENT_FAILURE_DAYS = 7
-#: parts per driver (pull request, other events)
-PARTS = {"psycopg": (4, 4), "psql": (1, 6)}
+#: parts per driver (pull request, other events). Le pilote psql d'une PR est
+#: en trois parts depuis #947 : sur les runners auto-hébergés, huit jobs se
+#: partagent un hôte, la part unique pesait 21,7-26,6 min au repos (médiane
+#: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
+#: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
+#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
+#: saturé) ; la suite psql complète reste en six parts.
+PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
 #: entries listed in the job summary, per category
 SUMMARY_LIMIT = 25
 

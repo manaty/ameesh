@@ -538,8 +538,22 @@ class PlanTest(unittest.TestCase):
         if p["version_only"] or p["docs_only"]:
             self.skipTest("the checked out commit is a version or documentation change")
         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
-        self.assertEqual([ps["modules"] and sorted(ps["modules"]) for ps in p["parts"]["psql"]],
-                         [pilot])
+        psql = p["parts"]["psql"]
+        # #947 : trois parts (PARTS), les modules pilotes une fois chacun
+        self.assertEqual([ps["part"] for ps in psql], [1, 2, 3])
+        self.assertEqual([ps["of"] for ps in psql], [3, 3, 3])
+        seen = [m for ps in psql for m in ps["modules"]]
+        self.assertEqual(len(seen), len(set(seen)), "un module dans deux parts")
+        self.assertTrue(set(pilot) <= set(seen), sorted(set(pilot) - set(seen)))
+
+    def test_pull_request_psql_part_is_split_for_the_cap(self):
+        # #947 : huit jobs se partagent chaque hôte auto-hébergé ; une part
+        # pilote unique pesait 21,7-26,6 min au repos (médiane 24,5) pour un
+        # plafond de 30 min et l'atteignait dès que la flotte était saturée
+        # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
+        # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
+        self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
+        self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -595,6 +609,9 @@ class PlanTest(unittest.TestCase):
         self.assertIsNone(parts.read_plan(f, "psql", 1))
         self.assertTrue(parts._driver_plan(str(f)))
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
+        # #947 : le plan de repli garde le découpage de la part psql d'une PR
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3])
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3, 3, 3])
 
     def test_each_module_in_exactly_one_part_with_the_map(self):
         mods = parts.modules()
