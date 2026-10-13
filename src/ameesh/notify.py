@@ -110,7 +110,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain", "db_connections_high")
+                 "land_uncertain", "db_connections_high",
+                 # #532: a local PgBouncer pool queues its mesh clients
+                 "pgbouncer_pool_waiting")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -135,6 +137,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
+    "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -199,7 +202,7 @@ TYPE_LABELS = {
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
                 "credential_failing", "critical_budget_pause", "owner_key_registered",
-                "land_uncertain", "db_connections_high")
+                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
