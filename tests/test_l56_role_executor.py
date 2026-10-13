@@ -255,13 +255,14 @@ class RoleExecutorTest(PgTestCase):
         cfg = dataclasses.replace(self.cfg, schema=schema)
         db = db_mod.connect(cfg)
         try:
-            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO %s'
+            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT,INSERT,UPDATE,DELETE,'
+                       'TRUNCATE,REFERENCES,TRIGGER ON TABLES TO %s'
                        % (q(schema),q(self.role)))
             with tempfile.TemporaryDirectory() as directory:
                 shutil.copy(Path(REPO,'src/ameesh/migrations/0417_host_release_fences.sql'), directory)
                 migrations.migrate(db, directory)
             for relation in ('host_release_operations','host_release_fences','host_release_fence_receipts'):
-                for privilege in ('INSERT','UPDATE','DELETE'):
+                for privilege in ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'):
                     self.assertFalse(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
                         (self.role,schema+'.'+relation,privilege))[0]['allowed'])
                 self.assertTrue(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
@@ -292,6 +293,9 @@ class RoleExecutorTest(PgTestCase):
                 for relation in ('agent_mailbox','mesh_approvals','mesh_consumed_nonces','turn_resources','spend_pending'):
                     tx.query('SELECT * FROM '+q(relation)+' LIMIT 0')
                 tx.query('SELECT * FROM mesh_approvals_status LIMIT 0')
+                # SignedDecisionAuthority re-reads the owner key at every step.
+                tx.query('SELECT name, holder, public_key, public_key_fingerprint, key_role,'
+                         ' key_updated_at, key_revoked_at FROM mesh_keys LIMIT 0')
             with self.assertRaises(db_mod.DbError):
                 with self.db.transaction() as tx:
                     tx.execute('SET LOCAL ROLE %s' % q(controller))

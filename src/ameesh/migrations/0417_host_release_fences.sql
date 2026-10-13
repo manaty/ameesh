@@ -27,17 +27,22 @@ BEGIN
 END $$;
 -- Default executor grants must not confer release-controller writes.
 -- Leave SELECT available to the invoker-rights claim predicate, revoke every
--- non-owner writer present at creation (including global/schema defaults).
+-- non-owner writer present at creation (including global/schema defaults) by
+-- reading the ACL itself: a hard-coded privilege list was read by the
+-- additive-only classifier as a table emptied, and named a PostgreSQL 17
+-- privilege that older servers reject.
 DO $release_acl$
 DECLARE item record;
 BEGIN
-    FOR item IN SELECT DISTINCT c.relname,acl.grantee
+    FOR item IN SELECT DISTINCT c.relname,acl.grantee,acl.privilege_type
                   FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                   CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) acl
                  WHERE n.nspname=current_schema()
                    AND c.relname IN ('host_release_operations','host_release_fences','host_release_fence_receipts')
-                   AND acl.grantee<>c.relowner LOOP
-        EXECUTE format('REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN ON %I.%I FROM %s',
+                   AND acl.grantee<>c.relowner
+                   AND acl.privilege_type<>'SELECT' LOOP
+        EXECUTE format('REVOKE %s ON %I.%I FROM %s',
+                       item.privilege_type,
                        current_schema(),item.relname,
                        CASE WHEN item.grantee=0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(item.grantee)) END);
     END LOOP;
