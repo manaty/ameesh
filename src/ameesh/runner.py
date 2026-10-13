@@ -1570,22 +1570,22 @@ class AgentWorker(threading.Thread):
         reprendra avec `--resume`. Celle du lot du tour est reprise si elle a
         été ouverte sous le même harnais, le même compte et le même dossier ;
         sinon une session neuve s'ouvre sur le brief déterministe (L39) du
-        lot. Bail perdu ou base injoignable : le tour part dans la session
-        courante, le nouveau lot y est noté (pas de nouvel essai à chaque tour).
+        lot. Bail perdu, base injoignable ou dossier absent : le tour ne part
+        pas dans la session du lot précédent et sa consigne reste à livrer.
         """
         if not spec:
             return spec
         lot = spec.get("lot")
-        if not self.lot_rotation_due(lot):
+        self._workdir_lot = lot or self.agent.get("session_work_item")
+        from . import projects as projects_mod
+        multi_switch = (lot and self.proc is None
+                        and len(projects_mod.agent_projects(self.agent)) > 1
+                        and str(lot) != str(self.agent.get("session_work_item") or ""))
+        if not self.lot_rotation_due(lot) and not multi_switch:
             return spec
         courant = (self.agent or {}).get("session_work_item")
         if not self._switch_lot(str(courant), str(lot)):
-            try:
-                if storage.of(self.db).operations.set_session_work_item(
-                        self.name, self.runner.runner_id, self.epoch, str(lot)):
-                    self.agent["session_work_item"] = str(lot)
-            except db_mod.DbError as exc:
-                log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+            return dict(spec, lot_switch_failed=True)
         return spec
 
     def _switch_lot(self, courant: str, lot: str) -> bool:
@@ -1598,10 +1598,14 @@ class AgentWorker(threading.Thread):
         # emprunte), pas celui de la fiche : une session n'est reprise que
         # sous le harnais qui l'a ouverte
         harnais = self.turn_harness()
+        cwd = self._resolve_workdir(lot=lot)
+        if not cwd:
+            self._workdir_missing(force_status=True)
+            return False
         try:
             out = storage.of(self.db).lot_sessions.switch(
                 self.name, self.runner.runner_id, self.epoch, to_lot=lot,
-                harness=harnais, account=nom, cwd=self.agent.get("cwd"),
+                harness=harnais, account=nom, cwd=cwd,
                 current=session)
         except db_mod.DbError as exc:
             log_async("[%s] session switch to lot %s failed (%s)" % (self.name, lot, exc))
@@ -2129,12 +2133,28 @@ class AgentWorker(threading.Thread):
     WORKDIR_BACKOFF_MIN = 5.0
     WORKDIR_BACKOFF_MAX = 300.0
 
-    def _resolve_workdir(self, adopt: bool = True) -> str | None:
+    def _resolve_workdir(self, adopt: bool = True, *, lot=None) -> str | None:
         """Le dossier de travail utilisable, ou None.
 
-        Le `cwd` est celui de la ligne du registre relue par `pick()` (jamais
-        un cache de l'inscription) ; à défaut, adoption bornée d'un worktree
-        déplacé (0018), seulement si `adopt`."""
+        Le primaire garde le `cwd` du registre relu par `pick()` et l'adoption
+        bornée d'un worktree déplacé (0018). Un lot secondaire utilise le
+        dossier de son projet déclaré au Host, sans modifier le registre."""
+        from . import canon as canon_mod, lot_workdir, projects as projects_mod
+        lot = lot or getattr(self, "_workdir_lot", None) or self.agent.get("session_work_item")
+        try:
+            project = lot_workdir.project(self.db, lot)
+            names = projects_mod.agent_projects(self.agent)
+            secondary = bool(names and project and project != names[0])
+            if secondary and getattr(self.runner, "mediated", False):
+                raise lot_workdir.WorkdirError("mediated executor has no per-project depot")
+            if secondary:
+                cwd = lot_workdir.destination(self.cfg, self.agent, project)
+                self._lot_workdir_error = "project %s: %r" % (project, cwd)
+                return cwd if cwd and os.path.isdir(cwd) else None
+        except (lot_workdir.WorkdirError, canon_mod.CanonError) as exc:
+            self._lot_workdir_error = str(exc)
+            return None
+        self._lot_workdir_error = ""
         if getattr(self.runner, "mediated", False):
             return self._mediated_workdir()  # L113 : dépôt de travail
         cwd = self.agent.get("cwd")
@@ -2228,7 +2248,8 @@ class AgentWorker(threading.Thread):
         cwd = self.agent.get("cwd")
         nouveau = not self._wd_blocked or cwd != self._wd_seen
         if nouveau or force_status:
-            message = "%s : %r" % (self.WORKDIR_ERROR, cwd)
+            message = "%s : %s" % (self.WORKDIR_ERROR,
+                                     getattr(self, "_lot_workdir_error", "") or repr(cwd))
             issue = registry.set_marked_block(
                 self.db, self.name, self.runner.runner_id, self.epoch,
                 self.WORKDIR_STATUS, message, self.WORKDIR_ERROR)
@@ -3573,6 +3594,27 @@ class AgentWorker(threading.Thread):
         return dict(spec, prompt=note + spec["prompt"]), dits
 
     def _run_turn(self, spec: dict) -> bool:
+        if spec.get("lot_switch_failed"):
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        self._workdir_lot = spec.get("lot") or self.agent.get("session_work_item")
+        cwd = self._resolve_workdir()
+        if not cwd:
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._workdir_missing(force_status=True)
+            return False
+        # First assignment to another repository, or a changed Host root:
+        # a session can only resume in the directory that opened it.
+        session = self.current_session()
+        origin = self.agent.get("session_cwd")
+        from . import projects as projects_mod
+        if (session and len(projects_mod.agent_projects(self.agent)) > 1
+                and (self.agent.get("session_origin") != session or not origin
+                     or os.path.realpath(origin) != os.path.realpath(cwd))):
+            lot = self._workdir_lot
+            if not lot or not self._switch_lot(str(self.agent.get("session_work_item") or ""),
+                                               str(lot)):
+                return False
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
         harness = self.turn_harness()
@@ -3666,11 +3708,9 @@ class AgentWorker(threading.Thread):
                 self.agent["session_work_item"] = str(lot)
         self._note_delegate_turn(spec)
 
-        # Worktree renommé/déplacé (0018) : adoption bornée. Absent : la
-        # consigne repart en attente et `pick()` garde l'agent bloqué, avec une
-        # attente croissante et un journal au changement d'état (L35).
-        cwd = self._resolve_workdir()
-        if not cwd:
+        # Keep the directory used for the resume check above. Resolving a
+        # changed policy again here could resume a session in another cwd.
+        if not os.path.isdir(cwd):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             self._workdir_missing(force_status=True)
             return False
