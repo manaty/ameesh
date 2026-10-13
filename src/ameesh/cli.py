@@ -7,8 +7,10 @@
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
-                                                 from an orchestrator, --lot assigns the work item
-                                                 to the recipient and --new-lot creates it (L118),
+                                                 from a declared orchestrator, --lot hands an
+                                                 unassigned work item to the recipient — an item
+                                                 already assigned to an agent needs a declared
+                                                 role or a human (#859) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
                                                  refused to a name not in the registry (close
