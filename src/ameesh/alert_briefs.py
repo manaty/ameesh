@@ -163,8 +163,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
-    repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
+    l'équipe de l'assigné (sinon celle du lot, #917) ; `plan_underused`, ceux
+    des équipes des agents au repos ; `estimate_bias` (L157b), ceux de
+    l'équipe de l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. Auditeurs : toujours pour les autres
     types. Un agent à la fois orchestrateur et auditeur reçoit un seul texte."""
@@ -195,6 +196,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         if kind == "stale_lot":
             text = _stale_lot(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+            if not teams:
+                # #917 : sans assigné connu, l'équipe du lot — sinon un lot
+                # ameesh réveillerait les orchestrateurs nexlink, et
+                # inversement (une alerte reçue pousse à assigner, ce qui
+                # entretient la liste des orchestrateurs par historique).
+                teams = {(alert.get("lot_team") or "").strip()} - {""}
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
