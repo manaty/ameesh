@@ -10,6 +10,7 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import functools
 import json
 import random
 import time
@@ -70,6 +71,14 @@ _CLOSED = "('merged', 'promoted', 'closed')"
 _RESERVE_BUDGET_S = 30.0
 _RESERVE_WAIT_BASE_S = 0.005
 _RESERVE_WAIT_MAX_S = 0.5
+#: #879 : pendant la fenêtre de déploiement mixte, un client pré-0419 verrouille
+#: la ligne du lot puis le dépôt (trigger), l'ordre inverse du code courant :
+#: PostgreSQL tue l'une des deux transactions (40P01). La victime rejouée dans
+#: le bon ordre retrouve les verrous libérés par l'autre. Reprise bornée : au
+#: delà, l'erreur remonte telle quelle.
+_DEADLOCK_ATTEMPTS = 5
+_DEADLOCK_WAIT_BASE_S = 0.05
+_DEADLOCK_WAIT_MAX_S = 0.5
 #: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
 MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
@@ -160,6 +169,33 @@ class _Refrozen(Exception):
     """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
 
 
+def _deadlock_victim(exc) -> bool:
+    """40P01, reconnu par le seul code du serveur (jamais le texte)."""
+    return isinstance(exc, DbError) and exc.sqlstate == '40P01'
+
+
+def _retry_deadlock(writer):
+    """Rejoue `writer` quand sa transaction est victime d'un interblocage.
+
+    Chaque essai ouvre sa propre transaction : la reprise reprend les verrous
+    dans l'ordre du code courant (dépôt avant ligne de lot). Le nombre
+    d'essais est borné, et seule la victime 40P01 est rejouée."""
+
+    @functools.wraps(writer)
+    def wrapped(self, *args, **kwargs):
+        for attempt in range(_DEADLOCK_ATTEMPTS):
+            try:
+                return writer(self, *args, **kwargs)
+            except DbError as exc:
+                if not _deadlock_victim(exc) or attempt == _DEADLOCK_ATTEMPTS - 1:
+                    raise
+                time.sleep(random.uniform(
+                    0.0, min(_DEADLOCK_WAIT_MAX_S, _DEADLOCK_WAIT_BASE_S * 2 ** attempt)))
+        raise AssertionError('unreachable')
+
+    return wrapped
+
+
 def _lock_migration_writer(tx, item_id, proposed=None):
     """Take repository locks before the lot and recheck its observed scope."""
     before = tx.query('SELECT migration_repo FROM work_items WHERE id = %s', (int(item_id),))
@@ -185,6 +221,7 @@ def _lock_migration_writer(tx, item_id, proposed=None):
 
 class WorkItems(interface.WorkItems):
 
+    @_retry_deadlock
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
             if not _lock_migration_writer(tx, item_id):
@@ -292,6 +329,7 @@ class WorkItems(interface.WorkItems):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    @_retry_deadlock
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
@@ -662,6 +700,7 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- branche d'un lot (L118) ---------------------------------------------
+    @_retry_deadlock
     def set_branch(self, item_id, branch, target, *, note, actor) -> dict | None:
         """Pose la branche (et la cible) d'un lot ouvert, avec une ligne de
         journal ; le dernier commit vu est oublié si la branche change. None
@@ -685,6 +724,7 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- numéro de migration réservé (L122) ----------------------------------
+    @_retry_deadlock
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
@@ -972,6 +1012,7 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % ITEM_COLUMNS,
             (package_id,))
 
+    @_retry_deadlock
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
                      frozen_id=None) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),
@@ -1017,6 +1058,7 @@ class WorkItems(interface.WorkItems):
         except _Refrozen:
             return None
 
+    @_retry_deadlock
     def close(self, item_id, *, current, reason, superseded_by, actor, note) -> dict | None:
         """`current` → `closed` (abandon ou remplacement) si le lot y est encore ;
         journal et jalon `closed` dans la même transaction."""

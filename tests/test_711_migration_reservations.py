@@ -10,6 +10,7 @@ from unittest import mock
 
 from ameesh import migration_reservations as reservations, migrations, storage, work
 from ameesh.db import DbError
+from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
 from .test_l122_numeros_de_migration import _commit, _depot, _git, NEXLINK
@@ -44,6 +45,11 @@ class ScopedReservationsTest(PgTestCase):
         self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
         return self.sha
 
+    def move(self, item_id, state):
+        return storage.of(self.db).work.move(
+            item_id, state, current=work.get(self.db, item_id)['state'], loops=0,
+            note='move to %s' % state, actor='dev')
+
     def test_target_only_floor_multi_slot_json_and_idempotence(self):
         first = self.reserve(slots=('schema', 'backfill'))
         self.assertEqual([row['number'] for row in first], [377, 378])
@@ -62,10 +68,13 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(self.reserve(self.b, target_branch='refs/heads/develop')[0]['number'], 378)
         _git(self.repo, 'checkout', '-qb', 'release')
         self.assertEqual(self.reserve(self.b, slots=('release',), target_branch='release')[0]['number'], 377)
+        # #879 : un clone par un autre port du même dépôt reste le même espace
+        # d'allocation que la projection legacy (`github.com/<slug>`) : sans
+        # cela, le même numéro se réserve deux fois.
         _git(self.repo, 'remote', 'set-url', 'origin', 'ssh://git@github.com:2222/MANATY/NEXLINK.git')
         port = self.reserve(self.lot('port'))[0]
-        self.assertEqual(port['target']['repo'], 'github.com:2222/manaty/nexlink')
-        self.assertEqual(port['number'], 377)
+        self.assertEqual(port['target']['repo'], 'github.com/manaty/nexlink')
+        self.assertEqual(port['number'], 379)
 
     def test_legacy_reservations_and_new_slots_use_one_allocator(self):
         work.set_branch(self.db, self.b['id'], 'agent/b', target='origin/develop', actor='dev')
@@ -443,6 +452,83 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(work.get(self.db, self.a['id'])['state'], self.a['state'])
         self.assertEqual(reservations.listing(self.db, self.a['id']), before)
         self.assertEqual(work.events(self.db, self.a['id']), events)
+
+    def test_writer_deadlock_victim_replays_in_repository_order(self):
+        """#879 : la victime 40P01 rejoue, dans l'ordre dépôt -> ligne du lot."""
+        real = pg_work._lock_migration_writer
+        attempts = []
+
+        def flaky(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            if len(attempts) == 1:
+                raise DbError('deadlock detected', sqlstate='40P01')
+            return real(tx, item_id, proposed)
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=flaky):
+            moved = storage.of(self.db).work.move(
+                self.a['id'], 'build', current=self.a['state'], loops=0, note='move', actor='dev')
+        self.assertEqual(attempts, [self.a['id'], self.a['id']])
+        self.assertEqual(moved['state'], 'build')
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], 'build')
+
+    def test_writer_deadlock_replays_are_bounded(self):
+        """#879 : au-delà des essais bornés, la DbError remonte telle quelle."""
+        attempts = []
+
+        def always(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            raise DbError('deadlock detected', sqlstate='40P01')
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=always):
+            with self.assertRaises(DbError) as raised:
+                storage.of(self.db).work.close(
+                    self.a['id'], current=self.a['state'], reason='abandoned',
+                    superseded_by=None, note='close', actor='dev')
+        self.assertEqual(raised.exception.sqlstate, '40P01')
+        self.assertEqual(len(attempts), pg_work._DEADLOCK_ATTEMPTS)
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], self.a['state'])
+
+    def test_writer_error_that_is_not_a_deadlock_is_not_replayed(self):
+        """#879 : seul 40P01 rejoue ; une autre DbError ne consomme aucun essai."""
+        attempts = []
+
+        def other(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            raise DbError('lot migration repository changed; retry')
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=other):
+            with self.assertRaises(DbError):
+                storage.of(self.db).work.move(
+                    self.a['id'], 'build', current=self.a['state'], loops=0, note='move', actor='dev')
+        self.assertEqual(len(attempts), 1)
+
+    def test_merged_to_blocked_does_not_resurrect_a_landed_slot(self):
+        """#879 : `merged -> blocked` ne rouvre pas un numéro déjà atterri.
+
+        Le trigger de projection repasserait le slot `default` de `landed` à
+        `reserved` ; quand un autre lot a réservé ce numéro entre-temps, la
+        transition échouait sur l'index partiel (ou la garde) avec un 23505
+        brut."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.move(self.a['id'], 'build')
+        self.move(self.a['id'], 'qa')
+        self.move(self.a['id'], 'merged')
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+        # 400 n'est pas encore dans l'arbre : un autre lot peut le réserver.
+        self.advance(*['%d_x.sql' % number for number in range(377, 400)])
+        taken = self.reserve(self.b)[0]
+        self.assertEqual(taken['number'], 400)
+        self.move(self.a['id'], 'blocked')
+        default = reservations.listing(self.db, self.a['id'])[0]
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], 'blocked')
+        self.assertEqual((default['slot'], default['number'], default['status']),
+                         ('default', 400, 'landed'))
+        # Le numéro suivant reste projeté en `reserved` : la garde ne fige pas
+        # la projection, elle empêche seulement de rouvrir un numéro consommé.
+        work.reserve_migration(self.db, self.a['id'], 401, repo=self.repo, actor='dev')
+        renewed = reservations.listing(self.db, self.a['id'])[0]
+        self.assertEqual((renewed['number'], renewed['status']), (401, 'reserved'))
 
     def test_cli_json_list_and_legacy_output_compatible(self):
         args = ('work', 'migration', str(self.a['id']))
