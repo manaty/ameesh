@@ -47,9 +47,11 @@ ameesh set <agent> model=… effort=… tier=… session_policy=… mode=execute
   `flex`). A harness that declares none ignores it, and `set` says so.
 - `effort` and `tier` are written in the host's local state **and** in the
   database, so `list --json` shows them whatever the host.
-- `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`,
-  `turn_grace_seconds` and `mail_batch` override the host's defaults for this
-  agent (`0` = the ceiling is off); see
+- `context_max_tokens`, `turn_max_seconds` and `turn_mail_max` override the
+  host's defaults for this agent (`0` = the ceiling is off). `turn_grace_seconds`
+  and `mail_batch` also accept `0`, where it means *immediately*, not *off*:
+  `0` closes the turn's leftover background work at once, and wakes an idle
+  agent at once without a batching window; see
   [Configuration](../reference/configuration.md#runner).
 - `lot_wake=off` stops the runner from waking this agent when an open lot of
   its own becomes actionable (L165b).
@@ -368,7 +370,9 @@ ameesh offload status [<job>] | cancel <job>
 ```
 
 `ameesh heavy` runs a suite in one of the host's capped slots (`--status` lists
-the slots and their holders; the orchestrator is served first under pressure).
+the slots and their holders; slots go to whoever takes them first — no agent
+role has priority). The command runs under `nice` (default 10), so the runner
+and the orchestrator's short turns stay responsive.
 `--max-duration` caps the command (default `AMEESH_HEAVY_MAX_S`, then
 `heavy_max_seconds`, then 60 minutes; `0` = none): a message, then
 SIGTERM/SIGKILL, exit 124. A test suite a turn launches outside `ameesh heavy`

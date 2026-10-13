@@ -1,8 +1,10 @@
 # Members, agents, hosts, placements
 
 The ameesh profile of OKF defines four card types. All are ordinary OKF files;
-the file name is free. The examples below come from the fictitious canon in
-[`examples/canon/`](https://github.com/manaty/ameesh/tree/main/examples/canon).
+the file name is free. The examples below follow the card shapes of the
+fictitious canon in
+[`examples/canon/`](https://github.com/manaty/ameesh/tree/main/examples/canon),
+with generic organisation and project names.
 
 ## `Member`: a human
 
@@ -23,8 +25,8 @@ is a reviewed change to the canon.
 type: Agent
 title: orchestre                      # the agent's name
 responsible: human:alice              # REQUIRED
-team: acme-web                        # team or project; also the project of its thread
-projects: [acme-web, acme-api]        # optional (L243-1): the first is primary
+team: example-web                     # team or project; also the project of its thread
+projects: [example-web, example-api]  # optional (L243-1): the first is primary
 capabilities: [read, report-drift, propose]   # `approve` is forbidden for agents
 harness: claude                       # claude | codex | deepseek
 model: claude-opus                    # optional
@@ -36,7 +38,7 @@ reviewers: [relecteur]                # optional
 priority: 5                           # optional: paused last under critical host pressure (v1.3.0)
 memory:                               # optional: the persona's memory repository (v1.3.0)
   mode: neutral
-  repository: "git@forge.example:acme/persona-orchestre.git"
+  repository: "git@forge.example:example-org/persona-orchestre.git"
 ```
 
 **Responsibility.** An agent without a `responsible` that resolves to a unique
@@ -102,16 +104,16 @@ policy:
     min_battery_percent: 25             # on battery: no new turn below (laptop host)
     stop_battery_percent: 10            # on battery: clean stop below
     max_cpu_pressure: 20%               # CPU pressure (PSI some, 60 s): no new turn above
-  work_roots: {acme-web: /srv/acme/acme-web}   # working directory per team (v1.3.0)
+  work_roots: {example-web: /srv/example-org/example-web}   # working directory per team (v1.3.0)
   work_root: /srv                               # default: work_root/<team>
-  work_dirs: {ouvrier: /srv/acme/ouvrier}       # per agent, wins over the above (v1.3.1)
+  work_dirs: {ouvrier: /srv/example-org/ouvrier}       # per agent, wins over the above (v1.3.1)
 ```
 
 The host's responsible human sets the rules of their machine, for example "only
 DeepSeek and Codex agents, billed by API key". The host also decides **where**
 agents work: the working directory is `policy.work_dirs[<agent>]`, else
 `policy.work_roots[<team>]`, else `policy.work_root/<team>`, and each accepts
-the `{agent}` template (`/srv/acme/acme-web-{agent}`: one worktree per agent).
+the `{agent}` template (`/srv/example-org/example-web-{agent}`: one worktree per agent).
 See [Runner and leases](runner-and-leases.md#working-directory) for the
 transitional fallback and what the runner does when the directory is missing,
 and [host resources](runner-and-leases.md#host-resources-and-back-pressure) for

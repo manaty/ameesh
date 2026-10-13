@@ -11,8 +11,10 @@ The session id is stored in the registry and in the agent's state directory on
 the host. After a crash, the runner reads it back from the registry, else from
 the file. `ameesh attach` opens the same session interactively. An agent's
 session id comes **only from its harness**: an id the harness does not know is
-never resumed (L224), and an interactive Claude session runs with
-`--permission-mode auto` (L223).
+never resumed (L224). An interactive Claude session takes the agent's
+permission mode (`ameesh set <agent> permission_mode=…`, or
+`AMEESH_CLAUDE_PERMISSION_MODE`), `auto` by default, with `acceptEdits` as
+fallback when the installed binary does not accept the chosen mode (L223).
 
 ## Rule: one fresh session per lot
 
@@ -85,10 +87,14 @@ ameesh session restore <agent> [--session S] [--key K] [--home DIR] [--overwrite
                         [--allow-other-agent]
 ```
 
-Session backups are off-device, on an explicit S3 endpoint
-(`AMEESH_BACKUP_S3_ENDPOINT`, `_REGION`, `_ACCESS_KEY`, `_SECRET_KEY`; L53);
-without an endpoint they stay local. `restore` refuses to overwrite another
-agent's home unless `--allow-other-agent` is given.
+Session backups need a target in the host's `session_backup` configuration:
+`s3://bucket/prefix` (then `AMEESH_BACKUP_S3_ENDPOINT`, `_REGION`,
+`_ACCESS_KEY`, `_SECRET_KEY` are required) or an explicit **absolute** local
+path; with no target there is no backup (L53). `restore` writes the named
+agent's backup into its account home, or into `--home DIR`, and `--overwrite`
+replaces the files already there. `--allow-other-agent` concerns the backup
+key: it is required when that key belongs to another agent than the one named
+on the command line; it does not guard the destination home.
 
 ## Moved working directories
 
