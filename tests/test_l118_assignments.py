@@ -117,6 +117,69 @@ class MailLinksLotsTest(_Base):
         self.assertIn("matches no open lot", proc.stderr)
         self.assertEqual(self.unread("dev1")[-1]["work_item_id"], "SUJET-LIBRE")
 
+    def test_lot_d_un_assigneur_recent_ne_reassigne_plus(self):
+        # #964 : dev2 a confié un lot récemment — il est vu « orchestrateur »
+        # par l'historique, pas par un rôle déclaré ; son --lot reste une
+        # étiquette de fil, il n'assigne plus le lot au relecteur.
+        deja = work.add(self.db, title="déjà confié")
+        work.assign(self.db, deja["id"], "dev1", actor="dev2")
+        self.assertTrue(assignments.is_orchestrator(self.cfg, self.db, "dev2"))
+        self.assertFalse(assignments.is_orchestrator(self.cfg, self.db, "dev2",
+                                                     history=False))
+        lot = work.add(self.db, title="relecture à confier")
+        proc = self.send("dev1", "Relis ce lot.", "--from", "dev2", "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("assigned to dev1", proc.stdout)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+
+    def test_assign_explicite_attribue(self):
+        # le geste explicite `--assign` remplace la détection d'historique
+        deja = work.add(self.db, title="déjà confié")
+        work.assign(self.db, deja["id"], "dev1", actor="dev2")
+        lot = work.add(self.db, title="relecture à confier")
+        proc = self.send("dev1", "À toi : relis puis gèle.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lot #%d assigned to dev1" % lot["id"], proc.stdout)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["assignee"], "dev1")
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+
+    def test_assign_ne_prend_pas_le_lot_d_un_autre(self):
+        # même avec --assign, le lot d'un autre agent n'est pas repris :
+        # la reprise passe par `ameesh work assign` (invariant du module)
+        self.agent("dev3")
+        deja = work.add(self.db, title="déjà confié")
+        work.assign(self.db, deja["id"], "dev1", actor="dev2")
+        lot = work.add(self.db, title="implémentation", assignee="dev3")
+        proc = self.send("dev1", "Relis le lot de dev3.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("belongs to dev3: not reassigned", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev3")
+
+    def test_assign_exige_le_lot_et_refuse_l_accuse(self):
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--assign requires --lot", proc.stderr)
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--lot", "X", "--assign",
+                         "--ack")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("contradict", proc.stderr)
+        self.assertEqual(self.unread("dev1"), [])
+
+    def test_assign_garde_l_assignataire(self):
+        # l'assigné passe par la même garde que `work assign` (L37) :
+        # un nom hors registre refuse le courrier, rien n'est déposé
+        lot = work.add(self.db, title="libre")
+        proc = self.send("inconnu", "Travail pour toi.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("message not dropped", proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("inconnu"), [])
+
     def test_reference_ambigue_refusee(self):
         work.add(self.db, title="DUP : un")
         work.add(self.db, title="DUP : deux")

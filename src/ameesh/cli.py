@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
-  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
+  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
                  [--estimate 2h] [--app PROJECT]] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
                                                  from an orchestrator, --lot assigns the work item
-                                                 to the recipient and --new-lot creates it (L118),
+                                                 to the recipient (any other sender: --assign)
+                                                 and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
                                                  refused to a name not in the registry (close
@@ -230,6 +231,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
+    # #964 : `--assign` = le geste explicite qui autorise un `--lot` à
+    # assigner le lot au destinataire (hors orchestrateur déclaré).
+    assign = "--assign" in args
+    args = [arg for arg in args if arg != "--assign"]
     # #506: --app may name a project nobody declares yet, on purpose
     new_project = "--new-project" in args
     args = [arg for arg in args if arg != "--new-project"]
@@ -276,6 +281,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --new-lot contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
+    if ack and assign:
+        print("--ack and --assign contradict each other: an acknowledgement does not hand over work",
+              file=sys.stderr)
+        return 2
     sign = key_path is not None or "--sign" in args
     allow_structured = "--allow-structured" in args
     args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
@@ -283,7 +292,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
+        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF [--assign]] "
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] "
@@ -295,6 +304,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if new_lot is not None and lot is not None:
         print("--lot OR --new-lot, not both", file=sys.stderr)
+        return 2
+    if assign and lot is None:
+        print("--assign requires --lot <id|ref>: say which lot to assign to the recipient",
+              file=sys.stderr)
+        return 2
+    if assign and new_lot is not None:
+        print("--assign goes with --lot (--new-lot already assigns the created lot to the "
+              "recipient)", file=sys.stderr)
         return 2
     if new_lot is not None and not new_lot.strip():
         print("--new-lot: empty title", file=sys.stderr)
@@ -426,6 +443,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
         print("--new-lot requires the database and a single recipient", file=sys.stderr)
         return 2
+    if assign and getattr(bk, "mediated", False):
+        print("--assign is unavailable in mediated contract 1.1; assign the work item "
+              "on the server before sending mail", file=sys.stderr)
+        return 2
+    if assign and (bk.kind != "pg" or dest == "all"):
+        print("--assign requires the database and a single recipient", file=sys.stderr)
+        return 2
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
@@ -434,7 +458,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project)
+                estimate=estimate, app=app, new_project=new_project, assign=assign)
         except assignments.AssignmentError as exc:
             print("message not dropped — %s" % exc, file=sys.stderr)
             return 2
