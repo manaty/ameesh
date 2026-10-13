@@ -428,8 +428,9 @@ def orphaned(check: dict, jobs: list[dict], execution_status: str) -> bool:
     terminal : le publisher est mort avec le runner (saturation #747) — ou il a
     expiré sans lire de ligne `fin` — et l'étape `close` n'a pas tourné. Le job
     est retrouvé par son nom (`tests (flux) X` pour le job `X`) ; s'il a
-    disparu, l'exécution terminale fait foi. Un job encore actif, une autre
-    tentative, une autre tête ne sont jamais touchés."""
+    disparu, l'exécution terminale fait foi. Un job encore actif — y compris
+    celui de la tentative courante d'un rerun du même run, qui porte le même
+    nom — et une autre tête ne sont jamais touchés."""
     if check.get("status") != "in_progress":
         return False
     nom = check.get("name") or ""
@@ -447,9 +448,9 @@ def sweep(args, gh: GitHub | None = None) -> int:
     Réconciliation indépendante du publisher (#856) : chaque check encore en
     cours est jugé sur l'état terminal réel du job et de l'exécution qui l'ont
     publié (relus par son `details_url`). Sans ligne `fin`, la conclusion est
-    `cancelled`, jamais `success`. Ne ferme aucun check actif, d'une autre tête
-    ni d'une autre tentative. Ne fait jamais échouer le job : une erreur d'API
-    est tracée et la fonction rend 0."""
+    `cancelled`, jamais `success`. Ne ferme aucun check dont l'exécution est
+    encore active, ni ceux d'une autre tête. Ne fait jamais échouer le job : une
+    erreur d'API est tracée et la fonction rend 0."""
     try:
         return _sweep(args, gh)
     except Exception as exc:  # la réconciliation n'échoue jamais le job
