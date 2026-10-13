@@ -208,10 +208,39 @@ _DELAYS_SELECT = """
 """
 
 
+class _Refrozen(Exception):
+    """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
+
+
+def _lock_migration_writer(tx, item_id, proposed=None):
+    """Take repository locks before the lot and recheck its observed scope."""
+    before = tx.query('SELECT migration_repo FROM work_items WHERE id = %s', (int(item_id),))
+    if not before:
+        return False
+    previous = before[0]['migration_repo']
+    repositories = {repo for repo in (previous, proposed) if repo}
+    # A legacy reservation may move between repositories. Lock both old and
+    # new in canonical order, including release's OLD repository.
+    for repo in sorted(repositories):
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                   "current_schema() || ':migration-repo:' || %s, 0))", ('github.com/' + repo,))
+    after = tx.query('SELECT migration_repo FROM work_items WHERE id = %s FOR NO KEY UPDATE',
+                     (int(item_id),))
+    if not after:
+        return False
+    # A concurrent legacy reservation can change the repository while we
+    # wait. Abort rather than acquire a new repo lock after locking the lot.
+    if after[0]['migration_repo'] != previous:
+        raise DbError('lot migration repository changed; retry')
+    return True
+
+
 class WorkItems(interface.WorkItems):
 
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
                             % item_columns(self.db), (int(item_id),))
             if not rows:
@@ -377,61 +406,31 @@ class WorkItems(interface.WorkItems):
         demande de décision ouverte le tient — vérifiée dans la même
         instruction, la demande verrouillée (voir l'interface). Un passage
         vers un état terminal libère la réservation de migration (#956)."""
-        # L157 : le premier passage en build (ou qa) date le début du travail
-        sql = """
-            UPDATE work_items
-               SET state = %s,
-                   loops = loops + %s,
-                   updated_at = now(),
-                   closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
-                   started_at = CASE WHEN %s IN ('build', 'qa')
-                                     THEN coalesce(started_at, now()) ELSE started_at END
-             WHERE id = %s AND state = %s __HELD__
-            RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", item_columns(self.db)).replace("__HELD__", _HELD if held else "")
-        params = ((state, loops, state, state, int(item_id), current)
-                  + ((str(int(item_id)),) if held else ()))
-        if state not in ("merged", "promoted", "closed"):
-            rows = self.db.query(sql, params)
-            if not rows:
-                return None
-            self._event(int(item_id), state, note, actor)
-            return rows[0]
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
+            # L157 : le premier passage en build (ou qa) date le début du travail
+            sql = """
+                UPDATE work_items
+                   SET state = %s,
+                       loops = loops + %s,
+                       updated_at = now(),
+                       closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
+                       started_at = CASE WHEN %s IN ('build', 'qa')
+                                         THEN coalesce(started_at, now()) ELSE started_at END
+                 WHERE id = %s AND state = %s __HELD__
+                RETURNING __COLUMNS__
+                """.replace("__COLUMNS__", item_columns(self.db)).replace("__HELD__", _HELD if held else "")
+            params = ((state, loops, state, state, int(item_id), current)
+                      + ((str(int(item_id)),) if held else ()))
             rows = tx.query(sql, params)
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
-            self._release_migration(tx, item_id, rows[0],
-                                    why="état %s" % state, actor=actor)
+            if state in ("merged", "promoted", "closed"):
+                self._release_migration(tx, item_id, rows[0],
+                                        why="état %s" % state, actor=actor)
             return rows[0]
-
-    def designate_reviewer(self, item_id, reviewer, *, actor) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
-        journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
-        colonne vient de la migration 0421 : sans elle, l'écriture est refusée
-        avec la marche à suivre (les lectures, elles, s'en passent)."""
-        if not has_reviewer(self.db):
-            raise DbError("work_items.reviewer is missing (migration 0421): "
-                          "run \"ameesh migrate\", then designate the reviewer")
-        with self.db.transaction() as tx:
-            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor)
-
-    def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
-        """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
-        ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
-        pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
-        avant, un `assign` a pu la changer entre-temps."""
-        rows = self.db.query(
-            "UPDATE work_items SET reviewer = %%s, updated_at = now()"
-            " WHERE id = %%s AND state = 'qa'"
-            "   AND assignee IS DISTINCT FROM %%s"
-            " RETURNING %s" % item_columns(self.db),
-            (reviewer, int(item_id), reviewer))
-        if not rows:
-            return None
-        self._event(int(item_id), "qa", "reviewer %s designated" % reviewer, actor)
-        return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor,
                queued_note=None, forced_note=None, take=False,
@@ -885,6 +884,8 @@ class WorkItems(interface.WorkItems):
         journal ; le dernier commit vu est oublié si la branche change. None
         si le lot n'est plus ouvert."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 "UPDATE work_items SET"
                 "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
@@ -953,11 +954,8 @@ class WorkItems(interface.WorkItems):
         while True:
             try:
                 with self.db.transaction() as tx:
-                    # Match the named allocator's lock order: repository
-                    # before lot rows. Unknown legacy targets span branches.
-                    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
-                               "current_schema() || ':migration-repo:' || %s, 0))",
-                               ("github.com/" + (repo or ""),))
+                    if not _lock_migration_writer(tx, item_id, None if release else repo):
+                        return None
                     if not release:
                         # #956 : une réservation héritée d'un lot terminal
                         # (prise avant ce correctif) ne tient plus le numéro :
@@ -1245,12 +1243,12 @@ class WorkItems(interface.WorkItems):
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
 
         `frozen_id` (revue codex1, P2-1) : le gel examiné doit être le dernier
-        gel du lot. Le `SELECT ... FOR UPDATE` prend d'abord le verrou de la
-        ligne du lot (en l'attendant au besoin) ; le dernier gel est relu
-        APRÈS, dans une instruction suivante de la même transaction — en READ
-        COMMITTED elle voit tout gel validé pendant l'attente (le sous-select
-        d'une seule instruction verrait l'instantané d'avant l'attente). S'il
-        a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
+        gel du lot. Après le verrou de dépôt, la ligne du lot est verrouillée
+        (en l'attendant au besoin) ; le dernier gel est relu APRÈS, dans une
+        instruction suivante de la même transaction — en READ COMMITTED elle
+        voit tout gel validé pendant l'attente (le sous-select d'une seule
+        instruction verrait l'instantané d'avant l'attente). S'il a changé,
+        la transaction est annulée (None). Un gel ne peut pas s'insérer
         ensuite : `add_milestone` prend le même verrou de ligne.
 
         Rien n'est écrit avant ce recontrôle : la fermeture est appelée dans
@@ -1258,37 +1256,37 @@ class WorkItems(interface.WorkItems):
         et un `UPDATE` suivi d'un `None` n'était annulé que par SA transaction
         — sous une transaction englobante, la ligne serait restée modifiée.
         """
-        with self.db.transaction() as tx:
-            locked = tx.query(
-                "SELECT id FROM work_items WHERE id = %s AND state = %s FOR UPDATE",
-                (int(item_id), current))
-            if not locked:
-                return None
-            if frozen_id is not None:
-                latest = tx.query(
-                    "SELECT id FROM work_item_milestones"
-                    " WHERE work_item_id = %s AND kind = 'frozen'"
-                    " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
-                if not latest or int(latest[0]["id"]) != int(frozen_id):
+        try:
+            with self.db.transaction() as tx:
+                if not _lock_migration_writer(tx, item_id):
                     return None
-            rows = tx.query(
-                """
-                UPDATE work_items
-                   SET state = 'merged', updated_at = now(), closed_at = NULL,
-                       pr_ref = coalesce(%s, pr_ref)
-                 WHERE id = %s AND state = %s
-                RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", item_columns(self.db)),
-                (pr_ref, int(item_id), current))
-            if not rows:
-                return None
-            WorkItems(tx)._event(int(item_id), "merged", note, actor)
-            self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
-            tx.query(
-                "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
-                (sha or "", actor or "", note or "", int(item_id)))
-            return rows[0]
+                rows = tx.query(
+                    """
+                    UPDATE work_items
+                       SET state = 'merged', updated_at = now(), closed_at = NULL,
+                           pr_ref = coalesce(%s, pr_ref)
+                     WHERE id = %s AND state = %s
+                    RETURNING __COLUMNS__
+                    """.replace("__COLUMNS__", item_columns(self.db)),
+                    (pr_ref, int(item_id), current))
+                if not rows:
+                    return None
+                if frozen_id is not None:
+                    latest = tx.query(
+                        "SELECT id FROM work_item_milestones"
+                        " WHERE work_item_id = %s AND kind = 'frozen'"
+                        " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+                    if not latest or int(latest[0]["id"]) != int(frozen_id):
+                        raise _Refrozen()
+                WorkItems(tx)._event(int(item_id), "merged", note, actor)
+                self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
+                tx.query(
+                    "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
+                    " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                    (sha or "", actor or "", note or "", int(item_id)))
+                return rows[0]
+        except _Refrozen:
+            return None
 
     def close(self, item_id, *, current, reason, superseded_by, sha="", actor, note) -> dict | None:
         """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
@@ -1296,6 +1294,8 @@ class WorkItems(interface.WorkItems):
         transaction. `delivered` (#988) écrit en plus le jalon `delivered`, qui
         porte le `sha` de la tête relue."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 """
                 UPDATE work_items
