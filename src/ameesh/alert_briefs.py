@@ -291,8 +291,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné — ou du projet du lot quand aucun relecteur n'est
-    désigné (#705) —, ou **un seul** quand le lot n'a pas d'assigné
+    l'équipe de l'assigné (sinon celle du lot, #917) — ou du projet du lot
+    quand aucun relecteur n'est désigné (#705) —, ou **un seul** quand le lot
+    n'a pas d'assigné
     (#1026 : sans équipe, le brief partait à tous et deux orchestrateurs
     traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
@@ -357,6 +358,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
             text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = _projects(by_name, alert.get("agent"))
+            if not teams:
+                # #917 : sans assigné connu, l'équipe du lot — sinon un lot
+                # ameesh réveillerait les orchestrateurs nexlink, et
+                # inversement (une alerte reçue pousse à assigner, ce qui
+                # entretient la liste des orchestrateurs par historique).
+                teams = {(alert.get("lot_team") or "").strip()} - {""}
             if reviewer and str(reviewer) in by_name:
                 extra[str(reviewer)] = _verdict_due(alert)
         elif kind == "estimate_bias":
