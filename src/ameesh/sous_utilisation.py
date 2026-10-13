@@ -620,6 +620,30 @@ def critical_by_role(row, canons) -> bool | None:
     return False
 
 
+#: #424 r7 : les agents d'un canon étranger déjà signalés par ce processus
+_FOREIGN_WARNED: set = set()
+
+
+def foreign_canon(row, canons, *, complete: bool) -> str | None:
+    """#424 r7 (mesh-design) : le canon de `row` quand AUCUN canon de l'hôte ne
+    le possède, tous les canons configurés chargés (`complete`) — un état
+    connu et permanent, pas une panne : l'agent garde le verdict d'avant
+    L242c (non critique). Un canon configuré mais illisible ou pas encore
+    chargé n'est pas étranger : la règle fail-safe s'applique. None sinon."""
+    if not complete or not canons or _owners(row, canons):
+        return None
+    return (row or {}).get("canon") or "?"
+
+
+def warn_foreign(name: str) -> bool:
+    """#424 r7 : vrai la première fois seulement (un avertissement par
+    processus et par agent d'un canon étranger)."""
+    if name in _FOREIGN_WARNED:
+        return False
+    _FOREIGN_WARNED.add(name)
+    return True
+
+
 def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
     l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire

@@ -619,7 +619,8 @@ def _local_session(cfg: Config, row: dict) -> str | None:
 def _critical(cfg: Config, row: dict) -> bool:
     """L242c : comme `Runner.is_critical` — déclaré, ou rôle critique de sa
     fiche dans son canon propriétaire ; canon lisible, le verdict rafraîchit
-    le cache (#424 r3) ; illisible, le dernier verdict lu, perdu : critique."""
+    le cache (#424 r3) ; illisible, le dernier verdict lu, perdu : critique ;
+    canon configuré sur aucun canon de l'hôte (#424 r7) : non critique."""
     from . import canon as canon_mod, sous_utilisation as su
     if row["name"] in (getattr(cfg, "critical_agents", None) or ()) \
             or row["name"] in su.declared_orchestrators():
@@ -629,6 +630,13 @@ def _critical(cfg: Config, row: dict) -> bool:
         canons = canon_mod.load_configured(cfg) if configured else []
     except Exception:
         canons = []
+    complete = configured and len(canons) == len(canon_mod.configured(cfg))
+    foreign = su.foreign_canon(row, canons, complete=complete)
+    if foreign is not None:
+        if su.warn_foreign(row["name"]):
+            print("ameesh: %s: owner canon %s is configured on no canon of this host:"
+                  " not critical" % (row["name"], foreign), file=sys.stderr)
+        return False
     verdict, unknown = su.critical_verdict(
         row, canons, configured=configured,
         known=su.remembered(su.critical_memory(cfg), row["name"]))

@@ -5197,7 +5197,8 @@ class Runner:
         rôle critique de sa fiche, dans son canon propriétaire seulement
         (`critical_roles` de l'organisation, défaut orchestrateur, conception,
         auditeur, relecture). Canon propriétaire illisible (#424 r1) : le
-        dernier verdict lu, sinon critique (#424 r6)."""
+        dernier verdict lu, sinon critique (#424 r6). Canon propriétaire
+        configuré sur aucun canon de l'hôte (#424 r7) : non critique."""
         if name in (getattr(self.cfg, "critical_agents", None) or ()):
             return True
         if name in getattr(self, "_orchestrators_declared", ()):
@@ -5219,6 +5220,14 @@ class Runner:
                 and name not in su.critical_candidates(canons)):
             return False
         row = agent if agent is not None else registry.get(self.db, name)
+        foreign = su.foreign_canon(dict(row or {}, name=name), canons,
+                                   complete=getattr(self, "_canon_complete", False))
+        if foreign is not None:
+            # #424 r7 : état connu, pas une panne ; jamais retenu au cache
+            if su.warn_foreign(name):
+                log_async("[%s] owner canon %s is configured on no canon of this host:"
+                          " not critical" % (name, foreign))
+            return False
         verdict, unknown = su.critical_verdict(
             dict(row or {}, name=name), canons,
             configured=bool(canon_mod.configured(self.cfg)), known=last)

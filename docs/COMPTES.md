@@ -473,7 +473,10 @@ or was read only in part (a card or the manifest could not be read:
 `canon-git-error`, `frontmatter-invalid` or `federation-invalid` errors), its
 criticality is never lowered silently: the last verdict read is kept, and
 without one (never read, or absent from the cache) the agent counts as
-critical. The last verdicts are kept in the host's
+critical. An agent whose owner canon is configured on no canon of the host
+(every configured canon loaded) is a known, permanent state, not an outage:
+it is not critical, and the runner (or `ameesh resume`) warns once per
+process, naming it. The last verdicts are kept in the host's
 state (`critical-known/known.json`), so a restarted runner and `ameesh resume`
 read them too; `ameesh resume` refreshes them when the canon is readable,
 and the runner compares each verdict it reads with the disk (never with its

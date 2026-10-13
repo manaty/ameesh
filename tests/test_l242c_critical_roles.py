@@ -512,8 +512,52 @@ class Relecture424r5Test(_Cache):
                 mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
             self.assertTrue(reprise._critical(self.cfg, self.rows["codex1"]))
         self.assertTrue(self.resume("codex1", None))
-        self.assertTrue(self.outage("codex1"))
+        panne = self.fake([_Canon("A", {}, readable=False)])
+        panne._canon_complete = False                     # B pas chargé (#424 r7)
+        self.assertTrue(self.critical(panne, "codex1"))
         self.assertFalse(self.outage("dev7"))
+
+
+class Relecture424r7Test(_Cache):
+    """#424 r7 (mesh-design) : un canon configuré sur aucun canon de l'hôte est
+    un état connu, pas une panne (non critique, un avertissement par
+    processus) ; configuré mais illisible ou pas encore chargé : critique."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(su._FOREIGN_WARNED.clear)
+        su._FOREIGN_WARNED.clear()
+        self.rows["codex1"] = {"name": "codex1", "canon": "Z"}
+
+    def test_canon_etranger_non_critique_un_avertissement(self):
+        fake = self.fake([_Canon("A", CARTES)])
+        with mock.patch("ameesh.registry.get", lambda db, n: self.rows.get(n)), \
+                mock.patch("ameesh.runner.log_async") as log:
+            self.assertFalse(runner.Runner.is_critical(fake, "codex1"))
+            self.assertFalse(runner.Runner.is_critical(fake, "codex1"))
+        self.assertEqual(len(log.call_args_list), 1)
+        self.assertIn("codex1", log.call_args.args[0])
+        self.assertIn("Z", log.call_args.args[0])
+        self.assertNotIn("codex1", su.critical_memory(self.cfg) or {})  # jamais retenu
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.resume("codex1", [_Canon("A", CARTES)]))
+        self.assertEqual(err.getvalue(), "")                 # déjà signalé ici
+
+    def test_canon_configure_illisible_ou_pas_encore_charge_critique(self):
+        # pas encore chargé : un canon configuré manque, il peut être le sien
+        fake = self.fake([_Canon("A", CARTES)])
+        fake._canon_complete = False
+        self.assertTrue(self.critical(fake, "codex1"))
+        self.cfg.canon_entries = ("a", "z")
+        self.assertTrue(self.resume("codex1", [_Canon("A", CARTES)]))
+        # configuré et chargé, mais illisible
+        z = _Canon("Z", {}, readable=False)
+        self.assertTrue(self.critical(self.fake([_Canon("A", CARTES), z]), "codex1"))
+        self.assertTrue(self.resume("codex1", [_Canon("A", CARTES), z]))
+        self.assertEqual(su._FOREIGN_WARNED, set())
 
 
 if __name__ == "__main__":
