@@ -1709,6 +1709,31 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         self.assertEqual({r["credential_id"] for r in self.rows()},
                          {self.alice2.credential_id, self.bruno.credential_id})
 
+    def test_ref_descendant_non_fusionne_ne_deplace_pas_le_checkout(self):
+        """#814 (R1/R2) : une révision descendante du dernier commit appliqué
+        mais non fusionnée, lue par --ref, est refusée AVANT toute mutation du
+        checkout : HEAD et fichiers restent sur la branche canonique."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        # un commit de feature descendant, sur une AUTRE branche locale : HEAD
+        # reste sur main, la révision n'est pas celle du checkout
+        git(self.clone, "checkout", "-q", "-b", "feature")
+        write(self.clone, "note-feature.md", "feature non revue\n")
+        commit_all(self.clone, "feature non revue", push=False)
+        git(self.clone, "checkout", "-q", "main")
+        arbre = git(self.clone, "status", "--porcelain")
+        before, journal = self.rows(), self.journal()
+        done = self.sync(ref="feature").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("not on the canonical branch", done.reason)
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(self.journal(), journal)
+        # le checkout n'a pas bougé : HEAD sur main, aucun fichier de la feature
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        self.assertEqual(git(self.clone, "status", "--porcelain"), arbre)
+        self.assertFalse(os.path.exists(os.path.join(self.clone, "note-feature.md")))
+
     def test_hote_en_retard_ne_reactive_rien(self):
         """Deux hôtes, une base : celui qui n'a pas vu le retrait ne le défait pas.
 

@@ -14,9 +14,11 @@ canonique seulement (voir `sync_authenticators`) :
 * **le clone suit le journal** (L814) : le journal est unique par canon, tous
   hôtes confondus ; `sync` rattrape le clone de l'hôte AVANT de le juger —
   fetch quand un dernier commit appliqué est inconnu du dépôt, relecture, puis
-  fast-forward du checkout à la révision lue. Un checkout qui ne peut pas la
-  contenir (clone divergé, modifications locales) fait refuser l'écriture des
-  authentificateurs : jamais de registre en avance sur ce que l'hôte a ;
+  fast-forward du checkout à la révision lue, seulement après les contrôles de
+  confiance et de monotonie (une révision non fusionnée refuse sans déplacer le
+  checkout). Un checkout qui ne peut pas la contenir (clone divergé,
+  modifications locales) fait refuser l'écriture des authentificateurs : jamais
+  de registre en avance sur ce que l'hôte a ;
 * **la branche canonique ne vient jamais du commit lu** (B2) : configuration
   de l'hôte (`AMEESH_CANON_REF` / `canon_ref`), sinon manifeste du dernier
   commit appliqué, sinon amorçage explicite (`canon sync --bootstrap-ref`,
@@ -747,7 +749,9 @@ def _follow_checkout(canon: Canon) -> str:
                root.commit[:12]))
 
 
-def catch_up(db: Db, canon: Canon, host: str, key: str | None = None) -> tuple[Canon, str]:
+def catch_up(db: Db, canon: Canon, host: str, key: str | None = None, *,
+             trusted_ref: str | None = None,
+             bootstrap_ref: str = "") -> tuple[Canon, str]:
     """Rattrape le clone de l'hôte sur le journal du canon (L814).
 
     Le journal des authentificateurs est unique par canon, tous hôtes
@@ -759,21 +763,37 @@ def catch_up(db: Db, canon: Canon, host: str, key: str | None = None) -> tuple[C
     qui est lu, le canon est relu sans fetch.
 
     Puis le checkout du clone canonique suit la révision lue
-    (`canon.git_fast_forward`, fast-forward seulement). Rend `(canon, refus)` :
-    `refus` n'est non vide que si le checkout ne peut pas contenir cette
-    révision (clone divergé, modifications locales écrasées) —
-    `sync_authenticators` refuse alors d'écrire, registre inchangé.
+    (`canon.git_fast_forward`, fast-forward seulement) — mais seulement après
+    les contrôles de confiance et de monotonie (`_verify`) sur le canon relu :
+    une révision non fusionnée lue par `--ref` ne doit pas avancer le checkout
+    avant d'être refusée (relecture R1/R2 du 13/10). `trusted_ref` (None : la
+    configuration de l'hôte pour ce canon) et `bootstrap_ref` sont ceux de
+    l'appelant ; ils refont foi sous le verrou (`_sync_locked`). Rend
+    `(canon, refus)` : `refus` n'est non vide que si le canon relu ne passe
+    pas ces contrôles, ou si le checkout ne peut pas contenir cette révision
+    (clone divergé, modifications locales écrasées) — `sync_authenticators`
+    refuse alors d'écrire, registre et checkout inchangés.
 
     Lecture seule pour le registre : l'appelant reste seul juge (`_verify`,
     sous le verrou, relit le journal)."""
     if key is None:
         key = state_key(db, canon, host)
+    if trusted_ref is None:
+        trusted_ref = configured_ref(db, canon)
     last = last_applied(db, key)
     if last is not None:
         reread, fetch = _catch_up_needed(canon, last)
         if reread or fetch:
             canon = canon_mod.load(canon.root, ref=canon.rev, untrusted=canon.untrusted,
                                    fetch=fetch, default=canon.is_default)
+    # L814 (R1/R2) : contrôles AVANT toute mutation du checkout — sinon un ref
+    # non fusionné, descendant du dernier appliqué, avance HEAD puis se fait
+    # refuser : registre intact mais canon local modifié.
+    if canon.readable and not canon.untrusted and canon.sources:
+        try:
+            _verify(canon, last, trusted_ref, bootstrap_ref)
+        except _Refused as exc:
+            return canon, str(exc)
     return canon, _follow_checkout(canon)
 
 
@@ -1281,9 +1301,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     # L814 : le journal des authentificateurs est global par canon ; la passe
     # rattrape le clone (fetch, relecture, fast-forward du checkout) AVANT de
     # le juger — sinon un hôte dont le clone n'a pas fetché refuse sans fin.
-    # `checkout_block` non vide : le checkout ne peut pas contenir la révision
-    # lue, les authentificateurs refuseront d'écrire (registre inchangé).
-    canon, checkout_block = catch_up(db, canon, host, key)
+    # Les contrôles de confiance et de monotonie passent avant le fast-forward
+    # (R1/R2) ; `checkout_block` non vide : contrôle refusé ou checkout qui ne
+    # peut pas contenir la révision lue, les authentificateurs refuseront
+    # d'écrire (registre et checkout inchangés).
+    canon, checkout_block = catch_up(db, canon, host, key, trusted_ref=trusted_ref,
+                                     bootstrap_ref=bootstrap_ref)
     ident = key or canon.id
     owner = (ident, canon.is_default)
 
