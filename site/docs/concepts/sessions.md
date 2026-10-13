@@ -9,7 +9,10 @@ its context between messages.
 
 The session id is stored in the registry and in the agent's state directory on
 the host. After a crash, the runner reads it back from the registry, else from
-the file. `ameesh attach` opens the same session interactively.
+the file. `ameesh attach` opens the same session interactively. An agent's
+session id comes **only from its harness**: an id the harness does not know is
+never resumed (L224), and an interactive Claude session runs with
+`--permission-mode auto` (L223).
 
 ## Rule: one fresh session per lot
 
@@ -71,6 +74,21 @@ never a prompt such as "resume session X":
   exchanges, unread count, path of the old transcript).
 
 See [Operate agents](../guides/operate-agents.md#adopt-an-interactive-session-ameesh-adopt).
+
+## Off-device backups
+
+```bash
+ameesh sessions <persona> [--limit N] [--json]      # current and past sessions (L52)
+ameesh session list <agent> [--host H]              # off-device backups
+ameesh session backup <agent> [--force]             # back up the current session now
+ameesh session restore <agent> [--session S] [--key K] [--home DIR] [--overwrite]
+                        [--allow-other-agent]
+```
+
+Session backups are off-device, on an explicit S3 endpoint
+(`AMEESH_BACKUP_S3_ENDPOINT`, `_REGION`, `_ACCESS_KEY`, `_SECRET_KEY`; L53);
+without an endpoint they stay local. `restore` refuses to overwrite another
+agent's home unless `--allow-other-agent` is given.
 
 ## Moved working directories
 

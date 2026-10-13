@@ -24,6 +24,7 @@ type: Agent
 title: orchestre                      # the agent's name
 responsible: human:alice              # REQUIRED
 team: acme-web                        # team or project; also the project of its thread
+projects: [acme-web, acme-api]        # optional (L243-1): the first is primary
 capabilities: [read, report-drift, propose]   # `approve` is forbidden for agents
 harness: claude                       # claude | codex | deepseek
 model: claude-opus                    # optional
@@ -60,6 +61,25 @@ error: authority belongs to humans, and is proven by a receipt.
 None of them carries a decision: `merge` and `release` *execute* an approval
 already given by a human (approved review, recorded go). They never replace
 it. An ephemeral agent still gets only `read` and `propose`.
+
+**Projects.** A card may list several `projects` (L243-1, migration 0388): the
+**first is primary**, and the others are secondary — placement, lots and mail
+use the primary unless the operation names another.
+
+**Naming.** Since L243 the default name of a new agent is
+`<org>-<repo>-<role>-<seq>` (or `<org>-<role>-<seq>` across projects), read
+from the canon's `extensions.ameesh.naming` rules:
+
+```bash
+ameesh agent name --role R [--project P …] [--json]   # generate, without creating
+ameesh agent spawn <name> --by CREATOR --ttl 2h       # create an ephemeral agent
+```
+
+Every card and every registry row reserves its number, so a name is never
+reused — stopped agents included. A role without a short name is refused, two
+repositories never share a segment and one repository keeps the same segment in
+every canon (a divergent mesh is refused), and an unreadable naming block is
+refused, never guessed.
 
 ## `Host`: a machine or a cluster
 
