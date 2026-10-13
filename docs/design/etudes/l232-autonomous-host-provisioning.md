@@ -322,6 +322,41 @@ account rather than silently switch a subscription to paid API usage.
 New secret enrolment or a broader destination needs a scoped owner decision;
 a standing approved policy may cover subsequent routine delivery/rotation.
 
+## Inventory of the existing store (L232c, observed 2026-10-13)
+
+There is no vault and no delivery API: the mesh-owned store is a set of
+root-owned environment files on each host, written by the installers or by an
+administrator, plus per-runner account files. The server side below is read
+from the installer and README sources; the client side is observed on
+`ameesh-agents-2` (no root and no placement on the mesh host, so the live
+`/etc/ameesh` of the server is not read directly).
+
+| Path | Written by | Mode / owner | Read by |
+| --- | --- | --- | --- |
+| `/etc/ameesh/db.env` (`PGPASSWORD`) | `deploy/serveur/installer-serveur.sh` | `0640 root:ameesh`, dir `0750 root:ameesh` | the server scripts and `basculer-mesh.sh` |
+| `/etc/ameesh/harnais.env` (provider API keys) | administrator | `0640 root:ameesh` | `ameesh-runner@.service` (`EnvironmentFile=`) |
+| `/etc/ameesh/sauvegarde.env` (object storage) | administrator | `0640 root:ameesh` | `sauvegarder-base.sh` |
+| `/etc/ameesh/guard.json`, `guard.env` | installer / administrator | `0644 root:root` (no secret) | `guard.py` |
+| `/etc/ameesh/guest.env`, `guest-<agent>.env` | `deploy/guest/install-pilot.sh` | `0640 root:<guest>`, created empty, never overwritten | the guest runners |
+| `~/.config/ameesh/config.json` (`dsn`, `accounts`) | installer / procedure | `0664 ameesh:ameesh` observed on `ameesh-agents-2`; carries a live database password there | every CLI process |
+| `~/.config/ameesh/env` (provider key) | administrator | `0600 ameesh:ameesh` | `ameesh-runner@.service` (`EnvironmentFile=-`) |
+| account `key_file` named by `config.json` | administrator | `0600`, mode checked at turn start by `accounts.py` | the runner, at turn launch |
+
+Absent today, and therefore to build in L232c: reference-based resolution (a
+caller names a store path or an environment variable today, never an
+allowlisted reference), an install-to-stdin helper (files are copied with
+`install`), staged rotation with a format/permission check and a bounded
+health check, revocation records, and the canary test. Two consequences:
+
+- the pilot backend is the existing protected directory: a narrow reader on
+  the mesh host resolves an allowlisted reference and writes the value to the
+  destination helper's stdin; no new vault, no new private-approval service;
+- `~/.config/ameesh/config.json` carries a live database password at `0664`
+  on `ameesh-agents-2` and nothing checks that mode (`accounts.py` checks
+  `key_file` modes only). Delivery and rotation must not widen this, and the
+  bridge that writes runner-owned `0600` files should validate the modes it
+  depends on instead of inheriting them.
+
 # OAuth: ameesh prepares, a human consents in a browser
 
 Use one grant per host and account. Never copy Claude credentials, Codex
@@ -430,7 +465,9 @@ L232a can build with a fake prepared-host adapter while L232b is implemented.
 Real activation depends on B and C readiness and D login where applicable.
 C's estimate assumes a protected-file store is sufficient; a new vault or
 new private-approval service beyond the existing approval stack requires
-re-estimation before implementation. D is a deliberately small pilot of the
+re-estimation before implementation. The L232c inventory of 2026-10-13
+confirms the protected-file store (see *Inventory of the existing store*):
+the 2 h estimate stands. D is a deliberately small pilot of the
 installed CLI versions, not a promise to support every provider release.
 
 # Verification and rollout
