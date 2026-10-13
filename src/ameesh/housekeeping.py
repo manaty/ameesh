@@ -1329,8 +1329,17 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 blocked = unremovable > quota
                 failed.append(path)
                 break
-            freed = st.st_nlink == 1   # #530: dry-run, read from the scan's stat
-            if not dry_run:
+            others = [p for p in (scan.get("links") or {}).get(
+                (st.st_dev, st.st_ino), ()) if p != path and _located_in(p, root)]
+            if dry_run:
+                # #762 (codex P2): the dry-run announces what the pass would
+                # do, and the pass removes every name the walk saw before
+                # crediting. The inode is therefore freed exactly when no name
+                # escapes the walk: `st_nlink` counts them all, the walked
+                # ones included. Reading `st_nlink == 1` alone counted a fully
+                # walked inode as unremovable and blocked the dry-run.
+                freed = st.st_nlink == len(set(others)) + 1
+            else:
                 # #500 r6 (codex P2 r5): an inode with hard links is counted
                 # once, but it can still have several names inside the managed
                 # root. Removing only one leaves the bytes in place while
@@ -1339,8 +1348,6 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 # `counted` once none is left. A name that cannot be removed
                 # keeps the whole inode counted, and stops the pass like any
                 # other refused deletion.
-                others = [p for p in (scan.get("links") or {}).get(
-                    (st.st_dev, st.st_ino), ()) if p != path and _located_in(p, root)]
                 kept = False
                 for other in others:
                     try:
@@ -1458,7 +1465,13 @@ def tmp_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
             break
         current = ("truncated" if result.get("truncated") else
                    "unremovable" if result.get("unremovable") else None)
-        if current == previous:
+        # #762 (codex P3): `truncated` and `mounts_unreadable` feed the same
+        # `tmp_unscanned` alert; a pass whose mount table was unreadable and
+        # the truncated listing that follows are one episode, so the second
+        # keeps the first's `since` instead of re-announcing the alert.
+        same_episode = current == previous or (
+            previous == "mounts_unreadable" and current == "truncated")
+        if same_episode:
             # #530: same episode (a second truncated listing, or the bytes
             # still there): keep its first observation
             out["since"] = float(data.get("episode_since") or row.get("at_ts") or now)
