@@ -57,11 +57,11 @@
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
-  ameesh plan add "what" --pour DATE [--projet P] [--lot N] [--source S] | list
+  ameesh plan add "what" --due DATE [--project P] [--lot N] [--source S] | list
         | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
         roadmap: dated commitments, proposals drawn from decisions,
         text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
-        task or a card: `ameesh work plan <id> --debut DATE --fin DATE --livraison DATE`;
+        task or a card: `ameesh work plan <id> --start DATE --end DATE --delivery DATE`;
   ameesh work estimates [--app P] [--json]
         L157: actual/estimated gaps of delivered work items (median, p80) by
         type and by estimate author; every work item carries an estimated
@@ -102,6 +102,10 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh hosts HOST --hold --until 2h --reason R | --release
+                                        the owner holds a host on purpose: its
+                                        agents' alerts stay quiet (#254);
   ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
         durable withdrawal, return and lost-host recovery (L232e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
@@ -160,6 +164,10 @@ MESH_COMMANDS = (
     "budget",
     # L131 : suites lourdes plafonnées par hôte (`ameesh heavy -- <commande>`)
     "heavy",
+    # L161c (#744) : la CI lue par `ameesh ci status <lot>` — le parseur existait
+    # dans mesh_cli, mais aucune liste de routage ne le servait : code 2 avant
+    # même de regarder la base.
+    "ci",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")

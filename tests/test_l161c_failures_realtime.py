@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L161c — chaque échec de test remonté en temps réel au courrier de l'agent du lot.
 
-Côté CI, `scripts/ci-flux.py publier` tient le check run « tests (flux) »
-pendant la part et `fermer` le termine ; côté ameesh, `ci.Watcher` (mené par
+Côté CI, `scripts/ci-flow.py publish` tient le check run « tests (flux) »
+pendant la part et `close` le termine ; côté ameesh, `ci.Watcher` (mené par
 `ameesh notify` sur l'hôte `github.host`) relève les exécutions en cours,
 envoie un urgent au premier échec d'une tête, des événements ordinaires
 ensuite et le verdict à la fin, n'impute jamais un rouge hérité de main, et
@@ -36,7 +36,7 @@ def _charger(nom: str, fichier: str):
     return module
 
 
-ciflux = _charger("ci_flux_l161c", "ci-flux.py")
+ciflux = _charger("ci_flux_l161c", "ci-flow.py")
 
 DEPOT = "manaty/ameesh"
 
@@ -51,29 +51,29 @@ def ev_test(test, statut="echec", execution=101, part="psycopg 1/4", **extra):
 
 
 def check_run(events, name="tests (flux) psycopg 1/4"):
-    """Un check run tel que GitHub le rend, sortie produite par ci-flux.py."""
-    return {"name": name, "output": ciflux.sortie(events)}
+    """Un check run tel que GitHub le rend, sortie produite par ci-flow.py."""
+    return {"name": name, "output": ciflux.check_output(events)}
 
 
 # --------------------------------------------------------------------------
-# côté CI : scripts/ci-flux.py publier / fermer
+# côté CI : scripts/ci-flow.py publish / close
 # --------------------------------------------------------------------------
 
 class FauxGitHub:
     def __init__(self, refus=False):
         self.appels, self.refus = [], refus
 
-    def pret(self):
+    def ready(self):
         return True
 
-    def creer(self, nom, output):
+    def create(self, nom, output):
         if self.refus:
             raise ciflux.urllib.error.HTTPError("u", 403, "Resource not accessible", {}, None)
-        self.appels.append(("creer", nom, output, None))
+        self.appels.append(("create", nom, output, None))
         return 7
 
-    def maj(self, ident, output, conclusion=None):
-        self.appels.append(("maj", ident, output, conclusion))
+    def update(self, ident, output, conclusion=None):
+        self.appels.append(("update", ident, output, conclusion))
 
 
 class PublicationTest(unittest.TestCase):
@@ -88,16 +88,16 @@ class PublicationTest(unittest.TestCase):
                 fh.write(json.dumps(ev) + "\n")
 
     def args(self, **kw):
-        return argparse.Namespace(**dict(dict(fichier=str(self.flux), nom="tests (flux) p 1/1",
-                                              intervalle=1.0, duree_max=100.0), **kw))
+        return argparse.Namespace(**dict(dict(file=str(self.flux), name="tests (flux) p 1/1",
+                                              interval=1.0, max_duration=100.0), **kw))
 
     def test_sortie_lue_par_ameesh(self):
         """La sortie du check run est exactement ce que `ci.events_of` relit."""
         events = [{"v": 1, "type": "debut", "part": "p 1/1", "modules": ["test_a"]},
                   ev_test("tests.test_a.T.test_ok", "succes", extrait=None),
                   ev_test("tests.test_a.T.test_ko"), ev_test("tests.test_a.T.test_err", "erreur")]
-        sortie = ciflux.sortie(events)
-        self.assertIn(ciflux.MARQUEUR, sortie["text"])
+        sortie = ciflux.check_output(events)
+        self.assertIn(ciflux.MARKER, sortie["text"])
         self.assertIn("2 échec(s)", sortie["title"])
         lus = ci.events_of([{"name": "tests (flux) p 1/1", "output": sortie}], 101)
         self.assertEqual([e["test"] for e in lus], ["tests.test_a.T.test_ko",
@@ -111,7 +111,7 @@ class PublicationTest(unittest.TestCase):
     def test_sortie_bornee(self):
         gros = "x" * 3000 + "\n"
         events = [ev_test("tests.test_a.T.test_%03d" % i, extrait=gros * 40) for i in range(200)]
-        sortie = ciflux.sortie(events)
+        sortie = ciflux.check_output(events)
         self.assertLess(len(sortie["text"]), 65535)
         self.assertIn("hors de la limite", sortie["text"])
         self.assertTrue(ci.events_of([{"name": "tests (flux)", "output": sortie}], 101))
@@ -130,10 +130,10 @@ class PublicationTest(unittest.TestCase):
                 self.ecrire({"v": 1, "type": "fin", "statut": "echec", "comptes": {}})
 
         horloge = iter(range(0, 10000, 1))
-        self.assertEqual(ciflux.publier(self.args(), gh=gh, dormir=dormir,
+        self.assertEqual(ciflux.publish(self.args(), gh=gh, dormir=dormir,
                                         horloge=lambda: next(horloge)), 0)
         genres = [a[0] for a in gh.appels]
-        self.assertEqual(genres[0], "creer")
+        self.assertEqual(genres[0], "create")
         # l'échec est publié aussitôt, avec son annotation, une seule fois
         avec_annot = [a for a in gh.appels if "annotations" in a[2]]
         self.assertEqual(len(avec_annot), 1)
@@ -141,29 +141,29 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(gh.appels[-1][3], "failure")
         # fermer ensuite ne refait rien : la conclusion est déjà posée
         avant = len(gh.appels)
-        ciflux.fermer(self.args(), gh=gh)
+        ciflux.close(self.args(), gh=gh)
         self.assertEqual(len(gh.appels), avant)
 
     def test_fermer_cree_si_absent(self):
         self.ecrire(ev_test("tests.test_a.T.test_ko"))
         gh = FauxGitHub()
-        ciflux.fermer(self.args(), gh=gh)
-        self.assertEqual([a[0] for a in gh.appels], ["creer", "maj"])
+        ciflux.close(self.args(), gh=gh)
+        self.assertEqual([a[0] for a in gh.appels], ["create", "update"])
         self.assertEqual(gh.appels[-1][3], "cancelled")  # pas de ligne `fin`
 
     def test_refus_jamais_bloquant(self):
         gh = FauxGitHub(refus=True)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(ciflux.publier(self.args(), gh=gh, dormir=lambda s: None), 0)
-            self.assertEqual(ciflux.fermer(self.args(), gh=gh), 0)
+            self.assertEqual(ciflux.publish(self.args(), gh=gh, dormir=lambda s: None), 0)
+            self.assertEqual(ciflux.close(self.args(), gh=gh), 0)
         self.assertIn("non publié (HTTP Error 403", err.getvalue())
 
     def test_sans_jeton(self):
         gh = ciflux.GitHub(env={"GITHUB_REPOSITORY": DEPOT, "GITHUB_SHA": "a" * 40})
-        self.assertFalse(gh.pret())
+        self.assertFalse(gh.ready())
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(ciflux.publier(self.args(), gh=gh), 0)
+            self.assertEqual(ciflux.publish(self.args(), gh=gh), 0)
 
 
 class WorkflowTest(unittest.TestCase):
@@ -175,8 +175,8 @@ class WorkflowTest(unittest.TestCase):
             self.assertIn("FLUX_NOM: tests (flux) %s" % job, bloc, job)
             self.assertRegex(bloc, r"\*publier|&publier", job)
             self.assertRegex(bloc, r"\*fermer|&fermer", job)
-        self.assertIn("ci-flux.py publier", texte)
-        self.assertIn("ci-flux.py fermer", texte)
+        self.assertIn("ci-flow.py publish", texte)
+        self.assertIn("ci-flow.py close", texte)
         # la permission reste locale aux parts
         self.assertIn("permissions:\n  contents: read\n", texte)
 

@@ -75,6 +75,15 @@ def _as_share(value, default: float) -> float:
     return part if 0.0 <= part <= 1.0 else default
 
 
+def _as_days(value, default: int) -> int:
+    """Nombre entier de jours ≥ 0 (L361) : « 0.5 » ou « 1.9 » ne sont pas
+    tronqués (0 couperait l'expiration) ; illisible ou non entier : défaut."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    return int(text) if re.fullmatch(r"[0-9]{1,6}", text) else default
+
+
 def _as_count(value, default: int) -> int:
     """Entier ≥ 0 (L105) ; une valeur illisible, négative ou infinie : défaut."""
     nombre = _as_float(value, float(default))
@@ -296,6 +305,10 @@ class Config:
     worktree_roots: tuple[str, ...] = (_expand("~/development"),)
     #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
     threads_dir: str = ""
+    #: rétention des fils lisibles, en jours (L361 ; 0033 §9 : un an par
+    #: défaut) : les entrées plus anciennes sont retirées par le ménage de
+    #: l'exécuteur ; 0 = aucune expiration
+    thread_retention_days: int = 365
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
     #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
     project: str = ""
@@ -589,6 +602,8 @@ def load(env: dict | None = None) -> Config:
                 pick("AMEESH_WORKTREE_ROOTS", "AGENT_MESH_WORKTREE_ROOTS"))
         ) or cfg.worktree_roots,
         threads_dir=_expand(threads_brut) if threads_brut else "",
+        thread_retention_days=_as_days(pick("AMEESH_THREAD_RETENTION_DAYS"),
+                                        cfg.thread_retention_days),
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),

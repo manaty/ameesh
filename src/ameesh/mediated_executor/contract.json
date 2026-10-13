@@ -2716,6 +2716,70 @@
    ]
   },
   {
+   "name": "turn_resources.running_started_before",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "before_ts",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": true
+    },
+    {
+     "name": "after_id",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": false,
+     "default": 0
+    },
+    {
+     "name": "limit",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": false,
+     "default": 500
+    }
+   ],
+   "result": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "admitted_agents",
+    "host forced; only admitted agents, including invitation allowlist and credential modes; filter before pagination; limit capped at 200"
+   ]
+  },
+  {
    "name": "hosts.record",
    "write": true,
    "transport": "op",
@@ -2991,6 +3055,15 @@
       "type": "object"
      },
      "required": true
+    },
+    {
+     "name": "count",
+     "kind": "keyword",
+     "schema": {
+      "type": "boolean"
+     },
+     "required": false,
+     "default": true
     }
    ],
    "result": {
@@ -3756,7 +3829,7 @@
   }
  ],
  "refused": {
-  "interface_total": 373,
+  "interface_total": 386,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3785,7 +3858,7 @@
    "projects": "vue des humains (/api/v1)",
    "roadmap": "feuille de route (L96) : serveur seulement",
    "session_bindings": "session toujours liée au bail : la recherche de liaison rend vide",
-   "threads": "hors du sous-ensemble de l'exécuteur médié",
+   "threads": "hors du sous-ensemble de l'exécuteur médié ; lock et expired (L361) : un verrou ne tient pas d'une requête distante à l'autre, l'expiration médiée viendra en une seule opération côté serveur",
    "turn_costs": "hors du sous-ensemble de l'exécuteur médié",
    "turn_resources": "hors du sous-ensemble de l'exécuteur médié",
    "visibility": "visibilité 0029 : serveur seulement",
@@ -3831,7 +3904,8 @@
     "human_known",
     "set_mode",
     "upsert_unleased",
-    "wake_check"
+    "wake_check",
+    "note_unleased"
    ],
    "approvals": [
     "candidates",
@@ -3942,8 +4016,12 @@
     "gate_guard",
     "harness_versions",
     "history",
+    "hold",
+    "hold_events",
+    "holds",
     "lend_basis",
     "record_harness_version",
+    "release",
     "since",
     "usage"
    ],
@@ -3958,7 +4036,10 @@
     "worktrees"
    ],
    "keys": [
+    "confirm",
+    "owner_registrations",
     "register",
+    "register_human",
     "registered",
     "revoke"
    ],
@@ -4042,7 +4123,9 @@
     "with_pids"
    ],
    "threads": [
-    "indexed"
+    "expired",
+    "indexed",
+    "lock"
    ],
    "turn_costs": [
     "correct",
@@ -4060,7 +4143,6 @@
     "open_by_agent",
     "orphans",
     "orphans_started_before",
-    "running_started_before",
     "settle",
     "settle_many",
     "settle_unchanged",
@@ -4083,6 +4165,7 @@
     "auto_takes_since",
     "backlog",
     "backlog_add",
+    "by_issue_ref",
     "by_package",
     "close",
     "close_merged",
@@ -4099,6 +4182,8 @@
     "handoff_lots",
     "issue_feed",
     "items",
+    "land_lock",
+    "land_unlock",
     "link_package",
     "lock_deep_analysis",
     "mark_started",

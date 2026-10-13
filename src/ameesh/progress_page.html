@@ -224,6 +224,17 @@ p.question { font-size: .95rem; margin: 8px 0; overflow-wrap: anywhere; }
 ul.options { margin: 0 0 8px; padding-left: 20px; font-size: .86rem; }
 details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
 .warn { color: var(--warning); }
+/* L160f (#497) : onglet Versions — dernière publiée, prochaine release */
+.vhead { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.vpub { font-size: .85rem; margin: 6px 0 2px; overflow-wrap: anywhere; }
+.vtag { color: var(--warning); }
+.vnext { margin-top: 6px; }
+.vthemes { margin: 6px 0 0; font-size: .82rem; }
+.vthemes summary { cursor: pointer; color: var(--ink-2); }
+.vthemes details { margin: 2px 0 2px 12px; }
+.vthemes ul { margin: 2px 0 4px; padding-left: 18px; }
+.vthemes li { margin: 2px 0; overflow-wrap: anywhere; }
+p.summary { font-size: .86rem; margin: 6px 0; }
 #refresh-status.warn { font-size: .8rem; }
 @media (max-width: 520px) { .stats { grid-template-columns: repeat(2, 1fr); } main { padding: 0 10px 10px; } }
 </style>
@@ -245,6 +256,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   </header>
 
   <section class="panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview"></section>
+  <section class="panel" id="panel-versions" role="tabpanel" aria-labelledby="tab-versions" hidden></section>
   <section class="panel" id="panel-gantt" role="tabpanel" aria-labelledby="tab-gantt" hidden></section>
   <section class="panel" id="panel-lots" role="tabpanel" aria-labelledby="tab-lots" hidden></section>
   <section class="panel" id="panel-agents" role="tabpanel" aria-labelledby="tab-agents" hidden></section>
@@ -273,8 +285,9 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   var MODE = /*__AMEESH_PROGRESS_MODE__*/"static";
   var API = "/api/progress.json", TOKEN_KEY = "ameesh-progress-token", TOKEN = "";
   var D = JSON.parse(document.getElementById("data").textContent || "null");
-  var TABS = [["overview", "Overview"], ["gantt", "Gantt"], ["lots", "Work items"],
-              ["agents", "Agents"], ["budget", "Budget"], ["decisions", "Decisions"]];
+  var TABS = [["overview", "Overview"], ["versions", "Versions"], ["gantt", "Gantt"],
+              ["lots", "Work items"], ["agents", "Agents"], ["budget", "Budget"],
+              ["decisions", "Decisions"]];
   var LOT_FR = {active: "active", review: "in review", blocked: "blocked", approved: "approved", merged: "merged", closed: "closed"};
   var LOT_ICON = {active: "▶", review: "◐", blocked: "■", approved: "✓", merged: "●", closed: "✕"};
   var LOT_ORDER = {blocked: 0, review: 1, approved: 2, active: 3, merged: 4, closed: 5};
@@ -508,6 +521,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     select.value = S.p;
     var sc = scoped();
     var badges = {decisions: sc.decisions.length,
+                  versions: versionGaps(),
                   lots: sc.lots.filter(function (l) { return !l.closed && l.state !== "merged"; }).length};
     TABS.forEach(function (t) {
       var b = document.getElementById("tab-" + t[0]), on = t[0] === S.tab;
@@ -778,6 +792,131 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
   function note(box) {
     if (partialScope()) box.appendChild(el("p", "meta", "Static page: budget, milestones and epics cover all projects."));
   }
+  // -- onglet Versions (L160f, #497) : dernière publiée, prochaine release --
+  var VSTATE = {
+    intake: ["st-review", "to do"], build: ["st-active", "in progress"],
+    qa: ["st-review", "in review"], blocked: ["st-blocked", "blocked"],
+    waiting_human: ["st-blocked", "waiting for a human"],
+    draft: ["st-proposed", "draft release"], "pull request": ["st-proposed", "release PR"]
+  };
+  function vchip(state) {
+    var x = VSTATE[state] || ["st-idle", state || "unknown"];
+    return el("span", "chip " + x[0], x[1]);
+  }
+  function vlink(text, url) {
+    if (!url) return el("span", "meta", text);
+    return link(text, function () { window.open(url, "_blank", "noopener"); });
+  }
+  function versionProducts() {
+    return ((D.versions && D.versions.products) || []).filter(function (p) {
+      return inScope(p.project);
+    });
+  }
+  function versionGaps() {
+    var n = 0;
+    versionProducts().forEach(function (p) {
+      if ((p.missing || []).length || (p.next && (p.next.missing || []).length)) n++;
+    });
+    return n;
+  }
+  function versionCard(p) {
+    var card = el("div", "pcard"), head = el("div", "vhead");
+    head.appendChild(el("span", "card-name", p.label || p.product || "?"));
+    if (p.repo) head.appendChild(el("span", "meta", p.repo));
+    card.appendChild(head);
+    var pub = el("div", "vpub");
+    if (p.last) {
+      pub.appendChild(el("span", "chip st-merged", "● " + p.last.tag));
+      pub.appendChild(document.createTextNode(" published " + (p.last.date || "date unknown")));
+      if (p.last.url) { pub.appendChild(document.createTextNode(" · ")); pub.appendChild(vlink("release", p.last.url)); }
+    } else {
+      pub.appendChild(el("span", "meta", "no published release known"));
+    }
+    card.appendChild(pub);
+    if (p.last_tag) {
+      var tag = el("div", "line vtag");
+      tag.appendChild(el("span", "chip " + (p.last_tag.draft ? "st-proposed" : "st-late"),
+                         (p.last_tag.draft ? "draft " : "tag ") + p.last_tag.tag));
+      tag.appendChild(document.createTextNode(" " + (p.last_tag.date || "date unknown")
+        + (p.last_tag.draft ? " — draft release, not published" : " — no published release")));
+      if (p.last_tag.url) { tag.appendChild(document.createTextNode(" · ")); tag.appendChild(vlink("release", p.last_tag.url)); }
+      card.appendChild(tag);
+    }
+    var n = p.next;
+    if (!n) {
+      card.appendChild(el("div", "warn", "⚠ no next release announced"));
+    } else {
+      var line = el("div", "line vnext");
+      line.appendChild(vchip(n.state));
+      line.appendChild(el("span", "card-name", " " + (n.version ? "next " + n.version : "next release: version unknown")));
+      line.appendChild(el("span", "meta", " · " + (n.date || (n.date_partial ? "not firm, latest " + n.date_partial : "no planned date"))
+        + (n.date_label ? " · " + n.date_label : "") + (n.tag ? " · tag " + n.tag : "")));
+      card.appendChild(line);
+      (n.lots || []).forEach(function (l) {
+        var lline = el("div", "line");
+        lline.appendChild(link("#" + l.id + " " + l.title, function () {
+          if (lotById(l.id)) openModal("lot", l.id);
+          else if (l.url) window.open(l.url, "_blank", "noopener");
+        }));
+        lline.appendChild(document.createTextNode(" "));
+        lline.appendChild(vchip(l.state));
+        if (l.assignee) lline.appendChild(el("span", "meta", " " + l.assignee));
+        card.appendChild(lline);
+      });
+      if (n.release) {
+        var rel = el("div", "line");
+        rel.appendChild(vlink("draft release " + (n.release.tag || ""), n.release.url));
+        card.appendChild(rel);
+      }
+      if (n.pr) {
+        var pl = el("div", "line");
+        pl.appendChild(vlink("release PR #" + n.pr.number + (n.pr.title ? " — " + n.pr.title : ""), n.pr.url));
+        card.appendChild(pl);
+      }
+      if (n.notes) card.appendChild(el("div", "meta", "notes " + n.notes.path + " (" + n.notes.source + ")"));
+      if (n.summary) card.appendChild(el("p", "summary", n.summary));
+      var themes = n.themes || [];
+      if (themes.length) {
+        var content = el("details", "vthemes"), csum = el("summary");
+        csum.textContent = (n.notes ? "Content (release notes)" : "Content (merged since "
+          + (n.merged_since || "the last tag") + ")") + " · " + contentCount(themes) + " item(s)";
+        content.appendChild(csum);
+        content.open = !!n.notes;
+        themes.forEach(function (t, i) {
+          var d = el("details");
+          if (!n.notes && i === 0) d.open = true;
+          d.appendChild(el("summary", null, t.theme + " · " + (t.items || []).length));
+          var ul = el("ul");
+          (t.items || []).forEach(function (item) { ul.appendChild(el("li", null, item)); });
+          d.appendChild(ul);
+          content.appendChild(d);
+        });
+        card.appendChild(content);
+      }
+      if (!n.notes && (n.merged_lots || []).length) {
+        var ml = el("details", "vthemes"), msum = el("summary", null,
+          "Merged lots · " + n.merged_lots.length), mul = el("ul");
+        n.merged_lots.forEach(function (l) {
+          var li = el("li");
+          li.appendChild(link("#" + l.id + " " + l.title, function () {
+            if (lotById(l.id)) openModal("lot", l.id);
+            else if (l.pr_url) window.open(l.pr_url, "_blank", "noopener");
+          }));
+          if (l.pr_url) { li.appendChild(document.createTextNode(" · ")); li.appendChild(vlink("PR", l.pr_url)); }
+          mul.appendChild(li);
+        });
+        ml.appendChild(msum); ml.appendChild(mul); card.appendChild(ml);
+      }
+    }
+    (p.missing || []).concat((n && n.missing) || []).forEach(function (m) {
+      card.appendChild(el("div", "warn", "⚠ " + m));
+    });
+    return card;
+  }
+  function contentCount(themes) {
+    return themes.reduce(function (n, t) { return n + (t.items || []).length; }, 0);
+  }
+
   var RENDER = {
     overview: function (box) {
       var sc = scoped();
@@ -842,6 +981,35 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       });
       if (watch.length > 6) wbox.appendChild(el("div", "meta", "+ " + (watch.length - 6) + " more: Work items and Decisions tabs"));
       box.appendChild(wbox);
+    },
+    versions: function (box) {
+      var v = D.versions;
+      if (!v) { box.appendChild(el("p", "empty", "Snapshot without versions (older than L160f).")); return; }
+      var gh = v.github;
+      if (gh && gh.read_ts) {
+        box.appendChild(el("p", "meta" + (gh.stale ? " warn" : ""),
+          "GitHub (" + gh.source + "): read " + ago(gh.read_ts)
+          + (gh.stale ? " — stale cache" : "")));
+      } else if (gh) {
+        box.appendChild(el("p", "meta", "GitHub (" + gh.source + "): nothing read"));
+      }
+      var products = versionProducts();
+      if (!products.length) {
+        box.appendChild(el("p", "empty", S.p ? "No product version known for this project."
+                                             : "No product version known."));
+      }
+      var cards = el("div", "pcards");
+      products.forEach(function (p) { cards.appendChild(versionCard(p)); });
+      box.appendChild(cards);
+      var glob = v.missing || [];
+      if (glob.length) {
+        var miss = el("details", "missing-box"), sum = el("summary", null, "Missing data");
+        miss.appendChild(sum);
+        var ul = el("ul", "missing");
+        glob.forEach(function (t) { ul.appendChild(el("li", null, t)); });
+        miss.appendChild(ul);
+        box.appendChild(miss);
+      }
     },
     gantt: function (box) {
       note(box);

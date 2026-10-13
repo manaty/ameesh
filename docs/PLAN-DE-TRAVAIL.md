@@ -235,8 +235,14 @@ section.
 ```
 ameesh work backlog add --title T --value "valeur attendue" --score 1-100
                         [--priority 1|2|3] [--source S] [--team E] [--requires CAP …]
+                        [--app P [--new-project]]
 ameesh work backlog list [--all] [--json]
 ```
+
+The item inherits its creator's project, as `work add` does (L118c, #495);
+`--app` must name a known project, otherwise the item is refused with the
+close names; `--new-project` introduces a project nobody declares yet, and
+the item's history records who did (#506, as `work add` and `--new-lot`).
 
 A queue item is a lot of type `improvement`, in `intake`, with no
 assignee; its expected value (one sentence) and its score are mandatory: no
@@ -255,10 +261,10 @@ Safeguards:
 * **never an irreversible or production action**: the pick-up mail
   forbids it (deployment, merge, data deletion, production
   server, committed spending); the agent proposes it to a human;
-* plans first; the token only with `--take-paid`, never during
-  `balance_low`; nothing under a reached cap nor on a host under pressure,
-  on low battery or not ready; at most `--take-max-per-hour` (2) pick-ups
-  per sliding hour for the whole mesh.
+* plans first; what they leave is taken by the pay-per-token agents in the
+  same pass, never during `balance_low`; nothing under a reached cap nor on a
+  host under pressure, on low battery or not ready; at most
+  `--take-max-per-hour` (2) pick-ups per sliding hour for the whole mesh.
 
 When agents are idle and the queue is empty (and no lot of the
 project is waiting), the `backlog_empty` alert invites the human lead to

@@ -98,6 +98,10 @@ le numéro du lot.**
   `--new-lot "titre" --estimate 2h` confie en un seul geste, et rattache le
   courrier (qui porte la phrase de l'humain) au lot créé, mais sans priorité :
   `work add` reste préférable.
+* **Projet** : sans `--app`, le lot prend le projet de son créateur. Un
+  `--app` explicite doit nommer un projet connu (#506) ; une faute de frappe
+  est refusée avec les noms proches. Le premier lot d'un vrai nouveau projet
+  passe `--app <projet> --new-project`, et l'historique du lot l'inscrit.
 * **Répondre** en citant le lot : « Enregistré : lot #142, priorité haute,
   estimation 2 h. »
 * Une demande refusée ou remise à plus tard s'enregistre aussi : le lot se
@@ -336,8 +340,16 @@ précèdent, plus celui-ci) et en sort un lot dont un conflit n'est couvert par
 aucune résolution, ou dont la branche a bougé après le gel ; son agent est
 prévenu. On fusionne le lot de rang 1 (`ameesh work queue show`), puis le
 suivant. Un lot en file ne reçoit plus de commit : `ameesh work queue remove
-<id>` d'abord. La fusion par ameesh elle-même (`ameesh work land`) vient
-avec L160e2.
+<id>` d'abord.
+
+Un projet qui déclare `land` dans `radar.projects` (`local` ou `pr`, avec
+ses portes) est fusionné par ameesh : l'exécuteur prend la tête de file,
+fusionne dans son clone avec les résolutions préparées, lance les portes,
+pousse sans forcer (ou fusionne la PR une fois la CI verte) et prévient
+dans le fil du lot. Un échec sort le lot de la file et réveille son agent ;
+l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
+30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
+rang 1.
 
 ## Le lot en cours
 
@@ -562,7 +574,12 @@ restée 4 h fusionnée sans être déployée :
    des numéros déjà réservés pour ce dépôt. Chaque dépôt a sa suite : la
    même valeur peut être réservée dans ameesh et dans nexlink. L'unicité
    (dépôt, numéro) est un index unique en base : deux réservations
-   simultanées ne prennent jamais le même numéro. La commande est
+   simultanées ne prennent jamais le même numéro ; la perdante réessaie après
+   une attente plein jitter (entre 0 et un plafond croissant), bornée au
+   budget restant, et si le budget s'épuise la commande rend
+   « reservation contention, retry » (jamais
+   l'erreur brute de l'index). Seule la violation d'unicité de cet index
+   déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
    déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
    `--release` libère. La réservation se lit dans `ameesh work show <lot>`

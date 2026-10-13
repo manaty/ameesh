@@ -377,12 +377,15 @@ class Canon(interface.Canon):
                AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name
                                AND h.state NOT IN ('verified','cancelled'))
                AND %s = ANY(verrou.admitted_hosts)
+               -- #254 : rien ne part vers un hôte en pause
+               AND NOT EXISTS (SELECT 1 FROM host_holds hh
+                                WHERE hh.host = %s AND hh.until > clock_timestamp())
              RETURNING r.name, r.host
             """,
             (name, target, canon_ref, diagnostic, ref, bool(keep_session),
              bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
              bool(keep_session), "moved to %s" % target,
-             host, owner, int(epoch), target),
+             host, owner, int(epoch), target, target),
         )
         return rows[0] if rows else None
 

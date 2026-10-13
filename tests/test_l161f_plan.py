@@ -4,7 +4,7 @@
 `scripts/test-plan.py plan` classes every test module once per CI run (P0
 changed test, P1 impacted by changed blocks, files, directories or tables,
 P2 recent failure, P3 the rest) and writes the parts; every part runs from
-that plan (`scripts/test-parts.py lancer --plan`) and says when its impacted
+that plan (`scripts/test-parts.py run --plan`) and says when its impacted
 modules are done (provisional green); `leaks` counts the failures of
 modules the map did not select. No database needed.
 """
@@ -37,7 +37,7 @@ def _load(name: str, filename: str):
 plan = _load("test_plan_l161f", "test-plan.py")
 parts = _load("test_parts_l161f", "test-parts.py")
 sys.path.insert(0, str(REPO / "scripts"))
-import carte  # noqa: E402
+import map as map_mod  # noqa: E402  scripts/map.py
 
 NOW = datetime.datetime(2026, 10, 11, 12, 0, tzinfo=datetime.timezone.utc)
 
@@ -100,11 +100,11 @@ class _Repo:
 
     def card(self) -> dict:
         """A map of the first commit: who executed, read, listed, touched what."""
-        infos, _ = carte.blocs(self.code)
+        infos, _ = map_mod.blocks(self.code)
         users = {"<module>": ["test_a", "test_b", "test_c"], "used": ["test_a"],
                  "untested": [], "Box": ["test_b"], "Box.get": ["test_b"]}
         return {
-            "schema": carte.SCHEMA, "commit": self.base, "genere": NOW.isoformat(),
+            "schema": map_mod.SCHEMA, "commit": self.base, "genere": NOW.isoformat(),
             "modules": {m: {"durees": {"psycopg": 1.0}, "echecs": []}
                         for m in ("test_a", "test_b", "test_c", "test_db", "test_old")},
             "blocs": {"src/ameesh/code.py": {n: {**i, "modules": users.get(n, [])}
@@ -390,7 +390,7 @@ class MapTest(unittest.TestCase):
             def prints(blocks):
                 return {k: v["empreinte"] for k, v in blocks.items()}
             self.assertEqual(prints(plan._without_new_functions(source, set())),
-                             prints(carte.blocs(source)[0]), f)
+                             prints(map_mod.blocks(source)[0]), f)
 
 
 class DocsLaneTest(unittest.TestCase):
@@ -523,7 +523,7 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("pull_request", None, NOW)
         if p["version_only"] or p["docs_only"]:
             self.skipTest("the checked out commit is a version or documentation change")
-        pilot = parts.lire_liste(plan.PILOT_FILE, parts.modules())
+        pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
         self.assertEqual([ps["modules"] and sorted(ps["modules"]) for ps in p["parts"]["psql"]],
                          [pilot])
 
@@ -551,15 +551,15 @@ class PlanTest(unittest.TestCase):
         f = pathlib.Path(tempfile.mkdtemp()) / "plan.json"
         self.addCleanup(shutil.rmtree, f.parent)
         f.write_text(json.dumps(p), encoding="utf-8")
-        self.assertIsNone(parts.lire_plan(f, "psql", 1))
-        self.assertTrue(parts._plan_pilote(str(f)))
+        self.assertIsNone(parts.read_plan(f, "psql", 1))
+        self.assertTrue(parts._driver_plan(str(f)))
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
 
     def test_each_module_in_exactly_one_part_with_the_map(self):
         mods = parts.modules()
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, check=True,
                               capture_output=True, text=True).stdout.strip()
-        card = {"schema": carte.SCHEMA, "commit": head, "genere": NOW.isoformat(),
+        card = {"schema": map_mod.SCHEMA, "commit": head, "genere": NOW.isoformat(),
                 "modules": {m: {"durees": {"psycopg": 1.0 + 7 * (i % 5), "psql": 2.0 + i % 3},
                                 "echecs": []} for i, m in enumerate(mods)},
                 "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
@@ -637,13 +637,13 @@ class ProvisionalGreenTest(unittest.TestCase):
     def _run(self, impacted: tuple, *cases):
         d = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d)
-        flux = parts.Flux(d / "flux.jsonl", {"part": "psycopg 1/1"})
-        cls = type("_R", (parts._Resultat,), {"flux": flux, "classes": {},
+        flux = parts.Flow(d / "flux.jsonl", {"part": "psycopg 1/1"})
+        cls = type("_R", (parts._Result,), {"flow": flux, "classes": {},
                                               "impactes": impacted})
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(c)
                                    for c in cases)
         unittest.TextTestRunner(stream=io.StringIO(), resultclass=cls).run(suite)
-        flux.fermer()
+        flux.close()
         return [json.loads(x) for x in (d / "flux.jsonl").read_text().splitlines()]
 
     def test_event_after_the_impacted_modules(self):
@@ -682,9 +682,9 @@ class ProvisionalGreenTest(unittest.TestCase):
                             f"setUpClass ({__name__}.C)", f"tearDownClass ({__name__}.C)",
                             f"setUpClass ({__name__}._cases.<locals>.Impacted)"):
             with self.subTest(description=description):
-                self.assertEqual(parts._module_de(_ErrorHolder(description)), module)
+                self.assertEqual(parts._module_of(_ErrorHolder(description)), module)
         failed = unittest.defaultTestLoader.loadTestsFromName("tests.test_absent_l161f")
-        self.assertEqual(parts._module_de(next(iter(failed))), "test_absent_l161f")
+        self.assertEqual(parts._module_of(next(iter(failed))), "test_absent_l161f")
 
     def test_no_impacted_module_green_at_once(self):
         _, rest = _cases()

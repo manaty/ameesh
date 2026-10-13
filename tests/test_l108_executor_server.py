@@ -327,6 +327,56 @@ class DoreTest(ServeurExecTest):
 
 
 class PorteeTest(ServeurExecTest):
+    def test_background_ownership_read_refuses_empty_admission(self):
+        token = "amx1." + "F" * 43
+        self.auth.add(token, Principal("executor", EXEC, "m", HOST,
+                                      agents_allowlist=(), expires_ts=FAR))
+        response = self.op("turn_resources.running_started_before", [HOST, FAR], token=token)
+        self.assertEqual(response.status, 403, response.body)
+        self.assertEqual(response.body["error"], "forbidden_scope")
+
+    def test_background_ownership_read_scopes_before_pagination(self):
+        self.agent("second", HOST, team="ingénieur")
+        # Non-governed and wrong-host rows precede every visible row.
+        self.db.execute(
+            "INSERT INTO turn_resources (turn_id, agent, host, pgid)"
+            " SELECT 'hidden-' || i, 'manuel', %s, 9000+i"
+            " FROM generate_series(1, 201) i", (HOST,))
+        resources = storage.of(self.db).turn_resources
+        resources.open_turn("elsewhere", "inge-front", "autre-hote", pgid=9900, label="test")
+        resources.open_turn("other-agent", "second", HOST, pgid=9901, label="test")
+        for name, status in (("visible", "running"), ("done", "done"), ("orphan", "orphan")):
+            resources.open_turn(name, "inge-front", HOST, pgid=9902, label="test")
+            self.db.execute("UPDATE turn_resources SET status=%s WHERE turn_id=%s",
+                            (status, name))
+        token = "amx1." + "F" * 43
+        self.auth.add(token, Principal("executor", EXEC, "m", HOST,
+                                      agents_allowlist=("inge-front",), expires_ts=FAR))
+        response = self.op("turn_resources.running_started_before", ["autre-hote", FAR],
+                           {"limit": 1}, token=token)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertEqual([r["turn_id"] for r in response.body["value"]], ["visible"])
+        after = response.body["value"][0]["id"]
+        response = self.op("turn_resources.running_started_before", [HOST, FAR],
+                           {"after_id": after, "limit": 1}, token=token)
+        self.assertEqual(response.body["value"], [])
+        response = self.op("turn_resources.running_started_before", [HOST, FAR])
+        self.assertEqual({r["turn_id"] for r in response.body["value"]},
+                         {"visible", "other-agent"})
+
+    def test_background_ownership_read_caps_pages(self):
+        self.db.execute(
+            "INSERT INTO turn_resources (turn_id, agent, host, pgid)"
+            " SELECT 'visible-' || i, 'inge-front', %s, 9000+i"
+            " FROM generate_series(1, 201) i", (HOST,))
+        response = self.op("turn_resources.running_started_before", [HOST, FAR])
+        self.assertEqual(response.status, 200, response.body)
+        rows = response.body["value"]
+        self.assertEqual(len(rows), 200)
+        response = self.op("turn_resources.running_started_before", [HOST, FAR],
+                           {"after_id": rows[-1]["id"]})
+        self.assertEqual(len(response.body["value"]), 1)
+
     def test_waiting_human_requires_an_open_decision_even_without_held(self):
         for supplied in ({}, {"held": False}, {"held": True}):
             with self.subTest(supplied=supplied):

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -52,6 +53,10 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(env["AMEESH_DRAIN_SECONDS"], "120")
         self.assertTrue(env["HOME"].startswith("/srv/ameesh-guest/"))
         self.assertIn("--agents %i", u["ExecStart"][0])
+        # mesh-design #457 r5: a trace of git keeps the token redacted,
+        # whatever the secrets files set (UnsetEnvironment is applied last)
+        self.assertEqual(u["UnsetEnvironment"], ["GIT_TRACE_REDACT"])
+        self.assertNotIn("GIT_TRACE_REDACT", env)
 
     def test_guest_runner_hardening(self):
         u = unit("ameesh-guest-runner@.service")
@@ -195,6 +200,32 @@ class InstallPilotTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("`memory_max` required", res.stderr)
 
+    def test_a_legacy_offer_the_previous_reader_accepted_installs(self):
+        # mesh-design #459 r4c: a refused `disk_paths` and a size the previous
+        # reader truncated to <= 0 drop the offer; the guard starts closed and
+        # lends nothing, but the installation goes on. The classification is
+        # structural: a value that copies the wording of a refused path does
+        # not pass for one.
+        for reclaim in ({"disk_paths": ["rel/x"]},
+                        {"disk_paths": ["/srv", "/srv/../etc"]},
+                        {"disk_free_min": 0},
+                        {"memory_available_min": "0.5B"}):
+            with self.subTest(reclaim=reclaim):
+                offer = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB",
+                         "reclaim": reclaim}
+                res = self.dry("--allow-rootfs", "--lend", "/dev/stdin",
+                               stdin=json.dumps(offer))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("offer dropped (the guard starts closed and lends nothing)",
+                              res.stderr)
+                self.assertIn('"lend": null', res.stdout)
+        # the same wording inside another value stays a real refusal
+        offer = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB",
+                 "windows": ["mon 10:00-11:00 disk_paths` refused path"]}
+        res = self.dry("--allow-rootfs", "--lend", "/dev/stdin", stdin=json.dumps(offer))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("invalid offer", res.stderr)
+
     def test_arguments_are_checked(self):
         for args in (["--enable", "x;rm"], ["--purge"], ["--set-guard-mode"],
                      ["--set-guard-mode", "on"], ["--root", "srv"]):
@@ -202,13 +233,663 @@ class InstallPilotTest(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0, args)
 
     def test_enable_and_guard_mode(self):
-        res = self.dry("--enable", "deepseek5", "deepseek6")
+        res = self.dry("--enable", "deepseek5", "deepseek6", *self.workspace_args())
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("systemctl enable --now ameesh-guest-runner@deepseek6.service", res.stdout)
         res = self.dry("--set-guard-mode", "enforce")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("AMEESH_GUARD_ARGS=\n", res.stdout)
         self.assertIn("systemctl restart ameesh-guard.service", res.stdout)
+
+    # --- the guests' workspace (#483): clone, git credential, dsh profile ---
+
+    REPO_ARG = "proj-a=https://github.com/example-org/proj-a.git#develop"
+    TOKEN = "ghp_" + "T0k3n" * 6
+
+    def canon(self, work="/srv/ameesh-guest/work/{agent}", agents=("deepseek5", "deepseek6"),
+              placed=("deepseek5", "deepseek6"), team="proj-a"):
+        """A canon of the test's own, a git checkout read at origin/main: the
+        agents on project TEAM, their work folders on host vm-test."""
+        root = os.path.join(self.host, "canon")
+        if os.path.isdir(root):
+            subprocess.run(["rm", "-rf", root], check=True)
+        def fiche(path, text):
+            os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+            with open(os.path.join(root, path), "w", encoding="utf-8") as fh:
+                fh.write("---\n%s---\n" % text)
+        for a in agents:
+            fiche("agents/%s.md" % a, "type: Agent\ntitle: %s\nresponsible: human:alice\n"
+                  "team: %s\nharness: deepseek\nprovider: deepseek\n"
+                  "credential_mode: api-key\n" % (a, team))
+        for a in placed:
+            fiche("placements/%s-vm-test.md" % a, "type: Placement\ntitle: %s@vm-test\n"
+                  "agent: %s\nhost: vm-test\ncredential_mode: api-key\n" % (a, a))
+        fiche("hotes/vm-test.md", "type: Host\ntitle: vm-test\nresponsible: human:alice\n"
+              "policy:\n  harnesses: [deepseek]\n  max_agents: 2\n  work_dirs:\n"
+              + "".join('    %s: "%s"\n' % (a, work) for a in agents))
+        git = ["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q", root], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "canon"], check=True)
+        subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        return root
+
+    def dsh(self, **files):
+        """A ~/.dsh of the test's own: hooks.json, a profile, and what must
+        never be copied (a session, a key, a log)."""
+        root = os.path.join(self.host, "dsh-source")
+        content = {"hooks.json": '{"hooks": {"Stop": [{"hooks": [{"type": "command", '
+                                 '"command": "/usr/local/bin/agent-mail hook deepseek"}]}]}}',
+                   "profiles/agent/cordis.yml": "[]\n",
+                   "profiles/agent/package.json": '{"name": "dsh-profile-agent"}\n',
+                   "profiles/agent/.plugin-manager/logs/op.log": "x\n",
+                   "llm-deepseek/key": "sk-" + "s3cr3t" * 5 + "\n",
+                   "sessions/1.json": "{}\n", **files}
+        for rel, text in content.items():
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return root
+
+    def workspace_args(self, *, repo=True, dsh=True):
+        root = os.path.join(self.host, "canon")
+        if not os.path.isdir(root):
+            self.canon()
+        args = ["--canon", root]
+        if repo:
+            args += ["--repo", self.REPO_ARG]
+        if dsh:
+            args += ["--dsh-from", self.dsh()]
+        return args
+
+    def guest_user(self):
+        """ameesh-guest in the test's passwd, with the test's own uid (its
+        files, made by the test, are then the guest's)."""
+        with open(os.path.join(self.host, "etc", "passwd"), "a", encoding="utf-8") as fh:
+            fh.write("ameesh-guest:x:%d:%d::/srv/ameesh-guest/home:/bin/bash\n"
+                     % (os.getuid(), os.getgid()))
+
+    def test_enable_prepares_the_workspace(self):
+        self.on_host("/etc/ameesh/guest-deepseek6.env",
+                     "DEEPSEEK_API_KEY=k\nGH_TOKEN=%s\n" % self.TOKEN)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        # the helper, root's; the guest's ~/.gitconfig names it, set by the guest
+        self.assertIn("--- /opt/ameesh/git-credential-guest (0755 root:root)", out)
+        # the clone's helpers, in its own .git/config: reset, then ours alone
+        self.assertIn("+ runuser -u ameesh-guest -- git -C /srv/ameesh-guest/work/deepseek6 config "
+                      "--local --replace-all credential.helper \n", out)
+        self.assertIn("+ runuser -u ameesh-guest -- git -C /srv/ameesh-guest/work/deepseek6 config "
+                      "--local --add credential.helper /opt/ameesh/git-credential-guest\n", out)
+        # the branch asked of the forge before anything is written
+        self.assertLess(out.index("ls-remote --exit-code --heads -- "
+                                  "https://github.com/example-org/proj-a.git refs/heads/develop"),
+                        out.index("--- /opt/ameesh/git-credential-guest"))
+        # the profile: hooks.json and the profile's plain files, nothing else
+        tar = next(l for l in out.splitlines() if l.startswith("+ (dsh_read tar "))
+        self.assertIn(" hooks.json profiles/agent/cordis.yml profiles/agent/package.json) |", tar)
+        for never in ("plugin-manager", "llm-deepseek", "sessions"):
+            self.assertNotIn(never, tar)
+        self.assertIn("| runuser -u ameesh-guest -- tar -C /srv/ameesh-guest/home/.dsh -xf -", tar)
+        # the clone, from the canon's project and folder, by the guest, detached
+        self.assertIn(" git -c credential.helper= -c credential.helper=", out)
+        self.assertIn(" -C /srv/ameesh-guest/work clone --quiet "
+                      "--no-checkout -- https://github.com/example-org/proj-a.git "
+                      "/srv/ameesh-guest/work/deepseek6", out)
+        self.assertIn("+ runuser -u ameesh-guest -- git -C /srv/ameesh-guest/work/deepseek6 "
+                      "checkout --quiet --detach origin/develop", out)
+        # all of it before the runner starts; the token never printed
+        self.assertLess(out.index("checkout --quiet --detach"),
+                        out.index("+ systemctl enable --now ameesh-guest-runner@deepseek6"))
+        self.assertNotIn(self.TOKEN, out + res.stderr)
+        self.assertNotIn("GH_TOKEN not set", out + res.stderr)
+        # without the token: said in a dry run, refused for real
+        os.remove(self.host + "/etc/ameesh/guest-deepseek6.env")
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertIn("GH_TOKEN not set in /etc/ameesh/guest-deepseek6.env (refused for real)",
+                      res.stdout)
+
+    def test_the_helper_hands_the_token_to_github_only(self):
+        out = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout
+        text = out.split("--- /opt/ameesh/git-credential-guest (0755 root:root)\n")[1]
+        helper = self.on_host("/opt/ameesh/git-credential-guest", text.split("\n---\n")[0] + "\n")
+        os.chmod(helper, 0o755)
+        def fill(host, token=self.TOKEN):
+            env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_TOKEN=token,
+                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+            res = subprocess.run(
+                ["git", "-c", "credential.helper=",
+                 "-c", "credential.https://github.com.helper=" + helper, "credential", "fill"],
+                input="protocol=https\nhost=%s\npath=example-org/proj-a.git\n\n" % host,
+                capture_output=True, text=True, env=env)
+            return res.stdout
+        self.assertIn("username=x-access-token\npassword=%s\n" % self.TOKEN, fill("github.com"))
+        self.assertNotIn(self.TOKEN, fill("example.com"))
+        res = subprocess.run([helper, "get"], input="protocol=https\nhost=evil.example\n\n",
+                             capture_output=True, text=True, env=dict(os.environ, GH_TOKEN="x"))
+        self.assertEqual(res.stdout, "")
+
+    def test_enable_refuses_before_doing_anything(self):
+        def refused(*args, why, **canon):
+            if canon:
+                self.canon(**canon)
+            res = self.dry("--enable", "deepseek6", *args)
+            self.assertNotEqual(res.returncode, 0, args)
+            self.assertIn(why, res.stderr, args)
+            self.assertNotIn("+ ", res.stdout, args)     # nothing done, not even printed
+            self.canon()
+        refused(why="--enable needs --canon DIR")
+        refused(*self.workspace_args(repo=False), why="--repo proj-a=https://")
+        for url in ("https://x:tok@github.com/example-org/proj-a.git", "http://github.com/m/n",
+                    "https://github.com/m/n?x=1", "git@github.com:m/n.git"):
+            res = self.dry("--enable", "deepseek6", "--canon", self.canon(),
+                           "--repo", "proj-a=%s#develop" % url)
+            self.assertNotEqual(res.returncode, 0, url)
+            self.assertNotIn("tok@", res.stdout)
+        for branch in ("-x", "a..b", "a b"):
+            res = self.dry("--enable", "deepseek6", "--canon", self.canon(),
+                           "--repo", "proj-a=https://github.com/m/n#%s" % branch)
+            self.assertNotEqual(res.returncode, 0, branch)
+        args = self.workspace_args()
+        refused(*args, why="deepseek6: not placed on vm-test", placed=("deepseek5",))
+        refused(*args, why="not a directory of its own in /srv/ameesh-guest/work",
+                work="/home/ameesh/work/{agent}")
+        refused(*args, why="not a directory of its own in /srv/ameesh-guest/work",
+                work="/srv/ameesh-guest/work/x/{agent}")
+        refused(*args, why="deepseek6: no such agent", agents=("deepseek5",), placed=())
+        res = self.dry("--enable", "deepseek6", "--canon", os.path.join(self.host, "etc"),
+                       *args[2:])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("the canon refuses", res.stderr)
+
+    def test_enable_keeps_what_is_there(self):
+        # bureau's activation: a clone (its URL without .git) and a profile
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/config",
+                     '[remote "origin"]\n\turl = https://github.com/example-org/proj-a\n')
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/index", "DIRC")
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent")
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn("kept /srv/ameesh-guest/work/deepseek6: a clone of "
+                      "https://github.com/example-org/proj-a (never fetched nor reset here)", out)
+        self.assertIn("kept /srv/ameesh-guest/home/.dsh: hooks.json and profiles there", out)
+        self.assertNotIn("git -C /srv/ameesh-guest/work clone", out)
+        self.assertNotIn("dsh_read tar", out)
+        # the kept clone's helpers set all the same (the same helper)
+        self.assertIn("git -C /srv/ameesh-guest/work/deepseek6 config --local --add "
+                      "credential.helper /opt/ameesh/git-credential-guest", out)
+
+    def test_enable_refuses_a_folder_holding_something_else(self):
+        work = "/srv/ameesh-guest/work/deepseek6"
+        self.on_host(work + "/.git/config", '[remote "origin"]\n\turl = https://github.com/x/y\n')
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertIn("is a clone of https://github.com/x/y, not of", res.stderr)
+        subprocess.run(["rm", "-rf", self.host + work], check=True)
+        self.on_host(work + "/notes.txt", "mine")
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertIn("is not empty and not a clone", res.stderr)
+        os.remove(self.host + work + "/notes.txt")
+        self.assertEqual(self.dry("--enable", "deepseek6", *self.workspace_args()).returncode, 0)
+        if os.getuid() != 0:
+            # an unreadable folder is never taken for an empty one
+            os.chmod(self.host + work, 0)
+            self.addCleanup(os.chmod, self.host + work, 0o700)
+            res = self.dry("--enable", "deepseek6", *self.workspace_args())
+            self.assertIn("is not empty and not a clone", res.stderr)
+        subprocess.run(["rm", "-rf", self.host + work], check=True)
+        self.on_host(work[:-1] + "x")
+        os.symlink(self.host + work[:-1] + "x", self.host + work)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertIn("is not empty and not a clone", res.stderr)
+
+    def test_a_profile_holding_a_secret_is_not_copied(self):
+        source = self.dsh(**{"profiles/agent/cordis.patch.yml":
+                             "- llm:\n    apiKey: sk-%s\n" % ("abcdef" * 4)})
+        args = self.workspace_args(dsh=False) + ["--dsh-from", source]
+        res = self.dry("--enable", "deepseek6", *args)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("look like they hold a secret: profiles/agent/cordis.patch.yml", res.stderr)
+        self.assertNotIn("abcdef", res.stdout + res.stderr)
+        self.assertNotIn("+ ", res.stdout)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False))
+        self.assertIn("give --dsh-from DIR", res.stderr)
+
+    # --- codex #457 r1 ---
+
+    def test_bash_x_never_traces_the_token(self):
+        # P1: under bash -x, an assignment or an argument goes to stderr
+        self.on_host("/etc/ameesh/guest-deepseek6.env",
+                     "DEEPSEEK_API_KEY=k\nGH_TOKEN=%s\n" % self.TOKEN)
+        res = subprocess.run(["bash", "-x", self.SCRIPT, "--dry-run", "--host", "vm-test",
+                              "--enable", "deepseek6", *self.workspace_args()],
+                             capture_output=True, text=True, env=self.env())
+        self.assertEqual(res.returncode, 0, res.stderr[-2000:])
+        self.assertIn("+ ", res.stderr)           # traced, all but the token
+        self.assertNotIn(self.TOKEN, res.stdout + res.stderr)
+        self.assertIn("ls-remote", res.stdout)     # the clone's path, all of it traced
+
+    def clone_here(self, work="/srv/ameesh-guest/work/deepseek6"):
+        """A real clone in the test's host: git init, its origin set."""
+        path = self.host + work
+        subprocess.run(["git", "init", "-q", path], check=True)
+        subprocess.run(["git", "-C", path, "remote", "add", "origin",
+                        "https://github.com/example-org/proj-a.git"], check=True)
+        return path
+
+    def helper_on_host(self, out):
+        text = out.split("--- /opt/ameesh/git-credential-guest (0755 root:root)\n")[1]
+        helper = self.on_host("/opt/ameesh/git-credential-guest", text.split("\n---\n")[0] + "\n")
+        os.chmod(helper, 0o755)
+        return helper
+
+    def test_a_credential_store_never_gets_the_token(self):
+        # codex #457 r2 P1: a credential.helper=store in the guest's global
+        # config, after its own reset (through an include), or appended by
+        # GIT_CONFIG_COUNT: the clone's .git/config (read after every file)
+        # resets them, the command line too; nothing writes the token
+        self.guest_user()
+        self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
+        fresh = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout   # to clone
+        clone = self.clone_here()
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/index", "DIRC")
+        out = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout
+        helper = self.helper_on_host(out)
+        home = self.on_host("/srv/ameesh-guest/home")
+        store = os.path.join(home, ".git-credentials")
+        self.on_host("/srv/ameesh-guest/home/store.inc", "[credential]\n\thelper = store --file %s\n" % store)
+        self.on_host("/srv/ameesh-guest/home/.gitconfig",
+                     "[credential]\n\thelper = \n[include]\n\tpath = %s/store.inc\n" % home)
+        # the script's own `git … config --local` commands, on the clone
+        mark = "+ runuser -u ameesh-guest -- git -C /srv/ameesh-guest/work/deepseek6 config "
+        for line in out.splitlines():
+            if line.startswith(mark):
+                scope, op, key, value = line[len(mark):].split(" ", 3)
+                subprocess.run(["git", "-C", clone, "config", scope, op, key, value], check=True)
+        # --check reads the same list: ours alone after the last reset
+        self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: credential.helper "
+                      "/opt/ameesh/git-credential-guest alone",
+                      self.run_script("--check", "--host", "vm-test").stdout)
+        # (git run here: the helper of the test's host)
+        subprocess.run(["git", "-C", clone, "config", "--local", "--replace-all", "credential.helper",
+                        helper, "^/opt/"], check=True)
+        env = dict(os.environ, HOME=home, GH_TOKEN=self.TOKEN, GIT_TERMINAL_PROMPT="0",
+                   GIT_CONFIG_NOSYSTEM="1")
+        env.pop("GIT_CONFIG_GLOBAL", None)
+        req = "protocol=https\nhost=github.com\npath=example-org/proj-a.git\n\n"
+        def cred(action, data, **extra):
+            return subprocess.run(["git", "-C", clone, "credential", action], input=data,
+                                  capture_output=True, text=True, env=dict(env, **extra))
+        got = cred("fill", req).stdout
+        self.assertIn("password=%s" % self.TOKEN, got)
+        cred("approve", got + "\n")
+        self.assertFalse(os.path.exists(store))
+        # the clone and ls-remote: the environment's config unset, every
+        # file's helpers reset on the command line
+        for cmd in ("ls-remote --exit-code", "clone --quiet"):
+            line = next(l for l in fresh.splitlines() if cmd in l)
+            self.assertIn("-- env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN "
+                          "-u GIT_TRACE_REDACT GIT_TERMINAL_PROMPT=0 git -c credential.helper= "
+                          "-c credential.helper=!f()",
+                          line)
+        # that inline helper, run: the store set by the environment unset
+        inline = self.inline_helper(fresh)
+        for extra in ({}, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
+                           "GIT_CONFIG_VALUE_0": "store --file " + store}):
+            res = subprocess.run(["env", "-u", "GIT_CONFIG_COUNT", "git", "-c", "credential.helper=",
+                                  "-c", "credential.helper=" + inline, "credential", "fill"],
+                                 input=req, capture_output=True, text=True, env=dict(env, **extra))
+            self.assertIn("password=%s" % self.TOKEN, res.stdout)
+        # --check sees a store after the clone's reset (its own include)
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/store.inc",
+                     "[credential]\n\thelper = store\n")
+        subprocess.run(["git", "-C", clone, "config", "--local", "include.path", "store.inc"], check=True)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: credential helpers in use: "
+                      "%s, store, not" % helper, out)
+        self.assertFalse(os.path.exists(store))
+
+    def inline_helper(self, out):
+        """The inline helper of --enable's ls-remote, reading the test's
+        host's /etc/ameesh/guest-deepseek6.env."""
+        line = next(l for l in out.splitlines() if "ls-remote --exit-code" in l)
+        inline = line.split(" -c credential.helper=", 2)[2].split(" ls-remote ")[0]
+        self.assertIn(" /etc/ameesh/guest-deepseek6.env ", inline)
+        return inline.replace(" /etc/ameesh/", " %s/etc/ameesh/" % self.host)
+
+    def test_the_token_is_in_no_environment(self):
+        # codex #457 r2 P2: the token reaches no process's environment;
+        # r3 P2: nor any file (a SIGKILL would leave it); r4 P2: nor a
+        # descriptor git's children inherit (a hook): root hands git
+        # nothing, the guest's helper reads the guest's own file
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertNotRegex(script, r"GH_TOKEN=\$")
+        self.assertNotIn("mktemp", script)
+        self.assertNotRegex(script, r"<&3|3<&|3<")
+        self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
+        out = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout
+        self.assertNotRegex(out, r'GH_TOKEN=(?!//p")')    # (but the helper's sed)
+        self.assertNotIn("/token", out)
+        self.assertNotIn("token_of", out)
+        self.assertEqual(out.count("+ runuser -u ameesh-guest -- env -u GIT_CONFIG_COUNT"), 2)
+        self.assertNotIn(self.TOKEN, out)
+
+    def test_the_inline_helper_asks_for_https_and_answers_again(self):
+        # codex #457 r4 P2: protocol=http got the token; a second request
+        # (a retry, a redirect) got nothing once fd 3 was read
+        self.on_host("/etc/ameesh/guest-deepseek6.env",
+                     "DEEPSEEK_API_KEY=k\nGH_TOKEN='%s'\n" % self.TOKEN)
+        inline = self.inline_helper(self.dry("--enable", "deepseek6", *self.workspace_args()).stdout)
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_NOSYSTEM="1")
+        def fill(protocol="https", host="github.com"):
+            return subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + inline,
+                                   "credential", "fill"],
+                                  input="protocol=%s\nhost=%s\n\n" % (protocol, host),
+                                  capture_output=True, text=True, env=env).stdout
+        for _ in range(3):
+            self.assertIn("username=x-access-token\npassword=%s\n" % self.TOKEN, fill())
+        self.assertNotIn(self.TOKEN, fill("http"))
+        self.assertNotIn(self.TOKEN, fill(host="evil.example"))
+        self.assertNotIn(self.TOKEN, fill(host="github.com.evil.example"))
+
+    def test_a_profile_swapped_while_read_is_refused(self):
+        # codex #457 r2 P1 (TOCTOU): agent/ swapped for a link to elsewhere
+        # between the check and the copy: what is copied is read again,
+        # never through a link, and checked again: refused
+        outside = self.on_host("/outside")
+        with open(os.path.join(outside, "cordis.yml"), "w", encoding="utf-8") as fh:
+            fh.write("shadow: root\n")
+        with open(os.path.join(outside, "package.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        source = self.dsh()
+        agent = os.path.join(source, "profiles", "agent")
+        swap = "mv %s %s.old && ln -s %s %s" % (agent, agent, outside, agent)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", source,
+                       PILOT_TEST_STAGE_HOOK=swap)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("profiles/agent: a link", res.stderr)
+        self.assertNotIn("dsh_read tar", res.stdout)
+        self.assertNotIn("systemctl enable", res.stdout)
+
+    def test_a_linked_dsh_source_is_refused(self):
+        # codex #457 r2 P1: --dsh-from itself a link, or through one
+        source = self.dsh()
+        link = os.path.join(self.host, "dsh-link")
+        os.symlink(source, link)
+        os.makedirs(os.path.join(self.host, "real", "home"))
+        os.rename(source, os.path.join(self.host, "real", "home", "dsh"))
+        os.symlink(os.path.join(self.host, "real", "home"), os.path.join(self.host, "home-link"))
+        for given in (link, os.path.join(self.host, "home-link", "dsh")):
+            res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", given)
+            self.assertNotEqual(res.returncode, 0, given)
+            self.assertIn("goes through a symbolic link", res.stderr)
+            self.assertNotIn("+ ", res.stdout)
+
+    def test_a_binary_or_unknown_file_is_not_copied(self):
+        # codex #457 r2 P1: only the kinds a profile needs, text only: a DER
+        # key renamed agent.txt, an id_* of any name, are refused
+        der = "0\x82\x04\xbe\x02\x01\x000\r\x06\t*\x86H\x86\xf7\r\x01\x01\x01\x05\x00"
+        for rel, data, why in (("profiles/agent/agent.txt", der.encode("latin-1"), "not text"),
+                               ("profiles/agent/agent.txt", b"\xff\xfe\x00k", "not text"),
+                               ("profiles/agent/id_work", b"x\n", "not a file a profile needs"),
+                               ("profiles/agent/id_work.json", b"{}\n", "look like they hold a secret"),
+                               ("profiles/agent/run.sh", b"echo\n", "not a file a profile needs")):
+            source = self.dsh()
+            with open(os.path.join(source, rel), "wb") as fh:
+                fh.write(data)
+            res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", source)
+            self.assertNotEqual(res.returncode, 0, rel)
+            self.assertIn(why, res.stderr, rel)
+            self.assertIn(rel, res.stderr)
+            self.assertNotIn("+ ", res.stdout)
+            subprocess.run(["rm", "-rf", source], check=True)
+
+    def test_links_on_the_destination_are_refused(self):
+        # codex #457 r2 P1: hooks missing, the guest's .dsh/profiles/agent a
+        # link to outside: refused before anything (and copied as the guest)
+        outside = self.on_host("/outside")
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles")
+        os.symlink(outside, self.host + "/srv/ameesh-guest/home/.dsh/profiles/agent")
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("/srv/ameesh-guest/home/.dsh/profiles/agent is a symbolic link", res.stderr)
+        self.assertNotIn("+ ", res.stdout)
+        os.remove(self.host + "/srv/ameesh-guest/home/.dsh/profiles/agent")
+        os.rmdir(self.host + "/srv/ameesh-guest/home/.dsh/profiles")
+        os.symlink(outside, self.host + "/srv/ameesh-guest/home/.dsh/profiles")
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertIn("/srv/ameesh-guest/home/.dsh/profiles is a symbolic link", res.stderr)
+
+    def test_a_linked_profiles_folder_is_not_copied(self):
+        # P1: --dsh-from DIR with DIR/profiles -> elsewhere
+        source = self.dsh()
+        elsewhere = os.path.join(self.host, "elsewhere")
+        os.rename(os.path.join(source, "profiles"), elsewhere)
+        os.symlink(elsewhere, os.path.join(source, "profiles"))
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False),
+                       "--dsh-from", source)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("not copied:\n  profiles: a link", res.stderr)
+        self.assertNotIn("+ ", res.stdout)
+
+    def test_a_private_key_is_not_copied(self):
+        # P1: PEM and OpenSSH private keys, by content or by name
+        for extra in ({"profiles/agent/deploy": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbn\n"},
+                      {"profiles/agent/k.txt": "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n"},
+                      {"profiles/agent/id_ed25519": "whatever\n"}):
+            source = self.dsh(**extra)
+            res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False),
+                           "--dsh-from", source)
+            self.assertNotEqual(res.returncode, 0, extra)
+            self.assertIn("not copied", res.stderr)
+            self.assertIn(next(iter(extra)), res.stderr)
+            self.assertNotIn("+ ", res.stdout)
+            subprocess.run(["rm", "-rf", source], check=True)
+
+    # --- codex #457 r3 ---
+
+    def test_a_credential_setting_not_ours_is_refused(self):
+        # P1: a helper for one URL (in config.worktree, the guest's global
+        # file) is asked after the clone's reset; a credential.helper read
+        # after .git/config (an include of it) too: a kept clone holding one
+        # is refused before anything, and --check says it
+        self.guest_user()
+        self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
+        clone = self.clone_here()
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/index", "DIRC")
+        home = self.on_host("/srv/ameesh-guest/home")
+        git = ["git", "-C", clone, "config"]
+        url_helper = "credential.https://github.com.helper"
+        subprocess.run([*git, "extensions.worktreeConfig", "true"], check=True)
+        subprocess.run([*git, "--worktree", url_helper, "store"], check=True)
+        def refused(why):
+            res = self.dry("--enable", "deepseek6", *self.workspace_args())
+            self.assertNotEqual(res.returncode, 0, why)
+            self.assertIn("credential settings not ours, remove them first", res.stderr)
+            self.assertIn(why, res.stderr)
+            self.assertNotIn("+ ", res.stdout)
+        refused("%s (worktree, file:%s/.git/config.worktree): not ours" % (url_helper, clone))
+        subprocess.run([*git, "--worktree", "--unset", url_helper], check=True)
+        gitconfig = os.path.join(home, ".gitconfig")
+        subprocess.run(["git", "config", "--file", gitconfig, url_helper, "store"], check=True)
+        refused("%s (global, file:%s): not ours" % (url_helper, gitconfig))
+        # a generic helper in the global file: reset by the clone's own
+        os.remove(gitconfig)
+        subprocess.run(["git", "config", "--file", gitconfig, "credential.helper", "store"], check=True)
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/store.inc", "[credential]\n\thelper = store\n")
+        subprocess.run([*git, "--local", "include.path", "store.inc"], check=True)
+        refused("credential.helper store (local, file:%s/.git/store.inc): read after the clone's reset"
+                % clone)
+        subprocess.run([*git, "--local", "--unset", "include.path"], check=True)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # --check: our helper alone in .git/config, a URL's in config.worktree
+        out = res.stdout
+        self.helper_on_host(out)
+        for args in (("--replace-all", "credential.helper", ""),
+                     ("--add", "credential.helper", "/opt/ameesh/git-credential-guest")):
+            subprocess.run([*git, "--local", *args], check=True)
+        check = lambda: self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: credential.helper "
+                      "/opt/ameesh/git-credential-guest alone", check())
+        subprocess.run([*git, "--worktree", url_helper, "store"], check=True)
+        self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: %s (worktree, file:%s/.git/config.worktree):"
+                      " not ours" % (url_helper, clone), check())
+
+    def test_the_source_swapped_above_it_is_refused(self):
+        # P1 (TOCTOU): a directory above --dsh-from swapped for a link to
+        # elsewhere once its path was checked: opened from / down, refused
+        os.makedirs(os.path.join(self.host, "a", "b"))
+        source = os.path.join(self.host, "a", "b", "dsh")
+        os.rename(self.dsh(), source)
+        elsewhere = os.path.join(self.host, "elsewhere")
+        shutil.copytree(os.path.join(self.host, "a", "b"), elsewhere)
+        with open(os.path.join(elsewhere, "dsh", "profiles", "agent", "cordis.yml"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("shadow: root\n")
+        b = os.path.join(self.host, "a", "b")
+        swap = "mv %s %s.real && ln -s %s %s" % (b, b, elsewhere, b)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", source,
+                       PILOT_TEST_ROOT_HOOK=swap)
+        self.assertTrue(os.path.islink(b))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("%s: goes through a symbolic link" % source, res.stderr)
+        self.assertNotIn("dsh_read tar", res.stdout)
+        self.assertNotIn("systemctl enable", res.stdout)
+
+    def test_a_fifo_never_blocks(self):
+        # P2: a FIFO for hooks.json (opened before it was checked) blocked
+        # root; read now without blocking, a plain file only. --check too.
+        source = self.dsh()
+        os.remove(os.path.join(source, "hooks.json"))
+        os.mkfifo(os.path.join(source, "hooks.json"))
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", "--enable",
+                              "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", source],
+                             capture_output=True, text=True, env=self.env(), timeout=60)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("hooks.json: not a plain file", res.stderr)
+        self.assertNotIn("+ ", res.stdout)
+        self.guest_user()
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
+        os.mkfifo(self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent") + "/cordis.yml")
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--check", "--host", "vm-test"],
+                             capture_output=True, text=True, env=self.env(), timeout=60)
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml: not a file", res.stdout)
+
+    def test_check_holds_the_profile_to_the_copy_rules(self):
+        # P2: --check read the profile for secrets only: a DER key renamed
+        # agent.txt passed. It is read now as --enable reads it.
+        self.guest_user()
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml", "[]\n")
+        check = lambda: self.run_script("--check", "--host", "vm-test").stdout
+        self.assertNotIn("FAIL /srv/ameesh-guest/home/.dsh/", check())
+        der = "0\x82\x04\xbe\x02\x01\x000\r\x06\t*\x86H\x86\xf7\r\x01\x01\x01\x05\x00"
+        with open(self.host + "/srv/ameesh-guest/home/.dsh/profiles/agent/agent.txt", "wb") as fh:
+            fh.write(der.encode("latin-1"))
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/id_work", "x\n")
+        out = check()
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/agent.txt: not text (UTF-8)", out)
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/id_work: not a file a profile "
+                      "needs", out)
+
+    def test_a_work_root_out_of_the_volume_is_refused(self):
+        # P2: $ROOT/work a link to elsewhere: the clone would land there
+        outside = self.on_host("/srv/outside")
+        os.makedirs(self.host + "/srv/ameesh-guest", exist_ok=True)
+        os.symlink(outside, self.host + "/srv/ameesh-guest/work")
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("/srv/ameesh-guest/work goes through a symbolic link", res.stderr)
+        self.assertNotIn("+ ", res.stdout)
+
+    def test_a_missing_branch_is_found_before_anything(self):
+        # P2: the branch asked first: absent, nothing is written ...
+        self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(), PILOT_TEST_FAIL="runuser")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no branch develop", res.stderr)
+        self.assertNotIn("--- /opt/ameesh", res.stdout)
+        self.assertNotIn("clone", res.stdout)
+        self.assertNotIn("systemctl", res.stdout)
+        # ... and a clone never checked out is not kept on a rerun
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/config",
+                     '[remote "origin"]\n\turl = https://github.com/example-org/proj-a.git\n')
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("never checked out: move it away first", res.stderr)
+        self.assertNotIn("systemctl enable", res.stdout)
+
+    def test_hooks_already_there_are_never_overwritten(self):
+        # P2: hooks.json there, profiles/ missing: only the profile copied
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", '{"mine": 1}')
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("kept /srv/ameesh-guest/home/.dsh/hooks.json: there already", res.stdout)
+        tar = next(l for l in res.stdout.splitlines() if l.startswith("+ (dsh_read tar "))
+        self.assertNotIn("hooks.json", tar)
+        self.assertIn(" profiles/agent/cordis.yml profiles/agent/package.json) |", tar)
+
+    def test_check_reports_the_workspace(self):
+        self.guest_user()
+        self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
+        os.chmod(self.host + "/etc/ameesh/guest-deepseek6.env", 0o640)
+        res = self.run_script("--check", "--host", "vm-test", "--canon", self.canon())
+        out = res.stdout
+        self.assertIn("FAIL /opt/ameesh/git-credential-guest missing", out)
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh: no hooks.json", out)
+        self.assertIn("ok   GH_TOKEN set in guest-deepseek6.env", out)
+        # mesh-design #457 r5: one UID, so one token, for every guest
+        self.assertIn("note: the guests of one host share a UID, so their tokens: one GitHub "
+                      "token per guest host, with the fewest rights possible", out)
+        self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: not a clone", out)
+        self.assertNotIn(self.TOKEN, out + res.stderr)
+        # what --enable makes, made by hand in the test's host
+        out = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout
+        text = out.split("--- /opt/ameesh/git-credential-guest (0755 root:root)\n")[1]
+        os.chmod(self.on_host("/opt/ameesh/git-credential-guest",
+                              text.split("\n---\n")[0] + "\n"), 0o755)
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml", "[]\n")
+        clone = self.clone_here()
+        out = self.run_script("--check", "--host", "vm-test", "--canon", self.canon()).stdout
+        self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: credential helpers in use: none", out)
+        for args in (("--replace-all", "credential.helper", ""),
+                     ("--add", "credential.helper", "/opt/ameesh/git-credential-guest")):
+            subprocess.run(["git", "-C", clone, "config", "--local", *args], check=True)
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/HEAD", "0123456789abcdef0123" * 2 + "\n")
+        out = self.run_script("--check", "--host", "vm-test", "--canon", self.canon()).stdout
+        self.assertIn("ok   /opt/ameesh/git-credential-guest (git credential helper, root 755)", out)
+        self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: credential.helper "
+                      "/opt/ameesh/git-credential-guest alone", out)
+        self.assertIn("ok   /srv/ameesh-guest/home/.dsh: hooks.json, profiles agent", out)
+        self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: a clone of "
+                      "https://github.com/example-org/proj-a.git, detached at 0123456789ab", out)
+        # without --canon: the folder taken for $ROOT/work/<agent>
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("no --canon: each work folder taken for /srv/ameesh-guest/work/<agent>", out)
+        self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: a clone of", out)
+        # a helper changed, a profile with a secret: said
+        with open(self.host + "/opt/ameesh/git-credential-guest", "a", encoding="utf-8") as fh:
+            fh.write("echo leak\n")
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml",
+                     "token: %s\n" % self.TOKEN)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL /opt/ameesh/git-credential-guest missing, changed", out)
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml looks like it "
+                      "holds a secret", out)
+        self.assertNotIn(self.TOKEN, out)
+
+    def test_uninstall_removes_the_helper(self):
+        res = self.dry("--uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("/opt/ameesh/git-credential-guest", res.stdout.split("+ rm -f /etc/tmpfiles.d")[1]
+                      .splitlines()[0])
 
     def test_uninstall_follows_the_study_order(self):
         res = self.dry("--uninstall", "--purge")
@@ -478,15 +1159,24 @@ class InstallPilotTest(unittest.TestCase):
             text = re.sub(r"\\\n\s*", "", fh.read())
         commands = []
         for line in text.splitlines():
-            m = re.search(r"sudo deploy/guest/install-pilot\.sh([^`#|]*)", line)
+            # (a comment starts at a "#" after a blank; --repo P=URL#BRANCH stays)
+            m = re.search(r"sudo deploy/guest/install-pilot\.sh((?:[^`#|]|(?<=\S)#)*)", line)
             if m:
                 commands.append(shlex.split(m.group(1)))
         self.assertGreaterEqual(len(commands), 8)
+        enable = [a for a in commands if "--enable" in a]
+        self.assertTrue(enable and all("--canon" in a and "--repo" in a for a in enable), enable)
+        # the project is the runbook's own (--repo P=…): ameesh names none
+        team = enable[0][enable[0].index("--repo") + 1].split("=", 1)[0]
+        canon = self.canon(agents=("deepseek6", "deepseek1"), placed=("deepseek6", "deepseek1"),
+                           team=team)
+        dsh = self.dsh()
         for args in commands:
             args = [a for a in args if a != "--dry-run"]
             if "--host" not in args:
                 args = ["--host", "vm-test", *args]   # --enable takes the rest
-            res = self.run_script(*args)
+            # its canon and ~/.dsh: the test's own
+            res = self.run_script(*args, PILOT_TEST_CANON=canon, PILOT_TEST_DSH=dsh)
             if "--check" in args:   # read only: it fails here, nothing being installed
                 self.assertNotIn("install-pilot.sh:", res.stderr, args)
             else:

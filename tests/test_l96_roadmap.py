@@ -355,8 +355,8 @@ class RoadmapPgTest(PgTestCase):
         """Le lot #65 réel : une date écrite seulement dans le corps."""
         lot = self._lot(body="Prévu le lundi 2026-10-12 (dit en conversation).",
                         assignee=None)
-        # Le scénario se déroule le 10 octobre : une création à la date
-        # réelle ferait passer la livraison dans le passé après le 12.
+        # created on the test clock, not the real one: from_task drops body dates
+        # earlier than the creation day (the date in the body went stale on 2026-10-13)
         self.db.execute("UPDATE work_items SET created_at = to_timestamp(%s) WHERE id = %s",
                         (NOW, lot["id"]))
         view = roadmap_propose.propose(self.db, canon=False, now=NOW)

@@ -230,6 +230,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
+    # #506: --app may name a project nobody declares yet, on purpose
+    new_project = "--new-project" in args
+    args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
     for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
@@ -281,7 +284,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
-              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT]] [--kind request|reply|notify|event] "
+              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]]] "
+              "[--kind request|reply|notify|event] "
               "[--urgent] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
               file=sys.stderr)
@@ -301,6 +305,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if app is not None and not app.strip():
         print("--app: empty project", file=sys.stderr)
+        return 2
+    if new_project and app is None:
+        print("--new-project goes with --new-lot \"title\" --app <project>", file=sys.stderr)
         return 2
     if estimate is not None and new_lot is None:
         print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
@@ -427,7 +434,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app)
+                estimate=estimate, app=app, new_project=new_project)
         except assignments.AssignmentError as exc:
             print("message not dropped — %s" % exc, file=sys.stderr)
             return 2
@@ -1482,6 +1489,16 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 0
+    from . import db_capacity
+    try:
+        capacity = db_capacity.read(db)
+        if capacity is not None:
+            print("connections: %s" % db_capacity.line(capacity))
+            if db_capacity.pressured(capacity):
+                verdict = 1
+    except db_mod.DbError:
+        print("connections: unavailable")
+        verdict = 1
     if notify_test:
         channel = "ameesh_doctor"
         listener = storage.of(db).wakeups.subscribe([channel])

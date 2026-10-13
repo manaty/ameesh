@@ -9,7 +9,7 @@
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
   ameesh work project-github --app P [--repo R] [--dry-run] [--json]   (L126)
-  ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
+  ameesh work plan <id|fiche> [--start J] [--end J] [--delivery J] [--source S]  (L96)
                   [--estimate 90m] [--estimate-source S]                (L157, une tâche)
   ameesh work estimates [--app P] [--json]   (L157 : écarts réel/estimé, pour l'auditeur)
 
@@ -86,11 +86,18 @@ def add_parsers(work_sub, func) -> None:
     p_plan = work_sub.add_parser(
         "plan", help="planned dates of a task or a WorkPackage (L96)")
     p_plan.add_argument("target", help="task number, or package id")
-    p_plan.add_argument("--debut", "--start", dest="debut", default=None,
+    p_plan.add_argument("--start", dest="debut", default=None,
                         help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
-    p_plan.add_argument("--fin", "--end", dest="fin", default=None, help="planned end")
-    p_plan.add_argument("--livraison", "--delivery", dest="livraison",
+    p_plan.add_argument("--debut", dest="debut", action=DeprecatedAlias, canonical="--start",
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_plan.add_argument("--end", dest="fin", default=None, help="planned end")
+    p_plan.add_argument("--fin", dest="fin", action=DeprecatedAlias, canonical="--end",
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_plan.add_argument("--delivery", dest="livraison",
                         default=None, help="planned delivery or deployment")
+    p_plan.add_argument("--livraison", dest="livraison", action=DeprecatedAlias,
+                        canonical="--delivery", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     p_plan.add_argument("--deploiement", dest="livraison", action=DeprecatedAlias,
                         canonical="--delivery", default=argparse.SUPPRESS,
                         help=argparse.SUPPRESS)
@@ -126,6 +133,11 @@ def add_parsers(work_sub, func) -> None:
                          help="write the dates (work items without dates, or dated by the schedule)")
     p_sched.add_argument("--force", action="store_true",
                          help="with --apply: also overwrite dates set by a person")
+    p_sched.add_argument("--pin", nargs="*", type=int, default=None, metavar="ID",
+                         help="#740: without ids, the work items whose dates carry the "
+                              "schedule's source (a date set by hand before #704 does too) "
+                              "and who dated them; with ids, keep those dates from the "
+                              "schedule (a human, an orchestrator or a design agent)")
     p_sched.add_argument("--actor", default="")
     p_sched.add_argument("--json", action="store_true", help="schema ameesh-schedule/1")
     p_sched.set_defaults(func=func)
@@ -185,6 +197,8 @@ def run(db, args: argparse.Namespace) -> int:
         else:
             print(estimates.format_report(report))
         return 0
+    if command == "schedule" and args.pin is not None:
+        return _pin(db, args)
     if command == "schedule":
         from . import lot_schedule
         sched = lot_schedule.build(db, assignee=args.assignee,
@@ -235,6 +249,38 @@ def run(db, args: argparse.Namespace) -> int:
         return 1
 
 
+def _pin(db, args: argparse.Namespace) -> int:
+    """#740: `work schedule --pin [ID ...]`, dry run without ids."""
+    from . import lot_schedule
+
+    if args.apply or args.force:
+        print("error: --pin goes without --apply and --force", file=sys.stderr)
+        return 2
+    if not args.pin:
+        rows = lot_schedule.pin_candidates(lot_schedule.build(db, assignee=args.assignee))
+        if args.json:
+            print(json.dumps({"candidates": rows}, ensure_ascii=False, indent=2))
+            return 0
+        print("dated with the schedule's source (dry run; --pin <id> keeps a date set by hand):")
+        for r in rows:
+            print("  #%-5d %-14s %s → %s  by %s%s  %s" % (
+                r["id"], r["assignee"], r["planned_start"] or "—", r["planned_end"] or "—",
+                r["planned_by"] or "?", "  (next --apply moves it)" if r["moves"] else "",
+                r["title"][:50]))
+        if not rows:
+            print("  none")
+        return 0
+    rows = lot_schedule.pin(db, args.pin, actor=args.actor)
+    if args.json:
+        print(json.dumps({"pinned": rows}, ensure_ascii=False, indent=2))
+    else:
+        for r in rows:
+            print("#%d: %s%s" % (r["id"], r["status"],
+                                  " (%s)" % (r.get("source") or r.get("reason"))
+                                  if r.get("source") or r.get("reason") else ""))
+    return 0
+
+
 def _plan(db, args: argparse.Namespace) -> int:
     """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage ; L157 :
     durée estimée d'une tâche (`--estimate`)."""
@@ -269,6 +315,8 @@ def _plan(db, args: argparse.Namespace) -> int:
         out["estimate"] = estimates.view(estimated)
     else:
         out = roadmap.plan(db, args.target, source=args.source, actor=args.actor, **kwargs)
+    if out.get("warning"):
+        print("warning: %s" % out["warning"], file=sys.stderr)
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0

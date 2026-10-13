@@ -15,7 +15,12 @@
     "binary_env": ["AMEESH_CODEX_BIN", "AGENT_MESH_CODEX_BIN"],
     "command": ["--dangerously-bypass-hook-trust", "exec",
                 "--dangerously-bypass-approvals-and-sandbox", "--json"],
-    "interactive": [],
+    "interactive": ["--no-daemon"],
+    "interactive_permission": {
+      "modes": {"bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"]},
+      "choices": ["bypassPermissions"],
+      "explicit_only": ["bypassPermissions"]
+    },
     "session": {"flag": ["resume"]},
     "stream": "codex-json",
     "model": {"flag": ["-m", "{model}"]},

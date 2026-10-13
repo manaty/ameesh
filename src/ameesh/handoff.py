@@ -210,16 +210,21 @@ def _not_on_branch(path: str, branch: str, remote: str, git, *,
     return ""
 
 
-def sensitive(paths: list, canons) -> str:
+def sensitive(paths: list, canons, project=None) -> str:
     """Pourquoi ce changement est sensible (vide sinon) : la classe de revue
     de la politique de CHAQUE canon, pas du seul premier — un chemin sensible
-    pour l'un l'est (codex r1, #409) ; une politique illisible vaut sensible."""
+    pour l'un l'est (codex r1, #409) ; une politique illisible vaut sensible.
+
+    `project` (l'app du lot) choisit la politique du projet dans chaque canon :
+    les globs d'un projet ne classent pas les fichiers d'un autre (§8). Un
+    projet non déclaré sans repli est un doute, donc sensible.
+    """
     from . import review as review_mod
     if not paths:
         return ""
     for federation in [getattr(c, "federation", None) for c in canons] or [None]:
         try:
-            policy, problems = review_mod.policy_from_federation(federation)
+            policy, problems = review_mod.policy_from_federation(federation, project)
             if any(severity == "error" for _code, severity, _text in problems):
                 return "review policy unreadable"
             result = review_mod.classify(policy, paths)
@@ -386,7 +391,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                                                         checked["reason"]),
                                  backlog.SENDER)
                 continue
-            if sensitive(checked["paths"], canons):
+            if sensitive(checked["paths"], canons, project):
                 continue
             if dry_run:
                 done_list.append({"item": item, "agent": target["name"],

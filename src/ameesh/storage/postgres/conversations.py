@@ -88,12 +88,15 @@ class Conversations(Contract):
                         " WHERE agent = %s AND seq = %s AND thread_entry IS NULL",
                         (entry_id, agent, seq))
 
-    def prune(self, agent, *, before_ts):
+    def prune(self, agent, *, before_ts, thread_before_ts=None):
         with self.db.transaction() as tx:
             tx.query("SELECT seq FROM conversation_heads WHERE agent = %s FOR UPDATE", (agent,))
             where = (" WHERE agent = %s AND created_at < to_timestamp(%s)"
-                     " AND (thread_text IS NULL OR thread_entry IS NOT NULL)")
+                     " AND (thread_text IS NULL OR thread_entry IS NOT NULL"
+                     " OR created_at < to_timestamp(%s))")
+            # no thread retention: a pending R12 entry stays (epoch 0 matches nothing)
+            params = (agent, before_ts, 0 if thread_before_ts is None else thread_before_ts)
             count = tx.query("SELECT count(*) AS n FROM conversation_log" + where,
-                             (agent, before_ts))[0]["n"]
-            tx.execute("DELETE FROM conversation_log" + where, (agent, before_ts))
+                             params)[0]["n"]
+            tx.execute("DELETE FROM conversation_log" + where, params)
             return int(count)
