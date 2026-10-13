@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L161a : une PR de documentation seule ne passe que les tests qui lisent la
-documentation, et une exécution de main n'est jamais annulée par la suivante.
+documentation ; sur main, un seul run attend, et la fusion suivante remplace
+celui qui attend, jamais l'exécution en cours (décision owner c, 13/10/2026).
 
 Tests sans base : détection d'une PR de documentation seule
 (scripts/version-only.py), liste des lecteurs déclarés, workflow.
@@ -74,6 +75,9 @@ class WorkflowTest(unittest.TestCase):
 
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding="utf-8")
+        # le groupe de concurrence est écrit en scalaire replié : on compare
+        # l'expression à espaces normalisés
+        self.flat = " ".join(self.text.split())
 
     def test_parts_sautees_pour_la_doc(self):
         # L161f : les matrices du plan sont vides pour une PR de documentation
@@ -85,10 +89,19 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers]", self.text)
         self.assertIn('test "${{ needs.doc-readers.result }}" = success', self.text)
 
-    def test_main_jamais_annulee(self):
-        # hors PR, un groupe par exécution : ni annulée, ni écartée en attente
-        self.assertIn("|| github.run_id }}", self.text)
-        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.text)
+    def test_main_un_seul_run_en_attente(self):
+        # L161a (décision owner c, 13/10/2026) : sur main, un seul groupe et
+        # cancel-in-progress faux ; GitHub ne garde qu'une exécution en attente
+        # par groupe, donc la suivante remplace celle qui attend, jamais celle
+        # qui tourne. PR : un groupe par PR, l'exécution dépassée est annulée ;
+        # release/* et workflow_dispatch : un groupe par exécution.
+        self.assertIn(
+            "tests-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main')"
+            " && 'main' || (github.event_name == 'pull_request'"
+            " && format('pr-{0}', github.event.pull_request.number) || github.run_id) }}",
+            self.flat)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                      self.flat)
         self.assertNotIn("cancel-in-progress: true", self.text)
 
 

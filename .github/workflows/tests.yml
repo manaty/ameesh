@@ -21,8 +21,10 @@
 # L161a — même chose pour une PR de documentation seule (docs/, site/, *.md
 # hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
 # (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
-# doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
-# fusion garde son verdict.
+# doc ». Sur main, un seul groupe : GitHub n'y garde qu'une exécution en
+# attente, donc la fusion suivante remplace celle qui attend, jamais celle en
+# cours (décision owner c du 13/10/2026) ; release/* et workflow_dispatch
+# gardent un groupe par exécution.
 #
 # L161b — chaque part écrit ses résultats au fil de l'eau (--flow, JSON lignes,
 # un test par ligne, schéma ameesh-test-event/1), publiés en artefact
@@ -57,11 +59,17 @@ on:
   pull_request:
   workflow_dispatch:
 
-# une exécution de PR dépassée (nouveau commit sur la PR) est annulée ; hors
-# PR, chaque exécution a son propre groupe : ni annulée, ni écartée en attente
-# (GitHub n'en garde qu'une en attente par groupe), même sans cancel-in-progress
+# PR : un groupe par PR, l'exécution dépassée (nouveau commit) est annulée.
+# Main : un seul groupe, cancel-in-progress faux — GitHub ne garde qu'une
+# exécution en attente par groupe, donc la fusion suivante remplace celle qui
+# attend, jamais celle en cours (L161a, décision owner c du 13/10/2026).
+# Release/* et workflow_dispatch : un groupe par exécution, ni annulée, ni
+# écartée en attente.
 concurrency:
-  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  group: >-
+    tests-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    && 'main' || (github.event_name == 'pull_request'
+    && format('pr-{0}', github.event.pull_request.number) || github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

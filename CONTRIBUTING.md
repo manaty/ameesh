@@ -27,8 +27,9 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   sans base (« lecteurs de la doc », moins d'une minute). Un test qui ouvre
   un fichier de `docs/` ou `site/` se déclare dans
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
-  vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
-  jamais annulée par la fusion suivante.
+  vérifie. Sur `main`, la suite complète tourne à chaque fusion ; un seul run
+  y attend, et une fusion plus récente remplace celui qui attend, jamais
+  l'exécution en cours (L161a, décision owner c du 13/10/2026).
 - **Tests indépendants du poste** (L142) : le poste et la CI donnent le même
   verdict. À l'import, `tests/support.py` retire toutes les variables
   `AMEESH_*`, `AGENT_MESH_*` et `AGENT_MAIL_*` de la session (identité
