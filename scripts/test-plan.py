@@ -91,8 +91,11 @@ SUMMARY_LIMIT = 25
 
 MIGRATIONS_DIR = "src/ameesh/migrations/"
 CODE_ROOT = "src/ameesh/"
-#: changes that trigger the "always" list
-ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/")
+#: changes that trigger the "always" list (#749: the runner drives turns,
+#: leases and orphan settlement through objects global to the cluster, which
+#: the per-schema measure of the map cannot see)
+ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/",
+                   "src/ameesh/runner.py")
 #: test infrastructure: the map cannot judge a change there
 FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".github/",
               "scripts/test-parts.py", "scripts/test-plan.py", "scripts/map.py",
@@ -418,6 +421,15 @@ def always_hits(changes: list[tuple[str, str]], always: list[str]) -> dict[str, 
     return {m: f"always list ({trigger})" for m in always} if trigger else {}
 
 
+def psql_pr_modules(pilot: list[str], always: list[str]) -> list[str]:
+    """#749 : modules du pilote psql d'une PR, augmentes de la liste « always »
+    declenchee par le diff (contrat de base, baux et orphelins). Le pilote psql
+    d'une PR ne voit sinon que `tests/parts/pilote-psql.txt` : une regression
+    qu'il est le seul a voir, dans un module hors liste, attendait la suite
+    complete de main (rouge de release de l'incident #749)."""
+    return sorted(set(pilot) | set(always))
+
+
 def recent_failures(card: dict | None, now: datetime.datetime) -> dict[str, str]:
     if not card:
         return {}
@@ -496,7 +508,11 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                               and not impact.untested)
     changes = changes or []
     out["changed"] = len(changes)
-    for m, r in always_hits(changes, always).items():
+    triggered = always_hits(changes, always)
+    #: #749 : la liste declenchee est publiee pour que le pilote psql d'une PR
+    #: la rejoigne (make_plan), au lieu d'attendre la suite complete de main.
+    out["always"] = sorted(triggered)
+    for m, r in triggered.items():
         if classes.get(m, ("P3",))[0] not in ("P0", "P1"):
             classes[m] = ("P1", r)
     for m, r in recent_failures(card, now).items():
@@ -580,6 +596,9 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             "tested": _rev(head, repo), **nature(event, head=head, repo=repo)}
     plan.update(classify(modules, card, now, head=head, repo=repo))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+    #: #749 : modules « always » declenches par le diff (contrat de base, baux
+    #: et orphelins), a rejoindre au pilote psql sur une PR.
+    always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
     if plan["docs_only"]:
         # the fast lane needs a map that judged everything: a missing, stale or
@@ -602,7 +621,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
         if driver == "psql" and pr:
-            selected = read_list(PILOT_FILE, modules, required=True)
+            selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
+                                       always)
         plan["parts"][driver] = [] if skip else split(
             selected, driver, n_pr if pr else n_other, card, classes)
     every = [m for m in modules]

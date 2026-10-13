@@ -374,6 +374,9 @@ class MapTest(unittest.TestCase):
         self.assertEqual(plan.always_hits(changes, ["test_cluster"]),
                          {"test_cluster": "always list (src/ameesh/migrations/0099_x.sql)"})
         self.assertEqual(plan.always_hits([("M", "src/ameesh/work.py")], ["test_cluster"]), {})
+        # #749 : le runner declenche la liste, comme une migration ou le SQL
+        self.assertEqual(plan.always_hits([("M", "src/ameesh/runner.py")], ["test_l31_orphans"]),
+                         {"test_l31_orphans": "always list (src/ameesh/runner.py)"})
         card = {"modules": {
             "test_recent": {"echecs": [{"ts": "2026-10-09T00:00:00+00:00"}]},
             "test_old": {"echecs": [{"ts": "2026-09-30T00:00:00+00:00"}]}}}
@@ -381,7 +384,18 @@ class MapTest(unittest.TestCase):
 
     def test_always_list_sorted_and_known(self):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
-        self.assertEqual(always, ["test_cluster", "test_events_attach", "test_l72_panne_de_base"])
+        self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
+                                  "test_events_attach", "test_l31_orphans",
+                                  "test_l50_group_orphan_work_items",
+                                  "test_l72_panne_de_base"])
+
+    def test_psql_pr_modules_adds_the_triggered_always_list(self):
+        # #749 : la liste « always » declenchee rejoint le pilote psql d'une PR ;
+        # sans declenchement, la selection reste exactement tests/parts/pilote-psql.txt
+        self.assertEqual(plan.psql_pr_modules(["test_a", "test_cluster"],
+                                              ["test_l31_orphans"]),
+                         ["test_a", "test_cluster", "test_l31_orphans"])
+        self.assertEqual(plan.psql_pr_modules(["test_a"], []), ["test_a"])
 
     def test_new_functions_taken_out_losslessly(self):
         # taking nothing out must give the very fingerprints of the map
@@ -527,6 +541,33 @@ class PlanTest(unittest.TestCase):
         self.assertEqual([ps["modules"] and sorted(ps["modules"]) for ps in p["parts"]["psql"]],
                          [pilot])
 
+    def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
+        # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
+        # declenche la liste « always » (contrat de base, baux et orphelins) ;
+        # ces modules passent alors AUSSI sous psql des la PR, au lieu d'attendre
+        # la suite complete de main ou la CI de release.
+        mods = parts.modules()
+        always = ["test_339_orphan_settle", "test_cluster", "test_l31_orphans"]
+        card = {"schema": map_mod.SCHEMA, "commit": "0" * 40, "genere": NOW.isoformat(),
+                "modules": {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                            for m in mods},
+                "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
+        classes = {m: (["P1", "always list (src/ameesh/runner.py)"]
+                       if m in always else ["P3", ""]) for m in mods}
+        with mock.patch.object(plan, "classify", return_value={
+                "map": None, "sure": False, "phase2_safe": False, "unsure": [],
+                "untested": [], "unknown_blocks": [], "foundation": [], "changed": 1,
+                "always": always,
+                "classes": {m: list(c) for m, c in classes.items()}}):
+            p = plan.make_plan("pull_request", card, NOW)
+        if p["version_only"] or p["docs_only"]:
+            self.skipTest("the checked out commit is a version or documentation change")
+        pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
+        seen = sorted(m for ps in p["parts"]["psql"] for m in ps["modules"])
+        self.assertEqual(seen, sorted(set(pilot) | set(always)))
+        # sans declenchement, la selection reste exactement le pilote
+        self.assertEqual(plan.psql_pr_modules(pilot, []), pilot)
+
     def test_parts_impacted_first(self):
         classes = {"test_canon": ("P3", ""), "test_cluster": ("P1", "x"),
                    "test_version": ("P0", "y"), "test_cost": ("P2", "z")}
@@ -565,6 +606,9 @@ class PlanTest(unittest.TestCase):
                 "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
+        # #749 : une fusion a main passe la suite complete sous les deux pilotes
+        # (psql en 6 parts), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
