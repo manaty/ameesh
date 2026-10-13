@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Image ameesh-approve (#953, tranche R5-IMAGE-APPROVE) : construit l'image du
+# service d'approbation d'une equipe et la publie sur le registre ghcr.io du
+# depot. Politique de tags, de digests, d'epinglage et de retour arriere :
+# docs/IMAGE-APPROVE.md.
+#
+# Declencheurs volontairement etroits — aucun declencheur de PR, aucune fourche :
+#   - push sur lot/953-image-approve : construit et publie le tag immuable
+#     sha-<12> de la tete poussee. C'est la preuve avant fusion (#953, #608) ;
+#   - workflow_dispatch sur main : publie en plus le tag de version de
+#     pyproject.toml, sur le commit de fusion, apres le feu du pilote ;
+#   - workflow_dispatch sur lot/* : meme publication que le push (sha seul).
+# GitHub ne propose workflow_dispatch que si le fichier existe deja sur la
+# branche par defaut ; au premier lot, c'est donc le push sur la branche du lot
+# qui produit la preuve pre-fusion.
+#
+# Le GITHUB_TOKEN du depot porte `packages: write` (permission declaree ici) ;
+# aucun jeton personnel n'est utilise. Un tag deja publie n'est jamais reecrit :
+# le workflow rend le digest existant au lieu de le deplacer.
+name: image approve
+
+on:
+  push:
+    branches: ["lot/953-image-approve"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-approve-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: image approve
+    # Une fourche n'a ni l'ecriture du paquet ni acces a nos runners
+    # auto-heberges : le job est ignore, jamais execute sur un runner heberge.
+    if: github.repository == 'manaty/ameesh'
+    runs-on: [self-hosted, linux, ameesh-ci]
+    timeout-minutes: 30
+    env:
+      IMAGE: ghcr.io/manaty/ameesh-approve
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Version, revision et tags autorises
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          test -n "$version"
+          revision="$(git rev-parse HEAD)"
+          sha12="$(printf '%s' "$revision" | cut -c1-12)"
+          case "$GITHUB_REF" in
+            refs/heads/main)   publish_version=1 ;;
+            refs/heads/lot/*)  publish_version=0 ;;
+            *)
+              echo "::error::ref $GITHUB_REF refusee : publication depuis main ou lot/* uniquement"
+              exit 1
+              ;;
+          esac
+          {
+            echo "version=$version"
+            echo "revision=$revision"
+            echo "sha12=$sha12"
+            echo "publish_version=$publish_version"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, revision $revision (tag sha-$sha12), tag de version: $publish_version"
+
+      - name: Build de l'image
+        run: |
+          set -euo pipefail
+          docker build -f deploy/approve-image/Containerfile \
+            --build-arg VERSION="${{ steps.meta.outputs.version }}" \
+            --build-arg REVISION="${{ steps.meta.outputs.revision }}" \
+            -t "$IMAGE:sha-${{ steps.meta.outputs.sha12 }}" \
+            -t "$IMAGE:${{ steps.meta.outputs.version }}" \
+            .
+          docker image inspect --format 'image locale {{.Id}} ({{.Size}} octets)' \
+            "$IMAGE:sha-${{ steps.meta.outputs.sha12 }}"
+
+      - name: Publication (tags immuables, digest)
+        id: publish
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA_TAG: sha-${{ steps.meta.outputs.sha12 }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PUBLISH_VERSION: ${{ steps.meta.outputs.publish_version }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+          remote_digest() {
+            # digest du manifeste publie pour une reference (tag ou @digest)
+            docker manifest inspect -v "$1" 2>/dev/null \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) else d; print(d["Descriptor"]["digest"])'
+          }
+
+          sha_ref="$IMAGE:$SHA_TAG"
+          if docker manifest inspect "$sha_ref" >/dev/null 2>&1; then
+            digest="$(remote_digest "$sha_ref")"
+            echo "tag deja publie, jamais reecrit : $sha_ref -> $digest"
+          else
+            docker push "$sha_ref" | tee push.log
+            digest="$(grep -o 'digest: sha256:[0-9a-f]\{64\}' push.log | head -1 | cut -d' ' -f2)"
+          fi
+          test -n "$digest"
+
+          published="$SHA_TAG"
+          if [ "$PUBLISH_VERSION" = "1" ]; then
+            version_ref="$IMAGE:$VERSION"
+            if docker manifest inspect "$version_ref" >/dev/null 2>&1; then
+              existing="$(remote_digest "$version_ref")"
+              if [ "$existing" != "$digest" ]; then
+                echo "::error::$version_ref pointe deja sur $existing, pas $digest : incrementer la version"
+                exit 1
+              fi
+              echo "tag de version deja publie avec le meme digest : $version_ref"
+            else
+              docker push "$version_ref"
+              got="$(remote_digest "$version_ref")"
+              if [ "$got" != "$digest" ]; then
+                echo "::error::$version_ref ne rend pas le digest attendu $digest (recu $got)"
+                exit 1
+              fi
+            fi
+            published="$published, $VERSION"
+          fi
+
+          # le registre sert bien le digest annonce (preuve de disponibilite)
+          for attempt in 1 2 3 4 5; do
+            if docker manifest inspect "$IMAGE@$digest" >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::le registre ne sert pas $IMAGE@$digest apres publication"
+              exit 1
+            fi
+            sleep 3
+          done
+
+          {
+            echo "image=$IMAGE"
+            echo "revision=${{ steps.meta.outputs.revision }}"
+            echo "tags=$published"
+            echo "digest=$digest"
+          } | tee digest.txt
+          {
+            echo "## image approve publiee"
+            echo ""
+            echo "| champ | valeur |"
+            echo "|---|---|"
+            echo "| image | \`$IMAGE\` |"
+            echo "| tags | \`$published\` |"
+            echo "| revision | \`${{ steps.meta.outputs.revision }}\` |"
+            echo "| digest | \`$digest\` |"
+            echo ""
+            echo "Epingler le digest : \`$IMAGE@$digest\` — jamais un tag mobile."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"

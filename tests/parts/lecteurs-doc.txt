@@ -12,4 +12,5 @@ test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
 test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
 test_l33_chatbot  # docs/design et site/docs (index du chatbot), site/landing
 test_l84_serve  # docs/api/openapi-v1.json (OpenAPI contract of the read API, L84)
+test_l953_image_approve  # docs/IMAGE-APPROVE.md (politique de publication de l'image approve, #953)
 test_site_art  # site/landing/index.html
