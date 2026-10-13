@@ -72,10 +72,11 @@ team: ameesh                  # still read when projects: is absent
 - **Work directories.** The agent's `cwd` stays the work directory of its
   primary project. A lot from another project gets its worktree under that
   project's work root, `policy.work_dir(lot_project, agent)`. Its session is
-  opened there through the per-lot sessions of #408 (L165b), which already
-  store `cwd` per (agent, lot). Until #408 is merged, a multi-project agent
-  only picks up lots from its primary project automatically. Lots from other
-  projects must then be assigned to it explicitly.
+  opened there through the per-lot sessions of #408 (L165b, merged:
+  `agent_lot_sessions`, migration 0384), which store `cwd` per (agent, lot).
+  Until L243-3 is merged, a multi-project agent only picks up lots from its
+  primary project automatically. Lots from other projects must then be
+  assigned to it explicitly.
 
 ## (2) Default name `<org>-<repo>-<role>-<seq>`
 
@@ -121,7 +122,7 @@ Implementation goes to DeepSeek agents, at the owner's request of 12/10
 |---|---|---|---|
 | L243-1 | Card field, validation (`agent-team-mismatch`, `agent-project-unknown`), migration `projects text[]`, sync with `team = projects[0]`, both drivers and grants | — | 3 h |
 | L243-2 | Consumers: pick-up, orchestrators, alert briefs, idle-capacity briefs, `roadmap --project`, `progress`, `ameesh projects` and `mesh list` display | L243-1 | 3 h |
-| L243-3 | Work directory per lot project, session `cwd` taken from the lot | L243-1, #408 | 2 h |
+| L243-3 | Work directory per lot project, session `cwd` taken from the lot (`agent_lot_sessions`) | L243-1 | 2 h |
 | L243-4 | `naming:` block, generator `canon agent name`, `spawn` without a name, `agent-name-convention` warning, reserved retired names | #414 | 3 h |
 
 L243-1 and L243-4 can start at the same time. #423 (renaming with aliases)
