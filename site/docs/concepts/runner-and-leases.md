@@ -150,6 +150,25 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
   above that CPU PSI. `ameesh hosts` shows them; relocation ranks a lending
   host by its lendable memory.
 
+## Host gate and durable withdrawal
+
+A **host gate** (L159f) is the declarative stop on a host: the runner reads an
+external state (`AMEESH_HOST_GATE=file|none`, `AMEESH_HOST_GATE_PATH`) and holds
+new turns while the gate says `draining` or `stopped`; `AMEESH_HOST_GATE_FALLBACK`
+decides what an unreadable gate means (`available`, `draining` or `stopped` —
+never a silent green), and the runner writes its acknowledgement to
+`AMEESH_HOST_GATE_ACK`. `--once` never says the host free while its lease is
+still held (#379).
+
+`ameesh host drain|undrain|status` (L232e) withdraws and returns a host durably:
+claims, turns and prompt consumption close while the current turn finishes,
+**critical agents first**. The lifecycle state survives a restart (migration
+0380), and an unplanned loss is recovered only after a proof scoped to the
+source, agent and lease epoch. A **handoff** (L232a) reserves the move at a lot
+boundary, with a durable journal: `ameesh handoff plan AGENT --repository R`
+then `ameesh handoff show OPERATION` (see
+[Operate agents](../guides/operate-agents.md#host-lifecycle-drain-return-and-handoff)).
+
 ## Host not ready
 
 A harness binary or interpreter that cannot be found (a user unit started

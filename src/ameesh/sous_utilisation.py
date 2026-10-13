@@ -344,12 +344,12 @@ def declared_orchestrators(env=None) -> set:
 
 
 def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
-                  roles=ORCHESTRATOR_ROLES) -> list:
+                  roles=ORCHESTRATOR_ROLES, history: bool = True) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
     `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
     a confié des lots (délégation ou `work assign`) dans les 30 derniers
-    jours. Seulement des agents du registre."""
+    jours, sauf avec `history=False` (#740). Seulement des agents du registre."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -360,8 +360,9 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
             canons = []
     found |= role_orchestrators(canons, roles)
     try:
-        found |= {_bare(n) for n in storage.of(db).operations.assigners(
-            since_s=ASSIGNERS_SINCE_S)}
+        if history:
+            found |= {_bare(n) for n in storage.of(db).operations.assigners(
+                since_s=ASSIGNERS_SINCE_S)}
     except Exception:
         pass
     # L123 : le chat du propriétaire transmet, il ne répartit pas

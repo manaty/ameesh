@@ -1446,6 +1446,10 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
+        # #538 : le résumé de l'agent est gardé BRUT ; les règles de travail du
+        # canon sont injectées à la construction du prompt de la session neuve
+        # (`_resume_prompt`), donc relues à ce moment-là : une fiche retirée ne
+        # reste pas dans un résumé en attente.
         if not self._resume_keep(resume, "agent"):
             self._fil_note("Session rotation cancelled: the resume summary could not "
                            "be kept on disk. The old session is kept.",
@@ -3267,24 +3271,61 @@ class AgentWorker(threading.Thread):
             log("[%s] harness %s: %s" % (self.name, descriptor.id, resolution))
         return adapter
 
+    def _canon_id(self) -> str | None:
+        """L'identifiant du canon qui possède la ligne du registre de l'agent
+        (colonne `canon` ; NULL = canon par défaut) : les règles injectées sont
+        les siennes, jamais celles d'un homonyme déclaré par un autre canon
+        (L42/L43 ; verdict codex #510 r2, P1)."""
+        return (self.agent or {}).get("canon")
+
     def _resume_prompt(self) -> str:
         """Le cadre et le résumé de reprise qui ouvriront la session neuve après
         une rotation (0018), ou "" sans résumé en attente. Le résumé est
-        délimité et n'a aucune autorité (`adapters.resume_prompt`)."""
+        délimité et n'a aucune autorité (`adapters.resume_prompt`).
+
+        #538 : les règles de travail du canon de l'agent sont relues MAINTENANT,
+        quel que soit l'auteur du résumé : un brief préparé à l'avance (origine
+        `ameesh`) ne fige pas des règles périmées (verdict codex #510 r2, P2)."""
         if not self.resume_summary:
             return ""
-        return adapters.resume_prompt(self.resume_summary, origin=self.resume_origin)
+        from . import reprise
+        resume = reprise.with_process_rules(
+            self.cfg, self.resume_summary, agent=self.name,
+            canon_id=self._canon_id(),
+            host=(self.agent or {}).get("host") or self.cfg.host)
+        return adapters.resume_prompt(resume, origin=self.resume_origin)
+
+    def _ouverture(self) -> str:
+        """Ce qui ouvre la consigne du prochain tour : le résumé de rotation
+        (règles relues) quand il y en a un, sinon les règles de travail du canon
+        pour une session neuve ordinaire (premier démarrage) ; "" quand la
+        session reprend.
+
+        #538 : `_budget_courrier` réserve ces octets — le bloc de première
+        session ne se paie pas sur le courrier (verdict codex #510 r2, P2)."""
+        if self.current_session():
+            return ""
+        if self.resume_summary:
+            return self._resume_prompt()
+        if self.session_turns:
+            return ""
+        from . import reprise
+        bloc = reprise.process_rules_block(
+            self.cfg, agent=self.name, canon_id=self._canon_id(),
+            host=(self.agent or {}).get("host") or self.cfg.host)
+        return bloc + "\n\n" if bloc else ""
 
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
 
         Le plafond (`AMEESH_PROMPT_MAIL_MAX`) borne la consigne ENTIÈRE, résumé
-        de reprise compris quand il ouvrira le tour ; jamais au-delà de la
-        borne sûre d'un argument de processus. Un résumé qui ne laisserait pas
-        `PROMPT_MIN_BYTES` au courrier les lui laisse quand même (la consigne
-        dépasse alors le plafond, jamais la borne de l'argument).
+        de reprise ou règles de première session compris quand ils ouvriront le
+        tour ; jamais au-delà de la borne sûre d'un argument de processus. Un
+        résumé qui ne laisserait pas `PROMPT_MIN_BYTES` au courrier les lui
+        laisse quand même (la consigne dépasse alors le plafond, jamais la borne
+        de l'argument).
         """
-        resume = mail.octets(self._resume_prompt())
+        resume = mail.octets(self._ouverture())
         return min(self.runner.prompt_max_bytes, mail.ARG_SAFE_BYTES) - resume
 
     def _courrier_spec(self, kind: str, messages: list[dict]) -> dict:
@@ -3527,7 +3568,7 @@ class AgentWorker(threading.Thread):
         note, dits = tracker.note_for(self.name)
         if not note:
             return spec, []
-        if mail.octets(self._resume_prompt() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
+        if mail.octets(self._ouverture() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
             return spec, []
         return dict(spec, prompt=note + spec["prompt"]), dits
 
@@ -3556,11 +3597,10 @@ class AgentWorker(threading.Thread):
             # puis arrêt) ; dernière session principale connue, sinon brief.
             self._ecarte_session_inconnue(session, connue)
             session = self.current_session()
-        resume = ""
-        if self.resume_summary and not session:
-            # Session neuve après rotation (0018) : le résumé de reprise, encadré
-            # et délimité (il n'a aucune autorité), ouvre le tour.
-            resume = self._resume_prompt()
+        # Session neuve : résumé de rotation (règles relues) ou, sans résumé,
+        # règles de travail du canon (premier démarrage) — `_ouverture` calcule
+        # les deux, règles bornées comprises.
+        resume = self._ouverture()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
@@ -5326,7 +5366,8 @@ class Runner:
         db = None
         ok = True
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             db_mod.require_schema(db)
             # L42 (0031) : chaque canon configuré est relu et synchronisé à chaque
             # passe, le canon par défaut d'abord ; une erreur dans l'un n'empêche
@@ -5481,7 +5522,8 @@ class Runner:
         db = None
         releves = 0
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             for source, compte in paires:
                 try:
                     releves += len(balance_mod.record(db, source, compte,
@@ -5538,7 +5580,8 @@ class Runner:
                 return None
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             gate = self.host_gate
             reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
                                             gate=gate.snapshot() if gate is not None else None)
@@ -5678,7 +5721,8 @@ class Runner:
         from . import resources as resources_mod
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             en_tour = self.agents_in_turn()
             try:
                 busy = bool(en_tour) or storage.of(db).hosts.turns_in_progress(self.host) > 0
@@ -5767,7 +5811,8 @@ class Runner:
         from . import plan_git
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             report = plan_git.sync_branches(
                 db, host=self.host, agents=set(self.agents_filter) if self.agents_filter
                 else None, dry_run=self.dry_run, actor="runner %s" % self.runner_id)
@@ -6286,7 +6331,8 @@ class Runner:
         self._versions_due = now + versions_mod.PROBE_INTERVAL_S
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             served = {r.get("harness") for r in self.served_rows(db)} - {None, ""}
             return versions_mod.probe_and_record(db, self.host, served)
         except Exception as exc:  # never fatal for the runner
@@ -6943,7 +6989,13 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
     (`created_ts`): deleting the agent and recreating it under the same name,
     with its state directory kept, does not inherit the previous authorization.
     A legacy plain-text file (written before L685) carries neither and is
-    refused (fail-closed), with the same warning."""
+    refused (fail-closed), with the same warning.
+
+    L719: the harness and the incarnation are those of the registration
+    **claimed** by `attach_claim` (read under its row lock), never of the read
+    that preceded it; the caller passes an unmatchable incarnation when the two
+    differ, so a registration replaced while the attach was starting inherits
+    nothing."""
     path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -7062,6 +7114,22 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         return 1
     epoch = int(lease["lease_epoch"])
     log_async("[%s] attach lease taken (epoch %d)" % (name, epoch))
+    # L719 : le mode de permission est vérifié contre la registration
+    # **revendiquée** par `attach_claim` (harnais et created_ts lus sous son
+    # verrou), jamais contre la lecture qui a précédé la prise du bail : un
+    # enregistrement supprimé puis recréé entre les deux n'hérite pas de
+    # l'autorisation précédente. L'adaptateur, lui, vient de la lecture
+    # antérieure : si la registration revendiquée en diffère, aucun mode ne
+    # peut lui être lié — incarnation vide, donc jamais de correspondance.
+    incarnation_revendiquee = agent_incarnation(lease)
+    if (incarnation_revendiquee
+            and (lease.get("harness") or "") == (agent.get("harness") or "")
+            and incarnation_revendiquee == agent_incarnation(agent)):
+        harness_revendique = lease.get("harness") or ""
+        mode_incarnation = incarnation_revendiquee
+    else:
+        harness_revendique = lease.get("harness") or (agent.get("harness") or "")
+        mode_incarnation = ""
     stop = threading.Event()
     perdu = threading.Event()
     etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
@@ -7116,7 +7184,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
-                cfg, name, agent.get("harness") or "", agent_incarnation(agent)))
+                cfg, name, harness_revendique, mode_incarnation))
         env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
