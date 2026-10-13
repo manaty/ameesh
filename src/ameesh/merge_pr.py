@@ -15,36 +15,44 @@ branche, checks requis).
 
 Le geste, et ses gardes (toutes vérifiées AVANT toute écriture) :
 
-1. **le lot** (`--lot`, obligatoire) est le porteur de l'autorisation : il doit
+1. **une seule identité de dépôt** (#1003 B/P1, R1 delta) : le checkout, le
+   `--repo` de la PR, `--fetch-url` et `--push-url` doivent désigner le MÊME
+   dépôt — clé `owner/repo` pour GitHub, chemin réel pour un transport local —
+   et le checkout doit porter cette identité (son `origin`). Une divergence,
+   ou une identité non vérifiable (pas d'`origin`, URL inconnue), refuse
+   avant la première lecture : depuis un clone de A, `--repo B` avec les
+   remotes de B ne peut pas faire admettre A par les conditions de B, ni
+   l'inverse ;
+2. **le lot** (`--lot`, obligatoire) est le porteur de l'autorisation : il doit
    être gelé sur `--head` et porter un verdict de relecture `ok` sur ce même
    commit (classe lue par la file : un lot léger en est dispensé). C'est
    l'admission **de la file de fusion elle-même** (`merge_queue.readiness`)
    qui est rejouée ici — cible protégée, gel, verdict, classe, CI verte sur la
    tête gelée — et non une copie : cette voie n'est jamais plus faible que la
    file ;
-2. **le projet** est résolu par la configuration radar (`merge_queue.
+3. **le projet** est résolu par la configuration radar (`merge_queue.
    radar_project`) : ses conditions (`protected`, `ci_required`, `gates`)
    s'appliquent. Une cible protégée est refusée (c'est le geste de
    l'orchestrateur, hors de cette commande) ; `ci_required` exige la CI verte
    du commit gelé (`radar.commit_ci`), et les `gates` du projet tournent sur
    l'arbre fusionné avant le push ;
-3. **la PR** est lue par `gh` : elle est ouverte, non brouillon, sa base est
+4. **la PR** est lue par `gh` : elle est ouverte, non brouillon, sa base est
    la cible, sa tête est le SHA gelé donné, son `mergeStateStatus` est
    `CLEAN`/`HAS_HOOKS` et tous ses checks sont terminés et verts
    (`radar.ci_green`) — rien n'est affaibli : une PR bloquée, en retard
    (`BEHIND`) ou dont un check n'est pas vert est refusée ;
-4. **le diff** est calculé localement (`merge-base` puis `diff --name-only`) :
+5. **le diff** est calculé localement (`merge-base` puis `diff --name-only`) :
    la PR doit toucher au moins un chemin `.github/workflows/**` — cette voie
    ne remplace donc jamais la fusion par l'API pour les autres PR ;
-5. **le SHA gelé** est relu sur le dépôt distant (`refs/pull/<pr>/head`) et
+6. **le SHA gelé** est relu sur le dépôt distant (`refs/pull/<pr>/head`) et
    doit être exactement `--head` ;
-6. **la cible n'a pas bougé** : la tête fraîche de la cible est un ancêtre du
+7. **la cible n'a pas bougé** : la tête fraîche de la cible est un ancêtre du
    gel (`merge-base --is-ancestor`) ; sinon rien n'est écrit et il faut
    refusionner la cible dans la branche, refaire CI et relecture ;
-7. **l'arbre du commit de fusion est identique à l'arbre du gel** : le
+8. **l'arbre du commit de fusion est identique à l'arbre du gel** : le
    `merge --no-ff` local doit produire exactement l'arbre relu ; deux
    parents (tête de cible, gel), message qui nomme la PR et les gardes ;
-8. **garde fraîche juste avant l'écriture** : la PR est relue une seconde
+9. **garde fraîche juste avant l'écriture** : la PR est relue une seconde
    fois (état, tête, base, mergeabilité, checks), l'admission de la file est
    rejouée sur cette vue, et `refs/pull/<pr>/head` comme la tête de la cible
    sont relus sur le distant. Toute mutation depuis la construction du commit
@@ -53,12 +61,12 @@ Le geste, et ses gardes (toutes vérifiées AVANT toute écriture) :
    ci-dessous ferme la course sur la cible, pas une fermeture de PR ou un
    check devenu rouge dans cet instant — la relecture finale le constate et
    ne déclare jamais le lot sur une PR non `MERGED` ;
-9. **le push est un compare-and-swap** : `--force-with-lease=<ref>:<tête>`
-   sur un remote **hors jeton** (SSH) ; si la cible a bougé entre la lecture
-   et le push, git refuse — jamais `--force` ;
-10. **relecture** : la PR est relue jusqu'à `MERGED`, son commit de fusion doit
-   être celui poussé, la tête de la cible relue doit être ce commit ; le lot
-   n'est déclaré fusionné qu'après cette relecture.
+10. **le push est un compare-and-swap** : `--force-with-lease=<ref>:<tête>`
+    sur un remote **hors jeton** (SSH) ; si la cible a bougé entre la lecture
+    et le push, git refuse — jamais `--force` ;
+11. **relecture** : la PR est relue jusqu'à `MERGED`, son commit de fusion doit
+    être celui poussé, la tête de la cible relue doit être ce commit ; le lot
+    n'est déclaré fusionné qu'après cette relecture.
 
 Le remote de lecture peut rester celui du jeton (lire un workflow ne demande
 pas le scope) ; seul le push doit être hors jeton. `--dry-run` déroule toutes
@@ -244,6 +252,59 @@ def _ls_remote_ref(owner: str, url: str, ref: str) -> str:
     return text.split()[0].lower() if text.split() else ""
 
 
+def _remote_identity(url: str):
+    """L'identité d'un remote (#1003 B/P1) : `("github", owner/repo)` quand
+    l'URL désigne un dépôt GitHub, `("path", chemin réel)` quand c'est un
+    transport local (`file://` compris), None quand elle n'est pas
+    vérifiable — une identité non vérifiable ne s'accepte pas."""
+    text = (url or "").strip()
+    if not text:
+        return None
+    slug = migrations.github_repo(text)
+    if slug:
+        return ("github", migrations.repo_key(slug))
+    path = text[len("file://"):] if text.startswith("file://") else text
+    if os.path.isabs(path) and os.path.exists(path):
+        return ("path", os.path.realpath(path))
+    return None
+
+
+def _bind_repo_identity(repo: str, slug: str, fetch_url: str, push_url: str) -> tuple:
+    """Une seule identité de dépôt pour la PR, le lot, l'admission, la lecture
+    et le push (#1003 B/P1).
+
+    Le checkout (`repo`), `--fetch-url` et `--push-url` doivent désigner le
+    MÊME dépôt : clé `owner/repo` pour GitHub, chemin réel pour un transport
+    local. Le `slug` de la PR ne peut pas contredire l'identité vérifiée du
+    checkout : depuis un clone de A, `--repo B` avec des remotes de A est
+    refusé comme une divergence, même quand A et B partagent les mêmes
+    commits. Sans `origin` lisible, rien n'est vérifiable : le geste refuse
+    avant toute lecture de PR, toute admission et toute écriture."""
+    origin_url = plan_git._out(repo, "remote", "get-url", "origin") or ""
+    origin = _remote_identity(origin_url)
+    if origin is None:
+        raise MergePrError(
+            "cannot verify the repository of this checkout (%s): its origin is missing or "
+            "unreadable — run the gesture from the checkout of the repository it merges; "
+            "nothing written" % (_redact(origin_url) or "no origin"))
+    for what, url in (("--fetch-url", fetch_url), ("--push-url", push_url)):
+        ident = _remote_identity(url)
+        if ident is None:
+            raise MergePrError("cannot verify the identity of %s (%s): nothing written"
+                               % (what, _redact(url)))
+        if ident != origin:
+            raise MergePrError(
+                "%s (%s) and this checkout's origin (%s) are not the same repository: the "
+                "lot, its admission, the PR read and the push must be one repository; "
+                "nothing written" % (what, _redact(url), _redact(origin_url)))
+    if origin[0] == "github" and migrations.repo_key(slug) != origin[1]:
+        raise MergePrError(
+            "--repo %s and this checkout's origin (%s) are not the same repository: the PR "
+            "read by gh and the repository whose guards admit and whose branch is pushed "
+            "must be one; nothing written" % (slug, _redact(origin_url)))
+    return origin
+
+
 def pr_view(slug: str, pr: int, gh=land._gh) -> dict:
     """La PR lue par `gh` : état, base, tête, mergeabilité, checks."""
     proc = gh(["pr", "view", str(pr), "--repo", slug, "--json",
@@ -346,6 +407,9 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError("no GitHub repository: give --repo owner/repo")
     fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
     push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
+    # #1003 B/P1 : une seule identité de dépôt, vérifiée avant la première
+    # lecture ; une divergence n'écrit rien et n'admet rien.
+    _bind_repo_identity(repo, slug, fetch_url, push_url)
     view = pr_view(slug, pr, gh=gh)
     branch = (view.get("baseRefName") or "").strip()
     target = (target or "").strip() or branch

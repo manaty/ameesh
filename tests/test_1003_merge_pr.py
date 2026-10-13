@@ -127,7 +127,7 @@ class _Base(unittest.TestCase):
         over.setdefault("headRefOid", self.head)
         return FakeGh(view(**over), fresh=fresh, later=later)
 
-    def merge(self, gh, **kw):
+    def merge(self, gh, slug=None, **kw):
         kw.setdefault("target", "main")
         kw.setdefault("fetch_url", self.origin)
         kw.setdefault("push_url", self.origin)
@@ -138,7 +138,7 @@ class _Base(unittest.TestCase):
         kw.setdefault("repo", self.repo)
         kw.setdefault("db", None)
         kw.setdefault("cfg", None)
-        return merge_pr.direct_merge(self.slug, 7, self.head, gh=gh, **kw)
+        return merge_pr.direct_merge(slug or self.slug, 7, self.head, gh=gh, **kw)
 
     def move_main(self):
         """Un commit de plus sur `main` dans l'origin, hors du gel."""
@@ -267,6 +267,50 @@ class GuardTest(_Base):
     def test_the_target_branch_is_validated(self):
         with self.assertRaises(merge_pr.MergePrError):
             self.merge(self.gh(), target="..bad")
+
+
+class IdentityTest(_Base):
+    """#1003 B/P1 (R1 delta) : une seule identité de dépôt pour la PR lue, le
+    lot, l'admission, la lecture et le push. Le négatif A/B reprend le témoin
+    de l'auditeur : deux dépôts qui partagent la base et le gel, B protégé
+    (`protected=[main]`) et les remotes du geste sur B — A ne peut pas être
+    admis par les conditions de B, ni l'inverse."""
+
+    def _twin(self):
+        """Un dépôt B avec les MÊMES commits (base et gel) que A."""
+        twin = os.path.join(self.tmp, "twin.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo, twin],
+                       check=True, capture_output=True)
+        _git(twin, "update-ref", "refs/pull/7/head", self.head)
+        return twin
+
+    def test_remotes_of_another_repository_are_refused(self):
+        twin = self._twin()
+        before = _git(twin, "rev-parse", "main").lower()
+        with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
+            self.merge(self.gh(), fetch_url=twin, push_url=twin)
+        self.assertEqual(before, _git(twin, "rev-parse", "main").lower())
+        self.assertEqual(self.tip(), self.base)          # rien n'a bougé non plus
+
+    def test_a_pr_of_another_repository_is_refused(self):
+        _git(self.repo, "remote", "set-url", "origin", "https://github.com/a/repo.git")
+        with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
+            self.merge(self.gh(), slug="b/repo",
+                       fetch_url="https://github.com/a/repo.git",
+                       push_url="git@github.com:a/repo.git")
+
+    def test_a_checkout_without_a_readable_origin_is_refused(self):
+        _git(self.repo, "remote", "remove", "origin")
+        with self.assertRaisesRegex(merge_pr.MergePrError, "cannot verify"):
+            self.merge(self.gh())
+
+    def test_an_unverifiable_remote_is_refused(self):
+        with self.assertRaisesRegex(merge_pr.MergePrError, "cannot verify"):
+            self.merge(self.gh(), fetch_url="somewhere/else")
+
+    def test_the_same_repository_under_another_form_is_accepted(self):
+        out = self.merge(self.gh(), dry_run=True, fetch_url=self.origin + "/")
+        self.assertEqual(out["state"], "dry-run", out)
 
 
 class MergeTest(_Base):
