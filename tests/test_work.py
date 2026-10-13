@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import registry, work
 
@@ -101,11 +102,22 @@ class WorkTest(PgTestCase):
     def test_deplacement_concurrent_un_seul_gagnant(self):
         item = self._add()
         db1, db2 = self.connect(), self.connect()
-        barrier = threading.Barrier(2)
+        # Les deux threads doivent LIRE le lot avant que l'un des deux écrive
+        # (#1001, canon §3) : sinon, sous charge, le second lit après la bascule
+        # du premier (build) et build -> blocked étant une transition licite,
+        # les deux gagnent. La barrière ne porte donc plus sur le départ des
+        # threads mais sur la lecture faite par work.move.
+        lectures = threading.Barrier(2)
+        vrai_get = work.get
+
+        def get_synchronise(db, item_id):
+            lu = vrai_get(db, item_id)
+            lectures.wait(timeout=30)
+            return lu
+
         resultats: list = [None, None]
 
         def bouger(index: int, db, state: str) -> None:
-            barrier.wait(timeout=10)
             try:
                 resultats[index] = work.move(db, item["id"], state, actor="t%d" % index)
             except work.WorkError as exc:
@@ -116,10 +128,11 @@ class WorkTest(PgTestCase):
                 threading.Thread(target=bouger, args=(0, db1, "build")),
                 threading.Thread(target=bouger, args=(1, db2, "blocked")),
             ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=30)
+            with mock.patch.object(work, "get", get_synchronise):
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=60)
             gagnants = [r for r in resultats if isinstance(r, dict)]
             perdants = [r for r in resultats if isinstance(r, work.WorkError)]
             self.assertEqual(len(gagnants), 1, resultats)
