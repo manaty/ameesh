@@ -137,6 +137,18 @@ class BriefsTest(unittest.TestCase):
         self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
                          ["orch-b"])
 
+    def test_stale_lot_sans_assigne_suit_l_equipe_du_lot(self):
+        # #917 : sans assigné, le brief va aux orchestrateurs de l'équipe du lot,
+        # pas à ceux de toutes les équipes.
+        alert = dict(STALE, agent=None, lot_team="b")
+        briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
+        self.assertEqual(sorted(briefs), ["auditeur", "orch-b"])
+        alert = dict(STALE, lot_team="b")               # assigné sans équipe : le lot tranche
+        self.assertEqual(sorted(alert_briefs.briefs(alert, _listing(("orch", "a"),
+                                                                    ("orch-b", "b"),
+                                                                    ("dev1", "")))),
+                         ["orch-b"])
+
     def test_plan_underused(self):
         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])
         self.assertEqual(sorted(briefs), ["auditeur", "orch-b"])
