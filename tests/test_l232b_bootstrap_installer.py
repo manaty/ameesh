@@ -88,21 +88,26 @@ class InstallerTest(unittest.TestCase):
         with mock.patch.object(installer.runtime,'inventory',side_effect=OSError('fixture missing runtime')):
             self.assertFalse(host.ready(self.bundle))
 
-    def test_staging_root_belongs_to_the_reviewed_layout_with_exact_mode(self):
-        # The adapter reads the staged trees from this exact root and preflight
-        # runs before layout: the administrator fills a directory that must be
-        # part of the signed inventory, with the reviewed 0700 mode.
+    def test_private_roots_read_by_the_adapter_are_in_the_reviewed_layout(self):
+        # The adapter reads the staged trees from this exact root (filled by the
+        # administrator before preflight runs) and the pinned factory reads its
+        # versioned release store there: both belong to the signed inventory,
+        # with the reviewed 0700 mode, never to ad hoc paths.
         self.assertEqual(installer.DIRECTORIES.get('/var/lib/ameesh-release-bootstrap'), 0o700)
+        self.assertEqual(installer.DIRECTORIES.get('/opt/ameesh-release/store'), 0o700)
         self.assertNotIn('/var/lib/ameesh-release/bootstrap', installer.DIRECTORIES)
-        self.assertEqual(self.bundle['directories']['/var/lib/ameesh-release-bootstrap'], 0o700)
+        roots = ('/var/lib/ameesh-release-bootstrap', '/opt/ameesh-release/store')
+        for logical in roots:
+            self.assertEqual(self.bundle['directories'][logical], 0o700)
         stage = self.root/'var/lib/ameesh-release-bootstrap'/self.operation
         self.assertTrue((stage/'runtime').is_dir())
         self.assertTrue((stage/'sources').is_dir())
-        root = self.root/'var/lib/ameesh-release-bootstrap'
-        root.chmod(0o700)
+        (self.root/'var/lib/ameesh-release-bootstrap').chmod(0o700)
         self.assertEqual(self.run_bootstrap(), 'installed')
-        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
-        self.assertEqual(root.stat().st_uid, os.geteuid())
+        for logical in roots:
+            root = self.root/logical.lstrip('/')
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700, logical)
+            self.assertEqual(root.stat().st_uid, os.geteuid(), logical)
 
     def test_lost_activation_reply_rechecks_configuration_and_never_recreates_account(self):
         original=self.system.activate_ssh_configuration; lost=[False]

@@ -75,8 +75,11 @@ class LinuxHost(account.LinuxAccounts):
             info=path.stat()
             if info.st_uid!=0 or not stat.S_ISDIR(info.st_mode):
                 raise InstallError('bootstrap directory not root-owned')
-            # Existing generic system directories may be more restrictive.
-            if logical.startswith(('/etc/ameesh-release','/var/lib/ameesh-release')) and stat.S_IMODE(info.st_mode)!=mode:
+            # Existing generic system directories may be more restrictive; the
+            # private roots below keep their reviewed mode exactly.
+            if (logical.startswith(('/etc/ameesh-release','/var/lib/ameesh-release',
+                                    '/opt/ameesh-release/store'))
+                    and stat.S_IMODE(info.st_mode)!=mode):
                 raise InstallError('bootstrap private layout mismatch')
         return True
 

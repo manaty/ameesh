@@ -26,7 +26,11 @@ WRAPPER = '/usr/local/libexec/ameesh-release-ssh'
 DISPATCHER = '/opt/ameesh-release/lib/hote-release.py'
 RUNTIME = '/opt/ameesh-release/runtime/bin/python'
 DIRECTORIES={
-    '/opt/ameesh-release':0o755,'/etc/ameesh-release':0o755,
+    '/opt/ameesh-release':0o755,
+    # Versioned release store read by the pinned host factory: fixed, private
+    # and part of the reviewed layout rather than an ad hoc administrator path.
+    '/opt/ameesh-release/store':0o700,
+    '/etc/ameesh-release':0o755,
     '/etc/ameesh-release/operations':0o700,'/usr/local/libexec':0o755,
     '/etc/sudoers.d':0o750,'/etc/ssh/sshd_config.d':0o755,
     '/var/lib/ameesh-release':0o755,'/var/lib/ameesh-release/controller':0o700,

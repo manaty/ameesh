@@ -462,7 +462,9 @@ enrollment document. It composes the protected documents under
 endpoint) and `backup.json` (recovery identities, retention window and optional
 remote references) — with the fixed private state under `/var/lib/ameesh-release`
 and the
-versioned release store under `/opt/ameesh-release/store`. Enrollment, database
+versioned release store under `/opt/ameesh-release/store`. The store root is
+part of the signed bootstrap directory inventory at mode 0700, like the
+administrator staging root; it is never created ad hoc. Enrollment, database
 and operation documents keep the exact shapes checked by the dispatcher and the
 service. A missing, linked, group/world-writable or inexact document refuses the
 factory before any host effect; document bodies and credential values never
