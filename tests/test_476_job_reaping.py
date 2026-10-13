@@ -28,6 +28,23 @@ class JobReapingTest(unittest.TestCase):
     def test_identity_mismatch_preserves_unknown_zombie(self):
         self._job_without_handle(mismatch=True)
 
+    @unittest.skipUnless(platform.is_linux() and hasattr(os, "fork"), "Linux children")
+    def test_job_checks_ignore_unrelated_zombie_children(self):
+        unrelated = os.fork()
+        if unrelated == 0:
+            os._exit(0)
+        try:
+            until = time.monotonic() + 5
+            while os.waitid(os.P_PID, unrelated, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                self.assertLess(time.monotonic(), until)
+                time.sleep(.01)
+            for mismatch in (False, True):
+                with self.subTest(mismatch=mismatch):
+                    self._job_without_handle(mismatch=mismatch)
+            self.assertIsNotNone(os.waitid(os.P_PID, unrelated, os.WEXITED | os.WNOHANG | os.WNOWAIT))
+        finally:
+            os.waitpid(unrelated, 0)
+
     def _job_without_handle(self, mismatch=False):
         tracker = self.tracker()
         pid = os.fork()
@@ -59,15 +76,17 @@ class JobReapingTest(unittest.TestCase):
                     tracker._refresh(entry, snapshot, now=1)
                 identity.assert_called_with(pid)
                 self.assertEqual(entry.jobs[pid].code, None if mismatch else -signal.SIGKILL)
+                # The host may also contain zombie children from other tests.
+                # Count only this fixture; preserve its real identity/wait checks.
                 if mismatch:
                     reap.assert_not_called()
-                    tracker._reap_strays(platform.process_table(), [])
+                    tracker._reap_strays([p for p in platform.process_table() if p["pid"] == pid], [])
                     self.assertEqual(tracker.unknown_zombies, 1)
                     self.assertIsNotNone(os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT))
                 else:
                     reap.assert_called_once_with(pid)
                     self.assertNotIn(pid, [p["pid"] for p in snapshot])
-                    tracker._reap_strays(snapshot, [])
+                    tracker._reap_strays([p for p in snapshot if p["pid"] == pid], [])
                     self.assertEqual(tracker.unknown_zombies, 0)
                     with self.assertRaises(ChildProcessError):
                         os.waitpid(pid, os.WNOHANG)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Zombie-only groups finish worker resources and live reviews (#472)."""
 import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -13,6 +14,8 @@ from unittest import mock
 from . import support
 from ameesh import background, containers, platform, resources, runner, storage
 from ameesh.runner import AgentWorker, Runner
+from ameesh import turn_processes
+from ameesh.platform import process as process_layer
 
 
 def process(pid=4242, *, zombie=True):
@@ -40,8 +43,9 @@ class CloseResourceTest(unittest.TestCase):
     def test_zombie_only_group_closes_done(self):
         self.assertFalse(self.close([process()])['orphan'])
 
-    def test_empty_group_closes_done_even_if_number_was_recycled(self):
-        self.assertFalse(self.close([])['orphan'])
+    def test_absent_group_closes_done(self):
+        with mock.patch.object(platform, 'process_group_exists', return_value=False):
+            self.assertFalse(self.close([])['orphan'])
 
     def test_live_member_keeps_orphan(self):
         self.assertTrue(self.close([process(), process(4243, zombie=False)])['orphan'])
@@ -93,7 +97,78 @@ class LiveReviewTest(unittest.TestCase):
 
     def test_replacement_between_scans_is_kept(self):
         tables = iter([[process()], [process(4243, zombie=False)]])
-        self.assertEqual(self.review(lambda: next(tables)), [])
+        self.assertEqual(self.review(lambda **_: next(tables)), [])
+
+
+class SnapshotSafetyTest(unittest.TestCase):
+    def stat(self, pid):
+        return io.StringIO(f"{pid} (job) Z 1 4242 " + "0 " * 17 + "1")
+
+    def fallback(self):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(process_layer, '_psutil', return_value=None))
+        stack.enter_context(mock.patch.object(process_layer, '_proc_ok', return_value=True))
+        stack.enter_context(mock.patch.object(process_layer, 'boot_time', return_value=1))
+        return stack
+
+    def test_unreadable_member_keeps_group_open(self):
+        with self.fallback(), \
+                mock.patch.object(os, 'listdir', return_value=['4242']), \
+                mock.patch('builtins.open', side_effect=PermissionError('stat denied')):
+            self.assertTrue(turn_processes.group_running(4242))
+
+    def test_fork_replacements_between_enumeration_and_stat_keep_group_open(self):
+        # Each last live member forks before its stat is read, then exits.
+        # The second enumeration includes its replacement, now also a zombie;
+        # PID 4244 is still live but was created after that enumeration.
+        with self.fallback(), \
+                mock.patch.object(os, 'listdir', side_effect=[['4242'], ['4242', '4243']]), \
+                mock.patch('builtins.open', side_effect=lambda path, **_: self.stat(path.split('/')[-2])), \
+                mock.patch.object(os, 'killpg', return_value=None):
+            self.assertTrue(turn_processes.group_running(4242))
+
+    def test_vanishing_replacements_beside_stable_zombie_keep_open(self):
+        def stat(path, **_):
+            pid = path.split('/')[-2]
+            if pid != '4242':
+                raise FileNotFoundError('replacement already exited')
+            return self.stat(pid)
+        with self.fallback(), \
+                mock.patch.object(os, 'listdir', side_effect=[['4242', '4243'], ['4242', '4244']]), \
+                mock.patch('builtins.open', side_effect=stat), \
+                mock.patch.object(os, 'killpg', return_value=None):
+            self.assertTrue(turn_processes.group_running(4242))
+
+    def test_psutil_unreadable_status_or_group_keeps_open(self):
+        for status, error in ((None, None), ('Z', PermissionError('denied')),
+                              ('Z', ProcessLookupError('vanished'))):
+            with self.subTest(status=status, error=error):
+                ps = types.SimpleNamespace(STATUS_ZOMBIE='Z', Error=RuntimeError, pids=lambda: [4242])
+                ps.Process = lambda _: types.SimpleNamespace(as_dict=lambda **_: {
+                    'pid': 4242, 'ppid': 1, 'name': 'job', 'create_time': 1, 'status': status})
+                with mock.patch.object(process_layer, '_psutil', return_value=ps), \
+                        mock.patch.object(os, 'getpgid', return_value=4242, side_effect=error):
+                    self.assertTrue(turn_processes.group_running(4242))
+
+    def test_psutil_vanished_member_is_not_silently_omitted(self):
+        ps = types.SimpleNamespace(STATUS_ZOMBIE='Z', Error=RuntimeError, pids=lambda: [4242],
+                                   Process=mock.Mock(side_effect=RuntimeError('vanished')))
+        with mock.patch.object(process_layer, '_psutil', return_value=ps):
+            self.assertTrue(turn_processes.group_running(4242))
+
+    def test_signal_zero_unknown_keeps_open_and_absent_closes(self):
+        for error, expected in ((PermissionError('denied'), True),
+                                (ProcessLookupError('absent'), False)):
+            with self.subTest(error=error), \
+                    mock.patch.object(platform, 'process_table', return_value=[]), \
+                    mock.patch.object(os, 'killpg', side_effect=error) as probe:
+                self.assertEqual(turn_processes.group_running(4242), expected)
+                probe.assert_called_once_with(4242, 0)
+
+    def test_group_missed_by_both_enumerations_keeps_open(self):
+        with mock.patch.object(platform, 'process_table', return_value=[]), \
+                mock.patch.object(os, 'killpg', return_value=None):
+            self.assertTrue(turn_processes.group_running(4242))
 
 
 @contextlib.contextmanager
@@ -124,10 +199,23 @@ def external_zombie():
         parent.stdout.close()
 
 
+@contextlib.contextmanager
+def isolated_process_enumeration(pid):
+    """Read the real fixture's stat without unrelated host fork/exit churn."""
+    listdir = os.listdir
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(os, 'listdir', side_effect=lambda path:
+            [str(pid)] if path == process_layer.PROC else listdir(path)))
+        ps = process_layer._psutil()
+        if ps is not None:
+            stack.enter_context(mock.patch.object(ps, 'pids', return_value=[pid]))
+        yield
+
+
 @unittest.skipUnless(hasattr(os, 'fork') and sys.platform.startswith('linux'), 'Linux zombie fixture')
 class RealZombieResourceTest(support.PgTestCase):
     def test_worker_closes_resource_after_tracker_finds_no_survivors(self):
-        with external_zombie() as pgid:
+        with external_zombie() as pgid, isolated_process_enumeration(pgid):
             self.assertTrue(AgentWorker._group_alive(pgid))
             worker = AgentWorker.__new__(AgentWorker)
             threading.Thread.__init__(worker, name='a1')
@@ -140,7 +228,7 @@ class RealZombieResourceTest(support.PgTestCase):
             self.assertEqual(storage.of(self.db).turn_resources.get('worker-zombie')['status'], 'done')
 
     def test_live_review_settles_zombie_only_resource(self):
-        with external_zombie() as pgid:
+        with external_zombie() as pgid, isolated_process_enumeration(pgid):
             self.assertTrue(AgentWorker._group_alive(pgid))
             turns = storage.of(self.db).turn_resources
             turns.open_turn('review-zombie', 'a1', self.cfg.host, pgid=pgid, label='test')

@@ -6407,7 +6407,7 @@ class Runner:
                 self.live_review_at = time.monotonic()  # la suite sans attendre
             if not rows:
                 return []
-            groups = running_groups()
+            groups = running_groups(int(row["pgid"]) for row in rows if row.get("pgid"))
             if groups is None:
                 return []  # unknown membership never proves a turn dead
             candidates = [row for row in rows

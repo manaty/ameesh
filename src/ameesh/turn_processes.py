@@ -2,28 +2,44 @@
 """Read-only process-group liveness for closing turn resources."""
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from . import platform
 
 
-def running_groups() -> set[int] | None:
-    """Groups with a non-zombie member; None means the table is unavailable.
+def running_groups(pgids: Iterable[int] = ()) -> set[int] | None:
+    """Keep live, changing, or unreadable groups open.
 
-    Keep groups seen on either of two scans: a parent exiting while a child
-    replaces it can leave one scan empty. Never reap or signal a process.
+    A zombie-only group must have identical member identities in both strict
+    scans. Zombies cannot fork replacements. For requested groups absent in
+    both scans, probe kernel existence to cover fork/exit enumeration races.
+    Never reap or send a nonzero signal.
     """
     try:
+        snapshots = []
         groups = set()
         for _ in range(2):
-            groups.update(row["pgid"] for row in platform.process_table()
-                          if not row["zombie"])
+            members = {}
+            for row in platform.process_table(strict=True):
+                members.setdefault(row["pgid"], set()).add((row["pid"], row["start"]))
+                if not row["zombie"]:
+                    groups.add(row["pgid"])
+            snapshots.append(members)
+        first, second = snapshots
+        for pgid in first.keys() | second.keys():
+            if first.get(pgid) != second.get(pgid):
+                groups.add(pgid)
+        for pgid in pgids:
+            if pgid not in first and pgid not in second and platform.process_group_exists(pgid):
+                groups.add(pgid)
         return groups
     except (platform.NotAvailable, OSError):
         return None
 
 
 def group_running(pgid: int | None) -> bool:
-    """Unknown membership keeps the resource open; zombies alone do not."""
+    """Unknown membership keeps the resource open; stable zombies do not."""
     if not pgid:
         return False
-    groups = running_groups()
+    groups = running_groups([pgid])
     return groups is None or pgid in groups
