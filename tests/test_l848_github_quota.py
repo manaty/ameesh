@@ -26,7 +26,7 @@ import urllib.error
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import ci, plan_github
+from ameesh import ci, plan_github, versions
 
 from .fake_github import FakeGh
 
@@ -46,12 +46,15 @@ class Clock:
         self.now += float(seconds)
 
 
-def quota_headers(*, remaining="4999", limit="5000", reset=None, retry=None) -> dict:
+def quota_headers(*, remaining="4999", limit="5000", reset=None, retry=None,
+                  resource=None) -> dict:
     headers = {"X-RateLimit-Limit": limit, "X-RateLimit-Remaining": remaining}
     if reset is not None:
         headers["X-RateLimit-Reset"] = str(int(reset))
     if retry is not None:
         headers["Retry-After"] = str(int(retry))
+    if resource is not None:
+        headers["X-RateLimit-Resource"] = resource
     return headers
 
 
@@ -172,6 +175,34 @@ class SharedReadsTest(unittest.TestCase):
                           counters["hits"]), (2, 1, 2))
         self.assertEqual(reads.quota()["remaining"], 4990)
 
+    def test_graphie_des_entetes_sans_casse(self):
+        """R1 #848 B1 : `gh api -i` rend `X-Ratelimit-*`, urllib la camel-case ;
+        les deux graphies (et les minuscules) disent le même quota."""
+        real = {"X-Ratelimit-Limit": "5000", "X-Ratelimit-Remaining": "0",
+                "X-Ratelimit-Used": "5000", "X-Ratelimit-Reset": "10000",
+                "X-Ratelimit-Resource": "core"}
+        for headers in (real, {name.lower(): value for name, value in real.items()}):
+            reads = self.reads()
+            until = reads.note(headers, status=403, now=self.clock.now)
+            self.assertEqual(until, 10000.0, headers)
+            self.assertEqual(reads.quota()["remaining"], 0, headers)
+            self.assertEqual(reads.quota()["used"], 5000, headers)
+            self.assertIsNotNone(reads.blocked(), headers)
+
+    def test_quota_par_ressource(self):
+        """R1 #848 : le bucket GraphQL ne bloque pas le bucket core."""
+        reads = self.reads()
+        until = reads.note(quota_headers(remaining="0", reset=5000, resource="graphql"),
+                           status=403, now=self.clock.now)
+        self.assertEqual(until, 5000.0)
+        self.assertIsNone(reads.blocked())                       # core intact
+        self.assertEqual(reads.blocked(resource="graphql"), 5000.0)
+        reads.note(quota_headers(remaining="4990", resource="core"),
+                   status=200, now=self.clock.now)
+        self.assertEqual(reads.quota("core")["remaining"], 4990)
+        self.assertEqual(reads.quota("graphql")["remaining"], 0)
+        self.assertEqual(sorted(reads.quotas()), ["core", "graphql"])
+
 
 class ApiTest(unittest.TestCase):
     def setUp(self):
@@ -258,6 +289,8 @@ class ApiTest(unittest.TestCase):
         self.assertIsNone(plain.reads)
 
     def test_repli_gh_partage_aussi(self):
+        # la fausse sortie `gh` porte la graphie réelle (`X-Ratelimit-*`,
+        # `Etag`) : ce témoin couvre B1 de bout en bout (If-None-Match, 304)
         gh = FakeGh()
         reads = plan_github.SharedReads(self.dir.name, clock=self.clock, ttl=60)
         api = plan_github.GhApi(gh, reads=reads, ttl=60, clock=self.clock)
@@ -271,6 +304,89 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(gh.calls()), 2)
         self.assertIn("If-None-Match:", " ".join(gh.calls()[-1]))
         self.assertEqual(reads.counters()["not_modified"], 1)
+
+
+class TransportMetaTest(unittest.TestCase):
+    """R1 #848 B2 : le transport dit ce qu'il a servi (date d'origine, péremption)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.clock = Clock()
+        self.gh = FakeGitHub(self.clock)
+        self.gh.body["repos/o/r"] = {"id": 1}
+        self.gh.etags["repos/o/r"] = '"abc"'
+
+    def api(self, **kw):
+        reads = plan_github.SharedReads(self.dir.name, clock=self.clock, ttl=60)
+        return plan_github.Api(token="secret-token", base=BASE, reads=reads,
+                               ttl=60, clock=self.clock, opener=self.gh, **kw)
+
+    def test_hit_frais_garde_la_date_dorigine(self):
+        api = self.api()
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})
+        self.assertEqual(api.last_read, plan_github.ReadMeta(self.clock.now, False, "network"))
+        first = self.clock.now
+        self.clock.advance(10)
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})
+        self.assertEqual(len(self.gh.calls), 1)          # servie du disque
+        self.assertEqual(api.last_read.source, "cache")
+        self.assertFalse(api.last_read.stale)
+        self.assertEqual(api.last_read.read_ts, first)
+
+    def test_cache_servi_sous_quota_epuise_est_perime(self):
+        api = self.api()
+        api.get("repos/o/r")
+        first = self.clock.now
+        self.clock.advance(61)
+        self.gh.fail_next = {"code": 403, "remaining": "0",
+                             "reset": self.clock.now + 600}
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})
+        self.assertTrue(api.last_read.stale)
+        self.assertEqual(api.last_read.source, "cache")
+        self.assertEqual(api.last_read.read_ts, first)
+
+
+class ReaderStaleTest(unittest.TestCase):
+    """R1 #848 B2 : un Reader sur cache partagé ne dit pas frais ce qui est périmé."""
+
+    @staticmethod
+    def _no_network(*_args, **_kw):
+        raise AssertionError("aucune requête attendue")
+
+    def _reader(self, directory, wall, api):
+        with mock.patch.object(plan_github, "client", lambda **kw: api):
+            reader = versions.Reader(cache_dir=directory, wall=wall,
+                                     clock=lambda: wall.now)
+            value = reader.get("repos/o/r")
+        return reader, value
+
+    def test_reader_quota_epuise_garde_date_et_perime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wall = Clock()
+            reads = plan_github.SharedReads(directory, clock=wall, ttl=60)
+            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=1.0)
+            reads.note(quota_headers(remaining="0", reset=100000),
+                       status=403, now=wall.now)
+            api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
+                                  clock=wall, opener=self._no_network)
+            reader, value = self._reader(directory, wall, api)
+            self.assertEqual(value, {"id": 1})           # rien n'est perdu
+            self.assertTrue(reader.stale("repos/o/r"))   # mais c'est périmé
+            self.assertEqual(reader.stamp("repos/o/r"), 1.0)
+            self.assertEqual(reader.read_ts(), 1.0)
+
+    def test_reader_hit_frais_garde_la_date_du_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wall = Clock()
+            reads = plan_github.SharedReads(directory, clock=wall, ttl=60)
+            reads.store("repos/o/r", {"id": 1}, etag='"e"', read_ts=990.0)
+            api = plan_github.Api(token="t", base=BASE, reads=reads, ttl=60,
+                                  clock=wall, opener=self._no_network)
+            reader, value = self._reader(directory, wall, api)
+            self.assertEqual(value, {"id": 1})
+            self.assertEqual(reader.stamp("repos/o/r"), 990.0)
+            self.assertFalse(reader.stale("repos/o/r"))
 
 
 class MesureTest(unittest.TestCase):
@@ -363,6 +479,11 @@ class StatusLineTest(unittest.TestCase):
             self.assertNotIn("exhausted", line)
             reads.note(quota_headers(remaining="0", reset=clock.now + 120), status=403)
             self.assertIn("exhausted until", ci.quota_line(directory, now=clock.now))
+            # le bucket GraphQL est dit à part, sans masquer le core épuisé
+            reads.note(quota_headers(remaining="4895", resource="graphql"), status=200)
+            line = ci.quota_line(directory, now=clock.now)
+            self.assertIn("quota 0/5000", line)
+            self.assertIn("quota graphql 4895/5000", line)
 
 
 class DataclassCompatTest(unittest.TestCase):

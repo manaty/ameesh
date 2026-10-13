@@ -1053,13 +1053,14 @@ def quota_line(state_dir, *, now=None) -> str | None:
     """Une ligne lisible sur les lectures GitHub partagées de l'hôte (#848),
     ou None tant qu'aucune lecture n'a été comptée.
 
-    Elle dit l'économie (requêtes, 304, cache servi) et le quota restant :
-    de quoi lire la CI sans ajouter d'appel, et voir venir l'épuisement."""
+    Elle dit l'économie (requêtes, 304, cache servi) et le quota restant par
+    ressource d'API (`core`, `graphql`…) : de quoi lire la CI sans ajouter
+    d'appel, et voir venir l'épuisement — sans confondre les buckets."""
     from . import plan_github
 
     stats = plan_github.quota_stats(state_dir)
-    counters, quota = stats["counters"], stats["quota"]
-    if not counters and not quota:
+    counters, quotas = stats["counters"], stats["quota"]
+    if not counters and not quotas:
         return None
     parts = []
     requests = int(counters.get("requests") or 0)
@@ -1067,13 +1068,20 @@ def quota_line(state_dir, *, now=None) -> str | None:
     if requests or hits:
         parts.append("%d request(s) (%d not modified), %d served from the shared cache"
                      % (requests, int(counters.get("not_modified") or 0), hits))
-    remaining = quota.get("remaining")
-    if remaining is not None:
-        parts.append("quota %s/%s" % (remaining, quota.get("limit", "?")))
-    blocked = float(quota.get("blocked_until") or 0.0)
     now = time.time() if now is None else float(now)
-    if blocked > now:
-        parts.append("exhausted until %s" % time.strftime("%H:%M:%SZ", time.gmtime(blocked)))
+    for resource, quota in sorted(quotas.items()):
+        if not isinstance(quota, dict):
+            continue
+        remaining = quota.get("remaining")
+        if remaining is not None:
+            label = "quota" if resource == plan_github.DEFAULT_RESOURCE \
+                else "quota %s" % resource
+            parts.append("%s %s/%s" % (label, remaining, quota.get("limit", "?")))
+        blocked = float(quota.get("blocked_until") or 0.0)
+        if blocked > now:
+            suffix = "" if resource == plan_github.DEFAULT_RESOURCE else " (%s)" % resource
+            parts.append("exhausted until %s%s"
+                         % (time.strftime("%H:%M:%SZ", time.gmtime(blocked)), suffix))
     return "GitHub reads (shared): " + ", ".join(parts) if parts else None
 
 
