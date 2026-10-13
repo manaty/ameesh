@@ -81,7 +81,7 @@ and recovery action, health rollback, rollback failure and receipt/log canaries.
 They establish protocol behavior with simulated effects, not an authenticated
 host pilot, root delegation, real claim fence or PostgreSQL lock integration.
 The next integration must enroll authority and supply durable host receipts, the
-cross-host database lock and bounded SSH/systemd adapters; helper/bootstrap and
+bounded SSH/systemd adapters; helper/bootstrap and
 installer wiring are also unfinished.
 
 ## Scoped signed decision adapter
@@ -156,6 +156,46 @@ Real disposable PostgreSQL tests cover competing workers before inventory,
 fresh-schema and DDL rollback, additive refusal after an obsolete CLI preflight,
 writer backend loss and retry, and bounded contention across schemas. Both
 drivers are covered; no production connection or host action is performed.
+
+## Durable host release fence
+
+Migration 0417 adds a dedicated release fence to the existing volatile host
+claim predicate. It is independent of placement withdrawal: installing it does
+not create handoffs, return timers or new resource readings. Claim, interactive
+attach, pending-prompt consumption, begin-turn and host-gate publications use
+the same closed predicate. Existing turns finish; their leases, prompts,
+sessions and placements are preserved. New agents registered on that host
+also encounter the gate.
+
+`fence-release.py.SignedReleaseFence` requires an independently enrolled
+PostgreSQL connection and signed decision authority. Gate and agent-row locks
+serialize publication with racing claim/turn writers. Authority is revalidated
+after those waits and operation binding before writes. Closure commits while
+turns drain; a bounded deadline leaves the gate closed for reconciliation.
+Running status, unfinished prompts/accounting, and unfinished/orphan turn
+resources prevent a drained receipt even if a lease has expired. The privileged
+host helper must additionally prove actual process/cgroup quiescence: a database
+observation cannot prove that every child process exited.
+
+Operation/host/digest bindings and exact action receipts are durable in the
+database. First unfence requires the live owned fence and quiescence; deleting
+only that fence and saving its receipt are one transaction. Retry after a lost
+reply replays the receipt, preserving any subsequent operation's fence. It never
+clears a placement withdrawal or agent handoff flag. No expiry-based gate
+opening or force-reset path is exposed; authority expiry/revocation retains
+the fence until a separately prepared applicable recovery authority exists.
+
+The creation migration removes inherited/default non-owner write grants from
+the three control tables. Reapplying executor or canon-writer roles preserves
+read access and removes their direct fence writes; the executor audit also
+rejects inherited writes. `deploy/sql/role-release-controller.sql` prepares a
+separate NOLOGIN group with read access needed for proof/drain validation,
+registry row-lock access through UPDATE(name) only, and writes to the fence
+tables. Its audit rejects unrelated table/column writes, inherited roles and
+schema/database creation. It grants no migration/backup/root authority and
+creates no login or credential. This storage is deliberately outside the
+mediated executor API. Enrollment remains a prepared administrative operation;
+no role or migration is applied to a live mesh by this development work.
 
 ## Operation-specific code and environment recovery
 

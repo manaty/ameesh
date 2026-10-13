@@ -43,6 +43,10 @@ SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', :'schema', :'
 -- Module policy writes belong exclusively to isolated canon synchronization.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
               :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
+-- Only the independently enrolled release controller may write these fences.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM %I', :'schema', name, :'role')
+  FROM unnest(ARRAY['host_release_operations','host_release_fences','host_release_fence_receipts']) name
+ WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
 -- Future migration objects must be created by this same owner.
 SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE '
               'ON TABLES TO %I', :'schema', :'role') \gexec
@@ -139,13 +143,13 @@ BEGIN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
-        ELSIF item.relname = 'project_modules' THEN
+        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts') THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
-                violations := violations || 'missing SELECT on project_modules';
+                violations := violations || format('missing SELECT on %s', item.relname);
             END IF;
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
                 IF has_table_privilege(r, item.oid, privilege) THEN
-                    violations := violations || format('forbidden %s on project_modules', privilege);
+                    violations := violations || format('forbidden %s on %s', privilege, item.relname);
                 END IF;
             END LOOP;
         ELSE
