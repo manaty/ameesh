@@ -147,6 +147,7 @@ systemctl daemon-reload
 log "sauvegarde quotidienne de la base"
 install -m 0755 "$SRC/deploy/serveur/sauvegarder-base.sh" /usr/local/sbin/ameesh-sauvegarder-base
 install -m 0755 "$SRC/deploy/mise-a-jour/sauvegarder-prive.py" /usr/local/sbin/ameesh-sauvegarder-prive.py
+install -m 0755 "$SRC/deploy/mise-a-jour/retention-privee.py" /usr/local/sbin/ameesh-retention-privee.py
 install -m 0644 "$SRC/deploy/serveur/ameesh-sauvegarde.service" "$SRC/deploy/serveur/ameesh-sauvegarde.timer" \
   /etc/systemd/system/
 systemctl daemon-reload

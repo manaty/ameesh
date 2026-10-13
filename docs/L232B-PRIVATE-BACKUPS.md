@@ -37,9 +37,9 @@ database; runner credentials are not a substitute for that capability.
 
 `upload --file ARCHIVE --host HOST` uses a private curl configuration, disables
 the user's curl configuration and removes upload keys from the child
-environment. Upload success alone cannot prove remote recovery. The current server script
-expires ordinary local backups only after all required dump/upload steps
-succeed.
+environment. Upload success alone cannot prove remote recovery. The server script
+runs catalog-based local expiry only after all required dump/upload steps
+succeed. Backups without a registered policy remain protected.
 
 `retrieve --credentials RECOVERY_CONFIG --host HOST --name OBJECT
 --sha256 SHA256 --output ARCHIVE` downloads an exact object using the
@@ -56,9 +56,38 @@ and removes staging credentials. Retrieval proves artifact integrity;
 The expected digest and inventory must come from the pinned recovery set,
 not from an untrusted remote response.
 
+`retention-privee.py --root DIRECTORY register ARTIFACT FILE... --expires-at
+EPOCH --rollback-until EPOCH` registers a local recovery set with hashes and
+policy dates supplied by the enrolled controller. Include its dump, inventory
+and verification artifacts as one set. The private catalog and lock serialize
+registration, protection changes and expiry. Registration pins the set until
+`accept ARTIFACT` records successful release acceptance, and expiry also waits
+until both the policy expiry and rollback deadline have passed. `hold ARTIFACT`
+protects it indefinitely; `hold ARTIFACT --release` removes that explicit hold.
+The controller must register and pin the verified pre-release set **before**
+starting migrations. Registration itself does not prove restoration or grant
+controller authority.
+
+`prune --now EPOCH` preflights all eligible files before deleting any. Unknown
+files survive; changed, shared, publicly readable or symlinked candidates
+block expiry. Artifact ids and durable deletion intent/completion timestamps
+remain in `.retention.json`; a retry completes a partially deleted set without
+requiring its already deleted members. A hold cannot be added after deletion
+has started. Hashing streams large archives in bounded chunks. The authorized
+backup/controller identities must use the same lock for protection changes;
+this directory is not a security boundary against another process using the
+same Unix identity. Direct catalog edits are not supported.
+
+The server installer installs this helper and removes the former age-only
+`find -delete` path. Existing and daily backups are preserved until an enrolled
+controller registers their policy. This can increase retained disk use; disk
+admission must count these artifacts and hold a release when capacity is
+insufficient. No implicit 14-day policy or remote object deletion is introduced.
+Remote retention and controller enrollment remain unfinished.
+
 These utilities are a local development checkpoint. The release controller,
-host helper/bootstrap, pinned retention and versioned environment switching
-are still being built. Retrieval tests simulate storage and do not claim
+host helper/bootstrap, remote retention and installer wiring for versioned
+environments are still being built. Retrieval tests simulate storage and do not claim
 an authenticated remote-storage pilot. `tests.test_l232b_backup_restore`
 uses the explicit test-bench DSN and newly created source/restoration
 databases to exercise real `pg_dump` and `pg_restore`. It verifies that

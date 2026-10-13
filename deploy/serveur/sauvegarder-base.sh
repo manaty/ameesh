@@ -21,5 +21,6 @@ if [ -r /etc/ameesh/sauvegarde.env ]; then
     export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_BUCKET SCW_REGION
     "$python" "$helper" upload --file "$f" --host "$(hostname)"
 fi
-# Retention follows every required backup/upload step, never a failed one.
-find "$d" -maxdepth 1 -type f -name 'ameesh-*.dump' -mtime +14 -delete
+# Expiry only follows completed backup/upload. Unregistered artifacts remain
+# protected until the enrolled controller supplies policy and recovery pins.
+"$python" /usr/local/sbin/ameesh-retention-privee.py --root "$d" prune --now "$(date +%s)"
