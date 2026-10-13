@@ -160,6 +160,24 @@ class AffichageTest(unittest.TestCase):
         # le total d'agents ne compte pas deux fois le même agent
         self.assertIn("2 agent(s)", text)
 
+    def test_courrier_sans_destinataire_connu_va_au_projet_primaire(self):
+        """Un nom absent du registre : la lettre morte va au projet PRIMAIRE de
+        l'expéditeur, comptée une seule fois (témoin R1 #810, projects.py)."""
+        board = {"agents": [agent("m1", team="ameesh", projects=["ameesh", "nexlink"])],
+                 "lots": [],
+                 "dead_letters": [{"recipient": "fantome", "sender": "m1", "n": 3,
+                                   "oldest_ts": NOW - 60, "unknown": True}]}
+        view = projects.build(board, now=NOW, paid_harnesses=())
+        by = {p["name"]: p for p in view["projects"]}
+        self.assertEqual(by["ameesh"]["undeliverable"], 3)
+        self.assertEqual(by["nexlink"]["undeliverable"], 0)
+        self.assertEqual([(e["recipient"], e["why"], e["count"], e["senders"])
+                          for e in by["ameesh"]["undeliverable_mail"]],
+                         [("fantome", "unknown", 3, ["m1"])])
+        self.assertEqual(by["nexlink"]["undeliverable_mail"], [])
+        # un expéditeur multi-projets connu ne fait pas lever AttributeError
+        self.assertIn("3 undeliverable", projects.format_text(view, 120))
+
 
 class _Multi(PgTestCase):
     """Un schéma migré et des agents à plusieurs projets."""

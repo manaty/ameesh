@@ -116,11 +116,14 @@ def agent_project_label(row: dict) -> str | None:
     return names[0] if len(names) == 1 else "%s+%d" % (names[0], len(names) - 1)
 
 
-def lot_project(lot: dict, agent_projects: dict[str, str | None] | None = None) -> str | None:
-    """Le projet d'un lot : `app`, `workstream`, équipe de la fiche, projet de l'assigné."""
+def lot_project(lot: dict, primary_of: dict[str, str | None] | None = None) -> str | None:
+    """Le projet d'un lot : `app`, `workstream`, équipe de la fiche, projet de l'assigné.
+
+    `primary_of` (jamais `agent_projects` : la fonction du même nom serait
+    masquée par le paramètre) : nom d'agent → projet primaire."""
     return (_text(lot.get("app")) or _text(lot.get("workstream"))
             or _text(lot.get("package_team"))
-            or (agent_projects or {}).get(lot.get("assignee") or "") or None)
+            or (primary_of or {}).get(lot.get("assignee") or "") or None)
 
 
 def payment(row: dict, paid_harnesses=None) -> str | None:
@@ -295,7 +298,7 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
         recipient = row.get("recipient")
         agent = by_name.get(recipient)
         sender = row.get("sender") or ""
-        where = agent["project"] if agent is not None else agent_projects.get(sender)
+        where = agent["project"] if agent is not None else primary_of.get(sender)
         group(where)
         entry = dead.setdefault(where, {}).setdefault(recipient, {
             "recipient": recipient,
