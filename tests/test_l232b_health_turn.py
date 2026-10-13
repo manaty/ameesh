@@ -49,8 +49,9 @@ class Database:
 class Backend:
     """Simulated one-turn backend: mutates the evidence like a real --once run."""
 
-    def __init__(self, db, *, code=0, effect=True):
+    def __init__(self, db, *, code=0, effect=True, outcome='idle', error=None):
         self.db, self.code, self.effect, self.calls = db, code, effect, []
+        self.outcome, self.error = outcome, error
 
     def one_turn(self, **kwargs):
         self.calls.append(kwargs)
@@ -61,7 +62,8 @@ class Backend:
             self.db.registry['lease_epoch'] += 2
             self.db.registry['lease_owner'] = None
             self.db.registry['lease_expires_at'] = None
-            self.db.registry['status'] = 'idle'
+            self.db.registry['status'] = self.outcome
+            self.db.registry['last_error'] = self.error
             self.db.registry['last_turn_at'] = self.db.now
             self.db.turns.append({'turn_id': 't1', 'status': 'done',
                                   'started_at': self.db.now, 'ended_at': self.db.now})
@@ -101,6 +103,16 @@ class HealthTurnTest(unittest.TestCase):
         self.assertEqual(call['home'], '/home/ameesh')
         self.assertEqual(call['seconds'], 30)
         self.assertEqual(call['executable'], str(self.runner))
+
+    def test_a_blocked_turn_outcome_is_refused(self):
+        # A blocked turn (an authentication failure, a host refusal) still
+        # increments `turns` and closes its resource; the outcome is evidence.
+        self.backend = Backend(self.db, outcome='blocked',
+                               error='auth_failure: account not authenticated')
+        self.turn = pilot.HealthTurn(self.db, enrollment=self.enrollment, host='fixture-host',
+                                     system=self.backend)
+        self.assertFalse(self.call())
+        self.assertEqual(len(self.backend.calls), 1)
 
     def test_a_live_lease_or_running_turn_is_never_disturbed(self):
         for change in ({'status': 'running'},

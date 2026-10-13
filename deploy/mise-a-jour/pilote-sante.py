@@ -21,7 +21,9 @@ Evidence, all read around the call:
 - before it, the probe's registry row is on this host, is not running and holds
   no live lease: a live turn is never disturbed;
 - after it, the row shows exactly one more completed turn (`turns`), a newer
-  claim generation (`lease_epoch`), a completion timestamp, and no held lease;
+  claim generation (`lease_epoch`), a completion timestamp, no held lease and a
+  successful outcome (status `idle`, no recorded error: a turn that ended
+  `blocked`, for example on an authentication failure, is a failed probe);
 - exactly one `turn_resources` row was opened for the probe on this host after
   the call started and is closed (`done`);
 - nothing of the probe is left running.
@@ -121,6 +123,12 @@ class HealthTurn:
         if after.get('last_turn_at') is None:
             return False
         if after.get('status') == 'running' or self._live_lease(after, marker):
+            return False
+        # The turn outcome is part of the evidence: a turn that ended blocked
+        # (an authentication failure, a host refusal, a harness error) still
+        # increments `turns` and closes its resource. Accepting it would accept
+        # a release that cannot authenticate, then defend it.
+        if after.get('status') != 'idle' or after.get('last_error'):
             return False
         rows = self._rows(TURNS, (self.agent, self.host, marker))
         if len(rows) != 1:
