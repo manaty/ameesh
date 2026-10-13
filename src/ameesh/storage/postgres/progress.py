@@ -139,8 +139,14 @@ class Progress(interface.Progress):
         """
         params: tuple = ()
         if project:
-            sql += " WHERE r.workstream = %s OR r.team = %s"
-            params = (project, project)
+            # L243 : l'agent appartient à tous ses projets — `projects` déclaré
+            # (0388), sinon son équipe, sinon son `workstream`
+            sql += (" WHERE %s = any(coalesce(r.projects,"
+                    " case when coalesce(btrim(r.team), '') <> '' then array[btrim(r.team)]"
+                    "      when coalesce(btrim(r.workstream), '') <> ''"
+                    "           then array[btrim(r.workstream)]"
+                    "      else array[]::text[] end))")
+            params = (project,)
         sql += " ORDER BY r.name"
         return self.db.query(sql, params)
 

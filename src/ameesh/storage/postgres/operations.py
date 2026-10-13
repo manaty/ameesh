@@ -82,7 +82,8 @@ class Operations(interface.Operations):
         today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
-            SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
+            SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
