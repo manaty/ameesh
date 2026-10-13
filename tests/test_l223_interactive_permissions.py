@@ -408,8 +408,12 @@ class AttachPermissionTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         state = os.path.join(self.cfg.agent_dir("perm"), "permission_mode")
         with open(state, encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh),
-                             {"harness": "claude", "mode": "bypassPermissions"})
+            stored = json.load(fh)
+        self.assertEqual(stored["harness"], "claude")
+        self.assertEqual(stored["mode"], "bypassPermissions")
+        # r2 P1: the registration identity is part of the binding
+        self.assertEqual(stored["incarnation"],
+                         "%.6f" % registry.get(self.db, "perm")["created_ts"])
         # under Claude the explicit authorization still applies
         self.assertIn("bypassPermissions", self._attach())
         registry.upsert(self.db, "perm", harness="codex")
@@ -421,6 +425,52 @@ class AttachPermissionTest(PgTestCase):
         # back under Claude, the authorization it received applies again
         registry.upsert(self.db, "perm", harness="claude")
         self.assertIn("bypassPermissions", self._attach())
+
+    def test_permission_mode_is_bound_to_the_registration(self):
+        # L685 review r2 P1: deleting the agent and recreating it under the same
+        # name, with its state directory kept, must not inherit the bypass
+        proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("bypassPermissions", self._attach())
+        cwd = os.path.join(self.tmp, "work", "perm")
+        self.db.execute("delete from agent_registry where name = %s", ("perm",))
+        self.register("perm", "claude", cwd=cwd)
+        argv, err = self._attach_capturing_stderr()
+        self.assertEqual(argv[:2], ["--permission-mode", "auto"])
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertIn("another registration", err)
+
+    def test_revocation_failure_is_visible_and_inert(self):
+        # L685 review r2 P2: with a non-writable state directory the unlink
+        # fails; the command must fail visibly and leave nothing active
+        proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state_dir = self.cfg.agent_dir("perm")
+        os.chmod(state_dir, 0o500)
+        try:
+            proc = self.mesh("set", "perm", "permission_mode=")
+        finally:
+            os.chmod(state_dir, 0o700)
+        self.assertEqual(proc.returncode, 2, (proc.stdout, proc.stderr))
+        self.assertIn("neutralised in place", proc.stderr)
+        argv, err = self._attach_capturing_stderr()
+        self.assertEqual(argv[:2], ["--permission-mode", "auto"])
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertNotIn("malformed", err)
+
+    def test_setting_failure_is_visible(self):
+        # a mode that cannot be written is not silently dropped
+        state_dir = self.cfg.agent_dir("perm")
+        os.makedirs(state_dir, exist_ok=True)
+        os.chmod(state_dir, 0o500)
+        try:
+            proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        finally:
+            os.chmod(state_dir, 0o700)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("cannot write", proc.stderr)
+        argv, _ = self._attach_capturing_stderr()
+        self.assertNotIn("bypassPermissions", argv)
 
     def test_permission_mode_does_not_leak_back_to_claude(self):
         # the binding is symmetric: a codex bypass authorization is not inherited
