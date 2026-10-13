@@ -53,6 +53,8 @@ def split_password(dsn: str, environ: Mapping[str, str] | None = None) -> tuple[
 
     `environ`: the environment of the client that gets the rest (os.environ by
     default), for PGSERVICE."""
+    if "\x00" in dsn:   # libpq stops reading at a NUL: the rest would differ
+        raise DsnError("a NUL byte in the DSN")
     if dsn.startswith(_URI_PREFIXES):
         password, rest, service = _split_uri(dsn)
     elif "=" in dsn:

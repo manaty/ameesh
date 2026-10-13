@@ -80,11 +80,13 @@ CASES = [
 ]
 # refused on purpose, though libpq's parser takes them (fail closed): libpq
 # would take the query's password; next to a service, PGPASSWORD would lose
-# to the service file's password
+# to the service file's password; libpq stops reading at a NUL, the split
+# would not
 DELIBERATE = [
     "postgresql://u:Pw-a@h.invalid/db?password=Pw-b",
     "service=prod password=Pw-svc-22",
     "postgresql://u:Pw-svc-23@h.invalid/db?service=prod",
+    "host=h.invalid dbname=production password=Pw-nul\x00 dbname=other password=Pw-nul-2",
 ]
 # refused, as libpq refuses them
 REFUSED = [
@@ -181,7 +183,7 @@ class CommandLineTest(unittest.TestCase):
                     self.assertEqual(proc.stdout.decode(), want)
 
     def test_refused_without_quoting_the_dsn(self):
-        for dsn in DELIBERATE[:2] + REFUSED[:1]:
+        for dsn in DELIBERATE + REFUSED[:1]:
             with self.subTest(dsn=dsn):
                 proc = self.run_dsn("dsn", dsn)
                 self.assertEqual((proc.returncode, proc.stdout), (1, b""))
@@ -319,10 +321,43 @@ class PosteDsnTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.state, "calls.log")))
 
     def test_invalid_dsn_stops_without_quoting_it(self):
-        for dsn in DELIBERATE[:2]:
+        for dsn in DELIBERATE[:2] + DELIBERATE[3:]:
             with self.subTest(dsn=dsn):
                 self.configure(dsn)
                 self.assert_stops(self.env)
+
+    def fake_venv(self, home):
+        """A venv python that records its calls: migrer's ameesh_de runs it."""
+        bin_dir = os.path.join(home, ".local", "share", "ameesh", "venv", "bin")
+        os.makedirs(bin_dir)
+        path = os.path.join(bin_dir, "python")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(FAKE_TOOL)
+        os.chmod(path, 0o755)
+
+    def test_migrer_stops_on_a_refused_dsn(self):
+        home = self.env["HOME"]
+        self.fake_venv(home)
+        # a refused DSN, then a valid one with dsn.py absent (a copy of the
+        # repository that holds poste.sh only)
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(repo, "deploy", "mise-a-jour"))
+        shutil.copy(SCRIPT, os.path.join(repo, "deploy", "mise-a-jour", "poste.sh"))
+        git = ["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid"]
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "poste.sh"]):
+            subprocess.run(git + args, check=True, capture_output=True, env=self.env)
+        for dsn, script in ((DELIBERATE[1], SCRIPT),
+                            ("postgresql://u:Pw-mig-24@h.invalid/production",
+                             os.path.join(repo, "deploy", "mise-a-jour", "poste.sh"))):
+            with self.subTest(dsn=dsn, script=script):
+                self.configure(dsn)
+                proc = subprocess.run(["bash", script, "migrer"], env=self.env,
+                                      capture_output=True, text=True, timeout=300,
+                                      stdin=subprocess.DEVNULL)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assert_secret_absent(proc.stdout + proc.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.state, "calls.log")),
+                                 "a migration ran")
 
     def test_a_service_in_the_environment_stops_a_password(self):
         self.configure(case("postgresql://ameesh:")[0])

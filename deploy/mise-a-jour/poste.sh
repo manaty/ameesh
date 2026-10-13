@@ -90,16 +90,15 @@ dsn_de() { python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv
 # standard input; it is the copy of the commit being deployed (the installed
 # ameesh may be older). `dsn_part VAR CONFIG dsn|password`: VAR gets the DSN
 # of CONFIG without its password, or that password, byte for byte (the "."
-# keeps the trailing newlines that $(…) strips). `avec_mdp CONFIG cmd…`: cmd
-# with that password in PGPASSWORD, which libpq reads, in a subshell without
-# xtrace. `dsn_sans_mdp CONFIG`: the DSN without its password, for display.
+# keeps the trailing newlines that $(…) strips); it fails if the DSN is
+# refused, and callers stop (|| return). `avec_mdp CONFIG cmd…`: cmd with that
+# password in PGPASSWORD, which libpq reads, in a subshell without xtrace.
 DSN_PY="$DEPOT/src/ameesh/dsn.py"
 dsn_part() {
   local _sortie
   _sortie=$(dsn_de "$2" | python3 "$DSN_PY" "$3" && printf .) || return
   printf -v "$1" '%s' "${_sortie%.}"
 }
-dsn_sans_mdp() { local d; dsn_part d "$1" dsn && printf '%s\n' "$d"; }
 avec_mdp() {
   ( { set +x; } 2>/dev/null
     dsn_part mdp "$1" password || exit
@@ -127,12 +126,14 @@ statut() {  # statut de la persona $2 vue par la configuration $1 (« mesh » ou
 }
 
 verifier() {
+  local d
   etape "dépôt et version"
   echo "dépôt : $DEPOT @ $(git -C "$DEPOT" rev-parse --short HEAD)"
   echo "installé : $("$VENV/bin/pip" show ameesh 2>/dev/null | sed -n 's/^Version: //p') depuis $(readlink "$PARTAGE/src-current" || echo '?')"
   etape "bases visées (sans mot de passe)"
-  echo "mesh     : $(dsn_sans_mdp "$CONFIG")"
-  if ancienne; then echo "ancienne : $(dsn_sans_mdp "$CONFIG_RESTE")"
+  dsn_part d "$CONFIG" dsn || return
+  echo "mesh     : $d"
+  if ancienne; then dsn_part d "$CONFIG_RESTE" dsn || return; echo "ancienne : $d"
   else echo "ancienne : aucune ($CONFIG_RESTE absent)"; fi
   etape "exécuteurs"
   echo "poste, base du mesh : $(unites_mesh | tr '\n' ' ')"
@@ -145,14 +146,14 @@ verifier() {
 sauvegarder() {
   local jour dsn; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
-  dsn_part dsn "$CONFIG" dsn
+  dsn_part dsn "$CONFIG" dsn || return
   avec_mdp "$CONFIG" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
   ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
   if ancienne; then
     etape "ancienne base"
-    dsn_part dsn "$CONFIG_RESTE" dsn
+    dsn_part dsn "$CONFIG_RESTE" dsn || return
     avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
@@ -211,7 +212,7 @@ installer() {
 # place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
 # fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
 migrer() {
-  local ref=${1:-HEAD} cible garde=(--additive-only)
+  local ref=${1:-HEAD} cible d garde=(--additive-only)
   cible=$(instantane "$ref")
   if installe "$cible"; then
     garde=()
@@ -220,12 +221,14 @@ migrer() {
     etape "migrations de $(basename "$cible"), avant son installation (additives seulement)"
   fi
   etape "base du mesh (une seule fois pour tout le mesh)"
-  echo "base : $(dsn_sans_mdp "$CONFIG")"
+  dsn_part d "$CONFIG" dsn || return
+  echo "base : $d"
   ameesh_de "$cible" migrate --dry-run
   migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
-    echo "base : $(dsn_sans_mdp "$CONFIG_RESTE")"
+    dsn_part d "$CONFIG_RESTE" dsn || return
+    echo "base : $d"
     AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   fi
 }
@@ -264,7 +267,7 @@ SQL
     echo "Executor role absent: initial provisioning requires a separate owner decision."
   fi
   if ancienne; then
-    dsn_part dsn "$CONFIG_RESTE" dsn
+    dsn_part dsn "$CONFIG_RESTE" dsn || return
     avec_mdp "$CONFIG_RESTE" "$DEPOT/deploy/mise-a-jour/role-executor.sh" "$dsn" "$EXECUTOR_ROLE"
   fi
 }
@@ -283,7 +286,7 @@ role() {
   fi
   if ancienne; then
     etape "rôle $ROLE, ancienne base"
-    dsn_part dsn "$CONFIG_RESTE" dsn
+    dsn_part dsn "$CONFIG_RESTE" dsn || return
     existe=$(avec_mdp "$CONFIG_RESTE" psql -X -At -d "$dsn" \
       -c "SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'")
     if [ "$existe" = 1 ]; then
