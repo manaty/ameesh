@@ -60,8 +60,11 @@ on:
 # une exécution de PR dépassée (nouveau commit sur la PR) est annulée ; hors
 # PR, chaque exécution a son propre groupe : ni annulée, ni écartée en attente
 # (GitHub n'en garde qu'une en attente par groupe), même sans cancel-in-progress
+# A PR keeps only its latest run. A push to main or release/* keeps the
+# running run and at most one pending run, the newest: a burst of merges no
+# longer queues one full suite per merge (12/10: 7 main runs queued for 1 h 30).
 concurrency:
-  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
