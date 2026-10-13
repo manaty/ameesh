@@ -3433,8 +3433,9 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
-    # La déclaration vit dans `federation.yaml`, sous `review_policies.classes` :
-    # `canon check` la valide, `ameesh review-class` la relit avec le même code.
+    # La déclaration vit dans `federation.yaml`, sous `review_policies.classes`,
+    # éventuellement par projet (`risk_classes.projects.<nom>`, §8) :
+    # `canon check` la valide en entier, `ameesh review-class` la relit.
     root_member = canon.sources[0].member if canon.sources else ""
     from . import modules as project_modules
     try:
@@ -3442,8 +3443,8 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     except ValueError as exc:
         add("project-modules-invalid", ERROR, str(exc),
             **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
-    _policy, policy_problems = review_mod.policy_from_federation(canon.federation)
-    for code, severity, message in policy_problems:
+    _scoped = review_mod.scoped_from_federation(canon.federation)
+    for code, severity, message in _scoped.problems:
         add(code, severity, message,
             **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
 

@@ -1097,10 +1097,10 @@ def _deep_analysis_line(found: dict) -> str:
 def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
     """La classe de revue d'un changement (décision 0018 point 1, R19).
 
-    La politique est lue au canon (`review_policies.classes`) ; les fichiers
-    viennent des arguments ou de `--diff REF` (ref..HEAD + arbre de travail).
-    Une déclaration invalide refuse de classer : jamais une classe par défaut
-    rassurante sur une politique illisible.
+    La politique est lue au canon (`review_policies.risk_classes`), par projet
+    (`--project`, §8) ; les fichiers viennent des arguments ou de `--diff REF`
+    (ref..HEAD + arbre de travail). Une déclaration invalide refuse de classer :
+    jamais une classe par défaut rassurante sur une politique illisible.
     """
     from . import canon as canon_mod
     from . import canon_cli, review as review_mod
@@ -1109,7 +1109,16 @@ def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
     if not canon.readable:
         print("error: unreadable canon (%s)" % canon.root, file=sys.stderr)
         return 1
-    policy, problems = review_mod.policy_from_federation(canon.federation)
+    scoped = review_mod.scoped_from_federation(canon.federation)
+    project = args.project
+    if project is None and scoped.projects:
+        # Sans projet, la politique d'un dépôt ne se devine pas : chaque projet
+        # déclare ses propres chemins sensibles (§8), les mélanger serait pire
+        # qu'une erreur.
+        print(USAGE_HINT % ("review-class: name the project (--project): declared here: %s"
+                            % ", ".join(sorted(scoped.projects))), file=sys.stderr)
+        return 1
+    policy, problems = scoped.policy_of(project)
     if problems:
         for code, _severity, message in problems:
             print("%s: %s" % (code, message), file=sys.stderr)
@@ -1153,7 +1162,8 @@ def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
         # `policy_ref` : le commit du canon lu, pour que la classe affichée soit
         # rattachable à la politique qui l'a produite (mesh-design).
         policy_ref = canon.sources[0].commit if canon.sources else ""
-        print(json.dumps(dict(result, root=canon.root, repo=repo, policy_ref=policy_ref),
+        print(json.dumps(dict(result, root=canon.root, repo=repo, project=project,
+                              policy_ref=policy_ref),
                          ensure_ascii=False, indent=2))
         return 0
     print("class: %s" % result["class_display"])
@@ -2588,6 +2598,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="files to classify, relative to the repository")
     p_review.add_argument("--diff", default=None, metavar="REF",
                           help="files changed since REF (ref..HEAD + working tree)")
+    p_review.add_argument("--project", default=None, metavar="NAME",
+                          help="project whose risk_classes apply (required when the "
+                               "canon declares several)")
     canon_cli._canon_options(p_review)
     p_review.set_defaults(func=cmd_review_class)
 

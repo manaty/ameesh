@@ -204,5 +204,77 @@ class FederationPolicyTest(unittest.TestCase):
         self.assertEqual(problems, [])
 
 
+class ScopedPoliciesTest(unittest.TestCase):
+    """Les politiques par projet : les globs d'un projet ne classent pas un autre."""
+
+    def federation(self):
+        return {"review_policies": {"risk_classes": {
+            "projects": {
+                "ameesh": {"default": "light", "rules": [
+                    {"paths": ["src/ameesh/db.py"], "class": "sensitive"}]},
+                "nexlink": {"default": "normal", "rules": [
+                    {"paths": ["supabase/**"], "class": "sensitive"}]},
+            },
+            "default": "normal",
+        }}}
+
+    def test_chaque_projet_a_sa_politique(self):
+        scoped = review.scoped_from_federation(self.federation())
+        self.assertEqual(sorted(scoped.projects), ["ameesh", "nexlink"])
+        self.assertEqual(scoped.problems, ())
+        ameesh, problems = scoped.policy_of("ameesh")
+        self.assertEqual(problems, [])
+        self.assertEqual(ameesh.default, "light")
+        self.assertEqual(review.classify(ameesh, ["src/ameesh/db.py"])["class"], "sensitive")
+        self.assertEqual(review.classify(ameesh, ["docs/a.md"])["class"], "light")
+
+    def test_les_globs_d_un_projet_ne_classent_pas_un_autre(self):
+        scoped = review.scoped_from_federation(self.federation())
+        nexlink, _ = scoped.policy_of("nexlink")
+        self.assertEqual(review.classify(nexlink, ["supabase/x.sql"])["class"], "sensitive")
+        # le chemin sensible d'ameesh reste au défaut de nexlink
+        self.assertEqual(review.classify(nexlink, ["src/ameesh/db.py"])["class"], "normal")
+        ameesh, _ = scoped.policy_of("ameesh")
+        # et le glob de nexlink ne classe pas un chemin d'ameesh
+        self.assertEqual(review.classify(ameesh, ["supabase/x.sql"])["class"], "light")
+
+    def test_projet_inconnu_prend_le_repli_et_le_dit(self):
+        scoped = review.scoped_from_federation(self.federation())
+        policy, problems = scoped.policy_of("omarchy")
+        self.assertEqual(policy.default, "normal")
+        self.assertEqual([code for code, _s, _m in problems], [review.UNKNOWN_PROJECT])
+        self.assertEqual(problems[0][1], "warning")
+
+    def test_projet_inconnu_sans_repli_est_une_erreur(self):
+        """Pas de repli déclaré : un projet inconnu est un doute, pas un défaut."""
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "projects": {"ameesh": {"default": "light"}}}}})
+        _policy, problems = scoped.policy_of("nexlink")
+        self.assertEqual([code for code, _s, _m in problems], [review.UNKNOWN_PROJECT])
+        self.assertEqual(problems[0][1], "error")
+
+    def test_constats_d_un_projet_sont_prefixes(self):
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "projects": {"ameesh": {"default": "urgent"}}}}})
+        self.assertEqual([code for code, _s, _m in scoped.problems],
+                         [review.UNKNOWN_CLASS])
+        self.assertIn("project ameesh", scoped.problems[0][2])
+
+    def test_projects_non_mapping(self):
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "projects": ["ameesh"]}}})
+        self.assertEqual([code for code, _s, _m in scoped.problems], [review.BAD_PROJECT])
+
+    def test_forme_globale_inchangee(self):
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "default": "light", "rules": [{"paths": ["a/**"], "class": "sensitive"}]}}})
+        self.assertEqual(scoped.projects, {})
+        self.assertEqual(scoped.problems, ())
+        policy, problems = scoped.policy_of()
+        self.assertEqual(problems, [])
+        self.assertEqual(policy.default, "light")
+        self.assertEqual(review.classify(policy, ["a/x"])["class"], "sensitive")
+
+
 if __name__ == "__main__":
     unittest.main()
