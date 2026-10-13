@@ -5,7 +5,9 @@ Un lot de release fige son périmètre à un commit **nommé** de sa cible ; les
 fusions postérieures vont à la release suivante. `ameesh release check` refuse
 une branche dont la base a bougé sans raison enregistrée, et l'absence d'une
 exécution de **suite complète** (poussée ou lancement manuel, jamais le plan
-impacté d'une PR) verte sur la tête gelée exacte.
+impacté d'une PR) verte sur la **tête fraîche** exacte — un commit postérieur
+au gel (correctif cherry-pické) doit être certifié lui-même, jamais par la CI
+de l'ancien gel.
 
 Tests sans base : dépôt git réel, journal du lot simulé, `gh` simulé.
 """
@@ -212,12 +214,14 @@ class CheckTest(_Base):
         with self.assertRaisesRegex(release.ReleaseError, "not a commit of"):
             self.check()
 
-    def test_the_full_suite_must_be_green_on_the_frozen_head(self):
+    def test_the_full_suite_must_be_green_on_the_head(self):
         release.record_perimeter(None, 750, self.perimeter)
         cases = (({"runs": 0, "green": False, "pending": [], "failed": []},
                   "no full-suite run"),
                  ({"runs": 1, "green": False, "pending": ["tests"], "failed": []},
                   "still running"),
+                 ({"runs": 1, "green": False, "pending": [], "missing": [".github/w.yml"]},
+                  "did not run"),
                  ({"runs": 1, "green": False, "pending": [], "failed": ["tests"]},
                   "is red"),
                  ({"runs": 1, "green": False, "pending": [], "failed": []},
@@ -226,10 +230,48 @@ class CheckTest(_Base):
             with self.subTest(expected=expected):
                 with self.assertRaisesRegex(release.ReleaseError, expected):
                     self.check(full_ci=lambda sha, runs=runs: runs)
-        out = self.check()
+        seen = []
+        out = self.check(full_ci=lambda sha: (seen.append(sha) or
+                                              {"runs": 1, "green": True,
+                                               "pending": [], "failed": []}))
+        self.assertEqual(seen[-1], self.tip("release/1.0"))
         self.assertTrue(out["full_suite"]["green"])
         self.assertEqual(out["frozen_sha"], self.tip("release/1.0"))
-        self.assertEqual(len(release.render(out)), 5)
+        self.assertEqual(out["certified"], self.tip("release/1.0"))
+        self.assertFalse(out["head_moved"])
+        self.assertEqual(len(release.render(out)), 6)
+
+    def test_a_commit_after_the_freeze_is_certified_on_itself(self):
+        """B2 (R1 auditeur/Codex PR #633) : un commit postérieur au gel sur la
+        branche de release ne peut pas s'abriter derrière la CI de l'ancien
+        gel ; c'est la tête fraîche qui est certifiée."""
+        release.record_perimeter(None, 750, self.perimeter)
+        frozen = self.tip("release/1.0")
+        _git(self.repo, "checkout", "-q", "release/1.0")
+        with open(os.path.join(self.repo, "hotfix.txt"), "w", encoding="utf-8") as fh:
+            fh.write("hotfix\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "hotfix after the freeze")
+        head = self.tip("release/1.0")
+        _git(self.repo, "checkout", "-q", "main")
+        self.assertNotEqual(head, frozen)
+        seen = []
+
+        def reader(sha):
+            seen.append(sha)
+            if sha == frozen:
+                return {"runs": 1, "green": True, "pending": [], "failed": []}
+            return {"runs": 0, "green": False, "pending": [], "failed": []}
+
+        with self.assertRaisesRegex(release.ReleaseError, "no full-suite run"):
+            self.check(full_ci=reader)
+        self.assertEqual(seen[-1], head)  # la tête fraîche, pas l'ancien gel
+        out = self.check(full_ci=lambda sha: {"runs": 1, "green": True,
+                                              "pending": [], "failed": []})
+        self.assertEqual(out["tip"], head)
+        self.assertEqual(out["frozen_sha"], frozen)
+        self.assertTrue(out["head_moved"])
+        self.assertIn("MOVED after the freeze", "\n".join(release.render(out)))
 
     def test_without_a_repository_the_check_refuses(self):
         release.record_perimeter(None, 750, self.perimeter)

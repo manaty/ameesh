@@ -137,8 +137,11 @@ def project_of(cfg, item: dict):
 
 def check(db, lot, *, repo: str | None = None, cfg=None, gh=None, full_ci=None) -> dict:
     """La porte d'une release : périmètre gelé, base non élargie, suite
-    complète verte sur la tête gelée. Rend le constat (`{lot, target,
-    perimeter, base, moved, reason, frozen_sha, full_suite}`) ou lève
+    complète verte sur la **tête fraîche** de la branche. Certifier la seule
+    tête gelée laisserait passer un commit postérieur au gel (correctif
+    cherry-pické) sans exécution propre : la tête qui serait publiée est celle
+    qui est certifiée. Rend le constat (`{lot, target, perimeter, base, moved,
+    reason, frozen_sha, tip, certified, head_moved, full_suite}`) ou lève
     `ReleaseError` avec le geste qui manque."""
     from . import merge_queue
     row = work.get(db, lot)
@@ -176,19 +179,21 @@ def check(db, lot, *, repo: str | None = None, cfg=None, gh=None, full_ci=None) 
     if not freeze or not freeze.get("sha"):
         raise ReleaseError("lot #%s is not frozen: ameesh work milestone %s frozen --sha <commit>"
                            % (lot, lot))
-    tip = merge_queue.pinned(repo, freeze["sha"])
-    if tip is None:
+    frozen_tip = merge_queue.pinned(repo, freeze["sha"])
+    if frozen_tip is None:
         raise ReleaseError("the freeze of lot #%s names %r, not a commit of %s"
                            % (lot, freeze["sha"], repo))
+    head = movement["tip"]
     project = project_of(cfg, row)
     try:
-        runs = merge_queue.required_full_ci(project, tip, full_ci, lot=lot)
+        runs = merge_queue.required_full_ci(project, head, full_ci, lot=lot)
     except merge_queue.QueueError as exc:
         raise ReleaseError(str(exc)) from exc
     return {"schema": "ameesh-release/1", "lot": lot, "target": target,
             "perimeter": movement["perimeter"],
-            "branch": branch, "tip": movement["tip"], "base": movement["base"],
-            "moved": movement["moved"], "reason": recorded, "frozen_sha": tip,
+            "branch": branch, "tip": head, "base": movement["base"],
+            "moved": movement["moved"], "reason": recorded, "frozen_sha": frozen_tip,
+            "certified": head, "head_moved": head != frozen_tip,
             "class_why": why, "full_suite": runs}
 
 
@@ -203,8 +208,11 @@ def render(report: dict) -> list[str]:
             " (MOVED after the freeze)" if report["moved"] else " (frozen)"),
         "  reason     %s" % (report["reason"] or "—"),
         "  frozen     %s" % report["frozen_sha"][:12],
-        "  full suite %s run(s), %s" % (runs.get("runs", 0),
-                                        "green" if runs.get("green") else "NOT green"),
+        "  head       %s%s" % (report["tip"][:12],
+                               " (MOVED after the freeze: certified itself)"
+                               if report.get("head_moved") else ""),
+        "  full suite %s/%s run(s), %s" % (runs.get("runs", 0), runs.get("suites", "?"),
+                                           "green" if runs.get("green") else "NOT green"),
     ]
 
 
