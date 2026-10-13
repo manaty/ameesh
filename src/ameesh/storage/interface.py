@@ -286,7 +286,9 @@ class Leases(Domain):
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
                      require_responsible: bool) -> dict | None:
-        """Prend le bail pour une session interactive (`ameesh attach`)."""
+        """Prend le bail pour une session interactive (`ameesh attach`) ; la
+        ligne rendue porte `harness` et `created_ts` (L719), l'identité de
+        l'enregistrement revendiqué."""
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:

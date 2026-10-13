@@ -508,6 +508,11 @@ class Leases(interface.Leases):
         L46 : contrairement à `claimable` / `claim`, le mode n'est PAS filtré —
         `attach` est une session humaine interactive, ce qu'est par nature un
         agent `externe` ; l'exécuteur, lui, ne le réclamera jamais.
+
+        L719 : la ligne rendue porte `harness` et `created_ts` (l'identité de
+        l'enregistrement, lue sous le verrou `FOR UPDATE`) pour que l'appelant
+        lie ce qu'il applique à la registration **revendiquée**, et non à une
+        lecture antérieure.
         """
         sql = """
             WITH verrou AS (
@@ -536,7 +541,9 @@ class Leases(interface.Leases):
                AND NOT r.handoff_fenced
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
-                      extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+                      extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts,
+                      r.harness,
+                      extract(epoch from r.created_at)::float8 as created_ts
         """
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
