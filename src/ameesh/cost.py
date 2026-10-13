@@ -239,9 +239,16 @@ class Gauge:
             return 1.0
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
-    def pace_cap(self, now: float) -> float:
-        """Le plafond de rythme : min(90 %, part écoulée + 10 points)."""
-        return min(PACE_CEILING, self.elapsed(now) + PACE_MARGIN)
+    def pace_cap(self, now: float, multiplier: float = 1.0) -> float:
+        """Le plafond de rythme : min(90 %, part écoulée × `multiplier` + 10 points).
+
+        `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
+        compte (`accounts`, `pace_multiplier`, défaut 1.0), posé à 2.0 sur le
+        compte principal Codex pour consommer sa réserve de forfait sans
+        remise à zéro. Il ne touche que la part écoulée : l'utilisation
+        relevée, les remises à zéro et les plafonds fixes ne changent pas.
+        """
+        return min(PACE_CEILING, self.elapsed(now) * multiplier + PACE_MARGIN)
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
@@ -253,7 +260,8 @@ class Gauge:
         """
         return 0.0 if self.reset_passed(now) else self.used
 
-    def held_cap(self, now: float, reserve: float = 0.0) -> float:
+    def held_cap(self, now: float, reserve: float = 0.0,
+                 multiplier: float = 1.0) -> float:
         """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
         jamais sous `PACE_MARGIN` quand une réserve s'applique.
 
@@ -262,14 +270,16 @@ class Gauge:
         sur une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »).
         Une fenêtre à 1 % d'écoulé garde donc 10 points, pas 1.
         """
-        cap = max(0.0, self.pace_cap(now) - reserve)
+        cap = max(0.0, self.pace_cap(now, multiplier) - reserve)
         return max(cap, PACE_MARGIN) if reserve else cap
 
-    def exceeded(self, now: float, reserve: float = 0.0) -> bool:
+    def exceeded(self, now: float, reserve: float = 0.0,
+                 multiplier: float = 1.0) -> bool:
         """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant."""
-        return self.used_at(now) >= self.held_cap(now, reserve)
+        return self.used_at(now) >= self.held_cap(now, reserve, multiplier)
 
-    def free_at(self, now: float, reserve: float = 0.0) -> float | None:
+    def free_at(self, now: float, reserve: float = 0.0,
+                multiplier: float = 1.0) -> float | None:
         """L'heure où la fenêtre cesse de bloquer, ou None si elle ne la dit
         pas (`resets_at` absent).
 
@@ -288,7 +298,7 @@ class Gauge:
         share = used + reserve - PACE_MARGIN
         if reserve:
             share = max(share, PACE_MARGIN)
-        share = min(max(share, 0.0), 1.0)
+        share = min(max(share / multiplier, 0.0), 1.0)
         return float(self.resets_at) - self.window_s * (1.0 - share)
 
     def reset_passed(self, now: float) -> bool:

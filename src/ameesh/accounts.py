@@ -99,6 +99,7 @@ sont plus posées : le choix par retard sur le rythme les remplace.
 """
 from __future__ import annotations
 
+import math
 import os
 import stat
 import time
@@ -195,6 +196,10 @@ class Profile:
     overage: str = "auto"
     overage_cap: float = OVERAGE_CAP
     short_window_cap: float | None = None
+    #: #1075: multiplies the elapsed share of the pace cap (1.0 = nominal
+    #: pace). Configured per account in the host's `accounts` key; there is no
+    #: implicit value, neither by name nor by default folder.
+    pace_multiplier: float = 1.0
 
     @property
     def default(self) -> bool:
@@ -237,6 +242,27 @@ class Profile:
 
 def _expand(path: str) -> str:
     return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def _pace_multiplier(harness: str, name: str, value) -> float:
+    """`pace_multiplier` d'un profil compte (#1075), validé strictement.
+
+    Absent : 1.0 (rythme nominal) — aucun défaut implicite selon le harnais,
+    le nom ou le dossier. Présent : un nombre fini strictement positif.
+    """
+    if value is None:
+        return 1.0
+    if isinstance(value, bool):
+        raise AccountError("account %s/%s: pace_multiplier must be a finite number > 0"
+                           % (harness, name))
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError):
+        raise AccountError("account %s/%s: unreadable pace_multiplier" % (harness, name))
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise AccountError("account %s/%s: pace_multiplier must be a finite number > 0"
+                           % (harness, name))
+    return multiplier
 
 
 def parse(raw) -> dict[str, list[Profile]]:
@@ -302,6 +328,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                                          or not isinstance(priority, int)):
                 raise AccountError("account %s/%s: priority must be an integer"
                                    % (harness, name))
+            pace_multiplier = _pace_multiplier(harness, name, item.get("pace_multiplier"))
             overage = str(item.get("overage") or "auto")
             if overage not in OVERAGE_MODES:
                 raise AccountError("account %s/%s: overage must be one of %s"
@@ -335,6 +362,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
+                pace_multiplier=pace_multiplier,
             ))
         out[harness] = profiles
     return out
@@ -641,7 +669,7 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     cut = RESERVE if reserve else 0.0
     out = {}
     for gauge in gauges:
-        pace = (gauge.held_cap(now, cut), "pace cap")
+        pace = (gauge.held_cap(now, cut, profile.pace_multiplier), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
             if reserve:
@@ -681,7 +709,7 @@ def _release(profile: Profile, depasses, hard, now: float,
                 short and gauge.used_at(now) >= max(0.0, profile.short_window_cap - cut)):
             free = float(gauge.resets_at)
         else:
-            free = gauge.free_at(now, cut)
+            free = gauge.free_at(now, cut, profile.pace_multiplier)
             if free is None:
                 return None, None
         dated.append((free, gauge))
@@ -873,7 +901,8 @@ def explain(result: Evaluation, now: float) -> str:
         return "no reading: 0% used"
     if all(g.reset_passed(now) for g in result.gauges):
         return "stale reading (window reset): 0% used"
-    cap, label = result.limits.get(gauge.key) or (gauge.pace_cap(now), "pace cap")
+    cap, label = result.limits.get(gauge.key) or (
+        gauge.pace_cap(now, result.profile.pace_multiplier), "pace cap")
     bound = ("pace %.0f%%" % (cap * 100)) if label == "pace cap" \
         else "%s %.0f%%" % (label, cap * 100)
     if not gauge.resets_at:
@@ -1204,7 +1233,8 @@ def report(cfg, db, book, *, now: float | None = None,
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
                     # relevé reste lisible (`last_used`)
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
-                     "cap": (result.limits.get(g.key) or (g.pace_cap(now),))[0],
+                     "cap": (result.limits.get(g.key)
+                             or (g.pace_cap(now, result.profile.pace_multiplier),))[0],
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
                      "reset_passed": g.reset_passed(now)}
                     for g in result.gauges
