@@ -163,6 +163,22 @@ def _date(text: str | None) -> _dt.date | None:
 _UNSET = object()
 
 
+def _hand_source(current: dict, dates: dict, source: str | None, actor: str) -> str | None:
+    """The source of a date set by hand on a task (#704).
+
+    Without `--source`, the stored source is kept as it is. When the planner
+    (`work schedule --apply`) dated the task, that source is the planner's, and
+    its next pass would overwrite the date set by hand: the date then records
+    who set it. A source written by a person stays."""
+    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+
+    if source is not None or all(value is None for value in dates.values()):
+        return source
+    if str(current.get("planned_source") or "").startswith(SOURCE):
+        return "set by %s" % (actor or "hand")
+    return source
+
+
 def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str | None = None,
          actor: str = "", now: float | None = None) -> dict:
     """Pose les dates prévues d'une tâche (`target` entier ou `#N`) ou d'une
@@ -182,6 +198,7 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
         if current is None:
             raise RoadmapError("task %s not found" % text)
         _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
+        source = _hand_source(current, dates, source, actor)
         row = st.roadmap.plan_item(int(text), dates, source=source, actor=actor)
         if row is None:
             raise RoadmapError("task %s not found" % text)
