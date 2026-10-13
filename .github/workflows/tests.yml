@@ -101,8 +101,9 @@
 # #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
 # `close` : le check restait `in_progress` pour toujours. Le job `tests`
 # (indépendant des publishers) conclut les orphelins en relisant l'état
-# terminal réel du job et de l'exécution (`ci-flow.py sweep`) : `cancelled`,
-# jamais `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`, par le
+# `details_url` ou, à défaut, par le `check_suite`) : `cancelled`, jamais
+# `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
 # `actions: read` et `checks: write` sur le job `tests`.
 name: tests
 
@@ -757,9 +758,10 @@ jobs:
       # #856 : réconciliation indépendante du publisher — un runner arrêté
       # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
       # restait in_progress pour toujours. On relit l'état terminal réel du job
-      # et de l'exécution qui l'ont publié ; jamais `success` sans ligne `fin`,
-      # aucun check dont l'exécution est encore active, ni d'une autre tête,
-      # n'est touché.
+      # et de l'exécution qui l'ont publié (par le `details_url`, sinon par le
+      # `check_suite` : GitHub laisse l'URL par défaut sur ces checks) ; jamais
+      # `success` sans ligne `fin`, aucun check dont l'exécution est encore
+      # active, ni d'une autre tête, n'est touché.
       # `continue-on-error` : cette réconciliation ne change jamais le verdict
       # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
       # `if: always()` : un bilan rouge (une part requise tombée) ne doit pas
