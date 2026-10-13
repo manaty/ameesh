@@ -28,6 +28,15 @@ The inventory is published only after the archive succeeds and contains no
 connection credentials. Source configurations that store their mesh in another
 schema must name that schema explicitly.
 
+`source_bytes` is mandatory and bounded (K2): the inventory's key set is exact,
+and a document that lacks it — an inventory written before the K2 bound — is
+refused by the controller instead of being restored on a declared or guessed
+size. There is no operator-supplied size and no fallback: a pair that cannot
+prove its uncompressed bound is recreated from the live source
+(`snapshot-dump`, a re-dump) before any copy, and the restore-capacity
+admission keeps its bound over that exact value. L232b is not deployed, so no
+inventory predating the bound exists in production.
+
 `verify-restore --config RESTORE_CONFIG --file ARCHIVE --expected INVENTORY`
 uses the separately approved restore identity. It verifies the archive digest,
 creates a new randomly named `ameesh_verify_*` database, restores with
