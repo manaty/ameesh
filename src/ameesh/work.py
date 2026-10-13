@@ -194,6 +194,8 @@ def add(
     estimate_source: str | None = None,
     size: str | None = None,
     note: str = "",
+    mark_item_id: int | None = None,
+    mark_note: str = "",
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -210,7 +212,9 @@ def add(
     L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
     clé de la table de référence des durées.
     #506: `note` is appended to the creation event (a project introduced
-    with --new-project)."""
+    with --new-project). L539 : `mark_item_id` et `mark_note` écrivent la
+    marque d'idempotence du lot de relecture au journal de ce lot, dans la
+    même transaction que la création (`{lot}` y vaut l'identifiant créé)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -244,7 +248,8 @@ def add(
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
-        if minutes else None, change_size=size or None)
+        if minutes else None, change_size=size or None,
+        mark_item_id=mark_item_id, mark_note=mark_note)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
