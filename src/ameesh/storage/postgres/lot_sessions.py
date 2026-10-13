@@ -161,4 +161,58 @@ class LotSessions(interface.LotSessions):
         if name is not None:
             sql += " AND l.agent = %s"
             params = (name,)
-        return self.db.query(sql + " RETURNING " + _COLUMNS, params)
+        with self.db.transaction() as tx:
+            purged = tx.query(sql + " RETURNING " + _COLUMNS, params)
+            # #794 : la session ACTIVE d'un lot purgé est OUBLIÉE au registre
+            # (« fermer = oublier la session harnais », décision du bureau du
+            # 2026-10-13). Le lot est reconnu par `session_work_item` : si
+            # l'agent est passé à un autre lot entre-temps, rien n'est effacé.
+            # `forgotten_session` rend l'id oublié à l'exécuteur, qui retire
+            # le fichier local — sinon `current_session` le relirait.
+            for row in purged:
+                row["forgotten_session"] = self._forget_active(
+                    tx, row["agent"], str(row["work_item_id"]))
+            # un lot fini peut n'avoir AUCUNE ligne (sa session n'a jamais été
+            # mise de côté) : sa session active est oubliée de même.
+            sql_actifs = (
+                "SELECT r.name, r.session_id, r.session_work_item"
+                "  FROM agent_registry r JOIN work_items w"
+                "    ON w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'"
+                "                   THEN r.session_work_item::bigint END"
+                " WHERE (w.state IN " + _CLOSED + " OR w.assignee IS DISTINCT FROM r.name)")
+            actifs_params: list = []
+            if name is not None:
+                sql_actifs += " AND r.name = %s"
+                actifs_params.append(name)
+            actifs = tx.query(sql_actifs + " FOR UPDATE OF r", tuple(actifs_params))
+            for row in actifs:
+                tx.execute(
+                    "UPDATE agent_registry"
+                    "   SET session_id = NULL, session_account = NULL,"
+                    "       session_harness = NULL, session_cwd = NULL,"
+                    "       session_origin = NULL, session_work_item = NULL,"
+                    "       updated_at = now()"
+                    " WHERE name = %s", (row["name"],))
+                purged.append({"agent": row["name"],
+                               "work_item_id": int(row["session_work_item"]),
+                               "session_id": None,
+                               "forgotten_session": row.get("session_id")})
+            return purged
+
+    def _forget_active(self, tx, agent: str, lot: str):
+        """Oublie la session active de `agent` si elle porte le lot `lot` ;
+        rend l'id oublié (None s'il n'y a rien à oublier)."""
+        rows = tx.query(
+            "SELECT session_id FROM agent_registry"
+            "  WHERE name = %s AND session_work_item = %s FOR UPDATE",
+            (agent, lot))
+        if not rows:
+            return None
+        tx.execute(
+            "UPDATE agent_registry"
+            "   SET session_id = NULL, session_account = NULL,"
+            "       session_harness = NULL, session_cwd = NULL,"
+            "       session_origin = NULL, session_work_item = NULL,"
+            "       updated_at = now()"
+            " WHERE name = %s AND session_work_item = %s", (agent, lot))
+        return rows[0].get("session_id")
