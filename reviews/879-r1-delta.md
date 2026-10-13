@@ -1,0 +1,15 @@
+# #879 — PR #775 — R1 delta Codex
+
+13/10/2026, codex3. Tête relue : `32bac4cf599b1215c61c8bf1045f10703becfa17`, base de PR `c6584918419752df30ae5720a14e18e7b340c6e0` (#711).
+
+**NO-GO — 1 B/P1 résiduel (B2) / 0 N nouveau / 0 n.** Classe sensible SQL/concurrence. Attribution R1 vérifiée dans le lot #879, note mesh-design du 13/10 à 21:39 ; nouveau delta transmis par auditeur.
+
+**B2 — la reprise 40P01 reste active dans une transaction appartenant à l'appelant.** `src/ameesh/storage/postgres/work.py:185-193` rejoue tout écrivain décoré sans vérifier si sa connexion est déjà une transaction. `reserve_migration` reste décorée (l.727), et `migration_reservations.import_reservations` ouvre une transaction globale (l.319), verrouille/prévisualise puis appelle `storage.of(tx).work.reserve_migration` pour chaque ligne (l.330-332). Le correctif Python demandé par le pilote (note 21:34) est absent de cette tête ; les nouveaux témoins n'exercent que les appels autonomes.
+
+Avec psql, la transaction imbriquée est le même objet (`db.py:667-668`). Une erreur SQL 40P01 provoque `_failure` puis `_close(abort=True)` (l.695-703) : la session/transaction appelante est fermée. Le décorateur intercepte pourtant cette erreur et appelle à nouveau l'écrivain ; `__enter__` voit proc=None et ouvre un nouveau BEGIN (l.631-648). Il rejoue donc la seule réservation, pas le verrouillage, la prévisualisation ni les réservations précédentes de l'import. La réservation reprise peut être validée séparément avant que la sortie de la transaction externe échoue sur sa session fermée. L'import peut laisser une écriture partielle malgré son contrat atomique. Avec psycopg, l'imbrication est un savepoint, pas une nouvelle transaction globale ; elle ne satisfait pas non plus la promesse « chaque essai ouvre sa propre transaction ». Constat statique du chemin de code, pas une reproduction SQL exécutée.
+
+Attendu : ne pas reprendre localement 40P01 lorsque l'écrivain participe à une transaction appelante ; laisser l'erreur atteindre le propriétaire pour rollback/reprise de l'opération complète. Ajouter un témoin import multi-lignes sur les deux pilotes, qui injecte une victime après une première réservation et vérifie l'absence d'écriture partielle et de reprise locale. Conserver les reprises bornées des écrivains autonomes.
+
+B1 SQL : 0419 est blob-identique à la base `c6584918` (blob `fe598ae6dadd75128ac1d3ab7a4c8fb1aa30bf2d`). La nouvelle 0432 porte l'union des règles NULL/atterrissage et maintien de landed pour le même numéro ; son SQL est identique à la 0420 de la PR #785 hors commentaires/espaces. Les témoins des deux règles sont présents. La cible d'allocation GitHub est canonique, y compris le port alternatif, et les origines étrangères sont refusées. Ces corrections ne ferment pas B2.
+
+Aucune suite ni test rejoué, aucune migration appliquée, aucune fusion/prod. La dépendance #1022, le second avis Claude et la CI exacte verte sans part annulée restent des portes distinctes ; ce NO-GO bloque la fusion de la tête relue.
