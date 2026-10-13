@@ -393,8 +393,11 @@ jobs:
           echo "macOS   : ${{ needs.platform-macos.result }}"
           echo "version : ${{ needs.version.result }}"
           test "${{ needs.plan.result }}" = success
-          # L158: on a PR, the version number check passes (skipped elsewhere)
-          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; }
+          # L158: on a PR, the version number check passes (skipped elsewhere).
+          # #940 : sous `bash -e`, l'échec de la branche gauche du `&&` interne
+          # est exempté et le groupe rend 1 sans faire sortir le script — le job
+          # concluait SUCCESS. Sortie explicite après le repli légitime.
+          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; } || exit 1
           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
             exit 0
@@ -405,7 +408,9 @@ jobs:
             exit 0
           fi
           # code changed: psycopg always runs (an empty matrix, e.g. tests moved to
-          # a subfolder, is an error); psql may be skipped when the plan gave it no part
+          # a subfolder, is an error); psql may be skipped when the plan gave it no part.
+          # #940 : même piège que ci-dessus ; un psql en échec ou annulé (parts non
+          # vides) doit rougir le check requis, jamais conclure SUCCESS.
           test "${{ needs.psycopg.result }}" = success
-          test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
+          test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; } || exit 1
           test "${{ needs.platform-macos.result }}" = success
