@@ -1238,7 +1238,7 @@ class WorkItems(Domain):
         L40 : efface la délégation en cours (issue `annulee`)."""
 
     @abc.abstractmethod
-    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+    def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
                 paused_prefix: str, note_prefix: str, window_s: float,
                 max_per_window: int, note: str, actor: str) -> dict | None:
         """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
@@ -1249,7 +1249,10 @@ class WorkItems(Domain):
         (`blocked`, `status_text` commençant par `paused_prefix`, ligne
         verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
         de `max_per_window` notes commençant par `note_prefix` dans les
-        `window_s` dernières secondes."""
+        `window_s` dernières secondes.
+
+        `assignee` None rend le lot à la file d'équipe (assigné NULL, L165) :
+        aucun contrôle du preneur n'a lieu, les autres tiennent."""
 
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
