@@ -8,6 +8,11 @@ envoie un urgent au premier échec d'une tête, des événements ordinaires
 ensuite et le verdict à la fin, n'impute jamais un rouge hérité de main, et
 retire les messages non lus d'une tête remplacée. `ci_main_red` signale main
 rouge ; `ameesh ci status` montre les exécutions d'un lot.
+
+#795 N2 : le courrier d'un événement de CI et sa preuve
+(`ci_runs.urgent_message_id` / `verdict_message_id`) sont publiés dans la
+même transaction — un lecteur intercalé ne voit jamais le courrier engagé
+sans la référence qui rend la préemption vérifiable.
 """
 from __future__ import annotations
 
@@ -20,9 +25,12 @@ import json
 import pathlib
 import re
 import tempfile
+import types
 import unittest
+from unittest import mock
 
-from ameesh import ci, exploitation, mail, notify, registry, storage, work
+from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, runner, storage, work
+from ameesh.storage.postgres.ci import CiResults
 
 from .support import PgTestCase
 
@@ -523,6 +531,84 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([o["to"] for o in out], [None])
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 701)["work_item_id"], humain["id"])
+
+    # -- #795 N2 : le courrier et sa preuve dans la même transaction ---------
+
+    def _interrupt_allowed(self, row, name="dev-a"):
+        """Ce que `runner.AgentWorker.interrupt_allowed` décide pour ce
+        courrier (même montage que tests/test_l795_preemption_evenement.py)."""
+        worker = types.SimpleNamespace(
+            name=name, agent={"name": name}, db=self.db,
+            cfg=types.SimpleNamespace(interrupt_senders=()),
+            runner=types.SimpleNamespace(is_auditor=lambda n, a=None: False),
+            _system_event_interrupt=lambda sender, r: runner.AgentWorker
+            ._system_event_interrupt(worker, sender, r),
+            _deep_analysis_interrupt=lambda sender, r: runner.AgentWorker
+            ._deep_analysis_interrupt(worker, sender, r))
+        return runner.AgentWorker.interrupt_allowed(worker, row)
+
+    def _publication_probe(self, seen):
+        """`set_message` instrumenté : au point de publication de la preuve,
+        une AUTRE connexion lit la boîte et `ci_runs`, puis la preuve est
+        écrite. Un lecteur intercalé (le dispatch de l'exécuteur) ne doit
+        jamais voir le courrier engagé sans sa référence."""
+        real = CiResults.set_message
+
+        def set_message(st, repo, run_id, which, message_id):
+            other = db_mod.connect(self.cfg)
+            try:
+                mails = other.query(
+                    "SELECT count(*)::int AS n FROM agent_mailbox WHERE recipient = %s",
+                    ("dev-a",))[0]["n"]
+                run = other.query(
+                    "SELECT urgent_message_id, verdict_message_id FROM ci_runs"
+                    " WHERE repo = %s AND run_id = %s", (DEPOT, run_id))[0]
+            finally:
+                other.close()
+            seen.append((which, mails, run["urgent_message_id"],
+                         run["verdict_message_id"]))
+            return real(st, repo, run_id, which, message_id)
+        return set_message
+
+    def test_alerte_et_preuve_publiees_ensemble(self):
+        sha = "9" * 40
+        self.api.live = [run_view(801, sha, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=801)])]
+        seen = []
+        with mock.patch.object(CiResults, "set_message",
+                               self._publication_probe(seen)):
+            out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out],
+                         [("failures", True)])
+        # au point de publication : ni courrier visible, ni référence
+        self.assertEqual(seen, [("urgent", 0, None, None)])
+        (alerte,) = self.mails("dev-a")
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 801)["urgent_message_id"],
+                         alerte["id"])
+        # après le commit, l'urgent est vérifiable : il préempte
+        self.assertTrue(self._interrupt_allowed(
+            mail.unread_urgent(self.db, "dev-a")[-1]))
+
+    def test_verdict_et_preuve_publiees_ensemble(self):
+        sha = "b" * 40
+        self.api.live = [run_view(802, sha, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live = []
+        self.api.done[802] = {"status": "completed", "conclusion": "success"}
+        seen = []
+        with mock.patch.object(CiResults, "set_message",
+                               self._publication_probe(seen)):
+            out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out],
+                         [("verdict", "success")])
+        self.assertEqual(seen, [("verdict", 0, None, None)])
+        (verdict,) = self.mails("dev-a")
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 802)["verdict_message_id"],
+                         verdict["id"])
+        self.assertTrue(self._interrupt_allowed(
+            mail.unread_urgent(self.db, "dev-a")[-1]))
 
 
 if __name__ == "__main__":
