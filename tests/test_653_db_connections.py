@@ -205,7 +205,7 @@ class OperatorRecipe(unittest.TestCase):
             self.skipTest('operator recipe requires psycopg; covered by the psycopg job')
         upstream = psycopg.conninfo.make_conninfo(
             host='upstream', hostaddr='192.0.2.1', port='5432', user='ameesh', dbname='ameesh',
-            sslmode='require', sslnegotiation='direct', sslcert='/private/cert',
+            sslmode='require', sslcert='/private/cert',
             sslkey='/private/key', sslrootcert='/private/root', channel_binding='require',
             options='-c search_path=test_schema -c statement_timeout=12345')
         local = psycopg.conninfo.conninfo_to_dict(
@@ -213,7 +213,10 @@ class OperatorRecipe(unittest.TestCase):
         self.assertEqual(local['host'], '/private/socket')
         self.assertEqual(local['sslmode'], 'disable')
         self.assertEqual(local['options'], '-c search_path=test_schema -c statement_timeout=12345')
-        self.assertEqual(local['sslnegotiation'], 'postgres')
+        if psycopg.pq.version() >= 170000:
+            self.assertEqual(local['sslnegotiation'], 'postgres')
+        else:
+            self.assertNotIn('sslnegotiation', local)
         self.assertFalse(set(local) & {'sslcert', 'sslkey',
                                       'sslrootcert', 'hostaddr', 'channel_binding'})
 
@@ -222,6 +225,8 @@ class OperatorRecipe(unittest.TestCase):
             import psycopg
         except ImportError:
             self.skipTest('operator recipe requires psycopg; covered by the psycopg job')
+        if psycopg.pq.version() < 170000:
+            self.skipTest('direct negotiation only exists in libpq 17+')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             service = root / 'pg_service.conf'
@@ -237,6 +242,112 @@ class OperatorRecipe(unittest.TestCase):
                         psycopg.connect(local, connect_timeout=1)
                     self.assertNotIn('weak sslmode', str(caught.exception))
                     self.assertIn(str(root / 'missing'), str(caught.exception))
+
+    def test_socket_dsn_supports_both_libpq_version_branches(self):
+        try:
+            import psycopg
+        except ImportError:
+            self.skipTest('operator recipe requires psycopg')
+        real_make = psycopg.conninfo.make_conninfo
+        for version in (160000, 170000):
+            def checked_make(**params):
+                if version < 170000 and 'sslnegotiation' in params:
+                    raise psycopg.ProgrammingError('invalid connection option "sslnegotiation"')
+                return real_make(**params)
+            with self.subTest(version=version), \
+                    mock.patch.object(psycopg.pq, 'version', return_value=version), \
+                    mock.patch.object(psycopg.conninfo, 'make_conninfo', side_effect=checked_make):
+                local = psycopg.conninfo.conninfo_to_dict(self.recipe.socket_conninfo(
+                    'dbname=test sslmode=require options=\'-c statement_timeout=12345\'',
+                    Path('/private/socket')))
+                self.assertEqual(local['sslmode'], 'disable')
+                self.assertEqual(local['options'], '-c statement_timeout=12345')
+                self.assertEqual(local.get('sslnegotiation'),
+                                 'postgres' if version >= 170000 else None)
+
+    def test_failed_install_can_be_retried_without_removing_preexisting_files(self):
+        try:
+            import psycopg
+        except ImportError:
+            self.skipTest('operator recipe requires psycopg')
+        from ameesh import config as config_mod
+        for failure in ('dsn', 'version', 'write', 'verify', 'start'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                original = home / '.config/ameesh/config.json'
+                original.parent.mkdir(parents=True)
+                raw = b'{"dsn":"dbname=test"}'
+                original.write_bytes(raw)
+                state = home / '.local/state/pgbouncer'
+                config = home / '.config/pgbouncer/pgbouncer.ini'
+                binary = home / '.local/bin/pgbouncer'
+                unit = home / '.config/systemd/user/ameesh-pgbouncer.service'
+                settings = config.parent
+                settings.mkdir(parents=True, mode=0o700)
+                sentinel = settings / 'unrelated'
+                sentinel.write_text('keep')
+                conn = mock.MagicMock()
+                conn.__enter__.return_value = conn
+                conn.info.get_parameters.return_value = dict(
+                    dbname='test', user='ameesh', host='upstream', port='5432', sslmode='require')
+                conn.pgconn.password = b'fake-secret'
+                conn.pgconn.ssl_in_use = True
+
+                def compile_fake(_home):
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    self.recipe.write_new(binary, b'fake pinned binary', 0o755)
+
+                real_write = self.recipe.write_new
+                def fail_write(path, content, mode=0o600):
+                    if path == state / 'socket.dsn':
+                        raise OSError('simulated write failure')
+                    return real_write(path, content, mode)
+
+                def fail_command(argv):
+                    if (failure == 'verify' and argv[0] == 'systemd-analyze') or (
+                            failure == 'start' and 'start' in argv):
+                        raise RuntimeError('simulated command failure')
+
+                with mock.patch.object(config_mod, 'load', return_value=types.SimpleNamespace(
+                        backend='postgres', dsn='dbname=test')), \
+                        mock.patch.object(psycopg, 'connect', return_value=conn), \
+                        mock.patch.object(self.recipe, 'compile_binary', side_effect=compile_fake) as build, \
+                        mock.patch.object(self.recipe.subprocess, 'run', return_value=types.SimpleNamespace(
+                            stdout='wrong' if failure == 'version' else 'PgBouncer 1.26.0')) as version, \
+                        mock.patch.object(self.recipe, 'run', side_effect=fail_command) as command:
+                    with mock.patch.object(self.recipe, 'socket_conninfo',
+                            side_effect=ValueError('bad option') if failure == 'dsn' else None,
+                            return_value='host=/private/socket sslmode=disable'), \
+                            mock.patch.object(self.recipe, 'write_new',
+                                side_effect=fail_write if failure == 'write' else real_write):
+                        with self.assertRaises((ValueError, OSError, RuntimeError)):
+                            self.recipe.install(home, state, config)
+                    for artifact in (binary, config, settings / 'userlist.txt',
+                                     state / 'socket.dsn', unit):
+                        self.assertFalse(artifact.exists(), artifact)
+                    self.assertEqual(original.read_bytes(), raw)
+                    self.assertEqual(sentinel.read_text(), 'keep')
+                    if failure == 'dsn':
+                        build.assert_not_called()
+                    if failure == 'start':
+                        self.assertIn(mock.call(['systemctl', '--user', 'stop',
+                                                'ameesh-pgbouncer.service']), command.call_args_list)
+                    version.return_value.stdout = 'PgBouncer 1.26.0'
+                    command.side_effect = None
+                    self.recipe.install(home, state, config)
+                    self.assertTrue(binary.exists())
+                    self.assertTrue(unit.exists())
+                    self.assertEqual(original.read_bytes(), raw)
+
+    def test_failed_exclusive_write_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'new-file'
+            with mock.patch.object(self.recipe.os, 'fsync', side_effect=OSError('disk error')):
+                with self.assertRaises(OSError):
+                    self.recipe.write_new(path, b'partial')
+            self.assertFalse(path.exists())
+            self.recipe.write_new(path, b'retry')
+            self.assertEqual(path.read_bytes(), b'retry')
 
     def test_approved_home_compares_and_returns_canonical_paths(self):
         with tempfile.TemporaryDirectory() as directory:

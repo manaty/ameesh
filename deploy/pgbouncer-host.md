@@ -5,7 +5,9 @@ under the Unix user running Ameesh. The script checks the system hostname and
 real/effective UID before creating directories or dispatching any action.
 Only `ameesh-agents-1` / `ameesh` and `ameesh-agents-2` / `ameesh` are accepted;
 root and a mismatched HOME are refused (HOME and the account home are compared
-as canonical paths, and the canonical home is used). Bureau must invoke the script as that
+as canonical paths, and the canonical home is used). This accepts an account
+home that is itself a symlink, including one targeting a different directory;
+this guard checks account identity and path agreement, not a fixed `/home` root. Bureau must invoke the script as that
 user, with its user-systemd environment. Agents prepare the files and tests;
 they do not install, switch configuration or restart services on these VMs.
 
@@ -31,7 +33,12 @@ export TMPDIR="$HOME/.local/state/pgbouncer-build"
 
 Installation refuses an existing configuration/service or **any preexisting
 binary**, including symlinks. A matching `--version` is not proof of provenance.
-Only a binary freshly compiled by this invocation may be executed.
+Only a binary freshly compiled by this invocation may be executed. The local
+DSN and credentials are validated before writing installation files. On a later
+failure, files created by this invocation are removed so installation can be
+retried; any attempted service start is stopped first. If stopping fails, files
+are retained and bureau must stop the service and inspect them before cleanup.
+Preexisting files are never removed.
 Version 1.26.0 is compiled under `ameesh heavy --` from the
 [official archive](https://www.pgbouncer.org/downloads/files/1.26.0/pgbouncer-1.26.0.tar.gz),
 with pinned SHA256 `afd25dd61ee6775d37b40629b87ce08736b3e6955f3057bb212e410fbf21c71d`.
@@ -75,8 +82,10 @@ configuration atomically with mode 0600. A running process keeps its original
 DSN until restart. No runner is restarted by the script.
 The socket DSN retains SQL startup options while removing upstream TLS
 negotiation, certificate and channel-binding settings and `hostaddr`;
-The local DSN explicitly sets `sslnegotiation=postgres` with `sslmode=disable`,
-overriding `PGSSLNEGOTIATION=direct` and libpq service defaults as well.
+The local DSN explicitly sets `sslmode=disable`. With libpq 17 or later, it also
+sets `sslnegotiation=postgres`, overriding `PGSSLNEGOTIATION=direct` and libpq
+service defaults. With libpq 16 or earlier, that unsupported option is omitted;
+these versions do not implement direct TLS negotiation.
 
 Before/after JSON records contain server-wide client count, `max_connections`,
 counts by client IP and state, local runner count and direct TCP connections

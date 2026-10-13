@@ -57,10 +57,14 @@ def private_dir(path):
 
 def write_new(path, content, mode=0o600):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    with os.fdopen(fd, 'wb') as stream:
-        stream.write(content.encode() if isinstance(content, str) else content)
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(content.encode() if isinstance(content, str) else content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink()
+        raise
 
 
 def replace(path, content):
@@ -121,8 +125,10 @@ def socket_conninfo(dsn, socket_dir):
         if key.startswith('ssl') or key in ('hostaddr', 'channel_binding'):
             del params[key]
     # Explicitly override PGSSLNEGOTIATION and libpq service defaults, too.
-    params.update(host=str(socket_dir), port='6432', sslmode='disable',
-                  sslnegotiation='postgres', password='')
+    params.update(host=str(socket_dir), port='6432', sslmode='disable', password='')
+    # libpq <= 16 has neither this option nor direct TLS negotiation.
+    if psycopg.pq.version() >= 170000:
+        params['sslnegotiation'] = 'postgres'
     return psycopg.conninfo.make_conninfo(**params)
 
 
@@ -140,9 +146,11 @@ def install(home, state, config):
     configured = json.loads((home / '.config/ameesh/config.json').read_text())
     if configured.get('dsn') != cfg.dsn:
         raise ValueError('DSN override differs from config; unset overrides first')
-    if config.exists() or (home / '.config/systemd/user/ameesh-pgbouncer.service').exists():
-        raise ValueError('existing installation; refusing overwrite')
     settings = home / '.config/pgbouncer'
+    unit = home / '.config/systemd/user/ameesh-pgbouncer.service'
+    artifacts = (config, settings / 'userlist.txt', state / 'socket.dsn', unit)
+    if any(os.path.lexists(path) for path in artifacts):
+        raise ValueError('existing installation; refusing overwrite')
     private_dir(settings)
     private_dir(state / 'socket')
     # Resolve defaults and .pgpass in libpq, without writing secrets to argv.
@@ -158,12 +166,6 @@ def install(home, state, config):
         raise ValueError('unsupported upstream identifiers')
     if not password:
         raise ValueError('upstream password unavailable')
-    compile_binary(home)
-    # Only the binary just built from the pinned archive may be executed.
-    result = subprocess.run([str(binary), '--version'],
-                            capture_output=True, text=True, check=True)
-    if f'PgBouncer {VERSION}' not in result.stdout:
-        raise ValueError('unexpected binary version')
     # Require TLS; preserve certificate verification if the original DSN
     # requested it. Certificate paths are unsupported until explicitly reviewed.
     tls = params.get('sslmode', 'require')
@@ -171,9 +173,26 @@ def install(home, state, config):
         tls = 'require'
     if any(params.get(key) for key in ('sslrootcert', 'sslcert', 'sslkey')):
         raise ValueError('custom TLS files require a reviewed configuration')
-    write_new(settings / 'userlist.txt', userlist_quote(user) + ' ' +
-              userlist_quote(password) + '\n')
-    write_new(config, f'''[databases]
+    # Validate libpq options and secrets before writing any install artifact.
+    socket_dsn = socket_conninfo(cfg.dsn, state / 'socket')
+    credentials = userlist_quote(user) + ' ' + userlist_quote(password) + '\n'
+    created = []
+    start_attempted = False
+
+    def create(path, content):
+        write_new(path, content)
+        created.append(path)
+
+    try:
+        compile_binary(home)
+        created.append(binary)
+        # Only the binary just built from the pinned archive may be executed.
+        result = subprocess.run([str(binary), '--version'],
+                                capture_output=True, text=True, check=True)
+        if f'PgBouncer {VERSION}' not in result.stdout:
+            raise ValueError('unexpected binary version')
+        create(settings / 'userlist.txt', credentials)
+        create(config, f'''[databases]
 {dbname} = host={upstream} port={port} dbname={dbname}
 
 [pgbouncer]
@@ -199,12 +218,10 @@ log_connections = 0
 log_disconnections = 0
 log_stats = 0
 ''')
-    socket_dsn = socket_conninfo(cfg.dsn, state / 'socket')
-    # Socket DSN is persisted only in a private file, not printed.
-    write_new(state / 'socket.dsn', socket_dsn)
-    unit = home / '.config/systemd/user/ameesh-pgbouncer.service'
-    unit.parent.mkdir(parents=True, exist_ok=True)
-    write_new(unit, f'''[Unit]
+        # Socket DSN is persisted only in a private file, not printed.
+        create(state / 'socket.dsn', socket_dsn)
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        create(unit, f'''[Unit]
 Description=Local PgBouncer for Ameesh (#653)
 After=network.target
 
@@ -220,9 +237,20 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 [Install]
 WantedBy=default.target
 ''')
-    run(['systemd-analyze', '--user', 'verify', str(unit)])
-    run(['systemctl', '--user', 'daemon-reload'])
-    run(['systemctl', '--user', 'start', 'ameesh-pgbouncer.service'])
+        run(['systemd-analyze', '--user', 'verify', str(unit)])
+        run(['systemctl', '--user', 'daemon-reload'])
+        start_attempted = True
+        run(['systemctl', '--user', 'start', 'ameesh-pgbouncer.service'])
+    except BaseException:
+        # A failed start may still have spawned a process. Stop it before
+        # deleting its files; if stop fails, retain them for operator diagnosis.
+        if start_attempted:
+            run(['systemctl', '--user', 'stop', 'ameesh-pgbouncer.service'])
+        for path in reversed(created):
+            path.unlink()
+        if unit in created:
+            run(['systemctl', '--user', 'daemon-reload'])
+        raise
     print('Installed and started; Ameesh configuration unchanged; service not enabled.')
 
 
