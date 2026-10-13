@@ -437,7 +437,11 @@ registers an unknown agent as `externe`.
 the identity bound to the session, `whoami`); "all" skips stopped agents.
 Undeliverable mail raises the `mail_undeliverable` alert, and `ameesh
 mail forward <ancien> <nouveau>` re-delivers a dead mailbox to a live agent,
-keeping the original sender and date. Details:
+keeping the original sender and date. The executor's cleanup also sweeps dead
+mailboxes (`ameesh mail sweep`, L976): a stopped agent's mail goes to its bound
+successor, and mail nobody can read expires after `mail_dead_letter_days`
+(7 by default), with a thread trace — the alert clears without a human.
+Details:
 [EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
 
 **Hooks: write first, mark after.** The JSON is written to stdout and

@@ -308,6 +308,11 @@ class Config:
     #: défaut) : les entrées plus anciennes sont retirées par le ménage de
     #: l'exécuteur ; 0 = aucune expiration
     thread_retention_days: int = 365
+    #: rétention du courrier en souffrance, en jours (L976) : le ménage de
+    #: l'exécuteur re-livre au successeur d'un agent arrêté, et expire au-delà
+    #: de ce délai le courrier dont personne ne lit la boîte (arrêté sans
+    #: successeur, nom absent du registre) ; 0 = aucune expiration
+    mail_dead_letter_days: int = 7
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
     #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
     project: str = ""
@@ -600,6 +605,8 @@ def load(env: dict | None = None) -> Config:
         threads_dir=_expand(threads_brut) if threads_brut else "",
         thread_retention_days=_as_days(pick("AMEESH_THREAD_RETENTION_DAYS"),
                                         cfg.thread_retention_days),
+        mail_dead_letter_days=_as_days(pick("AMEESH_MAIL_DEAD_LETTER_DAYS"),
+                                       cfg.mail_dead_letter_days),
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),

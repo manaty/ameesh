@@ -505,5 +505,188 @@ class RenvoiTest(_Base):
         self.assertEqual([m["id"] for m in mail.unread(self.db, "claude3")], [reserved])
 
 
+class SweepTest(_Base):
+    """L976 : le balayage vide les boîtes mortes sans geste humain — re-livraison
+    au successeur déclaré (session liée, L41), sinon expiration message par
+    message après `mail_dead_letter_days`, avec trace ; l'alerte
+    `mail_undeliverable` peut alors se vider d'elle-même."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in ("claude1", "mesh-design", "orchestrateur"):
+            self.agent(name)
+        self.agent("claude3")
+
+    def lie(self, agent="claude3", session="s-claude3", to="mesh-design"):
+        """Déclare `to` successeur de `agent` (sa session est liée)."""
+        registry.set_session(self.db, agent, session)
+        storage.of(self.db).session_bindings.bind(
+            host=self.cfg.host, harness="claude", session_id=session, agent=to,
+            pid=None, created_by="human:proprio")
+
+    def age(self, days):
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - make_interval("
+                        "days => %s)", (int(days),))
+
+    def alertes(self):
+        return [a for a in exploitation.alerts(self.cfg, self.db)
+                if a["type"] == "mail_undeliverable"]
+
+    def test_re_delivre_au_successeur_declare(self):
+        self.lie()
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport 1.")
+        mail.send(self.db, "orchestrateur", "claude3", "Gel du lot.", kind="event")
+        self.age(2)
+        report = undeliverable.sweep(self.cfg, self.db)
+        self.assertEqual(report["days"], 7)
+        [fwd] = report["forwarded"]
+        self.assertEqual((fwd["old"], fwd["new"], fwd["count"]),
+                         ("claude3", "mesh-design", 2))
+        self.assertEqual(report["expired"], [])
+        self.assertEqual(self.pending("claude3"), [])
+        copies = mail.unread(self.db, "mesh-design")
+        self.assertEqual([c["body"] for c in copies], ["Rapport 1.", "Gel du lot."])
+        self.assertEqual(copies[0]["forwarded_from"], "claude3")   # expéditeur et date gardés
+        self.assertEqual(self.alertes(), [])
+        # rejoué : plus rien à faire, aucune erreur
+        again = undeliverable.sweep(self.cfg, self.db)
+        self.assertEqual((again["forwarded"], again["expired"], again["refused"]),
+                         ([], [], []))
+
+    def test_expire_apres_la_retention_avec_trace(self):
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport 1.")
+        mail.send(self.db, "claude1", "claude3", "Rapport 2.")
+        self.age(3)
+        report = undeliverable.sweep(self.cfg, self.db)
+        self.assertEqual((report["forwarded"], report["expired"]), ([], []))
+        self.assertEqual(len(self.pending("claude3")), 2)          # sous la rétention
+        self.assertEqual(len(self.alertes()), 1)                   # mais déjà en alerte
+        self.age(8)
+        report = undeliverable.sweep(self.cfg, self.db)
+        [exp] = report["expired"]
+        self.assertEqual((exp["recipient"], exp["count"], exp["unknown"]),
+                         ("claude3", 2, False))
+        self.assertEqual(self.pending("claude3"), [])
+        rows = self.db.query("SELECT meta->'expired' AS note FROM agent_mailbox"
+                             " WHERE recipient = 'claude3' ORDER BY id")
+        for row in rows:
+            note = json.loads(row["note"]) if isinstance(row["note"], str) else row["note"]
+            self.assertEqual((note["days"], note["by"]), (7, "ameesh:mail-sweep"))
+        self.assertIn("Expired 2 undeliverable message(s) addressed to claude3",
+                      self.mesh("fil", "show", "manaty").stdout)
+        self.assertEqual(self.alertes(), [])                       # l'alerte se vide
+
+    def test_expire_respecte_le_seuil_du_message(self):
+        """Le défaut corrigé : sans le seuil, un message FRAIS d'une boîte morte
+        partait avec les vieux."""
+        self.stop("claude3")
+        old = mail.send(self.db, "claude1", "claude3", "Vieux.")
+        fresh = mail.send(self.db, "claude1", "claude3", "Frais.")
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'"
+                        " WHERE id = %s", (old,))
+        report = undeliverable.sweep(self.cfg, self.db)
+        [exp] = report["expired"]
+        self.assertEqual(exp["messages"], [old])
+        self.assertEqual([m["id"] for m in mail.unread(self.db, "claude3")], [fresh])
+
+    def test_epargne_reservation_active_et_boite_relancee(self):
+        self.stop("claude3")
+        free = mail.send(self.db, "claude1", "claude3", "Libre.")
+        reserved = mail.send(self.db, "claude1", "claude3", "En cours de remise.")
+        self.db.execute(
+            "UPDATE agent_mailbox SET meta = jsonb_build_object('consigne', jsonb_build_object("
+            "'jeton', 'j', 'expire', extract(epoch from clock_timestamp()) + 600))"
+            " WHERE id = %s", (reserved,))
+        self.age(8)
+        report = undeliverable.sweep(self.cfg, self.db)
+        [exp] = report["expired"]
+        self.assertEqual(exp["messages"], [free])
+        self.assertEqual([m["id"] for m in mail.unread(self.db, "claude3")], [reserved])
+        # un agent VIVANT n'est jamais expiré, même avec du vieux courrier
+        self.agent("claude2")
+        mail.send(self.db, "claude1", "claude2", "Pour un vivant.")
+        self.age(8)
+        self.assertEqual(storage.of(self.db).mailbox.expire_dead_letters(
+            "claude2", {"by": "test"}, time.time()), [])
+        self.assertEqual(len(self.pending("claude2")), 1)
+
+    def test_dry_run_ne_touche_rien(self):
+        self.lie()
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        self.age(8)
+        report = undeliverable.sweep(self.cfg, self.db, dry_run=True)
+        [fwd] = report["forwarded"]
+        self.assertEqual((fwd["count"], fwd["dry_run"]), (1, True))
+        self.assertEqual(len(self.pending("claude3")), 1)          # rien n'a bougé
+        # sans successeur : l'expiration à blanc dit ce qui partirait
+        self.db.execute("UPDATE session_bindings SET revoked_at = now()")
+        report = undeliverable.sweep(self.cfg, self.db, dry_run=True)
+        [exp] = report["expired"]
+        self.assertEqual((exp["count"], exp["dry_run"]), (1, True))
+        self.assertEqual(len(self.pending("claude3")), 1)
+
+    def test_retention_nulle_ou_surchargee(self):
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        self.age(30)
+        report = undeliverable.sweep(self.cfg, self.db, days=0)
+        self.assertEqual((report["days"], report["cutoff"], report["expired"]),
+                         (0, None, []))                            # 0 = jamais
+        self.assertEqual(len(self.pending("claude3")), 1)
+        report = undeliverable.sweep(self.cfg, self.db, days=7)
+        self.assertEqual(report["expired"][0]["count"], 1)
+
+    def test_successeur_arrete_refus_puis_retention(self):
+        self.lie()
+        self.stop("mesh-design")
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        self.age(8)
+        report = undeliverable.sweep(self.cfg, self.db)
+        self.assertEqual(report["forwarded"], [])
+        [refused] = report["refused"]
+        self.assertEqual((refused["old"], refused["new"]), ("claude3", "mesh-design"))
+        self.assertEqual(report["expired"][0]["count"], 1)         # pas d'attente infinie
+
+    def test_le_menage_de_l_executeur_balaye_et_respecte_dry_run(self):
+        import types
+        from ameesh import runner as runner_mod
+        self.lie()
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        fake = types.SimpleNamespace(cfg=self.cfg, dry_run=True, mediated=False)
+        first = runner_mod.Runner.sweep_dead_letters_once(fake, self.db, clock=1000.0)
+        self.assertEqual(first["forwarded"][0]["count"], 1)
+        self.assertEqual(len(self.pending("claude3")), 1)          # dry-run : rien bougé
+        self.assertEqual(fake._dead_letters_next,
+                         1000.0 + runner_mod.DEAD_LETTER_SWEEP_EVERY_S)
+        self.assertIsNone(runner_mod.Runner.sweep_dead_letters_once(
+            fake, self.db, clock=1001.0))                          # au plus une fois par heure
+        fake.dry_run = False
+        second = runner_mod.Runner.sweep_dead_letters_once(fake, self.db, clock=5000.0)
+        self.assertEqual(second["forwarded"][0]["count"], 1)
+        self.assertEqual(self.pending("claude3"), [])
+
+    def test_cli_sweep(self):
+        self.lie()
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        out = self.mesh("mail", "sweep", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("dry run", out.stdout)
+        self.assertIn("claude3 (stopped): 1 message(s) would be re-delivered to mesh-design",
+                      out.stdout)
+        self.assertEqual(len(self.pending("claude3")), 1)
+        out = self.mesh("mail", "sweep", "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        payload = json.loads(out.stdout)
+        self.assertEqual(payload["forwarded"][0]["new"], "mesh-design")
+        self.assertEqual(self.pending("claude3"), [])
+        self.assertEqual(self.mesh("mail", "sweep", "--days", "-1").returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

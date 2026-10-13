@@ -439,3 +439,37 @@ class Mailbox(interface.Mailbox):
                 """ % ", ".join("(%d, %d)" % pair for pair in pairs),
                 (new, by))
         return sorted(rows, key=lambda row: int(row["original_id"]))
+
+    def expire_dead_letters(self, recipient, note, before_ts, dry_run=False) -> list[dict]:
+        # L976 : expire le courrier en souffrance d'une boîte morte. Le
+        # destinataire est revérifié dans le WHERE : relancé entre la lecture
+        # et l'écriture, il garde son courrier. Mêmes exclusions que
+        # `dead_letters` (L124 : une demande de décision attend un humain) et
+        # que `forward` (réservation active : le message est peut-être montré).
+        # `before_ts` : seuls les messages reçus avant ce seuil (la rétention).
+        where = """
+             WHERE m.recipient = %%s
+               AND m.delivered_at IS NULL
+               AND m.created_at <= to_timestamp(%%s)
+               AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
+               AND NOT (%s)
+               AND NOT EXISTS (SELECT 1 FROM agent_registry r
+                                WHERE r.name = m.recipient AND r.status <> 'stopped')
+            """ % _RESERVED_SQL
+        columns = ("m.id, m.sender, m.kind,"
+                   " extract(epoch from m.created_at)::float8 AS created_ts")
+        params = (recipient, float(before_ts))
+        if dry_run:
+            rows = self.db.query("SELECT %s FROM agent_mailbox AS m%s"
+                                 % (columns, where), params)
+        else:
+            rows = self.db.query(
+                """
+                UPDATE agent_mailbox AS m
+                   SET delivered_at = now(), status = 'delivered',
+                       meta = m.meta || jsonb_build_object('expired', %%s::jsonb)
+                %s
+                 RETURNING %s
+                """ % (where, columns),
+                (json.dumps(note or {}, ensure_ascii=False),) + params)
+        return sorted(rows, key=lambda row: int(row["id"]))

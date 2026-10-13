@@ -818,6 +818,18 @@ class Mailbox(Domain):
         `sender`, `kind`, `work_item_id`, `created_ts`."""
 
     @abc.abstractmethod
+    def expire_dead_letters(self, recipient: str, note: dict, before_ts: float,
+                            dry_run: bool = False) -> list[dict]:
+        """L976 : expire le courrier en souffrance de `recipient` — non remis,
+        reçu avant `before_ts`, sans réservation active, hors demande de
+        décision (L124) — à condition qu'il soit TOUJOURS une boîte morte
+        (absent du registre ou arrêté) : marqué remis, `note` dans
+        `meta.expired`. Un destinataire relancé entre la lecture et l'écriture
+        garde son courrier. Rend une ligne par message expiré : `id`, `sender`,
+        `kind`, `created_ts` ; `dry_run` : ceux qui le seraient, rien n'est
+        écrit."""
+
+    @abc.abstractmethod
     def human_messages(self, *, since_ts: float, humans: Sequence[str],
                        limit: int) -> list[dict]:
         """L130 : les messages d'humains déposés depuis `since_ts`, du plus
