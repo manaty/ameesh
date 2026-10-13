@@ -459,6 +459,17 @@ def open_lots(db: Db, assignee: str) -> list[dict]:
     return storage.of(db).work.open_for(assignee)
 
 
+def release_lots(db: Db, agent: str, *, reason: str, actor: str = "") -> list[dict]:
+    """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+    d'équipe — assigné effacé (assignee = NULL), journal au lot avec la raison,
+    délégation en cours annulée. Rend les lots rendus ; idempotent (un lot
+    repris ou fermé entre-temps n'est pas touché)."""
+    name = (agent or "").strip()
+    if not name:
+        return []
+    return storage.of(db).work.release_agent(name, reason=reason, actor=actor)
+
+
 # --------------------------------------------------------------------------
 # attribution gardée (L37, règle 2 de la décision 0030)
 # --------------------------------------------------------------------------

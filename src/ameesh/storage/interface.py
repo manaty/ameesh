@@ -1181,6 +1181,13 @@ class WorkItems(Domain):
         """L118 : les lots ouverts d'un assigné."""
 
     @abc.abstractmethod
+    def release_agent(self, agent: str, *, reason: str, actor: str) -> list[dict]:
+        """#753 : les lots ouverts d'un agent retournent à la file d'équipe
+        (assigné effacé, journal au lot avec la raison), en une transaction.
+        Rend les lots rendus. Idempotent : un lot dont l'assigné a changé
+        entre-temps n'est pas touché."""
+
+    @abc.abstractmethod
     def open_by_ref(self, ref: str) -> list[dict]:
         """L118 : les lots ouverts désignés par une référence (issue, fiche,
         branche, premier mot du titre)."""

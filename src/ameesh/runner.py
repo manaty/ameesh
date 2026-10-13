@@ -5022,8 +5022,49 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    def release_stopped_lots_once(self) -> list[dict]:
+        """#753 : un agent arrêté ne garde pas ses lots. À chaque passe, les
+        lots ouverts d'un agent `stopped` retournent à la file d'équipe
+        (assigné effacé, journal au lot). Ne dépend d'aucun agent : tout
+        exécuteur vivant le fait ; idempotent (verrou de ligne et recontrôle
+        côté base). Une erreur de base n'est pas fatale à la passe."""
+        from . import work as work_mod
+
+        if getattr(self, "mediated", False):
+            return []  # L109 : le registre est tenu par le serveur
+        try:
+            agents = registry.overview(self.db)
+        except db_mod.DbError as exc:
+            message = "stopped agents not swept (%s)" % exc
+            if message != getattr(self, "_stopped_lots_error", None):
+                log_async(message)
+            self._stopped_lots_error = message
+            return []
+        self._stopped_lots_error = None
+        out: list[dict] = []
+        for agent in agents:
+            if agent.get("status") != "stopped":
+                continue
+            try:
+                done = work_mod.release_lots(
+                    self.db, agent["name"],
+                    reason="agent stopped: returned to the team queue (#753)",
+                    actor="runner %s" % self.runner_id)
+            except db_mod.DbError as exc:
+                message = "stopped lots of %s not released (%s)" % (agent["name"], exc)
+                if message != getattr(self, "_stopped_lots_error", None):
+                    log_async(message)
+                self._stopped_lots_error = message
+                continue
+            for row in done:
+                log_async("lot #%s returned to the team queue (%s stopped)"
+                          % (row["id"], agent["name"]))
+            out.extend(done)
+        return out
+
     def sweep(self) -> None:
         self.expire_delegations_once()
+        self.release_stopped_lots_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
         finished = []
@@ -6839,6 +6880,15 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     # `stopped_with_mail` (l'humain sait qu'il l'a arrêté)
     registry.set_status(db, args[0], "stopped", status_text="stopped by hand",
                         stop_reason="manuel")
+    # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
+    # retournent à la file d'équipe (assignee = NULL, journal avec la raison).
+    from . import work as work_mod
+    returned = work_mod.release_lots(
+        db, args[0],
+        reason="stopped by hand: returned to the team queue (#753)",
+        actor="stop")
+    for row in returned:
+        log("lot #%s returned to the team queue" % row["id"])
     log("agent %s marked stopped" % args[0])
     return 0
 

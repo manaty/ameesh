@@ -913,6 +913,39 @@ class WorkItems(interface.WorkItems):
             " WHERE assignee = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
             " ORDER BY id" % ITEM_COLUMNS, (assignee,))
 
+    def release_agent(self, agent, *, reason, actor) -> list[dict]:
+        """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+        d'équipe — assigné effacé, journal au lot (raison), délégation en cours
+        annulée, le tout dans une transaction. Le lot est verrouillé puis
+        l'assigné recontrôlé : un lot repris entre-temps n'est pas touché."""
+        with self.db.transaction() as tx:
+            return WorkItems(tx)._release_agent(agent, reason=reason, actor=actor)
+
+    def _release_agent(self, agent, *, reason, actor) -> list[dict]:
+        """`release_agent` dans la transaction ouverte."""
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE assignee = %s"
+            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+            " ORDER BY id FOR NO KEY UPDATE", (agent,))
+        out: list[dict] = []
+        for row in rows:
+            updated = self.db.query(
+                "UPDATE work_items SET assignee = NULL, updated_at = now(),"
+                "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                " WHERE id = %%s AND assignee = %%s"
+                "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                " RETURNING %s" % ITEM_COLUMNS, (int(row["id"]), agent))
+            if not updated:
+                continue
+            self.db.query(
+                "UPDATE work_item_delegations SET outcome = 'annulee',"
+                "       resolved_at = now(), resolved_by = %s"
+                " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
+                (actor or "", int(row["id"])))
+            self._event(int(row["id"]), updated[0]["state"], reason, actor)
+            out.append(updated[0])
+        return out
+
     def open_by_ref(self, ref) -> list[dict]:
         """Les lots ouverts désignés par une référence : `issue_ref`, fiche du
         plan (`package_id`), branche, ou premier mot du titre (« REF : … »),
