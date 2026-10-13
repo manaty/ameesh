@@ -74,7 +74,7 @@ team: ameesh                  # still read when projects: is absent
   project's work root, `policy.work_dir(lot_project, agent)`. Its session is
   opened there through the per-lot sessions of #408 (L165b, merged:
   `agent_lot_sessions`, migration 0384), which store `cwd` per (agent, lot).
-  Until L243-3 is merged, a multi-project agent only picks up lots from its
+  Until #811 is merged, a multi-project agent only picks up lots from its
   primary project automatically. Lots from other projects must then be
   assigned to it explicitly.
 
@@ -118,15 +118,14 @@ team: ameesh                  # still read when projects: is absent
 Implementation goes to DeepSeek agents, at the owner's request of 12/10
 14:46. Every PR is reviewed by Codex. Durations are design estimates.
 
-| Lot | Content | Depends on | Estimate |
-|---|---|---|---|
-| L243-1 | Card field, validation (`agent-team-mismatch`, `agent-project-unknown`), migration `projects text[]`, sync with `team = projects[0]`, both drivers and grants | — | 3 h |
-| L243-2 | Consumers: pick-up, orchestrators, alert briefs, idle-capacity briefs, `roadmap --project`, `progress`, `ameesh projects` and `mesh list` display | L243-1 | 3 h |
-| L243-3 | Work directory per lot project, session `cwd` taken from the lot (`agent_lot_sessions`) | L243-1 | 2 h |
-| L243-4 | `naming:` block, generator `canon agent name`, `spawn` without a name, `agent-name-convention` warning, reserved retired names | #414 | 3 h |
+| Lot | Content | Depends on | Estimate | State (13/10) |
+|---|---|---|---|---|
+| #435 | Card field, validation (`agent-team-mismatch`, `agent-project-unknown`), migration `projects text[]` (0388), sync with `team = projects[0]`, both drivers and grants | — | 3 h | merged |
+| #810 | Consumers: pick-up, orchestrators, alert briefs, idle-capacity briefs, `roadmap --project`, `progress`, `ameesh projects` and `mesh list` display | #435 | 3 h | intake |
+| #811 | Work directory per lot project, session `cwd` taken from the lot (`agent_lot_sessions`) | #810 | 2 h | intake |
+| #468 | `naming:` block, generator `canon agent name`, `spawn` without a name, `agent-name-convention` warning, reserved retired names | #414 | 3 h | merged |
 
-L243-1 and L243-4 can start at the same time. #423 (renaming with aliases)
-needs L243-4 for the target names and adds the alias layer.
+#423 (renaming with aliases) uses the names of #468 and adds the alias layer.
 
 ## Out of scope
 
