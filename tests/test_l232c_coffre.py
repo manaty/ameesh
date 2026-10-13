@@ -475,6 +475,186 @@ class InstalleurTest(Materiel):
                          {"version": request["version"], "previous": premier["version"]})
         self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(), CANARY)
 
+    def test_reprise_deux_arrets_successifs_dont_un_dans_la_reprise(self):
+        class Arret(Exception):
+            pass
+
+        _, premier = self.handle()
+        etat = {"casse": True}
+
+        def sante(destination):
+            if etat["casse"]:
+                raise Arret()
+            return True
+
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        installeur._health = sante
+        pending = self.key.with_name(self.key.name + ".pending")
+        rollback = self.key.with_name(self.key.name + ".rollback")
+        sidecar = self.key.with_name(self.key.name + ".version")
+        payload, request = self.trame(value=b"sk-canary-v2", operation="rotate")
+
+        # premier arret : la rotation a publie la valeur sans commit.
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": premier["version"]})
+        self.assertTrue(pending.exists() and rollback.exists())
+
+        # second arret, dans la reprise : la valeur et le record sont restaures
+        # durablement, mais l'intention n'est pas encore effacee.
+        etat["casse"] = False
+        menage = installeur._unlink_pending
+
+        def arret(destination):
+            raise Arret()
+
+        installeur._unlink_pending = arret
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        self.assertEqual(self.key.read_bytes(), CANARY)
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": premier["version"]})
+        self.assertTrue(pending.exists())
+        # la copie de retour ne part qu'apres l'effacement de l'intention :
+        # la deuxieme reprise reste decidable au lieu de manquer sa copie.
+        self.assertTrue(rollback.exists())
+
+        # troisieme invocation : la reprise se rejoue a l'identique, puis la
+        # rotation aboutit.
+        installeur._unlink_pending = menage
+        receipt = json.loads(installeur.handle(payload))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(receipt["version"], request["version"])
+        self.assertFalse(receipt["replayed"])
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": request["version"],
+                          "previous": premier["version"]})
+        self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(), CANARY)
+        self.assertFalse(pending.exists() or rollback.exists())
+
+    def test_reprise_apres_intention_effacee_copie_orpheline(self):
+        class Arret(Exception):
+            pass
+
+        _, premier = self.handle()
+        etat = {"casse": True}
+
+        def sante(destination):
+            if etat["casse"]:
+                raise Arret()
+            return True
+
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        installeur._health = sante
+        pending = self.key.with_name(self.key.name + ".pending")
+        rollback = self.key.with_name(self.key.name + ".rollback")
+        sidecar = self.key.with_name(self.key.name + ".version")
+        payload, request = self.trame(value=b"sk-canary-v2", operation="rotate")
+
+        # premier arret : la valeur est publiee, le record ne l'est pas.
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        etat["casse"] = False
+
+        # la reprise efface l'intention durablement, puis meurt avant de
+        # retirer sa copie de retour.
+        menage = installeur._discard_rollback
+
+        def arret(destination):
+            raise Arret()
+
+        installeur._discard_rollback = arret
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        self.assertFalse(pending.exists())
+        self.assertTrue(rollback.exists())
+        self.assertEqual(self.key.read_bytes(), CANARY)
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": premier["version"]})
+
+        # la copie orpheline est inerte : l'operation suivante la retire et
+        # refait la rotation depuis l'etat restaure.
+        installeur._discard_rollback = menage
+        receipt = json.loads(installeur.handle(payload))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": request["version"],
+                          "previous": premier["version"]})
+        self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(), CANARY)
+        self.assertFalse(pending.exists() or rollback.exists())
+
+    def test_menage_les_transitions_sont_fsyncees(self):
+        class Arret(Exception):
+            pass
+
+        _, premier = self.handle()
+        etat = {"casse": True}
+
+        def sante(destination):
+            if etat["casse"]:
+                raise Arret()
+            return True
+
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        installeur._health = sante
+        pending = self.key.with_name(self.key.name + ".pending")
+        rollback = self.key.with_name(self.key.name + ".rollback")
+        payload, _ = self.trame(value=b"sk-canary-v2", operation="rotate")
+
+        # premier arret : la valeur est publiee, le record ne l'est pas.
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        etat["casse"] = False
+
+        # la reprise restaure, efface l'intention puis retire la copie : chaque
+        # transition de menage est observee avec le fsync du repertoire.
+        evenements = []
+        menage = installeur._unlink_pending
+        copie = installeur._discard_rollback
+
+        def unlink_pending(destination):
+            evenements.append(("avant-intention", pending.exists(),
+                               rollback.exists()))
+            menage(destination)
+            evenements.append(("apres-intention", pending.exists(),
+                               rollback.exists()))
+
+        def discard_rollback(destination):
+            evenements.append(("avant-copie", pending.exists(),
+                               rollback.exists()))
+            copie(destination)
+            evenements.append(("apres-copie", pending.exists(),
+                               rollback.exists()))
+
+        vrai = os.fsync
+        dossier = os.stat(self.account_dir)
+
+        def fsync(fd):
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode) and info.st_ino == dossier.st_ino:
+                evenements.append(("fsync", pending.exists(), rollback.exists()))
+            return vrai(fd)
+
+        installeur._unlink_pending = unlink_pending
+        installeur._discard_rollback = discard_rollback
+        os.fsync = fsync
+        try:
+            receipt = json.loads(installeur.handle(payload))
+        finally:
+            os.fsync = vrai
+        self.assertTrue(receipt["ok"], receipt)
+        debut = evenements.index(("avant-intention", True, True))
+        milieu = evenements.index(("avant-copie", False, True))
+        fin = evenements.index(("apres-copie", False, False))
+        # l'effacement de l'intention est fsynce avant que la copie ne parte.
+        self.assertIn(("fsync", False, True), evenements[debut:milieu])
+        # le retrait de la copie est fsynce a son tour.
+        self.assertIn(("fsync", False, False), evenements[milieu:fin])
+
     def test_temporaires_orphelins_retires(self):
         reste = self.key.with_name("." + self.key.name + ".tmp-abcdef")
         reste.write_bytes(b"reste d'un arret brutal")

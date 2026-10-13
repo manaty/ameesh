@@ -562,21 +562,54 @@ class Installeur:
             raise Refused('pending_record')
         return record
 
+    def _fsync_dir(self, directory: Path) -> None:
+        """Rend durable une transition de répertoire (création, rename, unlink)."""
+        fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _replace(self, source: Path, target: Path) -> None:
+        """Renomme, et rend le renommage durable."""
+        try:
+            os.replace(source, target)
+        except OSError:
+            raise Uncertain('write') from None
+        try:
+            self._fsync_dir(source.parent)
+        except OSError:
+            raise Uncertain('write') from None
+
+    def _unlink(self, path: Path) -> None:
+        """Retire un fichier de ménage, et rend le retrait durable."""
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise Uncertain('write') from None
+        try:
+            self._fsync_dir(path.parent)
+        except OSError:
+            raise Uncertain('write') from None
+
     def _finish(self, destination: Destination, keep: bool) -> None:
         """Après commit : la copie de retour devient la précédente, ou part."""
         rollback = self._rollback_path(destination)
         if not rollback.exists():
             return
         if keep:
-            os.replace(rollback, self._backup_path(destination))
+            self._replace(rollback, self._backup_path(destination))
         else:
-            rollback.unlink()
+            self._unlink(rollback)
+
+    def _discard_rollback(self, destination: Destination) -> None:
+        """Retire une copie de retour devenue inerte (retrait durable)."""
+        self._unlink(self._rollback_path(destination))
 
     def _unlink_pending(self, destination: Destination) -> None:
-        try:
-            self._pending_path(destination).unlink()
-        except FileNotFoundError:
-            pass
+        self._unlink(self._pending_path(destination))
 
     def _recover(self, destination: Destination, owner: int, group: int) -> None:
         """Termine ou défait une installation interrompue.
@@ -585,10 +618,16 @@ class Installeur:
         reprise décidable sans condensat : si le sidecar porte déjà l'état
         visé, le commit a eu lieu et on termine le ménage ; sinon l'état
         d'avant est restauré à l'identique (valeur, précédente, sidecar) avant
-        tout nouvel effet.
+        tout nouvel effet. La copie de retour n'est retirée qu'une fois la
+        valeur et le sidecar restaurés durablement puis l'intention effacée
+        durablement : une reprise interrompue entre ces frontières se rejoue à
+        l'identique au lieu de manquer sa copie.
         """
         pending = self._pending(destination, owner)
         if pending is None:
+            # copie de retour sans intention : reste inerte d'une reprise
+            # menée à son terme, retiré sous le verrou.
+            self._discard_rollback(destination)
             return
         version, previous = pending['version'], pending['previous']
         keep = pending['keep']
@@ -611,22 +650,20 @@ class Installeur:
                                       limit=self.max_bytes)
             self._atomic_write(destination.path, preserved, destination,
                                mode=destination.mode, owner=owner, group=group)
-            rollback.unlink()
         else:
             path = destination.path
             if path.exists():
                 _protected_regular(path, owners=(owner, 0),
                                    modes=(destination.mode,))
-                path.unlink()
-            if rollback.exists():
-                rollback.unlink()
+                self._unlink(path)
         if pending['restore']:
             self._write_sidecar(destination, pending['restore'], owner, group)
         else:
-            sidecar = self._sidecar_path(destination)
-            if sidecar.exists():
-                sidecar.unlink()
+            self._unlink(self._sidecar_path(destination))
+        # l'intention s'efface durablement avant la copie de retour : une
+        # seconde interruption ici laisse la reprise encore décidable.
         self._unlink_pending(destination)
+        self._discard_rollback(destination)
 
     def _owner_ids(self, destination: Destination) -> tuple[int, int]:
         try:
@@ -692,11 +729,7 @@ class Installeur:
             if readback != data:
                 raise Uncertain('write_verify')
             os.replace(temporary, path)
-            directory = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            self._fsync_dir(parent)
         except SecretError:
             raise
         except OSError:
@@ -792,7 +825,7 @@ class Installeur:
             raise Refused('version_unknown')
         stale = self._backup_path(destination)
         if stale.exists():
-            stale.unlink()
+            self._unlink(stale)
         self._write_sidecar(destination, {'version': current}, owner, group)
         return {'protocol': PROTOCOL, 'operation': 'revoke',
                 'reference': request['reference'], 'version': version,

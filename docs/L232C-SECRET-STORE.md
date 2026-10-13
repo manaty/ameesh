@@ -93,7 +93,14 @@ decidable without a digest:
   becomes `.previous`, or is dropped; the intent is cleared) or undone (the
   value, the retained previous version and the record are restored exactly as
   before the intent). A missing rollback copy freezes the destination
-  (`rollback_missing`) instead of guessing.
+  (`rollback_missing`) instead of guessing;
+- an interrupted recovery replays identically: the rollback copy is kept until
+  the value and the record are durably restored **and** the intent is durably
+  erased; only then is the copy dropped. A copy left behind without an intent
+  is inert and removed by the next locked operation;
+- every cleanup transition (unlink of the intent, of the value, of the record,
+  of the copy, or rename of the copy to `.previous`) is followed by an `fsync`
+  of the directory, so a restart reads the same state back.
 
 An `install` never replaces a managed value: on a destination that has a
 version record, an `install` with a different version id is refused before any
@@ -160,7 +167,7 @@ journal carries no value, no digest and no connection string.
 
 ## Tests
 
-`tests/test_l232c_coffre.py` (47 cases, no database, no root, no network):
+`tests/test_l232c_coffre.py` (50 cases, no database, no root, no network):
 
     PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre
 
@@ -172,6 +179,8 @@ revocation, transport failure and inconsistent receipts, the refusal of an
 `install` on a managed destination (and the `rotate` authority), recovery
 after an interruption at each transaction boundary (value written without
 commit, intent without value, rollback copy without intent, commit without
-cleanup, orphan temporary), concurrent rotations and rotate/revoke, an
-inter-process `flock` holder, and a subprocess canary through the helper
-entry point.
+cleanup, orphan temporary, two successive stops — the second in the middle of
+the recovery, before the intent is erased — a copy left after the intent is
+gone, and the `fsync` of every cleanup transition), concurrent rotations and
+rotate/revoke, an inter-process `flock` holder, and a subprocess canary through
+the helper entry point.
