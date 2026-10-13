@@ -383,23 +383,27 @@ def _session_patterns(row: dict) -> tuple[str, ...]:
 def _agent_home(cfg, row: dict, agent: str = "") -> str:
     """Le home du propriétaire, seulement s'il est prouvable (N de relecture #731).
 
-    Le propriétaire est le compte de session inscrit au registre. Sans profil
-    de compte déclaré pour ce nom, son home n'est pas prouvable : il n'est
-    jamais déduit de l'environnement de l'appelant (`config_env_of`, home par
-    défaut partagé du harnais), on refuse. `--home` reste la désignation
-    explicite, faite par l'appelant, d'un home qu'il assume.
+    Le propriétaire est le compte de session inscrit au registre. Seul un
+    profil `config_dir` qui déclare explicitement son `path` prouve son home.
+    Sans profil, pour un compte par défaut (`config_dir` sans `path`) ou pour
+    un profil à clé d'API, `Profile.home()` le prendrait dans l'environnement
+    de l'appelant (`config_env_of`, home par défaut partagé du harnais) : on
+    refuse. `--home` reste la désignation explicite, faite par l'appelant,
+    d'un home qu'il assume.
     """
     from . import accounts
     harness = row.get("harness") or ""
     account = row.get("session_account")
     profile = accounts.by_name(accounts.profiles(cfg, harness), account)
-    if profile is None:
-        raise BackupError(
-            "cannot prove the home of %s: no account profile %s declared for harness %s "
-            "(use --home to designate the account home)"
-            % (agent or "the session owner", repr(account) if account else "(none)",
-               harness or "?"))
-    return profile.home()
+    if profile is not None and profile.kind == "config_dir" and profile.path:
+        return profile.home()
+    reason = ("no account profile %s" % (repr(account) if account else "(none)")
+              if profile is None else
+              "account profile %s declares no path" % repr(profile.name))
+    raise BackupError(
+        "cannot prove the home of %s: %s for harness %s "
+        "(use --home to designate the account home)"
+        % (agent or "the session owner", reason, harness or "?"))
 
 
 def key_owner(key: str) -> str:

@@ -210,6 +210,50 @@ class OwnerHomeTest(_Tmp):
             self.assertNotIn(self.home, message)
             self.assertNotIn("default home", message)
 
+    def test_profile_without_a_path_never_falls_back_to_the_caller(self):
+        """B de la relecture #782 : un profil déclaré sans chemin ne prouve rien."""
+        os.environ["DSH_HOME"] = self.home
+        os.environ["CODEX_HOME"] = self.home
+        self.addCleanup(os.environ.pop, "DSH_HOME", None)
+        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+        cfg = self.cfg({
+            "deepseek": [{"name": "primaire", "type": "config_dir"}],
+            "codex": [{"name": "cle", "type": "api_key_env", "env": "OPENAI_API_KEY",
+                       "key_env": "OPENAI_KEY"}],
+        })
+        for harness, account in (("deepseek", "primaire"), ("codex", "cle")):
+            with self.subTest(harness=harness):
+                with self.assertRaises(sb.BackupError) as caught:
+                    sb._agent_home(cfg, {"harness": harness, "session_account": account},
+                                   "agent-x")
+                message = str(caught.exception)
+                self.assertIn("agent-x", message)
+                self.assertIn("no path", message)
+                self.assertIn("--home", message)
+                self.assertNotIn(self.home, message)
+
+    def test_explicit_home_wins_over_an_unprovable_profile(self):
+        os.environ["DSH_HOME"] = self.home
+        self.addCleanup(os.environ.pop, "DSH_HOME", None)
+        conf = self.conf()
+        sb.backup(conf, host="pc", agent="a", home=self.home, patterns=DSH, session=SESSION,
+                  state_dir=self.state, now=1000.0)
+        key = sb.latest(conf, agent="a", session=SESSION)
+        cfg = self.cfg({"deepseek": [{"name": "primaire", "type": "config_dir"}]})
+        row = {"harness": "deepseek", "session_id": SESSION, "session_account": "primaire",
+               "status": "idle", "leased": False}
+        args = types.SimpleNamespace(agent="a", key=key, session=None, home=None,
+                                     overwrite=False, allow_other_agent=False)
+        with self.assertRaises(sb.BackupError) as caught:
+            sb.restore_agent(self.registry(row), cfg, conf, args)
+        self.assertIn("--home", str(caught.exception))
+        args.home = os.path.join(self.tmp, "explicite")
+        _key, home, files = sb.restore_agent(self.registry(row), cfg, conf, args)
+        self.assertEqual(home, args.home)
+        self.assertTrue(files)
+        self.assertTrue(os.path.exists(os.path.join(
+            home, "sessions/--directory--", SESSION, "session.v4.jsonl.zstd")))
+
     def test_restore_needs_a_proof_or_an_explicit_home(self):
         conf = self.conf()
         sb.backup(conf, host="pc", agent="a", home=self.home, patterns=DSH, session=SESSION,
