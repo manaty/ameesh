@@ -90,23 +90,24 @@ class InstallerTest(unittest.TestCase):
 
     def test_private_roots_read_by_the_adapter_are_in_the_reviewed_layout(self):
         # The adapter reads the staged trees from this exact root (filled by the
-        # administrator before preflight runs) and the pinned factory reads its
-        # versioned release store there: both belong to the signed inventory,
-        # with the reviewed 0700 mode, never to ad hoc paths.
+        # administrator before preflight runs), private at 0700; the pinned
+        # factory traverses its versioned release store at 0711 (not listable,
+        # not writable) to run the active release's own runner. Both belong to
+        # the signed inventory, never to ad hoc paths.
         self.assertEqual(installer.DIRECTORIES.get('/var/lib/ameesh-release-bootstrap'), 0o700)
-        self.assertEqual(installer.DIRECTORIES.get('/opt/ameesh-release/store'), 0o700)
+        self.assertEqual(installer.DIRECTORIES.get('/opt/ameesh-release/store'), 0o711)
         self.assertNotIn('/var/lib/ameesh-release/bootstrap', installer.DIRECTORIES)
-        roots = ('/var/lib/ameesh-release-bootstrap', '/opt/ameesh-release/store')
-        for logical in roots:
-            self.assertEqual(self.bundle['directories'][logical], 0o700)
+        self.assertEqual(self.bundle['directories']['/var/lib/ameesh-release-bootstrap'], 0o700)
+        self.assertEqual(self.bundle['directories']['/opt/ameesh-release/store'], 0o711)
         stage = self.root/'var/lib/ameesh-release-bootstrap'/self.operation
         self.assertTrue((stage/'runtime').is_dir())
         self.assertTrue((stage/'sources').is_dir())
         (self.root/'var/lib/ameesh-release-bootstrap').chmod(0o700)
         self.assertEqual(self.run_bootstrap(), 'installed')
-        for logical in roots:
+        for logical,mode in (('/var/lib/ameesh-release-bootstrap',0o700),
+                             ('/opt/ameesh-release/store',0o711)):
             root = self.root/logical.lstrip('/')
-            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700, logical)
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), mode, logical)
             self.assertEqual(root.stat().st_uid, os.geteuid(), logical)
 
     def test_lost_activation_reply_rechecks_configuration_and_never_recreates_account(self):

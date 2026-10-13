@@ -94,12 +94,12 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
             return False
         try:
             expires=json.loads(text[len(PREFIX):])['expires_at']
-            if text!=question(operation,self.bundle,expires_at=expires):
+            if type(expires) is not int or text!=question(operation,self.bundle,expires_at=expires):
                 return False
         except (KeyError,ValueError,TypeError):
             return False
         now=self.clock()
-        return now<expires and self._proof_live(view,now)
+        return now<expires and self._proof_live(view,now,expires)
 
 
 def run(journal,operation,bundle, *, authority,adapter):

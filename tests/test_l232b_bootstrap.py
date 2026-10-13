@@ -141,9 +141,14 @@ class SignedBootstrapTest(support.PgTestCase):
         self.assertFalse(self.valid(digest=changed))
 
     def test_original_approval_expiry_deadline_and_revocation_are_live(self):
-        self.sign(ttl=50); self.assertTrue(self.valid())
-        self.now+=51; self.assertFalse(self.valid())
-        self.now-=51; authority.revoke_key(self.db,'fixture-owner'); self.assertFalse(self.valid())
+        self.sign(); self.assertTrue(self.valid())
+        self.now+=601; self.assertFalse(self.valid())
+        self.now-=601; authority.revoke_key(self.db,'fixture-owner'); self.assertFalse(self.valid())
+
+    def test_approval_dying_before_the_declared_window_has_no_authority(self):
+        # The signed approval covers the whole declared window (P2): a shorter
+        # ttl never authorises the bootstrap it declares.
+        self.sign(ttl=50); self.assertFalse(self.valid())
 
     def test_unsigned_decline_tampered_bundle_and_later_deadline_have_no_authority(self):
         self.sign(); original=decisions.get(self.db,self.view['id'])
