@@ -2839,7 +2839,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                      resources_mod.fmt_value("q", policy.tmp_quota))})
                 if result.get("mounts_unreadable"):
                     skipped.append("tmp %s: mount table unreadable "
-                                   "(/proc/self/mountinfo), nothing evicted" % full)
+                                   "(platform layer), nothing evicted" % full)
                 elif result["truncated"]:
                     skipped.append("tmp %s: listing truncated (%s file limit), nothing "
                                    "evicted" % (full, WALK_LIMIT))
@@ -2878,7 +2878,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                           % (resources_mod.fmt_value("q", policy.cache_quota),
                                              result["files"])})
         if result.get("mounts_unreadable"):
-            skipped.append("caches: mount table unreadable (/proc/self/mountinfo), "
+            skipped.append("caches: mount table unreadable (platform layer), "
                            "nothing evicted")
         elif result["truncated"]:
             skipped.append("caches: listing truncated (%s file limit), nothing evicted"
