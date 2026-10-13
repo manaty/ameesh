@@ -490,7 +490,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
         'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
-        'urgent_message_id', 'verdict_message_id'
+        'urgent_message_id', 'verdict_message_id',
+        -- #747 (0424) : de l'ÉTAT, l'attente et l'exécution séparées ;
+        -- created_at = création GitHub du run, started_at = premier relevé
+        -- `in_progress` (l'extrait de sortie reste un contenu, ailleurs)
+        'created_at', 'started_at'
     ]),
     ('ci_test_failures', ARRAY[
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
