@@ -4,6 +4,13 @@
 
 This never signs, registers keys, answers a decision or executes a release.
 An agent's mail, unsigned answer or policy name cannot supply authority.
+
+The signature must cover the whole declared window (`expires_at`): a release
+fence is never committed under an authority that would die before the window
+it approved, recovery included. The one-hour `decide <id> <answer> --key` path
+therefore fits windows up to one hour; a longer window is signed deliberately
+with `ameesh approve --expires …` plus `decide <id> <answer> --signed`. After
+the window, resuming the same manifest needs a fresh signed decision.
 """
 import hashlib
 import json
@@ -75,10 +82,18 @@ class SignedDecisionAuthority:
         now = self.clock()
         if now >= expires:
             return False
-        return self._proof_live(view, now)
+        return self._proof_live(view, now, expires)
 
-    def _proof_live(self, view, now):
-        """Shared proof check after a subclass verifies its exact signed scope."""
+    def _proof_live(self, view, now, expires):
+        """Shared proof check after a subclass verifies its exact signed scope.
+
+        The signed approval must cover the whole declared window: a fence is
+        never committed under an authority that will die before its own
+        approved rollback/recovery window ends. An expired approval is then
+        refused at the first step (never after the fence), and a later resume
+        of the same manifest needs a fresh signed decision, not a manual
+        unfence.
+        """
         answer = view.get('answer') or {}
         if not decisions.verify_proof(self.db, view)[0]:
             return False
@@ -100,6 +115,7 @@ class SignedDecisionAuthority:
                     or signed['decision'] != 'approved'
                     or type(signed['expires']) is not int or type(signed['ts']) is not int
                     or signed['expires'] <= now * 1_000_000
+                    or signed['expires'] < expires * 1_000_000
                     or signed['ts'] > (now + 120) * 1_000_000
                     or signed['expires'] <= signed['ts']
                     or int(round(float(row['expires_ts']) * 1_000_000)) != signed['expires']

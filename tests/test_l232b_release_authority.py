@@ -87,11 +87,22 @@ class ReleaseAuthorityTest(PgTestCase):
         with mock.patch.object(decisions, 'get', return_value=dict(original, due_ts=self.now + 99999)):
             self.assertFalse(self.validate('rollback'))
 
-    def test_original_approval_expiry_also_bounds_execution(self):
+    def test_a_signature_shorter_than_the_declared_window_never_authorizes(self):
+        # P2 witness: with the standard one-hour signature over a longer declared
+        # window, every step (fence and recovery included) used to be refused
+        # only after one hour, leaving the host fenced. The mismatch is refused
+        # before the first effect instead.
         self.signed_answer(ttl=50)
-        self.assertTrue(self.validate())
-        self.now += 51
-        self.assertFalse(self.validate())
+        for step in ('prepare', 'backup', 'pin', 'fence', 'rollback', 'recovery_unfence'):
+            self.assertFalse(self.validate(step), step)
+
+    def test_signature_and_declared_window_bound_execution_together(self):
+        self.signed_answer()
+        self.assertTrue(self.validate('prepare'))
+        self.now += 599
+        self.assertTrue(self.validate('prepare'))
+        self.now += 2
+        self.assertFalse(self.validate('prepare'))
 
     def test_controller_uses_real_signature_and_rechecks_after_fence(self):
         from tests.test_l232b_release_controller import controller, Host
