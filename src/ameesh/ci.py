@@ -19,7 +19,11 @@ chaque passage un relevé (`Watcher.tick`) :
    silence (#1110). Chaque exécution porte son fichier de workflow, pour que
    le verdict nomme la suite concernée ; chacune est rattachée à un lot : par
    sa branche (`work_items.branch`, L118), sinon par la ligne
-   `ameesh-work: <id>` de son commit de tête (une fusion dans main) ;
+   `ameesh-work: <id>` de son commit de tête (une fusion dans main) ; une
+   exécution courte peut naître et finir entre deux passages sans jamais être
+   vue « en cours » : un rattrapage borné des exécutions récemment terminées
+   les découvre, rend leur verdict et réveille l'agent — une seule fois, et
+   jamais pour une tête déjà remplacée (#1110) ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
@@ -56,6 +60,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 
 from . import storage
 
@@ -71,6 +76,10 @@ DISCOVERY_RETRY = 300.0
 #: exécution en attente d'un runner est vue dès la poussée, avant que
 #: l'exécution qu'elle remplace soit annulée
 LIVE_STATUSES = ("in_progress", "queued")
+#: rattrapage borné des exécutions terminées entre deux passages (#1110) : on
+#: ne remonte pas plus loin que cette fenêtre, pour ne pas rendre de verdicts
+#: anciens après une longue interruption du veilleur
+CATCHUP_WINDOW = 3600.0
 #: préfixe du nom des check runs publiés par `scripts/ci-flow.py publish`
 CHECK_PREFIX = "tests (flux)"
 SCHEMA = "ameesh-test-event/1"
@@ -99,6 +108,18 @@ class CiError(RuntimeError):
 def workflow_of(path: str | None) -> str:
     """Le fichier de workflow d'une exécution (`…/backend-suite.yml`), ou ""."""
     return str(path or "").rsplit("/", 1)[-1].strip()
+
+
+def updated_ts(run: dict) -> float | None:
+    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
+    `None` s'il est absent ou illisible."""
+    text = str(run.get("updated_at") or run.get("created_at") or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def events_of(check_runs, run_id: int) -> list[dict]:
@@ -407,6 +428,9 @@ class Watcher:
         out: list[dict] = []
         for run_id in sorted(live):
             out += self._follow(db, repo, live[run_id], lots)
+        # les exécutions courtes, nées et finies entre deux passages, n'ont
+        # jamais été vues « en cours » : rattrapage borné (#1110)
+        out += self._catch_up(db, repo, lots, followed)
         # les lignes que ce passage conclut sont figées AVANT les envois : le
         # verdict d'un workflow ne cite pas comme « encore en cours » un
         # workflow conclu dans le même passage (#1110)
@@ -424,8 +448,49 @@ class Watcher:
             if run is None:
                 continue
             others = [r for r in running if int(r["run_id"]) not in finishing
-                      and int(r["run_id"]) != int(row["run_id"])]
+                      and int(r["run_id"]) != int(row["run_id"])
+                      and r.get("head_sha") == row.get("head_sha")
+                      and r.get("branch") == row.get("branch")]
             out += self._conclude(db, repo, row, run=run, pending=others)
+        return out
+
+    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
+        """Les exécutions terminées entre deux passages (#1110) : une exécution
+        courte n'est jamais vue « en cours », donc jamais conclue sans ce
+        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
+        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
+        la même branche est ignorée (pas de verdict périmé)."""
+        st = storage.of(db)
+        data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
+        runs = list(data.get("workflow_runs") or ())
+        # les exécutions que ce passage conclut (relevé normal compris) sont
+        # figées AVANT les envois : un verdict du rattrapage ne cite pas comme
+        # « encore en cours » un workflow conclu dans le même passage (#1110)
+        settled = {int(r["id"]) for r in runs}
+        now = float(self.clock())
+        out: list[dict] = []
+        for run in runs:
+            if workflow_of(run.get("path")) not in followed:
+                continue
+            run_id = int(run["id"])
+            if st.ci.run(repo, run_id) is not None:
+                continue
+            updated = updated_ts(run)
+            if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
+                continue
+            head = run.get("head_sha") or ""
+            branch = run.get("head_branch") or ""
+            if st.ci.head_replaced(repo, branch, head, run_id):
+                continue
+            out += self._follow(db, repo, run, lots)
+            row = st.ci.run(repo, run_id)
+            if row is None or (run.get("status") or "") != "completed":
+                continue
+            out += self._failures(db, repo, row)
+            pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
+                       and r.get("branch") == branch
+                       and int(r["run_id"]) not in settled]
+            out += self._conclude(db, repo, row, run=run, pending=pending)
         return out
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
@@ -464,7 +529,9 @@ class Watcher:
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
         if not events:
             return []
-        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0])
+        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
+                                        workflow=row.get("workflow")
+                                        or workflow_of(row.get("path")))
         if reference and int(reference["run_id"]) == int(row["run_id"]):
             reference = {}
         # aucune exécution conclue de la base relevée (juste après le
@@ -570,7 +637,9 @@ def describe(record: dict) -> str:
 # --------------------------------------------------------------------------
 
 def main_red(db) -> list[dict]:
-    """Les dernières exécutions conclues des branches de base qui sont rouges :
+    """Les dernières exécutions conclues des branches de base qui sont rouges,
+    **par workflow** : sur la dernière tête conclue de la branche, un succès
+    d'une suite ne masque pas l'échec d'une autre (#1110).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
     out = []

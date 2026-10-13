@@ -231,11 +231,15 @@ class FauxApi:
 
     def __init__(self):
         self.live, self.queued, self.done, self.checks = [], [], {}, {}
+        #: exécutions terminées (rattrapage borné #1110)
+        self.terminated = []
         #: fichiers de workflow que le dépôt publie (découverte #1110)
         self.workflows = ["tests.yml"]
 
     def __call__(self, path):
         if "/actions/runs?" in path:
+            if "status=completed" in path:
+                return {"workflow_runs": list(self.terminated)}
             return {"workflow_runs": list(self.queued if "status=queued" in path
                                           else self.live)}
         if "/actions/workflows" in path:
@@ -251,13 +255,16 @@ class FauxApi:
 
 
 def run_view(run_id, sha, branch, *, base="main", message="", workflow="tests.yml",
-             attempt=1):
-    return {"id": run_id, "head_sha": sha, "head_branch": branch, "event": "pull_request"
+             attempt=1, updated_at=None):
+    view = {"id": run_id, "head_sha": sha, "head_branch": branch, "event": "pull_request"
             if branch != "main" else "push", "path": ".github/workflows/%s" % workflow,
             "run_attempt": attempt,
             "html_url": "https://github.com/%s/actions/runs/%d" % (DEPOT, run_id),
             "pull_requests": [{"base": {"ref": base}}] if branch != "main" else [],
             "head_commit": {"message": message}}
+    if updated_at:
+        view["updated_at"] = updated_at
+    return view
 
 
 def completed(path, conclusion, attempt=1):
@@ -280,9 +287,10 @@ class WatcherTest(PgTestCase):
         self.api = FauxApi()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api)
         # une exécution verte de main déjà relevée : la référence du rouge hérité
+        # (nommée `tests.yml` : la migration 0433 nomme les lignes antérieures)
         st = storage.of(self.db)
         st.ci.open_run(DEPOT, 100, head_sha="0" * 40, branch="main", event="push",
-                       base="main", work_item_id=None, url=None)
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
         st.ci.conclude(DEPOT, 100, "success")
 
     def mails(self, to):
@@ -686,6 +694,181 @@ class WatcherTest(PgTestCase):
         self.assertIn("(backend-suite.yml)", message["body"])
         self.assertIn("attempt 2", message["body"])
         self.assertEqual(self.payload_of(message)["ci"]["attempt"], 2)
+
+    # -- #1110 R1 auditeur : rattrapage et rouge par workflow ----------------
+    #: horloge fixe des témoins de rattrapage (aucune dépendance à l'horloge
+    #: réelle) : 1 000 000 s après l'epoch, soit 1970-01-12T13:46:40Z
+    NOW = 1_000_000.0
+    AT_NOW = "1970-01-12T13:46:40+00:00"
+
+    def terminated(self, run_id, sha, branch, *, conclusion, workflow="tests.yml",
+                   updated_at=None):
+        """Une exécution terminée telle que la liste `status=completed` la rend."""
+        return dict(run_view(run_id, sha, branch, workflow=workflow,
+                             updated_at=updated_at or self.AT_NOW),
+                    status="completed", conclusion=conclusion)
+
+    def test_execution_courte_terminee_avant_le_premier_passage(self):
+        """#1110 P2-1 : une exécution née et finie entre deux passages n'a
+        jamais été vue « en cours » ; le rattrapage la découvre terminée, rend
+        son verdict et réveille l'agent — une seule fois."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "a1" * 20
+        self.api.terminated = [self.terminated(970, sha, "lot/1-un",
+                                               conclusion="failure")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=970)])]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("status"), o.get("urgent")) for o in out],
+                         [("failures", None, True), ("verdict", "failure", None)])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 970)["status"], "failure")
+        mails = self.mails("dev-a")
+        self.assertEqual(len(mails), 2)  # urgent puis verdict
+        self.assertIn("tests.test_a.T.test_1", mails[0]["body"])
+        self.assertIn("red, 1 failure(s)", mails[-1]["body"])
+        # le passage suivant ne double rien
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 2)
+
+    def test_rattrapage_borne_et_sans_verdict_perime(self):
+        """#1110 P2-1 : le rattrapage est borné (une exécution trop ancienne
+        est ignorée) et une tête déjà remplacée ne rend pas de verdict."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        vieille, neuve = "b1" * 20, "b2" * 20
+        self.api.live = [run_view(980, neuve, "lot/1-un")]
+        watcher.tick(self.db)
+        self.api.live = []
+        self.api.terminated = [
+            self.terminated(979, vieille, "lot/1-un", conclusion="failure"),
+            self.terminated(978, "b3" * 20, "lot/1-un", conclusion="failure",
+                            updated_at="1970-01-12T11:46:40+00:00")]  # hors fenêtre
+        self.assertEqual(watcher.tick(self.db), [])
+        st = storage.of(self.db)
+        self.assertIsNone(st.ci.run(DEPOT, 979))
+        self.assertIsNone(st.ci.run(DEPOT, 978))
+        self.assertEqual(self.mails("dev-a"), [])
+
+    def test_main_rouge_par_workflow(self):
+        """#1110 P2-2 : sur la même tête de main, un succès d'une autre suite
+        ne masque pas l'échec de `backend-suite.yml`."""
+        st = storage.of(self.db)
+        sha = "c1" * 20
+        for run_id, workflow, conclusion in ((990, "backend-suite.yml", "failure"),
+                                             (991, "scripts-suite.yml", "success")):
+            st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main", event="push",
+                           base="main", work_item_id=None, url=None, workflow=workflow)
+            if conclusion == "failure":
+                st.ci.add_failure(DEPOT, run_id, part="psql 1/1",
+                                  test="tests.test_a.T.test_1", module="tests.test_a",
+                                  status="echec", inherited=False, excerpt="", replay="",
+                                  duration_s=None, failed_at=None)
+            st.ci.conclude(DEPOT, run_id, conclusion)
+        self.assertEqual([(r["run_id"], r["workflow"], r["tests"]) for r in
+                          ci.main_red(self.db)],
+                         [(990, "backend-suite.yml", ["tests.test_a.T.test_1"])])
+        alertes = [a for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "ci_main_red"]
+        self.assertEqual(len(alertes), 1)
+        self.assertIn("backend-suite.yml", alertes[0]["detail"])
+
+    def test_rouge_herite_par_workflow(self):
+        """#1110 P2-2 : le rouge hérité se compare à la même suite ; l'échec
+        d'une autre suite de la base ne rend pas le test « hérité »."""
+        st = storage.of(self.db)
+        base_sha = "d1" * 20
+        for run_id, workflow, conclusion in ((994, "backend-suite.yml", "success"),
+                                             (995, "scripts-suite.yml", "failure")):
+            st.ci.open_run(DEPOT, run_id, head_sha=base_sha, branch="main", event="push",
+                           base="main", work_item_id=None, url=None, workflow=workflow)
+            if conclusion == "failure":
+                st.ci.add_failure(DEPOT, run_id, part="psql 1/1",
+                                  test="tests.test_a.T.test_1", module="tests.test_a",
+                                  status="echec", inherited=False, excerpt="", replay="",
+                                  duration_s=None, failed_at=None)
+            st.ci.conclude(DEPOT, run_id, conclusion)
+        # l'exécution du lot, même suite que le vert de la base : l'échec est
+        # neuf (pas hérité du rouge d'une autre suite), donc urgent et nominatif
+        self.api.workflows = ["backend-suite.yml"]
+        sha = "d2" * 20
+        self.api.live = [run_view(996, sha, "lot/1-un", workflow="backend-suite.yml")]
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=996)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", True)])
+        (message,) = self.mails("dev-a")
+        self.assertIn("tests.test_a.T.test_1", message["body"])
+        self.assertNotIn("inherited", self.payload_of(message).get("ci_passif", ""))
+
+    def test_pending_ne_cite_que_la_meme_tete(self):
+        """#1110 P3 : le verdict ne cite comme « encore en cours » que les
+        workflows de la même tête, pas ceux d'un autre lot."""
+        self.api.workflows = ["backend-suite.yml", "website-suite.yml"]
+        sha_a, sha_b = "e1" * 20, "e2" * 20
+        work.add(self.db, title="L2 : autre", branch="lot/2-autre", assignee="dev-b")
+        self.api.live = [run_view(1001, sha_a, "lot/1-un", workflow="backend-suite.yml"),
+                         run_view(1002, sha_b, "lot/2-autre",
+                                  workflow="website-suite.yml")]
+        self.watcher.tick(self.db)
+        self.api.live = [run_view(1002, sha_b, "lot/2-autre", workflow="website-suite.yml")]
+        self.api.done[1001] = completed(".github/workflows/backend-suite.yml", "success")
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "success")])
+        (message,) = self.mails("dev-a")
+        self.assertIn("(backend-suite.yml)", message["body"])
+        self.assertNotIn("still running", message["body"])
+
+    def test_rattrapage_ne_cite_pas_un_workflow_conclu_du_meme_passage(self):
+        """#1110 P3 : un workflow de la même tête, terminé dans le même
+        passage, n'est pas annoncé « encore en cours » par le rattrapage."""
+        self.api.workflows = ["backend-suite.yml", "website-suite.yml"]
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "f1" * 20
+        # passage 1 : le backend est vu en cours (ligne `running` en base)
+        self.api.live = [run_view(1010, sha, "lot/1-un", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        # passage 2 : les deux suites de la même tête sont terminées ; le
+        # website, plus court, n'a jamais été vu en cours (rattrapage)
+        self.api.live = []
+        self.api.done[1010] = completed(".github/workflows/backend-suite.yml", "success")
+        self.api.terminated = [
+            self.terminated(1011, sha, "lot/1-un", conclusion="success",
+                            workflow="website-suite.yml"),
+            self.terminated(1010, sha, "lot/1-un", conclusion="success",
+                            workflow="backend-suite.yml")]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["run_id"], o["status"]) for o in out],
+                         [("verdict", 1011, "success"), ("verdict", 1010, "success")])
+        bodies = [m["body"] for m in self.mails("dev-a")]
+        self.assertEqual(len(bodies), 2)
+        self.assertFalse([b for b in bodies if "still running" in b])
+
+    def test_reference_stricte_par_workflow(self):
+        """#1110 P2-2 : une ligne sans workflow (écrite avant 0433 par un
+        ancien processus) ne sert pas de référence à une autre suite : l'échec
+        n'est pas classé hérité au nom d'une suite étrangère."""
+        st = storage.of(self.db)
+        sha_main = "0" * 40  # la ligne verte `tests.yml` du setUp
+        st.ci.open_run(DEPOT, 993, head_sha=sha_main, branch="main", event="push",
+                       base="main", work_item_id=None, url=None)  # sans workflow
+        st.ci.add_failure(DEPOT, 993, part="psql 1/1", test="tests.test_a.T.test_1",
+                          module="tests.test_a", status="echec", inherited=False,
+                          excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 993, "failure")
+        # une exécution backend du lot échoue sur le même test : la ligne sans
+        # workflow n'est pas une référence backend, l'échec est passif (base
+        # inconnue), jamais « hérité » d'une autre suite
+        self.api.workflows = ["backend-suite.yml"]
+        sha = "0a" * 20
+        self.api.live = [run_view(997, sha, "lot/1-un", workflow="backend-suite.yml")]
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=997)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", False)])
+        (message,) = self.mails("dev-a")
+        self.assertTrue(self.payload_of(message).get("ci_passif"))
+        self.assertFalse(st.ci.failures(DEPOT, 997)[0]["inherited"])
 
 
 if __name__ == "__main__":

@@ -16,7 +16,12 @@
 -- et leur statut.
 --
 -- Additif : une colonne avec défaut, aucun retrait, aucune contrainte
--- resserrée ; les lignes déjà relevées portent une chaîne vide.
+-- resserrée. Les lignes déjà relevées ne pouvaient être que des exécutions de
+-- `tests.yml` (le filtre global d'avant #1110) : elles sont nommées, pour que
+-- la référence du rouge hérité (`base_failures`) ne compare jamais deux suites
+-- étrangères.
 
 alter table ci_runs
     add column if not exists workflow text not null default '';
+
+update ci_runs set workflow = 'tests.yml' where workflow = '';
