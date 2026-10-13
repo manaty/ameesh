@@ -318,6 +318,50 @@ class SchedulePgTest(PgTestCase):
         self.assertIn("(reference p80 (table #", proc.stdout)
 
 
+class ScheduleByHandPgTest(PgTestCase):
+    """#704: a date set by hand after the schedule is kept (own class: it
+    publishes a reference table, which SchedulePgTest expects absent)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host)
+
+    def test_date_set_by_hand_after_the_schedule_is_kept(self):
+        # #704: `work plan` without --source on a lot the schedule had dated
+        a = work.add(self.db, title="dated by the schedule", assignee="dev1", estimate=60)
+        storage.of(self.db).work.publish_reference(BODY, actor="auditeur")
+        proc = self.mesh("work", "schedule", "--apply", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # a delivery date alone is never written by the schedule: its source stays
+        proc = self.mesh("work", "plan", str(a["id"]), "--delivery", "2030-02-01",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(storage.of(self.db).roadmap.item_plans([a["id"]])[0]
+                        ["planned_source"].startswith("reference p80 (table #"))
+        proc = self.mesh("work", "plan", str(a["id"]), "--start", "2030-01-01",
+                         "--end", "2030-01-02", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        def plan():
+            return storage.of(self.db).roadmap.item_plans([a["id"]])[0]
+
+        self.assertEqual((str(plan()["planned_start"])[:10], plan()["planned_source"]),
+                         ("2030-01-01", "set by orch"))
+        proc = self.mesh("work", "schedule", "--apply", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(str(plan()["planned_start"])[:10], "2030-01-01")
+        # a source given by the person stays as given
+        proc = self.mesh("work", "plan", str(a["id"]), "--start", "2030-01-01",
+                         "--source", "decision #1", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(plan()["planned_source"], "decision #1")
+        # --force still rewrites a date set by hand
+        proc = self.mesh("work", "schedule", "--apply", "--force", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotEqual(str(plan()["planned_start"])[:10], "2030-01-01")
+        self.assertTrue(plan()["planned_source"].startswith("reference p80 (table #"))
+
+
 class MeasurePgTest(PgTestCase):
 
     def _at(self, sql, minutes, *params):
