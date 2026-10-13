@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Pilote Postgres : résultats de CI relevés en direct (`ci_runs`,
-`ci_test_failures`, 0055, L161c)."""
+`ci_test_failures`, 0055, L161c) et garde de la CI (`ci_runner_state`,
+`ci_queue_state`, 0426, #845)."""
 from __future__ import annotations
 
 import json
@@ -155,3 +156,74 @@ class CiResults(interface.CiResults):
                AND status IN ('success', 'failure')
              ORDER BY repo, branch, concluded_at DESC, run_id DESC
             """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
+
+    # -- #845 : garde de la CI (runners et file) ---------------------------
+    def observe_runners(self, repo, runners) -> None:
+        ids = []
+        for r in runners:
+            if r.get("id") is None:
+                continue
+            ids.append(int(r["id"]))
+            self.db.execute(
+                """
+                INSERT INTO ci_runner_state AS s
+                    (repo, runner_id, name, busy, job, busy_since, stuck_since)
+                VALUES (%s, %s, %s, %s, %s,
+                        CASE WHEN %s THEN now() END,
+                        CASE WHEN %s THEN now() END)
+                ON CONFLICT (repo, runner_id) DO UPDATE SET
+                    name        = excluded.name,
+                    busy        = excluded.busy,
+                    job         = excluded.job,
+                    busy_since  = CASE WHEN excluded.busy
+                                       THEN coalesce(s.busy_since, now()) ELSE NULL END,
+                    stuck_since = CASE WHEN excluded.stuck_since IS NOT NULL
+                                       THEN coalesce(s.stuck_since, now()) ELSE NULL END,
+                    seen_at     = now()
+                """,
+                (repo, int(r["id"]), r.get("name") or "", bool(r.get("busy")),
+                 r.get("job"), bool(r.get("busy")), bool(r.get("stuck"))))
+        # un runner retiré du dépôt ne doit pas laisser une alerte derrière lui
+        if ids:
+            marks = ", ".join(["%s"] * len(ids))
+            self.db.execute(
+                "DELETE FROM ci_runner_state WHERE repo = %%s AND runner_id NOT IN (%s)"
+                % marks, tuple([repo] + ids))
+        else:
+            self.db.execute("DELETE FROM ci_runner_state WHERE repo = %s", (repo,))
+
+    def stuck_runners(self) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT repo, runner_id, name, job, busy,
+                   extract(epoch from stuck_since)::float8 AS since_ts,
+                   extract(epoch from busy_since)::float8  AS busy_ts,
+                   extract(epoch from seen_at)::float8     AS seen_ts
+              FROM ci_runner_state
+             WHERE stuck_since IS NOT NULL
+             ORDER BY repo, name
+            """)
+
+    def observe_queue(self, repo, *, oldest_id, oldest_at, queued) -> None:
+        self.db.execute(
+            """
+            INSERT INTO ci_queue_state AS q (repo, oldest_id, oldest_at, queued, seen_at)
+            VALUES (%s, %s, %s::timestamptz, %s, now())
+            ON CONFLICT (repo) DO UPDATE SET
+                oldest_id = excluded.oldest_id,
+                oldest_at = excluded.oldest_at,
+                queued    = excluded.queued,
+                seen_at   = now()
+            """,
+            (repo, int(oldest_id) if oldest_id is not None else None, oldest_at,
+             int(queued or 0)))
+
+    def queued_oldest(self) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT repo, oldest_id, queued,
+                   extract(epoch from oldest_at)::float8 AS oldest_ts,
+                   extract(epoch from seen_at)::float8   AS seen_ts
+              FROM ci_queue_state
+             ORDER BY repo
+            """)

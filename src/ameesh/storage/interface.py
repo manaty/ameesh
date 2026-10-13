@@ -2863,6 +2863,34 @@ class CiResults(Domain):
         """Par dépôt et par branche parmi `branches`, la dernière exécution
         conclue verte ou rouge."""
 
+    # -- #845 : garde de la CI (runners et file), relevée par l'API ---------
+    @abc.abstractmethod
+    def observe_runners(self, repo: str, runners: Sequence[dict]) -> None:
+        """Enregistre l'état des runners du dépôt (relevé `ci.Watcher`) :
+        `[{id, name, busy, job, stuck}]`. `stuck_since` garde le début de
+        l'épisode « busy sans job in_progress » et redevient NULL dès qu'il
+        finit ; `busy_since` suit l'état busy, pour le diagnostic. Les runners
+        absents du relevé (retirés du dépôt) sont supprimés : pas d'alerte
+        fantôme. Un relevé partiel n'est jamais écrit (l'appelant le saute)."""
+
+    @abc.abstractmethod
+    def stuck_runners(self) -> list[dict]:
+        """Les runners dont l'épisode « busy sans job in_progress » est encore
+        ouvert : `{repo, runner_id, name, job, since_ts, busy_ts, seen_ts}`
+        (`since_ts` : début de l'épisode)."""
+
+    @abc.abstractmethod
+    def observe_queue(self, repo: str, *, oldest_id: int | None, oldest_at: str | None,
+                      queued: int) -> None:
+        """Enregistre la file vue du dépôt : le run `queued` le plus ancien
+        (son `created_at` ; proxy du plus vieux job en file) et le nombre de
+        runs `queued` vus. `queued=0` efface le relevé précédent."""
+
+    @abc.abstractmethod
+    def queued_oldest(self) -> list[dict]:
+        """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
+        queued, seen_ts}` (les dépôts sans run `queued` ont `oldest_ts` NULL)."""
+
 
 class Handoffs(Domain):
     """L232a: destination reservations and durable lot-boundary handoffs."""

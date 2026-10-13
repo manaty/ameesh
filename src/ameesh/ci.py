@@ -72,6 +72,19 @@ EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
+#: #845 : le relevé « runner busy sans job » coûte un appel par exécution non
+#: conclue (en plus de la liste des runners) : il est mené au plus toutes les
+#: `GUARD_SCAN_S` secondes, jamais à chaque passage
+GUARD_SCAN_S = 300.0
+#: #845 : au-delà de ce nombre d'exécutions non conclues, le relevé est trop
+#: large : la comparaison runners/jobs est sautée et journalisée, plutôt que
+#: de risquer une fausse panne (leçon de la mesure du 13/10, #828)
+GUARD_SCAN_MAX_RUNS = 120
+#: #845 : taille de page des listes du relevé (runners et jobs) ; les
+#: exécutions sont listées par le relevé lui-même, sans le filtre de workflow
+#: ni la page de 50 du suivi des échecs (un runner peut tenir un job de
+#: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
+GUARD_PER_PAGE = 100
 
 
 class CiError(RuntimeError):
@@ -273,6 +286,8 @@ class Watcher:
         self.log = log or (lambda _text: None)
         self.clock = clock or time.time
         self.dry_run = bool(dry_run)
+        #: #845 : dernier relevé « runner busy sans job » par dépôt
+        self._guard_scans: dict[str, float] = {}
 
     def repos(self) -> list[str]:
         from . import plan_github
@@ -316,7 +331,91 @@ class Watcher:
             out += self._failures(db, repo, row)
             if int(row["run_id"]) not in live:
                 out += self._conclude(db, repo, row)
+        # #845 : la garde passe après les échecs et les verdicts — un relevé de
+        # runners coûte une requête par exécution non conclue (quelques
+        # dizaines de secondes en saturation) et ne doit pas les retarder
+        self._guard(db, repo)
         return out
+
+    # -- #845 : la garde de la CI ---------------------------------------------
+    def _guard(self, db, repo: str) -> None:
+        """#845 : l'état des runners et de la file, relevé par l'API (sans SSH).
+
+        La file se relève à chaque passage (le plus vieux run encore `queued`
+        et leur nombre). Le rapprochement « runner `busy` sans job
+        `in_progress` à son nom » coûte un appel par exécution non conclue : il
+        est mené au plus toutes les `GUARD_SCAN_S` secondes, et sauté quand le
+        relevé est incomplet (liste tronquée, trop d'exécutions), car une
+        comparaison partielle crierait à tort.
+
+        Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
+        journalisée et n'empêche ni les échecs, ni les verdicts.
+        """
+        try:
+            self._guard_state(db, repo)
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
+            self.log("CI %s: guard failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+
+    def _guard_state(self, db, repo) -> None:
+        st = storage.of(db)
+        # #845 : le relevé liste lui-même les exécutions non conclues, tous
+        # workflows et jusqu'à `GUARD_PER_PAGE` par état — la liste du suivi
+        # des échecs (50, `tests.yml` seul) ne suffit pas à la garde
+        not_done: dict[int, dict] = {}
+        truncated = False
+        for status in LIVE_STATUSES:
+            data = self.api("repos/%s/actions/runs?status=%s&per_page=%d"
+                            % (repo, status, GUARD_PER_PAGE)) or {}
+            runs = data.get("workflow_runs") or ()
+            if int(data.get("total_count") or 0) > len(runs):
+                truncated = True
+            for r in runs:
+                not_done.setdefault(int(r["id"]), r)
+        queued = [r for r in not_done.values() if (r.get("status") or "") == "queued"]
+        if queued:
+            oldest = min(queued, key=lambda r: (str(r.get("created_at") or ""), int(r["id"])))
+            st.ci.observe_queue(repo, oldest_id=int(oldest["id"]),
+                                oldest_at=oldest.get("created_at"), queued=len(queued))
+        else:
+            st.ci.observe_queue(repo, oldest_id=None, oldest_at=None, queued=0)
+        now = float(self.clock())
+        last = self._guard_scans.get(repo)
+        if last is not None and now - last < GUARD_SCAN_S:
+            return
+        self._guard_scans[repo] = now
+        if truncated:
+            self.log("CI %s: runner scan skipped (run list truncated)" % repo)
+            return
+        if len(not_done) > GUARD_SCAN_MAX_RUNS:
+            self.log("CI %s: runner scan skipped (%d non-completed runs)"
+                     % (repo, len(not_done)))
+            return
+        data = self.api("repos/%s/actions/runners?per_page=%d" % (repo, GUARD_PER_PAGE)) or {}
+        runners = data.get("runners") or ()
+        if int(data.get("total_count") or 0) > len(runners):
+            self.log("CI %s: runner scan skipped (runner list truncated)" % repo)
+            return
+        holding: dict[str, str] = {}
+        for run_id in sorted(not_done):
+            jobs_data = self.api("repos/%s/actions/runs/%d/jobs?per_page=%d"
+                                 % (repo, run_id, GUARD_PER_PAGE)) or {}
+            jobs = jobs_data.get("jobs") or ()
+            if int(jobs_data.get("total_count") or 0) > len(jobs):
+                self.log("CI %s: runner scan skipped (jobs of run %d truncated)"
+                         % (repo, run_id))
+                return
+            for job in jobs:
+                if (job.get("status") or "") == "in_progress" and job.get("runner_name"):
+                    holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))
+        state = []
+        for r in runners:
+            name = str(r.get("name") or "")
+            online = (r.get("status") or "online") == "online"
+            busy = bool(r.get("busy")) and online
+            state.append({"id": r.get("id"), "name": name, "busy": busy,
+                          "job": holding.get(name) if busy else None,
+                          "stuck": busy and name not in holding})
+        st.ci.observe_runners(repo, state)
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; elle remplace

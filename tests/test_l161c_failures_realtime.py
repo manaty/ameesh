@@ -20,7 +20,9 @@ import json
 import pathlib
 import re
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 
 from ameesh import ci, exploitation, mail, notify, registry, storage, work
 
@@ -226,21 +228,61 @@ class RoutageTest(unittest.TestCase):
 
 class FauxApi:
     """L'API GitHub vue par le relevé : exécutions en cours, état d'une
-    exécution, check runs d'une tête."""
+    exécution, check runs d'une tête, et (#845) runners et jobs."""
 
     def __init__(self):
         self.live, self.queued, self.done, self.checks = [], [], {}, {}
+        #: #845 : runners du dépôt, jobs par exécution, liste d'exécutions
+        #: tronquée, panne de l'API des runners
+        self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
 
     def __call__(self, path):
+        if "/actions/runs/" in path and "/jobs" in path:
+            run_id = int(path.split("/actions/runs/")[1].split("/")[0])
+            jobs = self.jobs.get(run_id, [])
+            return {"total_count": len(jobs), "jobs": list(jobs)}
+        if "/actions/runners" in path:
+            if self.runners_fail:
+                raise RuntimeError("403 runners: Resource not accessible")
+            return {"total_count": len(self.runners), "runners": list(self.runners)}
         if "/actions/runs?" in path:
-            return {"workflow_runs": list(self.queued if "status=queued" in path
-                                          else self.live)}
+            runs = list(self.queued if "status=queued" in path else self.live)
+            return {"total_count": len(runs) + (1 if self.truncated else 0),
+                    "workflow_runs": runs}
         if "/actions/runs/" in path:
             return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
         if "/check-runs" in path:
             sha = path.split("/commits/")[1].split("/")[0]
             return {"check_runs": self.checks.get(sha, [])}
         raise AssertionError(path)
+
+
+class FauxHorloge:
+    """#845 : l'horloge du relevé, pour espacer les relevés de la garde sans
+    dormir (les bases de temps restent proches de l'horloge réelle, que
+    PostgreSQL garde pour `stuck_since`/`seen_at`)."""
+
+    def __init__(self, t: float | None = None):
+        self.t = time.time() if t is None else float(t)
+
+    def __call__(self) -> float:
+        return self.t
+
+    def avance(self, dt: float) -> None:
+        self.t += float(dt)
+
+
+def iso(t: float) -> str:
+    return datetime.fromtimestamp(float(t), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def runner_view(runner_id, name, *, busy=True, status="online"):
+    return {"id": runner_id, "name": name, "status": status, "busy": busy}
+
+
+def job_view(name, *, status="in_progress", runner=""):
+    return {"name": name, "status": status, "runner_name": runner}
+
 
 
 def run_view(run_id, sha, branch, *, base="main", message=""):
@@ -254,7 +296,7 @@ def run_view(run_id, sha, branch, *, base="main", message=""):
 class WatcherTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        for table in ("ci_test_failures", "ci_runs"):
+        for table in ("ci_test_failures", "ci_runs", "ci_runner_state", "ci_queue_state"):
             self.db.execute("DELETE FROM %s" % table)
         registry.upsert(self.db, "dev-a", harness="claude", host=self.cfg.host)
         registry.upsert(self.db, "dev-b", harness="claude", host=self.cfg.host)
@@ -520,6 +562,130 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([o["to"] for o in out], [None])
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 701)["work_item_id"], humain["id"])
+
+    # -- #845 : la garde de la CI (runners et file) --------------------------
+    def test_garde_runner_busy_sans_job(self):
+        """#845 : un runner busy sans job in_progress à son nom tient un job
+        fantôme ; l'épisode est daté, l'alerte ne se lève qu'après 15 min, et
+        se tait dès que le job revient ou que le runner disparaît."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1"),
+                            runner_view(22, "ameesh-ci-1-2", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.jobs[901] = [job_view("psycopg 1/4", runner="ameesh-ci-1-1")]
+        self.watcher.tick(self.db)
+        st = storage.of(self.db)
+        self.assertEqual(st.ci.stuck_runners(), [])
+        # le job disparaît : l'épisode s'ouvre au relevé suivant (espacé)
+        self.api.jobs[901] = []
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        (row,) = st.ci.stuck_runners()
+        self.assertEqual((row["repo"], row["name"], row["job"]), (DEPOT, "ameesh-ci-1-1", None))
+        # rien avant le seuil, l'alerte après (une par dépôt, non urgente)
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_runner_stuck"], [])
+        (alerte,) = [a for a in exploitation.alerts(
+            self.cfg, self.db,
+            now=float(row["since_ts"]) + exploitation.CI_RUNNER_STUCK_S + 1)
+            if a["type"] == "ci_runner_stuck"]
+        self.assertEqual(alerte["reason"], DEPOT)
+        self.assertIn("ameesh-ci-1-1", alerte["detail"])
+        self.assertIn("ci_runner_stuck", notify.DEFAULT_TYPES)
+        # le job revient : l'épisode se ferme
+        self.api.jobs[901] = [job_view("psycopg 1/4", runner="ameesh-ci-1-1")]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(st.ci.stuck_runners(), [])
+        # un runner retiré du dépôt ne laisse pas d'alerte derrière lui
+        self.api.jobs[901] = []
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(len(st.ci.stuck_runners()), 1)
+        self.api.runners = [runner_view(22, "ameesh-ci-1-2", busy=False)]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(st.ci.stuck_runners(), [])
+
+    def test_garde_file_saturee(self):
+        """#845 : le plus vieux run queued au-delà du SLO de 15 min lève
+        `ci_queue_saturated` ; l'alerte dure tant que la file reste longue,
+        même quand le plus vieux run change (une alerte par dépôt)."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.queued = [run_view(902, "a1" * 20, "main"), run_view(903, "a2" * 20, "main")]
+        self.api.queued[0].update({"status": "queued", "created_at": iso(horloge.t - 1000)})
+        self.api.queued[1].update({"status": "queued", "created_at": iso(horloge.t - 10)})
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (2, 902))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(alerte["reason"], DEPOT)
+        self.assertIn("15 min queue SLO", alerte["detail"])
+        cle = exploitation.alert_key(alerte)
+        # un autre plus vieux run : même cause, même clé (pas de renvoi)
+        self.api.queued = [run_view(904, "a3" * 20, "main")]
+        self.api.queued[0].update({"status": "queued", "created_at": iso(horloge.t - 2000)})
+        horloge.avance(exploitation.DEFAULT_INTERVAL_S)
+        self.watcher.tick(self.db)
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(exploitation.alert_key(alerte), cle)
+        # file redevenue courte : plus d'alerte, relevé effacé
+        self.api.queued = []
+        horloge.avance(exploitation.DEFAULT_INTERVAL_S)
+        self.watcher.tick(self.db)
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_queue_saturated"], [])
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(int(row["queued"]), 0)
+        self.assertIsNone(row["oldest_ts"])
+        self.assertIn("ci_queue_saturated", notify.DEFAULT_TYPES)
+
+    def test_garde_sautee_si_releve_tronque_ou_trop_large(self):
+        """#845 : un relevé incomplet ne conclut rien — l'épisode précédent
+        reste, il n'est ni défait ni renouvelé — et l'alerte se tait quand le
+        relevé n'est plus assez frais."""
+        horloge = FauxHorloge()
+        logs = []
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1")]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.jobs[901] = []
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.stuck_runners()
+        self.api.truncated = True
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertTrue(any("truncated" in line for line in logs), logs)
+        self.assertEqual(len(storage.of(self.db).ci.stuck_runners()), 1)
+        self.api.truncated = False
+        self.api.live = [run_view(900 + i, "%040d" % i, "main")
+                         for i in range(ci.GUARD_SCAN_MAX_RUNS + 1)]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertTrue(any("runner scan skipped" in line for line in logs), logs)
+        # le relevé est périmé : l'alerte ne se lève plus sur un état ancien
+        now = float(row["since_ts"]) + ci.GUARD_SCAN_S + exploitation.CI_GUARD_FRESH_S + 1
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=now)
+                          if a["type"] == "ci_runner_stuck"], [])
+
+    def test_garde_ne_casse_pas_le_releve(self):
+        """#845 : une erreur de la garde (jeton sans droit runners, GitHub) est
+        journalisée et n'empêche ni les échecs, ni les verdicts."""
+        logs = []
+        self.api.runners_fail = True
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=FauxHorloge(),
+                                  log=logs.append)
+        sha = "c" * 40
+        self.api.live = [run_view(201, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=201)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("failures", "dev-a")])
+        self.assertTrue(any("guard failed" in line for line in logs), logs)
+        self.assertEqual(storage.of(self.db).ci.stuck_runners(), [])
 
 
 if __name__ == "__main__":
