@@ -144,6 +144,9 @@ TYPE_LABELS = {
     "long_turn": "long turn",
     "session_too_big": "session too big",
     "stale_lot": "stale lot",
+    # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
+    # humains si le type est dans `notify.types`
+    "slo_breach": "internal deadline (SLO) overdue",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",

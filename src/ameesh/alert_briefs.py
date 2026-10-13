@@ -21,7 +21,7 @@ from . import sous_utilisation
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
-                 "critical_budget_pause", "idle_actionable_lot")
+                 "critical_budget_pause", "idle_actionable_lot", "slo_breach")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -137,6 +137,37 @@ def _idle_actionable_lot(alert: dict) -> str:
                 int(alert.get("wakes") or 0), nudge, lot))
 
 
+def _slo_breach(alert: dict) -> str:
+    """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
+    délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
+    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1)."""
+    lot = int(alert["lot"])
+    title = alert.get("title")
+    level = int(alert.get("level") or 1)
+    step = alert.get("step_label") or alert.get("step") or "?"
+    who = alert.get("agent")
+    head = ("SLO breach, level %d: lot #%d%s (%s), step `%s` late by %s (target %s)%s."
+            % (level, lot, " \"%s\"" % title if title else "",
+               alert.get("lot_state") or "?", step,
+               sous_utilisation._duration(alert.get("overdue_s") or 0),
+               sous_utilisation._duration(alert.get("target_s") or 0),
+               ", assigned to %s" % who if who else ", unassigned"))
+    if level >= 3:
+        move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
+                "%d <agent>, then agent-mail send <agent> \"…\" --lot %d); do not wait "
+                "for the pilot if it is itself late" % (lot, lot))
+    elif level >= 2:
+        move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>, then "
+                "agent-mail send <agent> \"…\" --lot %d)" % (lot, lot))
+    else:
+        move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
+                "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
+    if alert.get("critical"):
+        move += ("; the lot is P1: the owner is notified (ameesh notify), and nothing "
+                 "waits for a human that an agent can do")
+    return "%s Expected action: %s." % (head, move)
+
+
 def _critical_budget_pause(alert: dict) -> str:
     """L242b (5) : aux orchestrateurs de l'équipe et aux auditeurs (urgent)."""
     return ("Critical agent paused on budget: %s. Expected action: check the accounts "
@@ -191,6 +222,26 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     elif kind == "idle_capacity":
         out = sous_utilisation.orchestrator_briefs(alert, listing, lot_titles)
         audit_text = _for_auditor(alert)
+    elif kind == "slo_breach":
+        # #789 t2 (canon §9) : le niveau atteint règle les destinataires
+        # (`targets` du moteur SLO) ; l'auditeur n'est briefé qu'au niveau 3,
+        # sinon le niveau 1 doublerait `stale_lot` pour du bruit.
+        text = _slo_breach(alert)
+        roles = set(alert.get("targets") or ("assignee",))
+        out = {}
+        if "assignee" in roles and alert.get("agent") in by_name:
+            out[alert["agent"]] = text
+        if "pilot" in roles:
+            teams = {_team(by_name, alert.get("agent"))} - {""}
+            for name in _of_teams(orchestras, by_name, teams):
+                out.setdefault(name, text)
+        if "bureau" in roles and "bureau" in by_name:
+            out.setdefault("bureau", text)
+        if "auditeur" in roles:
+            for name in auditor_names or ():
+                if name in by_name:
+                    out.setdefault(name, text)
+        return out
     else:
         if kind == "stale_lot":
             text = _stale_lot(alert)
