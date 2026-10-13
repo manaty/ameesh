@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from unittest import mock
 
 from ameesh import migration_reservations as reservations, migrations, storage, work
@@ -305,6 +306,137 @@ class ScopedReservationsTest(PgTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         self.assertEqual(sorted(results), [377, 378])
+
+    def _legacy_writer_concurrent_with_named(self, operation):
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        errors, results, pid = [], [], []
+        ready = threading.Event()
+
+        def write():
+            conn = self.connect()
+            try:
+                with conn.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '5s'")
+                    pid.append(tx.query('SELECT pg_backend_pid() AS pid')[0]['pid'])
+                    ready.set()
+                    results.append(operation(storage.of(tx).work))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        # Connection 1 holds the named allocator's repository lock. Connection
+        # 2 must wait there BEFORE locking the lot, so connection 1 can reserve
+        # a named slot on that lot without a cycle (or either caller retrying).
+        thread = threading.Thread(target=write)
+        try:
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL lock_timeout = '5s'")
+                storage.of(tx).migration_reservations.lock_target('github.com/manaty/nexlink', 'develop')
+                thread.start()
+                self.assertTrue(ready.wait(timeout=5))
+                deadline = time.monotonic() + 5
+                while not tx.query("SELECT 1 FROM pg_locks WHERE pid = %s"
+                                   " AND locktype = 'advisory' AND NOT granted", (pid[0],)):
+                    self.assertFalse(errors, errors)
+                    self.assertLess(time.monotonic(), deadline, 'writer never waited for repository lock')
+                    time.sleep(0.01)
+                rows = reservations.update(tx, self.a['id'], ['schema'], repo=self.repo,
+                                           target_branch='develop', target_sha=self.sha, actor='dev')
+                self.assertEqual(rows[0]['number'], 401)
+        finally:
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(results[0])
+
+    def test_set_app_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.set_app(self.a['id'], 'other', actor='dev'))
+
+    def test_set_branch_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.set_branch(self.a['id'], 'agent/new', 'release', note='branch', actor='dev'))
+
+    def test_close_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.close(self.a['id'], current=self.a['state'], reason='abandoned',
+                                  superseded_by=None, note='close', actor='dev'))
+
+    def test_merge_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.close_merged(self.a['id'], current=self.a['state'], sha=self.sha,
+                                         pr_ref=None, note='merge', actor='dev'))
+
+    def test_move_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.move(self.a['id'], 'build', current=self.a['state'], loops=0,
+                                 note='move', actor='dev'))
+
+    def test_release_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.reserve_migration(self.a['id'], None, None, 1, release=True,
+                                              note='release %(number)s', actor='dev'))
+
+    def test_repository_move_and_named_allocation_lock_old_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: api.reserve_migration(self.a['id'], 'manaty/other', 400, 1,
+                                              note='move %(number)s', actor='dev'))
+        self.assertEqual(work.get(self.db, self.a['id'])['migration_repo'], 'manaty/other')
+
+    def test_repository_changed_after_observation_aborts_writer_without_new_lock(self):
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        observed, moved = threading.Event(), threading.Event()
+        errors = []
+
+        def write():
+            conn = self.connect()
+            try:
+                with conn.transaction() as tx:
+                    query = tx.query
+                    def pause(sql, params=()):
+                        rows = query(sql, params)
+                        if sql == 'SELECT migration_repo FROM work_items WHERE id = %s':
+                            observed.set()
+                            if not moved.wait(timeout=5):
+                                raise RuntimeError('repository change did not finish')
+                        return rows
+                    with mock.patch.object(tx, 'query', side_effect=pause):
+                        storage.of(tx).work.set_app(self.a['id'], 'other', actor='dev')
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        try:
+            self.assertTrue(observed.wait(timeout=5))
+            storage.of(self.db).work.reserve_migration(self.a['id'], 'manaty/other', 400, 1,
+                                                       note='move %(number)s', actor='dev')
+        finally:
+            moved.set()
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], DbError)
+        self.assertIn('repository changed; retry', str(errors[0]))
+        item = work.get(self.db, self.a['id'])
+        self.assertEqual((item['app'], item['migration_repo']), ('nexlink', 'manaty/other'))
+
+    def test_refrozen_merge_rolls_back_projection_lifecycle(self):
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        self.reserve()
+        before = reservations.listing(self.db, self.a['id'])
+        events = work.events(self.db, self.a['id'])
+        result = storage.of(self.db).work.close_merged(
+            self.a['id'], current=self.a['state'], sha=self.sha, actor='dev',
+            note='stale freeze', pr_ref=None, frozen_id=-1)
+        self.assertIsNone(result)
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], self.a['state'])
+        self.assertEqual(reservations.listing(self.db, self.a['id']), before)
+        self.assertEqual(work.events(self.db, self.a['id']), events)
 
     def test_cli_json_list_and_legacy_output_compatible(self):
         args = ('work', 'migration', str(self.a['id']))

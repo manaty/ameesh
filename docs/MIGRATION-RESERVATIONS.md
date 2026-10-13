@@ -111,9 +111,13 @@ The named allocator takes a repository advisory lock (unknown legacy targets
 span branches), then the target lock, then affected lot rows in id order.
 Ancestry and lifecycle observations are made under the repository and target
 locks, before lot rows are edited.
-The upgraded legacy allocator also takes the repository lock before its lot
-update. The named path retries a deadlock victim from clients using the older
-lock order; every failed attempt rolls its records and journal back.
+Upgraded legacy allocation, release, project/branch edits and lifecycle writers
+also take repository locks before the lot row. Moving a legacy reservation locks
+both old and new repositories in sorted order; release locks the old repository.
+The repository is rechecked after locking the lot: if it changed concurrently,
+the operation rolls back with a readable retry error instead of taking another
+repository lock after the row lock. The named path retries a deadlock victim
+from clients using the older lock order; every failed attempt rolls its records and journal back.
 
 During rollout, install the additive schema and upgrade/restart legacy writers
 before enabling named reservations. Pre-0419 code does not see named slots or
