@@ -2475,6 +2475,10 @@ class _Loader:
                       untrusted=source.mode != "git", bundle_path=bundle_path or path)
         if not title and kind != "Placement":
             subject = {"package": _package_stem(path)} if kind == "WorkPackage" else {}
+            if kind == PROCESS_TYPE:
+                # a Process card error blocks no agent (#538): without a title,
+                # the card is named by its path
+                subject = {"process": path}
             self.add("fiche-title-missing", ERROR, "%s card without `title`" % kind, **where,
                      **subject)
             return
