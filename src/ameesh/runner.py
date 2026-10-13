@@ -2311,14 +2311,54 @@ class AgentWorker(threading.Thread):
     def interrupt_allowed(self, row: dict) -> bool:
         """Un message ne préempte que s'il vient d'un expéditeur habilité (0018).
 
-        Sans canon (L2), `AMEESH_INTERRUPT_SENDERS` est la seule autorisation ;
-        la capacité « interrupt » d'une fiche canon s'ajoutera ici. Un urgent
-        non habilité est remis comme un message normal (et l'abus est journalisé).
+        L'owner (`human:*`) interrompt toujours ; un événement du système
+        (`ameesh`) seulement s'il est vérifiable en base (#795) : la fin de CI
+        d'un lot de cet agent, pas un `--from ameesh` imité (garde L317c).
+        Les agents passent par `AMEESH_INTERRUPT_SENDERS` ; la capacité
+        « interrupt » d'une fiche canon s'ajoutera ici. Un urgent non habilité
+        est remis comme un message normal (et l'abus est journalisé).
         """
         sender = (row.get("sender") or row.get("from") or "").strip()
-        if bool(sender) and sender in self.cfg.interrupt_senders:
+        if not sender:
+            return False
+        from . import work
+        if sender.startswith(work.HUMAN_PREFIX):
             return True
-        return self._deep_analysis_interrupt(sender, row)
+        if sender in self.cfg.interrupt_senders:
+            return True
+        return (self._system_event_interrupt(sender, row)
+                or self._deep_analysis_interrupt(sender, row))
+
+    def _system_event_interrupt(self, sender: str, row: dict) -> bool:
+        """#795 : l'événement système qui perce le tour — la fin de CI d'un lot
+        de cet agent. Vérifié en base : l'exécution est enregistrée, le lot
+        qu'elle suit est bien assigné à l'agent, et ce courrier est celui que
+        la CI a posé pour cette exécution (verdict ou première alerte). Un
+        payload `ci` imité sous l'expéditeur `ameesh` ne préempte donc pas."""
+        from . import work
+        if sender != work.SYSTEM_SENDER:
+            return False
+        ci = mail.message_payload(row).get("ci")
+        if not isinstance(ci, dict):
+            return False
+        try:
+            run = storage.of(self.db).ci.run(str(ci.get("repo") or ""),
+                                             int(ci.get("run_id") or 0))
+            message_id = int(row.get("id") or 0)
+        except (db_mod.DbError, TypeError, ValueError):
+            return False
+        if not run or not message_id:
+            return False
+        # le lot est celui de l'exécution (le courrier de CI le porte aussi,
+        # mais la ligne de boîte ne rend pas `work_item_id`) : un lot relevé
+        # par l'exécution et assigné à un autre agent ne perce pas ce tour.
+        lot = (work.get(self.db, int(run["work_item_id"]))
+               if run.get("work_item_id") else None)
+        if not lot or (lot.get("assignee") or "") != self.name:
+            return False
+        posed = {int(run.get(cle) or 0)
+                 for cle in ("urgent_message_id", "verdict_message_id")}
+        return message_id in posed
 
     def _deep_analysis_interrupt(self, sender: str, row: dict) -> bool:
         """L317c (#315 r1) : la demande d'analyse profonde (`deep_analysis`)
