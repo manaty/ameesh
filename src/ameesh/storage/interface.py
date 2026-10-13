@@ -1901,6 +1901,20 @@ class Threads(Domain):
         dernier recomptage (`expired`), None s'il n'a jamais été recompté."""
 
     @abc.abstractmethod
+    def recount(self, *, project: str, lot: str, transport: str, host: str, location: str,
+                kept: int, last: dict | None, end: int) -> int:
+        """L361b : verrou, recomptage et expiration de l'index en UNE
+        transaction serveur, pour un fil dont le fichier vit sur l'hôte médié.
+
+        Le census vient de l'hôte (`kept` entrées gardées, `last` la plus
+        récente, `end` la fin logique du fil) : sous le verrou de la ligne
+        (`lock`), l'index reprend ce census (`expired`) si son `counted_until`
+        n'est pas déjà AU-DELÀ de `end` — un recomptage plus récent fait foi.
+        Un `counted_until` égal à `end` est repris : à fin logique constante,
+        seule une expiration change le fil (moins d'entrées gardées). Rend le
+        `counted_until` retenu."""
+
+    @abc.abstractmethod
     def expired(self, *, project: str, lot: str, transport: str, host: str,
                 kept: int, last: dict | None, end: int) -> None:
         """Après une expiration (L361), sous `lock` : `kept` entrées restent ;

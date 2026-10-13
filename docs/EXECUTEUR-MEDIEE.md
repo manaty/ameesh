@@ -2,7 +2,8 @@
 
 Contrat figé par le lot L107 (version `1.0.0`, schéma
 `ameesh-exec-contract/1`), complété à l'assemblage de la voie B (version
-`1.1.0`, compatible : voir « Contrat 1.1 »). Étude et décision :
+`1.1.0`, compatible : voir « Contrat 1.1 ») puis par l'expiration médiée des
+fils (version `1.2.0`, compatible : voir « Contrat 1.2 »). Étude et décision :
 `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -15,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 296 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 64 opérations et la liste des 322 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -58,12 +59,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 63 opérations, dont 25 lectures et 38 écritures. 53 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Cinq
-lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
-servies aussi par `session/op`. Le test
+Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Six
+lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
+sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (377
+signature et les mêmes types. Il vérifie aussi que l'interface entière (386
 opérations après intégration de main et de #330) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -264,6 +265,32 @@ table : aucun écart n'est toléré d'un côté seulement.
   l'exécuteur ou que l'agent est hors de son invitation. Les commandes
   sont `ameesh host` (serveur) et `ameesh device` (appareil).
 
+## Contrat 1.2
+
+L'expiration des fils d'un exécuteur médié (L361b, #499) ajoute une
+opération, `threads.recount` : le fil est un fichier sur l'appareil,
+l'index (`thread_index`) est sur le serveur. L'appareil réécrit son fichier
+sous son propre verrou, puis cette seule opération verrouille la ligne
+d'index, reprend le census du fichier et l'écrit dans la même transaction.
+L'ajout est compatible : la version passe à `1.2.0` et une sixième ligne de
+`op` est marquée `session: true`.
+
+- **`threads.recount`** (écriture, portée H, sans enveloppe de bail) :
+  `project`, `lot`, `transport`, `host` (forcé à celui de l'exécuteur),
+  `location`, `kept` (entrées gardées), `last` (la plus récente, ou `null`)
+  et `end` (fin logique du fil). Rend le `counted_until` retenu. Un
+  `counted_until` au-delà de `end` (recomptage plus récent) n'est pas
+  repris ; à `end` égal le census est repris : à fin logique constante,
+  seule une expiration change le fil. `threads.lock`, `threads.expired` et
+  `threads.indexed` restent refusés : un verrou ne tient pas d'une requête
+  distante à l'autre.
+- **Indexation.** Sur un exécuteur médié, l'entrée qui vient d'être écrite
+  reste indexée par `threads.index` (l'opération d'avant L361, chaque
+  entrée comptée) ; l'expiration et l'indexation sont deux requêtes
+  distinctes.
+- **Sans connexion, rien n'expire** : `fil expire` refuse et ne touche à
+  aucun fichier ; `--dry-run` liste ce qui expirerait.
+
 ## Porte d'hôte
 
 Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
@@ -451,7 +478,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 63 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 64 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |
