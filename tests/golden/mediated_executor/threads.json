@@ -53,6 +53,57 @@
    }
   },
   {
+   "name": "threads.index/not-counted",
+   "op": "threads.index",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "1e3e18c3-da1e-5396-8b24-aa2548f1dc06"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "threads.index",
+     "args": [],
+     "kwargs": {
+      "project": "site",
+      "lot": "812",
+      "transport": "github",
+      "host": "anna-portable",
+      "location": "owner/repo#812",
+      "entry_id": "c-1001",
+      "mailbox_ids": [
+       812
+      ],
+      "author": "agent:inge-front",
+      "excerpt": "PR relue.",
+      "ts": 1791640000.12,
+      "trace": {
+       "comment_id": 1001
+      },
+      "count": false
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
    "name": "threads.index/session",
    "op": "threads.index",
    "request": {
