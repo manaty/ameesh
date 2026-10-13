@@ -235,8 +235,14 @@ section.
 ```
 ameesh work backlog add --title T --value "valeur attendue" --score 1-100
                         [--priority 1|2|3] [--source S] [--team E] [--requires CAP …]
+                        [--app P [--new-project]]
 ameesh work backlog list [--all] [--json]
 ```
+
+The item inherits its creator's project, as `work add` does (L118c, #495);
+`--app` must name a known project, otherwise the item is refused with the
+close names; `--new-project` introduces a project nobody declares yet, and
+the item's history records who did (#506, as `work add` and `--new-lot`).
 
 A queue item is a lot of type `improvement`, in `intake`, with no
 assignee; its expected value (one sentence) and its score are mandatory: no

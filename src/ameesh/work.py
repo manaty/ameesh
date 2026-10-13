@@ -37,7 +37,7 @@ import time
 from typing import Sequence
 
 from . import storage
-from .db import Db, DbError
+from .db import Db, DbError, is_unique_violation
 from .storage.postgres import work as _pg
 
 STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
@@ -193,6 +193,9 @@ def add(
     estimate=None,
     estimate_source: str | None = None,
     size: str | None = None,
+    note: str = "",
+    mark_item_id: int | None = None,
+    mark_note: str = "",
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -207,7 +210,11 @@ def add(
     posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
     un agent » est appliquée par les points d'entrée (`estimates.check`).
     L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
-    clé de la table de référence des durées."""
+    clé de la table de référence des durées.
+    #506: `note` is appended to the creation event (a project introduced
+    with --new-project). L539 : `mark_item_id` et `mark_note` écrivent la
+    marque d'idempotence du lot de relecture au journal de ce lot, dans la
+    même transaction que la création (`{lot}` y vaut l'identifiant créé)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -234,13 +241,15 @@ def add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
         budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
-        + ("; estimate: %s" % span(minutes * 60) if minutes else ""),
+        + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+        + ("; %s" % note if note else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
-        if minutes else None, change_size=size or None)
+        if minutes else None, change_size=size or None,
+        mark_item_id=mark_item_id, mark_note=mark_note)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
@@ -381,8 +390,14 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     try:
         row = storage.of(db).work.reserve_migration(item_id, slug, number, floor, note=note,
                                                     actor=actor)
+    except storage.ReservationContention as exc:
+        # #478 : budget de réessais épuisé sous la rafale — message lisible,
+        # jamais la DbError brute de l'index unique
+        raise WorkError("reservation contention, retry") from exc
     except DbError as exc:
-        if number is None or "work_items_migration_repo_idx" not in str(exc):
+        # une autre erreur qui nomme l'index (permission refusée) n'est pas
+        # une réservation concurrente : elle remonte telle quelle (codex #478 r1)
+        if number is None or not is_unique_violation(exc, _pg.MIGRATION_INDEX):
             raise
         holder = storage.of(db).work.migration_holder(number, slug)
         raise WorkError("migration %s of %s already reserved by lot #%s (%s)" % (

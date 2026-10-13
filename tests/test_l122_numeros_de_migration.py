@@ -14,9 +14,11 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 from ameesh import db as db_mod, migrations, work
 from ameesh.db import DbError
+from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
 
@@ -443,8 +445,10 @@ class ReservationsSimultaneesTest(PgTestCase):
                 self.assertEqual(out["b"]["migration"], 378)
                 self.assertEqual(work.get(self.db, a)["migration"], 377)
 
-    def test_rafale_sur_les_deux_pilotes(self):
-        ids = self._lots(8)
+    def test_rafale_de_20_sur_les_deux_pilotes(self):
+        """#478 : 20 réservations simultanées, 20 numéros distincts — la
+        rafale de qa-443 épuisait les 8 essais de _RESERVE_ATTEMPTS."""
+        ids = self._lots(20)
         start, out = threading.Barrier(len(ids)), {}
 
         def reserve(item_id, driver):
@@ -464,8 +468,234 @@ class ReservationsSimultaneesTest(PgTestCase):
         for t in threads:
             t.start()
         for t in threads:
-            t.join(120)
+            t.join(180)
         self.assertEqual(sorted(out.values()), list(range(377, 377 + len(ids))), out)
+
+
+#: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
+_INDEX = "work_items_migration_repo_idx"
+
+
+def _violation(*, constraint=_INDEX, state="23505") -> DbError:
+    """La violation d'unicité de `constraint` telle qu'un pilote la rend : le
+    code SQLSTATE 23505 et le nom exact de la contrainte — ceux de psycopg
+    (`diag.constraint_name`) comme ceux de psql (`VERBOSITY=verbose`). Le
+    message n'entre pas dans la classification (codex #478 r2)."""
+    return DbError('psql: ERROR:  duplicate key value violates unique constraint "%s"'
+                   % constraint, sqlstate=state, constraint=constraint)
+
+
+def _psql_verbose(constraint=_INDEX, *, severity="ERROR", state="23505",
+                  message=None) -> str:
+    """Le rapport d'erreur de psql en `VERBOSITY=verbose` : le code SQLSTATE
+    sur la ligne d'erreur, le nom exact dans son champ. `severity` et
+    `message` suivent `lc_messages` du serveur (« ERREUR », message
+    français) ; le code et le champ CONSTRAINT NAME, non."""
+    if message is None:
+        message = 'duplicate key value violates unique constraint "%s"' % constraint
+    return ("%s:  %s: %s\n"
+            "DETAIL:  Key (migration_repo, migration)=(manaty/nexlink, 377)"
+            " already exists.\n"
+            "SCHEMA NAME:  public\n"
+            "TABLE NAME:  work_items\n"
+            "CONSTRAINT NAME:  %s\n"
+            "LOCATION:  _bt_check_unique, nbtinsert.c:677\n"
+            % (severity, state, message, constraint))
+
+
+def _failed(stderr: str) -> subprocess.CompletedProcess:
+    """Un psql en échec (code 3, ON_ERROR_STOP) dont le `_fail` lit stderr."""
+    return subprocess.CompletedProcess([], 3, "", stderr)
+
+
+class _FakeTime:
+    """Horloge fausse d'un test de budget : `monotonic()` ne bouge que par
+    `sleep()`, qui est enregistré au lieu d'attendre (codex #478 r1)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+class RetryReservationTest(PgTestCase):
+    """#478 (codex r1) : le budget de réessais de la réservation, sans
+    ordonnancement réel ni verrou : les violations d'unicité sont injectées
+    et l'horloge est fausse."""
+
+    def setUp(self):
+        super().setUp()
+        self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                              NEXLINK.directory, ["376_b.sql"])
+
+    def _lot(self):
+        return work.add(self.db, title="lot", issue_ref="manaty/nexlink#1",
+                        actor="mesh-design")["id"]
+
+    def _reserve(self, exc, *, budget):
+        """`reserve_migration` sur un lot neuf, chaque essai levant `exc` :
+        rend (résultat ou exception, horloge, essais, tirages d'attente)."""
+        lot = self._lot()
+        clock = _FakeTime()
+        attempts, draws = [], []
+
+        def transaction():
+            attempts.append(clock.now)
+            raise exc
+
+        def uniform(low, high):
+            draws.append((low, high))
+            return high
+
+        with mock.patch.object(pg_work, "time", clock), \
+                mock.patch.object(pg_work, "_RESERVE_BUDGET_S", budget), \
+                mock.patch.object(pg_work, "random",
+                                  types.SimpleNamespace(uniform=uniform)), \
+                mock.patch.object(self.db, "transaction", side_effect=transaction):
+            try:
+                out = work.reserve_migration(self.db, lot, repo=self.nexlink)
+            except Exception as got:  # noqa: BLE001 - rapporté par l'assertion
+                out = got
+        return out, clock, attempts, draws
+
+    def test_l_attente_est_bornee_par_le_budget_restant(self):
+        # codex #478 r1 : avec 1 ms de budget, l'ancienne attente de 5 ms
+        # entamait une transaction après l'échéance ; l'attente est bornée au
+        # restant, et rien n'est retenté une fois l'échéance passée
+        got, clock, attempts, _ = self._reserve(_violation(), budget=0.001)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+        self.assertEqual(attempts, [0.0], "une seule transaction, avant l'échéance")
+        self.assertEqual(clock.slept, [0.001], "l'attente tient dans le budget")
+
+    def test_budget_nul_ne_retente_pas(self):
+        # codex #478 r1 : budget épuisé, la première violation rend la
+        # contention sans deuxième transaction ni attente
+        got, clock, attempts, _ = self._reserve(_violation(), budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(attempts, [0.0])
+        self.assertEqual(clock.slept, [])
+
+    def test_une_erreur_qui_nomme_l_index_sans_unicite_remonte(self):
+        # codex #478 r1 : « permission denied for relation
+        # work_items_migration_repo_idx » n'est pas une violation d'unicité :
+        # elle remonte telle quelle, jamais en WorkError de contention
+        denied = DbError("psql: ERROR:  permission denied for relation %s" % _INDEX)
+        got, _, _, _ = self._reserve(denied, budget=0.05)
+        self.assertIs(got, denied, got)
+
+    def test_la_violation_se_reconnait_au_code_sqlstate(self):
+        # codex #478 r1/r2 : psycopg donne le code 23505 et le nom exact par
+        # ses diagnostics ; c'est la contention de l'index
+        got, _, _, _ = self._reserve(_violation(), budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+
+    def test_une_autre_contrainte_au_nom_proche_ne_retente_pas(self):
+        # codex #478 r2 : `work_items_migration_repo_idx_other` contient le
+        # nom de l'index sans être lui ; sa violation remonte telle quelle et
+        # n'entame aucune deuxième transaction (l'ancien test par sous-chaîne
+        # la retentait)
+        other = _violation(constraint=_INDEX + "_other")
+        got, _, attempts, _ = self._reserve(other, budget=10.0)
+        self.assertIs(got, other, got)
+        self.assertEqual(attempts, [0.0], "aucune deuxième transaction")
+
+    def test_psql_verbose_reconnait_la_violation_meme_en_francais(self):
+        # codex #478 r2 : un serveur en `lc_messages=fr` écrit « ERREUR » et
+        # un message français ; le code SQLSTATE et le champ CONSTRAINT NAME
+        # ne sont pas traduits, et c'est tout ce que la classification lit
+        exc = db_mod.PsqlDriver._fail(None, _failed(_psql_verbose(
+            severity="ERREUR",
+            message="la valeur d'une clé dupliquée rompt la contrainte unique"
+                    " « %s »" % _INDEX)))
+        self.assertEqual(exc.sqlstate, "23505")
+        self.assertEqual(exc.constraint, _INDEX)
+        got, _, _, _ = self._reserve(exc, budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+
+    def test_psql_verbose_autre_contrainte_ne_retente_pas(self):
+        # codex #478 r2 : le champ CONSTRAINT NAME tranche exactement, même
+        # quand le message (traduit) nomme l'index par sous-chaîne
+        exc = db_mod.PsqlDriver._fail(None, _failed(_psql_verbose(
+            constraint=_INDEX + "_other",
+            message='duplicate key value violates unique constraint "%s"' % _INDEX)))
+        self.assertEqual(exc.constraint, _INDEX + "_other")
+        got, _, attempts, _ = self._reserve(exc, budget=10.0)
+        self.assertIs(got, exc, got)
+        self.assertEqual(attempts, [0.0], "aucune deuxième transaction")
+
+    def test_psql_verbose_ignore_les_notices_avant_l_erreur(self):
+        # codex #478 r3 : psql imprime les NOTICE et WARNING traversés avant
+        # l'erreur ; leur classe (00, 01, 02) n'est pas une erreur et ne doit
+        # pas donner le code qui classe l'échec. Le libellé de sévérité peut
+        # être traduit : c'est la classe du code qui tranche.
+        for severity, state in (("NOTICE", "00000"), ("AVERTISSEMENT", "01000"),
+                                ("INFO", "02000")):
+            with self.subTest(severity=severity, state=state):
+                stderr = ("%s:  %s: table \"work_items\" does not exist, skipping\n"
+                          % (severity, state)) + _psql_verbose()
+                exc = db_mod.PsqlDriver._fail(None, _failed(stderr))
+                self.assertEqual(exc.sqlstate, "23505")
+                self.assertEqual(exc.constraint, _INDEX)
+                got, _, _, _ = self._reserve(exc, budget=0.0)
+                self.assertIsInstance(got, work.WorkError, got)
+
+    def test_psql_verbose_le_message_ne_pretend_pas_le_champ_contrainte(self):
+        # codex #478 r3 : un message multiligne qui recopie « CONSTRAINT
+        # NAME: » ne doit pas se faire passer pour le champ ; psql écrit ses
+        # champs structurés APRÈS le message — le dernier est le vrai
+        exc = db_mod.PsqlDriver._fail(None, _failed(_psql_verbose(
+            constraint=_INDEX,
+            message='duplicate key value violates unique constraint "%s"\n'
+                    "CONSTRAINT NAME:  %s" % (_INDEX, _INDEX + "_other"))))
+        self.assertEqual(exc.constraint, _INDEX)
+        got, _, _, _ = self._reserve(exc, budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+
+    def test_le_code_et_la_contrainte_du_pilote_survivent_a_la_dberror(self):
+        # codex #478 r1/r2 : le code SQLSTATE et le nom de contrainte du
+        # pilote (psycopg) survivent à la traduction en DbError — seuls eux
+        # distinguent 23505 d'une autre erreur qui nomme le même index
+        class Diag:
+            constraint_name = _INDEX
+
+        class DriverError(Exception):
+            sqlstate = "23505"
+            diag = Diag()
+
+        mapped = db_mod._map_error(DriverError("duplicate key value"))
+        self.assertEqual(mapped.sqlstate, "23505")
+        self.assertEqual(mapped.constraint, _INDEX)
+        self.assertIsNone(db_mod._map_error(Exception("boom")).sqlstate)
+        self.assertIsNone(db_mod._map_error(Exception("boom")).constraint)
+
+    def test_l_attente_plein_jitter_part_de_zero(self):
+        # codex #478 r1 (P3) : plein jitter — uniform(0, min(cap, base*2^n)) —
+        # et non uniform(base, wait) : le premier tirage part de 0, les
+        # suivants doublent jusqu'au plafond
+        got, _, _, draws = self._reserve(_violation(), budget=10.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(draws[:3], [(0.0, 0.005), (0.0, 0.01), (0.0, 0.02)])
+
+    def test_budget_epuise_rend_workerror_lisible(self):
+        """#478 : le budget de réessais épuisé rend un WorkError lisible,
+        jamais la DbError brute de l'index. Déterministe (codex #478 r1) :
+        violation injectée, horloge fausse — plus de verrou réel ni
+        d'attente de 60 s."""
+        got, clock, attempts, _ = self._reserve(_violation(), budget=0.0)
+        self.assertIsInstance(got, work.WorkError, got)
+        self.assertEqual(str(got), "reservation contention, retry")
+        self.assertNotIsInstance(got, DbError)
+        self.assertEqual(attempts, [0.0])
+        self.assertEqual(clock.slept, [])
 
 
 if __name__ == "__main__":

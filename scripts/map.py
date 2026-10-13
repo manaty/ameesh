@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Carte test → code mesurée (L161e).
 
-    scripts/carte.py installer
-    scripts/test-parts.py lancer … --mesure DIR      (une part sous mesure)
-    scripts/carte.py fusionner --sortie carte.json.gz [--precedente F] DIR [DIR…]
-    scripts/carte.py montrer carte.json.gz [CHEMIN | table:NOM | test_module …]
-    scripts/carte.py blocs src/ameesh/x.py
+    scripts/map.py install
+    scripts/test-parts.py run … --measure DIR      (une part sous mesure)
+    scripts/map.py merge --output carte.json.gz [--previous F] DIR [DIR…]
+    scripts/map.py show carte.json.gz [CHEMIN | table:NOM | test_module …]
+    scripts/map.py blocks src/ameesh/x.py
 
 Le lien entre un module de test et le code n'est jamais déclaré : il est
 **mesuré** en passant la suite sous mesure (docs/design/etudes/
@@ -15,8 +15,8 @@ l161-tests-par-impact.md, section 1) :
 1. **code Python exécuté, par test, sous-processus compris** : coverage.py,
    un contexte par test dans le processus de la suite, et dans chaque
    sous-processus un contexte statique lu dans `CARTE_CONTEXTE` ;
-   `installer` pose le fichier `.pth` qui démarre la mesure dans les
-   sous-processus (scripts/carte_mesure.py) ;
+   `install` pose le fichier `.pth` qui démarre la mesure dans les
+   sous-processus (scripts/map_measure.py) ;
 2. **fichiers de données lus et dossiers listés**, par test : hook d'audit ;
 3. **tables touchées**, par classe : `pg_stat_user_tables` du schéma de la
    classe, relevé par `tests/support.py` avant de le supprimer.
@@ -32,10 +32,12 @@ de son fichier (il les a importés).
 **La carte** (`ameesh-carte/1`, JSON compressé, clés triées) :
 
     commit, genere, outils     commit mesuré, date, versions (Python, coverage)
-    mesure                     parts, processus mesurés (dont sans contexte),
+    measure, mesure            parts, processus mesurés (dont sans contexte),
                                sous-processus Python lancés sans la mesure,
-                               surcoût
-    modules.<m>                durées par pilote, échecs sous mesure (14 jours)
+                               surcoût (L148 stage 6 : les deux graphies,
+                               l'anglaise d'abord, une release)
+    modules.<m>                durations et durees (mêmes valeurs), échecs sous
+                               mesure (14 jours)
     blocs.<fichier>.<bloc>     empreinte, lignes [début, fin], modules
     donnees.<fichier>          modules qui l'ont lu
     dossiers.<dossier>         modules qui l'ont listé
@@ -70,18 +72,18 @@ import sysconfig
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
 MIGRATIONS = SRC / "ameesh" / "migrations"
-TABLE_DUREES = REPO / "tests" / "parts" / "durees.json"
+TABLE_DURATIONS = REPO / "tests" / "parts" / "durees.json"
 SCHEMA = "ameesh-carte/1"
 #: nom du fichier .pth posé dans le site-packages de l'interpréteur
 PTH = "ameesh_carte.pth"
 #: les échecs sous mesure sont gardés ce nombre de jours
-JOURS_ECHECS = 14
+FAILURE_DAYS = 14
 MODULE = "<module>"
 
 
 # -- installation ---------------------------------------------------------
 
-def ecrire_rc(dossier: str) -> str:
+def write_rc(dossier: str) -> str:
     """Configuration coverage de la mesure : chaque processus écrit son
     propre fichier de données, contexte statique lu dans l'environnement."""
     rc = os.path.join(dossier, "coveragerc")
@@ -99,19 +101,19 @@ def _site_packages() -> pathlib.Path:
     return pathlib.Path(sysconfig.get_paths()["purelib"])
 
 
-def pth_installe() -> bool:
+def pth_installed() -> bool:
     return (_site_packages() / PTH).exists()
 
 
-def installer(_args=None) -> int:
+def install(_args=None) -> int:
     sys.path.insert(0, str(REPO / "scripts"))
-    import carte_mesure
+    import map_measure
     try:
         import coverage  # noqa: F401
     except ImportError:
         raise SystemExit("coverage absent : pip install 'coverage>=7.10'")
     cible = _site_packages() / PTH
-    cible.write_text(carte_mesure.ligne_pth(), encoding="utf-8")
+    cible.write_text(map_measure.pth_line(), encoding="utf-8")
     print(f"{cible} : mesure des sous-processus quand CARTE_MESURE est posé")
     return 0
 
@@ -121,7 +123,7 @@ def installer(_args=None) -> int:
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-class _Souche(ast.NodeTransformer):
+class _Stub(ast.NodeTransformer):
     """Remplace le corps des fonctions et des classes par `pass` : ce qui
     reste est exécuté à l'import (en-têtes, décorateurs, valeurs par défaut)."""
 
@@ -133,18 +135,18 @@ class _Souche(ast.NodeTransformer):
     visit_ClassDef = visit_FunctionDef
 
 
-def _empreinte(noeud: ast.AST) -> str:
+def _fingerprint(noeud: ast.AST) -> str:
     return hashlib.sha1(ast.dump(noeud).encode("utf-8")).hexdigest()[:16]
 
 
-def blocs(source: str) -> tuple[dict[str, dict], list[str]]:
+def blocks(source: str) -> tuple[dict[str, dict], list[str]]:
     """Les blocs d'un fichier Python ({nom: {empreinte, lignes}}) et, pour
     chaque numéro de ligne, le bloc qui la porte (index 0 inutilisé)."""
     arbre = ast.parse(source)
     n = len(source.splitlines())
     proprietaire = [MODULE] * (n + 2)
     infos: dict[str, dict] = {
-        MODULE: {"empreinte": _empreinte(_Souche().generic_visit(copy.deepcopy(arbre))),
+        MODULE: {"empreinte": _fingerprint(_Stub().generic_visit(copy.deepcopy(arbre))),
                  "lignes": [1, max(n, 1)]}}
 
     def unique(nom: str) -> str:
@@ -155,35 +157,35 @@ def blocs(source: str) -> tuple[dict[str, dict], list[str]]:
             i += 1
         return f"{nom}#{i}"
 
-    def parcourir(corps: list, prefixe: str) -> None:
+    def walk(corps: list, prefixe: str) -> None:
         for noeud in corps:
             if isinstance(noeud, _DEFS + (ast.ClassDef,)):
                 nom = unique(prefixe + noeud.name)
                 debut, fin = noeud.body[0].lineno, noeud.end_lineno
                 if isinstance(noeud, ast.ClassDef):
                     classe = copy.deepcopy(noeud)
-                    classe.body = [_Souche().visit(x) for x in classe.body]
-                    empreinte = _empreinte(classe)
+                    classe.body = [_Stub().visit(x) for x in classe.body]
+                    empreinte = _fingerprint(classe)
                 else:
-                    empreinte = _empreinte(noeud)
+                    empreinte = _fingerprint(noeud)
                 infos[nom] = {"empreinte": empreinte, "lignes": [debut, fin]}
                 for ligne in range(debut, fin + 1):
                     proprietaire[ligne] = nom
                 if isinstance(noeud, ast.ClassDef):
-                    parcourir(noeud.body, nom + ".")
+                    walk(noeud.body, nom + ".")
             else:  # if, try, with… au niveau du module ou de la classe
                 for champ in ("body", "orelse", "finalbody"):
                     sous = getattr(noeud, champ, None)
                     if isinstance(sous, list):
-                        parcourir(sous, prefixe)
+                        walk(sous, prefixe)
                 for groupe in getattr(noeud, "handlers", []) + getattr(noeud, "cases", []):
-                    parcourir(groupe.body, prefixe)
+                    walk(groupe.body, prefixe)
 
-    parcourir(arbre.body, "")
+    walk(arbre.body, "")
     return infos, proprietaire
 
 
-def _ancetres(nom: str) -> list[str]:
+def _ancestors(nom: str) -> list[str]:
     """`A.B.f` → `A.B`, `A` (blocs englobants, s'ils existent)."""
     morceaux = nom.split("#")[0].split(".")
     return [".".join(morceaux[:i]) for i in range(len(morceaux) - 1, 0, -1)]
@@ -191,7 +193,7 @@ def _ancetres(nom: str) -> list[str]:
 
 # -- fusion ---------------------------------------------------------------
 
-def module_du_contexte(contexte: str) -> str | None:
+def context_module(contexte: str) -> str | None:
     """`tests.test_x.Classe.test_y` → `test_x` ; contexte vide → None."""
     morceaux = contexte.split("|")[-1].split(".")
     if len(morceaux) >= 2 and morceaux[0] == "tests" and morceaux[1].startswith("test"):
@@ -199,7 +201,7 @@ def module_du_contexte(contexte: str) -> str | None:
     return None
 
 
-def chemin_relatif(chemin: str) -> str | None:
+def relative_path(chemin: str) -> str | None:
     """Chemin mesuré (absolu, sur le runner) → `src/ameesh/…`."""
     chemin = chemin.replace(os.sep, "/")
     i = chemin.rfind("/src/")
@@ -220,7 +222,7 @@ _RE_TABLES = [re.compile(m, re.I) for m in (
 )]
 
 
-def tables_de_migration(sql: str) -> list[str]:
+def migration_tables(sql: str) -> list[str]:
     """Tables qu'une migration crée, modifie ou dont elle change les droits."""
     sql = re.sub(r"--[^\n]*", "", sql)
     tables = set()
@@ -233,7 +235,7 @@ def tables_de_migration(sql: str) -> list[str]:
     return sorted(tables)
 
 
-def _lignes_json(motif: str):
+def _json_lines(motif: str):
     for chemin in sorted(glob.glob(motif)):
         with open(chemin, encoding="utf-8", errors="replace") as fh:
             for ligne in fh:
@@ -246,7 +248,7 @@ def _lignes_json(motif: str):
                     continue  # ligne coupée (processus tué en écrivant)
 
 
-def _couverture(dossiers: list[str]) -> tuple[dict, int, int]:
+def _coverage(dossiers: list[str]) -> tuple[dict, int, int]:
     """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés
     et celui des processus sans contexte (environnement remplacé par le test :
     leurs lignes ne sont attribuées à aucun module)."""
@@ -259,14 +261,14 @@ def _couverture(dossiers: list[str]) -> tuple[dict, int, int]:
             donnees.read()
             processus += 1
             contextes = donnees.measured_contexts()
-            if contextes and not any(module_du_contexte(c) for c in contextes):
+            if contextes and not any(context_module(c) for c in contextes):
                 sans_contexte += 1
             for mesure in donnees.measured_files():
-                relatif = chemin_relatif(mesure)
+                relatif = relative_path(mesure)
                 if relatif is None:
                     continue
                 for ligne, contextes in donnees.contexts_by_lineno(mesure).items():
-                    modules = {m for m in map(module_du_contexte, contextes) if m}
+                    modules = {m for m in map(context_module, contextes) if m}
                     if modules:
                         lignes[relatif][ligne] |= modules
     return lignes, processus, sans_contexte
@@ -280,16 +282,22 @@ def _version_coverage() -> str:
     return coverage.__version__
 
 
-def _par_module(ensembles: dict) -> dict:
+def _per_module(ensembles: dict) -> dict:
     return {k: sorted(v) for k, v in sorted(ensembles.items()) if v}
 
 
-def fusionner(dossiers: list[str], commit: str, precedente: dict | None = None,
+def _module_out(infos: dict) -> dict:
+    """L148 stage 6 : `durations` (anglais) et l'ancienne `durees`, une release."""
+    return {"durations": infos["durations"], "durees": infos["durations"],
+            "echecs": infos["echecs"]}
+
+
+def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
               maintenant: datetime.datetime | None = None,
               table_durees: dict | None = None) -> dict:
     """Les mesures des parts → la carte."""
     maintenant = maintenant or datetime.datetime.now(datetime.timezone.utc)
-    lignes, processus, sans_contexte = _couverture(dossiers)
+    lignes, processus, sans_contexte = _coverage(dossiers)
 
     # blocs de tout src/, exécutés ou non
     carte_blocs: dict[str, dict] = {}
@@ -298,7 +306,7 @@ def fusionner(dossiers: list[str], commit: str, precedente: dict | None = None,
         if "__pycache__" in relatif:
             continue
         try:
-            infos, proprietaire = blocs(fichier.read_text(encoding="utf-8"))
+            infos, proprietaire = blocks(fichier.read_text(encoding="utf-8"))
         except (SyntaxError, UnicodeDecodeError):
             continue
         modules: dict[str, set] = collections.defaultdict(set)
@@ -306,7 +314,7 @@ def fusionner(dossiers: list[str], commit: str, precedente: dict | None = None,
             nom = proprietaire[ligne] if ligne < len(proprietaire) else MODULE
             modules[nom] |= mods
         for nom, mods in list(modules.items()):
-            for ancetre in _ancetres(nom) + [MODULE]:
+            for ancetre in _ancestors(nom) + [MODULE]:
                 if ancetre in infos:
                     modules[ancetre] |= mods
         carte_blocs[relatif] = {nom: {**info, "modules": sorted(modules.get(nom, ()))}
@@ -318,8 +326,8 @@ def fusionner(dossiers: list[str], commit: str, precedente: dict | None = None,
     donnees, dossiers_lus = collections.defaultdict(set), collections.defaultdict(set)
     sans_mesure: dict = collections.defaultdict(set)
     for dossier in dossiers:
-        for fait in _lignes_json(os.path.join(dossier, "lectures", "*.jsonl")):
-            module = module_du_contexte(fait.get("c", ""))
+        for fait in _json_lines(os.path.join(dossier, "lectures", "*.jsonl")):
+            module = context_module(fait.get("c", ""))
             if module is None:
                 continue
             if "f" in fait:
@@ -332,31 +340,33 @@ def fusionner(dossiers: list[str], commit: str, precedente: dict | None = None,
     # tables touchées, par classe
     tables = collections.defaultdict(set)
     for dossier in dossiers:
-        for fait in _lignes_json(os.path.join(dossier, "tables", "*.jsonl")):
-            module = module_du_contexte(fait.get("classe", ""))
+        for fait in _json_lines(os.path.join(dossier, "tables", "*.jsonl")):
+            module = context_module(fait.get("classe", ""))
             if module:
                 for table in fait.get("tables", {}):
                     tables[table].add(module)
 
     migrations = {}
     for sql in sorted(MIGRATIONS.glob("*.sql")):
-        migrations[sql.relative_to(REPO).as_posix()] = tables_de_migration(
+        migrations[sql.relative_to(REPO).as_posix()] = migration_tables(
             sql.read_text(encoding="utf-8"))
 
     # modules : durées par pilote, échecs sous mesure (14 jours)
-    modules: dict = collections.defaultdict(lambda: {"durees": {}, "echecs": []})
+    # L148 stage 6 : la carte porte les deux graphies (`durations` et l'ancienne
+    # `durees`) pendant une release ; les lecteurs préfèrent l'anglaise.
+    modules: dict = collections.defaultdict(lambda: {"durations": {}, "echecs": []})
     for dossier in dossiers:
         for chemin in sorted(glob.glob(os.path.join(dossier, "durees*.json"))):
-            for pilote, durees in json.loads(pathlib.Path(chemin).read_text()).items():
-                for module, duree in durees.items():
-                    modules[module]["durees"][pilote] = duree
-    limite = (maintenant - datetime.timedelta(days=JOURS_ECHECS)).isoformat()
+            for pilote, par_module in json.loads(pathlib.Path(chemin).read_text()).items():
+                for module, duree in par_module.items():
+                    modules[module]["durations"][pilote] = duree
+    limite = (maintenant - datetime.timedelta(days=FAILURE_DAYS)).isoformat()
     for module, infos in ((precedente or {}).get("modules") or {}).items():
         anciens = [e for e in infos.get("echecs", []) if e.get("ts", "") >= limite]
         if anciens:
             modules[module]["echecs"].extend(anciens)
     for dossier in dossiers:
-        for fait in _lignes_json(os.path.join(dossier, "flux*.jsonl")):
+        for fait in _json_lines(os.path.join(dossier, "flux*.jsonl")):
             if fait.get("type") == "test" and fait.get("statut") in ("echec", "erreur"):
                 modules[fait["module"]]["echecs"].append(
                     {"ts": fait.get("ts", maintenant.isoformat()), "commit": commit,
@@ -369,41 +379,44 @@ def fusionner(dossiers: list[str], commit: str, precedente: dict | None = None,
         infos["echecs"].sort(key=lambda e: (e.get("ts", ""), e.get("test", "")))
 
     # surcoût : durées sous mesure face à la table de référence
-    if table_durees is None and TABLE_DUREES.exists():
-        table_durees = json.loads(TABLE_DUREES.read_text(encoding="utf-8"))
+    if table_durees is None and TABLE_DURATIONS.exists():
+        table_durees = json.loads(TABLE_DURATIONS.read_text(encoding="utf-8"))
     surcout = {}
     for pilote, reference in (table_durees or {}).items():
-        communs = [m for m in reference if pilote in modules.get(m, {}).get("durees", {})]
+        communs = [m for m in reference if pilote in modules.get(m, {}).get("durations", {})]
         base = sum(reference[m] for m in communs)
         if base > 0:
-            surcout[pilote] = round(sum(modules[m]["durees"][pilote] for m in communs) / base, 2)
+            surcout[pilote] = round(sum(modules[m]["durations"][pilote] for m in communs) / base, 2)
 
+    # L148 stage 6 : les deux graphies pendant une release, l'anglaise d'abord.
+    measure = {"parts": len(dossiers), "processus": processus,
+               "processus_sans_contexte": sans_contexte,
+               "sous_processus_sans_mesure": _per_module(sans_mesure),
+               "surcout": surcout}
     return {
         "schema": SCHEMA,
         "commit": commit,
         "genere": maintenant.isoformat(timespec="seconds"),
         "outils": {"python": platform.python_version(), "coverage": _version_coverage()},
-        "mesure": {"parts": len(dossiers), "processus": processus,
-                   "processus_sans_contexte": sans_contexte,
-                   "sous_processus_sans_mesure": _par_module(sans_mesure),
-                   "surcout": surcout},
-        "modules": {m: modules[m] for m in sorted(modules)},
+        "measure": measure,
+        "mesure": measure,
+        "modules": {m: _module_out(modules[m]) for m in sorted(modules)},
         "blocs": carte_blocs,
-        "donnees": _par_module(donnees),
-        "dossiers": _par_module(dossiers_lus),
-        "tables": _par_module(tables),
+        "donnees": _per_module(donnees),
+        "dossiers": _per_module(dossiers_lus),
+        "tables": _per_module(tables),
         "migrations": migrations,
         "sans_test": sans_test,
     }
 
 
-def ecrire(carte: dict, chemin: str) -> None:
+def write(carte: dict, chemin: str) -> None:
     texte = json.dumps(carte, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
     with gzip.open(chemin, "wt", encoding="utf-8") as f:
         f.write(texte)
 
 
-def lire(chemin: str) -> dict:
+def read(chemin: str) -> dict:
     with gzip.open(chemin, "rt", encoding="utf-8") as f:
         carte = json.load(f)
     if carte.get("schema") != SCHEMA:
@@ -411,10 +424,10 @@ def lire(chemin: str) -> dict:
     return carte
 
 
-def resume(carte: dict) -> str:
+def summary(carte: dict) -> str:
     """Résumé Markdown (résumé du job de la carte)."""
     blocs_ = [b for bs in carte["blocs"].values() for b in bs]
-    mesure = carte["mesure"]
+    mesure = carte.get("measure", carte.get("mesure", {}))
     lignes = [
         f"### Carte test → code ({carte['commit'][:12]})", "",
         f"* {len(carte['modules'])} modules de test, {len(carte['blocs'])} fichiers de code, "
@@ -437,9 +450,9 @@ def resume(carte: dict) -> str:
     return "\n".join(lignes) + "\n"
 
 
-def montrer(carte: dict, cles: list[str]) -> str:
+def show(carte: dict, cles: list[str]) -> str:
     if not cles:
-        return resume(carte)
+        return summary(carte)
     sortie = []
     for cle in cles:
         if cle.startswith("table:"):
@@ -473,40 +486,40 @@ def _commit() -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sous = ap.add_subparsers(dest="commande", required=True)
-    sous.add_parser("installer", help="pose le .pth qui mesure les sous-processus")
-    p = sous.add_parser("fusionner", help="mesures des parts → carte.json.gz")
-    p.add_argument("--sortie", required=True)
-    p.add_argument("--precedente", help="carte précédente (historique des échecs)")
+    sous.add_parser("install", help="pose le .pth qui mesure les sous-processus")
+    p = sous.add_parser("merge", help="mesures des parts → carte.json.gz")
+    p.add_argument("--output", required=True)
+    p.add_argument("--previous", help="carte précédente (historique des échecs)")
     p.add_argument("--commit", help="commit mesuré (défaut : HEAD)")
-    p.add_argument("--resume", help="écrit aussi le résumé Markdown dans ce fichier")
-    p.add_argument("dossiers", nargs="+")
-    p = sous.add_parser("montrer", help="lire une carte")
-    p.add_argument("carte")
-    p.add_argument("cles", nargs="*", help="fichier, module de test ou table:NOM")
-    p = sous.add_parser("blocs", help="blocs et empreintes d'un fichier Python")
-    p.add_argument("fichier")
+    p.add_argument("--summary", help="écrit aussi le résumé Markdown dans ce fichier")
+    p.add_argument("directories", nargs="+")
+    p = sous.add_parser("show", help="lire une carte")
+    p.add_argument("map")
+    p.add_argument("keys", nargs="*", help="fichier, module de test ou table:NOM")
+    p = sous.add_parser("blocks", help="blocs et empreintes d'un fichier Python")
+    p.add_argument("file")
     args = ap.parse_args(argv)
-    if args.commande == "installer":
-        return installer(args)
-    if args.commande == "fusionner":
+    if args.commande == "install":
+        return install(args)
+    if args.commande == "merge":
         precedente = None
-        if args.precedente and os.path.exists(args.precedente):
+        if args.previous and os.path.exists(args.previous):
             try:
-                precedente = lire(args.precedente)
+                precedente = read(args.previous)
             except (OSError, ValueError) as exc:
                 print(f"carte précédente ignorée : {exc}", file=sys.stderr)
-        carte = fusionner(args.dossiers, args.commit or _commit(), precedente)
-        ecrire(carte, args.sortie)
-        texte = resume(carte)
-        if args.resume:
-            with open(args.resume, "a", encoding="utf-8") as fh:
+        carte = merge(args.directories, args.commit or _commit(), precedente)
+        write(carte, args.output)
+        texte = summary(carte)
+        if args.summary:
+            with open(args.summary, "a", encoding="utf-8") as fh:
                 fh.write(texte)
         print(texte, end="")
         return 0
-    if args.commande == "montrer":
-        print(montrer(lire(args.carte), args.cles), end="")
+    if args.commande == "show":
+        print(show(read(args.map), args.keys), end="")
         return 0
-    infos, _ = blocs(pathlib.Path(args.fichier).read_text(encoding="utf-8"))
+    infos, _ = blocks(pathlib.Path(args.file).read_text(encoding="utf-8"))
     print(json.dumps(infos, ensure_ascii=False, indent=1))
     return 0
 

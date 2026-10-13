@@ -244,59 +244,58 @@ class Offer:
     restart_after_seconds: float = DEFAULT_RESTART_AFTER_S
     #: the offer as published in the state (`offer`): sizes in bytes
     published: dict = dataclasses.field(default_factory=dict, compare=False)
+    #: why the host lends nothing (mesh-design #459 r4c): "no_offer" (absent
+    #: `lend`) or "offer_invalid" (refused by the reader). A closed offer is
+    #: level 3 forever: `max_concurrent` 0, nothing lendable published.
+    closed: str | None = None
 
 
-def _percent(value: Any, key: str) -> float | None:
-    if value is None:
-        return None
-    number = resources.parse_percent(value)
-    if number is None:
-        raise GuardError("lend.reclaim.%s: percentage expected, got %r" % (key, value))
-    return number
-
-
-def _bytes(value: Any, key: str) -> int | None:
-    if value is None:
-        return None
-    number = resources.parse_bytes(value)
-    if number is None:
-        raise GuardError("lend.%s: size expected (e.g. 6GiB), got %r" % (key, value))
-    return number
-
-
-#: reclaim keys only the guard reads; the contract's reader reports them as
-#: unknown and ignores them
-GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
+#: the guard's own reclaim keys: the contract's reader knows and validates
+#: them too (capacity_guard.GUARD_RECLAIM_KEYS)
+GUARD_RECLAIM_KEYS = capacity_guard.GUARD_RECLAIM_KEYS
 
 
 def parse_offer(lend: Any) -> Offer:
     """`Offer` from the `lend` object, read by the contract's own reader
     (`capacity_guard.parse_lend`): the guard accepts exactly the offers the
-    canon accepts (codex #211 r6), plus the reclaim keys of
-    `GUARD_RECLAIM_KEYS`. `GuardError` on any problem."""
-    parsed, problems, _unknown = capacity_guard.parse_lend(lend)
-    if problems or parsed is None:
-        raise GuardError("lend: %s" % "; ".join(problems or ["unreadable"]))
+    canon accepts (codex #211 r6), the reclaim keys of `GUARD_RECLAIM_KEYS`
+    included.
+
+    Any problem closes the offer instead of stopping the guard: an absent
+    offer (`lend: null`, reason `no_offer`) and an offer the reader refused
+    (reason `offer_invalid`) both start the guard CLOSED — level 3, which
+    lends nothing, publishes its state and answers a manual drain. Only a
+    problem outside `lend` (host, max_agents, slice) still stops it
+    (mesh-design #459 r4c). The message names the keys; the canon still
+    reports the fiche."""
+    warnings: list[str] = []
+    parsed, problems, _unknown = capacity_guard.parse_lend(lend, warnings)
+    for warning in warnings:
+        print("ameesh guard: lend: %s" % warning, file=sys.stderr)
+
+    def closed(reason: str, detail: str) -> Offer:
+        # closed: no cap, no window and no reclaim threshold that could lend
+        # or stop anything on an offer it could not read
+        print("ameesh guard: no lend offer (%s), the guard starts closed and lends "
+              "nothing: %s" % (reason, detail), file=sys.stderr)
+        return Offer(closed=reason, published={})
+
+    if parsed is None:
+        return closed("no_offer" if lend is None else "offer_invalid",
+                      "absent" if lend is None else "; ".join(problems))
     reclaim = parsed.get("reclaim") or {}
-    extra = lend.get("reclaim") or {}
-    paths = extra.get("disk_paths") or ["/"]
-    if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
-        raise GuardError("lend.reclaim.disk_paths: list of paths expected")
-    io = _percent(extra.get("io_pressure_max"), "io_pressure_max")
-    disk_min = _bytes(extra.get("disk_free_min"), "reclaim.disk_free_min")
     published = dict(parsed)
     restart = lend.get("restart_after_seconds")
     if restart is not None:
-        # the guard's own key, as the reclaim keys above: whole seconds >= 0
+        # the guard's own key, as the reclaim keys above: whole seconds >= 0.
+        # A problem here closes the guard too — it is a `lend` problem, not a
+        # configuration one (mesh-design #459 r4c)
         restart = capacity_guard._positive_int(restart, 0)
         if restart is None:
-            raise GuardError("lend.restart_after_seconds: whole number of seconds expected")
+            return closed("offer_invalid",
+                          "`lend.restart_after_seconds`: whole number of seconds expected")
         published["restart_after_seconds"] = restart
-    guard_keys = {"io_pressure_max": io, "disk_free_min": disk_min,
-                  "disk_paths": paths if "disk_paths" in extra else None}
-    guard_keys = {k: v for k, v in guard_keys.items() if v is not None}
-    if guard_keys:
-        published["reclaim"] = dict(reclaim, **guard_keys)
+    disk_min = reclaim.get("disk_free_min")
     return Offer(
         cpu_max=parsed["cpu_max"], cpu_weight=parsed.get("cpu_weight", 10),
         memory_max=parsed["memory_max"], agent_memory_max=parsed.get("agent_memory_max"),
@@ -305,10 +304,10 @@ def parse_offer(lend: Any) -> Offer:
         memory_available_min=reclaim.get("memory_available_min"),
         cpu_pressure_max=reclaim.get("cpu_pressure_max"),
         memory_pressure_max=reclaim.get("memory_pressure_max"),
-        io_pressure_max=io,
+        io_pressure_max=reclaim.get("io_pressure_max"),
         busy_units=tuple(reclaim.get("busy_units", ())), busy_max=reclaim.get("busy_max"),
         disk_free_min=DEFAULT_DISK_FREE_MIN if disk_min is None else disk_min,
-        disk_paths=tuple(paths),
+        disk_paths=tuple(reclaim.get("disk_paths") or ("/",)),
         drain_seconds=float(parsed["drain_seconds"]),
         calm_seconds=float(parsed["calm_seconds"]),
         restart_after_seconds=DEFAULT_RESTART_AFTER_S if restart is None else float(restart),
@@ -329,11 +328,24 @@ class GuardConfig:
     work_path: str = DEFAULT_WORK_PATH
 
 
+def _strict_object(pairs):
+    """`object_pairs_hook` of the configuration reader: a duplicate key is an
+    error, never a silent overwrite (codex #459 r1: `disk_free_min` written
+    twice loaded as the last value, 0, which disables disk reclaim). The
+    canon's YAML reader refuses duplicates the same way."""
+    found: dict = {}
+    for key, value in pairs:
+        if key in found:
+            raise ValueError("duplicate key %r" % key)
+        found[key] = value
+    return found
+
+
 def load_config(path: str | None = None) -> GuardConfig:
     path = path or os.environ.get("AMEESH_GUARD_CONFIG") or DEFAULT_CONFIG
     try:
         with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
+            raw = json.load(fh, object_pairs_hook=_strict_object)
     except OSError as exc:
         raise GuardError("configuration %s unreadable: %s" % (path, exc.strerror or exc))
     except ValueError as exc:
@@ -461,6 +473,11 @@ def raw_level(offer: Offer, signals: dict, now: float) -> tuple[int, str]:
     mem_min = offer.memory_available_min
     if signals.get("drain_requested"):
         return 3, "manual"
+    if offer.closed:
+        # absent or unreadable offer: closed forever, and the reason says
+        # which (mesh-design #459 r4c). Above the window: a closed offer has
+        # no window, it must never read "idle"
+        return 3, offer.closed
     if not open_:
         return 3, "window_end"
     if mem_min is not None and (mem is None or mem < mem_min):
@@ -536,6 +553,10 @@ def lendable(offer: Offer, reading: dict) -> dict:
     """{cpu, memory_bytes, disk_bytes}, capped by the offer: `resources.lendable`
     (L159d) when there, else the warm-up values of §1.4 (25 % of the memory,
     1 CPU)."""
+    if offer.closed:
+        # a closed offer lends nothing: no share, no memory, no disk is
+        # published (level 3, `max_concurrent` 0) — mesh-design #459 r4c
+        return {"cpu": None, "memory_bytes": None, "disk_bytes": None}
     out = None
     found = getattr(resources, "lendable", None)
     if found is not None:

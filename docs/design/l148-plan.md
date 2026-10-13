@@ -114,9 +114,10 @@ It changes no code.
 
 | path                        | suggested                      | open PRs touching it   |
 |-----------------------------|--------------------------------|------------------------|
-| scripts/carte.py            | scripts/test_map.py            | —                      |
-| scripts/carte_mesure.py     | scripts/test_map_measure.py    | —                      |
-| scripts/ci-flux.py          | scripts/ci-flow.py             | —                      |
+| scripts/carte.py            | scripts/map.py (stage 2b)      | —                      |
+| scripts/carte_mesure.py     | scripts/map_measure.py (2b;    | —                      |
+|                             | old path kept as an alias)     |                        |
+| scripts/ci-flux.py          | scripts/ci-flow.py (stage 2b)  | —                      |
 | scripts/test-parallele.sh   | scripts/test-parallel.sh       | —                      |
 | deploy/mise-a-jour/         | deploy/update/                 | —                      |
 | .github/workflows/carte.yml | .github/workflows/test-map.yml | —                      |
@@ -526,6 +527,13 @@ English. A later PR swaps `dest` and the tests; the French strings leave in stag
 names (names in §2.1/§2.2/§2.5). Also update `.github/workflows/carte.yml`, `scripts/test.sh`,
 `tests/parts/*` and `scripts/version-level.py` expectations (it parses `add_parser` calls).
 Tests and CI call these scripts; do it in one PR so the workflow never sees a half-renamed tool.
+Done (2026-10-12, #147 stage 2b): `carte.py` → `map.py`, `carte_mesure.py` → `map_measure.py` (the
+old path stays as a compatibility alias for the `.pth` files installed before the rename; deleted
+at stage 7), `ci-flux.py` → `ci-flow.py`; `test-parts.py` keeps its already-English name, its 11
+functions, options and positionals are renamed. The plan's `test_map.py` / `test_map_measure.py`
+suggestions were a typo (the scripts are not tests). Dev-script options get **no** deprecated
+spelling: `scripts/version-level.py` reads only `src/ameesh/` (`SOURCES`), and every caller —
+workflows, `test-parallele.sh`, `test-plan.py`, tests, docs — is updated in the same PR.
 
 **2c — free-file function renames.** `identity.py` (`chantier_of` → `workstream_of`),
 `chat.py` (`consigne` → `instruction`) and `watch.py` (same name), `plan_github.py`
@@ -544,11 +552,34 @@ Zero-downtime recipe, no applied migration touched:
    `alter table agent_registry add column if not exists workstream text not null default '';`
    backfill from `chantier`, then a `before insert or update` trigger keeping both columns in
    sync in both directions (last write wins on the pair). Old code keeps working unchanged.
+   **A (2026-10-12, #147)**: `src/ameesh/migrations/0410_rename_chantier_workstream.sql`
+   (number reserved by `ameesh work migration 147`) adds the column, backfills it, and
+   installs `agent_registry_workstream_sync`: whichever column is written is copied onto the
+   other, and the new name wins when one statement writes both differently. Tested by
+   `tests/test_l148_stage3_workstream.py` (both drivers).
 2. **PR B** — switch readers/writers to `workstream` in the free files first (`identity.py`,
    `projects.py`, `plan_github.py`, `stagnation.py`), and emit both `workstream` and `chantier`
    in the JSON listing (duplicate key, deprecated) so the progress page keeps working.
+   **B (2026-10-12, #147)**: the free reads of `storage/postgres/projects.py`,
+   `progress.py` and `mailbox.py` select `workstream` (plus `workstream AS chantier`, the
+   deprecated duplicate) and the project filter reads `workstream`; `decisions.py`'s
+   `register_chat` writes `workstream`. The free Python readers (`projects.agent_project`,
+   `progress.build_agent`, `decisions._project`, `plan_github.lot_project`) read `workstream`
+   then fall back to `chantier`, so a row that only carries the old key still works. The hot
+   writers/readers (`storage/postgres/registry.py`, `work.py`, `operations.py`,
+   `storage/interface.py`, `backend.py`, `fil.py`, `notify.py`, `alert_briefs.py`,
+   `exploitation.py`, `mesh_cli.py`, `reprise.py`, `runner.py`) still write and read
+   `chantier`, which the trigger mirrors; PR C switches them and drops the duplicate key.
+   Tested by
+   `tests/test_l148_stage3b_workstream_readers.py` (both drivers). `identity.py`'s
+   `chantier_of` was already renamed by stage 2c; `stagnation.py` reads no `chantier`.
 3. **PR C (later)** — switch the hot files when their PRs merge, stop emitting `chantier`, then
    **Migration D** drops the trigger and the `chantier` column after one release.
+   **C1 (2026-10-12, #147)**: the last free readers switch first — `alert_briefs.py` reads
+   `workstream` with the `chantier` fallback, and `identity.py`'s last French locals plus
+   `write_alias`'s parameter are renamed (`chantier_of` stays the stage 2c alias, removed at
+   stage 7). Tested by `tests/test_l148_stage3c_workstream_free_files.py` (no database).
+   **C2**: the hot files, once the PRs that hold them have merged.
 
 The `lot` columns are **not renamed** (kept term, see §0.2). If mesh-design reverses that
 decision, the same recipe applies with `lot` → `work_item` and it must be scheduled with the

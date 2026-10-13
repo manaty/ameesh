@@ -130,9 +130,15 @@ def _capabilities(values) -> list:
 def add(db: Db, *, title: str, expected_value: str, value_score: int,
         priority: int = DEFAULT_PRIORITY, source: str = "", team: str | None = None,
         required_capabilities=None, body: str = "", package: str | None = None,
-        actor: str = "") -> dict:
+        actor: str = "", app: str | None = None, creator: str | None = None,
+        cfg=None, new_project: bool = False) -> dict:
     """Ajoute un élément à la file. La valeur attendue est obligatoire : la
-    file ne reçoit pas de travail pour occuper."""
+    file ne reçoit pas de travail pour occuper.
+
+    `app` (L118c, #495): the item's project. Omitted, it is inherited from
+    `creator` (default `actor`) as `work add` does; given, it must be a known
+    project (`work_projects.known_projects`), unless `new_project` (#506)
+    introduces it, which the item's history records."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -148,9 +154,22 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         raise BacklogError("value score out of range: %d (1 to 100)" % value_score)
     if int(priority) not in PRIORITIES:
         raise BacklogError("priority 1 (high), 2 (normal) or 3 (low): %r" % priority)
+    from . import work, work_projects
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if new_project and app is None:
+        raise BacklogError("--new-project goes with --app <project>")
+    introduced = ""
+    try:
+        project = work_projects.creation_project(cfg, db, creator or actor, app,
+                                                 new_project=new_project)
+        if app is not None and not project:
+            raise BacklogError("--app: empty project")
+        if new_project:   # read before the item exists (it makes its project known)
+            introduced = work_projects.introduction(cfg, db, project, creator or actor)
+    except work.WorkError as exc:
+        raise BacklogError(str(exc)) from None
     fiche = None
     if package:
-        from . import work
         fiche = work._package(db, package)
     return storage.of(db).work.backlog_add(
         title=title, body=body or "", source=source or "", expected_value=expected_value,
@@ -158,8 +177,9 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         required_capabilities=_capabilities(required_capabilities) or None,
         package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        note="improvement backlog (value %d): %s" % (value_score, expected_value),
-        actor=actor)
+        note="improvement backlog (value %d): %s%s" % (
+            value_score, expected_value, "; %s" % introduced if introduced else ""),
+        actor=actor, app=project)
 
 
 def items(db: Db, *, open_only: bool = True, limit: int = 100) -> list:
@@ -361,6 +381,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         return []
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
+    # #254 : un hôte en pause ne prend pas de travail, ni ses agents
+    from . import host_holds
+    holds = host_holds.live(db)
+    blocked |= set(holds)
+    held = host_holds.held_agents(listing, holds)
     balance_low = any(a.get("type") == "balance_low" for a in alerts)
     if paid is None:
         paid = sous_utilisation.paid_harnesses(getattr(cfg, "host", None))
@@ -378,8 +403,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
                                                 waiting_free=waiting_free):
-            if row["name"] in skip or _awaited(row, waiting_free=waiting_free) \
-                    or row.get("host") in blocked:
+            if row["name"] in skip or row["name"] in held \
+                    or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
             if is_paid(row) and (not allow_paid or balance_low):
                 continue
@@ -522,6 +547,11 @@ def add_parsers(work_sub, func) -> None:
     p_add.add_argument("--body", default="")
     p_add.add_argument("--package", default=None, help="WorkPackage sheet (L29)")
     p_add.add_argument("--actor", default="")
+    p_add.add_argument("--app", default=None,
+                       help="its project (L118c); default: the creator's project")
+    p_add.add_argument("--new-project", action="store_true",
+                       help="#506: accept an --app project nobody declares yet "
+                            "(journaled on the item); refused otherwise")
     p_add.add_argument("--json", action="store_true")
     p_add.set_defaults(func=func)
     p_list = sub.add_parser("list", help="the backlog, in take order")
@@ -546,16 +576,24 @@ def _line(item: dict) -> str:
         item.get("expected_value") or "")
 
 
-def run(db: Db, args) -> int:
+def run(db: Db, args, cfg=None) -> int:
     import sys
     command = getattr(args, "backlog_command", None)
     if command == "add":
+        from . import identity
+        cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+        # L118c: the creator is this session, whatever `--actor` says (`work add`)
+        binding = identity.resolve_binding(cfg, db) if cfg is not None else None
         try:
             item = add(db, title=args.title, expected_value=args.expected_value,
                        value_score=args.value_score, priority=args.priority,
                        source=args.source, team=args.team,
                        required_capabilities=args.requires, body=args.body,
-                       package=args.package, actor=args.actor)
+                       package=args.package, actor=args.actor,
+                       app=getattr(args, "app", None),
+                       creator=binding.name if binding is not None and binding.ok
+                       else args.actor, cfg=cfg,
+                       new_project=getattr(args, "new_project", False))
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2

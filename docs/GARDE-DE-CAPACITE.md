@@ -75,6 +75,9 @@ policy:
       memory_pressure_max: 2%     # PSI memory "some", avg60
       busy_units: ["actions.runner.*"]   # systemd unit patterns (CI jobs)
       busy_max: 4                 # requires busy_units
+      io_pressure_max: 20%        # PSI io "some", avg60 (ameesh guard, L159e)
+      disk_free_min: 10GiB        # watched free space under this (ameesh guard, L159e)
+      disk_paths: ["/", "/srv/ameesh-guest"]   # filesystems watched (ameesh guard, L159e)
     drain_seconds: 90         # deadline of the withdrawal (default 90, > 0)
     calm_seconds: 600         # hysteresis before lending again (default 600)
     restart_after_seconds: 600   # ameesh guard only: units it stopped start again (L159e4)
@@ -89,8 +92,43 @@ policy:
 - **Fail closed.** Any unreadable key, or one of the three caps
   missing, is a `host-policy-invalid` error, and the whole offer is
   dropped. A number counts as unreadable if it is `.inf`, `.nan` or has
-  more digits than a float holds, `reclaim` included: the host lends nothing until its fiche is fixed. An unknown key
+  more digits than a float holds, `reclaim` included: the host lends
+  nothing until its fiche is fixed. The guard still starts: with no
+  readable offer it starts CLOSED — level 3, reason `no_offer` for an
+  absent `lend`, `offer_invalid` for a refused one — publishes an empty
+  offer, lends nothing (`caps.max_concurrent` 0) and answers a manual
+  drain. An unknown key
   is a `host-lend-unknown` warning, and the key is ignored.
+- Three `reclaim` keys drive the ameesh guard (L159e): `io_pressure_max`
+  (a percentage), `disk_free_min` (a size > 0, with a whole number of
+  bytes) and `disk_paths` (a non-empty list of absolute, normalized
+  paths — a trailing slash is stripped, except for the root — without `..`
+  or NUL, each path watched once) whose free
+  space is watched. The reader knows and validates them (L479), so they
+  are no warning; a reader that does not use them ignores them. An
+  explicit null is refused for every `reclaim` key: it is not an absent
+  key, and it used to disable a threshold or fall back to a default,
+  silently. A `%` sign is single (`20%%` is not 20).
+- Mise à jour d'une offre existante : les graphies de `disk_paths` que le
+  lecteur précédent acceptait nomment les mêmes dossiers et sont lues
+  normalisées au lieu de faire refuser l'offre — plusieurs slashes de tête
+  (`//srv`), un `//` interne, un composant `.` (`/srv/.`), un slash final,
+  le même chemin deux fois, une liste vide (lue `["/"]`, son ancien
+  défaut). Chacune est signalée en `host-lend-legacy` : l'offre est gardée,
+  la garde démarre, et l'opérateur corrige la fiche. Une taille que le
+  lecteur précédent tronquait est tronquée de la même façon et signalée
+  aussi (`"0.001KiB"` vaut 1 octet, `6442450944.5` vaut 6442450944) :
+  l'offre que main acceptait reste valide. Un `disk_paths` refusé et une
+  taille qui n'est pas > 0 (`0`, `-0`, `"0.5B"`, ou ce qui tronque à
+  0 octet : le lecteur précédent lisait `0` comme « pas de reclaim
+  disque », ce qui désactivait le seuil en silence) font tomber l'offre de
+  l'hôte : la garde démarre quand même, fermée, et ne prête rien, et le
+  message nomme la clé — chemin relatif (sondé depuis le dossier de la
+  garde), `..` (à travers un lien symbolique, `/srv/../etc` n'est pas
+  `/etc`), NUL. Ces deux familles sont celles que main acceptait : elles
+  sont classées par le code structuré du problème, jamais par une recherche
+  dans le message (qui cite la valeur saisie), `install-pilot.sh` les
+  accepte, et `canon check` signale la fiche.
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 
@@ -188,7 +226,9 @@ Free text is admitted. The following values have a fixed meaning:
   `owner_pause`, `lease_lost`, `shutdown`. The last three replace a
   misleading `revoked`;
 - VMs: `app_memory`, `app_cpu`, `app_busy` (CI jobs), `disk_low`,
-  `maintenance`, `guard_stopping`.
+  `maintenance`, `guard_stopping`. Two more say the guard is closed for
+  lack of a readable offer: `no_offer` (no `lend`) and `offer_invalid`
+  (the reader refused it) — level 3, nothing lent, the state published.
 
 ### 5.2 Paths
 

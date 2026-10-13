@@ -1105,34 +1105,49 @@ import json, os, sys
 sys.path.insert(0, sys.argv[4])
 from ameesh import capacity_guard
 lend = json.loads(sys.argv[1])
-offer, problems, unknown = capacity_guard.parse_lend(lend)
-if problems:
+warnings = []
+offer, problems, unknown = capacity_guard.parse_lend(lend, warnings)
+for warning in warnings:
+    print("warning: " + warning, file=sys.stderr)
+# mesh-design #459 r4c: the family "main accepted it" — a refused
+# `disk_paths` (relative, `..`, NUL) and a size the previous reader truncated
+# to <= 0 (`0`, `-0`, `"0.5B"`) — drops the offer; the guard must still start
+# closed and lend nothing, and `canon check` reports the fiche. The
+# classification reads the codes of `parse_lend`, never a substring of a
+# message that quotes the value the operator wrote. Any other problem refuses
+# the installation.
+if problems and not capacity_guard.tolerated_only(problems):
     sys.exit("invalid offer: " + "; ".join(problems))
-# disk_max: only the size of the guest volume holds it (no quota); a bigger
-# volume is refused, unless accepted (argv[6]); a dry run says so (argv[7]);
-# a mount point, binds included, read in mountinfo by the shell (argv[8]);
-# the filesystem is read at argv[9] (the root, under PILOT_TEST_HOST in a test)
-root, disk_max = sys.argv[5], offer["disk_max"]
-if sys.argv[8] == "1":
-    # the filesystem under it (a dry run may name a root not made yet)
-    probe = sys.argv[9]
-    while not os.path.exists(probe):
-        probe = os.path.dirname(probe)
-    st = os.statvfs(probe)
-    size = st.f_blocks * st.f_frsize
-    if size > disk_max * 1.05 and sys.argv[6] != "1":
-        msg = ("%s holds %.0f GiB, above disk_max %.0f GiB: nothing would hold disk_max "
-               "(a volume of that size, a bigger disk_max, or --accept-larger-volume)"
-               % (root, size / 2 ** 30, disk_max / 2 ** 30))
-        if sys.argv[7] != "1":
-            sys.exit("refused: " + msg)
-        print("warning: refused for real: " + msg, file=sys.stderr)
-    elif size > disk_max * 1.05:
-        print("warning: %s is bigger than disk_max (accepted): disk_max is not enforced" % root,
+if problems:
+    print("warning: offer dropped (the guard starts closed and lends nothing): "
+          + "; ".join(problems), file=sys.stderr)
+    lend, offer = None, None
+if offer is not None:
+    # disk_max: only the size of the guest volume holds it (no quota); a bigger
+    # volume is refused, unless accepted (argv[6]); a dry run says so (argv[7]);
+    # a mount point, binds included, read in mountinfo by the shell (argv[8]);
+    # the filesystem is read at argv[9] (the root, under PILOT_TEST_HOST in a test)
+    root, disk_max = sys.argv[5], offer["disk_max"]
+    if sys.argv[8] == "1":
+        # the filesystem under it (a dry run may name a root not made yet)
+        probe = sys.argv[9]
+        while not os.path.exists(probe):
+            probe = os.path.dirname(probe)
+        st = os.statvfs(probe)
+        size = st.f_blocks * st.f_frsize
+        if size > disk_max * 1.05 and sys.argv[6] != "1":
+            msg = ("%s holds %.0f GiB, above disk_max %.0f GiB: nothing would hold disk_max "
+                   "(a volume of that size, a bigger disk_max, or --accept-larger-volume)"
+                   % (root, size / 2 ** 30, disk_max / 2 ** 30))
+            if sys.argv[7] != "1":
+                sys.exit("refused: " + msg)
+            print("warning: refused for real: " + msg, file=sys.stderr)
+        elif size > disk_max * 1.05:
+            print("warning: %s is bigger than disk_max (accepted): disk_max is not enforced" % root,
+                  file=sys.stderr)
+    else:
+        print("warning: %s is not a volume of its own: disk_max is indicative only" % root,
               file=sys.stderr)
-else:
-    print("warning: %s is not a volume of its own: disk_max is indicative only" % root,
-          file=sys.stderr)
 print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
                   "work_path": sys.argv[5], "lend": lend}, indent=2))
 ' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY" "$ROOT_MOUNTED" \

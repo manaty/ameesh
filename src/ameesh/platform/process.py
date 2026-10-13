@@ -348,25 +348,51 @@ def fd_path(fd: int) -> str:
 # table des processus, groupes, sous-moissonneur (travail de fond d'un tour)
 # --------------------------------------------------------------------------
 
-def process_table() -> list[dict]:
+def process_table(*, strict: bool = False) -> list[dict]:
     """Les processus lisibles de l'hôte, en une passe : `pid`, `ppid`, `pgid`
     (groupe), `name`, `start` (secondes epoch, None si inconnue), `zombie`.
 
     Sert au travail de fond d'un tour (membres du groupe du tour, zombies
     adoptés par l'exécuteur). Un processus disparu pendant la lecture est
     omis. `NotAvailable` si l'OS ne permet pas de lister les processus ou
-    leurs groupes : une liste vide voudrait dire « plus rien ne tourne »."""
+    leurs groupes : une liste vide voudrait dire « plus rien ne tourne ».
+    With strict=True, an unreadable member fails closed instead of being
+    omitted: it may still be alive and fork unseen. A member that simply
+    vanished is omitted even then — it is gone and cannot fork again, and a
+    replacement it left behind shows up in the next snapshot."""
     if not hasattr(os, "getpgid"):
         raise NotAvailable("process table", "no process groups (POSIX)")
     ps = _psutil()
     if ps is not None:
         out = []
-        for proc in ps.process_iter(["pid", "ppid", "name", "create_time", "status"]):
-            info = proc.info
+        attrs = ["pid", "ppid", "name", "create_time", "status"]
+        def strict_infos():
+            # process_iter silently skips NoSuchProcess. A vanished member is
+            # gone (it cannot fork again): skip it, but any other read error
+            # keeps the whole snapshot unusable.
+            try:
+                pids = ps.pids()
+            except ps.Error as exc:
+                raise NotAvailable("process table", "unreadable process list") from exc
+            for pid in pids:
+                try:
+                    yield ps.Process(pid).as_dict(attrs=attrs)
+                except ps.NoSuchProcess:
+                    continue
+                except ps.Error as exc:
+                    raise NotAvailable("process table", "unreadable member") from exc
+        infos = strict_infos() if strict else (proc.info for proc in ps.process_iter(attrs))
+        for info in infos:
             try:
                 pgid = os.getpgid(int(info["pid"]))
-            except OSError:  # disparu entre la liste et la lecture
+            except ProcessLookupError:  # vanished during the scan
                 continue
+            except OSError:
+                if strict:
+                    raise
+                continue
+            if strict and info.get("status") is None:
+                raise NotAvailable("process table", "unreadable process status")
             out.append({"pid": int(info["pid"]), "ppid": int(info.get("ppid") or 0),
                         "pgid": pgid, "name": str(info.get("name") or ""),
                         "start": info.get("create_time"),
@@ -396,9 +422,27 @@ def process_table() -> list[dict]:
                         "start": (demarrage + int(fields[19]) / hertz
                                   if demarrage is not None else None),
                         "zombie": fields[0] == "Z"})
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ProcessLookupError):
+            # vanished during the scan: gone, so it cannot fork again
+            continue
+        except (OSError, ValueError, IndexError) as exc:
+            if strict:
+                raise NotAvailable("process table", "unreadable process member") from exc
             continue
     return out
+
+
+def process_group_exists(pgid: int) -> bool:
+    """Signal-zero existence probe; zombies count, uncertainty stays open."""
+    if not hasattr(os, "killpg"):
+        raise NotAvailable("process group", "no process groups (POSIX)")
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def command_line(pid: int) -> str:
@@ -489,6 +533,17 @@ def children(pid: int | None = None) -> list[dict]:
         except (ps.NoSuchProcess, ps.AccessDenied) as exc:
             raise NotAvailable("enfants d'un processus", str(exc))
     raise NotAvailable("enfants d'un processus", "ni liste du noyau ni psutil")
+
+
+def exited_child(pid: int) -> bool:
+    """Observe an exited direct child without consuming its wait status."""
+    if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")):
+        return False
+    try:
+        info = os.waitid(os.P_PID, int(pid), os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        return info is not None and info.si_pid == int(pid)
+    except (ChildProcessError, OSError):
+        return False
 
 
 def reap(pid: int) -> int | None:

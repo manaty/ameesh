@@ -45,6 +45,7 @@
 --   * clés publiques et identifiants d'authentificateurs — pas secrets, mais
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
+--       key_holders.public_key (et la vue mesh_keys, #330)
 --       authenticators.public_key, .credential_id
 --   * exécuteurs médiés (voie B, 0062 et 0063) — empreintes de jetons et de
 --     codes, identifiants d'assertions, clé et attestation d'appareil,
@@ -198,7 +199,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
-        'projects'
+        'projects',
+        -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
+        'workstream'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -230,6 +233,20 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'decision', 'signature_key', 'created_at', 'expires_at',
         'consumed_at', 'consumed_by', 'unconsumed', 'unexpired',
         'key_known', 'key_live', 'key_matches', 'expires_ts', 'key_is_owner'
+    ]),
+    -- #330 (0364) : clés des humains, hors registre des agents
+    ('key_holders', ARRAY[
+        'name', 'human', 'public_key_fingerprint', 'key_role',
+        'key_updated_at', 'key_revoked_at', 'created_at'
+    ]),
+    ('mesh_keys', ARRAY[
+        'name', 'holder', 'public_key_fingerprint', 'key_role',
+        'key_updated_at', 'key_revoked_at'
+    ]),
+    -- #326 r2 (0364) : journal des clés, sans la clé (l'empreinte suffit)
+    ('key_events', ARRAY[
+        'id', 'at', 'name', 'holder', 'event', 'key_role', 'fingerprint',
+        'db_user', 'owner_gesture'
     ]),
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'approval_id', 'consumed_by', 'consumed_at'
@@ -269,7 +286,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('thread_index', ARRAY[
         'project', 'lot', 'transport', 'host', 'location', 'last_entry_id',
-        'last_mailbox_id', 'last_author', 'last_at', 'entries',
+        'last_mailbox_id', 'last_author', 'last_at', 'entries', 'counted_until',
         'created_at', 'updated_at'
     ]),
     ('model_catalog', ARRAY[
@@ -409,6 +426,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('account_holds', ARRAY[
         'host', 'harness', 'account', 'until_ts', 'reason', 'created_at'
     ]),
+    -- #254 (0392) : pause d'un hôte voulue par le propriétaire
+    ('host_holds', ARRAY[
+        'host', 'reason', 'author', 'created_at', 'until'
+    ]),
+    ('host_hold_events', ARRAY[
+        'id', 'host', 'action', 'author', 'reason', 'until', 'at'
+    ]),
     ('account_switches', ARRAY[
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
@@ -531,7 +555,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- STATE, no content) and the per-target merge lease
     ('merge_queue', ARRAY[
         'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
-        'queued_by', 'queued_at', 'updated_at', 'source'
+        'queued_by', 'queued_at', 'updated_at', 'source',
+        -- L160e2 (0412): admission generation and frozen milestone identity
+        'generation', 'frozen_id'
     ]),
     ('merge_locks', ARRAY[
         'target', 'owner', 'epoch', 'expires_at'

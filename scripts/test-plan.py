@@ -10,13 +10,13 @@
 
 `plan` runs once per CI run (job `plan` of .github/workflows/tests.yml) and
 decides, for every test module, its class and the parts it runs in; every
-part then reads the same `plan.json` (`scripts/test-parts.py lancer --plan`),
+part then reads the same `plan.json` (`scripts/test-parts.py run --plan`),
 so the split never differs between parts.
 
 **Classes** (docs/design/etudes/l161-tests-par-impact.md, section 2):
 
 * P0 — the test module itself changed, or it is unknown to the map (new);
-* P1 — impacted, from the map (`scripts/carte.py`): a changed or removed
+* P1 — impacted, from the map (`scripts/map.py`): a changed or removed
   code block it executed, a data file it read, a directory it listed (file
   added or removed there), a table touched by a new migration; plus the
   "always" list (`tests/parts/toujours.txt`) when a migration, `db.py` or
@@ -33,7 +33,7 @@ safe for this change; it is recorded, never applied.
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
 missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--depuis HEAD^1`) and the
+falls back to the textual heuristic of L161b (`--since HEAD^1`) and the
 plan is marked unsure. A file the map cannot judge (Python outside
 `src/ameesh`, a non-documentation file no test reads, a syntax error) uses
 the textual heuristic for that file and marks the plan unsure; test
@@ -95,8 +95,8 @@ CODE_ROOT = "src/ameesh/"
 ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/")
 #: test infrastructure: the map cannot judge a change there
 FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".github/",
-              "scripts/test-parts.py", "scripts/test-plan.py", "scripts/carte.py",
-              "scripts/carte_mesure.py", "scripts/ci-flux.py", "scripts/version-only.py")
+              "scripts/test-parts.py", "scripts/test-plan.py", "scripts/map.py",
+              "scripts/map_measure.py", "scripts/ci-flow.py", "scripts/version-only.py")
 #: a migration that is not purely additive impacts every database test
 #: (any `drop`, `alter table t drop c` included; `create or replace` rewrites)
 _NOT_ADDITIVE = re.compile(
@@ -115,7 +115,7 @@ def _load(name: str, filename: str):
 parts = _load("test_parts", "test-parts.py")
 version_only = _load("version_only", "version-only.py")
 sys.path.insert(0, str(SCRIPTS))
-import carte  # noqa: E402  scripts/carte.py
+import map as map_mod  # noqa: E402  scripts/map.py
 
 
 # -- git ------------------------------------------------------------------
@@ -193,12 +193,12 @@ def is_foundation(path: str) -> bool:
 
 
 def read_list(path: pathlib.Path, known: list[str], required: bool = False) -> list[str]:
-    """`parts.lire_liste`, whose SystemExit (stale or unsorted entry) becomes a
+    """`parts.read_list`, whose SystemExit (stale or unsorted entry) becomes a
     ValueError: `main` catches it and falls back to the full suite."""
     if not path.exists() and not required:
         return []
     try:
-        return parts.lire_liste(path, known)
+        return parts.read_list(path, known)
     except SystemExit as exc:
         raise ValueError(str(exc)) from None
 
@@ -260,7 +260,7 @@ def _python(card: dict, impact: Impact, status: str, path: str, head: str,
         impact.doubt(f"{path}: unreadable at {head}", path)
         return
     try:
-        new, _ = carte.blocs(source)
+        new, _ = map_mod.blocks(source)
     except (SyntaxError, ValueError):
         impact.doubt(f"{path}: syntax error", path)
         return
@@ -319,7 +319,7 @@ def _without_new_functions(source: str, added: set[str]) -> dict:
     """
     tree = ast.parse(source)
     if _dynamic(tree):
-        return carte.blocs(source)[0]
+        return map_mod.blocks(source)[0]
     bound = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
              and isinstance(n.ctx, ast.Store)}
     bound |= {(a.asname or a.name).split(".")[0] for n in ast.walk(tree)
@@ -329,7 +329,7 @@ def _without_new_functions(source: str, added: set[str]) -> dict:
                  if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                          and node.name in added and not node.decorator_list
                          and not node.name.startswith("__") and node.name not in bound)]
-    return carte.blocs(ast.unparse(tree))[0]
+    return map_mod.blocks(ast.unparse(tree))[0]
 
 
 def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
@@ -344,7 +344,7 @@ def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
     impact.hit({m for f, ms in card.get("donnees", {}).items() if f.startswith("deploy/sql/")
                 for m in ms}, f"{path} (deploy/sql readers)")
     sql = show(path, head, repo) or ""
-    tables = carte.tables_de_migration(sql)
+    tables = map_mod.migration_tables(sql)
     if not tables or _NOT_ADDITIVE.search(re.sub(r"--[^\n]*", "", sql)):
         impact.hit(db, f"{path} (not additive, or tables unknown)")
         return
@@ -434,7 +434,7 @@ def textual(modules: list[str], files: list[str]) -> dict[str, str]:
     """The L161b heuristic (the test text names the file), P1 only."""
     if not files:
         return {}
-    classes = parts.classer(modules, files, ambigus=parts.noms_ambigus())
+    classes = parts.classify(modules, files, ambigus=parts.ambiguous_names())
     hits = {m: r for m, (c, r) in classes.items() if c == "P1"}
     for f in files:  # a test helper: `from tests.fake_github import …`
         p = pathlib.PurePosixPath(f)
@@ -475,8 +475,8 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 out["map"]["used"], out["map"]["problem"] = False, problem
     if impact is None:
         changes = changed_files(base_fallback, head, repo)
-        classes = parts.classer(modules, [p for _, p in changes],
-                                ambigus=parts.noms_ambigus()) if changes is not None else {}
+        classes = parts.classify(modules, [p for _, p in changes],
+                                ambigus=parts.ambiguous_names()) if changes is not None else {}
         out["unsure"] = [problem or "no map"]
     else:
         classes = {}
@@ -511,11 +511,15 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
     if card:
         table = {}
         for module, info in card.get("modules", {}).items():
-            for d, s in info.get("durees", {}).items():
+            # L148 stage 6 : `durations` (anglais) puis l'ancienne `durees`.
+            par_pilote = info.get("durations")
+            if par_pilote is None:
+                par_pilote = info.get("durees", {})
+            for d, s in par_pilote.items():
                 table.setdefault(d, {})[module] = s
         if not table.get(driver):
             table = None
-    weighed, _ = parts.poids(modules, driver, table)
+    weighed, _ = parts.weight(modules, driver, table)
     return weighed
 
 
@@ -525,10 +529,10 @@ def split(modules: list[str], driver: str, n: int, card: dict | None,
         return []
     weighed = weights(modules, driver, card)
     result = []
-    for i, part in enumerate(parts.repartir(weighed, n), 1):
+    for i, part in enumerate(parts.split(weighed, n), 1):
         if part:
             result.append({"part": i, "of": n, "label": f"{driver} {i}/{n}",
-                           "modules": parts.ordonner(part, weighed, classes),
+                           "modules": parts.order(part, weighed, classes),
                            "estimate_s": round(sum(weighed[m] for m in part), 1)})
     return result
 
@@ -805,7 +809,7 @@ def _load_map(path: str | None) -> tuple[dict | None, str]:
     if not path or not os.path.exists(path):
         return None, f"{path or 'no path'}: absent"
     try:
-        return carte.lire(path), ""
+        return map_mod.read(path), ""
     except (OSError, ValueError, EOFError) as exc:
         return None, f"{path}: {exc}"
 
@@ -815,7 +819,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     p = sub.add_parser("plan", help="classes and parts of this run")
     p.add_argument("--out", required=True)
-    p.add_argument("--map", help="carte.json.gz (scripts/carte.py)")
+    p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")

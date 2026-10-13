@@ -90,6 +90,7 @@ class Operations(interface.Operations):
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
+                   r.admitted_hosts,  -- #254 : hôtes en pause
                    r.last_error,  -- L106 : le détail de « hôte non prêt »
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    (r.lease_owner IS NOT NULL

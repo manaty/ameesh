@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -57,9 +58,20 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "target", "github")
+PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
+                "lease_ref", "generated", "ci_required", "protected")
+#: #194 r6: where the lease of a target lives on the remote (local mode)
+LEASE_REF_DEFAULT = "refs/ameesh/land/"
+#: #194 r8: the only namespaces a lease ref may live in — never a branch that
+#: ameesh lands on
+LEASE_NAMESPACES = ("refs/ameesh/", "refs/heads/ameesh-land/")
+#: L160e2: who merges the head of the queue — nobody (`off`: the agent or the
+#: orchestrator), ameesh by a local merge pushed to the target, or ameesh
+#: through the PR (target merged into the lot branch, CI, PR merged by the API)
+LAND_MODES = ("off", "local", "pr")
+MERGE_METHODS = ("merge", "squash", "rebase")
 #: une migration numérotée : `NNNN_nom.sql`
-MIGRATION_RE = re.compile(r"^([0-9]{4})_[^/]+$")
+MIGRATION_RE = re.compile(r"^([0-9]{3,4})_[^/]+\.sql$")
 #: paires gardées au plus dans le cache d'un exécuteur
 MAX_CACHE = 20000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -75,12 +87,47 @@ class SettingsError(ValueError):
 
 
 @dataclass(frozen=True)
+class Generated:
+    """L160g (#473): a file produced by a script. A merge never resolves it
+    (no rerere): it is regenerated on the merged tree by `regen`, then
+    `check` must pass."""
+    path: str
+    regen: str
+    check: str = ""
+
+
+@dataclass(frozen=True)
+class Gate:
+    """L160g (#473): a gate run on the merged tree only when the merge
+    touches one of `paths` (globs, as the paths filters of a workflow)."""
+    run: str
+    paths: tuple = ()
+
+
+@dataclass(frozen=True)
 class Project:
     name: str
     repo: str
     migrations: str = ""
     target: str = ""
     github: str = ""
+    #: L160e2: `off` (default), `local` or `pr`; the commands run on the merged
+    #: tree before it is pushed; how a PR is merged
+    land: str = "off"
+    gates: tuple = ()
+    merge_method: str = "merge"
+    #: #194 r6: prefix of the remote lease ref (`refs/ameesh/land/` by default;
+    #: a branch prefix such as `ameesh-land/` when the remote refuses custom
+    #: namespaces) — the lease of target T is `<prefix>T`
+    lease_ref: str = LEASE_REF_DEFAULT
+    #: L160g (#473): files regenerated, never resolved (`Generated`); gates
+    #: chosen by the paths the merge touches (`Gate`); GitHub CI green on the
+    #: frozen commit before entering the queue; targets (globs) the queue and
+    #: `land` refuse (main, release branches, tags: an orchestrator's gesture)
+    generated: tuple = ()
+    path_gates: tuple = ()
+    ci_required: bool = False
+    protected: tuple = ()
 
 
 @dataclass
@@ -129,10 +176,136 @@ def parse_settings(raw) -> Settings:
             plan_git.check_ref(texts["target"], "cible")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
+        land = value.get("land") or "off"
+        if land not in LAND_MODES:
+            raise SettingsError("%s.land: %s expected" % (where, " | ".join(LAND_MODES)))
+        method = value.get("merge_method") or "merge"
+        if method not in MERGE_METHODS:
+            raise SettingsError("%s.merge_method: %s expected"
+                                % (where, " | ".join(MERGE_METHODS)))
+        gates = value.get("gates") or ()
+        if isinstance(gates, str):
+            gates = (gates,)
+        if not isinstance(gates, (list, tuple)):
+            raise SettingsError("%s.gates: a list of commands expected" % where)
+        always, by_path = [], []
+        for gate in gates:
+            if isinstance(gate, str) and gate.strip():
+                always.append(gate.strip())
+                continue
+            run = gate.get("run") if isinstance(gate, dict) else None
+            paths = gate.get("paths", ()) if isinstance(gate, dict) else None
+            if isinstance(paths, str):
+                paths = [paths]
+            if not isinstance(run, str) or not run.strip() \
+                    or set(gate) - {"run", "paths"} or not isinstance(paths, (list, tuple)) \
+                    or not all(isinstance(p, str) and p.strip() for p in paths):
+                raise SettingsError("%s.gates: a command, or {\"run\": command, \"paths\": "
+                                    "[globs]} expected" % where)
+            if paths:
+                by_path.append(Gate(run.strip(), tuple(p.strip() for p in paths)))
+            else:
+                always.append(run.strip())
+        generated = []
+        declared_generated = value.get("generated", ())
+        if not isinstance(declared_generated, (list, tuple)):
+            raise SettingsError("%s.generated: a list of generated files expected" % where)
+        for item in declared_generated:
+            if not isinstance(item, dict) or set(item) - {"path", "regen", "check"} \
+                    or not all(isinstance(item.get(k), str) and item[k].strip()
+                               for k in ("path", "regen", "check")) \
+                    or not isinstance(item.get("check", ""), str):
+                raise SettingsError("%s.generated: [{\"path\": file, \"regen\": command, "
+                                    "\"check\": command}] expected" % where)
+            generated_path = item["path"].strip()
+            if generated_path.startswith("/") or any(
+                    part in ("", ".", "..") for part in generated_path.split("/")):
+                raise SettingsError("%s.generated: path must be relative to the repository" % where)
+            if any(g.path == generated_path for g in generated):
+                raise SettingsError("%s.generated: duplicate path %s" % (where, item["path"]))
+            generated.append(Generated(generated_path, item["regen"].strip(),
+                                       (item.get("check") or "").strip()))
+        ci_required = value.get("ci_required", False)
+        if not isinstance(ci_required, bool):
+            raise SettingsError("%s.ci_required: true or false expected" % where)
+        protected = value.get("protected") or ()
+        if isinstance(protected, str):
+            protected = (protected,)
+        if not isinstance(protected, (list, tuple)) or not all(
+                isinstance(p, str) and p.strip() for p in protected):
+            raise SettingsError("%s.protected: a list of target globs expected" % where)
+        gates = always
+        if land != "off" and not (gates or by_path):
+            raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
+                                "its gates, run on the merged tree" % (where, land))
+        lease_ref = value.get("lease_ref") or LEASE_REF_DEFAULT
+        if not isinstance(lease_ref, str) or not lease_ref.strip().endswith("/"):
+            raise SettingsError("%s.lease_ref: a ref prefix ending with / expected "
+                                "(refs/ameesh/land/, or a branch prefix such as ameesh-land/)"
+                                % where)
+        lease_ref = lease_ref.strip()
+        if not lease_ref.startswith("refs/"):
+            lease_ref = "refs/heads/" + lease_ref
+        if not lease_ref.startswith(LEASE_NAMESPACES):
+            raise SettingsError("%s.lease_ref: %s is not a lease namespace (%s, or a prefix "
+                                "under them)" % (where, lease_ref, " or ".join(LEASE_NAMESPACES)))
+        if texts["target"] and lease_collides(lease_ref, texts["target"]):
+            raise SettingsError("%s.lease_ref: %s collides with the target %s"
+                                % (where, lease_ref, texts["target"]))
+        try:
+            plan_git.check_ref(lease_ref + "main", "lease_ref")
+        except ValueError as exc:
+            raise SettingsError("%s.lease_ref: %s" % (where, exc)) from exc
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
-                                 github=texts["github"])
+                                 github=texts["github"], land=land,
+                                 gates=tuple(gates), merge_method=method,
+                                 lease_ref=lease_ref,
+                                 generated=tuple(generated), path_gates=tuple(by_path),
+                                 ci_required=ci_required,
+                                 protected=tuple(p.strip() for p in protected))
+    # Lease namespaces are reserved across the whole configuration. Checkout
+    # paths and remote aliases must not let one project's lease overwrite
+    # another project's target, including projects whose landing is off.
+    for holder in projects.values():
+        if holder.land != "local":
+            continue
+        for other in projects.values():
+            if other.target and lease_collides(holder.lease_ref, other.target):
+                raise SettingsError("`radar.projects.%s.lease_ref`: %s collides with the target %s of %s"
+                                    % (holder.name, holder.lease_ref, other.target, other.name))
+
     return Settings(projects=projects)
+
+
+def lease_collides(prefix: str, target: str) -> bool:
+    """#194 r8: the lease ref of `target` under `prefix` would be the target
+    branch itself, or one holds the other (a target inside the lease
+    namespace, a lease ref under the target's name)."""
+    branch = target
+    for head in ("origin/", "refs/heads/"):
+        branch = branch[len(head):] if branch.startswith(head) else branch
+    target_ref, lease = "refs/heads/" + branch, prefix + branch
+    return (lease == target_ref or target_ref.startswith(prefix)
+            or prefix.startswith(target_ref + "/") or lease.startswith(target_ref + "/")
+            or target_ref.startswith(lease + "/"))
+
+
+def protected_target(project, target: str) -> str | None:
+    """L160g (#473): the `protected` glob that `target` matches, or None.
+    Matched against the target as written, its branch (`origin/develop` →
+    `develop`) and its full ref (`refs/heads/…`, or `refs/tags/…` as is)."""
+    import fnmatch
+    if not target or not getattr(project, "protected", ()):
+        return None
+    branch = target.split("/", 1)[1] if target.startswith("origin/") else target
+    if branch.startswith("refs/heads/"):
+        branch = branch[len("refs/heads/"):]
+    names = {target, branch, branch if branch.startswith("refs/") else "refs/heads/" + branch}
+    for glob in project.protected:
+        if any(fnmatch.fnmatchcase(name, glob) for name in names):
+            return glob
+    return None
 
 
 def settings_of(cfg) -> Settings:
@@ -217,8 +390,9 @@ class Cache:
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
-        # L160e: stacked replays of the merge queues
+        # L160e: stacked replays of the merge queues; merge leases held (L160e2)
         self.stacks: dict = {}
+        self.locks: dict = {}
 
     def trim(self) -> None:
         for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
@@ -348,6 +522,8 @@ def _states(report: dict) -> dict:
         out["target:%d" % one["work_item"]] = one["state"]
     for dup in report.get("migrations") or ():
         out["migration:%s:%s" % (dup["target"], dup["number"])] = "duplicate"
+    for one in report.get("unreserved_migrations") or ():
+        out["unreserved:%s:%s" % (one["work_item"], one["path"])] = "unreserved"
     return out
 
 
@@ -369,7 +545,8 @@ def summary(report: dict) -> dict:
             "stale": sum(1 for p in pairs if p["state"] == "stale"),
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
-            "migration_duplicates": len(report.get("migrations") or ())}
+            "migration_duplicates": len(report.get("migrations") or ()),
+            "unreserved_migrations": len(report.get("unreserved_migrations") or ())}
 
 
 def read_snapshot(cfg, project: str) -> dict | None:
@@ -399,7 +576,7 @@ def write_journal(cfg, project: str, report: dict) -> dict:
 
 
 def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None = None,
-             now=time.time, ci="github") -> list[dict]:
+             now=time.time, ci="github", owner: str | None = None) -> list[dict]:
     """Un passage du radar sur les projets déclarés par l'hôte ; rend la ligne
     de journal de chacun, avec ses envois (`mail`, L160c). `ci` : la fonction
     `branche -> {number, green} | None`, par défaut lue sur GitHub."""
@@ -415,17 +592,24 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
         try:
             report = scan(project.repo, lots, default_target=project.target or None,
                           migrations=project.migrations, cache=cache)
+            from .migration_reservations import probe
+            if project.migrations and not github_slug(project):
+                report["reservation_error"] = "migration reservations need a GitHub repository identity"
+            else:
+                report["unreserved_migrations"] = probe(db, project, report.get("branches") or [])
             error = None
         except (GitError, plan_git.MergeProbeError, OSError) as exc:
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
         if not error:
             annotate_resolutions(cfg, db, project, report, lots, cache)
             report["queue"] = run_queue(cfg, db, project, report, cache)
+            if project.land != "off":
+                report["land"] = run_land(cfg, db, project, report, cache, owner)
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
         sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
-        lines.append(dict(line, project=project.name, mail=sent))
+        lines.append(dict(line, project=project.name, mail=sent, land=report.get("land") or []))
     return lines
 
 
@@ -453,7 +637,8 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
         resolutions.annotate(report, rows, {int(r["id"]): r for r in lots},
                              replayer=resolutions.Replayer(project.repo,
                                                            clone_dir(cfg, project.name)),
-                             cache=cache)
+                             cache=cache,
+                             generated=frozenset(g.path for g in project.generated))
     except Exception as exc:  # noqa: BLE001 - never fatal for the pass
         report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
 
@@ -466,6 +651,19 @@ def run_queue(cfg, db, project: Project, report: dict, cache: Cache | None) -> d
         return merge_queue.run_pass(cfg, db, project, report, cache=cache)
     except Exception as exc:  # noqa: BLE001 - never fatal for the pass
         return {"targets": {}, "mail": [], "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def run_land(cfg, db, project: Project, report: dict, cache: Cache | None,
+             owner: str | None) -> list[dict]:
+    """L160e2: ameesh merges the head of each queue (`ameesh.land.run_pass`).
+    Never raises."""
+    from . import land
+    owner = owner or "%s:%d" % (socket.gethostname(), os.getpid())
+    try:
+        return land.run_pass(cfg, db, project, report, owner=owner,
+                             locks=cache.locks if cache is not None else None)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        return [{"result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}]
 
 
 # --------------------------------------------------------------------------
@@ -498,12 +696,12 @@ def ci_green(rollup) -> bool:
 
 
 def github_ci(project: Project, gh=None, *, strict: bool = False):
-    """La fonction `branche -> {number, url, head, green} | None` du projet
-    (PR ouverte de la branche, `head` : son commit de tête), lue avec `gh` ;
-    None si le dépôt GitHub est inconnu. Une erreur de `gh` vaut « pas
+    """La fonction `branche -> {number, url, head, green, draft} | None` du
+    projet (PR ouverte de la branche, `head` : son commit de tête), lue avec
+    `gh` ; None si le dépôt GitHub est inconnu. Une erreur de `gh` vaut « pas
     verte » : le courrier reste passif. `strict` (entrée en file, L160e) :
     l'erreur est levée (`plan_github.GithubError`), jamais prise pour « pas
-    de PR »."""
+    de PR ». `draft` (L539) : un lot léger ne part que d'une PR non brouillon."""
     slug = github_slug(project)
     if not slug:
         return None
@@ -515,7 +713,7 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
             gh = gh or plan_github.Gh()
             rows = plan_github._json(gh, ["pr", "list", "--repo", slug, "--head", branch,
                                           "--state", "open", "--json",
-                                          "number,url,headRefOid,statusCheckRollup"]) or []
+                                          "number,url,headRefOid,statusCheckRollup,isDraft"]) or []
         except plan_github.GithubError:
             if strict:
                 raise
@@ -524,8 +722,137 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
             return None
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
                 "head": rows[0].get("headRefOid"),
-                "green": ci_green(rows[0].get("statusCheckRollup"))}
+                "green": ci_green(rows[0].get("statusCheckRollup")),
+                "draft": bool(rows[0].get("isDraft"))}
     return status
+
+
+#: L160g (#473): conclusions of a workflow run that do not block
+CI_PASSING = ("success", "skipped", "neutral")
+
+
+def commit_ci(project: Project, sha: str, gh=None) -> dict:
+    """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
+    (Actions, external app checks and commit statuses), the latest activity
+    of each workflow database ID: `{runs,
+    green, pending: [workflows], failed: [workflows]}`; green needs at least
+    one check, all concluded and passing. Raises `plan_github.GithubError`
+    when it cannot be read (never taken for « no CI »)."""
+    from datetime import datetime
+    from . import plan_github
+    slug = github_slug(project)
+    if not slug:
+        raise plan_github.GithubError("project %s declares no GitHub repository" % project.name)
+    gh = gh or plan_github.Gh()
+    rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
+                                  "100", "--json",
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha"])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise plan_github.GithubError("gh run list: unexpected output")
+    if len(rows) >= 100:
+        raise plan_github.GithubError("gh run list: result may be truncated; cannot certify frozen CI")
+    if any(r.get("headSha") != sha for r in rows):
+        raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
+    latest: dict = {}
+    times: dict = {}
+    for run in rows:
+        identity = run.get("workflowDatabaseId")
+        if type(identity) is not int or identity <= 0:
+            raise plan_github.GithubError("gh run list: missing or invalid workflow identity")
+        try:
+            stamps = [datetime.fromisoformat(run[field].replace("Z", "+00:00"))
+                      for field in ("createdAt", "startedAt", "updatedAt")]
+            if any(t.utcoffset() is None for t in stamps):
+                raise ValueError("timestamp lacks timezone")
+            at = max(stamps)
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise plan_github.GithubError("gh run list: missing or invalid run timestamp") from exc
+        if identity in times and at == times[identity] and run != latest[identity]:
+            raise plan_github.GithubError("gh run list: ambiguous latest run for workflow %s" % identity)
+        if identity not in times or at > times[identity]:
+            times[identity], latest[identity] = at, run
+
+    def label(identity, run):
+        return run.get("workflowName") or run.get("name") or str(identity)
+
+    pending = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") != "completed")
+    failed = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") == "completed"
+                    and (r.get("conclusion") or "").lower() not in CI_PASSING)
+    # Actions alone cannot certify a commit: GitHub Apps and classic commit
+    # statuses can also block it. Read the same exact SHA, never the PR head.
+    checks = plan_github._json(gh, ["api", "repos/%s/commits/%s/check-runs?filter=all&per_page=100"
+                                   % (slug, sha)])
+    if (not isinstance(checks, dict) or type(checks.get("total_count")) is not int
+            or not isinstance(checks.get("check_runs"), list)
+            or checks["total_count"] != len(checks["check_runs"])
+            or checks["total_count"] >= 100):
+        raise plan_github.GithubError("commit checks: malformed or truncated response")
+    external = {}
+    activity = {}
+    for check in checks["check_runs"]:
+        if (not isinstance(check, dict) or check.get("head_sha") != sha
+                or not isinstance(check.get("app"), dict)
+                or type(check["app"].get("id")) is not int
+                or type(check.get("id")) is not int or not check.get("name")):
+            raise plan_github.GithubError("commit checks: invalid identity or frozen SHA")
+        if check["app"].get("slug") == "github-actions":
+            continue  # workflow attempts above account for all their jobs
+        try:
+            stamps = [datetime.fromisoformat(check["started_at"].replace("Z", "+00:00"))]
+            if check.get("status") == "completed" or check.get("completed_at") is not None:
+                stamps.append(datetime.fromisoformat(check["completed_at"].replace("Z", "+00:00")))
+            if any(t.utcoffset() is None for t in stamps):
+                raise ValueError("timestamp lacks timezone")
+            if len(stamps) == 2 and stamps[1] < stamps[0]:
+                raise ValueError("completion precedes start")
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise plan_github.GithubError("commit checks: missing or invalid activity timestamp") from exc
+        key = (check["app"]["id"], check["name"])
+        # An unfinished attempt must not be hidden by any completed check.
+        at = (check.get("status") != "completed", max(stamps))
+        if key in activity and at == activity[key] and check != external[key]:
+            raise plan_github.GithubError("commit checks: ambiguous latest activity for %s/%s" % key)
+        if key not in activity or at > activity[key]:
+            activity[key], external[key] = at, check
+    for check in external.values():
+        label = "%s/%s" % (check["app"]["id"], check["name"])
+        if check.get("status") != "completed":
+            pending.append(label)
+        elif (check.get("conclusion") or "").lower() not in CI_PASSING:
+            failed.append(label)
+    statuses = plan_github._json(gh, ["api", "repos/%s/commits/%s/status?per_page=100"
+                                     % (slug, sha)])
+    if (not isinstance(statuses, dict) or statuses.get("sha") != sha
+            or type(statuses.get("total_count")) is not int
+            or not isinstance(statuses.get("statuses"), list)
+            or statuses["total_count"] != len(statuses["statuses"])
+            or statuses["total_count"] >= 100):
+        raise plan_github.GithubError("commit statuses: malformed, truncated or wrong SHA response")
+    for status in statuses["statuses"]:
+        if not isinstance(status, dict) or not status.get("context"):
+            raise plan_github.GithubError("commit statuses: invalid context")
+        if status.get("state") == "pending":
+            pending.append(status["context"])
+        elif status.get("state") != "success":
+            failed.append(status["context"])
+    count = len(latest) + len(external) + len(statuses["statuses"])
+    return {"runs": count, "green": bool(count) and not pending and not failed,
+            "pending": sorted(pending), "failed": sorted(failed)}
+
+
+def gates_for(project, files) -> tuple:
+    """L160g (#473): the gates of a merge that touches `files`: the
+    unconditional ones, then each path gate one of whose globs matches one
+    of them (`fnmatch`: `*` also crosses `/`, so a gate runs at least
+    whenever a workflow `paths` filter would). `files` None (unknown): every
+    path gate runs."""
+    import fnmatch
+    out = list(project.gates)
+    for gate in getattr(project, "path_gates", ()) or ():
+        if files is None or any(fnmatch.fnmatchcase(f, glob)
+                                for f in files for glob in gate.paths):
+            out.append(gate.run)
+    return tuple(out)
 
 
 def conflicts_of(report: dict) -> dict:
@@ -554,6 +881,11 @@ def conflicts_of(report: dict) -> dict:
             "kind": "migration", "lots": sorted({h["work_item"] for h in dup["lots"]}),
             "files": [h["path"] for h in dup["lots"]], "target": dup["target"],
             "number": dup["number"], "in_target": dup["in_target"]}
+    for one in report.get("unreserved_migrations") or ():
+        out["unreserved:%s:%s" % (one["work_item"], one["path"])] = {
+            "kind": "unreserved", "lots": [one["work_item"]], "files": [one["path"]],
+            "target": one["target"], "number": one["number"], "repo": one["repo"],
+            "holder": one.get("holder")}
     return out
 
 
@@ -613,6 +945,12 @@ def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
                 "if your PR is green and still blocked."
                 % (head, mine.get("branch") or "?", conflict["target"],
                    _files(conflict["files"]), conflict["target"]))
+    if conflict["kind"] == "unreserved":
+        return ("%s: SQL migration %s has no reservation for this lot in %s. "
+                "Reserve it with `ameesh work migration %d %s` before freezing. %s"
+                % (head, _files(conflict["files"]), conflict["repo"], lot,
+                   conflict["number"], "Already held by lot #%s; choose a new number."
+                   % conflict["holder"] if conflict.get("holder") else ""))
     others = [_who(branches, n) for n in conflict["lots"] if n != lot]
     return ("%s: migration number %s is duplicated (%s)%s%s. Take the first free "
             "number of %s and tell the other lot."
@@ -749,6 +1087,8 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
         out.append("  error: %s" % report["error"])
     if report.get("resolution_error"):
         out.append("  resolutions: %s" % report["resolution_error"])
+    if report.get("reservation_error"):
+        out.append("  reservations: %s" % report["reservation_error"])
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
@@ -778,6 +1118,10 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                                      for h in dup["lots"]),
             "; already in %s: %s" % (dup["target"], dup["in_target"])
             if dup["in_target"] else ""))
+    for one in report.get("unreserved_migrations") or ():
+        out.append("  unreserved migration %s: %s (%s, %s)%s" % (
+            one["number"], _lot(one["work_item"]), one["repo"], one["path"],
+            "; held by #%s" % one["holder"] if one.get("holder") else ""))
     queue = report.get("queue") or {}
     if queue.get("error"):
         out.append("  file : %s" % queue["error"])
@@ -787,6 +1131,10 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                           " (éjecté)" if one["state"] == "ejected" else
                           " (rejouée)" if (one.get("stack") or {}).get("state") == "replayed"
                           else "") for one in listed) or "vide"))
+    for one in report.get("land") or ():
+        out.append("  fusion   %s : %s%s" % (_lot(one["lot"]) if one.get("lot") else "—",
+                                             one["result"], " (%s)" % one["error"]
+                                             if one.get("error") else ""))
     for one in report.get("skipped") or ():
         out.append("  skipped  %s %s: %s" % (_lot(one["work_item"]), one["branch"],
                                              one["reason"]))

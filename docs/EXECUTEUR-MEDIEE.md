@@ -15,7 +15,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 62 opérations et la liste des 248 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 296 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -58,14 +58,22 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
+Comptes : 63 opérations, dont 25 lectures et 38 écritures. 53 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Cinq
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (315
-opérations après intégration de main le 12/10) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (377
+opérations après intégration de main et de #330) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
+
+`turn_resources.running_started_before` est une lecture de portée H :
+l'hôte est forcé et une règle dédiée limite les lignes aux agents admis de
+l'exécuteur, avec la liste blanche d'invitation et les modes d'identifiants.
+Ce filtre précède la pagination (200 lignes au plus). Le Tracker utilise
+cette lecture pour protéger les processus migrés dans un autre tour vivant.
+Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
+qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
 l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
@@ -126,6 +134,12 @@ The latest main merge also refuses host-history reads, waiting-episode
 reads and decision-source/prose reads. `work.move` accepts the optional
 `held=false` argument added by main; it adds a database-side open-request
 check for a move, without exposing the decision operations to the device.
+
+The three key-holder operations added by #330 remain refused:
+`keys.register_human`, `keys.owner_registrations` and `keys.confirm`.
+Human key registration, owner registration auditing and owner confirmation
+are outside the mediated executor's scope, alongside key registration and
+revocation. The admitted operations and contract version remain unchanged.
 
 ## Requête et réponse
 
@@ -437,7 +451,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 62 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 63 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

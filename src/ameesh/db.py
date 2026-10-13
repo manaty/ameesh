@@ -43,8 +43,9 @@ import time
 from collections import deque
 from decimal import Decimal
 from typing import Any, Iterable, Sequence, Union
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
+from . import dsn as dsn_mod
 from .config import Config, mask_dsn
 
 #: sonde de connexion ET de schéma (L61) : une seule requête pour les deux
@@ -84,8 +85,79 @@ _CONNECT_HINTS = (
 )
 
 
+#: code SQLSTATE de PostgreSQL pour une violation d'unicité
+UNIQUE_VIOLATION = "23505"
+#: une ligne de sévérité psql en verbosité `verbose` : « ERROR:  23505: … ».
+#: Le libellé de sévérité est traduit par le client (`ERREUR` en français) :
+#: on ne le reconnaît pas à son nom, mais à la forme « <mot>: <code>: » — le
+#: code, lui, ne dépend pas de la locale.
+_ERROR_LINE_RE = re.compile(r"^\w+:\s+([0-9A-Z]{5}):", re.MULTILINE)
+#: classes SQLSTATE qui ne sont pas des erreurs : succès (00), avertissement
+#: (01), absence de données (02). psql peut imprimer un NOTICE 00000 avant
+#: l'erreur qui fait échouer le script : ce n'est pas lui qui classe l'échec
+#: (codex #478 r3).
+_NON_ERROR_CLASSES = frozenset(("00", "01", "02"))
+#: le champ structuré « CONSTRAINT NAME: x » (psql, client en locale C) ; il
+#: porte le nom de l'index même quand celui-ci n'est pas une contrainte.
+_CONSTRAINT_LINE_RE = re.compile(r"^CONSTRAINT NAME:[ \t]+(\S.*?)[ \t]*$", re.MULTILINE)
+
+
+def _error_state(stderr: str) -> tuple[str, int] | None:
+    """(code SQLSTATE, position) de la PREMIÈRE ligne de sévérité du rapport
+    dont la classe n'est ni 00 (succès), ni 01 (avertissement), ni 02
+    (absence de données) ; `None` si le rapport n'en porte aucune.
+
+    La sévérité peut être traduite (`ERREUR` en français) : seule la forme de
+    la ligne tranche, jamais son libellé (codex #478 r3)."""
+    for match in _ERROR_LINE_RE.finditer(stderr):
+        if match.group(1)[:2] not in _NON_ERROR_CLASSES:
+            return match.group(1), match.start()
+    return None
+
+
+def _constraint_name(stderr: str, start: int) -> str | None:
+    """Le nom de contrainte du rapport d'erreur, ou `None` : le DERNIER champ
+    « CONSTRAINT NAME: » placé après la ligne de sévérité qui commence en
+    `start` (codex #478 r3).
+
+    psql écrit ses champs structurés après le message, DETAIL, HINT et
+    CONTEXT : un message multiligne qui recopie ce libellé reste avant le
+    vrai champ, seul retenu."""
+    name = None
+    for match in _CONSTRAINT_LINE_RE.finditer(stderr, start):
+        name = match.group(1)
+    return name
+
+
 class DbError(RuntimeError):
-    """Erreur SQL ou de protocole."""
+    """Erreur SQL ou de protocole. `sqlstate` et `constraint` : le code du
+    serveur et le nom de la contrainte violée, quand le pilote les donne
+    (psycopg par ses diagnostics, psql par ses champs `verbose`) ; None
+    sinon. Le texte du message ne sert jamais à classifier : il dépend de
+    `lc_messages` du serveur (codex #478 r2)."""
+
+    def __init__(self, message, *, sqlstate: str | None = None,
+                 constraint: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+        self.constraint = constraint
+
+
+def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bool:
+    """`exc` est-elle la violation d'unicité de `constraint` (ou d'une
+    contrainte quelconque quand il est None) ?
+
+    Seuls le code SQLSTATE 23505 et le nom EXACT de la contrainte tranchent
+    (codex #478 r2) : le texte du message est traduit par le serveur
+    (`lc_messages`), et une sous-chaîne confondrait
+    `work_items_migration_repo_idx` avec
+    `work_items_migration_repo_idx_other` — une violation de cette autre
+    contrainte ne doit pas être retentée en contention."""
+    if not isinstance(exc, DbError) or exc.sqlstate != UNIQUE_VIOLATION:
+        return False
+    if constraint is None:
+        return True
+    return exc.constraint == constraint
 
 
 class Unavailable(DbError):
@@ -327,23 +399,8 @@ def _batch_item(item) -> tuple[str, Sequence[Any]]:
 # DSN
 # --------------------------------------------------------------------------
 
-def split_password(dsn: str) -> tuple[str, str]:
-    """(mot de passe, DSN sans mot de passe) — le secret ne traîne pas en argv."""
-    if "://" in dsn:
-        parts = urlsplit(dsn)
-        password = ""
-        if parts.netloc and "@" in parts.netloc:
-            creds, host = parts.netloc.rsplit("@", 1)
-            user, _, pwd = creds.partition(":")
-            password = unquote(pwd)
-            netloc = "%s@%s" % (quote(user), host)
-            dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    else:
-        match = re.search(r"(?:^|\s)password=(\S+)", dsn)
-        password = match.group(1).strip("'\"") if match else ""
-        if match:
-            dsn = (dsn[: match.start()] + " " + dsn[match.end():]).strip()
-    return password, dsn
+# #518: libpq's own parsing, in ameesh.dsn (also run by deploy/mise-a-jour/poste.sh)
+split_password = dsn_mod.split_password
 
 
 # --------------------------------------------------------------------------
@@ -367,14 +424,26 @@ class PsqlDriver:
             cfg.statement_timeout_ms / 1000.0 + 5.0
             if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0 else None
         )
-        self.password, base = split_password(cfg.dsn)
+        try:
+            self.password, base = split_password(cfg.dsn)
+        except dsn_mod.DsnError as exc:   # #518: libpq would refuse it too
+            raise Unavailable("psql: invalid DSN: %s" % exc) from None
         self.env = os.environ.copy()
         self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
+        #: psql traduit les libellés des champs de son rapport d'erreur
+        #: (`CONSTRAINT NAME`) selon la locale du *client* : la classification
+        #: les lit, donc le client est forcé en C. Le message du serveur, lui,
+        #: reste traduit par `lc_messages` — et n'est jamais analysé
+        #: (codex #478 r2).
+        self.env["LC_ALL"] = "C"
         if self.password:
             self.env["PGPASSWORD"] = self.password
+        # `VERBOSITY=verbose` : psql imprime alors le code SQLSTATE sur la
+        # ligne d'erreur et les champs structurés (CONSTRAINT NAME) — la
+        # seule source du nom exact, indépendante de `lc_messages`.
         base_args = [
             binary, "-X", "-q", "-A", "-t", "-P", "pager=off",
-            "-v", "ON_ERROR_STOP=1", "-d", base,
+            "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-d", base,
         ]
         self._args = list(base_args)
         # Un `psql -c` ne lit jamais stdin : l'écouteur interactif a donc sa
@@ -441,16 +510,27 @@ class PsqlDriver:
             raise DbError("psql: %s" % message)
 
     def _fail(self, proc: subprocess.CompletedProcess) -> DbError:
-        lines = [l for l in (proc.stderr or "").strip().splitlines() if l.strip()]
+        stderr = proc.stderr or ""
+        lines = [l for l in stderr.strip().splitlines() if l.strip()]
         message = lines[-1] if lines else "code %d" % proc.returncode
         for line in reversed(lines):
             if "ERROR" in line or "ERREUR" in line:
                 message = line.strip()
                 break
-        low = (proc.stderr or "").lower()
+        low = stderr.lower()
         if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
             return Unavailable("psql: %s" % message)
-        return DbError("psql: %s" % message)
+        # `VERBOSITY=verbose` : le code SQLSTATE est sur la ligne de sévérité
+        # et le nom exact de la contrainte dans son champ structuré — ni l'un
+        # ni l'autre ne dépend de `lc_messages` (codex #478 r2). La première
+        # sévérité qui n'est ni une notice ni un avertissement classe l'échec,
+        # et seul le dernier champ CONSTRAINT NAME après elle compte : un
+        # message multiligne peut recopier ce libellé (codex #478 r3).
+        state = _error_state(stderr)
+        name = _constraint_name(stderr, state[1]) if state else None
+        return DbError("psql: %s" % message,
+                       sqlstate=state[0] if state else None,
+                       constraint=name)
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
@@ -470,7 +550,7 @@ class PsqlDriver:
             return []
         if len(items) == 1:
             return [self.query(*items[0])]
-        if any(not pure_read(sql) or ";" in sql.strip().rstrip(";") for sql, _ in items):
+        if any(not pure_read(sql) or not single_statement(sql) for sql, _ in items):
             return [self.query(sql, params) for sql, params in items]
         out: list[list[dict]] = []
         for start in range(0, len(items), 90):  # json_build_array : 100 arguments au plus
@@ -670,19 +750,28 @@ class _PsqlTransaction:
 class _PsqlListener:
     """Écoute LISTEN/NOTIFY avec `psql` (sans psycopg).
 
-    Deux contraintes de psql, vérifiées sur le conteneur :
+    Trois contraintes de psql, vérifiées sur le conteneur :
 
     * il ne vide son stdout (bloqué en `pg_sleep`) qu'à la fin de la requête ;
     * il n'imprime les notifications qu'en mode interactif, au tour de boucle
-      suivant.
+      suivant ;
+    * il lit ses instructions de façon asynchrone : `LISTEN` n'est effectif
+      qu'une fois la ligne exécutée par le processus, pas quand on l'a écrite.
 
     D'où ce montage : `psql` tourne sur un pty (stdin+stdout), on lui envoie un
     battement `SELECT 1` deux fois par seconde, et on filtre la sortie sur la
     ligne « Asynchronous notification … ». La latence de réveil est donc de
-    ~0,5 s, contre 5 s pour le sondage de repli.
+    ~0,5 s, contre 5 s pour le sondage de repli. `subscribe` attend en outre la
+    sonde `pg_listening_channels()` (lot #681) : sans elle, un `NOTIFY` émis
+    juste après l'abonnement pouvait précéder le `LISTEN` et être perdu.
     """
 
     HEARTBEAT = 0.5
+    #: en-tête de la sonde d'activation (voir `_await_ready`) ; le séparateur
+    #: des canaux est le caractère d'unité (31), absent des identifiants
+    READY_PREFIX = "__ameesh_listener_ready__"
+    READY_SEP = chr(31)
+    READY_TIMEOUT = 10.0
 
     def __init__(self, driver: PsqlDriver, channels: list[str]):
         self.channels = channels
@@ -690,6 +779,8 @@ class _PsqlListener:
         self._lines: list[str] = []
         self._down = threading.Event()
         self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._ready_channels: list[str] = []
         self._buf = ""
         self.master, slave = pty.openpty()
         try:
@@ -708,7 +799,27 @@ class _PsqlListener:
             "\\set PROMPT1 ''\n\\set PROMPT2 ''\n"
             + driver._bootstrap
             + "".join("LISTEN %s;\n" % quote_ident(c) for c in channels)
+            + ("SELECT '%s' || coalesce(string_agg(c, chr(31)), '') "
+               "FROM pg_listening_channels() c;\n" % self.READY_PREFIX)
         )
+        if not self._await_ready():
+            detail = self.error
+            self.close()
+            raise Unavailable("psql listener not ready after %gs%s"
+                              % (self.READY_TIMEOUT, ": " + detail if detail else ""))
+
+    def _await_ready(self) -> bool:
+        """Attend que psql ait exécuté les `LISTEN` (sonde) ; False si la
+        session est tombée ou si le délai est dépassé."""
+        deadline = time.monotonic() + self.READY_TIMEOUT
+        while not self._ready.is_set():
+            if self._down.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._ready.wait(min(0.05, remaining))
+        return True
 
     def _write(self, text: str) -> None:
         try:
@@ -740,6 +851,16 @@ class _PsqlListener:
                     match = _NOTIFY_RE.match(line)
                     if match:
                         self._queue.put({"channel": match.group(1), "payload": match.group(2)})
+                    elif line.startswith(self.READY_PREFIX):
+                        self._ready_channels = [
+                            c for c in line[len(self.READY_PREFIX):].split(self.READY_SEP) if c]
+                        if set(self.channels) <= set(self._ready_channels):
+                            self._ready.set()
+                        else:
+                            self._lines.append("psql listening on [%s] only, wanted [%s]"
+                                               % (",".join(self._ready_channels),
+                                                  ", ".join(self.channels)))
+                            del self._lines[:-20]
                     else:
                         self._lines.append(line)
                         del self._lines[:-20]
@@ -937,7 +1058,7 @@ class PsycopgDriver:
             raise SchemaMissing(_schema_message(self))
         if not self._schema_pending:
             return False
-        if (";" in sql.strip().rstrip(";") or not self._pipeline_ok()
+        if (not single_statement(sql) or not self._pipeline_ok()
                 or self.conn.info.transaction_status != self._psycopg.pq.TransactionStatus.IDLE):
             # plusieurs instructions (interdit en pipeline), ou transaction
             # ouverte : la sonde passe seule, d'abord
@@ -977,13 +1098,13 @@ class PsycopgDriver:
             raise SchemaMissing(_schema_message(self))
         probe = False
         if self._schema_pending:
-            if any(";" in sql.strip().rstrip(";") for sql, _ in items):
+            if any(not single_statement(sql) for sql, _ in items):
                 self._settle_schema()
             else:
                 probe = self._deferred(items[0][0])
         if len(items) == 1 and not probe:
             return [self.query(*items[0])]
-        if not self._pipeline_ok() or any(";" in sql.strip().rstrip(";") for sql, _ in items):
+        if not self._pipeline_ok() or any(not single_statement(sql) for sql, _ in items):
             if probe:
                 self._schema_pending = True
                 self._settle_schema()
@@ -1103,13 +1224,29 @@ def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())[:300]
 
 
+def _sqlstate(exc: Exception) -> str | None:
+    """Le code SQLSTATE d'une exception de pilote, quand il le donne :
+    psycopg 3 (`sqlstate`), psycopg 2 (`pgcode`)."""
+    state = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return state if isinstance(state, str) and state else None
+
+
+def _constraint(exc: Exception) -> str | None:
+    """Le nom de la contrainte violée, quand le pilote le donne : psycopg 3
+    et psycopg 2 l'exposent dans `exc.diag.constraint_name` (codex #478 r2)."""
+    diag = getattr(exc, "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    return name if isinstance(name, str) and name else None
+
+
 def _map_error(exc: Exception) -> DbError:
     text = _one_line(exc).lower()
+    state = _sqlstate(exc)
     if any(hint in text for hint in _CONNECT_HINTS):
-        return Unavailable(_one_line(exc))
+        return Unavailable(_one_line(exc), sqlstate=state)
     if "does not exist" in text and ("relation" in text or "table" in text):
-        return SchemaMissing(_one_line(exc))
-    return DbError(_one_line(exc))
+        return SchemaMissing(_one_line(exc), sqlstate=state)
+    return DbError(_one_line(exc), sqlstate=state, constraint=_constraint(exc))
 
 
 def is_unavailable(exc: BaseException) -> bool:
@@ -1253,6 +1390,68 @@ class _Abort(Exception):
 def pure_read(sql: str) -> bool:
     """SELECT sans effet : peut être regroupé et rejoué depuis le cache."""
     return bool(_READ_RE.match(sql)) and not _UNSAFE_RE.search(sql)
+
+
+#: dollar-quoted string opening (`$$`, `$tag$`) — rare here, but a `;` inside
+#: one is not a separator either
+_DOLLAR_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+
+def _skip_trivia(sql: str, index: int) -> int:
+    """Index after whitespace and comments, starting at `index`."""
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char.isspace():
+            index += 1
+        elif sql.startswith("--", index):
+            newline = sql.find("\n", index)
+            index = length if newline < 0 else newline + 1
+        elif sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+        else:
+            break
+    return index
+
+
+def single_statement(sql: str) -> bool:
+    """True when `sql` holds at most one statement (a trailing `;` allowed).
+
+    A pipeline carries a single statement: `query_batch` therefore falls back
+    to one query per item as soon as it sees a `;`. Scanning the raw text made
+    that test fire on a `;` written inside a `--` comment, which turned a
+    whole batch into one round trip per query (L521: `alerts` paid 33 trips
+    for 31 statements, ~7 s from a laptop). Comments, string literals, quoted
+    identifiers and dollar-quoted strings are skipped here.
+    """
+    index, length = 0, len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "'" or char == '"':
+            index += 1
+            while index < length:
+                if sql[index] == char:
+                    if index + 1 < length and sql[index + 1] == char:
+                        index += 2  # doubled quote: escaped, stay inside
+                        continue
+                    break
+                index += 1
+            index += 1
+        elif sql.startswith("--", index) or sql.startswith("/*", index):
+            index = _skip_trivia(sql, index)
+        elif char == "$":
+            match = _DOLLAR_RE.match(sql, index)
+            if match is None:
+                index += 1
+                continue
+            end = sql.find(match.group(0), match.end())
+            index = length if end < 0 else end + len(match.group(0))
+        elif char == ";":
+            return _skip_trivia(sql, index + 1) >= length
+        else:
+            index += 1
+    return True
 
 
 def _same_params(left: tuple, right: tuple) -> bool:
@@ -1429,6 +1628,30 @@ def prefetch(db, fn, *, levels: int = 4):
     return _Replay(db, _preload(db, fn, levels), owns=True)
 
 
+def _schema_migrated(db) -> bool:
+    """La sonde de schéma répond-elle oui ? Sert à distinguer une base non
+    migrée d'une lecture optionnelle qui manque une table (L521)."""
+    try:
+        require_schema(db)
+    except DbError:
+        return False
+    return True
+
+
+def _requery_faulty(db, items: list[tuple[str, tuple]]) -> list:
+    """Repli du préchargement, une requête à la fois : les fautives sont
+    écartées (`None`), une base injoignable remonte."""
+    results: list = []
+    for sql, params in items:
+        try:
+            results.append(db.query(sql, params))
+        except Unavailable:
+            raise
+        except DbError:
+            results.append(None)
+    return results
+
+
 def _preload(db, fn, levels: int) -> _Answers:
     answers = _Answers()
     for _level in range(levels):
@@ -1441,20 +1664,25 @@ def _preload(db, fn, levels: int) -> _Answers:
             break
         try:
             results = db.query_batch(recorder.misses)
-        except (SchemaMissing, Unavailable):
+        except Unavailable:
             raise
+        except SchemaMissing:
+            # `SchemaMissing` recouvre deux cas (L521) : la sonde dit que la
+            # base n'est pas migrée — à dire tout de suite —, ou une lecture
+            # optionnelle référence une table d'une migration absente. Le
+            # pilote psql rend la seconde en `DbError`, psycopg en
+            # `SchemaMissing` : sans cette distinction, `work show` échouait
+            # sous psycopg au lieu de rendre « resolutions: unavailable »
+            # (L160d). La lecture fautive est écartée ; la vraie passe la
+            # redemandera à l'appelant, qui sait quoi en faire.
+            if not _schema_migrated(db):
+                raise
+            results = _requery_faulty(db, recorder.misses)
         except DbError:
             # une requête de la passe à blanc est invalide (bâtie sur une
             # réponse vide) : le lot échoue en entier. Repli : une à une, les
             # fautives écartées — la vraie passe fera les bonnes.
-            results = []
-            for sql, params in recorder.misses:
-                try:
-                    results.append(db.query(sql, params))
-                except (SchemaMissing, Unavailable):
-                    raise
-                except DbError:
-                    results.append(None)
+            results = _requery_faulty(db, recorder.misses)
         for (sql, params), rows in zip(recorder.misses, results):
             if rows is None:
                 answers.refused.append((sql, params))
