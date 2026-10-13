@@ -2816,10 +2816,12 @@ class CiResults(Domain):
     @abc.abstractmethod
     def reopen_run(self, repo: str, run_id: int, *, run_attempt: int) -> dict | None:
         """Une exécution conclue que GitHub dit de nouveau en cours (relance,
-        #901 : même `run_id`, nouvel `run_attempt`) repasse `running`, note
-        l'attempt et efface les messages de l'attempt précédent. None si une
-        tête plus récente de la branche l'a remplacée : la relance d'une
-        exécution périmée ne la ressuscite pas."""
+        #901 : même `run_id`, `run_attempt` strictement supérieur) repasse
+        `running`, note l'attempt et efface les messages de l'attempt
+        précédent. None si rien ne change : attempt non supérieur (une liste
+        en retard, #828, ne rouvre pas une exécution conclue au même attempt)
+        ou tête plus récente de la branche (la relance d'une exécution périmée
+        ne la ressuscite pas)."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:

@@ -53,7 +53,10 @@ class CiResults(interface.CiResults):
         # #901 : GitHub dit l'exécution de nouveau `queued`/`in_progress` avec
         # le même run_id : c'est une relance. La tête a pu bouger depuis (une
         # relance d'exécution périmée ne doit pas ressusciter une ligne
-        # remplacée) : dans ce cas rien n'est rouvert.
+        # remplacée) : dans ce cas rien n'est rouvert. L'attempt doit avoir
+        # augmenté : une liste API en retard (#828) redit en cours une
+        # exécution conclue au même attempt sans relance, la rouvrir
+        # renverrait son verdict à chaque passe.
         rows = self.db.query(
             """
             UPDATE ci_runs r
@@ -61,13 +64,14 @@ class CiResults(interface.CiResults):
                    run_attempt = %%s, urgent_message_id = NULL, verdict_message_id = NULL
              WHERE r.repo = %%s AND r.run_id = %%s
                AND r.status <> 'superseded'
+               AND r.run_attempt < %%s
                AND NOT EXISTS (
                    SELECT 1 FROM ci_runs n
                     WHERE n.repo = r.repo AND n.branch = r.branch
                       AND n.run_id > r.run_id AND n.head_sha <> r.head_sha)
             RETURNING %s
             """ % RUN_COLUMNS,
-            (int(run_attempt), repo, int(run_id)))
+            (int(run_attempt), repo, int(run_id), int(run_attempt)))
         return rows[0] if rows else None
 
     def running(self, repo) -> list[dict]:

@@ -510,6 +510,34 @@ class WatcherTest(PgTestCase):
         self.assertEqual(report["runs"][0]["run_attempt"], 2)
         self.assertIn("(attempt 2)", "\n".join(ci.render_status(report)))
 
+    def test_liste_en_retard_ne_rouvre_pas_un_attempt_identique(self):
+        """R1 (bureau) : une liste d'exécutions en retard (#828) peut redire
+        `in_progress` une exécution conclue, au même attempt, sans qu'elle ait
+        été relancée. Ni le relevé ni `reopen_run` ne la rouvrent : sinon son
+        verdict repartirait à chaque passe. Un attempt supérieur, lui, rouvre."""
+        sha = "99" * 20
+        self.api.live = [run_view(851, sha, "lot/1-un", attempt=1)]
+        self.watcher.tick(self.db)
+        self.api.live, self.api.done[851] = [], {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 851)
+        self.assertEqual((row["status"], row["run_attempt"]), ("failure", 1))
+        self.assertEqual(len(self.mails("dev-a")), 1)  # le verdict, une fois
+        # la ligne elle-même refuse un attempt qui n'augmente pas (WHERE)
+        self.assertIsNone(storage.of(self.db).ci.reopen_run(DEPOT, 851, run_attempt=1))
+        # la liste en retard redit le run en cours au même attempt : rien
+        self.api.live = [run_view(851, sha, "lot/1-un", attempt=1)]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.watcher.tick(self.db), [])
+        row = storage.of(self.db).ci.run(DEPOT, 851)
+        self.assertEqual((row["status"], row["run_attempt"]), ("failure", 1))
+        self.assertEqual(len(self.mails("dev-a")), 1)
+        # l'attempt suivant est bien une relance : la ligne est rouverte
+        self.api.live = [run_view(851, sha, "lot/1-un", attempt=2)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt")) for o in out], [("rerun", 2)])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 851)["run_attempt"], 2)
+
     def test_relance_impute_les_echecs_de_l_attempt_courant(self):
         """Un échec de l'attempt précédent qui n'est pas re-vu n'est plus
         imputé ; un échec qui revient compte comme nouveau (re-signalé)."""
