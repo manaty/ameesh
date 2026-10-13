@@ -252,6 +252,19 @@ class CodexPermissionTest(unittest.TestCase):
             messages = [f.message for f in harnesses._check_interactive_permission(raw, "")]
             self.assertTrue(any("plan" in m and "delivered" in m for m in messages), messages)
 
+    def test_modes_empty_table_delivers_nothing(self):
+        # L685 review r1 P2: `{"modes": {}, "choices": ["plan"], "default": "plan"}`
+        # passed validation (the delivery check was guarded by a non-empty table)
+        # and then normalized to {} — the choices were silently lost
+        raw = {"modes": {}, "choices": ["plan"], "default": "plan"}
+        messages = [f.message for f in harnesses._check_interactive_permission(raw, "")]
+        self.assertTrue(any("plan" in m and "delivered" in m for m in messages), messages)
+        self.assertEqual(harnesses._interactive_permission(raw), {})
+        # a table whose only entries are invalid delivers nothing either
+        broken = {"modes": {"plan": ["--permission-mode", "{mode}"]}, "choices": ["plan"]}
+        messages = [f.message for f in harnesses._check_interactive_permission(broken, "")]
+        self.assertTrue(any("delivered" in m for m in messages), messages)
+
     def test_modes_mapping_validation(self):
         good = {"modes": {"bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"]}}
         self.assertEqual([f for f in harnesses._check_interactive_permission(good, "")
@@ -379,6 +392,60 @@ class AttachPermissionTest(PgTestCase):
         with open(os.path.join(state_dir, "permission_mode"), "wb") as fh:
             fh.write(b"\xffplan")
         self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
+        self.assertIsNone(registry.get(self.db, "perm")["lease_owner"])
+
+    def _attach_capturing_stderr(self, name: str = "perm") -> tuple[list[str], str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            argv = self._attach(name)
+        return argv, err.getvalue()
+
+    def test_permission_mode_is_bound_to_the_harness(self):
+        # L685 review r1 P1: a mode set while the agent runs Claude is not
+        # inherited after a switch to Codex (offline reproduction: attach added
+        # --dangerously-bypass-approvals-and-sandbox with no fresh codex setting)
+        proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = os.path.join(self.cfg.agent_dir("perm"), "permission_mode")
+        with open(state, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh),
+                             {"harness": "claude", "mode": "bypassPermissions"})
+        # under Claude the explicit authorization still applies
+        self.assertIn("bypassPermissions", self._attach())
+        registry.upsert(self.db, "perm", harness="codex")
+        argv, err = self._attach_capturing_stderr()
+        self.assertEqual(argv[:1], ["--no-daemon"])
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertIn("was set for harness 'claude'", err)
+        # back under Claude, the authorization it received applies again
+        registry.upsert(self.db, "perm", harness="claude")
+        self.assertIn("bypassPermissions", self._attach())
+
+    def test_permission_mode_does_not_leak_back_to_claude(self):
+        # the binding is symmetric: a codex bypass authorization is not inherited
+        # when the agent moves to Claude (where bypassPermissions is also a
+        # descriptor choice, so it would silently be applied)
+        registry.upsert(self.db, "perm", harness="codex")
+        proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        registry.upsert(self.db, "perm", harness="claude")
+        argv, err = self._attach_capturing_stderr()
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertEqual(argv[:2], ["--permission-mode", "auto"])
+        self.assertIn("was set for harness 'codex'", err)
+
+    def test_attach_legacy_unbound_setting_ignored(self):
+        # a plain-text file written before L685 carries no harness: fail-closed,
+        # the owner must re-run `ameesh set` to authorize a mode
+        state_dir = self.cfg.agent_dir("perm")
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "permission_mode"), "w", encoding="utf-8") as fh:
+            fh.write("bypassPermissions\n")
+        argv, err = self._attach_capturing_stderr()
+        self.assertEqual(argv[:2], ["--permission-mode", "auto"])
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertIn("not bound to a harness", err)
         self.assertIsNone(registry.get(self.db, "perm")["lease_owner"])
 
     def test_attach_ctrl_c_while_preparing_releases_the_lease(self):

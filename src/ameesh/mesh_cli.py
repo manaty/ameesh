@@ -1677,7 +1677,7 @@ def cmd_set(cfg: Config, args) -> int:
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
     """
-    from . import adapters, harnesses
+    from . import adapters, harnesses, runner
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
@@ -1687,6 +1687,7 @@ def cmd_set(cfg: Config, args) -> int:
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
             return 1
+        harness = agent.get("harness") or ""
         valeurs: dict = {}
         for couple in args.values:
             cle, sep, valeur = couple.partition("=")
@@ -1751,7 +1752,6 @@ def cmd_set(cfg: Config, args) -> int:
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
-                harness = agent.get("harness") or ""
                 descriptor = harnesses.get(harness)
                 rule = descriptor.interactive_permission if descriptor else {}
                 if not rule:
@@ -1767,7 +1767,11 @@ def cmd_set(cfg: Config, args) -> int:
                     return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):
+            if cle == "permission_mode":
+                # L685: le mode est enregistré avec le harnais qui l'autorise ;
+                # `attach` refuse de l'appliquer sous un autre harnais.
+                runner.write_attach_permission_mode(cfg, args.agent, harness, valeur)
+            elif cle in ("model", "effort", "tier", "mail_batch"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:

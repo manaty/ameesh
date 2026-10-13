@@ -1072,9 +1072,12 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
                 findings.append(Finding("harness-permission-mode-invalid", ERROR,
                                         "`ameesh.interactive_permission.%s`: %r not in "
                                         "`choices`" % (key, mode), path))
-    if not template and delivered:
+    if not template:
         # L685: without a `{mode}` template every mode of the contract must be
-        # delivered by `modes` — an undelivered choice would be silently ignored
+        # delivered by `modes` — an undelivered choice would be silently ignored.
+        # Checked even when `modes` is empty (or absent): review r1 found
+        # `{"modes": {}, "choices": ["plan"], "default": "plan"}` passing
+        # validation and then normalizing to `{}` (nothing delivered).
         for key in ("default", "fallback"):
             mode = value.get(key)
             if isinstance(mode, str) and mode and mode not in delivered:

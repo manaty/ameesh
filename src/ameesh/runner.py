@@ -6818,20 +6818,77 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
     log_async("[%s] harness stopped (%s)" % (name or "?", reason))
 
 
-def _attach_permission_mode(cfg: Config, name: str) -> str:
-    """L223: the permission mode set for the agent (`ameesh set <agent>
+#: L223/L685 : nom du fichier d'état local du mode de permission interactif.
+#: Son contenu est un objet JSON `{"harness": …, "mode": …}` : l'autorisation
+#: est liée au harnais qui l'a reçue (voir `_attach_permission_mode`).
+PERMISSION_MODE_SETTING = "permission_mode"
+
+
+def write_attach_permission_mode(cfg: Config, name: str, harness: str, mode: str) -> None:
+    """L685: enregistre le mode de permission avec le harnais qui l'a autorisé
+    (mode vide : efface le réglage). Écriture atomique — `attach` ne lit jamais
+    un fichier à moitié écrit."""
+    path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
+    if not mode:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+    os.makedirs(cfg.agent_dir(name), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"harness": harness, "mode": mode}, fh)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _attach_permission_mode(cfg: Config, name: str, harness: str) -> str:
+    """L223/L685: the permission mode set for the agent (`ameesh set <agent>
     permission_mode=…`, local state of its host), '' when unset; an unreadable
-    setting (permissions, invalid bytes) is ignored with a warning."""
-    path = os.path.join(cfg.agent_dir(name), "permission_mode")
+    setting (permissions, invalid bytes) is ignored with a warning.
+
+    L685 (review r1 P1): the setting is bound to the harness that received it.
+    A mode set under Claude (`bypassPermissions`) is never applied after the
+    agent moves to Codex: a mismatch is ignored with a warning, so the codex
+    bypass flag cannot appear without a fresh `ameesh set` under Codex. A legacy
+    plain-text file (written before L685) carries no harness and is refused
+    (fail-closed), with the same warning."""
+    path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
     try:
         with open(path, encoding="utf-8") as fh:
-            return fh.read().strip()
+            raw = fh.read()
     except FileNotFoundError:
         return ""
     except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError
         print("ameesh attach: unreadable permission_mode setting (%s: %s), ignored"
               % (path, exc), file=sys.stderr)
         return ""
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        document = None
+    if document is None:
+        print("ameesh attach: permission_mode setting is not bound to a harness "
+              "(legacy format): ignored; re-run `ameesh set %s permission_mode=…` "
+              "to authorize a mode" % name, file=sys.stderr)
+        return ""
+    if not isinstance(document, dict):
+        print("ameesh attach: malformed permission_mode setting (%s), ignored" % path,
+              file=sys.stderr)
+        return ""
+    stored = document.get("harness")
+    mode = document.get("mode")
+    if not (isinstance(stored, str) and stored and isinstance(mode, str)):
+        print("ameesh attach: malformed permission_mode setting (%s), ignored" % path,
+              file=sys.stderr)
+        return ""
+    if stored != harness:
+        print("ameesh attach: permission_mode %r was set for harness %r, ignored under "
+              "%r (re-run `ameesh set %s permission_mode=…` to authorize this harness)"
+              % (mode, stored or "?", harness or "?", name), file=sys.stderr)
+        return ""
+    return mode.strip()
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
@@ -6945,7 +7002,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         thread.start()
         veille.start()
         argv = adapter.interactive_command(agent.get("session_id"),
-                                           permission_mode=_attach_permission_mode(cfg, name))
+                                           permission_mode=_attach_permission_mode(
+                                               cfg, name, agent.get("harness") or ""))
         env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
