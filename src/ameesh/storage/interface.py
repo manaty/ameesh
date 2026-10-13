@@ -1833,13 +1833,29 @@ class Threads(Domain):
     @abc.abstractmethod
     def index(self, *, project: str, lot: str, transport: str, host: str, location: str,
               entry_id: str, mailbox_ids: Sequence[int], author: str, excerpt: str,
-              ts: float, trace: dict) -> None:
-        """Compte l'entrée dans l'index du fil et, si elle porte des messages
+              ts: float, trace: dict, count: bool = True) -> None:
+        """Compte l'entrée (sauf `count` faux) dans l'index du fil et, si elle porte des messages
         de la boîte, y note `trace` (id externe) — en une seule écriture."""
 
     @abc.abstractmethod
     def indexed(self) -> list[dict]:
         """Fils indexés, du plus récemment écrit au plus ancien."""
+
+    @abc.abstractmethod
+    def lock(self, *, project: str, lot: str, transport: str, host: str,
+             location: str) -> int | None:
+        """Verrouille la ligne du fil jusqu'à la fin de la transaction (créée
+        vide au besoin) : expiration et indexation d'un même fil passent l'une
+        après l'autre (L361). Rend `counted_until` : la fin logique du fil au
+        dernier recomptage (`expired`), None s'il n'a jamais été recompté."""
+
+    @abc.abstractmethod
+    def expired(self, *, project: str, lot: str, transport: str, host: str,
+                kept: int, last: dict | None, end: int) -> None:
+        """Après une expiration (L361), sous `lock` : `kept` entrées restent ;
+        `last` (entry_id, mailbox_id, author, excerpt, ts) est la plus récente
+        gardée, None si le fil est vide (aucune entrée expirée n'est citée) ;
+        `end`, la fin logique du fil recompté, devient `counted_until`."""
 
 
 # --------------------------------------------------------------------------
