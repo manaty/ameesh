@@ -32,19 +32,35 @@ SENSITIVE = "sensitive"
 RELEASE = "release"
 #: la plus haute l'emporte entre deux lectures (un chemin sensible pour l'un)
 RANK = {LIGHT: 0, NORMAL: 1, SENSITIVE: 2, RELEASE: 3}
-#: classe rendue dans le doute : jamais une classe rassurante par défaut
+#: classe rendue dans le doute : jamais une classe rassurante par défaut.
+#: Le drapeau `doubt` dit si la classe est un doute ou une lecture : deux
+#: lectures de la même tête se comparent par le maximum, jamais en rétrogradant
+#: une classe calculée (revue #544 r1).
 DOUBT = SENSITIVE
 
 
-def release_reason(row: dict) -> str:
+def _normalized_target(ref) -> str:
+    """Une cible ramenée à sa branche : `origin/x`, `refs/heads/x` et
+    `refs/remotes/origin/x` valent `x` (revue #544 r1)."""
+    text = str(ref or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def release_reason(row: dict, *targets) -> str:
     """Pourquoi ce lot est « release » (chaîne vide sinon).
 
-    L'axe release ne dépend ni du dépôt ni du canon : une cible `release/*` ou
-    un lot de type `release` se lit sur la ligne du lot seule.
+    L'axe release ne dépend ni du dépôt ni du canon : une cible `release/*` —
+    celle portée par le lot **ou la cible résolue à l'atterrissage**, écrite
+    `origin/release/1.10` ou `refs/heads/release/1.10` — ou un lot de type
+    `release` se lit sur la ligne du lot seule.
     """
-    target = str(row.get("branch_target") or "").strip()
-    if target.startswith("release/"):
-        return "target %s" % target
+    for candidate in tuple(targets) + (row.get("branch_target"),):
+        value = _normalized_target(candidate)
+        if value == RELEASE or value.startswith(RELEASE + "/"):
+            return "target %s" % value
     if str(row.get("type") or "").strip().lower() == RELEASE:
         return "lot type release"
     return ""
@@ -98,10 +114,10 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
-    Rend `{class, why, files, policy_ref}` ; une politique illisible, un projet
-    que **aucun** canon ne déclare (sans repli déclaré) ou des chemins
-    inclassables rendent `sensitive` — jamais une classe rassurante par
-    défaut. Un canon qui déclare d'autres projets sans repli ne dit rien de
+    Rend `{class, why, files, policy_ref, doubt}` ; une politique illisible, un
+    projet que **aucun** canon ne déclare (sans repli déclaré) ou des chemins
+    inclassables rendent `sensitive` avec `doubt` — jamais une classe rassurante
+    par défaut. Un canon qui déclare d'autres projets sans repli ne dit rien de
     celui-ci : il est ignoré, pas compté comme un doute.
     """
     worst, why, files, ref = LIGHT, "", [], ""
@@ -116,6 +132,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             continue
         if errors:
             return {"class": SENSITIVE, "files": [], "policy_ref": _ref(canon),
+                    "doubt": True,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
         covered = True
@@ -123,17 +140,18 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             result = review_mod.classify(policy, paths)
         except review_mod.ReviewError as exc:
             return {"class": SENSITIVE, "files": [], "policy_ref": _ref(canon),
-                    "why": "cannot classify the change: %s" % exc}
+                    "doubt": True, "why": "cannot classify the change: %s" % exc}
         if not ref:
             ref = _ref(canon)
         if RANK[result["class"]] > RANK[worst]:
             worst, files = result["class"], result["files"]
             why = "policy of %s" % (root or "canon")
     if not covered:
-        return {"class": SENSITIVE, "files": [], "policy_ref": "",
+        return {"class": SENSITIVE, "files": [], "policy_ref": "", "doubt": True,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
-    return {"class": worst, "why": why, "files": files, "policy_ref": ref}
+    return {"class": worst, "why": why, "files": files, "policy_ref": ref,
+            "doubt": False}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
@@ -143,19 +161,20 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
 
     `item` évite une lecture de la base ; `repo`, `base` et `head` sont ceux
     que l'appelant a déjà résolus (la file de fusion connaît la tête gelée et
-    le dépôt du clone). Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`
-    et `why`, pour la trace.
+    le dépôt du clone). Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
+    `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
+    d'une politique) pour la trace.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
-                 "frozen_sha": head or ""}
+                 "frozen_sha": head or "", "doubt": True}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot
         return out
     reason = release_reason(row)
     if reason:
-        out.update({"class": RELEASE, "why": reason})
+        out.update({"class": RELEASE, "why": reason, "doubt": False})
         return out
     if not repo:
         repo = repository(cfg, row)
@@ -178,9 +197,17 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
             out["why"] = "the freeze %s is not a commit of %s" % (frozen[:12], repo)
             return out
     out["frozen_sha"] = head
+    # La cible résolue à l'atterrissage (celle du projet, ou `origin/HEAD`) peut
+    # être `release/*` sans que la ligne du lot le dise : l'axe release se lit
+    # sur elle aussi, normalisée (revue #544 r1).
+    landing = default_base(cfg, row, repo)
     if not base:
-        base = default_base(cfg, row, repo)
+        base = landing
     out["target"] = base or ""
+    reason = release_reason(row, landing, base)
+    if reason:
+        out.update({"class": RELEASE, "why": reason, "doubt": False})
+        return out
     if not base:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
@@ -190,7 +217,8 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out["why"] = "cannot read the diff %s..%s: %s" % (base, head[:12], exc)
         return out
     if not paths:
-        out.update({"class": LIGHT, "why": "no file changed since %s" % base})
+        out.update({"class": LIGHT, "why": "no file changed since %s" % base,
+                    "doubt": False})
         return out
     canons = work.configured_canons(cfg)
     if not canons:

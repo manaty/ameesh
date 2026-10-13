@@ -31,6 +31,10 @@ class FakeOps:
                 if i.get("issue_ref") == ref
                 and i.get("state") not in ("merged", "promoted", "closed")]
 
+    def by_issue_ref(self, ref):
+        """L'identité du lot de relecture, quel que soit son état (revue #544)."""
+        return [i for i in self.items.values() if i.get("issue_ref") == ref]
+
     def events(self, item_id, limit):
         return self.events_rows.get(int(item_id), [])
 
@@ -119,6 +123,18 @@ class RuleTest(unittest.TestCase):
         self.assertIn("marqué", out["why"])
         self.assertEqual(self.ops.added, [])
 
+    def test_un_lot_de_relecture_ferme_sans_marque_ne_rouvre_pas(self):
+        """Revue #544 r1, cas reproduit : marque absente (écriture ratée), lot
+        de relecture fermé, nouvel appel — l'identité tient à la `issue_ref`,
+        pas à l'état ni à la marque au journal."""
+        first = self.open()
+        self.ops.items[first["id"]]["state"] = "merged"
+        self.ops.events_rows.pop(LOT, None)
+        out = self.open()
+        self.assertFalse(out["created"], out)
+        self.assertEqual(out["id"], first["id"])
+        self.assertEqual(len(self.ops.added), 1)
+
     def test_rien_n_est_ecrit_quand_l_ecriture_echoue(self):
         with mock.patch.object(work, "add", side_effect=work.WorkError("refusé")):
             out = self.open()
@@ -166,6 +182,58 @@ class ReviewLotDbTest(PgTestCase):
         self.assertEqual(again["id"], out["id"])
         self.assertEqual([i["id"] for i in storage.of(self.db).work.open_by_ref(
             review_lot.ref_of(self.lot))], [out["id"]])
+
+    def test_la_marque_et_le_lot_sont_une_seule_ecriture(self):
+        """Revue #544 r1 : l'échec de la marque annule la création.
+
+        Seule la ligne de journal de la marque échoue ; sans la transaction
+        unique, le lot de relecture resterait créé sans marque et un second
+        appel (ou un journal tronqué) en ouvrirait un autre."""
+        from ameesh.db import DbError
+        from ameesh.storage.postgres.work import WorkItems as PgWorkItems
+        before = self.db.query("SELECT count(*) AS n FROM work_items")[0]["n"]
+        original = PgWorkItems._event
+
+        def failing(self, item_id, state, note, actor):
+            if str(note).startswith(review_lot.PREFIX):
+                raise DbError("marque refusée")
+            return original(self, item_id, state, note, actor)
+
+        with mock.patch.object(PgWorkItems, "_event", failing):
+            out = review_lot.open_after_merge(
+                self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
+                merged_sha="d" * 40)
+        self.assertFalse(out["created"], out)
+        self.assertIn("non ouvert", out["why"])
+        after = self.db.query("SELECT count(*) AS n FROM work_items")[0]["n"]
+        self.assertEqual(after, before)
+        self.assertEqual(storage.of(self.db).work.by_issue_ref(
+            review_lot.ref_of(self.lot)), [])
+        # l'incident passé, un seul lot de relecture est ouvert
+        again = review_lot.open_after_merge(
+            self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
+            merged_sha="d" * 40)
+        self.assertTrue(again["created"], again)
+        self.assertEqual([i["id"] for i in storage.of(self.db).work.by_issue_ref(
+            review_lot.ref_of(self.lot))], [again["id"]])
+
+    def test_un_lot_de_relecture_ferme_ne_rouvre_pas(self):
+        """Revue #544 r1 : l'identité tient à la `issue_ref`, pas à l'état."""
+        first = review_lot.open_after_merge(
+            self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
+            merged_sha="e" * 40)
+        self.assertTrue(first["created"], first)
+        storage.of(self.db).work.move(first["id"], "merged", current="intake",
+                                      loops=0, note="", actor="orch")
+        self.db.execute("DELETE FROM work_item_events WHERE note LIKE %s",
+                        (review_lot.PREFIX + "%",))
+        again = review_lot.open_after_merge(
+            self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
+            merged_sha="e" * 40)
+        self.assertFalse(again["created"], again)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(len(storage.of(self.db).work.by_issue_ref(
+            review_lot.ref_of(self.lot))), 1)
 
     def test_une_classe_non_light_n_ouvre_rien(self):
         for klass in ({"class": "sensitive"}, {"class": "release"}, {"class": "normal"}, {}):

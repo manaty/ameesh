@@ -12,9 +12,10 @@ le lot.
 Rien ici n'autorise ni ne bloque une fusion : la classe est relue sur le diff
 gelé par l'appelant (`lot_class`), la fusion est un fait déjà enregistré, et
 toute erreur de cette écriture est **rendue**, jamais levée — le lot d'origine
-reste fusionné. L'idempotence tient à deux marques : le lot de relecture ouvert
-(`issue_ref = review-after-merge:#<lot>`) et une ligne de journal sur le lot
-fusionné.
+reste fusionné. L'idempotence tient à deux marques écrites **dans la même
+transaction** que la création (revue #544 r1) : le lot de relecture lui-même
+(`issue_ref = review-after-merge:#<lot>`, **quel que soit son état**) et une
+ligne de journal sur le lot fusionné, qui reste un confort.
 """
 from __future__ import annotations
 
@@ -73,12 +74,24 @@ def _author(db, name: str) -> dict:
 
 
 def _open(ops, ref: str) -> Optional[dict]:
-    """Le lot de relecture déjà ouvert pour `ref`, ou None."""
-    try:
-        rows = ops.open_by_ref(ref) or []
-    except Exception:  # noqa: BLE001 - pas d'idempotence plutôt qu'une erreur
-        return None
-    return rows[0] if rows else None
+    """Le lot de relecture déjà écrit pour `ref`, **quel que soit son état**.
+
+    L'identité tient à la `issue_ref` (`review-after-merge:#<lot>`), pas à
+    l'état du lot : un lot de relecture fermé reste celui de sa fusion, et la
+    marque au journal peut manquer (écriture ratée avant cette version, journal
+    tronqué). `open_by_ref` reste le repli d'un magasin sans `by_issue_ref`.
+    """
+    for name in ("by_issue_ref", "open_by_ref"):
+        reader = getattr(ops, name, None)
+        if reader is None:
+            continue
+        try:
+            rows = reader(ref) or []
+        except Exception:  # noqa: BLE001 - magasin incomplet : on essaie l'autre
+            continue
+        if rows:
+            return rows[0]
+    return None
 
 
 def _marked(ops, lot: int, ref: str) -> bool:
@@ -139,7 +152,11 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     Rend `{lot, id, created, class, why}` — ne lève jamais. `klass` est la
     classe lue sur le diff gelé (`lot_class`) : seule `light` ouvre un lot de
     relecture ; un doute ou une classe supérieure n'en ouvre pas (le canon §2
-    ne demande une relecture après fusion que pour les lots légers)."""
+    ne demande une relecture après fusion que pour les lots légers).
+
+    La création et la marque au journal de `lot` sont **une seule écriture**
+    (revue #544 r1) : un échec de la marque annule la création, donc un nouvel
+    appel ne peut pas ouvrir un second lot de relecture."""
     lot = int(lot)
     klass = klass or {}
     out = {"lot": lot, "id": None, "created": False, "class": klass.get("class") or "",
@@ -158,7 +175,8 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     existing = _open(ops, ref)
     if existing is not None:
         out.update({"id": int(existing["id"]),
-                    "why": "lot de relecture #%d déjà ouvert" % int(existing["id"])})
+                    "why": "lot de relecture #%d déjà ouvert (état %s)"
+                           % (int(existing["id"]), existing.get("state") or "?")})
         return out
     if _marked(ops, lot, ref):
         out["why"] = "lot de relecture déjà marqué au journal de #%d" % lot
@@ -171,16 +189,12 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
             app=str(item.get("app") or ""),
             body=body_of(item, lot, klass=klass, merged_sha=merged_sha, pr=pr,
                          target=target, author=author, family=family),
-            issue_ref=ref, actor=actor)
+            issue_ref=ref, actor=actor, mark_item_id=lot,
+            mark_note="%s lot #{lot} ouvert (classe light, relecture due %s)"
+                      % (ref, deadline()))
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
         out["why"] = "lot de relecture non ouvert : %s: %s" % (
             type(exc).__name__, str(exc)[:200])
         return out
-    new_id = int(created["id"])
-    out.update({"id": new_id, "created": True, "why": "ouvert"})
-    try:
-        work.note(db, lot, "%s lot #%d ouvert (classe light, relecture due %s)"
-                  % (ref, new_id, deadline()), actor=actor)
-    except Exception as exc:  # noqa: BLE001 - la marque est un confort
-        out["why"] = "ouvert ; marque non écrite : %s" % str(exc)[:120]
+    out.update({"id": int(created["id"]), "created": True, "why": "ouvert"})
     return out

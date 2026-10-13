@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import types
 import unittest
+from unittest import mock
 
 from ameesh import lot_class, review
 
@@ -63,7 +64,8 @@ class GlobTest(unittest.TestCase):
         self.assertTrue(review.compile_glob("src/?/x.ts").match("src/a/x.ts"))
 
     def test_chemin_normalise(self):
-        self.assertEqual(review.normalize_path("./a\\b/./c"), "a/b/c")
+        # un backslash n'est pas un séparateur POSIX : il reste dans le chemin
+        self.assertEqual(review.normalize_path("./a\\b/./c"), "a\\b/c")
         self.assertEqual(review.normalize_path("a/../b/"), "b")
         self.assertEqual(review.normalize_path("../a"), "../a")
         self.assertTrue(review.compile_glob("./docs/**").match("docs/a.md"))
@@ -106,6 +108,18 @@ class ClassifyTest(unittest.TestCase):
             review.classify(policy(), [])
         with self.assertRaises(review.ReviewError):
             review.classify(policy(), [""])
+
+    def test_un_chemin_ne_se_relit_jamais_en_un_autre(self):
+        """Revue #544 r1 : backslash, `..` et composant vide sont refusés.
+
+        `.github/workflows/..\\..\\docs/evil.yml` n'est pas `docs/evil.yml` :
+        le relire en chemin POSIX ferait matcher une portée plus légère.
+        """
+        for raw in ("a/../b", ".github/workflows/..\\..\\docs/evil.yml",
+                    "docs\\evil.yml", "docs//evil.yml", "docs/", "docs\\..\\main.py"):
+            with self.subTest(raw):
+                with self.assertRaises(review.ReviewError):
+                    review.classify(policy(), [raw])
 
 
 class ParseTest(unittest.TestCase):
@@ -292,6 +306,31 @@ class LotClassTest(unittest.TestCase):
         self.assertEqual(lot_class.release_reason({"type": "release"}), "lot type release")
         self.assertEqual(lot_class.release_reason({"branch_target": "main", "type": "bug"}), "")
 
+    def test_axe_release_sur_la_cible_resolue_et_normalisee(self):
+        """Revue #544 r1 : `origin/release/1.10` et `refs/heads/release/1.10`
+        sont la même branche release, et la cible résolue à l'atterrissage
+        compte même quand la ligne du lot ne la porte pas."""
+        self.assertEqual(lot_class.release_reason({"branch_target": "origin/release/1.10"}),
+                         "target release/1.10")
+        self.assertEqual(lot_class.release_reason({"branch_target": "refs/heads/release/1.10"}),
+                         "target release/1.10")
+        self.assertEqual(lot_class.release_reason(
+            {"branch_target": "main"}, "refs/remotes/origin/release/1.10"),
+            "target release/1.10")
+        self.assertEqual(lot_class.release_reason({"branch_target": "main"}), "")
+
+    def test_of_lot_classe_release_sur_la_cible_resolue(self):
+        """Une cible de projet `origin/release/1.10`, sans cible sur le lot,
+        doit rendre `release` — jamais `light` sur le diff de doc (revue #544 r1)."""
+        row = {"id": 1, "app": "ameesh", "branch_target": "main", "type": "evolution"}
+        with mock.patch.object(lot_class.work, "get", return_value=row), \
+                mock.patch.object(lot_class, "default_base",
+                                  return_value="origin/release/1.10"):
+            out = lot_class.of_lot(None, 1, cfg=None, repo="/tmp/depot", head="a" * 40)
+        self.assertEqual(out["class"], lot_class.RELEASE)
+        self.assertEqual(out["doubt"], False)
+        self.assertIn("release/1.10", out["why"])
+
     def test_un_canon_qui_ne_declare_pas_le_projet_ne_dit_rien(self):
         canons = [self.canon({"projects": {"ameesh": {"default": "light"}}}),
                   self.canon({"projects": {"nexlink": {
@@ -299,11 +338,13 @@ class LotClassTest(unittest.TestCase):
                       "rules": [{"paths": ["**"], "class": "sensitive"}]}}}, root="nexlink")]
         result = lot_class.class_of_paths(canons, "ameesh", ["src/ameesh/x.py"])
         self.assertEqual(result["class"], "light")
+        self.assertEqual(result["doubt"], False)
 
     def test_aucun_canon_ne_declare_le_projet_est_un_doute(self):
         canons = [self.canon({"projects": {"nexlink": {"default": "normal"}}})]
         result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
         self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertEqual(result["doubt"], True)
         self.assertIn("not declared", result["why"])
 
     def test_le_repli_declare_s_applique(self):
@@ -311,6 +352,7 @@ class LotClassTest(unittest.TestCase):
                               "default": "normal"})]
         result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
         self.assertEqual(result["class"], "normal")
+        self.assertEqual(result["doubt"], False)
 
     def test_la_plus_haute_des_lectures_l_emporte(self):
         canons = [self.canon({"projects": {"ameesh": {"default": "light"}}}),
@@ -320,17 +362,20 @@ class LotClassTest(unittest.TestCase):
                       root="strict")]
         result = lot_class.class_of_paths(canons, "ameesh", ["db/a.sql"])
         self.assertEqual(result["class"], "sensitive")
+        self.assertEqual(result["doubt"], False)
 
     def test_politique_illisible_rend_sensible(self):
         canons = [self.canon({"projects": {"ameesh": {"default": "urgent"}}})]
         result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
         self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertEqual(result["doubt"], True)
         self.assertIn("unreadable", result["why"])
 
     def test_chemins_vides_rendent_un_doute(self):
         canons = [self.canon({"projects": {"ameesh": {"default": "light"}}})]
         result = lot_class.class_of_paths(canons, "ameesh", [])
         self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertEqual(result["doubt"], True)
         self.assertIn("cannot classify", result["why"])
 
 

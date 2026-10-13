@@ -78,10 +78,12 @@ class _Land(_Base):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def enter(self, lot, ci=None):
-        """Admission fetches origin into the radar's clone (L160e1)."""
+    def enter(self, lot, ci="green"):
+        """Admission fetches origin into the radar's clone (L160e1); the CI is
+        green on the frozen head by default (revue #544 r1: it is required)."""
         clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
-        return merge_queue.enter(None, lot, repo=self.repo, actor="orch", ci=ci, clone=clone)
+        return merge_queue.enter(None, lot, repo=self.repo, actor="orch",
+                                 ci=self.green(lot) if ci == "green" else ci, clone=clone)
 
     def queued(self, lot):
         self.ready(lot)

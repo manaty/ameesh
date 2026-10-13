@@ -91,11 +91,16 @@ class ReviewPolicy:
 def normalize_path(path: str) -> str:
     """Chemin de dépôt : séparateurs POSIX, segments `.` et vides retirés.
 
+    Un backslash **n'est pas** converti en séparateur : sur un dépôt POSIX
+    c'est un caractère de nom de fichier comme un autre, et le relire en `/`
+    ferait matcher une portée qui ne couvre pas ce fichier (revue #544 r1).
+    [`classify`] refuse un tel chemin, comme un `..` ou un composant vide.
+
     Les `..` **intérieurs** sont résolus (`a/../b` → `b`), un `..` qui sortirait
     du dépôt est conservé pour que [`classify`] le refuse, et un `/` de tête
     aussi (un chemin absolu n'est pas un chemin de dépôt).
     """
-    value = str(path).strip().replace("\\", "/")
+    value = str(path).strip()
     prefix = "/" if value.startswith("/") else ""
     parts: list[str] = []
     for part in value.split("/"):
@@ -357,6 +362,12 @@ def classify(policy: ReviewPolicy, paths) -> dict:
         value = str(raw).strip()
         if value.startswith("/") or _WINDOWS_ABSOLUTE.match(value):
             raise ReviewError("absolute path: %r" % raw)
+        if "\\" in value or any(part in ("", "..") for part in value.split("/")):
+            # Un backslash n'est pas un séparateur POSIX ; `..` et un composant
+            # vide ne sont pas des chemins de dépôt. Les relire en un autre
+            # chemin (`.github/workflows/..\\..\\docs/x` → `docs/x`) ferait
+            # matcher une portée plus légère : refus, donc doute (revue #544 r1).
+            raise ReviewError("path is not a repository path: %r" % raw)
         path = normalize_path(value)
         if not path or path == ".." or path.startswith("../"):
             raise ReviewError("path outside the repository: %r" % raw)

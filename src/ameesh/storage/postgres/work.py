@@ -194,9 +194,12 @@ class WorkItems(interface.WorkItems):
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
-            estimate_source=None, change_size=None) -> dict:
+            estimate_source=None, change_size=None, mark_item_id=None,
+            mark_note="") -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
-        avec sa durée estimée (et sa ligne d'historique), en UNE transaction."""
+        avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
+        L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
+        si bien qu'un échec de la marque annule la création (et l'inverse)."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
@@ -221,6 +224,15 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if mark_item_id is not None and str(mark_note or "").strip():
+                marked = tx.query(
+                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                    (int(mark_item_id),))
+                if not marked:
+                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+                WorkItems(tx)._event(
+                    int(mark_item_id), marked[0]["state"],
+                    str(mark_note).replace("{lot}", str(item["id"])), actor)
             return item
 
     def get(self, item_id) -> dict | None:
@@ -898,6 +910,13 @@ class WorkItems(interface.WorkItems):
             "        OR lower(branch) = lower(%%s)"
             "        OR lower(rtrim(split_part(btrim(title), ' ', 1), ':')) = lower(%%s))"
             " ORDER BY id" % ITEM_COLUMNS, (ref, ref, ref, ref))
+
+    def by_issue_ref(self, ref) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, quel que soit
+        leur état (un lot de relecture fermé reste l'identité de sa référence)."""
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE lower(issue_ref) = lower(%%s)"
+            " ORDER BY id" % ITEM_COLUMNS, (str(ref or ""),))
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(

@@ -207,7 +207,11 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     the frozen head, a non-draft PR, and a target that is not `release/*`.
     Any doubt about the class (unreadable canon, unreachable diff, `cfg`
     absent) leaves the verdict requirement in place; the class and its reason
-    are traced in the queue note."""
+    are traced in the queue note.
+
+    The CI is required **explicitly**: `ci=None` (no reader) and a reader that
+    answers nothing are refused, like a red CI — an absent status is not a
+    green one (revue #544 r1)."""
     from . import lot_class
     from . import plan_github, radar
     row = work.get(db, lot)
@@ -254,22 +258,27 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
                             if verdict else "", klass.get("class") or "?"))
+    if ci is None:
+        raise QueueError("lot #%d has no CI reader: a green CI on the frozen head %s is "
+                         "required before entering the queue" % (lot, tip[:12]))
     try:
-        status = ci(row["branch"]) if ci else None
+        status = ci(row["branch"])
     except plan_github.GithubError as exc:
         raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
                          "gh works" % (row["branch"], exc)) from exc
-    if status:
-        if not _same(status.get("head"), tip):
-            raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
-                             "vouch for the frozen commit" % (status.get("number"),
-                                                             (status.get("head") or "?")[:12],
-                                                             tip[:12]))
-        if not status.get("green"):
-            raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-        if light and status.get("draft"):
-            raise QueueError("PR #%s is a draft: a light lot merges only from a "
-                             "non-draft PR" % status.get("number"))
+    if not status:
+        raise QueueError("no CI status for branch %s (lot #%d): a green CI on the frozen "
+                         "head %s is required" % (row["branch"], lot, tip[:12]))
+    if not _same(status.get("head"), tip):
+        raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
+                         "vouch for the frozen commit" % (status.get("number"),
+                                                         (status.get("head") or "?")[:12],
+                                                         tip[:12]))
+    if not status.get("green"):
+        raise QueueError("the CI of PR #%s is not green" % status.get("number"))
+    if light and status.get("draft"):
+        raise QueueError("PR #%s is a draft: a light lot merges only from a "
+                         "non-draft PR" % status.get("number"))
     if project is not None and getattr(project, "ci_required", False):
         _required_ci(project, tip, commit_ci)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
@@ -283,8 +292,14 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
 
     Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
     référence de la cible y est tentée, puis le dépôt du projet. `cfg` absent
-    ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`), et la
-    file garde l'exigence de verdict."""
+    ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`, drapeau
+    `doubt`), et la file garde l'exigence de verdict.
+
+    Les lectures sont **toutes** comparées : la plus haute l'emporte, une
+    lecture calculée ne se rétrograde jamais devant une autre, et un doute ne
+    se lit pas comme une classe sensible (le clone radar peut voir des
+    changements sensibles que le checkout de l'auteur ne voit plus — revue
+    #544 r1)."""
     from . import lot_class
     paths = []
     if target:
@@ -296,13 +311,26 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
         if where and where != repo:
             paths.append((repo, target))
     if not paths:
-        return lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo, base=target, head=tip)
-    last = None
+        paths.append((repo, target))
+    best = None
     for path, base in paths:
-        last = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base, head=tip)
-        if last.get("class") != lot_class.DOUBT:
-            return last
-    return last
+        current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base,
+                                   head=tip)
+        if best is None or _class_worse(current, best):
+            best = current
+    return best
+
+
+def _class_worse(candidate: dict, best: dict) -> bool:
+    """La plus haute des deux lectures l'emporte ; à classe égale, une lecture
+    calculée explique mieux qu'un doute."""
+    from . import lot_class
+    def rank(result):
+        return lot_class.RANK.get(str(result.get("class") or ""),
+                                  lot_class.RANK[lot_class.SENSITIVE])
+    if rank(candidate) != rank(best):
+        return rank(candidate) > rank(best)
+    return bool(best.get("doubt")) and not candidate.get("doubt")
 
 
 def _required_ci(project, sha: str, commit_ci=None) -> None:
