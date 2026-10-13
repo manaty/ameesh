@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.1.0",
+ "version": "1.2.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -3025,6 +3025,102 @@
    "session": true
   },
   {
+   "name": "threads.recount",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "project",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "lot",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "transport",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "host",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "location",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "kept",
+     "kind": "keyword",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "last",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "object",
+       "null"
+      ]
+     },
+     "required": true
+    },
+    {
+     "name": "end",
+     "kind": "keyword",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "integer"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
+   },
+   "rules": [
+    "L361b : verrou de la ligne, recomptage et expiration de l'index en une seule transaction ; le fichier a déjà été réécrit par l'appelant, sous son propre verrou",
+    "le census de l'hôte (`kept`, `last`, `end`) fait foi : un `counted_until` au-delà de `end` (recomptage plus récent) n'est pas repris",
+    "portée H : l'hôte est celui de l'exécuteur ; l'opération ne touche pas aux autres hôtes"
+   ],
+   "session": true
+  },
+  {
    "name": "work.mark_delegate_turn",
    "write": true,
    "transport": "op",
@@ -3802,7 +3898,7 @@
    "projects": "vue des humains (/api/v1)",
    "roadmap": "feuille de route (L96) : serveur seulement",
    "session_bindings": "session toujours liée au bail : la recherche de liaison rend vide",
-   "threads": "hors du sous-ensemble de l'exécuteur médié ; lock et expired (L361) : un verrou ne tient pas d'une requête distante à l'autre, l'expiration médiée viendra en une seule opération côté serveur",
+   "threads": "hors du sous-ensemble de l'exécuteur médié ; lock, indexed et expired (L361) : un verrou ne tient pas d'une requête distante à l'autre — l'expiration médiée passe par threads.recount (L361b), une seule transaction serveur qui verrouille, recompte et expire",
    "turn_costs": "hors du sous-ensemble de l'exécuteur médié",
    "turn_resources": "hors du sous-ensemble de l'exécuteur médié",
    "visibility": "visibilité 0029 : serveur seulement",
