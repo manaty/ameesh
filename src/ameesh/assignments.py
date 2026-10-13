@@ -10,12 +10,15 @@ sous-utilisation se trompaient et la frise restait vide.
   déclaré, rôle au canon, ou agent qui a confié des lots) qui écrit à un
   agent SANS lot ouvert est averti (sortie d'erreur et fil du message).
 * `--lot <id|réf>` : le lot est rattaché au fil. Il est assigné au
-  destinataire s'il ne l'est pas déjà, par l'attribution gardée (L37),
-  mais seulement sur un geste explicite : `--assign`, ou `--lot` d'un
-  orchestrateur DÉCLARÉ (règle #740 : « a confié des lots récemment » ne
-  compte pas, #964). Un lot qui appartient à un AUTRE agent n'est jamais
-  repris : le courrier d'un relecteur sur le lot de l'auteur ne doit pas
-  le lui voler (pour le prendre : `ameesh work assign`).
+  destinataire s'il n'a pas d'agent assigné (libre, ou tenu par un humain),
+  par l'attribution gardée (L37) — mais seulement sur un geste explicite :
+  `--assign`, ou `--lot` d'un orchestrateur DÉCLARÉ (règle #740 : « a confié
+  des lots récemment » ne compte pas, #964). Un lot déjà tenu par un AGENT
+  n'est jamais repris par la seule étiquette : ni celui d'un AUTRE (le
+  courrier d'un relecteur sur le lot de l'auteur ne doit pas le lui voler),
+  ni celui de l'expéditeur lui-même (#1066, incident #1046 : un courrier
+  d'information a emporté le lot qu'il citait). La remise est un geste
+  explicite : `ameesh work assign`.
 * `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
@@ -27,6 +30,9 @@ Correctif du 2026-10-13 (#964) : deux incidents (#688, #619) où le
 que l'expéditeur avait confié des lots dans les 30 derniers jours. Le
 `--lot` ne vaut plus détection d'assigneur récent ; l'attribution par
 courrier demande `--assign` ou un rôle d'orchestrateur déclaré.
+Correctif du 2026-10-13 (#1066) : un lot déjà tenu par un agent n'est
+jamais remis par la seule étiquette `--lot`, même quand c'est l'expéditeur
+qui le tient (incident #1046) ; la remise passe par `ameesh work assign`.
 """
 from __future__ import annotations
 
@@ -189,13 +195,24 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             else:
                 current = (item.get("assignee") or "").strip()
                 if current != recipient:
-                    if current and current != sender \
-                            and not current.startswith(work_mod.HUMAN_PREFIX):
-                        out["warnings"].append(
-                            "lot #%d belongs to %s: not reassigned to %s (to "
-                            "take it over: ameesh work assign %d %s)"
-                            % (int(item["id"]), current, recipient, int(item["id"]),
-                               recipient))
+                    if current and not current.startswith(work_mod.HUMAN_PREFIX):
+                        # #1066 (incident #1046) : un lot déjà tenu par un
+                        # agent ne se remet pas par la seule étiquette
+                        # `--lot`, même quand c'est l'expéditeur qui le tient.
+                        # La remise est un geste explicite (`ameesh work
+                        # assign`), jamais un effet de bord d'un courrier.
+                        if current == sender:
+                            out["warnings"].append(
+                                "lot #%d is yours: linked without reassignment to %s "
+                                "(to hand it over: ameesh work assign %d %s)"
+                                % (int(item["id"]), recipient, int(item["id"]),
+                                   recipient))
+                        else:
+                            out["warnings"].append(
+                                "lot #%d belongs to %s: not reassigned to %s (to "
+                                "take it over: ameesh work assign %d %s)"
+                                % (int(item["id"]), current, recipient, int(item["id"]),
+                                   recipient))
                     else:
                         done = work_mod.assign(db, int(item["id"]), recipient, actor=sender,
                                                cfg=cfg)
