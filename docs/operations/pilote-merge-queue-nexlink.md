@@ -193,8 +193,11 @@ Hôte et clone, confirmés de première main le 13/10 :
 
 * `pc-smichea` : ameesh **1.10.0**, Node **26.8.1**, `gh` authentifié
   (`mesh-design`, 23:15) ;
-* clone `/home/smichea/development/manaty/nexlink`, **non-bare**
-  (`git rev-parse`, orchestrateur, 23:11).
+* clone `/home/smichea/development/manaty/nexlink`, **non-bare**, `origin` =
+  `git@github.com:manaty/nexlink.git` (`git rev-parse` et lecture de l'hôte —
+  orchestrateur 23:11, auditeur 23:19) ;
+* `radar.projects.nexlink` **absent de la configuration chargée** sur cet hôte
+  (auditeur, 23:19) — cohérent avec `reports=[]` et la file vide.
 
 Le schéma et l'existence du dépôt sont deux contrôles distincts :
 `radar.parse_settings` valide le premier, `git -C <clone> rev-parse
@@ -220,6 +223,8 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    gh auth status                                # lecture CI + fusion des PR manaty/nexlink
    git -C "$REPO" rev-parse --show-toplevel      # attendu : /home/smichea/development/manaty/nexlink
    git -C "$REPO" rev-parse --is-bare-repository # attendu : false
+   git -C "$REPO" remote get-url origin          # attendu : git@github.com:manaty/nexlink.git
+   git -C "$REPO" fetch --prune origin           # prouve l'accès du compte au dépôt
    "$AMEESH_PY" -c "from ameesh import radar; print('land' in radar.PROJECT_KEYS, 'generated' in radar.PROJECT_KEYS)"
    # attendu : True True
    ```
