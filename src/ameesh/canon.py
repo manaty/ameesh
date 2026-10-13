@@ -783,6 +783,10 @@ class Fiche:
                             # `<canon>/<membre>:<chemin>@<commit>` sinon (L42)
     data: dict              # frontmatter complet (clés inconnues conservées)
     untrusted: bool = False
+    #: #538 : chemin RELATIF au bundle (`processus/lots.md`) quand il diffère du
+    #: chemin affiché (`knowledge/processus/lots.md` dans un bundle imbriqué) ;
+    #: les restrictions de dossier d'une fiche Process portent sur lui.
+    bundle_path: str = ""
 
 
 @dataclass
@@ -2415,7 +2419,7 @@ class _Loader:
                     if _profile_type(content):
                         ignored.append(path)
                     continue
-                self._fiche(source, path, content, version)
+                self._fiche(source, path, content, version, bundle_path=rel)
             if ignored:
                 self.canon.out_of_scope[source.member] = len(ignored)
                 self.add("ameesh-scope-ignored", INFO,
@@ -2425,7 +2429,8 @@ class _Loader:
                             ", ".join(ignored[:3])),
                          member=source.member, path=source.prefix)
 
-    def _fiche(self, source: Source, path: str, content: bytes | None, version: str) -> None:
+    def _fiche(self, source: Source, path: str, content: bytes | None, version: str,
+               *, bundle_path: str = "") -> None:
         where = {"member": source.member, "path": path}
         if content is None:
             self.add("canon-git-error", ERROR, "unreadable git object", **where)
@@ -2465,7 +2470,7 @@ class _Loader:
         title = _text(data.get("title"))
         fiche = Fiche(type=kind, title=title or "", member=source.member, path=path,
                       ref=make_ref(self.canon, source.member, path, version), data=data,
-                      untrusted=source.mode != "git")
+                      untrusted=source.mode != "git", bundle_path=bundle_path or path)
         if not title and kind != "Placement":
             subject = {"package": _package_stem(path)} if kind == "WorkPackage" else {}
             self.add("fiche-title-missing", ERROR, "%s card without `title`" % kind, **where,
@@ -2846,11 +2851,13 @@ class _Loader:
         fiche invalide (elle n'est jamais injectée dans un brief), sans bloquer
         aucun agent : c'est une règle, pas un droit.
 
-        Le chemin est contraint : `type: Process` dans `agents/…` n'est pas une
-        règle (constat, jamais injecté). Le texte est rendu encodable en UTF-8
-        (un surrogate YAML isolé ne doit pas faire échouer le brief ni un envoi)."""
+        Le chemin est contraint, RELATIF AU BUNDLE : `type: Process` dans
+        `agents/…` n'est pas une règle (constat, jamais injecté), mais un canon
+        imbriqué (`knowledge/`) garde ses `processus/*.md` (verdict codex
+        #510 r2, P2). Le texte est rendu encodable en UTF-8 (un surrogate YAML
+        isolé ne doit pas faire échouer le brief ni un envoi)."""
         subject = {"process": fiche.title}
-        chemin = fiche.path.replace("\\", "/").split("/")
+        chemin = (fiche.bundle_path or fiche.path).replace("\\", "/").split("/")
         if len(chemin) < 2 or chemin[0] != PROCESS_DIR:
             self.add("process-path", ERROR,
                      "Process card outside `%s/`: %s (never injected as a working "

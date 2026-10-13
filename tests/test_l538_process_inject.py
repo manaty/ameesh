@@ -19,6 +19,13 @@ encodable (surrogates), poussée aux seuls agents de cet hôte gouvernés par ce
 canon, comparaison à la référence approuvée, session neuve ordinaire couverte,
 règles relues à l'ouverture (une fiche retirée ne reste pas en attente), canon
 illisible dit dans le brief.
+
+Revue codex #510 r2 (2026-10-13) : le canon des règles est celui qui possède la
+ligne du registre (`canon`), pas le premier qui déclare un homonyme ; un brief
+préparé à l'avance est relu à l'ouverture ; un échec de lecture des fiches est
+dit au lieu de taire les règles ; `processus/` se juge dans le bundle (canon
+imbriqué) ; le bloc de première session est borné et réservé par le budget du
+courrier.
 """
 from __future__ import annotations
 
@@ -172,6 +179,20 @@ class ProcessLectureTest(_TmpMixin, unittest.TestCase):
         self.assertEqual(len(loaded.processes), 1)
         self.assertFalse(loaded.processes[0].valid)
 
+    def test_une_fiche_process_dans_un_bundle_imbrique_est_lue(self):
+        # verdict codex #510 r2 (P2) : la restriction `processus/` porte sur le
+        # chemin DANS LE BUNDLE, pas sur le chemin affiché du dépôt — un canon
+        # imbriqué (`knowledge/`) garde ses règles.
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "mono")
+        shutil.copytree(EXAMPLE, os.path.join(clone, "knowledge"))
+        write(clone, "knowledge/processus/lots.md", carte())
+        commit_all(clone)
+        loaded = canon.load(os.path.join(clone, "knowledge"))
+        self.assertEqual([p.title for p in loaded.processes], [TITRE])
+        self.assertTrue(loaded.processes[0].valid)
+        self.assertNotIn("process-path", codes(canon.validate(loaded), canon.ERROR))
+
     def test_un_surrogate_ne_casse_pas_la_lecture(self):
         # revue codex #510 r1 (P1) : `title: "\uD800"` passe la validation puis
         # faisait échouer tout encodage. Le texte lu est encodable.
@@ -185,7 +206,7 @@ class ProcessLectureTest(_TmpMixin, unittest.TestCase):
         self.assertTrue(loaded.processes[0].valid)
 
 
-class BriefProcessTest(PgTestCase):
+class BriefProcessTest(_TmpMixin, PgTestCase):
     """(2) injection en tête du brief déterministe — canon approuvé et validé."""
 
     def setUp(self) -> None:
@@ -273,11 +294,44 @@ class BriefProcessTest(PgTestCase):
         self.assertIn(REGLE, texte)
         self.assertNotIn("la règle de l'autre organisation", texte)
 
+    def test_le_registre_designe_le_canon_des_regles(self):
+        # verdict codex #510 r2 (P1) : le canon des règles est celui qui
+        # POSSÈDE la ligne du registre (colonne `canon`), pas le premier canon
+        # configuré qui déclare un homonyme (L42/L43, isolation).
+        autre = _canon_approuve(self.tmp, "beta", carte(
+            body="# Règles de beta\n\n- la règle du canon qui possède la ligne\n"))
+        cfg = dataclasses.replace(
+            self.cfg, extra_canons=(config_mod.CanonEntry(autre, "", False),))
+        beta = next(c for c in canon.load_configured(cfg)
+                    if os.path.realpath(c.root) == os.path.realpath(autre))
+        self.assertNotEqual(beta.id, "")
+        # ligne du canon par défaut (NULL) : les règles d'acme, pas celles de beta
+        texte = self._brief(cfg=cfg, row=self._row())
+        self.assertIn(REGLE, texte)
+        self.assertNotIn("la règle du canon qui possède la ligne", texte)
+        # ligne de beta : ses règles, et pas celles d'acme
+        texte = self._brief(cfg=cfg, row=self._row(canon=beta.id))
+        self.assertIn("la règle du canon qui possède la ligne", texte)
+        self.assertNotIn(REGLE, texte)
+        # ligne d'un canon inconnu : rien plutôt que les règles d'un autre
+        texte = self._brief(cfg=cfg, row=self._row(canon="inconnu"))
+        self.assertNotIn(reprise.PROCESS_RULES_HEADER, texte)
+
     def test_un_canon_illisible_est_dit_dans_le_brief(self):
         # revue codex #510 r1 (P3) : l'échec de lecture n'est pas silencieux.
         cfg = dataclasses.replace(self.cfg, canon=os.path.join(self.tmp, "absent"),
                                   canon_untrusted=False)
         texte = self._brief(cfg=cfg)
+        self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
+        self.assertIn(reprise.PROCESS_RULES_UNAVAILABLE, texte)
+
+    def test_un_echec_de_lecture_des_fiches_est_dit(self):
+        # verdict codex #510 r2 (P3) : `readable` reste vrai quand la lecture
+        # des fiches échoue (`canon-git-error`) — le brief dit alors les règles
+        # indisponibles, jamais un silence trompeur.
+        with mock.patch.object(canon, "_git_blobs",
+                               side_effect=canon.GitError("objets illisibles")):
+            texte = self._brief()
         self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
         self.assertIn(reprise.PROCESS_RULES_UNAVAILABLE, texte)
 
@@ -291,6 +345,65 @@ class BriefProcessTest(PgTestCase):
         texte.encode("utf-8")
         self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
         self.assertIn(REGLE, texte)
+
+    def test_un_canon_imbrique_injecte_ses_regles(self):
+        # verdict codex #510 r2 (P2) : un canon dont le bundle est un
+        # sous-dossier garde ses `processus/*.md` — la restriction ne porte pas
+        # sur le chemin affiché du dépôt.
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "mono")
+        shutil.copytree(EXAMPLE, os.path.join(clone, "knowledge"))
+        write(clone, "knowledge/processus/lots.md", carte(
+            body="# Règles\n\n- la règle du canon imbriqué\n"))
+        commit_all(clone)
+        cfg = dataclasses.replace(self.cfg, canon=os.path.join(clone, "knowledge"),
+                                  canon_ref="", canon_untrusted=False)
+        texte = self._brief(cfg=cfg)
+        self.assertIn("la règle du canon imbriqué", texte)
+
+    def test_un_brief_prepare_est_relu_a_l_ouverture(self):
+        # verdict codex #510 r2 (P2) : un texte qui porte déjà un bloc de règles
+        # n'est pas figé — il est relu (une fiche remplacée l'emporte, une fiche
+        # retirée disparaît) et la consigne reste entière.
+        prepare = self._brief()
+        self.assertIn(REGLE, prepare)
+        write(self.clone, RACINE, carte(body="# Règles\n\n- la règle remplacée\n"))
+        commit_all(self.clone, "règle remplacée")
+        relu = reprise.with_process_rules(self.cfg, prepare, agent="ouvrier",
+                                          host=self.cfg.host)
+        self.assertEqual(relu.count(reprise.PROCESS_RULES_HEADER), 1)
+        self.assertIn("la règle remplacée", relu)
+        self.assertNotIn(REGLE, relu)
+        self.assertIn("## Instructions", relu)
+        write(self.clone, RACINE, None)
+        commit_all(self.clone, "règle retirée")
+        sans = reprise.with_process_rules(self.cfg, prepare, agent="ouvrier",
+                                          host=self.cfg.host)
+        self.assertNotIn(reprise.PROCESS_RULES_HEADER, sans)
+        self.assertIn("## Instructions", sans)
+
+    def test_un_bloc_apres_une_note_est_remplace(self):
+        # verdict codex #510 r2 (P2) : le pied délimite le bloc — un texte qui
+        # le porte après une note d'ameesh est relu, jamais doublé.
+        prepare = "Note d'ameesh.\n\n" + self._brief()
+        relu = reprise.with_process_rules(self.cfg, prepare, agent="ouvrier",
+                                          host=self.cfg.host)
+        self.assertEqual(relu.count(reprise.PROCESS_RULES_HEADER), 1)
+        self.assertIn("Note d'ameesh.", relu)
+        self.assertIn("## Instructions", relu)
+
+    def test_le_bloc_de_regles_est_borne(self):
+        # verdict codex #510 r2 (P2) : le bloc entier (en-tête, règles, pied)
+        # tient dans `BRIEF_MAX_BYTES` — jamais 182 Ko de règles pour une
+        # première session.
+        write(self.clone, RACINE, carte(body="# Règles\n\n" + ("- règle\n" * 4000)))
+        commit_all(self.clone, "règles longues")
+        bloc = reprise.process_rules_block(self.cfg, agent="ouvrier",
+                                           host=self.cfg.host)
+        self.assertTrue(bloc.startswith(reprise.PROCESS_RULES_HEADER))
+        self.assertTrue(bloc.endswith(reprise.PROCESS_RULES_FOOTER))
+        self.assertLessEqual(mail.octets(bloc), reprise.BRIEF_MAX_BYTES)
+        self.assertIn("[…]", bloc)
 
 
 class RotationProcessTest(PgTestCase):
@@ -388,6 +501,33 @@ class PremiereSessionProcessTest(PgTestCase):
             self.assertIn("la règle du premier démarrage", prompt)
             self.assertLess(prompt.index(reprise.PROCESS_RULES_HEADER),
                             prompt.index("premier tour"))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_le_budget_du_courrier_reserve_le_bloc_de_premiere_session(self):
+        # verdict codex #510 r2 (P2) : le bloc est borné ET réservé par le
+        # budget du courrier — sinon la consigne d'un tour de courrier d'une
+        # première session dépassait le plafond (« instruction too long »).
+        write(self.clone, RACINE, carte(body="# Règles\n\n" + ("- règle\n" * 4000)))
+        commit_all(self.clone, "règles longues")
+        cfg = dataclasses.replace(self.cfg, canon=self.clone, canon_ref="",
+                                  canon_untrusted=False)
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "relecteur")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("relecteur", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "relecteur", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "relecteur"), lease)
+        try:
+            bloc = reprise.process_rules_block(cfg, agent="relecteur",
+                                               host=self.cfg.host)
+            ouverture = worker._ouverture()
+            self.assertIn(reprise.PROCESS_RULES_HEADER, ouverture)
+            self.assertLessEqual(mail.octets(bloc), reprise.BRIEF_MAX_BYTES)
+            self.assertEqual(ouverture, bloc + "\n\n")
+            self.assertEqual(
+                worker._budget_courrier() + mail.octets(ouverture),
+                min(runner.prompt_max_bytes, mail.ARG_SAFE_BYTES))
         finally:
             worker.watchdog_stop.set()
 

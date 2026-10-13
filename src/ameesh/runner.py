@@ -3271,34 +3271,61 @@ class AgentWorker(threading.Thread):
             log("[%s] harness %s: %s" % (self.name, descriptor.id, resolution))
         return adapter
 
+    def _canon_id(self) -> str | None:
+        """L'identifiant du canon qui possède la ligne du registre de l'agent
+        (colonne `canon` ; NULL = canon par défaut) : les règles injectées sont
+        les siennes, jamais celles d'un homonyme déclaré par un autre canon
+        (L42/L43 ; verdict codex #510 r2, P1)."""
+        return (self.agent or {}).get("canon")
+
     def _resume_prompt(self) -> str:
         """Le cadre et le résumé de reprise qui ouvriront la session neuve après
         une rotation (0018), ou "" sans résumé en attente. Le résumé est
         délimité et n'a aucune autorité (`adapters.resume_prompt`).
 
-        #538 : les règles de travail du canon de l'agent sont relues MAINTENANT
-        pour un résumé écrit par l'agent (origine `agent`) ; un brief
-        déterministe (origine `ameesh`) les porte déjà."""
+        #538 : les règles de travail du canon de l'agent sont relues MAINTENANT,
+        quel que soit l'auteur du résumé : un brief préparé à l'avance (origine
+        `ameesh`) ne fige pas des règles périmées (verdict codex #510 r2, P2)."""
         if not self.resume_summary:
             return ""
-        resume = self.resume_summary
-        if self.resume_origin == "agent":
-            from . import reprise
-            resume = reprise.with_process_rules(
-                self.cfg, resume, agent=self.name,
-                host=(self.agent or {}).get("host") or self.cfg.host)
+        from . import reprise
+        resume = reprise.with_process_rules(
+            self.cfg, self.resume_summary, agent=self.name,
+            canon_id=self._canon_id(),
+            host=(self.agent or {}).get("host") or self.cfg.host)
         return adapters.resume_prompt(resume, origin=self.resume_origin)
+
+    def _ouverture(self) -> str:
+        """Ce qui ouvre la consigne du prochain tour : le résumé de rotation
+        (règles relues) quand il y en a un, sinon les règles de travail du canon
+        pour une session neuve ordinaire (premier démarrage) ; "" quand la
+        session reprend.
+
+        #538 : `_budget_courrier` réserve ces octets — le bloc de première
+        session ne se paie pas sur le courrier (verdict codex #510 r2, P2)."""
+        if self.current_session():
+            return ""
+        if self.resume_summary:
+            return self._resume_prompt()
+        if self.session_turns:
+            return ""
+        from . import reprise
+        bloc = reprise.process_rules_block(
+            self.cfg, agent=self.name, canon_id=self._canon_id(),
+            host=(self.agent or {}).get("host") or self.cfg.host)
+        return bloc + "\n\n" if bloc else ""
 
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
 
         Le plafond (`AMEESH_PROMPT_MAIL_MAX`) borne la consigne ENTIÈRE, résumé
-        de reprise compris quand il ouvrira le tour ; jamais au-delà de la
-        borne sûre d'un argument de processus. Un résumé qui ne laisserait pas
-        `PROMPT_MIN_BYTES` au courrier les lui laisse quand même (la consigne
-        dépasse alors le plafond, jamais la borne de l'argument).
+        de reprise ou règles de première session compris quand ils ouvriront le
+        tour ; jamais au-delà de la borne sûre d'un argument de processus. Un
+        résumé qui ne laisserait pas `PROMPT_MIN_BYTES` au courrier les lui
+        laisse quand même (la consigne dépasse alors le plafond, jamais la borne
+        de l'argument).
         """
-        resume = mail.octets(self._resume_prompt())
+        resume = mail.octets(self._ouverture())
         return min(self.runner.prompt_max_bytes, mail.ARG_SAFE_BYTES) - resume
 
     def _courrier_spec(self, kind: str, messages: list[dict]) -> dict:
@@ -3540,7 +3567,7 @@ class AgentWorker(threading.Thread):
         note, dits = tracker.note_for(self.name)
         if not note:
             return spec, []
-        if mail.octets(self._resume_prompt() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
+        if mail.octets(self._ouverture() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
             return spec, []
         return dict(spec, prompt=note + spec["prompt"]), dits
 
@@ -3569,20 +3596,10 @@ class AgentWorker(threading.Thread):
             # puis arrêt) ; dernière session principale connue, sinon brief.
             self._ecarte_session_inconnue(session, connue)
             session = self.current_session()
-        resume = ""
-        if self.resume_summary and not session:
-            # Session neuve après rotation (0018) : le résumé de reprise, encadré
-            # et délimité (il n'a aucune autorité), ouvre le tour.
-            resume = self._resume_prompt()
-        elif not session and not self.session_turns:
-            # #538 : une session neuve SANS résumé en attente (premier
-            # démarrage) s'ouvre elle aussi sur les règles de travail du canon.
-            from . import reprise
-            bloc = reprise.process_rules_block(
-                self.cfg, agent=self.name,
-                host=(self.agent or {}).get("host") or self.cfg.host)
-            if bloc:
-                resume = bloc + "\n\n"
+        # Session neuve : résumé de rotation (règles relues) ou, sans résumé,
+        # règles de travail du canon (premier démarrage) — `_ouverture` calcule
+        # les deux, règles bornées comprises.
+        resume = self._ouverture()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
