@@ -3547,12 +3547,12 @@ class AgentWorker(threading.Thread):
         supprimé** ici."""
         if not getattr(self, "_turn_open", False):
             return
-        from .turn_processes import group_running
         self._turn_open = False
         self._release_resource(turn_id, pgid, survives=survives)
 
     def _release_resource(self, turn_id: str, pgid: int | None, *,
                           survives: bool = False) -> None:
+        from .turn_processes import group_running
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
         if runtime is not None:
