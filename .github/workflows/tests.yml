@@ -435,9 +435,13 @@ jobs:
       # restait in_progress pour toujours. On relit l'état terminal réel du job
       # et de l'exécution qui l'ont publié ; jamais `success` sans ligne `fin`,
       # aucun check actif, d'une autre tête ou d'une autre tentative n'est touché.
+      # `continue-on-error` : cette réconciliation ne change jamais le verdict
+      # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
       - uses: actions/checkout@v4
+        continue-on-error: true
       - name: conclusion des checks de flux orphelins
         if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci-flow.py sweep
