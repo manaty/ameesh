@@ -8,6 +8,7 @@ import json
 import types
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -60,6 +61,11 @@ class ScopedConnections(PgTestCase):
 
     def test_concurrent_transactions_do_not_join_each_other(self):
         ready = threading.Barrier(2, timeout=15)
+        # Second rendez-vous : les deux SELECT intra-transaction ont eu lieu avant
+        # tout commit. Sans lui, un fil peut terminer (SELECT, commit, close) avant
+        # que l'autre ne lise, et en READ COMMITTED ce dernier voit alors la ligne
+        # committée de l'autre en plus de la sienne (rouge CI #814, 13/10).
+        queried = threading.Barrier(2, timeout=15)
         errors, pids = [], []
 
         def run(value):
@@ -69,6 +75,7 @@ class ScopedConnections(PgTestCase):
                     tx.execute('INSERT INTO scoped_values VALUES (%s)', (value,))
                     ready.wait()
                     self.assertEqual(tx.query('SELECT n FROM scoped_values'), [{'n': value}])
+                    queried.wait()
             except BaseException as error:
                 errors.append(error)
 
@@ -80,7 +87,15 @@ class ScopedConnections(PgTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         self.assertEqual(len(set(pids)), 2)
-        self.assertTrue(all(self.present(pid) == 0 for pid in pids))
+        # Le backend quitte pg_stat_activity de façon asynchrone après close() :
+        # on attend sa disparition (borné) au lieu de la lire une seule fois.
+        closed = False
+        for _ in range(100):
+            if not any(self.present(pid) for pid in pids):
+                closed = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(closed, "session toujours ouverte après la transaction")
 
     def test_capacity_query_works_with_each_driver(self):
         reading = db_capacity.read(self.db)
