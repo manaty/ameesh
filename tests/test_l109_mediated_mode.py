@@ -58,6 +58,8 @@ class MedieBase(unittest.TestCase):
             db_retry_max=0.2, resource_interval=0.0, worktree_roots=(self.tmp,))
         self.transport = GoldenTransport()
         self.responder = self.transport.responder
+        self.responder.script["agents.resolve_name"] = lambda body: (
+            body["args"][0] if body.get("args") else body["kwargs"]["name"])
         self.db = make_db(self.transport, cfg=self.cfg)
         relay_health = mock.patch("ameesh.relay.credential_ready", return_value=True)
         self.relay_health = relay_health.start()
@@ -268,7 +270,9 @@ class BailEtPanneTest(MedieBase):
         self.assertIsNone(self.db.book.fence("inge-front"))
         avant = len(self.transport.calls)
         registry.set_status(self.db, "inge-front", "idle", status_text="x")
-        self.assertEqual(len(self.transport.calls), avant, "plus aucune écriture sans bail")
+        self.assertFalse(any(C.load().get(body["op"]).write
+                             for _route, body, _key in self.transport.calls[avant:]),
+                         "plus aucune écriture sans bail")
 
     def test_serveur_injoignable_puis_retabli_l72(self):
         worker = self._worker()
@@ -338,6 +342,8 @@ class SessionTest(unittest.TestCase):
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
         self.responder = self.server.responder
+        self.responder.script["agents.resolve_name"] = lambda body: (
+            body["args"][0] if body.get("args") else body["kwargs"]["name"])
         self.responder.script["leases.state"] = {
             "lease_owner": OWNER, "lease_epoch": 42, "status": "running", "live": True}
         env = {
@@ -405,8 +411,9 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("coord", out)
         # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
-        self.assertEqual(self.server.ops(), ["leases.state", "agents.overview",
-                                             "mailbox.send", "work.get", "threads.index"])
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name", "agents.overview",
+                                             "agents.resolve_name", "mailbox.send", "work.get",
+                                             "agents.resolve_name", "threads.index"])
         index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
         self.assertEqual(index["body"]["kwargs"]["author"], "agent:inge-front")
         self.assertEqual(index["body"]["kwargs"]["project"], "canon")
@@ -443,7 +450,7 @@ class SessionTest(unittest.TestCase):
                                      "--new-lot", "Review", "--estimate", "1h")
         self.assertEqual(code, 2)
         self.assertIn("mediated contract 1.1", err)
-        self.assertEqual(self.server.ops(), ["leases.state", "agents.overview"])
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name", "agents.overview"])
         self.assert_session_only()
 
     def test_hook_remet_par_la_session(self):
@@ -506,7 +513,8 @@ class SessionTest(unittest.TestCase):
         code, out, err = self.ameesh("work", "move", "812", "qa", "--note", "PR ouverte",
                                      "--actor", "inge-front")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.server.ops(), ["work.get", "work.note", "work.get", "work.move"])
+        self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get", "work.note",
+                                             "agents.resolve_name", "work.get", "work.move"])
         self.assert_session_only()
 
     def test_action_propose(self):

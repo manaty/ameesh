@@ -156,7 +156,7 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
                "visibility_ok", "visibility_diagnostic",
-               "placement_ok", "placement_diagnostic", "placement_ref", "projects")
+               "placement_ok", "placement_diagnostic", "placement_ref", "projects", "aliases")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -1173,6 +1173,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     if findings is None:
         findings = canon_mod.validate(canon)
     findings = list(findings)
+    from .agent_names import conflicts
+    findings.extend(conflicts(db, canon))
     status, diagnostic = assess(canon, host, findings)
     if status != CANON_OK:
         record_state(db, host, status, diagnostic, canon, key=key)
@@ -1202,6 +1204,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if agent is None or not NAME_RE.match(name):
             continue
         row = rows.get(name)
+        known = registry.get(db, name)
+        if known is not None and known["name"] != name:
+            actions.append(SyncAction(name, "conflit", "primary name is another agent's alias",
+                                      ["agent-alias-conflict"]))
+            continue
         # L42 (0031) : noms globaux, premier déclarant. Une ligne gouvernée par
         # un AUTRE canon, et non libérée, n'est jamais reprise : constat limité
         # à cette fiche, aucune écriture.
@@ -1254,6 +1261,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # stays the primary one for the readers of a single project
             "team": agent.team,
             "projects": agent.effective_projects,
+            "aliases": (list((row or {}).get("aliases") or [])
+                        if any(r.startswith("agent-alias") for r in reasons)
+                        else list(agent.aliases or [])),
             "provider": agent.provider,
             "credential_mode": admission.credential_mode or agent.credential_mode,
             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute

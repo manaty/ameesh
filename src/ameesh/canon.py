@@ -803,6 +803,8 @@ class Agent:
     #: (`projects:`), the first one being its primary project; `team` is then
     #: that first project.
     projects: list[str] | None = None
+    #: L243b: alternative spellings of this identity, not new agents.
+    aliases: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -924,9 +926,11 @@ def work_dir_for(host: "Host | None", agent: "Agent", admission: "Placement | No
         policy = host.policy
         dirs = policy.work_dirs or {}
         roots = policy.work_roots or {}
-        found = policy.work_dir(agent.team, agent.title)
+        spellings = [agent.title] + list(agent.aliases or [])
+        explicit = next((n for n in spellings if n in dirs), None)
+        found = policy.work_dir(agent.team, explicit or agent.title)
         if found:
-            source = ("work_dirs" if agent.title in dirs else
+            source = ("work_dirs" if explicit is not None else
                       "work_roots" if agent.team and agent.team in roots else "work_root")
             return found, source
     if admission is not None and admission.cwd:
@@ -1118,6 +1122,11 @@ class Canon:
         return {source.member for source in self.sources} - set(self.scope_unread)
 
     def agent(self, name: str) -> Agent | None:
+        from .agent_names import resolve
+        try:
+            name = resolve(name, canon=self)
+        except ValueError:
+            return None
         for agent in self.agents:
             if agent.title == name:
                 return agent
@@ -1136,7 +1145,14 @@ class Canon:
         return None
 
     def placements_of(self, agent: str) -> list[Placement]:
-        return [p for p in self.placements if p.agent == agent]
+        from .agent_names import resolve
+        try:
+            agent = resolve(agent, canon=self)
+        except ValueError:
+            return []
+        return [p for p in self.placements
+                if p.agent == agent or p.agent in ((self.agent(agent).aliases or [])
+                                                  if self.agent(agent) else [])]
 
     def resolve_human(self, responsible: str | None) -> str | None:
         """`human:<id>` qui désigne un Member du canon → `human:<id>`, sinon None.
@@ -1180,7 +1196,7 @@ class Canon:
                            admins=h.admins, occupants=h.occupants,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
-            "agents": [dict(title=a.title, type=a.fiche.type, responsible=a.responsible, team=a.team,
+            "agents": [dict(title=a.title, aliases=a.aliases or [], type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
                             harnesses=a.harnesses, roles=a.roles, projects=a.projects,
                             provider=a.provider, credential_mode=a.credential_mode,
@@ -2452,6 +2468,14 @@ class _Loader:
         team = _text(fiche.data.get("team"))
         if projects is not None:
             team = projects[0] if projects else None
+        alias_value = fiche.data.get("aliases")
+        if alias_value is not None and (not isinstance(alias_value, list)
+                                       or not all(isinstance(n, str) for n in alias_value)):
+            self.add("agent-aliases-invalid", ERROR, "`aliases`: list of names expected",
+                     **where, **subject)
+            agent_aliases = []
+        else:
+            agent_aliases = list(alias_value or [])
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -2471,6 +2495,7 @@ class _Loader:
             harnesses=harnesses,
             roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
             projects=projects,
+            aliases=agent_aliases,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -3052,7 +3077,23 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                             ", ".join("%s:%s" % (g.fiche.member, g.fiche.path) for g in group)),
                         item.fiche, **({subject: title} if subject else {}))
 
-    agent_names = {a.title for a in canon.agents}
+    # Names share one namespace, including every human Member in the canon.
+    owners = defaultdict(list)
+    for agent in canon.agents:
+        for name in [agent.title] + list(agent.aliases or []):
+            owners[name].append(agent)
+            if not NAME_RE.fullmatch(name) or (name == "all" and name != agent.title):
+                add("agent-alias-invalid", ERROR, "invalid agent name or alias %r" % name,
+                    agent.fiche, agent=agent.title)
+    human_names = {m.title for m in canon.members}
+    for name, agents in owners.items():
+        if len(agents) > 1 or name in human_names:
+            for agent in agents:
+                add("agent-alias-conflict", ERROR,
+                    "name or alias %s belongs to more than one identity" % name,
+                    agent.fiche, agent=agent.title)
+
+    agent_names = set(owners)
     for member in canon.members:
         if member.title in agent_names:
             add("member-agent-clash", ERROR,
@@ -3216,7 +3257,8 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 "admission of %s without `hosts` or `host_tags`" % placement.agent, f,
                 agent=placement.agent)
             continue
-        by_agent[placement.agent].append(placement)
+        declared_agent = canon.agent(placement.agent)
+        by_agent[declared_agent.title if declared_agent else placement.agent].append(placement)
         if placement.agent not in agent_names:
             add("placement-agent-unknown", ERROR,
                 "admission for an unknown agent: %s" % placement.agent, f,
@@ -3251,6 +3293,13 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                         name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
     for host in canon.hosts:
+        for agent in canon.agents:
+            paths = {host.policy.work_dirs[n] for n in [agent.title] + list(agent.aliases or [])
+                     if n in (host.policy.work_dirs or {})}
+            if len(paths) > 1:
+                add("host-work-dir-alias-conflict", ERROR,
+                    "host %s declares different work directories for %s and its aliases"
+                    % (host.title, agent.title), host.fiche, host=host.title, agent=agent.title)
         for name in sorted(host.policy.work_dirs or {}):
             if name not in agent_names:
                 add("host-work-dir-agent-unknown", WARNING,

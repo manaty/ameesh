@@ -726,3 +726,15 @@ Reste à faire pour un essai sur une vraie machine Windows ou Mac :
 - l'image signée (`deploy/executor-image`, dsh épinglé par empreinte), et
   sa taille (1,3 Go avec dsh par npm) ;
 - le hook `agent-mail` de dsh : l'essai n'a fait aucun appel `session/op`.
+
+
+## Agent name aliases (#423, L243b step 1)
+
+The compatible `agents.resolve_name(name, operation="lookup")` operation is
+served on `/op` and `/session/op`. It returns only the primary spelling (or the
+unchanged unknown name), with a server-side alias audit. It grants no access.
+The dispatcher resolves named agents and lease envelopes before checking scope
+and fencing; executor allowlists can use aliases. The agent's name, owner,
+epoch and host still have to satisfy the same authority checks. See
+[Agent aliases](AGENT-ALIASES.md) for collisions, signed mail and the deferred
+renaming/rollback migration.

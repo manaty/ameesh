@@ -119,6 +119,7 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
         return _session_binding(cfg, db, harness, session_id)
     if not NAME_RE.match(name):
         return Binding(reason="AGENT_MAIL_NAME not set (the runner sets it for the harness)")
+    from .agent_names import resolve
     runner_id = os.environ.get("AMEESH_RUNNER_ID") or os.environ.get("AGENT_MESH_RUNNER_ID") or ""
     epoch_text = (os.environ.get("AMEESH_LEASE_EPOCH")
                   or os.environ.get("AGENT_MESH_LEASE_EPOCH") or "")
@@ -129,9 +130,10 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
             return Binding(name=name, source="runner", runner_id=runner_id,
                            reason="unreadable AMEESH_LEASE_EPOCH")
         from . import registry  # import tardif : identity ne dépend pas de la base
-        ok, reason = registry.lease_matches(db, name, runner_id, epoch)
+        name, ok, reason = registry.lease_binding(db, name, runner_id, epoch)
         return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,
                        ok=ok, reason=reason)
+    name = resolve(name, db=db, cfg=cfg, operation="identity.binding")
     return Binding(name=name, source="explicit", ok=True)
 
 

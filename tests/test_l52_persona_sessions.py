@@ -267,9 +267,11 @@ class NonBlockingHistoryTest(unittest.TestCase):
 
     def test_clear_does_not_read_history_outside_fenced_storage(self):
         db = mock.Mock()
+        db._agent_primary_names = None
         db.query.side_effect = RuntimeError("snapshot unavailable")
         with mock.patch.object(registry.storage, "of") as store, \
                 mock.patch.object(sys, "stderr", io.StringIO()):
+            store.return_value.agents.resolve_name.side_effect = lambda name, **_kw: name
             store.return_value.leases.clear_session.return_value = True
             self.assertTrue(registry.clear_session(db, "checker", "r", 1))
         store.return_value.leases.clear_session.assert_called_once_with("checker", "r", 1)
