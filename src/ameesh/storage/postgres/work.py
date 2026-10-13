@@ -917,13 +917,13 @@ class WorkItems(interface.WorkItems):
                       measure_reason="", dry_run=False) -> list[dict]:
         """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
         d'équipe — assigné effacé, journal au lot (raison), délégation en cours
-        annulée —, et ses lots promus dont la mesure reste à refaire (dernière
-        mesure antérieure à la promotion, ou absente) vont à `measure_actor`
-        (l'auditeur), journal au lot (`measure_reason`). Le tout dans une
-        transaction ; le lot est verrouillé puis l'assigné recontrôlé : un lot
-        repris entre-temps n'est pas touché. `dry_run` : rien n'est écrit, les
-        lots concernés sont rendus tels quels (clé `assigned_to` pour ceux qui
-        iraient à l'acteur de la mesure)."""
+        annulée —, et ses lots promus (un déploiement porte toujours sa mesure
+        post-déploiement à refaire) vont à `measure_actor` (l'auditeur), journal
+        au lot (`measure_reason`). Le tout dans une transaction ; le lot est
+        verrouillé puis l'assigné recontrôlé : un lot repris entre-temps n'est
+        pas touché. `dry_run` : rien n'est écrit, les lots concernés sont rendus
+        tels quels (clé `assigned_to` pour ceux qui iraient à l'acteur de la
+        mesure)."""
         with self.db.transaction() as tx:
             return WorkItems(tx)._release_agent(
                 agent, reason=reason, actor=actor, measure_actor=measure_actor,
@@ -962,18 +962,15 @@ class WorkItems(interface.WorkItems):
             self._cancel_delegation(row["id"], actor)
             self._event(int(row["id"]), updated[0]["state"], reason, actor)
             out.append(updated[0])
-        # 2. lots promus dont la mesure reste à refaire : acteur de la mesure
-        #    (aucune mesure prise depuis la promotion)
+        # 2. lots promus : acteur de la mesure post-deploiement (l'auditeur).
+        #    `work_item_measures` mesure la duree et le diff de livraison, pas
+        #    la mesure d'impact a refaire apres deploiement : elle ne dit donc
+        #    pas si l'action est close (revue auditeur, R1 #753).
         if measure_actor and measure_actor != agent:
             limit = "" if dry_run else " FOR NO KEY UPDATE OF w"
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
                 " WHERE w.assignee = %%s AND w.state = 'promoted'"
-                "   AND NOT EXISTS (SELECT 1 FROM work_item_measures m"
-                "                    WHERE m.work_item_id = w.id AND m.measured_at > coalesce("
-                "                      (SELECT max(e.created_at) FROM work_item_events e"
-                "                        WHERE e.work_item_id = w.id AND e.state = 'promoted'),"
-                "                      'epoch'::timestamptz))"
                 " ORDER BY w.id%s" % (ITEM_COLUMNS, limit), (agent,))
             for row in rows:
                 if dry_run:

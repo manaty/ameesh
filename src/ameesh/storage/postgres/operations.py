@@ -313,9 +313,11 @@ class Operations(interface.Operations):
             "  FROM work_items WHERE assignee = %s AND state NOT IN " + _CLOSED +
             " ORDER BY updated_at DESC, id DESC", (name,))
 
-    def open_lots_activity(self, limit) -> list[dict]:
-        return self.db.query(
-            """
+    #: corps commun de `open_lots_activity` / `state_lots_activity` : la
+    #: dernière activité d'un lot (ligne, transitions, jalons, actions,
+    #: messages). `%%s` du LIMIT est échappé : `_lots_activity` injecte le
+    #: WHERE, qui peut lui-même porter un `%s`.
+    _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
@@ -330,11 +332,23 @@ class Operations(interface.Operations):
                                   WHERE a.work_item = w.id) ac ON true
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
                                   WHERE b.work_item_id = w.id::text) mb ON true
-             WHERE w.state NOT IN """ + _CLOSED + """
+             WHERE %s
              ORDER BY last_activity_ts ASC, w.id
-             LIMIT %s
-            """,
+             LIMIT %%s
+            """
+
+    def _lots_activity(self, where, params) -> list[dict]:
+        return self.db.query(self._LOTS_ACTIVITY % where, params)
+
+    def open_lots_activity(self, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state NOT IN " + _CLOSED,
             (int(limit) if limit is not None else None,))
+
+    def state_lots_activity(self, state, limit) -> list[dict]:
+        return self._lots_activity(
+            "w.state = %s",
+            (state, int(limit) if limit is not None else None))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:

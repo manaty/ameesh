@@ -96,8 +96,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
-                   open_lots_activity turns record_gauges gauge_history
-                   latest_gauges assigners record_balance balances
+                   open_lots_activity state_lots_activity turns record_gauges
+                   gauge_history latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
@@ -2309,6 +2309,13 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee. Les plus anciennement actifs d'abord. `limit=None` lit
         toute la vérité avant le filtrage des attentes planifiées (L368)."""
+
+    @abc.abstractmethod
+    def state_lots_activity(self, state: str, limit: int | None) -> list[dict]:
+        """Lots d'un état donné (`promoted`, …), même forme que
+        `open_lots_activity` — qui exclut `merged`, `promoted` et `closed` :
+        un lot promu qu'un agent arrêté garde doit rester visible (#753, R1
+        auditeur). `limit=None` : toute la vérité."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:

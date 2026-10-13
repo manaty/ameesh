@@ -63,8 +63,11 @@ class StopReleasesLotsTest(_Base):
 
 
 class PromotedMeasurementTest(_Base):
-    """#753 (2e incrément) : un lot promu dont la mesure reste à refaire ne
-    reste pas avec l'agent arrêté — il va à l'acteur de la mesure (auditeur)."""
+    """#753 (2e incrément) : un lot promu (mesure post-déploiement à refaire) ne
+    reste pas avec l'agent arrêté — il va à l'acteur de la mesure (auditeur).
+    La mesure de livraison de `work_item_measures` (durée, diff) ne dit rien de
+    cette action : une re-mesure de livraison après la promotion ne la clôt pas
+    (revue auditeur, R1 #753)."""
 
     def measure(self, item_id, *, offset_s=0.0):
         self.db.execute(
@@ -72,60 +75,82 @@ class PromotedMeasurementTest(_Base):
             " total_minutes, agent_minutes, review_minutes, human_minutes)"
             " VALUES (%s, now(), now(), 1, 1, 0, 0)", (item_id,))
         if offset_s:
-            self.db.execute(
-                "UPDATE work_item_measures SET measured_at = now() + make_interval(secs => %s)"
-                " WHERE work_item_id = %s", (float(offset_s), item_id))
+            self.remeasure(item_id, offset_s=offset_s)
 
-    def promoted(self, assignee="dev1", *, measure_before=True):
+    def remeasure(self, item_id, *, offset_s=0.0):
+        self.db.execute(
+            "UPDATE work_item_measures SET measured_at = now() + make_interval(secs => %s)"
+            " WHERE work_item_id = %s", (float(offset_s), item_id))
+
+    def promoted(self, assignee="dev1", *, remeasure_after=False):
         self.agent(assignee)
         lot = self.lot("deployed", assignee=assignee)
         work.merged(self.db, lot["id"], sha="a" * 40, actor=assignee)
-        if measure_before:
-            self.measure(lot["id"], offset_s=-3600)
+        self.measure(lot["id"], offset_s=-3600)     # mesure de livraison à la fusion
         work.move(self.db, lot["id"], "promoted", note="déployé", actor="auditeur")
-        if not measure_before:
-            self.measure(lot["id"], offset_s=3600)
+        if remeasure_after:
+            self.remeasure(lot["id"], offset_s=3600)
         return lot
 
     def test_measurement_actor_is_the_auditor(self):
         self.agent("auditeur")
         self.assertEqual(work.measurement_actor(self.db, self.cfg), "auditeur")
 
-    def test_pending_measure_goes_to_the_measure_actor(self):
+    def test_stopped_measure_actor_is_not_used(self):
+        self.agent("auditeur")
+        registry.set_status(self.db, "auditeur", "stopped", status_text="stopped",
+                            stop_reason="manuel")
+        self.assertEqual(work.measurement_actor(self.db, self.cfg), "")
+
+    def test_stopped_auditor_is_not_a_destination(self):
+        # R1 auditeur, témoin demandé : dev1 arrêté, auditeur arrêté — aucun
+        # promu n'est réattribué à un agent arrêté ; le lot reste en place (et
+        # `orphan_lot` le signale, test_l37_mode_et_alertes).
+        self.agent("auditeur")
+        registry.set_status(self.db, "auditeur", "stopped", status_text="stopped",
+                            stop_reason="manuel")
+        lot = self.promoted()
+        actor = work.measurement_actor(self.db, self.cfg)
+        self.assertEqual(actor, "")
+        done = work.release_lots(self.db, "dev1", reason="stopped (#753)", actor="stop",
+                                 measure_actor=actor, measure_reason="m")
+        self.assertEqual(done, [])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+
+    def test_promoted_lot_goes_to_the_measure_actor(self):
         lot = self.promoted()
         done = work.release_lots(self.db, "dev1", reason="stopped (#753)", actor="stop",
                                  measure_actor="auditeur",
-                                 measure_reason="measurement to redo (#753)")
+                                 measure_reason="post-deployment measurement to redo (#753)")
         self.assertEqual([row["id"] for row in done], [lot["id"]])
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["state"], item["assignee"]), ("promoted", "auditeur"))
         ev = self.db.query(
             "SELECT note, actor FROM work_item_events WHERE work_item_id = %s"
             " ORDER BY id DESC LIMIT 1", (lot["id"],))[0]
-        self.assertIn("measurement to redo", ev["note"])
+        self.assertIn("post-deployment measurement", ev["note"])
         self.assertEqual(ev["actor"], "stop")
         # idempotent : le lot a changé d'assigné
         self.assertEqual(work.release_lots(self.db, "dev1", reason="again", actor="stop",
                                            measure_actor="auditeur",
                                            measure_reason="m"), [])
 
-    def test_measure_taken_after_promotion_keeps_the_lot(self):
-        lot = self.promoted(measure_before=False)
-        self.assertEqual(work.release_lots(self.db, "dev1", reason="r", actor="a",
-                                           measure_actor="auditeur", measure_reason="m"), [])
-        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
-
-    def test_no_measure_at_all_is_pending(self):
-        self.agent("dev1")
-        lot = self.lot("never measured", assignee="dev1")
-        work.merged(self.db, lot["id"], sha="c" * 40, actor="dev1")
-        work.move(self.db, lot["id"], "promoted", note="déployé", actor="auditeur")
+    def test_delivery_remeasure_after_promotion_does_not_close_the_action(self):
+        lot = self.promoted(remeasure_after=True)
         done = work.release_lots(self.db, "dev1", reason="r", actor="a",
                                  measure_actor="auditeur", measure_reason="m")
         self.assertEqual([row["id"] for row in done], [lot["id"]])
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "auditeur")
 
-    def test_measure_actor_stopped_agent_leaves_the_lot(self):
+    def test_merged_lot_is_not_handed_to_the_measure_actor(self):
+        self.agent("dev1")
+        lot = self.lot("merged, not deployed", assignee="dev1")
+        work.merged(self.db, lot["id"], sha="c" * 40, actor="dev1")
+        self.assertEqual(work.release_lots(self.db, "dev1", reason="r", actor="a",
+                                           measure_actor="auditeur", measure_reason="m"), [])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+
+    def test_measure_actor_same_as_stopped_agent_leaves_the_lot(self):
         lot = self.promoted(assignee="auditeur")
         done = work.release_lots(self.db, "auditeur", reason="r", actor="a",
                                  measure_actor="auditeur", measure_reason="m")
