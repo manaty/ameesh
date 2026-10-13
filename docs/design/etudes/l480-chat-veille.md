@@ -39,10 +39,18 @@ entrées (message humain, courrier, événement) comme des tours, le journal
 (L78) et le client (L79) portent la conversation, et l'autorité d'un message
 humain passe par l'enveloppe d'identité locale (L77) au lieu de l'ascendance
 du processus. C'est la décision 0035 ; elle règle le cas général (plusieurs
-humains, page Nexlink, rotation). Elle n'est **pas disponible** : L76 n'est
-pas fusionnée et L77 n'a pas de lot.
+humains, page Nexlink, rotation). Elle n'est **pas disponible** : L76 (#285)
+n'est pas fusionnée et L77 (#286) est en intake, dépendante de #285.
 
-# Intérim retenu (ce lot) : la veille dans le lanceur
+# Intérim écrit, gardé au frigo : la veille dans le lanceur
+
+Arbitrage du pilote (mesh-design, 2026-10-13 13:40) : **option 1** — attendre
+L76 (#285) et L77 (#286) et brancher la veille du chat dessus ; pas d'intérim
+par courrier, un agent externe n'est pas réveillé. L'intérim décrit ci-dessous
+n'est **pas** par courrier (le harnais est réveillé dans sa session ouverte) ;
+il est écrit et testé sur la branche `lot/480-chat-veille`, et n'est proposé à
+la relecture que si le pilote le décide. Le lot #480 reste bloqué sur #285 et
+#286.
 
 Tant que L76/L77 manquent, `ameesh chat` garde la session interactive — et
 donc l'ancrage humain intact — mais **le lanceur prête le terminal** au
