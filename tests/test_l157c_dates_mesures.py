@@ -15,8 +15,9 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
-from ameesh import lot_measures, lot_schedule, registry, storage, work
+from ameesh import lot_measures, lot_schedule, registry, roadmap, storage, work
 
 from .support import PgTestCase
 
@@ -338,21 +339,23 @@ class ScheduleByHandPgTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(storage.of(self.db).roadmap.item_plans([a["id"]])[0]
                         ["planned_source"].startswith("reference p80 (table #"))
+        # #740: only a human, an orchestrator or a design agent pins a date
         proc = self.mesh("work", "plan", str(a["id"]), "--start", "2030-01-01",
-                         "--end", "2030-01-02", "--actor", "orch")
+                         "--end", "2030-01-02", "--actor", "human:test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
         def plan():
             return storage.of(self.db).roadmap.item_plans([a["id"]])[0]
 
         self.assertEqual((str(plan()["planned_start"])[:10], plan()["planned_source"]),
-                         ("2030-01-01", "set by orch"))
+                         ("2030-01-01", "set by human:test"))
         proc = self.mesh("work", "schedule", "--apply", "--actor", "orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(str(plan()["planned_start"])[:10], "2030-01-01")
-        # a source given by the person stays as given
+        # a source given by the person stays as given (#740 r1: replacing a
+        # "set by" marker takes the same authority as pinning)
         proc = self.mesh("work", "plan", str(a["id"]), "--start", "2030-01-01",
-                         "--source", "decision #1", "--actor", "orch")
+                         "--source", "decision #1", "--actor", "human:test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(plan()["planned_source"], "decision #1")
         # --force still rewrites a date set by hand
@@ -360,6 +363,218 @@ class ScheduleByHandPgTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotEqual(str(plan()["planned_start"])[:10], "2030-01-01")
         self.assertTrue(plan()["planned_source"].startswith("reference p80 (table #"))
+
+
+class ScheduleRacePgTest(PgTestCase):
+    """#740 (P1a): the schedule writes a lot only while its dates are still
+    those the schedule read (own class: it publishes a reference table)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host)
+
+    def _plan(self, lot):
+        return storage.of(self.db).roadmap.item_plans([lot])[0]
+
+    def test_a_date_set_after_the_build_is_kept(self):
+        a = work.add(self.db, title="race", assignee="dev1", estimate=60)
+        storage.of(self.db).work.publish_reference(BODY, actor="auditeur")
+        sched = lot_schedule.build(self.db)
+        roadmap.plan(self.db, a["id"], start="2030-01-01", end="2030-01-02",
+                     actor="human:test")
+        self.assertEqual(lot_schedule.apply(self.db, sched, actor="orch"), [])
+        plan = self._plan(a["id"])
+        self.assertEqual((str(plan["planned_start"])[:10], plan["planned_by"]),
+                         ("2030-01-01", "human:test"))
+
+    def test_a_forced_apply_keeps_a_date_changed_after_the_build(self):
+        a = work.add(self.db, title="race", assignee="dev1", estimate=60)
+        storage.of(self.db).work.publish_reference(BODY, actor="auditeur")
+        roadmap.plan(self.db, a["id"], start="2030-01-01", end="2030-01-02",
+                     source="decision #1", actor="human:test")
+        sched = lot_schedule.build(self.db, force=True)
+        roadmap.plan(self.db, a["id"], start="2030-02-01", end="2030-02-02",
+                     source="decision #2", actor="human:test")
+        self.assertEqual(lot_schedule.apply(self.db, sched, force=True, actor="orch"), [])
+        self.assertEqual((str(self._plan(a["id"])["planned_start"])[:10],
+                          self._plan(a["id"])["planned_source"]), ("2030-02-01", "decision #2"))
+        # nothing changed since the build: --force still writes
+        sched = lot_schedule.build(self.db, force=True)
+        self.assertEqual([e["id"] for e in lot_schedule.apply(self.db, sched, force=True,
+                                                              actor="orch")], [a["id"]])
+        self.assertTrue(self._plan(a["id"])["planned_source"].startswith("reference p80"))
+
+
+class PinAuthorityPgTest(PgTestCase):
+    """#740 (P2): the "set by" marker that protects a date from the schedule
+    needs a real change of the start or the end, by a human, an orchestrator
+    or a design agent (`work.corrector`)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host)
+        self.lot = work.add(self.db, title="dated by the schedule", assignee="dev1",
+                            estimate=60)["id"]
+        storage.of(self.db).work.publish_reference(BODY, actor="auditeur")
+        lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="orch")
+
+    def _plan(self):
+        return storage.of(self.db).roadmap.item_plans([self.lot])[0]
+
+    def test_an_agent_without_authority_does_not_pin(self):
+        out = roadmap.plan(self.db, self.lot, start="2030-01-01", end="2030-01-02",
+                           actor="dev1")
+        self.assertEqual(str(self._plan()["planned_start"])[:10], "2030-01-01")
+        self.assertTrue(self._plan()["planned_source"].startswith("reference p80"))
+        self.assertIn("not protected", out.get("warning") or "")
+        proc = self.mesh("work", "plan", str(self.lot), "--start", "2030-01-03",
+                         "--end", "2030-01-04", "--actor", "dev1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("not protected", proc.stderr)
+
+    def test_resubmitting_the_current_dates_does_not_pin(self):
+        cur = self._plan()
+        roadmap.plan(self.db, self.lot, start=str(cur["planned_start"])[:10],
+                     end=str(cur["planned_end"])[:10], actor="human:test")
+        self.assertTrue(self._plan()["planned_source"].startswith("reference p80"))
+
+    def test_a_human_changing_the_start_pins(self):
+        out = roadmap.plan(self.db, self.lot, start="2030-01-01", end="2030-01-02",
+                           actor="human:test")
+        self.assertEqual(self._plan()["planned_source"], "set by human:test")
+        self.assertIsNone(out.get("warning"))
+
+    def test_assigning_a_lot_gives_no_pin_authority(self):
+        # r1 (1): having assigned a lot is not a declared role
+        registry.upsert(self.db, "dev2", harness="claude", host=self.cfg.host)
+        other = work.add(self.db, title="handed over", estimate=60)["id"]
+        work.assign(self.db, other, "dev2", actor="dev1")
+        out = roadmap.plan(self.db, self.lot, start="2030-01-01", end="2030-01-02",
+                           actor="dev1")
+        self.assertTrue(self._plan()["planned_source"].startswith("reference p80"))
+        self.assertIn("not protected", out.get("warning") or "")
+
+    def test_a_source_that_claims_the_dates_needs_authority(self):
+        # r1 (2): a caller-supplied marker goes through the same check
+        for claim in ("set by human:owner", "decision #9"):
+            out = roadmap.plan(self.db, self.lot, delivery="2030-02-01", source=claim,
+                               actor="dev1")
+            self.assertTrue(self._plan()["planned_source"].startswith("reference p80"),
+                            claim)
+            self.assertIn("not recorded", out.get("warning") or "")
+        roadmap.plan(self.db, self.lot, delivery="2030-02-01", source="decision #9",
+                     actor="human:test")
+        self.assertEqual(self._plan()["planned_source"], "decision #9")
+        out = roadmap.plan(self.db, self.lot, delivery="2030-02-02",
+                           source="set by human:owner", actor="dev1")
+        self.assertEqual(self._plan()["planned_source"], "decision #9")
+        self.assertIn("not recorded", out.get("warning") or "")
+
+    def test_a_schedule_write_between_read_and_write_is_not_kept(self):
+        # internal review r1 (P1): `work plan` writes only the row it read
+        storage.of(self.db).roadmap.plan_item(self.lot, {"start": None, "end": None},
+                                              source="decision #1", actor="orchestrateur")
+        real, raced = roadmap._hand_source, []
+
+        def racing(db, current, dates, source, actor):
+            out = real(db, current, dates, source, actor)
+            if not raced:     # the schedule dates the lot after `work plan` read it
+                raced.append(True)
+                lot_schedule.apply(db, lot_schedule.build(db), actor="orch")
+            return out
+
+        with mock.patch.object(roadmap, "_hand_source", racing):
+            roadmap.plan(self.db, self.lot, start="2030-01-01", end="2030-01-02",
+                         actor="human:test")
+        self.assertEqual(self._plan()["planned_source"], "set by human:test")
+        lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="orch")
+        self.assertEqual(str(self._plan()["planned_start"])[:10], "2030-01-01")
+
+    def test_clearing_both_dates_by_hand_is_kept(self):
+        # r2: the "set by" marker protects an intentional clearing too
+        roadmap.plan(self.db, self.lot, start="-", end="-", actor="human:test")
+        self.assertEqual(self._plan()["planned_source"], "set by human:test")
+        lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="orch")
+        plan = self._plan()
+        self.assertEqual((plan["planned_start"], plan["planned_end"], plan["planned_source"]),
+                         (None, None, "set by human:test"))
+
+    def test_clearing_a_date_is_a_change(self):
+        # r1 (3): `--end -` is a change of the end
+        out = roadmap.plan(self.db, self.lot, end="-", actor="dev1")
+        self.assertIsNone(self._plan()["planned_end"])
+        self.assertTrue(self._plan()["planned_source"].startswith("reference p80"))
+        self.assertIn("not protected", out.get("warning") or "")
+        lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="orch")
+        self.assertIsNotNone(self._plan()["planned_end"])
+        roadmap.plan(self.db, self.lot, end="-", actor="human:test")
+        self.assertIsNone(self._plan()["planned_end"])
+        self.assertEqual(self._plan()["planned_source"], "set by human:test")
+
+
+class PinRepairPgTest(PgTestCase):
+    """#740 (P1b): a date set by hand before #704 still carries the
+    schedule's source. `work schedule --pin` lists such lots (dry run) and
+    protects those a corrector names; it never guesses."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host)
+        self.legacy = work.add(self.db, title="hand date before #704", assignee="dev1",
+                               estimate=60)["id"]
+        self.other = work.add(self.db, title="person's source", assignee="dev1",
+                              estimate=60)["id"]
+        storage.of(self.db).work.publish_reference(BODY, actor="auditeur")
+        lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="auditeur")
+        # before #704: `work plan` without --source kept the schedule's source
+        storage.of(self.db).roadmap.plan_item(self.legacy, {"start": "2030-01-01",
+                                                            "end": "2030-01-02"},
+                                              source=None, actor="orchestrateur")
+        storage.of(self.db).roadmap.plan_item(self.other, {"start": "2030-03-01",
+                                                           "end": "2030-03-02"},
+                                              source="decision #1", actor="orchestrateur")
+
+    def _plan(self, lot):
+        return storage.of(self.db).roadmap.item_plans([lot])[0]
+
+    def test_dry_run_lists_without_writing(self):
+        before = self._plan(self.legacy)
+        proc = self.mesh("work", "schedule", "--pin", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = {r["id"]: r for r in json.loads(proc.stdout)["candidates"]}
+        self.assertEqual(set(rows), {self.legacy})
+        self.assertEqual(rows[self.legacy]["planned_by"], "orchestrateur")
+        self.assertTrue(rows[self.legacy]["moves"])
+        self.assertEqual(self._plan(self.legacy), before)
+
+    def test_pin_keeps_the_dates_with_who_set_them(self):
+        proc = self.mesh("work", "schedule", "--pin", str(self.legacy), str(self.other),
+                         "--actor", "human:test", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        status = {r["id"]: r["status"] for r in json.loads(proc.stdout)["pinned"]}
+        self.assertEqual(status, {self.legacy: "pinned", self.other: "skipped"})
+        plan = self._plan(self.legacy)
+        self.assertEqual((str(plan["planned_start"])[:10], plan["planned_source"]),
+                         ("2030-01-01", "set by orchestrateur"))
+        self.assertEqual(self._plan(self.other)["planned_source"], "decision #1")
+        proc = self.mesh("work", "schedule", "--apply", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(str(self._plan(self.legacy)["planned_start"])[:10], "2030-01-01")
+
+    def test_pin_needs_a_corrector(self):
+        proc = self.mesh("work", "schedule", "--pin", str(self.legacy), "--actor", "dev1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refused", proc.stderr)
+        self.assertTrue(self._plan(self.legacy)["planned_source"].startswith("reference p80"))
+
+    def test_assigning_lots_gives_no_pin_right(self):
+        # r1 (1): `work assign` once does not make a corrector for --pin
+        registry.upsert(self.db, "dev2", harness="claude", host=self.cfg.host)
+        work.assign(self.db, self.other, "dev2", actor="dev1")
+        proc = self.mesh("work", "schedule", "--pin", str(self.legacy), "--actor", "dev1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refused", proc.stderr)
+        self.assertTrue(self._plan(self.legacy)["planned_source"].startswith("reference p80"))
 
 
 class MeasurePgTest(PgTestCase):

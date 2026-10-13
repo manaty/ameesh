@@ -286,7 +286,9 @@ class Leases(Domain):
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
                      require_responsible: bool) -> dict | None:
-        """Prend le bail pour une session interactive (`ameesh attach`)."""
+        """Prend le bail pour une session interactive (`ameesh attach`) ; la
+        ligne rendue porte `harness` et `created_ts` (L719), l'identité de
+        l'enregistrement revendiqué."""
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
@@ -2116,14 +2118,18 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def plan_item(self, item_id: int, dates: dict, *, source: str | None,
-                  actor: str) -> dict | None:
+                  actor: str, expect: dict | None = None) -> dict | None:
         """Pose les dates prévues d'une tâche (`dates` : clés parmi `start`,
         `end`, `delivery` ; valeur None = date effacée ; clé absente =
         inchangée), avec qui et quand (`planned_by`, `planned_at`). Ce n'est
         PAS une activité de la tâche : ni `updated_at` ni le journal ne
         bougent (une replanification ne masque pas une stagnation). Rend
         `{id, planned_start, planned_end, planned_delivery, planned_source,
-        planned_by, planned_ts}`, ou None si la tâche est inconnue."""
+        planned_by, planned_ts}`, ou None si la tâche est inconnue.
+
+        #740 : avec `expect` (`planned_start`, `planned_end`,
+        `planned_source` lus avant), rien n'est écrit si l'un d'eux a changé
+        depuis la lecture ; None alors aussi."""
 
     @abc.abstractmethod
     def item_plans(self, ids: Sequence[int]) -> list[dict]:
