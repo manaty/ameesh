@@ -80,8 +80,8 @@ changed manifests, two simultaneous controllers, lost replies at every release
 and recovery action, health rollback, rollback failure and receipt/log canaries.
 They establish protocol behavior with simulated effects, not an authenticated
 host pilot, root delegation, real claim fence or PostgreSQL lock integration.
-The next integration must enroll authority and supply durable host receipts, the
-bounded SSH/systemd adapters; helper/bootstrap and
+The next integration must enroll authority and supply durable host receipts and
+the bounded SSH/systemd adapters; helper/bootstrap and the controller's own
 installer wiring are also unfinished.
 
 ## Scoped signed decision adapter
@@ -249,11 +249,12 @@ Input is size/time bounded; errors return only a structured generic category.
 
 The helper/dispatcher remain **source only**, not installed, exposed through SSH,
 or enabled as a service. Tests simulate systemd and cgroup filesystem fixtures;
-they do not prove a real host restart. The bootstrap, pinned helper runtime,
-restricted SSH/sudo enrollment, full independent-service adapter, config/caps/
-guard snapshots, installer wiring and authenticated health/rollback pilot are
-still required. This checkpoint implements neither user-mode systemd nor other
-root operations and grants no root authority to an agent.
+they do not prove a real host restart. The administrator bootstrap and helper
+runtime, restricted SSH/sudo enrollment, independent service, config/caps/guard
+snapshots and the controller's own installer wiring are prepared but not
+installed; the authenticated health/rollback pilot is still required. This
+checkpoint implements neither user-mode systemd nor other root operations and
+grants no root authority to an agent.
 
 ## Pinned SSH restart transport
 
@@ -522,10 +523,10 @@ migrations, the effective card units, declared capabilities and guard, and runs
 credential file, scrubbed environment and bounded deadline. The study's
 controlled authenticated turn needs the enrolled runner identity: it is the
 authenticated health/rollback pilot's work and this module never claims it.
-Installer/provider wiring and that pilot therefore remain build work. Tests use
-real disposable documents, release trees and private roots with simulated
-systemd, database and provider effects; no root, SSH, migration or production
-effect is executed.
+The controller's own installer wiring and that pilot therefore remain build
+work. Tests use real disposable documents, release trees and private roots with
+simulated systemd, database and provider effects; no root, SSH, migration or
+production effect is executed.
 
 ## Operation-specific code and environment recovery
 
@@ -579,10 +580,11 @@ field. The host adapter must still validate syntax, reconcile daemon reloads and
 verify effective units, caps and guard policy before returning a full configure
 or rollback receipt; `verification-release.py` (below) now supplies that
 effectiveness half and the pinned factory binds both halves. The recovery-set and
-health companions are supplied too (above); installer wiring and the authenticated
-health/rollback pilot remain unfinished. Targeted tests exercise real disposable
-files with simulated signed authority and database gates; no real host
-configuration or service is changed.
+health companions are supplied too (above); the controller's own installer wiring
+and the authenticated health/rollback pilot remain unfinished (the daily
+retention provider is wired separately, `L232B-PRIVATE-BACKUPS.md`). Targeted
+tests exercise real disposable files with simulated signed authority and database
+gates; no real host configuration or service is changed.
 
 ## Effective configuration verification
 

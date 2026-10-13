@@ -23,4 +23,11 @@ if [ -r /etc/ameesh/sauvegarde.env ]; then
 fi
 # Expiry only follows completed backup/upload. Unregistered artifacts remain
 # protected until the enrolled controller supplies policy and recovery pins.
-"$python" /usr/local/sbin/ameesh-retention-privee.py --root "$d" prune --now "$(date +%s)"
+# A set with a remote member is only expired through the enrolled provider
+# document; without it that set stays protected instead of being guessed.
+if [ -r /etc/ameesh/retention-provider.json ]; then
+    "$python" /usr/local/sbin/ameesh-retention-privee.py --root "$d" prune \
+        --provider-enrollment /etc/ameesh/retention-provider.json --now "$(date +%s)"
+else
+    "$python" /usr/local/sbin/ameesh-retention-privee.py --root "$d" prune --now "$(date +%s)"
+fi

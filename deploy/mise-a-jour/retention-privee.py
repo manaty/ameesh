@@ -9,6 +9,7 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -205,14 +206,107 @@ def protect(root, artifact, *, accepted=None, hold=None):
         save(root, records)
 
 
-def prune(root, *, now, remote_adapter=None):
+PROVIDER_FIELDS = {"host", "credentials", "staging", "max_bytes"}
+# Fixed sibling module; never a path or module name supplied by a caller.
+PROVIDER_MODULE = "retention-scaleway"
+PROVIDER_DOCUMENT_LIMIT = 65536
+
+
+def provider_module():
+    """Load the fixed provider backend installed beside this helper."""
+    path = Path(__file__).with_name(PROVIDER_MODULE + ".py")
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise RetentionError("provider retention module unavailable") from None
+    if (stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode)):
+        raise RetentionError("untrusted provider retention module")
+    spec = importlib.util.spec_from_file_location("private_retention_scaleway", path)
+    loaded = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(loaded)
+    except Exception:
+        raise RetentionError("provider retention module unavailable") from None
+    return loaded
+
+
+class ScopedProvider:
+    """One enrolled object host over the fixed versioned provider backend."""
+
+    def __init__(self, backend, host):
+        self.backend, self.host = backend, host
+
+    def _scoped(self, object_id):
+        if not isinstance(object_id, str) or object_id.split("/", 1)[0] != self.host:
+            raise RetentionError("provider object outside enrolled host scope")
+        return object_id
+
+    def inspect(self, object_id, **version):
+        return self.backend.inspect(self._scoped(object_id), **version)
+
+    def delete_if_digest(self, object_id, sha256, **version):
+        return self.backend.delete_if_digest(self._scoped(object_id), sha256, **version)
+
+
+def provider_adapter(path):
+    """Build the enrolled version-retention provider for exactly one host.
+
+    The protected document has exact keys: `host` (the object host this job may
+    expire), `credentials` (private provider credential file), `staging`
+    (private on-disk staging root) and `max_bytes` (explicit staging budget).
+    The backend is the fixed sibling module; credential values never enter an
+    argument, a receipt or an error message. The enrolled host must be covered
+    by the credential's own host allowlist and no other host may be addressed.
+    """
+    enrollment = Path(path)
+    if not enrollment.is_absolute():
+        raise RetentionError("absolute provider enrollment required")
+    try:
+        with private_stream(enrollment) as stream:
+            data = stream.read(PROVIDER_DOCUMENT_LIMIT + 1)
+    except OSError:
+        raise RetentionError("private provider enrollment required") from None
+    if len(data) > PROVIDER_DOCUMENT_LIMIT:
+        raise RetentionError("provider enrollment exceeds limit")
+    try:
+        document = json.loads(data)
+    except ValueError:
+        raise RetentionError("provider enrollment is not JSON") from None
+    if not isinstance(document, dict) or set(document) != PROVIDER_FIELDS:
+        raise RetentionError("exact provider enrollment required")
+    host = document["host"]
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", host):
+        raise RetentionError("invalid provider host")
+    for key in ("credentials", "staging"):
+        value = document[key]
+        if (not isinstance(value, str) or not value.startswith("/") or "\x00" in value
+                or ".." in Path(value).parts):
+            raise RetentionError("absolute provider path required")
+    budget = document["max_bytes"]
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+        raise RetentionError("explicit provider staging budget required")
+    module = provider_module()
+    try:
+        backend = module.VersionRetention(document["credentials"], document["staging"],
+                                          max_bytes=budget)
+    except Exception:
+        raise RetentionError("provider retention adapter unavailable") from None
+    if host not in getattr(backend, "hosts", ()):
+        raise RetentionError("provider enrollment outside credential host scope")
+    return ScopedProvider(backend, host)
+
+
+def prune(root, *, now, remote_adapter=None, remote_provider=None):
     """Delete remote members before local files, under the protection lock.
 
     An enrolled adapter implements inspect(object_id) -> SHA256 or None,
     and delete_if_digest(object_id, sha256) -> exact absence receipt. The
     latter must enforce the digest condition atomically, including races
     after inspect; plain unconditional DELETE is not a valid implementation.
-    No provider backend is enrolled by this module.
+    `remote_provider` is a zero-argument factory resolved only when a candidate
+    still has an undeleted remote member, so an enrolled backend is not built,
+    contacted or required when nothing remote has to be expired.
     """
     timestamp(now)
     with locked(root) as (root, records):
@@ -231,6 +325,8 @@ def prune(root, *, now, remote_adapter=None):
             for item in record.get("remote", []):
                 if item["deleted"]:
                     continue
+                if remote_adapter is None and remote_provider is not None:
+                    remote_adapter = remote_provider()
                 if remote_adapter is None:
                     raise RetentionError("remote retention adapter is not enrolled")
                 actual = remote_adapter.inspect(item["object_id"], **(
@@ -280,6 +376,7 @@ def main():
     hold.add_argument("--release", action="store_true")
     expire = commands.add_parser("prune")
     expire.add_argument("--now", type=float, required=True)
+    expire.add_argument("--provider-enrollment")
     args = parser.parse_args()
     try:
         if args.command == "register":
@@ -291,7 +388,8 @@ def main():
         elif args.command == "hold":
             protect(args.root, args.artifact, hold=not args.release)
         else:
-            print(json.dumps({"deleted": prune(args.root, now=args.now)}))
+            provider = (lambda: provider_adapter(args.provider_enrollment)) if args.provider_enrollment else None
+            print(json.dumps({"deleted": prune(args.root, now=args.now, remote_provider=provider)}))
         return 0
     except Exception:
         print("private retention failed; inspect artifact state before retry", file=sys.stderr)

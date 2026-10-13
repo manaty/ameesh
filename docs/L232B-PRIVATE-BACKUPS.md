@@ -197,12 +197,24 @@ DELETE preserve the local recovery set. Lost deletion replies resume under the
 catalog's already durable intent. Temporary response/configuration files are
 removed on success and failure.
 
-This backend is source code only: it is not installed/enrolled for the server
-CLI or daily job. These remain closed for remote expiry without an explicitly
-supplied adapter. Tests simulate the HTTP transport, including credentials and
-argv canaries, concurrent new versions, lost replies, quota/size failures and
-version holds. No authenticated Scaleway request or provider-policy pilot has
-been performed. `sauvegarde-release.py` now binds `backup`, `pin` and `accept`
-to these primitives (see `L232B-RELEASE-CONTROLLER.md`); host enrollment,
-installer wiring and the authenticated pilot remain
-unfinished; the presence of this module is not deployment authority.
+This backend is source code only: no provider was contacted and no provider
+policy was changed. `ameesh-retention-privee.py prune --provider-enrollment`
+resolves it only when a candidate still has an undeleted remote member: the
+protected document has exact keys `host` (one enrolled object host),
+`credentials` (private provider credential file), `staging` (private on-disk
+staging root) and `max_bytes` (explicit staging budget). The backend module is
+the fixed sibling installed by `installer-serveur.sh`; a caller cannot name
+another module or path. The enrolled host must already be covered by the
+credential's `allowed_hosts`, and a scoped adapter refuses any object whose
+host differs from the enrollment. A missing, linked, open, oversized or inexact
+document, an unenrolled or untrusted module, or a version-less remote reference
+keeps the local set protected. `sauvegarder-base.sh` passes
+`/etc/ameesh/retention-provider.json` when it exists, and otherwise keeps
+remote sets protected as before. Tests simulate the HTTP transport, including
+credentials and argv canaries, concurrent new versions, lost replies,
+quota/size failures and version holds. No authenticated Scaleway request or
+provider-policy pilot has been performed. `sauvegarde-release.py` binds
+`backup`, `pin` and `accept` to these primitives (see
+`L232B-RELEASE-CONTROLLER.md`); host enrollment of the document and the
+authenticated pilot remain unfinished; the presence of this module is not
+deployment authority.
