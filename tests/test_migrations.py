@@ -205,8 +205,10 @@ class MigrationsTest(PgTestCase):
             done = migrations.migrate(db)
             self.assertEqual([m.version for m in done],
                              [m.version for m in migrations.discover() if m.version >= 5])
-            db.execute("UPDATE agent_registry SET key_role = 'owner' "
-                       "WHERE name = 'proprietaire'")
+            with db.transaction() as tx:     # the owner's own gesture (0364)
+                tx.execute("SET LOCAL ameesh.owner_gesture = 'on'")
+                tx.execute("UPDATE agent_registry SET key_role = 'owner' "
+                           "WHERE name = 'proprietaire'")
             ledger = db.query(
                 "SELECT approver, nonce, consumed_by FROM mesh_consumed_nonces")
             self.assertEqual(len(ledger), 1)

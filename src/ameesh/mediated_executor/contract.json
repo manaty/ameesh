@@ -3773,7 +3773,7 @@
   }
  ],
  "refused": {
-  "interface_total": 376,
+  "interface_total": 379,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3975,7 +3975,10 @@
     "worktrees"
    ],
    "keys": [
+    "confirm",
+    "owner_registrations",
     "register",
+    "register_human",
     "registered",
     "revoke"
    ],

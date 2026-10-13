@@ -43,6 +43,9 @@ SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', :'schema', :'
 -- Module policy writes belong exclusively to isolated canon synchronization.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
               :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
+-- #326 r4: the key journal's order is the server's; no setval on its ids
+SELECT format('REVOKE UPDATE ON SEQUENCE %I.key_events_id_seq FROM %I', :'schema', :'role')
+ WHERE to_regclass(format('%I.key_events_id_seq', :'schema')) IS NOT NULL \gexec
 -- Future migration objects must be created by this same owner.
 SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE '
               'ON TABLES TO %I', :'schema', :'role') \gexec
@@ -135,7 +138,11 @@ BEGIN
                 WHERE n.nspname = s AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') LOOP
         IF item.relkind = 'S' THEN
             FOREACH privilege IN ARRAY ARRAY['USAGE', 'SELECT', 'UPDATE'] LOOP
-                IF NOT has_sequence_privilege(r, item.oid, privilege) THEN
+                IF item.relname = 'key_events_id_seq' AND privilege = 'UPDATE' THEN
+                    IF has_sequence_privilege(r, item.oid, privilege) THEN
+                        violations := violations || format('UPDATE (setval) on sequence %s', item.relname);
+                    END IF;
+                ELSIF NOT has_sequence_privilege(r, item.oid, privilege) THEN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
