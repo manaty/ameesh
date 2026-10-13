@@ -26,7 +26,7 @@ from ameesh import adapters, exploitation, mail, menage, registry, storage
 from ameesh import runner as runner_mod
 
 from .support import PgTestCase
-from .test_l73_menage import _Cfg, _git, _repo, _write
+from .test_l73_housekeeping import _Cfg, _git, _repo, _write
 
 HEURE = 3600.0
 

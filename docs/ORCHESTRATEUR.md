@@ -339,8 +339,16 @@ précèdent, plus celui-ci) et en sort un lot dont un conflit n'est couvert par
 aucune résolution, ou dont la branche a bougé après le gel ; son agent est
 prévenu. On fusionne le lot de rang 1 (`ameesh work queue show`), puis le
 suivant. Un lot en file ne reçoit plus de commit : `ameesh work queue remove
-<id>` d'abord. La fusion par ameesh elle-même (`ameesh work land`) vient
-avec L160e2.
+<id>` d'abord.
+
+Un projet qui déclare `land` dans `radar.projects` (`local` ou `pr`, avec
+ses portes) est fusionné par ameesh : l'exécuteur prend la tête de file,
+fusionne dans son clone avec les résolutions préparées, lance les portes,
+pousse sans forcer (ou fusionne la PR une fois la CI verte) et prévient
+dans le fil du lot. Un échec sort le lot de la file et réveille son agent ;
+l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
+30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
+rang 1.
 
 ## Le lot en cours
 
@@ -551,13 +559,31 @@ restée 4 h fusionnée sans être déployée :
    développés en parallèle ont pris les mêmes numéros (0048 à 0050) : trois
    renumérotations en cascade. Un lot qui ajoute une migration réserve son
    numéro **avant d'écrire le fichier** : `ameesh work migration <lot>` note
-   dans le lot le prochain numéro libre — au-delà des migrations du paquet,
-   de l'arbre courant et de toutes les branches du dépôt (locales et
-   distantes, sans fetch : faire `git fetch` avant), et des numéros déjà
-   réservés par d'autres lots. La commande est idempotente ; `--number N`
-   réserve un numéro précis (refusé s'il est réservé ailleurs), `--release`
-   libère. La réservation se lit dans `ameesh work show <lot>` (ligne
-   `migration`) et au journal du lot ; la description de la PR l'annonce.
+   dans le lot le prochain numéro libre **de son dépôt** (#443) : celui de
+   l'issue du lot (`owner/repo#N`, sinon `github.projects` de l'hôte ; sans
+   dépôt, refus ; la clé est en minuscules, une seule suite par dépôt), avec
+   son dossier et sa largeur (`src/ameesh/migrations` sur 4 chiffres pour
+   ameesh, `supabase/migrations` sur 3 pour nexlink ; un autre dépôt se
+   déclare dans `radar.projects.<p>` avec `github` et `migrations`). Le
+   numéro passe au-delà de tout fichier numéroté (`N_…`) de l'arbre et de toutes les branches
+   d'un clone local du dépôt (locales et distantes, sans fetch : faire
+   `git fetch` avant ; `--repo <clone>`, défaut : le clone déclaré à l'hôte,
+   sinon le dépôt courant, dont l'`origin` doit être le dépôt du lot sur
+   l'hôte github.com exactement), et
+   des numéros déjà réservés pour ce dépôt. Chaque dépôt a sa suite : la
+   même valeur peut être réservée dans ameesh et dans nexlink. L'unicité
+   (dépôt, numéro) est un index unique en base : deux réservations
+   simultanées ne prennent jamais le même numéro ; la perdante réessaie après
+   une attente plein jitter (entre 0 et un plafond croissant), bornée au
+   budget restant, et si le budget s'épuise la commande rend
+   « reservation contention, retry » (jamais
+   l'erreur brute de l'index). Seule la violation d'unicité de cet index
+   déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
+   idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
+   déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
+   `--release` libère. La réservation se lit dans `ameesh work show <lot>`
+   (ligne `migration`) et au journal du lot ; la description de la PR
+   l'annonce.
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire

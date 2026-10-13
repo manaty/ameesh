@@ -229,6 +229,15 @@ IDLE_PROMPT = (
     "say so with agent-mail send orchestrateur, then stop."
 )
 
+#: #408 (L165b, règle 1) : réveil sur un lot actionnable de l'agent au repos
+LOT_WAKE_PROMPT = (
+    "Resuming lot #%(id)d \"%(title)s\" (%(state)s): you are idle and this lot is "
+    "assigned to you and actionable. Continue it now. If it cannot advance "
+    "(waiting on someone or something), record why with: ameesh work note %(id)d "
+    "\"hold: <reason>\" (or move it to blocked), and you will not be woken for it "
+    "again; once it is ready for review, move it to qa."
+)
+
 #: anciens dossiers de binaires acceptés en repli (renommage agent-mesh → ameesh)
 BIN_DIR_ENV = ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR")
 

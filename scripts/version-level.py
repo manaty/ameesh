@@ -31,7 +31,9 @@ The level found in the range is a floor, from what a script can see:
 
 The CLI is read from the syntax tree of each module (`add_parser` with its
 `aliases`, every option string of `add_argument`), not from the text:
-reordering the aliases of an option changes nothing. A parser handed to a
+reordering the aliases of an option changes nothing. A parser built by
+`argparse.ArgumentParser` or by the package's own subclass
+(`HiddenAliasParser`, L148) is read the same way. A parser handed to a
 function, of the same module or another, by position or by name, fills the
 caller's command; a loop over literal strings counts each of them. In a new
 migration, comments, strings and function bodies are not statements; the
@@ -73,6 +75,9 @@ LEVELS = ("patch", "minor", "major")
 TRAILER = "ameesh-breaking"
 #: program names a parser's `prog` starts with (the top level)
 PROGRAMS = ("ameesh", "agent-mesh")
+#: parser classes read as `argparse.ArgumentParser`: the project's own
+#: subclass (`HiddenAliasParser`, L148) keeps the command tree readable
+PARSER_CLASSES = ("ArgumentParser", "HiddenAliasParser")
 #: the repository: the checkout this script belongs to, whatever the caller's
 #: directory (`python3 ameesh/scripts/version-level.py` from its parent works);
 #: the tests point it elsewhere
@@ -468,8 +473,8 @@ class _Parsers(ast.NodeVisitor):
     def parser_of(self, node) -> tuple[str, ...] | None:
         """The path a call returns when it builds a parser, None otherwise."""
         if isinstance(node, ast.Call) and (
-                isinstance(node.func, ast.Name) and node.func.id == "ArgumentParser"
-                or isinstance(node.func, ast.Attribute) and node.func.attr == "ArgumentParser"):
+                isinstance(node.func, ast.Name) and node.func.id in PARSER_CLASSES
+                or isinstance(node.func, ast.Attribute) and node.func.attr in PARSER_CLASSES):
             return self.own_parser(node)
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             return None

@@ -617,32 +617,18 @@ def _local_session(cfg: Config, row: dict) -> str | None:
 
 
 def _critical(cfg: Config, row: dict) -> bool:
-    """L242c : comme `Runner.is_critical` — déclaré, ou rôle critique de sa
-    fiche dans son canon propriétaire ; canon lisible, le verdict rafraîchit
-    le cache (#424 r3) ; illisible, le dernier verdict lu, perdu : critique ;
-    canon configuré sur aucun canon de l'hôte (#424 r7) : non critique."""
-    from . import canon as canon_mod, sous_utilisation as su
-    if row["name"] in (getattr(cfg, "critical_agents", None) or ()) \
-            or row["name"] in su.declared_orchestrators():
-        return True
-    configured = bool(canon_mod.configured(cfg))
+    """L242c : comme `Runner.is_critical` (`auditor.is_critical`) — déclaré, ou
+    rôle critique de sa fiche dans son canon propriétaire ; canon lisible, le
+    verdict rafraîchit le cache (#424 r3) ; illisible, le dernier verdict lu,
+    sinon critique (#424 r6) ; canon configuré sur aucun canon de l'hôte
+    (#424 r7) : non critique."""
+    from . import auditor as auditor_mod, canon as canon_mod, sous_utilisation as su
     try:
-        canons = canon_mod.load_configured(cfg) if configured else []
+        canons = canon_mod.load_configured(cfg) if canon_mod.configured(cfg) else []
     except Exception:
         canons = []
-    complete = configured and len(canons) == len(canon_mod.configured(cfg))
-    foreign = su.foreign_canon(row, canons, complete=complete)
-    if foreign is not None:
-        if su.warn_foreign(row["name"]):
-            print("ameesh: %s: owner canon %s is configured on no canon of this host:"
-                  " not critical" % (row["name"], foreign), file=sys.stderr)
-        return False
-    verdict, unknown = su.critical_verdict(
-        row, canons, configured=configured,
-        known=su.remembered(su.critical_memory(cfg), row["name"]))
-    if not unknown and configured:
-        su.remember_critical(cfg, row["name"], verdict)
-    return verdict
+    return auditor_mod.is_critical(cfg, None, row["name"], canons,
+                                   declared=su.declared_orchestrators(), agent=row)
 
 
 def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:

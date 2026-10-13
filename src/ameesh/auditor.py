@@ -78,3 +78,54 @@ def card_markers(card):
         return ()
     markers = {card.path.casefold(), card.ref.rsplit("@", 1)[0].casefold()}
     return tuple(marker for marker in markers if marker)
+
+
+def is_auditor(db, name, canons, agent=None):
+    """L234 : persona auditeur ou rôle auditeur/auditor dans le canon
+    propriétaire. Le registre n'est lu que pour un nom candidat ; `agent`, la
+    ligne fraîche de l'appelant, évite cette lecture."""
+    from . import registry, sous_utilisation as su
+    if name == AUDITOR_NAME:
+        return True
+    if name not in su.role_orchestrators(canons, AUDITOR_ROLES):
+        return False
+    row = agent if agent is not None else registry.get(db, name)
+    return bool(row and name in cards([row], canons))
+
+
+def is_critical(cfg, db, name, canons, *, declared=(), agent=None):
+    """L242b : agent critique, jamais en pause budget tant qu'un compte a de la
+    marge. L242c : déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS` ;
+    `declared`, d'`AMEESH_ALERT_ORCHESTRATORS`), sinon par un rôle critique de
+    sa fiche, dans son canon propriétaire seulement (`critical_roles` de
+    l'organisation). Canon lisible : le verdict rafraîchit le cache (#424 r3) ;
+    illisible ou non chargé : le dernier verdict lu, sinon critique (#424 r6) ;
+    configuré sur aucun canon de l'hôte : non critique (#424 r7). Sans mémoire
+    de processus : partagé par la reprise sur pause budget (L233b) et `ameesh
+    resume` ; l'exécuteur a la sienne (`Runner.is_critical`)."""
+    import sys
+    from . import registry, sous_utilisation as su
+    if name in (getattr(cfg, "critical_agents", None) or ()):
+        return True
+    if name in (declared or ()):
+        return True
+    row = dict((agent if agent is not None else registry.get(db, name)) or {}, name=name)
+    try:
+        entries = canon_mod.configured(cfg) if cfg is not None else tuple(canons or ())
+    except Exception:
+        entries = None                  # on ne sait pas : jamais « sans canon »
+    configured = entries is None or bool(entries)
+    complete = entries is not None and bool(canons) and len(canons) == len(entries)
+    foreign = su.foreign_canon(row, canons, complete=complete)
+    if foreign is not None:
+        # #424 r7 : état connu, pas une panne ; jamais retenu au cache
+        if su.warn_foreign(name):
+            print("ameesh: %s: owner canon %s is configured on no canon of this host:"
+                  " not critical" % (name, foreign), file=sys.stderr)
+        return False
+    verdict, unknown = su.critical_verdict(
+        row, canons, configured=configured,
+        known=su.remembered(su.critical_memory(cfg), name))
+    if not unknown and configured:
+        su.remember_critical(cfg, name, verdict)
+    return verdict

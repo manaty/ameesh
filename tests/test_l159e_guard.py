@@ -91,12 +91,66 @@ class OfferTest(unittest.TestCase):
                {"cpu_max": float("nan")}, {"drain_seconds": True},
                {"reclaim": {"io_pressure_max": "120%"}},
                {"reclaim": {"disk_paths": "/"}},
+               # codex #459 r1: the reader refuses what the guard used to fix up
+               {"reclaim": {"disk_free_min": 0}},
+               {"reclaim": {"io_pressure_max": None}},
                # L159e4: whole seconds >= 0
                {"restart_after_seconds": -1}, {"restart_after_seconds": 1.5},
                {"restart_after_seconds": True}, {"restart_after_seconds": "600"}]
-        for offer in [None, {}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
-            with self.assertRaises(guard.GuardError, msg=offer):
-                guard.parse_offer(offer)
+        # mesh-design #459 r4c: any offer problem closes the guard instead of
+        # stopping it — level 3, nothing published, nothing lendable
+        for offer in [{}, {"cpu_max": 1}] + [lend(**b) for b in bad]:
+            with self.subTest(offer=offer):
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    got = guard.parse_offer(offer)
+                self.assertEqual(got.closed, "offer_invalid", offer)
+                self.assertEqual(got.published, {}, offer)
+                self.assertEqual(guard.raw_level(got, {}, 1000.0),
+                                 (3, "offer_invalid"), offer)
+                self.assertIn("lends nothing", err.getvalue(), offer)
+        # an absent offer closes it too, with its own reason; the message names
+        # the key of every problem
+        for offer, reason in ((None, "no_offer"),
+                              (lend(reclaim={"disk_paths": ["../etc"]}), "offer_invalid"),
+                              (lend(reclaim={"disk_paths": ["/\x00"]}), "offer_invalid"),
+                              (lend(reclaim={"disk_paths": ["/srv", "rel/x"]}),
+                               "offer_invalid")):
+            with self.subTest(offer=offer):
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    got = guard.parse_offer(offer)
+                text = err.getvalue()
+                self.assertEqual(got.closed, reason)
+                self.assertEqual(got.published, {})
+                self.assertEqual(guard.raw_level(got, {}, 1000.0), (3, reason))
+                self.assertIn("lends nothing", text)
+                if offer is not None:
+                    self.assertIn("disk_paths", text)
+        # codex #459 r3: a path named twice (`/` and `/`) is collapsed, not
+        # refused — the guard starts on an offer main accepted
+        offer = guard.parse_offer(lend(reclaim={"disk_paths": ["/", "/"]}))
+        self.assertEqual(offer.disk_paths, ("/",))
+        self.assertIsNone(offer.closed)
+        self.assertTrue(offer.published)
+
+    def test_config_refuses_duplicate_json_keys(self):
+        # codex #459 r1: a duplicate JSON key silently overwrote ('10GiB'
+        # then 0: disk reclaim disabled); the config reader refuses
+        # duplicates, as the canon's YAML reader does
+        doc = ('{"host": "vm", "lend": {"cpu_max": 1, "memory_max": "1GiB",'
+               ' "disk_max": "1GiB", "reclaim": {"disk_free_min": "10GiB",'
+               ' "disk_free_min": 0}}}')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "guard.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            with self.assertRaises(guard.GuardError) as caught:
+                guard.load_config(path)
+            self.assertIn("duplicate key", str(caught.exception))
+            self.assertIn("disk_free_min", str(caught.exception))
+            # the same key once: the config loads, with the value read
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc.replace(', "disk_free_min": 0', ""))
+            self.assertEqual(guard.load_config(path).offer.disk_free_min, 10 * GIB)
 
     def test_exactly_the_offers_of_the_contract(self):
         # codex #211 r6: the guard reads the offer with the contract's reader;
@@ -109,9 +163,14 @@ class OfferTest(unittest.TestCase):
                 if "offer" in case:
                     offer = guard.parse_offer(case["lend"])
                     self.assertEqual(offer.published, case["offer"])
+                    self.assertIsNone(offer.closed)
                 else:
-                    with self.assertRaises(guard.GuardError):
-                        guard.parse_offer(case["lend"])
+                    # mesh-design #459 r4c: the canon still refuses the offer,
+                    # the guard no longer stops on it — it starts closed
+                    with mock.patch("sys.stderr", new_callable=io.StringIO):
+                        offer = guard.parse_offer(case["lend"])
+                    self.assertEqual(offer.closed, "offer_invalid")
+                    self.assertEqual(offer.published, {})
         # overnight windows on a list of days, a calm of 0, a zone
         offer = guard.parse_offer(lend(windows=["mon,wed 18:00-14:00 UTC",
                                                 "sun 18:00-20:00 Europe/Paris"],
@@ -1770,13 +1829,131 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(guard.main(["drain", "--for", "0", "--config", config]), 2)
             with open(config, "w") as fh:
                 json.dump({"lend": {"cpu_max": "three"}}, fh)
-            with mock.patch("sys.stderr"):
-                self.assertEqual(guard.main(["check", "--config", config]), 1)
+            # mesh-design #459 r4c: an offer the canon refuses no longer stops
+            # the guard; `check` reports the closed state and exits 0
+            with mock.patch("sys.stdout") as out, mock.patch("sys.stderr"):
+                self.assertEqual(guard.main(["check", "--config", config, "--json"]), 0)
+            closed = json.loads("".join(c.args[0] for c in out.write.call_args_list))
+            self.assertEqual((closed["level"], closed["reason"]), (3, "offer_invalid"))
+            self.assertEqual(closed["caps"]["max_concurrent"], 0)
+            self.assertEqual(schema_errors(schema("ameesh-host-state-1.schema.json"),
+                                           closed), [])
             # the slice goes into the freezing unit's ExecStopPost= line
             with open(config, "w") as fh:
                 json.dump({"slice": "x.slice --now", "lend": {"cpu_max": 1}}, fh)
             with mock.patch("sys.stderr"):
                 self.assertEqual(guard.main(["check", "--config", config]), 1)
+
+
+class ClosedOfferTest(unittest.TestCase):
+    """mesh-design #459 r4c: an absent or refused offer starts the guard
+    CLOSED — level 3, `max_concurrent` 0, nothing lendable published, the
+    offer published empty — and that level 3 applies to a guest unit already
+    started."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l159e-closed-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.calls = []
+        self.clock = [1000.0]
+        self.reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                        "mem_available_bytes": 12 * GIB, "disk_free_bytes": 50 * GIB}
+        patcher = mock.patch.multiple(guard.resources, lendable=None, measure=None,
+                                      create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def config(self, lend_value):
+        return guard.GuardConfig(
+            host="vm-test", max_agents=2, offer=guard.parse_offer(lend_value),
+            state_path=os.path.join(self.tmp, "state.json"),
+            ack_path=os.path.join(self.tmp, "ack.json"),
+            drain_request_path=os.path.join(self.tmp, "drain.json"))
+
+    def fake(self, argv, **kw):
+        self.calls.append(argv)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def guard(self, cfg, observe=False):
+        return guard.Guard(cfg, observe=observe, signals=lambda now: dict(self.reading),
+                           clock=lambda: self.clock[0],
+                           enforcer=guard.Enforcer(cfg, run=self.fake, log=lambda t: None,
+                                                   clock=lambda: self.clock[0]))
+
+    def stops(self):
+        return [c[1:] for c in self.calls if c[1] in ("stop", "kill")
+                and not c[2].startswith(guard.FREEZE_UNIT)]
+
+    def test_les_offres_absentes_ou_refusees_ferment_la_garde(self):
+        cases = ((None, "no_offer"),
+                 (lend(reclaim={"disk_paths": ["rel/x"]}), "offer_invalid"),
+                 (lend(reclaim={"disk_free_min": 0}), "offer_invalid"))
+        for raw, reason in cases:
+            with self.subTest(reason=reason, raw=raw):
+                with mock.patch("sys.stderr", new_callable=io.StringIO):
+                    cfg = self.config(raw)
+                    g = self.guard(cfg)
+                # several cycles, before the drain's deadline: the level never
+                # comes back down and nothing lendable is published
+                for now in (1000.0, 1005.0, 1010.0, 1015.0):
+                    self.clock[0] = now
+                    state = g.step()
+                    where = (reason, now)
+                    self.assertEqual(state["level"], 3, where)
+                    self.assertEqual(state["state"], "draining", where)
+                    self.assertEqual(state["reason"], reason, where)
+                    self.assertEqual(state["caps"]["max_concurrent"], 0, where)
+                    for key in ("cpu_share", "memory_mb", "memory_high_mb", "disk_mb"):
+                        self.assertNotIn(key, state["caps"], where)
+                    self.assertEqual(state["offer"], {}, where)
+                    self.assertEqual(state["measure"]["lendable"],
+                                     {"cpu": None, "memory_bytes": None, "disk_bytes": None},
+                                     where)
+                    self.assertEqual(schema_errors(
+                        schema("ameesh-host-state-1.schema.json"), state), [], where)
+                self.assertEqual(self.stops(), [],
+                                 "a closed offer stops nothing before the deadline")
+                os.unlink(cfg.state_path)
+
+    def test_une_unite_invitee_deja_lancee_est_drainee_puis_arretee(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            cfg = self.config(lend(reclaim={"disk_free_min": 0}))
+            g = self.guard(cfg)
+        state = g.step()
+        self.assertEqual((state["level"], state["state"]), (3, "draining"))
+        self.assertEqual(state["drain_deadline_ts"], 1090.0)   # since_ts + 90 s
+        self.clock[0] = 1085.0
+        g.step()
+        self.assertEqual(self.stops(), [], "the guest's jobs run until the deadline")
+        self.clock[0] = 1090.0
+        g.step()
+        self.assertEqual(self.stops(), [["stop", "ameesh-job-*.scope"]],
+                         "the deadline drains the jobs of a guest already started")
+        self.clock[0] = 1130.0                    # since_ts + drain + grace, no ack
+        self.assertEqual(g.step()["level"], 4)
+        self.clock[0] = 1135.0
+        g.step()
+        self.assertIn(["stop", "ameesh-guest.slice"], self.stops(),
+                      "without an acknowledgement, level 4 stops the guest")
+        # a guest that acknowledges: level 3 forever, never stopped
+        os.unlink(cfg.state_path)
+        if os.path.exists(cfg.ack_path):
+            os.unlink(cfg.ack_path)
+        self.calls.clear()
+        self.clock[0] = 2000.0
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            g = self.guard(cfg)
+        drain = g.step()
+        with open(cfg.ack_path, "w") as fh:
+            json.dump({"schema": "ameesh-host-ack/1", "seq": drain["seq"],
+                       "state": "draining", "drained": True, "in_turn": []}, fh)
+        for t in (2090.0, 2130.0, 3000.0):
+            self.clock[0] = t
+            state = g.step()
+            self.assertEqual((state["level"], state["caps"]["max_concurrent"], state["state"]),
+                             (3, 0, "draining"), t)
+        self.assertEqual([s for s in self.stops() if s[-1] == "ameesh-guest.slice"], [],
+                         "an acknowledged drain never stops the guest")
 
 
 if __name__ == "__main__":

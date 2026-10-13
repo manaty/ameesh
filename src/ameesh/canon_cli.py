@@ -20,7 +20,16 @@
   ameesh hosts [--json] [HÔTE] [--history N]
                                          ressources des hôtes (L31) : dernier relevé,
                                          seuils, pression et historique court
-  ameesh agent spawn <nom> --by <créateur> --ttl <durée> [--cwd DIR] [--prompt T]
+  ameesh agent spawn [nom] --by <créateur> --ttl <durée> [--role R] [--project P …]
+                                         [--cwd DIR] [--prompt T] ; sans nom, il est
+                                         engendré par `extensions.ameesh.naming`
+                                         (L243, #468)
+  ameesh agent name --role R [--project P …] [--json]
+                                         prochain nom libre <org>-<repo>-<role>-<seq>
+                                         (L243, #468) : fiches, registre et rôles du
+                                         nommage du canon
+  ameesh canon agent spawn|name …        mêmes commandes sous `canon` (L243, #468) ;
+                                         la place canonique du nommage
 
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
 (sinon AMEESH_CANON_REF, le `ref` du manifeste, origin/main), `--fetch`.
@@ -610,7 +619,127 @@ def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
     return 1
 
 
+def _canon_read_key(canon: canon_mod.Canon) -> tuple:
+    """(dossier réel, révision lue) : la clé de déduplication d'un canon (L243, #468).
+
+    Deux lectures du MÊME dossier à deux révisions ne sont pas le même canon :
+    `--canon DOSSIER` lit la révision par défaut, mais un canon configuré sur
+    `origin/stable` réserve des noms que `origin/main` ignore. Dédupliquer sur
+    le seul dossier perdait ces réservations (codex r2, #452)."""
+    source = canon.sources[0] if canon.sources else None
+    return (os.path.realpath(canon.root),
+            (source.commit or source.rev) if source is not None else "")
+
+
+def _configured_canons(cfg: Config, args: argparse.Namespace) -> list[canon_mod.Canon]:
+    """Tous les canons configurés, le canon par défaut d'abord.
+
+    L243 (#468) : un nom d'agent est unique pour TOUS les canons, donc les
+    noms déjà pris se lisent partout ; `--canon` ne choisit que le nommage
+    qui s'applique (voir `_naming_canon`). Un `--canon DOSSIER` n'est donc pas
+    le SEUL canon lu : les canons configurés restent lus pour leurs
+    réservations (sinon le générateur rendrait un nom déjà déclaré ailleurs).
+    La déduplication se fait sur (dossier, révision) : un dossier configuré à
+    deux révisions est lu deux fois, chacune pour ses réservations."""
+    if getattr(args, "ref", None):
+        cfg = dataclasses.replace(cfg, canon_ref=args.ref)
+    fetch = bool(getattr(args, "fetch", False))
+    entries = canon_mod.configured(cfg)
+    wanted = getattr(args, "canon", None)
+    if wanted and (os.path.isdir(wanted) or not entries):
+        chosen = canon_mod.from_config(cfg, root=wanted, fetch=fetch)
+        if not entries:
+            return [chosen]
+        merged = [chosen]
+        seen = {_canon_read_key(chosen)}
+        for canon in canon_mod.from_config_all(cfg, fetch=fetch):
+            key = _canon_read_key(canon)
+            if key in seen:                 # même dossier, même révision que `--canon`
+                continue
+            seen.add(key)
+            merged.append(canon)
+        return merged
+    if len(entries) <= 1:
+        return [canon_mod.from_config(cfg, fetch=fetch)]
+    return canon_mod.from_config_all(cfg, fetch=fetch)
+
+
+def _naming_canon(canons: list, wanted: str | None) -> canon_mod.Canon:
+    """Le canon dont le nommage s'applique : `--canon <id>`, sinon le défaut."""
+    if wanted and not os.path.isdir(wanted):
+        chosen = next((c for c in canons if c.id == wanted), None)
+        if chosen is None:
+            raise canon_mod.CanonError("canon %r is not configured: %s"
+                                       % (wanted, ", ".join(c.id for c in canons)))
+        return chosen
+    return canons[0]
+
+
+def _taken_agent_names(canons: list, db) -> set:
+    """Noms déjà pris : fiches de tous les canons, puis registre entier.
+
+    Les agents ARRÊTÉS restent dans le registre : leur nom est réservé pour
+    toujours (courrier, fils, lots et sessions continuent de le citer). Les
+    alias de #423 s'ajouteront ici quand ils existeront."""
+    names = {agent.title for canon in canons if canon.readable for agent in canon.agents}
+    names |= {row["name"] for row in registry.overview(db) if row.get("name")}
+    return names
+
+
+def _require_readable(canons: list) -> None:
+    """Toutes les réservations sont-elles lisibles ? (codex r3, #452)
+
+    Un canon configuré mais ILLISIBLE (révision jamais récupérée, dépôt cassé)
+    ne dit pas ses noms : proposer un nom supposerait qu'il est libre. On
+    refuse, en nommant le canon et sa ref — que le canon illisible soit celui
+    qui nomme ou un autre, ses réservations manqueraient dans les deux cas."""
+    for canon in canons:
+        if canon.readable:
+            continue
+        reasons = [f.message for f in canon.load_findings
+                   if f.severity == canon_mod.ERROR]
+        raise canon_mod.NamingError(
+            "unreadable canon %s (%s) at ref %s: %s — its agent names are unknown, "
+            "so no free name can be guaranteed (fetch or repair it first)"
+            % (canon.id or "?", canon.root, canon.rev or "?",
+               reasons[0] if reasons else "no source read"))
+
+
+def _generated_name(naming, role: str | None, projects, canons: list, db) -> str:
+    """Nom par défaut engendré par le nommage, ou refus explicite (L243, #468)."""
+    _require_readable(canons)
+    if naming is None:
+        raise canon_mod.NamingError(
+            "no `extensions.ameesh.naming` in the canon: declare org, projects and "
+            "roles in its federation.yaml")
+    if not role:
+        raise canon_mod.NamingError("--role is required to generate a name")
+    known = canon_mod.known_projects(canons, projects or [], naming)
+    return naming.next_name(role, projects or [], _taken_agent_names(canons, db), known)
+
+
+def cmd_agent_name(cfg: Config, args: argparse.Namespace) -> int:
+    canons = _configured_canons(cfg, args)
+    chosen = _naming_canon(canons, getattr(args, "canon", None))
+    db = db_mod.connect(cfg)
+    try:
+        db_mod.require_schema(db)
+        name = _generated_name(chosen.naming, args.role, args.project, canons, db)
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps({"name": name, "org": chosen.naming.org, "role": args.role,
+                          "projects": list(args.project or [])}, ensure_ascii=False))
+    else:
+        print(name)
+    return 0
+
+
 def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
+    if args.name and (args.role or args.project):
+        print("refused: give a name OR --role/--project (the name is then generated "
+              "from the canon's naming)", file=sys.stderr)
+        return 1
     # Une session d'agent ne crée qu'en son propre nom : son identité est celle
     # que le runner a posée (et, sous bail, vérifiée), jamais celle qu'elle dit.
     if os.environ.get("AGENT_MAIL_NAME"):
@@ -635,9 +764,11 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
-        row = canon_sync.spawn(db, args.name, args.by, ttl, cwd=args.cwd, canon=canon)
+        name = args.name or _generated_name(
+            canon[0].naming if canon else None, args.role, args.project, canon, db)
+        row = canon_sync.spawn(db, name, args.by, ttl, cwd=args.cwd, canon=canon)
         if args.prompt:
-            registry.set_pending_prompt(db, args.name, args.prompt)
+            registry.set_pending_prompt(db, name, args.prompt)
     finally:
         db.close()
     if args.json:
@@ -666,8 +797,40 @@ def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
+def _add_agent_parsers(parent) -> None:
+    """`agent spawn|name` (L243, #468), branché aux DEUX endroits.
+
+    `ameesh canon agent …` est la place canonique (le nommage est une
+    propriété du canon) ; `ameesh agent …` reste branché pour les scripts et
+    la documentation existants. Codex r1 (#452) : le premier chemin manquait."""
+    p_agent = parent.add_parser("agent", help="ephemeral agents, and names (L243)")
+    agent_sub = p_agent.add_subparsers(dest="agent_command")
+    p_spawn = agent_sub.add_parser(
+        "spawn", help="create an ephemeral (responsible inherited from the creator, read/propose)")
+    p_spawn.add_argument("name", nargs="?", default=None,
+                         help="name; omitted, generated from `extensions.ameesh.naming`")
+    p_spawn.add_argument("--by", required=True, help="creating agent")
+    p_spawn.add_argument("--ttl", required=True, help="expiry: 30m, 2h, 1d (max 7d)")
+    p_spawn.add_argument("--role", default=None,
+                         help="role of a generated name (L243, #468)")
+    p_spawn.add_argument("--project", action="append", default=None,
+                         help="project of a generated name; repeat for several (L243)")
+    p_spawn.add_argument("--cwd", default=None, help="directory (otherwise the creator's)")
+    p_spawn.add_argument("--prompt", default=None, help="first prompt")
+    p_spawn.add_argument("--json", action="store_true")
+    p_spawn.set_defaults(func=cmd_spawn)
+
+    p_name = agent_sub.add_parser(
+        "name", help="next free agent name <org>-<repo>-<role>-<seq> (L243, #468)")
+    _canon_options(p_name)
+    p_name.add_argument("--role", required=True, help="role declared in naming.roles")
+    p_name.add_argument("--project", action="append", default=None,
+                        help="project the agent works on; repeat for a multi-project agent")
+    p_name.set_defaults(func=cmd_agent_name)
+
+
 def add_parsers(sub) -> None:
-    """Branche `canon …`, `placement …` et `agent …` sur le parseur de mesh_cli."""
+    """Branche `canon …` (dont `canon agent …`), `placement …` et `agent …`."""
     p_canon = sub.add_parser("canon", help="OKF canon: check, show, sync")
     canon_sub = p_canon.add_subparsers(dest="canon_command")
     p_check = canon_sub.add_parser("check", help="validate the canon (§4.3)")
@@ -688,6 +851,7 @@ def add_parsers(sub) -> None:
                              "canonical branch (origin/<BRANCH>), logged; "
                              "ignored afterwards")
     p_sync.set_defaults(func=cmd_sync)
+    _add_agent_parsers(canon_sub)
 
     p_place = sub.add_parser("placement", help="governed placement (C4): check")
     place_sub = p_place.add_subparsers(dest="placement_command")
@@ -697,14 +861,4 @@ def add_parsers(sub) -> None:
     p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
     p_pcheck.set_defaults(func=cmd_placement_check)
 
-    p_agent = sub.add_parser("agent", help="ephemeral agents")
-    agent_sub = p_agent.add_subparsers(dest="agent_command")
-    p_spawn = agent_sub.add_parser(
-        "spawn", help="create an ephemeral (responsible inherited from the creator, read/propose)")
-    p_spawn.add_argument("name")
-    p_spawn.add_argument("--by", required=True, help="creating agent")
-    p_spawn.add_argument("--ttl", required=True, help="expiry: 30m, 2h, 1d (max 7d)")
-    p_spawn.add_argument("--cwd", default=None, help="directory (otherwise the creator's)")
-    p_spawn.add_argument("--prompt", default=None, help="first prompt")
-    p_spawn.add_argument("--json", action="store_true")
-    p_spawn.set_defaults(func=cmd_spawn)
+    _add_agent_parsers(sub)

@@ -23,6 +23,7 @@
   agent-mesh work migration <id> [--number N | --release]   reserve the work item's migration number (L122)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
+  agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
   agent-mesh work move <id> merged --correct "reason"   correct a promoted state set by mistake
                                                 (the actor of work commands: --actor, otherwise
                                                 the session's bound identity, otherwise "inconnu")
@@ -33,7 +34,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   OKF canon (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
-  agent-mesh menage [--dry-run | --apply] [--json]       agent cleanup (L73)
+  agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
@@ -60,6 +61,7 @@ from . import migrations, placement, registry
 from . import fil, signing, storage, work
 from .config import Config
 from .db import Db
+from .deprecated import HiddenAliasParser
 
 USAGE_HINT = "agent-mesh: %s"
 
@@ -169,6 +171,39 @@ def agent_detail(db, name: str) -> dict | None:
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
     return row
+
+
+def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
+    """L232a planner/journal; activation is supplied by the L232b controller."""
+    from . import canon, handoffs, identity, resources, storage
+    db = _open(cfg)
+    try:
+        if args.handoff_command == "show":
+            row = storage.of(db).handoffs.get(args.operation)
+            if row is None:
+                raise ValueError("unknown handoff")
+            print(json.dumps({"operation": row,
+                              "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
+            return 0
+        binding = identity.resolve_binding(cfg, db)
+        if not binding.ok or binding.name != args.agent:
+            work.corrector(cfg, db)
+        agent = registry.get(db, args.agent)
+        if agent is None:
+            raise ValueError("unknown agent")
+        canons = canon.load_configured(cfg)
+        def limits(host):
+            effective = resources.host_limits(canons, host)
+            return dict(effective["limits"], max_agents=effective["max_agents"])
+        candidate = handoffs.plan(db, agent, limits_for=limits)
+        if candidate is None:
+            print("no fresh admitted destination with capacity")
+            return 0
+        result = candidate if args.dry_run else handoffs.request(db, candidate, repository=args.repository)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    finally:
+        db.close()
 
 
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
@@ -607,10 +642,16 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
     return ci.cmd_ci(cfg, args)
 
 
+def cmd_housekeeping(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh housekeeping` (L73, L148) : voir `ameesh.housekeeping.cmd_housekeeping`."""
+    from . import housekeeping
+    return housekeeping.cmd_housekeeping(cfg, args)
+
+
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
-    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
-    from . import menage
-    return menage.cmd_menage(cfg, args)
+    """`ameesh menage` (L73), déprécié (L148) : alias caché de `housekeeping`."""
+    sys.stderr.write("menage is deprecated, use housekeeping\n")
+    return cmd_housekeeping(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -1091,7 +1132,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
-            return backlog.run(db, args)
+            return backlog.run(db, args, cfg)
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)
@@ -1104,6 +1145,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "queue":   # merge queue per target (L160e)
             from . import merge_queue
             return merge_queue.run(cfg, db, args)
+        if args.work_command == "land":   # merge of the head of the queue (L160e2)
+            from . import land
+            return land.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -1284,7 +1328,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     " (last commit seen ahead: %s)" % item["branch_head"][:12]
                     if item.get("branch_head") else ""))
             if item.get("migration"):
-                print("migration: %04d reserved (L122)" % item["migration"])
+                print("migration: %s reserved in %s (L122)" % (
+                    work.migration_layout(item, cfg).label(item["migration"]),
+                    item.get("migration_repo")))
             for mark in item["module_milestones"]:
                 print("module   : %s/%s · %s · by %s" % (
                     mark["module"], mark["kind"], mark["subject"], mark["actor"]))
@@ -1332,15 +1378,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "migration":
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
-                                          repo=args.repo, actor=args.actor)
+                                          repo=args.repo, actor=args.actor, cfg=cfg)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             elif item.get("migration") is None:
                 print("lot #%d: no migration reserved" % item["id"])
             else:
-                print("lot #%d: migration %04d reserved — file "
-                      "src/ameesh/migrations/%04d_<name>.sql" % (
-                          item["id"], item["migration"], item["migration"]))
+                print("lot #%d: migration %s reserved in %s — file %s" % (
+                    item["id"], item["migration_label"], item["migration_repo"],
+                    item.get("migration_file") or "<migrations>/%s_<name>.sql"
+                    % item["migration_label"]))
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
@@ -1556,10 +1603,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
 #: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
-#: interactive sessions (`ameesh attach`), also local
+#: interactive sessions (`ameesh attach`), also local; #408: lot_wake, on|off
+#: (rule 1, the runner's wake on an actionable lot), in the database
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode")
+            "permission_mode", "lot_wake")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1648,13 +1696,16 @@ def cmd_set(cfg: Config, args) -> int:
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
-                      "permission_mode=auto|acceptEdits|…"
+                      "permission_mode=auto|acceptEdits|… lot_wake=on|off"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
             if cle == "mode" and valeur and valeur not in registry.MODES:
                 print("invalid mode: %r (%s)" % (valeur, " | ".join(registry.MODES)),
                       file=sys.stderr)
+                return 2
+            if cle == "lot_wake" and valeur and valeur not in ("on", "off"):
+                print("invalid lot_wake: %r (on | off)" % valeur, file=sys.stderr)
                 return 2
             if cle == "session_policy" and valeur and valeur not in SESSION_POLICIES:
                 print("invalid session_policy: %r (%s)"
@@ -1756,12 +1807,13 @@ def cmd_set(cfg: Config, args) -> int:
             regroupement, secondes = "", int(cfg.mail_batch)
         regroupement_txt = ("immediate" if secondes == 0 else "%ds" % secondes) + (
             "" if regroupement else " (default)")
+        reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
         print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
-              "(takes effect at the next turn)"
+              "lot_wake=%s (takes effect at the next turn)"
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
-                 grace_txt, regroupement_txt))
+                 grace_txt, regroupement_txt, reveil_txt))
         for local in ("mail_batch", "permission_mode"):
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
                 print("warning: %s is read from the local state of the agent's host "
@@ -1882,11 +1934,21 @@ def cmd_models_discover(cfg, args) -> int:
     return 1 if failures and not getattr(args, "dry_run", False) else 0
 
 
+#: L148 : commandes encore acceptées pour la transition mais absentes de
+#: l'aide (`menage` → `housekeeping`), retirées au stage 7. argparse affiche
+#: les choix en clair dans la ligne d'usage : `build_parser` lui donne la
+#: liste visible par `metavar`.
+HIDDEN_COMMANDS = frozenset({"menage"})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-mesh", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command")
+    # L148 : les sous-parseurs héritent de `HiddenAliasParser`, pour que les
+    # alias cachés (ancienne graphie d'une option) ne captent jamais une
+    # abréviation visible ni n'apparaissent dans un message d'ambiguïté.
+    sub = parser.add_subparsers(dest="command", parser_class=HiddenAliasParser)
 
     p_list = sub.add_parser("list", help="mesh list: all agents")
     p_list.add_argument("--json", action="store_true")
@@ -1909,8 +1971,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="window of --report, in days (default 7)")
     p_hosts.set_defaults(func=cmd_hosts)
 
-    p_menage = sub.add_parser(
-        "menage", help="cleanup of what agents create (L73); dry run by default")
+    p_housekeeping = sub.add_parser(
+        "housekeeping", help="cleanup of what agents create (L73); dry run by default")
+    mode = p_housekeeping.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="show only (default): nothing is removed")
+    mode.add_argument("--apply", action="store_true",
+                      help="apply (human or runner only, never an agent "
+                           "session)")
+    p_housekeeping.add_argument("--by", default="", help="who triggers it (log), e.g. human:alice")
+    p_housekeeping.add_argument("--json", action="store_true", help="`ameesh-menage/1` report")
+    p_housekeeping.set_defaults(func=cmd_housekeeping)
+
+    # L148 : `ameesh menage` reste accepté (une ligne sur stderr) ; sans
+    # `help=`, il ne figure pas dans la liste des commandes.
+    p_menage = sub.add_parser("menage")
     mode = p_menage.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="show only (default): nothing is removed")
@@ -1958,6 +2033,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_models_discover.add_argument("--notify", help="agent to wake with an event")
     p_models_discover.add_argument("--sender", default=os.environ.get("AMEESH_AGENT") or "catalogue")
     p_models_discover.set_defaults(func=cmd_models_discover)
+
+    p_handoff = sub.add_parser("handoff", help="plan a reserved lot-boundary host move or inspect its journal")
+    handoff_sub = p_handoff.add_subparsers(dest="handoff_command")
+    p_handoff_plan = handoff_sub.add_parser("plan")
+    p_handoff_plan.add_argument("agent")
+    p_handoff_plan.add_argument("--repository", required=True,
+                                help="enrolled Git remote identity, never inferred from a directory name")
+    p_handoff_plan.add_argument("--dry-run", action="store_true")
+    p_handoff_plan.set_defaults(func=cmd_handoff)
+    p_handoff_show = handoff_sub.add_parser("show")
+    p_handoff_show.add_argument("operation")
+    p_handoff_show.set_defaults(func=cmd_handoff)
 
     p_key = sub.add_parser("key", help="owner public keys")
     key_sub = p_key.add_subparsers(dest="key_command")
@@ -2067,13 +2154,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "before writing the file; idempotent, visible in work show")
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
-                        help="reserve this exact number (refused if reserved by another "
-                             "work item)")
+                        help="reserve this exact number (refused if it already exists in the "
+                             "lot's repository or is reserved by another work item)")
     pw_mig.add_argument("--release", action="store_true",
                         help="release the reservation (the work item no longer adds a migration)")
     pw_mig.add_argument("--repo", default=None,
-                        help="ameesh repository whose branches count (default: the current "
-                             "git repository)")
+                        help="local clone of the lot's repository (that of its issue), whose "
+                             "worktree and branches count (default: the clone declared in "
+                             "radar.projects, else the current git repository; its origin "
+                             "must be the lot's repository)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -2170,6 +2259,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolutions.add_parser(work_sub, cmd_work)  # prepared conflict resolutions (L160d)
     from . import merge_queue
     merge_queue.add_parser(work_sub, cmd_work)  # merge queue per target (L160e)
+    from . import land
+    land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
@@ -2251,6 +2342,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="key=value",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "lot_wake=on|off "
                             "context_max_tokens=15M|0 "
                             "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
                             "turn_grace_seconds=20m|0 "
@@ -2299,6 +2391,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="files changed since REF (ref..HEAD + working tree)")
     canon_cli._canon_options(p_review)
     p_review.set_defaults(func=cmd_review_class)
+
+    # L148 : la ligne d'usage liste les sous-commandes en clair, y compris
+    # celles cachées ; on lui donne la liste visible (retirée au stage 7).
+    sub.metavar = "{%s}" % ",".join(
+        name for name in sub.choices if name not in HIDDEN_COMMANDS)
     return parser
 
 

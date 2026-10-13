@@ -9,7 +9,7 @@
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
   ameesh work project-github --app P [--repo R] [--dry-run] [--json]   (L126)
-  ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
+  ameesh work plan <id|fiche> [--start J] [--end J] [--delivery J] [--source S]  (L96)
                   [--estimate 90m] [--estimate-source S]                (L157, une tâche)
   ameesh work estimates [--app P] [--json]   (L157 : écarts réel/estimé, pour l'auditeur)
 
@@ -24,6 +24,7 @@ import json
 import sys
 
 from . import plan_git, plan_github, work
+from .deprecated import DeprecatedAlias
 
 COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
             "plan", "estimates", "schedule", "measure")
@@ -85,11 +86,21 @@ def add_parsers(work_sub, func) -> None:
     p_plan = work_sub.add_parser(
         "plan", help="planned dates of a task or a WorkPackage (L96)")
     p_plan.add_argument("target", help="task number, or package id")
-    p_plan.add_argument("--debut", "--start", dest="debut", default=None,
+    p_plan.add_argument("--start", dest="debut", default=None,
                         help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
-    p_plan.add_argument("--fin", "--end", dest="fin", default=None, help="planned end")
-    p_plan.add_argument("--livraison", "--deploiement", "--delivery", dest="livraison",
+    p_plan.add_argument("--debut", dest="debut", action=DeprecatedAlias, canonical="--start",
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_plan.add_argument("--end", dest="fin", default=None, help="planned end")
+    p_plan.add_argument("--fin", dest="fin", action=DeprecatedAlias, canonical="--end",
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p_plan.add_argument("--delivery", dest="livraison",
                         default=None, help="planned delivery or deployment")
+    p_plan.add_argument("--livraison", dest="livraison", action=DeprecatedAlias,
+                        canonical="--delivery", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
+    p_plan.add_argument("--deploiement", dest="livraison", action=DeprecatedAlias,
+                        canonical="--delivery", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     p_plan.add_argument("--source", default=None,
                         help="where the date comes from (conversation, decision, message...); "
                              "also that of the estimate, failing --estimate-source")

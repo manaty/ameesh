@@ -5,6 +5,7 @@ the runner copies `guard.restart` of the local state into its readings
 `guard_restart` for a day."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 import re
@@ -118,6 +119,7 @@ class AlertTest(unittest.TestCase):
 class StorageTest(unittest.TestCase):
     def test_read_back_as_an_object_and_granted_to_the_supervisor(self):
         db = mock.Mock()
+        db.transaction.return_value = nullcontext(db)
         db.query.return_value = [{"host": "vm", "guard_restart": json.dumps(RESTART)},
                                  {"host": "pc", "guard_restart": None}]
         rows = pg_hosts.Hosts(db).current(None)
