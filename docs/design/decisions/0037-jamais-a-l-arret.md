@@ -125,3 +125,29 @@ Never handled, as before: a lot under review or frozen, a sensitive or
 reserved one, one waiting for a decision, one whose last assignment came from
 a human. The rolling hourly ceiling (`--handoff-max-per-hour`) counts returns
 and handoffs together; the cross-family review rule is unchanged.
+# Amendment of 2026-10-13 (#804): the executor triggers the take
+
+Canon (*Processus de lot* §4) makes the free agent the one who takes the next
+ready lot of its team, without waiting for the pilot. The take of L119 and
+L165 was in practice only triggered by `ameesh notify`, and no `notify`
+process or unit was running on the agent hosts (constat of 13/10 08:0x): idle
+agents took nothing. Lot #754 fixed what the take refused (budget pause,
+token agents); #804 fixes who triggers it.
+
+**The runner triggers the take for its own agents.** Every
+`--take-interval` seconds (default 60, `AMEESH_TAKE_INTERVAL`; 0 turns the
+runner's take off), each executor calls the same `backlog.auto_take` for the
+agents it serves, on the host where they run, with the same safeguards
+(idleness, budget, hosts on hold, hourly caps counted in the database):
+
+- only its own agents are takers (`agents=` filter); the mesh listing stays
+  whole for the guards and for notifying the orchestrators;
+- a host under pressure is passed as a local `host_pressure` alert, as
+  `ameesh notify` does with its alerts;
+- the take happens before the executor claims its agents, so the taken lot
+  and its mail are served in the same pass;
+- a failing take pass never takes the executor down: it is logged and the
+  next pass retries.
+
+`ameesh notify` keeps its own take for hosts where it runs; the two share the
+database counters, so the mesh-wide caps hold.

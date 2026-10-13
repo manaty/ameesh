@@ -14,10 +14,13 @@ et des capacités exigées. Pas de table neuve : le cycle, le journal, les
 jalons, la vue d'avancement et les alertes des lots s'appliquent tels quels.
 
 **Prise automatique** (`auto_take`, appelée à chaque passage d'`ameesh
-notify`) : un agent réveillable au repos sans lot depuis `idle_s` prend
-l'élément de plus forte valeur qui correspond à son équipe et à ses
-capacités. Le lot lui est assigné (attribution gardée de L37) et lui est
-annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
+notify`, et par l'exécuteur de chaque hôte pour ses propres agents — #804) :
+un agent réveillable au repos sans lot depuis `idle_s` prend l'élément de
+plus forte valeur qui correspond à son équipe et à ses capacités. Le lot lui
+est assigné (attribution gardée de L37) et lui est annoncé par un courrier
+lié au lot (`--lot`), qui le réveille. `agents` restreint les **preneurs** à
+un ensemble de noms (ceux de l'exécuteur) : la liste du mesh reste entière
+pour les gardes et l'avertissement des orchestrateurs. Garde-fous :
 
 * **aucun lot ne l'attend** : l'agent n'a ni lot ouvert, ni courrier non lu,
   ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
@@ -553,7 +556,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
               alerts: list | None = None, listing: list | None = None, paid=None,
               budget_check=None, dry_run: bool = False,
               lot_idle_s: float = DEFAULT_LOT_IDLE_S,
-              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None) -> list:
+              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None,
+              agents: set[str] | None = None) -> list:
     """Un passage de prise automatique ; rend les prises faites (ou prévues
     en `dry_run`) : `[{item, agent, message_id, kind, notified}]`, `kind`
     valant `lot` (lot non assigné de l'équipe, L165) ou `backlog` (file
@@ -565,7 +569,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     ce qui lui va, puis les agents payés au token prennent ce qu'il reste
     dans le même passage (#754, owner 13/10). Un agent en pause budget ou
     au-dessus de son plafond ne prend rien et ne bloque personne ; un agent
-    au token ne prend jamais sous une alerte `balance_low`."""
+    au token ne prend jamais sous une alerte `balance_low`.
+
+    `agents`, quand il est donné, borne les preneurs à ces noms (l'exécuteur
+    de leurs hôtes, #804) sans rétrécir `listing` : les gardes et les
+    orchestrateurs prévenus restent ceux du mesh entier."""
     from . import mail, registry, sous_utilisation, work
 
     now = time.time() if now is None else float(now)
@@ -622,6 +630,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
                                                 waiting_free=waiting_free):
+            # #804 : un exécuteur ne fait prendre que ses propres agents ; les
+            # autres restent dans `listing` pour les gardes et l'avertissement.
+            if agents is not None and row["name"] not in agents:
+                continue
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
