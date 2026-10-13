@@ -55,15 +55,32 @@ class CanonSyncConcurrencyTest(PgTestCase):
         self.db.execute(
             "CREATE TRIGGER t802_slow_package BEFORE INSERT OR UPDATE ON work_packages "
             "FOR EACH ROW EXECUTE FUNCTION t802_slow_package()")
+        # #802 R1 : le délai se met dans la Config de la connexion, pas par un
+        # `SET` après coup. Avec le pilote psql, chaque `execute` ouvre son
+        # propre sous-processus : un `SET` isolé meurt avec lui et le sync
+        # retomberait sur le délai par défaut (30 s), si bien que le témoin ne
+        # prouverait plus que c'est l'attente des verrous qui dépasse le délai.
+        # On atteste donc le délai effectif de la session, pour les deux
+        # pilotes, avant de lancer la course.
+        attest = self.connect(statement_timeout_ms=STATEMENT_TIMEOUT_MS)
+        try:
+            row = attest.query("SELECT setting, unit FROM pg_settings "
+                               "WHERE name = 'statement_timeout'")[0]
+        finally:
+            attest.close()
+        self.assertEqual((row["setting"], row["unit"]),
+                         (str(STATEMENT_TIMEOUT_MS), "ms"),
+                         "délai de session non appliqué par le pilote %s"
+                         % self.db.name)
+
         barrier = threading.Barrier(WORKERS, timeout=30)
         results: list = []
         errors: list = []
         lock = threading.Lock()
 
         def attempt() -> None:
-            db = self.connect()
+            db = self.connect(statement_timeout_ms=STATEMENT_TIMEOUT_MS)
             try:
-                db.execute("SET statement_timeout = %d" % STATEMENT_TIMEOUT_MS)
                 barrier.wait()
                 report = canon_sync.sync_packages(db, loaded, [])
                 outcome = ("ok", len(report.created), len(report.unchanged))
