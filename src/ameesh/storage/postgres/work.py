@@ -57,11 +57,21 @@ def has_reviewer(db) -> bool:
     return flag
 
 
-def item_columns(db) -> str:
+def item_columns(db, ref: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
-    (les lectures d'avant la migration ne cassent pas, #705)."""
-    return _COLUMNS_TEMPLATE.replace(
-        "__REVIEWER__", "reviewer" if has_reviewer(db) else "''::text AS reviewer")
+    (les lectures d'avant la migration ne cassent pas, #705).
+
+    `ref` (le nom de la table dans la requête, « work_items ») lit `reviewer`
+    par `to_jsonb`, sans sonde de colonne : les commandes à budget
+    d'allers-retours (L61 : `work list`, `progress`) n'en paient pas un de
+    plus. `to_jsonb` rend NULL sur une base d'avant 0421, d'où le coalesce."""
+    if ref:
+        reviewer = "coalesce(to_jsonb(%s)->>'reviewer', '') AS reviewer" % ref
+    elif has_reviewer(db):
+        reviewer = "reviewer"
+    else:
+        reviewer = "''::text AS reviewer"
+    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer)
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
@@ -282,7 +292,8 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def items(self, *, state, assignee, limit) -> list[dict]:
-        sql = "SELECT %s FROM work_items WHERE true" % item_columns(self.db)
+        # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
+        sql = "SELECT %s FROM work_items WHERE true" % item_columns(self.db, "work_items")
         params: list = []
         if state:
             sql += " AND state = %s"

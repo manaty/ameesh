@@ -489,6 +489,9 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual(item["reviewer"], "")
         rows = work.list_items(self.db, limit=10)
         self.assertEqual(rows[0]["id"], lot["id"])
+        # `progress` lit la même liste : sans colonne, `to_jsonb` rend ''
+        lots = storage.of(self.db).progress.lots(since_ts=0.0, project=None, limit=10)
+        self.assertIn(lot["id"], [r["id"] for r in lots])
         listing = storage.of(self.db).operations.open_lots_activity(10)
         self.assertIn(lot["id"], [r["id"] for r in listing])
         proc = self.mesh("work", "show", str(lot["id"]))

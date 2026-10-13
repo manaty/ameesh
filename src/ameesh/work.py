@@ -166,6 +166,11 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
+        # le libellé historique de la correction reste (la CLI `hosts` le
+        # traduit en « hold: say who holds », #254) ; `what` nomme les autres
+        # gestes (#705, « designation »)
+        if what == "correction":
+            raise WorkError("correction: say who corrects (--actor human:<id>)")
         raise WorkError("%s: say who does it (--actor human:<id>)" % what)
     if text.startswith(HUMAN_PREFIX):
         return text
