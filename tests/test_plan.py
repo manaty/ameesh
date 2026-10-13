@@ -12,10 +12,11 @@ import os
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import (canon, canon_sync, plan, plan_git, plan_github, progress, registry,
-                    stagnation, storage, work)
+from ameesh import (canon, canon_sync, lot_class, plan, plan_git, plan_github, progress,
+                    registry, review_lot, stagnation, storage, work)
 
 from .fake_github import FakeGh
 from .support import FAKEBIN, PgTestCase
@@ -455,6 +456,24 @@ class GithubTest(_PlanDb):
         again = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(again["merged"], 0)
         self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()}, {"pr list"})
+
+    def test_sync_github_ouvre_le_lot_de_relecture_l539(self):
+        # #1104 : une fusion constatée par GitHub est une fusion enregistrée
+        # comme une autre ; elle ouvre le lot de relecture (L539). La lecture
+        # de classe est doublée : sans dépôt local ni radar, `of_lot` ne peut
+        # que douter ici — elle a ses propres témoins (test_1104…, test_l160e).
+        a = work.add(self.db, title="léger", package="cat-recherche")
+        work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="alice")
+        self.merged_pr(1, "lot/cat-recherche-index")
+        with mock.patch.object(lot_class, "of_lot",
+                               return_value={"class": "light", "why": "policy"}):
+            report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {a["id"]: "merged"})
+        rows = storage.of(self.db).work.by_issue_ref(review_lot.ref_of(a["id"]))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["state"], "intake")
+        self.assertIsNone(rows[0]["assignee"])
 
     def test_sync_github_branche_lot_numero_et_pr_partielle(self):
         # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR

@@ -866,9 +866,36 @@ def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
     return row
 
 
+def _pr_number(pr_ref) -> "int | None":
+    """Le numéro de PR d'une référence `owner/repo#N`, ou None."""
+    text = str(pr_ref or "")
+    head, _, tail = text.rpartition("#")
+    return int(tail) if head and tail.isdigit() else None
+
+
+def _review_after_merge(db, item_id, *, sha: str = "", pr_ref=None, repo=None) -> None:
+    """L539 : toute fusion **enregistrée** ouvre le lot de relecture du canon §2.
+
+    La file de fusion l'ouvre à l'atterrissage (`land`) ; ici passent les
+    autres voies — relevé des branches (L118), `sync-merges`, `sync-github`,
+    porte `git-merge`, `ameesh work merged` — et l'ouverture y est idempotente
+    (`review_lot.open_for_merge`). `repo` porte le dépôt où la fusion a été
+    constatée quand l'appelant le connaît (indice de classe).
+
+    Best effort : la fusion est un fait **déjà écrit**, et `review_lot` ne lève
+    jamais ; rien ici ne doit remonter jusqu'à l'appelant et transformer un
+    fait acquis en échec."""
+    try:
+        from . import review_lot
+        review_lot.open_for_merge(db, int(item_id), merged_sha=sha or "",
+                                  pr=_pr_number(pr_ref), repo=repo)
+    except Exception:  # noqa: BLE001 - la fusion reste un fait
+        pass
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
-                 declared: bool = False, extra: str = "") -> dict:
+                 declared: bool = False, extra: str = "", repo: str | None = None) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -883,6 +910,14 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
     (`declared`, `ameesh work merged`), suivie de `extra`.
+
+    L539 (#1104) : une fusion enregistrée, par quelque voie que ce soit, ouvre
+    aussi le lot de relecture du canon §2 (`_review_after_merge`), y compris
+    hors file de fusion. `repo` est le dépôt où la fusion a été constatée
+    (le relevé le connaît) ; sans lui, la classe se lit sur le dossier de
+    travail de l'assigné, puis sur le dépôt du projet, et un doute n'ouvre
+    rien. Le lot de la file l'ouvre à l'atterrissage : l'ouverture est
+    idempotente.
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -913,6 +948,9 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": str(exc)}
         if row is not None:
+            # L539 (#1104) : la fusion est écrite ; le lot de relecture suit,
+            # sans jamais pouvoir la défaire.
+            _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": "%s → merged" % state}
         if frozen_id is not None:

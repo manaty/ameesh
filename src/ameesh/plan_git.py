@@ -198,7 +198,8 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
             else:
                 done = work_mod.close_merged(
                     db, int(row["id"]), sha=entry["ref"] or "", actor="git:%s" % target,
-                    source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]))
+                    source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]),
+                    repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
                 entry["result"] = done["result"]
                 entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
@@ -876,7 +877,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         else:
             source = "branch %s (%s)" % (branch, found["how"])
         done = work_mod.close_merged(
-            db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source)
+            db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source,
+            repo=repo)                          # L539 : dépôt du relevé, indice de classe
         entry.update(result=done["result"], detail="%s — %s" % (found["detail"], done["detail"]))
         if done["result"] == "merged":
             text = ("Lot #%d \"%s\" delivered: %s (%s, commit %s). Closed by the runner's "

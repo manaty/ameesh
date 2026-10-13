@@ -18,9 +18,20 @@ transaction** que la création (revue #544 r1) : le lot de relecture lui-même
 ligne de journal sur le lot fusionné, qui reste un confort. Deux appels
 **concurrents** sont sérialisés par le verrou de la ligne marquée, qui est
 posé avant l'insertion : le perdant rend le lot du gagnant (revue #544 r2).
+
+#1104 : l'ouverture ne dépend plus de la **voie** de fusion. La file l'ouvre à
+l'atterrissage (`land`), et toute fusion **enregistrée** ailleurs l'ouvre par
+`open_for_merge` — le point d'entrée de `work.close_merged`, donc du relevé
+des branches (L118), de `sync-merges`, de `sync-github`, de la porte
+`git-merge` et de `ameesh work merged`. La classe est alors relue sur le diff
+que la fusion a fait entrer (`class_at_merge`, `lot_measures.diff_range`) —
+jamais `cible..gel`, vide dès que le gel est un ancêtre de la cible — avec les
+indices de l'appelant ; seule `light` ouvre, un doute n'ouvre rien, et
+l'idempotence reste celle de `open_after_merge`.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -73,6 +84,25 @@ def _author(db, name: str) -> dict:
     except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
         return {"name": name, "harness": ""}
     return {"name": name, "harness": str(row.get("harness") or "")}
+
+
+def _repo_of_agent(db, name: str) -> str:
+    """Le dossier de travail déclaré de l'agent, s'il existe (indice de dépôt).
+
+    Même source que le relevé des branches (`sync_branches`) : le `cwd` du
+    registre est le worktree où le gel vit encore. Un nom inconnu, un chemin
+    disparu ou un registre illisible ne rendent rien — l'appelant doubtera,
+    jamais ne devinera."""
+    name = (name or "").strip()
+    if not name or ":" in name:
+        return ""
+    try:
+        from . import registry
+        row = registry.get(db, name) or {}
+    except Exception:  # noqa: BLE001 - registre illisible : pas d'indice
+        return ""
+    path = os.path.expanduser(str(row.get("cwd") or ""))
+    return path if path and os.path.isdir(path) else ""
 
 
 def _open(ops, ref: str) -> Optional[dict]:
@@ -208,3 +238,96 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
         return out
     out.update({"id": int(created["id"]), "created": True, "why": "ouvert"})
     return out
+
+
+def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
+                   repo: Optional[str] = None, target: str = "",
+                   sha: str = "") -> dict:
+    """La classe du lot au moment d'une fusion constatée (L539, canon §8).
+
+    Le diff lu est celui que la fusion a fait entrer : `sha` (le commit de la
+    fusion constatée, le gel à défaut) est ramené à son intervalle de
+    changement par `lot_measures.diff_range` — commit de fusion, fusion qui a
+    introduit le gel, ou gel hors cible. Lire `cible..gel` serait un piège :
+    une fois la fusion faite, le gel est un ancêtre de la cible, ce diff est
+    vide et toute classe y serait « light ».
+
+    `repo` est le dépôt où la fusion a été constatée (le relevé des branches
+    le connaît), sinon le dossier de travail de l'assigné au registre, sinon
+    le dépôt du projet (`lot_class.repository`) — toujours pour y lire le diff
+    de la fusion, jamais `cible..gel`. `target` la cible déjà résolue. Tout
+    doute rend `sensitive` — d'une classe inconnue, on n'ouvre pas de lot de
+    relecture."""
+    from . import lot_measures, plan_git
+    if item is None:
+        item = work.get(db, lot)
+    if item is None:
+        return {"class": "", "why": "lot #%d introuvable" % int(lot), "doubt": True}
+    where = repo or _repo_of_agent(db, str(item.get("assignee") or ""))
+    if not where:
+        where = lot_class.repository(getattr(db, "cfg", None), item) or ""
+    base = head = ""
+    try:
+        frozen = ""
+        if where:
+            freeze = plan_git.latest_freeze(work.milestones(db, int(lot)))
+            frozen = str((freeze or {}).get("sha") or "").strip()
+        # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
+        # déclarée sans commit lisible, `ameesh work merged` à la main)
+        for tip in ((sha or "").strip(), frozen):
+            if not where or not tip:
+                continue
+            rng = lot_measures.diff_range(where, tip, target or None)
+            if rng:
+                base, head = rng
+                break
+    except Exception:  # noqa: BLE001 - pas d'intervalle : `of_lot` doubtera
+        base = head = ""
+    try:
+        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None), item=item,
+                                repo=where or None, base=base or None, head=head or None)
+    except Exception as exc:  # noqa: BLE001 - un doute, jamais une exception
+        return {"class": "", "why": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
+                "doubt": True}
+
+
+def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
+                   repo: Optional[str] = None, target: str = "",
+                   actor: str = work.SYSTEM_SENDER) -> dict:
+    """L539 : le lot de relecture d'une fusion enregistrée **hors file**.
+
+    Toute voie qui enregistre une fusion (`work.close_merged`) passe ici : le
+    relevé des branches (L118), `sync-merges`, `sync-github`, la porte
+    `git-merge` et `ameesh work merged`. La classe est relue sur le diff de la
+    fusion constatée (`class_at_merge`) avec les indices de l'appelant ; seule
+    `light` ouvre, un doute n'ouvre rien. Idempotent : un lot de relecture déjà
+    écrit, **quel que soit son état**, est rendu sans relire la classe. Ne lève
+    jamais — la fusion est un fait déjà enregistré."""
+    lot = int(lot)
+    out = {"lot": lot, "id": None, "created": False, "class": "", "why": ""}
+    try:
+        item = work.get(db, lot)
+        if item is None:
+            out["why"] = "lot #%d introuvable" % lot
+            return out
+        existing = _open(storage.of(db).work, ref_of(lot))
+        if existing is not None:
+            out.update({"id": int(existing["id"]),
+                        "why": "lot de relecture #%d déjà ouvert (état %s)"
+                               % (int(existing["id"]), existing.get("state") or "?")})
+            return out
+        where_target = target or str(item.get("branch_target") or "")
+        klass = class_at_merge(db, lot, item=item, repo=repo, target=where_target,
+                               sha=merged_sha)
+        out["class"] = klass.get("class") or ""
+        opened = open_after_merge(
+            db, lot=lot, klass=klass, item=item, merged_sha=merged_sha, pr=pr,
+            target=where_target, actor=actor)
+        out.update({"id": opened.get("id"), "created": bool(opened.get("created")),
+                    "class": opened.get("class") or out["class"],
+                    "why": opened.get("why") or ""})
+        return out
+    except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
+        out["why"] = "lot de relecture non ouvert : %s: %s" % (
+            type(exc).__name__, str(exc)[:200])
+        return out
