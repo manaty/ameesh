@@ -8,7 +8,9 @@ porte §2 « autre famille de modele » pouvait donc compter un avis Codex comme
 Claude. Trois temoins de contrat ici :
 
 * un hook — sous bail ou non — ne reecrit jamais la DECLARATION d'un agent
-  `execute` (le harnais du tour, L242b, faisait clignoter `harness`) ;
+  `execute` (le harnais du tour, L242b, faisait clignoter `harness` ; modele et
+  session restaient ceux de la session precedente) ; sous bail, le dossier et
+  l'hote du tour continuent de suivre (L61, deja tenu par ses bornes) ;
 * `adopt` pose la session vivante de 0384 (`session_harness`, `session_cwd`,
   `session_origin`) et efface modele, effort et tier quand le harnais declare
   change — en base comme dans l'etat local, que l'exécuteur relit avant les
@@ -45,7 +47,9 @@ class HookNeReecritPasLaDeclarationTest(PgTestCase):
         self.assertEqual(apres["harness"], "claude")
         self.assertEqual(apres["model"], "claude-opus-5-5")
         self.assertEqual(apres["session_id"], "session-declaree")
-        self.assertEqual(apres["cwd"], avant["cwd"])
+        # L61 : sous bail, le dossier du tour suit le hook (sa session, non :
+        # L166 l'a deja filtree) — la declaration ne porte que harnais/modele.
+        self.assertEqual(apres["cwd"], ailleurs)
         self.assertEqual(apres["host"], avant["host"])
         self.assertEqual(apres["mode"], "execute")
         self.assertGreaterEqual(apres["last_seen_ts"], avant["last_seen_ts"])

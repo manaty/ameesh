@@ -334,16 +334,29 @@ class PgBackend:
     # -- agents ------------------------------------------------------------
     def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,
                  *, leased: bool = True) -> None:
-        # #1037 : le harnais, le modèle et le dossier de la ligne sont
-        # DÉCLARÉS (canon, `agent-runner register`, `adopt`) ; le harnais du
-        # tour, lui, peut être EMPRUNTÉ (L242b : un agent critique au seuil
-        # tourne sous un autre harnais). Un hook — sous bail ou non — ne
-        # réécrit donc jamais la déclaration : les mêmes règles que L46
-        # s'appliquent dans les deux cas (agent `execute` : seul `last_seen`
-        # avance ; agent `externe` : hôte, harnais et session suivis).
-        registry.upsert_unleased(
+        if not leased:
+            # L36 → L46 : un hook sans bail (session externe, shell qui a hérité
+            # de AGENT_MAIL_NAME) ne touche à la ligne d'un agent `execute` que
+            # pour `last_seen` : ni session, ni dossier, ni hôte, ni harnais —
+            # l'exécuteur reprendrait sinon une session étrangère, ailleurs.
+            # Un agent NÉ d'un hook sans bail est `externe` (L37, 0030). Une
+            # seule instruction : pas de course lecture → écriture.
+            registry.upsert_unleased(
+                self.db, name, chantier=identity.chantier_of(name, self.cfg),
+                harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
+            return
+        # #1037 : sous bail, le harnais DÉCLARÉ de la ligne n'est jamais
+        # réécrit par un hook — le harnais du tour peut être EMPRUNTÉ (L242b :
+        # un agent critique au seuil tourne sous un autre harnais), et le hook
+        # le faisait clignoter pendant que modèle et session restaient ceux de
+        # la session précédente. `harness=None` : l'ON CONFLICT de `upsert`
+        # garde la valeur existante (la ligne existe — le bail a été vérifié
+        # par `identity.resolve_binding`). Le dossier et l'hôte du tour, eux,
+        # suivent (L61 : sous bail le hook réinscrit le dossier ; L166 a déjà
+        # filtré la session du hook, jamais inscrite sous bail).
+        registry.upsert(
             self.db, name, chantier=identity.chantier_of(name, self.cfg),
-            harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
+            harness=None, host=self.cfg.host, cwd=cwd, session_id=session_id)
 
     def agents(self) -> list[dict]:
         rows = registry.overview(self.db)
