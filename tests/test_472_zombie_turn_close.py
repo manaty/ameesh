@@ -127,21 +127,22 @@ class SnapshotSafetyTest(unittest.TestCase):
                 mock.patch.object(os, 'killpg', return_value=None):
             self.assertTrue(turn_processes.group_running(4242))
 
-    def test_vanishing_replacements_beside_stable_zombie_keep_open(self):
+    def test_a_member_vanishing_in_the_first_scan_is_omitted(self):
+        # a member vanishing mid-scan is gone and cannot fork again: the
+        # strict scan keeps its other rows, and the stable zombie decides
         def stat(path, **_):
             pid = path.split('/')[-2]
             if pid != '4242':
                 raise FileNotFoundError('replacement already exited')
             return self.stat(pid)
         with self.fallback(), \
-                mock.patch.object(os, 'listdir', side_effect=[['4242', '4243'], ['4242', '4244']]), \
+                mock.patch.object(os, 'listdir', side_effect=[['4242', '4243'], ['4242']]), \
                 mock.patch('builtins.open', side_effect=stat), \
                 mock.patch.object(os, 'killpg', return_value=None):
-            self.assertTrue(turn_processes.group_running(4242))
+            self.assertFalse(turn_processes.group_running(4242))
 
     def test_psutil_unreadable_status_or_group_keeps_open(self):
-        for status, error in ((None, None), ('Z', PermissionError('denied')),
-                              ('Z', ProcessLookupError('vanished'))):
+        for status, error in ((None, None), ('Z', PermissionError('denied'))):
             with self.subTest(status=status, error=error):
                 ps = types.SimpleNamespace(STATUS_ZOMBIE='Z', Error=RuntimeError, pids=lambda: [4242])
                 ps.Process = lambda _: types.SimpleNamespace(as_dict=lambda **_: {
@@ -150,11 +151,22 @@ class SnapshotSafetyTest(unittest.TestCase):
                         mock.patch.object(os, 'getpgid', return_value=4242, side_effect=error):
                     self.assertTrue(turn_processes.group_running(4242))
 
-    def test_psutil_vanished_member_is_not_silently_omitted(self):
+    def test_psutil_unreadable_member_keeps_group_open(self):
         ps = types.SimpleNamespace(STATUS_ZOMBIE='Z', Error=RuntimeError, pids=lambda: [4242],
-                                   Process=mock.Mock(side_effect=RuntimeError('vanished')))
+                                   NoSuchProcess=type('NoSuchProcess', (RuntimeError,), {}),
+                                   Process=mock.Mock(side_effect=RuntimeError('denied')))
         with mock.patch.object(process_layer, '_psutil', return_value=ps):
             self.assertTrue(turn_processes.group_running(4242))
+
+    def test_psutil_vanished_member_is_omitted(self):
+        no_such = type('NoSuchProcess', (RuntimeError,), {})
+        ps = types.SimpleNamespace(STATUS_ZOMBIE='Z', Error=RuntimeError, NoSuchProcess=no_such,
+                                   pids=lambda: [4242],
+                                   Process=mock.Mock(side_effect=no_such('gone')))
+        with mock.patch.object(process_layer, '_psutil', return_value=ps), \
+                mock.patch.object(os, 'killpg', side_effect=ProcessLookupError('absent')) as probe:
+            self.assertFalse(turn_processes.group_running(4242))
+        probe.assert_called_once_with(4242, 0)
 
     def test_signal_zero_unknown_keeps_open_and_absent_closes(self):
         for error, expected in ((PermissionError('denied'), True),
@@ -169,6 +181,46 @@ class SnapshotSafetyTest(unittest.TestCase):
         with mock.patch.object(platform, 'process_table', return_value=[]), \
                 mock.patch.object(os, 'killpg', return_value=None):
             self.assertTrue(turn_processes.group_running(4242))
+
+
+class UnreadableScanRetryTest(unittest.TestCase):
+    """A strict pair that cannot be read is retried before giving up.
+
+    `running_groups` answers None — every requested group stays open — when a
+    scan fails. An unreadable member (permission, missing status) is a stable
+    failure, but a transient one must not hide every dead group until the
+    next review, so the pair is tried `SNAPSHOT_ATTEMPTS` times.
+    """
+
+    @staticmethod
+    def _unreadable():
+        return platform.NotAvailable('process table', 'unreadable member')
+
+    def test_an_unreadable_first_scan_is_retried(self):
+        with mock.patch.object(platform, 'process_table',
+                               side_effect=[self._unreadable(), [process()], [process()]]) as scan:
+            self.assertEqual(turn_processes.running_groups([4242]), set())
+        self.assertEqual(scan.call_count, 3)
+
+    def test_an_unreadable_second_scan_restarts_a_fresh_pair(self):
+        # what the first scan read before the failure must not leak into the retry
+        vivant, zombie = [process(4242, zombie=False)], [process()]
+        with mock.patch.object(platform, 'process_table',
+                               side_effect=[vivant, self._unreadable(), zombie, zombie]) as scan:
+            self.assertEqual(turn_processes.running_groups([4242]), set())
+        self.assertEqual(scan.call_count, 4)
+
+    def test_a_retried_pair_still_keeps_a_live_group_open(self):
+        vivant = [process(4242, zombie=False)]
+        with mock.patch.object(platform, 'process_table',
+                               side_effect=[self._unreadable(), vivant, vivant]):
+            self.assertEqual(turn_processes.running_groups([4242]), {4242})
+
+    def test_every_unreadable_pair_fails_closed(self):
+        with mock.patch.object(platform, 'process_table',
+                               side_effect=self._unreadable()) as scan:
+            self.assertIsNone(turn_processes.running_groups([4242]))
+        self.assertEqual(scan.call_count, turn_processes.SNAPSHOT_ATTEMPTS)
 
 
 @contextlib.contextmanager

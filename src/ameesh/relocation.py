@@ -73,10 +73,12 @@ def candidates(admitted_hosts, current_host: str, *, db,
     """Hôtes admis autres que l'actuel, avec leur dernier relevé et pression.
 
     `limits_for(host)` rend les seuils de l'hôte (à défaut, les valeurs par
-    défaut prudentes)."""
+    défaut prudentes). #254 : jamais un hôte en pause."""
+    from . import host_holds
+    held = host_holds.live(db) if admitted_hosts else {}
     out: list[dict] = []
     for host in admitted_hosts or []:
-        if not host or host == current_host:
+        if not host or host == current_host or host in held:
             continue
         reading = storage.of(db).hosts.latest(host)
         if reading is None:

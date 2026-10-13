@@ -35,6 +35,25 @@ def _proc_ok() -> bool:
     return is_linux() and os.path.isdir(os.path.join(PROC, "self"))
 
 
+def self_cgroup_paths() -> tuple[str, ...]:
+    """Kernel cgroup memberships of this process (Linux only).
+
+    Missing, unreadable or malformed membership raises NotAvailable, never
+    an empty result that could be mistaken for a confirmed native identity.
+    """
+    from . import is_linux
+    if not is_linux():
+        raise NotAvailable("process cgroup membership", "requires Linux")
+    try:
+        with open(os.path.join(PROC, "self", "cgroup"), encoding="utf-8") as stream:
+            rows = [line.rstrip().split(":", 2) for line in stream]
+    except (OSError, UnicodeError) as exc:
+        raise NotAvailable("process cgroup membership", str(exc)) from exc
+    if not rows or any(len(row) != 3 or not row[2].startswith("/") for row in rows):
+        raise NotAvailable("process cgroup membership", "empty or malformed membership")
+    return tuple(row[2] for row in rows)
+
+
 def _stat_fields(pid: int) -> list[str]:
     """Champs de /proc/<pid>/stat à partir du 3e (état). Le nom (champ 2) est
     entre parenthèses et peut en contenir : on coupe à la DERNIÈRE « ) »."""
@@ -337,8 +356,10 @@ def process_table(*, strict: bool = False) -> list[dict]:
     adoptés par l'exécuteur). Un processus disparu pendant la lecture est
     omis. `NotAvailable` si l'OS ne permet pas de lister les processus ou
     leurs groupes : une liste vide voudrait dire « plus rien ne tourne ».
-    With strict=True, unreadable members fail closed instead of being omitted;
-    even a vanished member makes the snapshot incomplete (it may have forked)."""
+    With strict=True, an unreadable member fails closed instead of being
+    omitted: it may still be alive and fork unseen. A member that simply
+    vanished is omitted even then — it is gone and cannot fork again, and a
+    replacement it left behind shows up in the next snapshot."""
     if not hasattr(os, "getpgid"):
         raise NotAvailable("process table", "no process groups (POSIX)")
     ps = _psutil()
@@ -346,20 +367,25 @@ def process_table(*, strict: bool = False) -> list[dict]:
         out = []
         attrs = ["pid", "ppid", "name", "create_time", "status"]
         def strict_infos():
-            # process_iter silently skips NoSuchProcess. A vanished parent may
-            # have forked an unenumerated child, so closure must see the loss.
+            # process_iter silently skips NoSuchProcess. A vanished member is
+            # gone (it cannot fork again): skip it, but any other read error
+            # keeps the whole snapshot unusable.
             try:
-                for pid in ps.pids():
-                    yield ps.Process(pid).as_dict(attrs=attrs)
+                pids = ps.pids()
             except ps.Error as exc:
-                raise NotAvailable("process table", "unreadable or vanished member") from exc
+                raise NotAvailable("process table", "unreadable process list") from exc
+            for pid in pids:
+                try:
+                    yield ps.Process(pid).as_dict(attrs=attrs)
+                except ps.NoSuchProcess:
+                    continue
+                except ps.Error as exc:
+                    raise NotAvailable("process table", "unreadable member") from exc
         infos = strict_infos() if strict else (proc.info for proc in ps.process_iter(attrs))
         for info in infos:
             try:
                 pgid = os.getpgid(int(info["pid"]))
-            except ProcessLookupError as exc:  # vanished during the scan
-                if strict:
-                    raise NotAvailable("process table", "member vanished during scan") from exc
+            except ProcessLookupError:  # vanished during the scan
                 continue
             except OSError:
                 if strict:
@@ -396,9 +422,8 @@ def process_table(*, strict: bool = False) -> list[dict]:
                         "start": (demarrage + int(fields[19]) / hertz
                                   if demarrage is not None else None),
                         "zombie": fields[0] == "Z"})
-        except (FileNotFoundError, ProcessLookupError) as exc:
-            if strict:
-                raise NotAvailable("process table", "member vanished during scan") from exc
+        except (FileNotFoundError, ProcessLookupError):
+            # vanished during the scan: gone, so it cannot fork again
             continue
         except (OSError, ValueError, IndexError) as exc:
             if strict:

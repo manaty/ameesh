@@ -166,7 +166,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
         'status', 'status_text', 'model', 'budget_usd', 'spent_usd',
         'turns', 'last_error', 'lease_owner', 'lease_expires_at',
-        'lease_epoch', 'last_turn_at', 'last_seen', 'created_at',
+        'lease_epoch', 'lease_wait_since', 'last_turn_at', 'last_seen', 'created_at',
         'updated_at', 'public_key_fingerprint', 'key_updated_at',
         'key_revoked_at', 'key_role', 'responsible', 'team', 'provider',
         'credential_mode', 'ephemeral', 'ephemeral_expires_at',
@@ -425,6 +425,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('account_holds', ARRAY[
         'host', 'harness', 'account', 'until_ts', 'reason', 'created_at'
+    ]),
+    -- #254 (0392) : pause d'un hôte voulue par le propriétaire
+    ('host_holds', ARRAY[
+        'host', 'reason', 'author', 'created_at', 'until'
+    ]),
+    ('host_hold_events', ARRAY[
+        'id', 'host', 'action', 'author', 'reason', 'until', 'at'
     ]),
     ('account_switches', ARRAY[
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',

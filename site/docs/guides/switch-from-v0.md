@@ -398,6 +398,37 @@ the runner; `ameesh mail bind` refuses an `execute` agent without `--force`.
 (`pg_restore --clean --if-exists -d "$AMEESH_DSN" <file>`), reinstall the old
 code on each host, restart. Never the old code on the migrated database.
 
+### To 1.10.0: migrations 0058 and up, and the English renames
+
+v1.10.0 is a **minor** version: every migration it adds is additive (the exact
+list is the footer of `docs/versions/1.10.0.md`). Apply them with `ameesh
+migrate` before installing, from the same backup discipline as above:
+
+```bash
+pg_dump --format=custom --file ~/backups/ameesh-before-1.10.0-$(date +%F-%H%M).dump "$AMEESH_DSN"
+ameesh migrate           # 0058 … (all additive)
+```
+
+The L148 renaming lands in stages; the old spellings stay as **hidden,
+deprecated aliases**, so an unchanged script keeps working:
+
+| Old | New |
+|---|---|
+| `ameesh menage` | `ameesh housekeeping` |
+| `grand_livre` (module) | `ledger` |
+| `--tache` | `--lot` |
+| `--deploiement` | `--delivery` |
+| `--debut`, `--fin`, `--livraison` (planning) | `--start`, `--end`, `--delivery` |
+| French CLI option spellings | English spellings (the French ones are hidden aliases) |
+| `chantier` in the schema | `workstream` (twin kept in sync both ways, migration 0410) |
+| `scripts/carte.py` | `scripts/map.py` (old path kept as a compatibility alias) |
+
+The new commands and settings of 1.10.0 (host gate, budget caps per day, thread
+retention, heavy duration cap, personas, mediated executor) are described in
+[Configuration](../reference/configuration.md) and the
+[CLI reference](../reference/cli.md); the English drive (L156) moved the
+built-in help and the new output to English.
+
 ## Risks and countermeasures
 
 | Risk | Countermeasure |

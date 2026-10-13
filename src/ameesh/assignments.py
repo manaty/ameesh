@@ -35,13 +35,15 @@ class AssignmentError(RuntimeError):
     """Rattachement refusé : rien n'est déposé, le message dit quoi faire."""
 
 
-def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
+def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
     fiche Agent de son canon propriétaire dont `roles` nomme un orchestrateur
     (`sous_utilisation.orchestrators`), ou — tant que son organisation ne
     déclare aucun rôle (L242c) — agent qui a confié des lots dans les 30
     derniers jours. `roles` : les rôles du canon qui comptent (défaut :
-    orchestrateur ; `work.CORRECTOR_ROLES` ajoute les agents de conception)."""
+    orchestrateur ; `work.CORRECTOR_ROLES` ajoute les agents de conception).
+    `history=False` (#740) : les lots confiés ne comptent pas, seule une
+    déclaration compte."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -57,7 +59,8 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     row = dict(row or {}, name=name)
     try:
         return name in su.orchestrators(cfg, db, [row], declared=(), canons=canons,
-                                        roles=roles or su.ORCHESTRATOR_ROLES)
+                                        roles=roles or su.ORCHESTRATOR_ROLES,
+                                        history=history)
     except Exception:
         return False
 

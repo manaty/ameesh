@@ -4,7 +4,7 @@
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
-                [--take-idle S] [--take-max-per-hour N] [--take-paid]
+                [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
                 [--handoff-max-per-hour N] [--handoff-idle S]
         follows the operations alerts (`ameesh alerts --follow`, same
@@ -85,7 +85,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
                  "host_not_ready", "host_power_low",
-                 "host_unavailable", "host_drain_overdue", "backlog_empty", "mail_undeliverable",
+                 "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
@@ -112,7 +112,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain")
+                 "land_uncertain", "db_connections_high")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -136,6 +136,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
+    "db_connections_high": "database connection capacity",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -150,6 +151,8 @@ TYPE_LABELS = {
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
     "tmp_orphan": "/tmp entry left by a turn",
+    "tmp_unremovable": "temporary directory over quota with files it cannot remove",
+    "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
     "plan_underused": "underused plan",
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",
@@ -165,6 +168,7 @@ TYPE_LABELS = {
     "decision_pending": "decision pending",
     "decision_overdue": "decision unanswered by its deadline",
     "host_unavailable": "host unavailable",
+    "lease_not_taken": "runner cannot take its lease",
     "host_drain_overdue": "host drain overdue",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
@@ -191,11 +195,14 @@ TYPE_LABELS = {
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
     "critical_roles_unreadable": "canon unreadable: critical roles held",
+    # #254: not pushed by default (add it to `notify.types`)
+    "host_hold": "host on hold",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing", "critical_budget_pause", "owner_key_registered", "land_uncertain")
+                "credential_failing", "critical_budget_pause", "owner_key_registered",
+                "land_uncertain", "db_connections_high")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -1629,10 +1636,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
                         help="maximum auto-takes per rolling hour, for the whole mesh "
                              "(default 2)")
-    parser.add_argument("--take-paid", action="store_true",
-                        default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
-                        help="allow auto-take by pay-per-token agents (after plan agents; "
-                             "never during balance_low)")
+    # #754 : la prise par un agent au token est acquise — après les forfaits,
+    # jamais sous `balance_low` (owner, 13/10) ; l'ancien `--take-paid` reste
+    # accepté, sans effet, pour les unités qui le passent encore.
+    parser.add_argument("--take-paid", action="store_true", help=argparse.SUPPRESS)
     # L165 : prise d'un lot non assigné de l'équipe, avant la file
     parser.add_argument("--take-lot-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
@@ -1683,7 +1690,6 @@ def take_settings(args) -> dict | None:
     if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "allow_paid": bool(getattr(args, "take_paid", False)),
             "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
 
 
