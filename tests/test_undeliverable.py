@@ -838,6 +838,98 @@ class SweepTest(_Base):
         self.assertEqual(self.pending("claude3"), ["Rapport."])
         self.assertEqual(self.pending("mesh-design"), [])
 
+    # -- relecture codex3, B1 RÉSIDUEL : l'absence se sérialise aussi --------
+    #
+    # `FOR SHARE`/`FOR UPDATE` ne verrouillent que les lignes PRÉSENTES : une
+    # inscription concurrente d'un nom absent pouvait se committer entre la
+    # lecture d'absence et l'écriture. Les chemins de création prennent
+    # désormais le même verrou advisory par nom (`registry.NAME_LOCK_*`) que la
+    # décision ; ces témoins exigent que l'inscription ATTENDE ce verrou.
+
+    def _attend_verrou_inscription(self, register):
+        self._attend_verrou("pg_advisory_xact_lock")
+        self.assertTrue(register.is_alive(), "l'inscription a devancé la décision")
+
+    def test_expire_nom_absent_attend_une_inscription_concurrente(self):
+        mid = mail.send(self.db, "claude1", "fantome", "Rapport.")
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'"
+                        " WHERE id = %s", (mid,))
+        started, release = threading.Event(), threading.Event()
+        errors = []
+
+        def hold():
+            try:
+                with ScopedDb(self.cfg).transaction() as tx:
+                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
+                    started.set()
+                    release.wait(15)
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
+        worker, out = self._travail_concurrent(
+            lambda db: storage.of(db).mailbox.expire_dead_letters(
+                "fantome", {"by": "test"}, time.time()))
+        self._attend_verrou("jsonb_build_object('expired'")
+        register, reg_out = self._travail_concurrent(
+            lambda db: registry.upsert(db, "fantome", status="idle"))
+        self._attend_verrou_inscription(register)
+        release.set()
+        holder.join(20)
+        worker.join(20)
+        register.join(20)
+        self.assertFalse(holder.is_alive() or worker.is_alive() or register.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("error", out, out.get("error"))
+        self.assertNotIn("error", reg_out, reg_out.get("error"))
+        # ordre sérialisé : l'expiration (nom absent à sa décision) commite
+        # avant l'inscription, qui attendait le verrou par nom
+        self.assertEqual([r["id"] for r in out["value"]], [mid])
+        self.assertEqual(reg_out["value"]["name"], "fantome")
+        self.assertEqual(self.db.query(
+            "SELECT status FROM agent_registry WHERE name = 'fantome'"),
+            [{"status": "idle"}])
+        self.assertEqual(self.pending("fantome"), [])
+
+    def test_forward_nom_absent_attend_une_inscription_concurrente(self):
+        mid = mail.send(self.db, "claude1", "fantome", "Rapport.")
+        started, release = threading.Event(), threading.Event()
+        errors = []
+
+        def hold():
+            try:
+                with ScopedDb(self.cfg).transaction() as tx:
+                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
+                    started.set()
+                    release.wait(15)
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
+        worker, out = self._travail_concurrent(
+            lambda db: storage.of(db).mailbox.forward("fantome", "mesh-design", "test"))
+        self._attend_verrou("ORDER BY m.id FOR UPDATE")
+        register, reg_out = self._travail_concurrent(
+            lambda db: registry.upsert(db, "fantome", status="idle"))
+        self._attend_verrou_inscription(register)
+        release.set()
+        holder.join(20)
+        worker.join(20)
+        register.join(20)
+        self.assertFalse(holder.is_alive() or worker.is_alive() or register.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("error", out, out.get("error"))
+        self.assertNotIn("error", reg_out, reg_out.get("error"))
+        # le renvoi (old absent à sa décision) commite avant l'inscription
+        self.assertEqual(len(out["value"]), 1)
+        self.assertEqual(self.pending("fantome"), [])
+        self.assertEqual(self.pending("mesh-design"), ["Rapport."])
+        self.assertEqual(reg_out["value"]["name"], "fantome")
+
 
 if __name__ == "__main__":
     unittest.main()

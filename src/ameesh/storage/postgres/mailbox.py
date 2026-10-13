@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from .. import interface
-from .registry import canon_governed_sql
+from .registry import NAME_LOCK_SQL, canon_governed_sql, name_lock_key
 
 #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
 #: gouverné par le canon, sinon son chantier, désormais `workstream` (un
@@ -397,13 +397,23 @@ class Mailbox(interface.Mailbox):
         # message pris entre-temps par une remise (verrou de ligne, WHERE
         # réévalué) n'est pas renvoyé.
         with self.db.transaction() as tx:
-            # L976 (relecture codex3, B1) : la décision est prise ICI, sous le
-            # verrou des deux lignes du registre (`FOR UPDATE`, par ordre de
-            # nom : deux renvois croisés ne s'interbloquent pas) et le statut
-            # est relu après l'attente éventuelle. Une relance de `old` ou un
-            # arrêt de `new` committé entre la lecture et la copie bloquait
-            # jusqu'ici sans être revu : il bloque désormais sur ce verrou
-            # jusqu'à notre commit, donc jamais entre la décision et la copie.
+            # L976 (R2 delta codex3, B1 résiduel) : le verrou par nom est pris
+            # AVANT toute lecture du registre, et les chemins de création
+            # prennent le même (`registry.NAME_LOCK_CTE`). L'absence d'une
+            # ligne — qu'un `FOR UPDATE` ne verrouille pas — ne peut donc plus
+            # se glisser entre la lecture et la copie : une inscription
+            # concurrente attend notre commit, et si elle l'a gagné, la lecture
+            # ci-dessous la voit (instantané de l'instruction suivante).
+            # Deux renvois croisés prennent les verrous par ordre de clé.
+            for key in sorted({name_lock_key(old), name_lock_key(new)}):
+                tx.query(NAME_LOCK_SQL, (key,))
+            # Puis la décision sous le verrou des deux lignes du registre
+            # (`FOR UPDATE`, par ordre de nom : deux renvois croisés ne
+            # s'interbloquent pas) et le statut est relu après l'attente
+            # éventuelle. Une relance de `old` ou un arrêt de `new` committé
+            # entre la lecture et la copie bloquait jusqu'ici sans être revu :
+            # il bloque désormais sur ce verrou jusqu'à notre commit, donc
+            # jamais entre la décision et la copie.
             locked = {row["name"]: row["status"] for row in tx.query(
                 "SELECT name, status FROM agent_registry"
                 " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))}
@@ -465,16 +475,17 @@ class Mailbox(interface.Mailbox):
 
     def expire_dead_letters(self, recipient, note, before_ts, dry_run=False) -> list[dict]:
         # L976 : expire le courrier en souffrance d'une boîte morte. La
-        # décision (boîte morte) est prise DANS l'instruction, sous le verrou
-        # de la ligne du registre (`FOR SHARE`) : une relance concurrente
-        # bloque jusqu'à notre commit, le statut est relu après l'attente —
-        # le courrier d'un vivant n'est jamais expiré (relecture codex3, B1).
-        # Nom absent : pas de ligne à verrouiller ; l'absence est constatée au
-        # début de l'instruction, donc une inscription committée ensuite est
-        # ordonnée après l'expiration. Mêmes exclusions que `dead_letters`
+        # décision (boîte morte) est prise sous le verrou par nom
+        # (`registry.NAME_LOCK_*`, partagé avec les chemins de création), puis
+        # sous le verrou de la ligne du registre quand elle existe (`FOR
+        # SHARE`) : une relance concurrente comme une inscription d'un nom
+        # absent bloquent jusqu'à notre commit, et le statut est relu après
+        # l'attente — le courrier d'un vivant n'est jamais expiré (relectures
+        # codex3, B1 puis B1 résiduel). Mêmes exclusions que `dead_letters`
         # (L124 : une demande de décision attend un humain) et que `forward`
         # (réservation active : le message est peut-être montré). `before_ts` :
-        # seuls les messages reçus avant ce seuil (la rétention).
+        # seuls les messages reçus avant ce seuil (la rétention). `dry_run` :
+        # lecture seule, sans verrou.
         v = ("WITH v AS (SELECT name, status FROM agent_registry"
              " WHERE name = %%s FOR SHARE) ")
         where = """
@@ -492,14 +503,24 @@ class Mailbox(interface.Mailbox):
                                  % (columns, where),
                                  (recipient, recipient, float(before_ts)))
         else:
-            rows = self.db.query(
-                (v + """
-                UPDATE agent_mailbox AS m
-                   SET delivered_at = now(), status = 'delivered',
-                       meta = m.meta || jsonb_build_object('expired', %%s::jsonb)
-                %s
-                 RETURNING %s
-                """) % (where, columns),
-                (recipient, json.dumps(note or {}, ensure_ascii=False), recipient,
-                 float(before_ts)))
+            # L976 (relecture codex3, B1 résiduel) : le verrou par nom est pris
+            # dans une instruction À PART, avant la décision : une inscription
+            # concurrente prend le même verrou (chemins de création), donc soit
+            # elle a gagné et la lecture de l'instruction suivante la voit,
+            # soit elle attend notre commit — l'absence ne se glisse plus entre
+            # la lecture et l'écriture (une seconde lecture sans verrou ne
+            # suffit pas : l'instantané d'une même instruction ne se rafraîchit
+            # pas après l'attente sur le verrou).
+            with self.db.transaction() as tx:
+                tx.query(NAME_LOCK_SQL, (name_lock_key(recipient),))
+                rows = tx.query(
+                    (v + """
+                    UPDATE agent_mailbox AS m
+                       SET delivered_at = now(), status = 'delivered',
+                           meta = m.meta || jsonb_build_object('expired', %%s::jsonb)
+                    %s
+                     RETURNING %s
+                    """) % (where, columns),
+                    (recipient, json.dumps(note or {}, ensure_ascii=False), recipient,
+                     float(before_ts)))
         return sorted(rows, key=lambda row: int(row["id"]))
