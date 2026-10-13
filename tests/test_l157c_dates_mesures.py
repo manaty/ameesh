@@ -332,6 +332,12 @@ class ScheduleByHandPgTest(PgTestCase):
         storage.of(self.db).work.publish_reference(BODY, actor="auditeur")
         proc = self.mesh("work", "schedule", "--apply", "--actor", "orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # a delivery date alone is never written by the schedule: its source stays
+        proc = self.mesh("work", "plan", str(a["id"]), "--delivery", "2030-02-01",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(storage.of(self.db).roadmap.item_plans([a["id"]])[0]
+                        ["planned_source"].startswith("reference p80 (table #"))
         proc = self.mesh("work", "plan", str(a["id"]), "--start", "2030-01-01",
                          "--end", "2030-01-02", "--actor", "orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)

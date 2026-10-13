@@ -169,10 +169,11 @@ def _hand_source(current: dict, dates: dict, source: str | None, actor: str) -> 
     Without `--source`, the stored source is kept as it is. When the planner
     (`work schedule --apply`) dated the task, that source is the planner's, and
     its next pass would overwrite the date set by hand: the date then records
-    who set it. A source written by a person stays."""
+    who set it. A source written by a person stays. Only the start and the
+    end count: the planner never writes the delivery date."""
     from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
 
-    if source is not None or all(value is None for value in dates.values()):
+    if source is not None or (dates.get("start") is None and dates.get("end") is None):
         return source
     if str(current.get("planned_source") or "").startswith(SOURCE):
         return "set by %s" % (actor or "hand")
