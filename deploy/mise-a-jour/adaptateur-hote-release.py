@@ -219,6 +219,8 @@ class HostAdapter:
             if step in ('backup', 'pin', 'accept'):
                 if self.recovery_set is None:
                     raise FactoryError('recovery set capability unavailable')
+                if step == 'pin':
+                    return self._pin(request)
                 return self._complete(request, self.recovery_set.perform(step, request, self.release(request)))
             return self._complete(request, self._intrinsic(step, request))
         except self.DEFINITIVE:
@@ -238,6 +240,22 @@ class HostAdapter:
         if value is not True:
             raise FactoryError('host action incomplete')
         return dict(request, ok=True)
+
+    def _pin(self, request):
+        """One pin step binds every durable prerequisite, not just the dump.
+
+        `configure` refuses without the private configuration journal, and
+        `activate`/`rollback` refuse without the operation's pinned release
+        pair. All three pins are therefore performed here, before the fence,
+        and each one is idempotent so a lost reply can be replayed safely.
+        """
+        release = self.release(request)
+        receipt = self._complete(request, self.recovery_set.perform('pin', request, release))
+        if receipt['ok'] is not True:
+            return receipt
+        self.files.perform(request, release)
+        environnement.pin_switch(self.store, request['operation'], request['manifest']['release'])
+        return receipt
 
     def _intrinsic(self, step, request):
         release = self.release(request)

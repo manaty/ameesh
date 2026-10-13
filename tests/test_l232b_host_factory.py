@@ -6,6 +6,7 @@ The disposable fixture root is the only filesystem touched.
 """
 from tests import support
 from tests import test_l232b_bootstrap_files as fixture
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -42,10 +43,15 @@ class Database:
 
 class System:
     """Fixed executables are real files; systemd effects stay simulated."""
-    def __init__(self,systemctl,analyze): self.systemctl=str(systemctl); self.analyze=str(analyze)
+    def __init__(self,systemctl,analyze):
+        self.systemctl=str(systemctl); self.analyze=str(analyze); self.overrides={}
     def verify(self,files,seconds): return 0
     def reload(self,seconds): return 0
-    def show(self,unit,properties,seconds): return {}
+    def show(self,unit,properties,seconds):
+        values=dict(FragmentPath='',DropInPaths='',LoadState='loaded',
+                    NeedDaemonReload='no',ActiveState='active')
+        values.update(self.overrides.get(unit,{}))
+        return values
 
 
 class Fence:
@@ -53,6 +59,9 @@ class Fence:
     def perform(self,step,request,*,drain_seconds=0):
         self.steps.append(step); return dict(request,ok=True)
     def fenced(self,request): return True
+    @contextmanager
+    def guard(self,request):
+        self.steps.append('guard:'+request['step']); yield
 
 
 class Transport:
@@ -102,6 +111,9 @@ class HostFactoryTest(unittest.TestCase):
         self.db=Database(); self.authority=Authority()
         self.destinations=dict(unit='/etc/systemd/system/fixture.service',
                                guard='/etc/ameesh/guard.json')
+        self.systemroot=self.temp/'system'
+        for logical in self.destinations.values():
+            (self.systemroot/logical.lstrip('/')).parent.mkdir(mode=0o700,parents=True,exist_ok=True)
         self.card=dict(units=['ameesh-runner@one.service'],properties={},guard=None,seconds=30)
         self.known_hosts=self.temp/'known_hosts'; self.known_hosts.write_text('host ssh-ed25519 AAAA\n')
         self.identity=self.temp/'identity'; self.identity.write_text('PRIVATE-KEY-CANARY\n')
@@ -130,8 +142,10 @@ class HostFactoryTest(unittest.TestCase):
 
     def _release(self,commit,configuration=None):
         document=dict(commit=commit,python='/fixture/python',python_sha256='f'*64,wheels=[],
-                      configuration=configuration or {name:dict(content=name+'\n',mode=0o644)
-                                                      for name in self.destinations})
+                      configuration=configuration or {
+                          name:dict(content=('{"guard": true}\n' if name=='guard' else name+'\n'),
+                                    mode=0o644)
+                          for name in self.destinations})
         identity=hashlib.sha256(json.dumps(document,sort_keys=True).encode()).hexdigest()
         return document,commit+'-'+identity
 
@@ -163,10 +177,11 @@ class HostFactoryTest(unittest.TestCase):
         return dict(operation='release-fixture',manifest_digest=factory.protocol.identity(manifest),
                     action_id='release-fixture:'+step,manifest=manifest,step=step)
 
-    def build(self,*,capabilities=None):
+    def build(self,*,capabilities=None,root=None):
         return factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
             store=self.store,configuration_journal=self.journal,backup_root=self.backup,
             retention_root=self.retention,system=self.system,
+            root=self.systemroot if root is None else root,
             capabilities=capabilities if capabilities is not None else
                 {'sauvegarde-release':self.recovery,'sante-release':self.health})
 
@@ -245,6 +260,42 @@ class HostFactoryTest(unittest.TestCase):
         self.assertEqual(self.fence.steps,['fence','unfence','recovery_fence','recovery_unfence'])
         self.assertEqual(self.transport_fake.steps,['restart','recovery_restart'])
         # activate switched to the signed target, rollback restored the pinned prior pair
+        self.assertEqual(os.readlink(self.store/'current'),self.releases['previous'])
+
+    def test_real_pin_binds_configuration_and_switch_before_configure(self):
+        # B1 witness: with the real files/host_configuration adapter, the pin
+        # step must create the configuration journal and the release-switch
+        # pair. A pin that only reaches the recovery set leaves configure
+        # definitively refused and activate/rollback without their file.
+        value=self.build()
+        value.admit(self.enrollment)
+        adapter=value.for_operation(dict(operation='release-fixture'),self.authority)
+        adapter.fence=self.fence; adapter.files.gate=self.fence
+        adapter.transport=self.transport_fake
+        for logical in ('/etc/systemd/system/ameesh-runner@.service',
+                        '/etc/systemd/system/ameesh-runner@.service.d/10-plafonds.conf'):
+            path=self.systemroot/logical.lstrip('/')
+            path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            path.write_text('[Unit]\n'); path.chmod(0o644)
+        self.system.overrides['ameesh-runner@one.service']=dict(
+            FragmentPath='/etc/systemd/system/ameesh-runner@.service',
+            DropInPaths='/etc/systemd/system/ameesh-runner@.service.d/10-plafonds.conf')
+        # setUp pinned the switch by hand; the real pin must recreate it.
+        (self.store/'.operations'/'release-fixture.json').unlink()
+        self.assertFalse((self.journal/'release-fixture.configuration.json').exists())
+        self.assertEqual(adapter.perform('pin',self.request('pin')),
+                         dict(self.request('pin'),ok=True))
+        self.assertTrue((self.journal/'release-fixture.configuration.json').is_file())
+        self.assertTrue((self.store/'.operations'/'release-fixture.json').is_file())
+        self.assertEqual(self.recovery.steps,['pin'])
+        self.assertEqual(adapter.perform('configure',self.request('configure')),
+                         dict(self.request('configure'),ok=True))
+        self.assertEqual((self.systemroot/'etc/systemd/system/fixture.service').read_text(),'unit\n')
+        self.assertEqual(adapter.perform('activate',self.request('activate')),
+                         dict(self.request('activate'),ok=True))
+        self.assertEqual(os.readlink(self.store/'current'),self.releases['target'])
+        self.assertEqual(adapter.perform('rollback',self.request('rollback')),
+                         dict(self.request('rollback'),ok=True))
         self.assertEqual(os.readlink(self.store/'current'),self.releases['previous'])
 
     def test_unknown_release_and_partial_capability_are_definitive_not_effects(self):
