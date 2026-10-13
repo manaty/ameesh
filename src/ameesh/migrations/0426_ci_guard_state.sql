@@ -14,9 +14,11 @@
 --       `created_at` de son run, et un run `in_progress` peut encore porter un
 --       job en file.
 --
--- `ci_queue_starved` (#747) reste l'alerte symétrique : une exécution attend
--- un runner alors que les runners sont idle. Ici les runners sont occupés (a)
--- ou la file est simplement longue (b) : trois clés d'alerte distinctes.
+-- Chevauchement #747/#845 tranché par le pilote (13/10 11:02) : #747 garde
+-- l'observation du temps d'attente des exécutions (colonnes, durées, `ci
+-- status`) mais retire sa notification `ci_queue_starved`, qui faisait doublon
+-- avec (b) ; (a) et (b) restent les deux seules clés d'alerte, une par cause
+-- et par dépôt, et #845 porte seul le signal de capacité.
 set local lock_timeout = '5s';
 
 create table if not exists ci_runner_state (
