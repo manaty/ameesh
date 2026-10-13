@@ -573,7 +573,7 @@ def _inside(target: str, real: str | None, is_dir: bool) -> bool:
 
 
 def holders(path: str | None, needle: str | None = None, exclude=(), *,
-            mapped: bool = False) -> list[dict]:
+            mapped: bool = False, doubt: bool = False) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
@@ -582,20 +582,28 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     détenteur : `{"pid", "why", "cmd"}`.
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
-    si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
-    n'offre aucun moyen de les lire, ou (L63b) si un processus du même
-    utilisateur refuse la lecture de ses fichiers ouverts (non dumpable) sans
-    être le gestionnaire de services, `NotAvailable` : une liste vide voudrait
+    si ce processus-ci ne peut même pas lire SES fichiers ouverts, ou si l'OS
+    n'offre aucun moyen de les lire, `NotAvailable` : une liste vide voudrait
     dire « personne ne tient la session », ce qui n'aurait pas été vérifié.
+
+    `doubt` (L63b ; portée corrigée #388, constat auditeur 16:46) : avec
+    True, un processus du même utilisateur qui refuse la lecture de ses
+    fichiers ouverts (non dumpable) et n'est pas le gestionnaire de services
+    est lui aussi un doute, et `NotAvailable` est levée. C'est le contrôle
+    strict d'`adopt`/`resume`, qui doit refuser plutôt que de croire à une
+    session fermée. Faux par défaut : un voisin illisible de l'hôte
+    (ssh-agent, processus d'un autre agent) ne rend plus fail-closed le
+    ménage /tmp, les worktrees, deps ou build_artifacts, qui restent au
+    meilleur effort comme avant L63b.
     `path` None : `needle` seul, l'OS toujours exigé (L63b)."""
     real = os.path.realpath(path) if path else None
     is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped, doubt)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude, mapped)
+        return _holders_proc(real, is_dir, needle, exclude, mapped, doubt)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
 
@@ -754,7 +762,8 @@ def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | Non
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
+                    doubt=False) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
@@ -766,10 +775,10 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
     if _proc_ok():   # Linux: the same reading of a doubt as the /proc way
         uid, managers = os.getuid(), _once(service_managers)
 
-        def doubt(pid):
+        def why(pid):
             return _doubt_proc(pid, uid, managers)
     else:
-        def doubt(pid):
+        def why(pid):
             return _doubt_psutil(ps, pid, user)
     found = []
     doubts: dict = {}
@@ -810,11 +819,12 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
         row = _verdict(pid, hit, argv, needle, exclude)
         if row:
             found.append(row)
-        elif refused:
-            who = doubt(pid)
+        elif refused and doubt:
+            who = why(pid)
             if who:
                 doubts[pid] = who
-    _settle(doubts, doubt)
+    if doubt:
+        _settle(doubts, why)
     return found
 
 
@@ -851,7 +861,8 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     return ""
 
 
-def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_proc(real, is_dir, needle, exclude, mapped=False,
+                  doubt=False) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -904,11 +915,12 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
         row = _verdict(int(pid), hit, argv, needle, exclude)
         if row:
             found.append(row)
-        elif refused:
+        elif refused and doubt:
             who = _doubt_proc(pid, uid, managers)
             if who:
                 doubts[pid] = who
-    _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers))
+    if doubt:
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers))
     return found
 
 

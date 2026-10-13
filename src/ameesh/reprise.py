@@ -225,14 +225,21 @@ def holders(path: str | None, session_id: str) -> list[dict]:
     Par la couche plateforme (L63) ; les processus illisibles (autre
     utilisateur, disparus) sont ignorés.
 
-    Lève `platform.NotAvailable` si l'OS ne permet pas de le vérifier :
-    jamais de liste vide qui voudrait dire « personne » sans contrôle.
+    Lève `platform.NotAvailable` si l'OS ne permet pas de le vérifier, ou si
+    un processus du même utilisateur refuse la lecture de ses fichiers ouverts
+    (non dumpable, hors gestionnaire de services) : jamais de liste vide qui
+    voudrait dire « personne » sans contrôle. C'est le seul appelant qui
+    demande ce doute strict (`doubt=True`, L63b) ; le ménage /tmp, les
+    worktrees, deps et build_artifacts restent au meilleur effort (#388,
+    constat auditeur 16:46 : un voisin illisible de l'hôte ne doit pas les
+    rendre fail-closed).
 
     Limite connue : Claude Code n'ouvre son journal que le temps d'une
     écriture ; une session interactive démarrée sans `--resume` n'est donc vue
     que si elle écrit au moment du contrôle.
     """
-    return platform.holders(path, session_id, exclude=platform.ancestry())
+    return platform.holders(path, session_id, exclude=platform.ancestry(),
+                            doubt=True)
 
 
 def session_cwd(harness: str, path: str) -> str | None:

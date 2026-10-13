@@ -12,11 +12,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
+import sys
 import time
 import unittest
 from unittest import mock
 
-from ameesh import account_turn, accounts, fil, mail, registry, reprise, storage, work
+from ameesh import (account_turn, accounts, fil, mail, platform, registry, reprise,
+                    storage, work)
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -55,6 +58,15 @@ def _rollout(home: str, sid: str, cwd: str, used_percent: float | None = None) -
 class _Base(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
+        # #388 (constat auditeur 16:46) : le doute strict d'adopt/resume lit la
+        # table des processus de l'hôte ; un voisin illisible (gpg-agent,
+        # ssh-agent) rendrait ces tests dépendants de la machine. On neutralise
+        # ce doute ici — son comportement (strict contre meilleur effort) est
+        # testé dans test_l63_platform.
+        for nom in ("_doubt_proc", "_doubt_psutil"):
+            patcheur = mock.patch.object(platform.process, nom, return_value=None)
+            patcheur.start()
+            self.addCleanup(patcheur.stop)
         for table in ("account_active", "account_holds", "account_switches", "turn_costs",
                       "spend_pending", "quota_gauge_readings"):
             self.db.execute("DELETE FROM %s" % table)
@@ -87,6 +99,21 @@ class _Base(PgTestCase):
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         return runner, AgentWorker(runner, registry.get(self.db, name), lease)
+
+    def _mesh_sans_doute(self, *args: str, env: dict | None = None,
+                         timeout: float = 60.0) -> subprocess.CompletedProcess:
+        """`self.mesh`, mais dans un processus où le doute strict d'adopt/resume
+        est neutralisé : le patch de `_Base` ne traverse pas un processus neuf,
+        et un voisin illisible de l'hôte (gpg-agent) ne doit pas décider du
+        test (#388, constat auditeur 16:46). Le doute lui-même est testé dans
+        test_l63_platform."""
+        lanceur = ("from ameesh.platform import process;"
+                   " process._doubt_proc = lambda *a, **k: None;"
+                   " process._doubt_psutil = lambda *a, **k: None;"
+                   " from ameesh.main import main; raise SystemExit(main())")
+        return subprocess.run([sys.executable, "-c", lanceur, *args],
+                              capture_output=True, text=True, timeout=timeout,
+                              env=env or self.env(), cwd=self.tmp)
 
     def _tour(self, worker) -> dict | None:
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
@@ -222,16 +249,18 @@ class AdoptTest(_Base):
         with open(config, "w", encoding="utf-8") as fh:
             json.dump({"accounts": comptes}, fh)
         self._externe("coord")
-        proc = self.mesh("adopt", "coord", "--session", SID, "--harness", "codex", "--json",
-                         env=self.env(AMEESH_CONFIG=config))
+        proc = self._mesh_sans_doute("adopt", "coord", "--session", SID, "--harness",
+                                     "codex", "--json",
+                                     env=self.env(AMEESH_CONFIG=config))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         out = json.loads(proc.stdout)
         self.assertEqual((out["agent"], out["account"]), ("coord", "secondaire"))
         proc = self.mesh("show", "coord")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("session  : %s (account secondaire)" % SID, proc.stdout)
-        proc = self.mesh("adopt", "coord", "--session", "absente", "--harness", "codex",
-                         env=self.env(AMEESH_CONFIG=config))
+        proc = self._mesh_sans_doute("adopt", "coord", "--session", "absente",
+                                     "--harness", "codex",
+                                     env=self.env(AMEESH_CONFIG=config))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("not found", proc.stderr)
 

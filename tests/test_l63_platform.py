@@ -244,10 +244,30 @@ class PlatformTest(unittest.TestCase):
                         mock.patch.object(platform, "SYSTEM", "linux"):
                     if refus:
                         with self.assertRaises(platform.NotAvailable) as ctx:
-                            platform.holders(__file__, "x")
+                            platform.holders(__file__, "x", doubt=True)
                         self.assertIn("4242", str(ctx.exception))
                     else:
-                        self.assertEqual(platform.holders(__file__, "x"), [])
+                        self.assertEqual(platform.holders(__file__, "x", doubt=True), [])
+
+    def test_le_doute_ne_ferme_que_le_controle_strict(self):
+        """#388, défaut B (auditeur, 16:46) : le doute d'un voisin illisible de
+        l'hôte ne doit pas rendre fail-closed le ménage /tmp, les worktrees,
+        deps ou build_artifacts ; seul adopt/resume demande le contrôle strict."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = "%d %d %d %d" % ((os.getuid(),) * 4)
+        racine = self._faux_proc("node", moi)
+        with mock.patch.object(platform, "psutil", None), \
+                mock.patch.object(platform.process, "PROC", racine), \
+                mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                mock.patch.object(platform.process, "service_managers",
+                                  return_value=frozenset()), \
+                mock.patch.object(platform, "SYSTEM", "linux"):
+            # meilleur effort (défaut) : liste vide, aucune exception
+            self.assertEqual(platform.holders(__file__, "x"), [])
+            # strict (adopt/resume) : le doute refuse
+            with self.assertRaises(platform.NotAvailable):
+                platform.holders(__file__, "x", doubt=True)
 
     def test_un_processus_qui_se_termine_n_est_pas_un_doute(self):
         """CI #377 r2 : un `git` en fin de vie refuse son `fd` avant d'être
@@ -366,9 +386,9 @@ class PlatformTest(unittest.TestCase):
                         mock.patch.object(platform.process, "DOUBT_RETRY_S", 0):
                     if refus:
                         with self.assertRaises(platform.NotAvailable):
-                            platform.holders(__file__, "x")
+                            platform.holders(__file__, "x", doubt=True)
                     else:
-                        self.assertEqual(platform.holders(__file__, "x"), [])
+                        self.assertEqual(platform.holders(__file__, "x", doubt=True), [])
 
     def test_mesures_de_l_hote(self):
         for nom, ctx in self.variants:
@@ -464,6 +484,14 @@ class AdoptFailClosedTest(PgTestCase):
                 self.assertEqual(row["mode"], "externe")
                 self.assertNotEqual(row.get("session_id"), sid)
         self.assertNotIn("without checking", self._fil())
+
+    def test_le_controle_d_adopt_demande_le_doute_strict(self):
+        """#388 : adopt/resume reste le seul appelant du doute strict ; la
+        plateforme garde le meilleur effort pour les autres couches."""
+        from ameesh import reprise
+        with mock.patch.object(platform, "holders", return_value=[]) as appel:
+            reprise.holders(__file__, "sid-x")
+        self.assertIs(appel.call_args.kwargs.get("doubt"), True)
 
     def test_force_sur_une_session_vue_ouverte_reste_journalise(self):
         from ameesh import registry, reprise
