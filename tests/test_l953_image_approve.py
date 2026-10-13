@@ -13,7 +13,10 @@ Ils verrouillent aussi ce que l'arbitrage du pilote du 13/10/2026 (corrige par
 la consigne du bureau le meme jour) impose : aucune publication avant la
 fusion, publication depuis main seulement, runner auto-heberge, permissions
 minimales, delai maximal, tag immuable sha-<12>, conteneur non-root sans
-secret.
+secret. Le N P2 de la relecture bureau (13/10/2026) est verrouille par un
+temoin : les jetons (GHCR, bearer) passent par la configuration lue sur stdin
+(`-K -`), jamais par argv, que /proc exposerait sur un hote a plusieurs
+runners.
 """
 from __future__ import annotations
 
@@ -34,6 +37,8 @@ POLICY = REPO / "docs" / "IMAGE-APPROVE.md"
 IMAGE = "ghcr.io/manaty/ameesh-approve"
 SHA_TAG = "sha-0123456789ab"
 VERSION = "9.9.9"
+TOKEN = "canari-ghcr-953"      # jeton GHCR injecte : jamais en argv (N P2)
+BEARER = "canari-bearer-953"   # bearer rendu par le faux registre
 
 # Faux curl : un mini-registre de manifestes, sans reseau ni jeton.
 FAKE_CURL = '''#!/usr/bin/env python3
@@ -49,8 +54,14 @@ ERRORS = FAKE / "errors"
 
 method = "GET"
 out = dump = wfmt = data = url = None
+user = None
 headers = {}
 args = sys.argv[1:]
+
+# argv de chaque invocation : le temoin N P2 verifie qu'aucun secret n'y est.
+with (FAKE / "curl.log").open("a") as journal:
+    journal.write(" ".join(args) + "\\n")
+
 i = 0
 while i < len(args):
     arg = args[i]
@@ -61,6 +72,24 @@ while i < len(args):
         i += 1
         name, _, value = args[i].partition(":")
         headers[name.strip().lower()] = value.strip()
+    elif arg == "-u":
+        i += 1
+        user = args[i]
+    elif arg == "-K":
+        i += 1
+        if args[i] != "-":
+            sys.stderr.write("faux curl : config seulement sur stdin\\n")
+            sys.exit(8)
+        for ligne in sys.stdin.read().splitlines():
+            cle, _, valeur = ligne.partition("=")
+            valeur = valeur.strip()
+            if len(valeur) >= 2 and valeur[0] == '"' and valeur[-1] == '"':
+                valeur = valeur[1:-1]
+            if cle.strip().lower() == "user":
+                user = valeur
+            elif cle.strip().lower() == "header":
+                name, _, value = valeur.partition(":")
+                headers[name.strip().lower()] = value.strip()
     elif arg == "-o":
         i += 1
         out = args[i]
@@ -73,7 +102,7 @@ while i < len(args):
     elif arg == "--data-binary":
         i += 1
         data = args[i][1:] if args[i].startswith("@") else None
-    elif arg in ("-u", "--data-urlencode"):
+    elif arg == "--data-urlencode":
         i += 1
     if not arg.startswith("-"):
         url = arg
@@ -101,7 +130,10 @@ def respond(code, body=b"", ctype=None, digest=None):
 
 
 if "/token" in url:
-    respond(200, b'{"token": "jeton-de-test"}', "application/json")
+    if not user:
+        sys.stderr.write("faux curl : echange de jeton sans identifiants\\n")
+        sys.exit(5)
+    respond(200, b'{"token": "canari-bearer-953"}', "application/json")
 
 if (FAKE / "network-down").exists():
     sys.exit(7)
@@ -112,6 +144,10 @@ if not path.startswith(prefix):
     sys.stderr.write("faux curl : URL inattendue " + url + "\\n")
     sys.exit(3)
 ref = urllib.parse.unquote(path[len(prefix):])
+
+if not headers.get("authorization"):
+    sys.stderr.write("faux curl : requete registre sans bearer\\n")
+    sys.exit(6)
 
 if (ERRORS / ref).exists():
     respond(int((ERRORS / ref).read_text().strip()))
@@ -252,6 +288,17 @@ class ScriptInvariantsTest(unittest.TestCase):
         self.assertIn("--data-binary @", self.text)
         self.assertIn("promotion du manifeste distant", self.text)
 
+    def test_les_secrets_ne_passent_pas_en_argv(self):
+        # N P2 (bureau) : identifiants et bearer lus par curl sur stdin. Le
+        # seul `-u` restant est celui de docker login (nom seul, mot de passe
+        # sur stdin) : les formes historiques en argv ne doivent plus exister.
+        self.assertNotIn('-u "$GHCR_USER:$GHCR_TOKEN"', self.text)
+        self.assertNotIn('-H "Authorization: Bearer $token"', self.text)
+        # les trois appels reseau (jeton, lookup, PUT) lisent la config stdin
+        self.assertEqual(len(re.findall(r"\|\s*curl\b[^\n]*-K -", self.text)), 3)
+        self.assertIn("config_value", self.text)
+        self.assertIn("--password-stdin", self.text)
+
 
 class PublishBehaviourTest(unittest.TestCase):
     """B1/B2 exerces sur un faux registre : aucune suite, aucun reseau."""
@@ -275,7 +322,7 @@ class PublishBehaviourTest(unittest.TestCase):
             "SHA_TAG": SHA_TAG,
             "VERSION": VERSION,
             "GHCR_USER": "x-access-token",
-            "GHCR_TOKEN": "jeton-de-test",
+            "GHCR_TOKEN": TOKEN,
         })
 
     def _bin(self, name, code):
@@ -405,6 +452,18 @@ class PublishBehaviourTest(unittest.TestCase):
         self.assertEqual(self._pushed(), [])
         self.assertFalse((self.fake / "requests.log").exists())
 
+    def test_aucun_secret_dans_argv_des_curl(self):
+        # N P2 du bureau (13/10 20:1xZ) : sur l'hote ameesh-ci, plusieurs
+        # runners partagent l'utilisateur et /proc expose argv. Le jeton GHCR
+        # et le bearer passent par la configuration lue sur stdin (`-K -`) :
+        # le journal des invocations de curl ne doit en porter aucun.
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log = (self.fake / "curl.log").read_text(encoding="utf-8")
+        self.assertIn("-K -", log)
+        self.assertNotIn(TOKEN, log)
+        self.assertNotIn(BEARER, log)
+
 
 class ContainerfileTest(unittest.TestCase):
     """Le conteneur : non-root, sans secret, contrat du service explicite."""
@@ -450,7 +509,8 @@ class PolicyTest(unittest.TestCase):
         for attendu in ("ghcr.io/manaty/ameesh-approve", "sha-<12>", "digest",
                         "Retour arrière", "packages: write", "ghcr",
                         "deploy/approve-image/publish.sh", "404",
-                        "promotion", "concurrence", "après la fusion"):
+                        "promotion", "concurrence", "après la fusion",
+                        "-K -", "stdin"):
             self.assertIn(attendu, text)
 
 

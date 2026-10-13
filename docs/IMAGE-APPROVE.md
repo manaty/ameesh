@@ -39,6 +39,14 @@ Le workflow n'utilise que le `GITHUB_TOKEN` du dépôt, avec la seule
 permission `packages: write` (`contents: read` par ailleurs). **Aucun jeton
 personnel** n'est employé ni stocké.
 
+Les identifiants échangés avec le registre (jeton GHCR, bearer) **ne passent
+jamais par la ligne de commande** : `deploy/approve-image/publish.sh` les donne
+à `curl` par sa configuration lue sur stdin (`-K -`), car `/proc/<pid>/cmdline`
+les exposerait aux autres runners du même hôte ; le mot de passe de
+`docker login` passe par `--password-stdin`. Un témoin de
+`tests/test_l953_image_approve.py` vérifie qu'aucun des deux jetons n'apparaît
+dans les arguments de `curl`.
+
 Responsables :
 
 * **pilote ameesh** (mesh-design) : donne le feu de publication après la

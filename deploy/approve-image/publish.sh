@@ -7,7 +7,7 @@
 # complete dans docs/IMAGE-APPROVE.md. L'image locale (construite par le
 # workflow, taguee sha-<12>) n'est qu'une source possible du tag de revision.
 #
-# Deux invariants, verrouilles par tests/test_l953_image_approve.py :
+# Trois invariants, verrouilles par tests/test_l953_image_approve.py :
 #
 #  1. Une absence de tag ne se conclut que sur un 404 du registre. Toute autre
 #     reponse (reseau, 401/403, 5xx) arrete le run avant la moindre ecriture :
@@ -20,6 +20,11 @@
 #     reconstruction locale donne D2, c'est D1 qui est promu. Le digest source
 #     est lu et verifie avant la mutation, et la version deja publiee sur un
 #     autre digest arrete le run sans rien ecrire.
+#
+#  3. Le jeton GHCR et le bearer du registre ne passent jamais par argv : curl
+#     les lit dans sa configuration sur stdin (`-K -`). Sur l'hote ameesh-ci,
+#     plusieurs runners partagent l'utilisateur : /proc/<pid>/cmdline exposerait
+#     un secret passe en ligne de commande.
 #
 # Entrees (environnement) : IMAGE, SHA_TAG, VERSION, GHCR_USER, GHCR_TOKEN ;
 # REVISION est facultative (resume). Sortie : digest.txt et le resume du run
@@ -49,11 +54,26 @@ trap cleanup EXIT
 
 die() { printf '::error::%s\n' "$*" >&2; exit 1; }
 
+# Les secrets (jeton GHCR, bearer du registre) ne passent JAMAIS par argv :
+# /proc/<pid>/cmdline les exposerait a tout processus du meme utilisateur, et
+# l'hote ameesh-ci fait tourner plusieurs runners. curl les lit donc dans sa
+# configuration sur stdin (`-K -`). Les valeurs sont restreintes a un alphabet
+# sur : une valeur hostile ne peut pas fermer la citation ni injecter une ligne
+# de configuration. Verrouille par tests/test_l953_image_approve.py (N P2 de la
+# relecture bureau du 13/10/2026).
+config_value() {  # <option curl> <valeur>
+  case "$2" in
+    ''|*[!A-Za-z0-9._~+/:=\ -]*) die "$1 invalide pour la configuration curl" ;;
+  esac
+  printf '%s = "%s"\n' "$1" "$2"
+}
+
 # Jeton bearer du registre (le meme echange que `docker login`).
-token_json="$(curl -fsS -u "$GHCR_USER:$GHCR_TOKEN" --get \
-    --data-urlencode "service=$registry" \
-    --data-urlencode "scope=repository:$repo:pull,push" \
-    "https://$registry/token")" \
+token_json="$({ config_value user "$GHCR_USER:$GHCR_TOKEN"; } \
+  | curl -fsS -K - --get \
+      --data-urlencode "service=$registry" \
+      --data-urlencode "scope=repository:$repo:pull,push" \
+      "https://$registry/token")" \
   || die "jeton de registre non obtenu : identifiants refuses ou registre injoignable"
 token="$(printf '%s' "$token_json" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("token") or d.get("access_token") or "")')" \
@@ -71,9 +91,10 @@ lookup() {
   LOOKUP_STATE=""
   LOOKUP_DIGEST=""
   LOOKUP_TYPE=""
-  code="$(curl -sS -o "$work/body" -D "$work/headers" -w '%{http_code}' \
-      -H "Authorization: Bearer $token" -H "Accept: $accept" \
-      "$api/manifests/$ref" || true)"
+  code="$({ config_value header "Authorization: Bearer $token"; } \
+      | curl -sS -K - -o "$work/body" -D "$work/headers" -w '%{http_code}' \
+        -H "Accept: $accept" \
+        "$api/manifests/$ref" || true)"
   case "${code:-000}" in
     200)
       computed="sha256:$(sha256sum "$work/body" | cut -d' ' -f1)"
@@ -125,9 +146,10 @@ case "$LOOKUP_STATE" in
     cp "$work/body" "$work/promotion"
     got="sha256:$(sha256sum "$work/promotion" | cut -d' ' -f1)"
     [ "$got" = "$digest" ] || die "manifeste source $got different du digest $digest avant promotion"
-    code="$(curl -sS -o "$work/put.out" -D "$work/put.headers" -w '%{http_code}' \
-        -X PUT -H "Authorization: Bearer $token" -H "Content-Type: $LOOKUP_TYPE" \
-        --data-binary @"$work/promotion" "$api/manifests/$VERSION" || true)"
+    code="$({ config_value header "Authorization: Bearer $token"; } \
+        | curl -sS -K - -o "$work/put.out" -D "$work/put.headers" -w '%{http_code}' \
+          -X PUT -H "Content-Type: $LOOKUP_TYPE" \
+          --data-binary @"$work/promotion" "$api/manifests/$VERSION" || true)"
     case "${code:-000}" in
       200|201) ;;
       *) die "copie du tag $VERSION refusee ($code) : $(head -c 300 "$work/put.out" 2>/dev/null || true)" ;;
