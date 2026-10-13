@@ -433,7 +433,11 @@ exposes the single `validate_enrollment` validator, `probe()` builds the exact
 and whose own runner unit belongs to the enrolled restart policy, and
 `delegation-release.py` accepts such a document only at its fixed destination
 (`/etc/ameesh-release/turn.json`, mode 0600) as compact sorted JSON bounded to
-8 KiB. Its digest enters the signed file inventory, so the signed question binds
+8 KiB. `prepare()` does not take that document on trust: as soon as a probe is
+enrolled it re-attests it through `enrolled_probe()` — the same `probe()` path,
+with the plan's host and restart policy and the enrolled registry (`db`) — so a
+document of another host or of an absent agent refuses before the question is
+rendered. Its digest enters the signed file inventory, so the signed question binds
 the exact probe identity; its bytes are installed with the same private
 snapshot, lost-reply reconciliation and revoke semantics as the other reviewed
 files (revoke removes or restores it like any other newly created reviewed

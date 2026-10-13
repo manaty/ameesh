@@ -15,7 +15,10 @@ before every effect and reconciles its own durable receipts.
 this entry adds none: assembly is pure, and execution accepts only the typed
 result of `prepare()` plus an already enrolled authority/backend pair. The
 probe document is built by `probe()` from the real registry row on the exact
-host and the enrolled restart policy - never invented for an absent agent.
+host and the enrolled restart policy - never invented for an absent agent - and
+`prepare()` re-attests the supplied document through that same path (plan host
+and policy) before rendering the question: a document of another host or of an
+absent agent refuses.
 
 No root, SSH, systemd, PostgreSQL migration or production effect is executed by
 building or testing this module: tests use disposable trees, a simulated
@@ -110,6 +113,22 @@ def probe(*, db, host, agent, account, home, seconds, policy):
     return document
 
 
+def enrolled_probe(turn, *, db, plan):
+    """The one probe document the enrolled registry and the pinned plan attest.
+
+    `probe()` is the only path that reads the registry row on the plan's host
+    and binds the runner unit to the plan's restart policy. A document supplied
+    by a caller is accepted only when it is exactly the one that path returns,
+    so a document of another host, or of an agent absent from the registry,
+    cannot enter a signed question. A missing or unreadable registry refuses.
+    """
+    attested=probe(db=db,host=plan['host'],agent=turn['agent'],account=turn['account'],
+                   home=turn['home'],seconds=turn['seconds'],policy=plan['policy'])
+    if canonical(attested)!=canonical(turn):
+        raise OperatorError('probe document does not match the enrolled registry')
+    return attested
+
+
 def destinations(*, plan, account_ids, probe_turn=None):
     """Exact reviewed destinations the host inventory must cover, sorted.
 
@@ -153,15 +172,18 @@ def previous_files(observed, *, plan, account_ids, probe_turn=None):
     return prior
 
 
-def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, expires_at):
+def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, expires_at,
+            db=None):
     """Assemble the exact signed bundle; no host effect and no chosen path.
 
     `trees` names the staged `runtime` and `sources` trees: both are measured
     here and must match the plan's pinned digests (a mismatch refuses rather
     than silently repinning). `observed` is the host's current inventory of
     every reviewed destination, `probe_turn` is the enrolled probe document
-    (`probe()`), installed as a protected `turn.json` whose bytes the signed
-    question binds, and `expires_at` is the signed execution deadline.
+    (`probe()`) re-attested here through `enrolled_probe()` against the plan's
+    host and policy (so `db`, the enrolled registry, is required as soon as a
+    probe is enrolled), installed as a protected `turn.json` whose bytes the
+    signed question binds, and `expires_at` is the signed execution deadline.
     """
     if not isinstance(operation,str) or not operation:
         raise OperatorError('bootstrap operation required')
@@ -177,9 +199,9 @@ def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, e
         template=delegation.render(plan,account_ids=account_ids,enrollment=enrollment)
     except delegation.DelegationError:
         raise OperatorError('invalid bootstrap plan') from None
-    if turn is not None and turn['unit'] not in template['plan']['policy']['units']:
-        raise OperatorError('probe runner unit outside the enrolled policy')
     pinned=template['plan']
+    if turn is not None:
+        turn=enrolled_probe(turn,db=db,plan=pinned)
     for name,field in TREES.items():
         staged=str(trees[name])
         if not staged.startswith('/'):

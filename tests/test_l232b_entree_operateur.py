@@ -101,7 +101,7 @@ class OperatorEntryTest(unittest.TestCase):
     def prepare(self,**changes):
         arguments=dict(operation=self.operation,plan=self.plan,account_ids=self.accounts,
                        trees=self.trees,observed=self.observed,probe_turn=self.turn,
-                       expires_at=2000000000)
+                       expires_at=2000000000,db=self.registry)
         arguments.update(changes)
         return entry.prepare(**arguments)
 
@@ -205,6 +205,34 @@ class OperatorEntryTest(unittest.TestCase):
         with self.assertRaises(entry.OperatorError):
             self.prepare(probe_turn=dict(self.turn,unit='ameesh-runner@other.service'))
 
+    def test_prepare_re_attests_the_probe_document_on_the_plan_host(self):
+        """B1 de la relecture cx3 : un dict fourni ne suffit pas, prepare()
+        doit interroger le registre enrole sur l'hote du plan."""
+        self.registry.queries.clear()
+        attested=self.prepare()
+        self.assertEqual(self.registry.queries,[(entry.REGISTRY,('fixture',))])
+        self.assertEqual(attested.bundle['files'][entry.TURN]['content'],
+                         entry.canonical(self.turn))
+        for broken in (None,Registry([]),Registry(unreachable=True),
+                       Registry([dict(name='fixture',host='other-host')]),
+                       Registry([dict(name='other',host=self.host)])):
+            with self.assertRaises(entry.OperatorError,msg=broken):
+                self.prepare(db=broken)
+        # un document complet et bien forme d'un agent absent de cet hote refuse
+        absent=dict(self.turn,agent='other',unit='ameesh-runner@other.service')
+        with self.assertRaises(entry.OperatorError):
+            self.prepare(probe_turn=absent,db=Registry([dict(name='other',host='other-host')]))
+        # sans sonde enrolee, aucun registre n'est exige ni consulte
+        without={path:None for path in entry.destinations(plan=self.plan,
+                                                          account_ids=self.accounts)}
+        self.registry.queries.clear()
+        offline=self.prepare(probe_turn=None,observed=without,db=None)
+        self.assertNotIn(entry.TURN,offline.bundle['files'])
+        self.assertEqual(self.registry.queries,[])
+        # la forme reste refusee avant tout registre
+        with self.assertRaises(entry.OperatorError):
+            self.prepare(probe_turn=dict(self.turn,unit='ameesh-runner@other.service'))
+
     def test_install_executes_through_the_enrolled_backend_and_lands_the_turn_enrollment(self):
         prepared=self.prepare()
         system=Host(self.root); authority=self.base.authority
@@ -249,7 +277,8 @@ class OperatorEntryTest(unittest.TestCase):
         self.assertEqual(set(inspect.signature(entry.install).parameters),
                          {'prepared','authority','adapter','journal'})
         self.assertEqual(set(inspect.signature(entry.prepare).parameters),
-                         {'operation','plan','account_ids','trees','observed','probe_turn','expires_at'})
+                         {'operation','plan','account_ids','trees','observed','probe_turn',
+                          'expires_at','db'})
         source=(ROOT/'deploy/mise-a-jour/entree-operateur.py').read_text()
         self.assertNotIn('__main__',source)
         self.assertNotIn('argparse',source)
