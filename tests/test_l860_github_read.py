@@ -318,6 +318,18 @@ class _EmptyClient:
         return {}
 
 
+class _StubGh:
+    """Un `gh` de laboratoire : la CI n'installe pas `gh`, et le test ne doit
+    pas dépendre du PATH de la machine (canon §3 : un test qui dépend de
+    l'hôte est un défaut bloquant du test, corrigé à la source) — #894."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def run(self, *_args, **_kwargs):  # pragma: no cover - jamais appelé ici
+        raise AssertionError("no gh call expected")
+
+
 class FournisseurTest(unittest.TestCase):
     """Sans jeton, le repli `gh` reste servi — le cache s'y applique aussi."""
 
@@ -325,9 +337,12 @@ class FournisseurTest(unittest.TestCase):
         env = {name: "" for name in plan_github.TOKEN_VARS}
         env.update({name: value for name, value in os.environ.items()
                     if name not in plan_github.TOKEN_VARS})
-        with mock.patch.dict(os.environ, env, clear=True):
-            client = plan_github.client(cache_dir="/state")
+        with tempfile.TemporaryDirectory() as state:  # jamais /state (N4 #894)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(plan_github, "Gh", _StubGh):
+                client = plan_github.client(cache_dir=state)
         self.assertIsInstance(client, plan_github.GhApi)
+        self.assertIsInstance(client.gh, _StubGh)
 
 
 if __name__ == "__main__":
