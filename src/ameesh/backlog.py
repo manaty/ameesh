@@ -420,10 +420,26 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+
+    # #804 : la place restante est relue avant **chaque** prise, pas une fois
+    # par passe. Les compteurs sont en base et partagés par tous les
+    # exécuteurs ; avec plusieurs passes simultanées (un exécuteur par hôte),
+    # une lecture unique laissait chacune consommer la même place. La relecture
+    # ramène la fenêtre à la durée d'une attribution ; la place reste une
+    # lecture hors de la transaction d'écriture, donc deux passes strictement
+    # simultanées peuvent encore se dépasser de leur nombre — les passes
+    # suivantes, elles, voient le compteur à jour.
+    def lot_place() -> int:
+        return int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                                LOT_TAKE_NOTE)
+
+    def place() -> int:
+        return int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                            AUTO_TAKE_NOTE)
+
     lot_room = 0
     if lot_idle_s > 0 and lot_max_per_hour > 0:
-        lot_room = int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
-                                                                    LOT_TAKE_NOTE)
+        lot_room = lot_place()
     lots = st.work.unassigned_lots(200) if lot_room > 0 else []
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
     today = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -431,7 +447,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
     room = 0
     if idle_s > 0 and max_per_hour > 0:
-        room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
+        room = place()
     queue = items(db, open_only=True, limit=200) if room > 0 else []
     if not lots and not queue:
         return []
@@ -503,7 +519,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # L165b : un agent dont tous les lots attendent un autre est libre
         pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
         for row in pool:
-            if len(taken) >= lot_room or not lots:
+            # #804 : place relue avant chaque prise (compteur partagé)
+            if not lots or len(taken) >= lot_room or lot_place() <= 0:
                 break
             if not within_budget(row):
                 continue
@@ -525,14 +542,24 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                   "kind": "lot", "notified": notified})
                     lots.remove(item)
                     break
+                # #804 : la place est relue juste avant l'écriture — une passe
+                # concurrente a pu consommer la place depuis la sélection.
+                if lot_place() <= 0:
+                    break
                 try:
                     check = work.check_assignee(db, row["name"], cfg=cfg)
                 except work.WorkError:
                     break                   # agent non réveillable : au suivant
-                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                      note="%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                    check["assignee"]),
-                                      actor=SENDER)
+                try:
+                    # #540 (porté de #555) : sous le verrou de l'agent, pas de
+                    # second lot non démarré — il en a reçu un depuis sa
+                    # sélection (orchestrateur, courrier, autre exécuteur).
+                    done = st.work.assign(int(item["id"]), check["assignee"], current=None,
+                                          note="%s par %s, au repos" % (LOT_TAKE_NOTE,
+                                                                        check["assignee"]),
+                                          actor=SENDER, take=work.takes_rule(check))
+                except storage.PendingLot:
+                    break                   # le lot reste à l'agent suivant
                 lots.remove(item)
                 if done is None:
                     continue                # pris entre-temps : lot suivant
@@ -557,7 +584,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         return taken
     pool = candidates(idle_s)
     for row in pool:
-        if len(taken) >= room or not queue:
+        # #804 : place relue avant chaque prise (compteur partagé)
+        if not queue or len(taken) >= room or place() <= 0:
             break
         if not within_budget(row):
             continue
@@ -577,6 +605,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                               "kind": "backlog", "notified": []})
                 queue.remove(item)
                 break
+            # #804 : la place est relue juste avant l'écriture — une passe
+            # concurrente a pu consommer la place depuis la sélection.
+            if place() <= 0:
+                break
             try:
                 check = work.check_assignee(db, row["name"], cfg=cfg)
             except work.WorkError:
@@ -584,8 +616,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             note = "%s par %s (valeur %s) : %s" % (
                 AUTO_TAKE_NOTE, check["assignee"], item.get("value_score"),
                 item.get("expected_value") or "")
-            done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                  note=note, actor=SENDER)
+            try:
+                # #540 (porté de #555) : sous le verrou de l'agent, pas de
+                # second lot non démarré depuis sa sélection.
+                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
+                                      note=note, actor=SENDER,
+                                      take=work.takes_rule(check))
+            except storage.PendingLot:
+                break                       # l'élément reste au suivant
             queue.remove(item)
             if done is None:
                 continue                    # pris entre-temps : élément suivant

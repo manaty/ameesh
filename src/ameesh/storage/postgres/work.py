@@ -62,6 +62,10 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: L165b : états qui n'occupent pas l'agent (en attente d'un autre). Le
+#: prédicat « occupe l'agent » du listing (`operations.py`) est le même : la
+#: règle #540 « au plus un lot non démarré » ne compte pas ces lots-là.
+_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -75,6 +79,11 @@ MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
+
+#: #540 : verrou de transaction d'un agent : « a-t-il déjà un lot non démarré ? »
+#: et l'attribution qui suit passent l'une après l'autre (porté de #555)
+PENDING_LOCK = ("SELECT pg_advisory_xact_lock("
+                "hashtextextended(current_schema() || ':pending_lot:' || %s, 0))")
 
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
@@ -324,13 +333,38 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, note, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor,
+               take: bool = False) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
-        en cours est effacée (issue `annulee` au registre)."""
+        en cours est effacée (issue `annulee` au registre). #540 : `take`
+        (prise automatique) refuse un agent qui a déjà un lot ouvert non
+        démarré — `interface.PendingLot`, rien n'est écrit (porté de #555)."""
         with self.db.transaction() as tx:
+            if take and assignee:
+                lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
+                               " WHERE id = %s FOR UPDATE", (int(item_id),))
+                if lot and lot[0]["fresh"]:
+                    behind = WorkItems(tx)._pending(assignee, int(item_id))
+                    if behind is not None:
+                        raise interface.PendingLot(behind)
             return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+
+    def _pending(self, assignee, item_id) -> int | None:
+        """#540 (porté de #555), dans la transaction ouverte et sous le verrou
+        de l'agent : son plus ancien lot ouvert non démarré **qui l'occupe**
+        (L165b : ni en attente d'un autre, ni prévu pour plus tard) autre que
+        `item_id`, ou None."""
+        import datetime as _dt
+        self.db.query(PENDING_LOCK, (assignee,))
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
+            "   AND state NOT IN %s AND state NOT IN %s"
+            "   AND (planned_start IS NULL OR planned_start <= %%s::date)"
+            "   AND id <> %%s ORDER BY id LIMIT 1" % (_CLOSED, _WAITING_ON_OTHERS),
+            (assignee, _dt.date.today().isoformat(), int(item_id or 0)))
+        return int(rows[0]["id"]) if rows else None
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
         """`assign` dans la transaction ouverte ; `state` : celui exigé."""

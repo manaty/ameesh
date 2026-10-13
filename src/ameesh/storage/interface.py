@@ -1015,6 +1015,16 @@ class Nonces(Domain):
 # lots (`work_items`, `work_item_events`)
 # --------------------------------------------------------------------------
 
+class PendingLot(RuntimeError):
+    """#540 : `assign(…, take=True)` refusé — l'agent a déjà le lot non
+    démarré `lot` (lu sous son verrou) ; rien n'est écrit. Porté ici depuis
+    #555 tant qu'elle n'est pas fusionnée."""
+
+    def __init__(self, lot: int):
+        super().__init__("lot #%d not started" % lot)
+        self.lot = lot
+
+
 class ReservationContention(RuntimeError):
     """L122, #478 : le budget de réessais d'une réservation automatique est
     épuisé — le prochain numéro libre n'a pas pu être réservé à temps sous la
@@ -1284,10 +1294,13 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
-               actor: str) -> dict | None:
+               actor: str, take: bool = False) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
-        L40 : efface la délégation en cours (issue `annulee`)."""
+        L40 : efface la délégation en cours (issue `annulee`). #540 : `take`
+        (la prise automatique, `backlog.auto_take`) refuse, sous le verrou de
+        l'agent, un agent qui a déjà un lot ouvert non démarré — `PendingLot`,
+        rien n'est écrit."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,

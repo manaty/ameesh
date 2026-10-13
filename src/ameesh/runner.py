@@ -191,7 +191,8 @@ def local_take(db, cfg, agents, settings, *, dry_run: bool = False, alerts=None,
                **kw) -> list:
     """#804 : prise automatique pour un ensemble d'agents (ceux de cet
     exécuteur), avec les garde-fous de `backlog.auto_take` (repos réel,
-    budget, hôtes en pause, plafonds horaires comptés en base).
+    budget, hôtes en pause, plafonds horaires comptés en base) ; l'appelant
+    passe aussi l'alerte `balance_low` du moment (#754, owner 13/10).
 
     `settings` porte `idle_s`/`max_per_hour`/`lot_idle_s`/`lot_max_per_hour` ;
     `kw` surcharge les autres réglages d'`auto_take` (tests, diagnostic). Rend
@@ -205,6 +206,17 @@ def local_take(db, cfg, agents, settings, *, dry_run: bool = False, alerts=None,
     options.update(kw)
     return backlog.auto_take(cfg, db, agents=names, dry_run=dry_run, alerts=alerts,
                              **options)
+
+
+def local_balance_alerts(db, thresholds, now: float) -> list:
+    """#754 (owner, 13/10) : l'alerte `balance_low` du moment, avec les mêmes
+    seuils qu'`ameesh alerts` et `ameesh notify` — un agent au token ne prend
+    jamais sous cette alerte. `notify` ne publie pas d'état d'alerte : on
+    relit le solde au moment de la passe, une seule implémentation
+    (`sous_utilisation.balance_low`)."""
+    from . import sous_utilisation
+    listing = storage.of(db).operations.listing()
+    return sous_utilisation.balance_low(db, listing, now, **(thresholds or {}))
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -4687,6 +4699,7 @@ class Runner:
         max_turns: int | None = None,
         take: dict | None = None,
         take_interval: float = TAKE_INTERVAL_S,
+        take_balance: dict | None = None,
     ):
         from .host_gate import gate_choice
         try:
@@ -4709,6 +4722,10 @@ class Runner:
         self.take = take or None
         self.take_interval = (max(0.0, float(take_interval))
                               if self.take and take_interval else 0.0)
+        #: #754 (owner, 13/10) : seuils de l'alerte `balance_low` lus des
+        #: options `--balance-*` / `AMEESH_ALERT_BALANCE_*`, partagés avec
+        #: `ameesh alerts` et `ameesh notify` (`exploitation.balance_thresholds`).
+        self.take_balance = dict(take_balance or {})
         self._take_next = 0.0
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
@@ -5157,10 +5174,10 @@ class Runner:
 
         `backlog.auto_take` n'est plus appelée seulement par `ameesh notify` :
         ici, sur l'hôte où ces agents tournent, avec les mêmes garde-fous
-        (repos réel, budget, hôtes en pause, plafonds horaires comptés en
-        base). Seuls les agents servis par cet exécuteur — leurs workers
-        vivants — sont preneurs ; la liste du mesh reste entière pour les
-        gardes et l'avertissement des orchestrateurs. Un hôte sous pression
+        (repos réel, budget, hôtes en pause, `balance_low`, plafonds horaires
+        comptés en base). Seuls les agents servis par cet exécuteur — leurs
+        workers vivants — sont preneurs ; la liste du mesh reste entière pour
+        les gardes et l'avertissement des orchestrateurs. Un hôte sous pression
         est écarté comme par `ameesh notify` (alerte `host_pressure` locale).
         """
         if self.once or self.mediated or not self.take:
@@ -5175,6 +5192,15 @@ class Runner:
                 alerts.append({"type": "host_pressure", "host": self.host})
         except Exception:
             pass  # relevé illisible : on ne devine pas la pression
+        try:
+            alerts += local_balance_alerts(self.db, self.take_balance, time.time())
+        except Exception as exc:
+            # Solde illisible : on ne devine pas. Un agent au token pourrait
+            # être sous le seuil, on le retient ; un forfait, lui, ne dépense
+            # pas ce solde et reste preneur.
+            alerts.append({"type": "balance_low", "unreadable": True})
+            log_async("auto-take: balance unreadable (%s); token agents held"
+                      % type(exc).__name__)
         taken = local_take(self.db, self.cfg, names, self.take,
                            dry_run=self.dry_run, alerts=alerts)
         for take in taken:
@@ -7085,6 +7111,10 @@ def build_parser() -> argparse.ArgumentParser:
                                                         TAKE_INTERVAL_S),
                         help="seconds between two takes by this runner (default 60; 0 turns "
                              "the runner's take off)")
+    # #754 (owner, 13/10) : la prise refuse tant qu'une alerte `balance_low`
+    # est vive ; les seuils de cette alerte sont ceux d'`ameesh alerts` et
+    # d'`ameesh notify` (une seule déclaration, dans `exploitation`).
+    exploitation.add_balance_arguments(parser)
     parser.add_argument("--migrate", action="store_true", help="apply migrations before starting")
     return parser
 
@@ -7684,6 +7714,13 @@ def _take_settings(args) -> dict | None:
     return settings
 
 
+def _take_balance(args) -> dict:
+    """#754 : seuils de l'alerte `balance_low` de la prise de l'exécuteur,
+    lus des mêmes options que celles d'`ameesh alerts` et `ameesh notify`."""
+    from . import exploitation
+    return exploitation.balance_thresholds(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     # `register --help` / `stop --help` affichent l'aide, jamais d'écriture en base
@@ -7770,6 +7807,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
                 take=_take_settings(parsed), take_interval=parsed.take_interval,
+                take_balance=_take_balance(parsed),
             )
         except db_mod.DbError as exc:
             if not mediated:

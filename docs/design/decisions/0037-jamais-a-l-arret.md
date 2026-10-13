@@ -121,16 +121,28 @@ token agents); #804 fixes who triggers it.
 `--take-interval` seconds (default 60, `AMEESH_TAKE_INTERVAL`; 0 turns the
 runner's take off), each executor calls the same `backlog.auto_take` for the
 agents it serves, on the host where they run, with the same safeguards
-(idleness, budget, hosts on hold, hourly caps counted in the database):
+(idleness, budget, hosts on hold, `balance_low`, hourly caps counted in the
+database):
 
 - only its own agents are takers (`agents=` filter); the mesh listing stays
   whole for the guards and for notifying the orchestrators;
 - a host under pressure is passed as a local `host_pressure` alert, as
   `ameesh notify` does with its alerts;
+- the balance is read at the moment of the pass (`sous_utilisation.balance_low`,
+  same `--balance-*` / `AMEESH_ALERT_BALANCE_*` thresholds as `ameesh alerts`)
+  and passed as a `balance_low` alert: a pay-per-token agent never takes under
+  it (owner, 13/10; #754). An unreadable balance holds the token agents and
+  leaves the plans taking;
 - the take happens before the executor claims its agents, so the taken lot
   and its mail are served in the same pass;
 - a failing take pass never takes the executor down: it is logged and the
   next pass retries.
 
 `ameesh notify` keeps its own take for hosts where it runs; the two share the
-database counters, so the mesh-wide caps hold.
+database counters. The remaining place is re-read before **each** take, not
+once per pass: with one executor per host, a single read let two simultaneous
+passes each consume the same place. The counter is still read outside the
+write transaction, so two strictly simultaneous passes can exceed the cap by
+their own number; the following passes then see the updated counter. A strict
+cap would take a mesh-wide lock in the write transaction — to be decided with
+the pilot if the residual burst matters.

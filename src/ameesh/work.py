@@ -639,6 +639,14 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     return {"item": row, "check": check, "previous": previous}
 
 
+def takes_rule(check: dict) -> bool:
+    """#540 : l'assigné normalisé par `check_assignee` est soumis à la règle
+    « au plus un lot non démarré » (ni humain ni agent externe). Porté de #555
+    tant qu'elle n'est pas fusionnée ; `backlog.auto_take` la passe en `take=`
+    à `storage.…work.assign`."""
+    return not (check["externe"] or check["assignee"].startswith(HUMAN_PREFIX))
+
+
 # --------------------------------------------------------------------------
 # délégation à échéance (L40, point 5 de la décision 0030)
 # --------------------------------------------------------------------------
