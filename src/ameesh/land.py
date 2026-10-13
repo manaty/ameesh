@@ -382,13 +382,15 @@ class _Landing:
     stale holder's writes fail, and it reports `busy`; the lease is released
     once, at the end (`land_head`)."""
 
-    def __init__(self, db, project, row, key, owner, epoch, locks, projects=()):
+    def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
+                 cfg=None, clone=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
         self.key, self.owner, self.epoch, self.locks = key, owner, epoch, locks
         self.release = False
         self.projects = projects
+        self.cfg, self.clone = cfg, clone
         self.entry = tuple(row.get(k) for k in
                            ("generation", "target", "frozen_id", "frozen_sha"))
 
@@ -468,6 +470,25 @@ class _Landing:
                                   "ameesh work queue add %d." % self.lot)
         return None
 
+    def review_after_merge(self, *, merged_sha: str = "", pr=None) -> dict:
+        """L539 : ouvre le lot de relecture d'un lot **léger** (canon §2), une
+        seule fois, après que la fusion est un fait enregistré. La classe est
+        relue sur le diff gelé (`merge_queue._class_of`, canon §8) ; un doute
+        ou une classe supérieure n'ouvre rien. Ne lève jamais."""
+        from . import merge_queue, review_lot
+        try:
+            item = work.get(self.db, self.lot)
+            klass = merge_queue._class_of(
+                self.db, self.lot, item, self.project.repo, self.clone,
+                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg)
+            return review_lot.open_after_merge(
+                self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
+                pr=pr, target=self.row.get("target") or "")
+        except Exception as exc:  # noqa: BLE001 - la fusion est un fait, jamais défait
+            return {"lot": self.lot, "id": None, "created": False, "class": "",
+                    "why": "lot de relecture non ouvert : %s: %s"
+                           % (type(exc).__name__, str(exc)[:200])}
+
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
@@ -483,7 +504,9 @@ class _Landing:
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
         how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
             row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
-        return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr},
+        review = self.review_after_merge(merged_sha=str(merged.get("sha") or ""), pr=pr)
+        return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
+                     "review_lot": review},
                     **({"warning": "queue entry changed: recorded as history only (a newer entry is "
                         "queued)"} if how == "history" else {"warning": "remote merge succeeded; recording failed"}
                        if how == "unrecorded" else {}))
@@ -513,9 +536,10 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         locks.pop(key, None)
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
-    landing = _Landing(db, project, row, key, owner, epoch, locks, projects)
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+    landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
+                       cfg=cfg, clone=getattr(replayer, "path", None))
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         try:
@@ -744,7 +768,8 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
                                  note="merge queue of %s: landed" % row["target"],
                                  actor=work.SYSTEM_SENDER):
                 return landing.busy("lease on %s lost" % landing.key)
-            return {"lot": lot, "result": "landed"}
+            review = landing.review_after_merge(merged_sha=_merged_sha(landing.db, lot))
+            return {"lot": lot, "result": "landed", "review_lot": review}
         return landing.eject("its PR is no longer open",
                              "Reopen it, then ameesh work queue add %d." % lot)
     if status.get("base") != branch:
@@ -820,6 +845,19 @@ def _after_merge(landing: _Landing, pr, after, unread) -> dict:
         return _merged_in_doubt(landing, pr, after, unread)
     return landing.landed({"sha": landing.row["landing_sha"], "state": "pr", "files": []},
                           None, pr=pr)
+
+
+def _merged_sha(db, lot: int) -> str:
+    """Le sha de fusion déclaré au jalon `merged`, si connu (chemin « déjà
+    fusionné » de `_follow_pr`, L539)."""
+    try:
+        rows = work.milestones(db, int(lot))
+    except Exception:  # noqa: BLE001 - jalon illisible : sha inconnu
+        return ""
+    for row in rows or ():
+        if str(row.get("kind") or "") == "merged" and row.get("sha"):
+            return str(row["sha"])
+    return ""
 
 
 #: #194 r6: reasons of a PR merged where it should not have been, or that

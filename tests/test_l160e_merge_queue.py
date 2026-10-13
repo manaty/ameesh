@@ -17,7 +17,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import mail, merge_queue, plan_github, radar, resolutions, storage, work
+from ameesh import (lot_class, mail, merge_queue, plan_git, plan_github, radar,
+                    resolutions, storage, work)
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, make_repo
@@ -126,8 +127,15 @@ class _Base(unittest.TestCase):
                             "at_ts": 2.0},
                            {"id": 1, "kind": "frozen", "sha": sha, "at_ts": 1.0}]
 
-    def enter(self, lot, ci=None):
-        return merge_queue.enter(None, lot, repo=self.repo, actor="orch", ci=ci)
+    def green(self, lot, *, number=7, green=True, draft=False):
+        """Le statut CI par défaut de la file : verte sur la tête gelée."""
+        tip = self.tip(lot)
+        return lambda branch: {"number": number, "green": green, "head": tip,
+                               "draft": draft}
+
+    def enter(self, lot, ci="green"):
+        return merge_queue.enter(None, lot, repo=self.repo, actor="orch",
+                                 ci=self.green(lot) if ci == "green" else ci)
 
 
 class EntryTest(_Base):
@@ -155,9 +163,33 @@ class EntryTest(_Base):
         self.assertEqual((row["target"], row["frozen_sha"], row["state"]),
                          ("main", self.tip(1), "queued"))
         self.assertIn("PR #7 green", self.fake.notes[-1][1])
-        # a team that merges locally has no PR: nothing to check
+        # an absent CI status is not a green one: a team that merges locally
+        # without a PR, or a reader that answers nothing, is refused
+        # (revue #544 r1)
         self.ready(2)
-        self.assertEqual(self.enter(2, ci=lambda branch: None)["state"], "queued")
+        with self.assertRaisesRegex(merge_queue.QueueError, "no CI status"):
+            self.enter(2, ci=lambda branch: None)
+        with self.assertRaisesRegex(merge_queue.QueueError, "no CI reader"):
+            self.enter(2, ci=None)
+        self.assertEqual(set(self.fake.queue_rows), {1})
+
+    def test_required_commit_ci_certifies_a_landing_without_a_pr(self):
+        """Revue #544 r2 : sans PR (lecteur muet ou `None`), un projet
+        `ci_required` se certifie par la CI du commit gelé — le refus de
+        l'absence de PR ne passe plus avant elle."""
+        self.ready(1)
+        project = radar.Project(name="p", repo=self.repo, github="o/r", ci_required=True)
+        red = {"runs": 1, "green": False, "pending": [], "failed": ["ci"]}
+        with self.assertRaisesRegex(merge_queue.QueueError, "is red"):
+            merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                              ci=lambda branch: None, project=project,
+                              commit_ci=lambda sha: red)
+        self.assertEqual(self.fake.queue_rows, {})
+        green = {"runs": 1, "green": True, "pending": [], "failed": []}
+        row = merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                                ci=lambda branch: None, project=project,
+                                commit_ci=lambda sha: green)
+        self.assertEqual(row["state"], "queued")
 
     def test_sha_prefixes_are_resolved_and_compared_whole(self):
         tip = self.tip(1)
@@ -201,7 +233,7 @@ class EntryTest(_Base):
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "pushed from another host")
         self.ready(1)  # frozen and reviewed on the fresh tip, unknown to `agents`
         clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
-        row = merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        row = merge_queue.enter(None, 1, repo=agents, actor="orch", ci=self.green(1), clone=clone)
         self.assertEqual(row["frozen_sha"], self.tip(1))
         # the agents' repository is untouched: no object, no FETCH_HEAD, same remote ref
         self.assertEqual(_git(agents, "rev-parse", "refs/remotes/origin/lot/1-a"), stale)
@@ -212,7 +244,7 @@ class EntryTest(_Base):
         # without the clone, origin cannot be fetched: refused, never the cached tip
         self.fake.queue_rows.clear()
         with self.assertRaisesRegex(merge_queue.QueueError, "without the radar's clone"):
-            merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None)
+            merge_queue.enter(None, 1, repo=agents, actor="orch", ci=self.green(1))
 
     def test_a_local_branch_is_not_the_tip_when_origin_moved(self):
         agents = os.path.join(self.tmp, "agents")
@@ -222,7 +254,7 @@ class EntryTest(_Base):
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "B, pushed from another host")
         clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
         with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
-            merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+            merge_queue.enter(None, 1, repo=agents, actor="orch", ci=self.green(1), clone=clone)
         self.assertEqual(self.fake.queue_rows, {})
 
     def test_milestones_name_commit_ids_only(self):
@@ -249,7 +281,9 @@ class EntryTest(_Base):
         _git(self.tmp, "clone", "-q", self.repo, agents)
         clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
         self.ready(1)
-        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        status = {"number": 7, "green": True, "head": self.tip(1)}
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=lambda branch: status,
+                          clone=clone)
         # the clone holds the frozen tip; the branch is then deleted on the remote,
         # or the remote does not answer: the stale tip is never admitted
         _git(self.repo, "checkout", "-q", "main")
@@ -259,7 +293,8 @@ class EntryTest(_Base):
                 _git(agents, "remote", "set-url", "origin", url)
                 self.fake.queue_rows.clear()
                 with self.assertRaisesRegex(merge_queue.QueueError, "cannot fetch branch lot/1-a"):
-                    merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+                    merge_queue.enter(None, 1, repo=agents, actor="orch",
+                                      ci=lambda branch: status, clone=clone)
                 self.assertEqual(self.fake.queue_rows, {})
 
     def test_merged_lot_is_refused(self):
@@ -267,6 +302,165 @@ class EntryTest(_Base):
         self.fake.lots[1]["state"] = "merged"
         with self.assertRaisesRegex(merge_queue.QueueError, "nothing to merge"):
             self.enter(1)
+
+
+class LightClassTest(_Base):
+    """L539 (§8): a light lot enters without a review verdict, but keeps every
+    other gate — green CI on the frozen head, a non-draft PR, a target that is
+    not a release, and no doubt about the class (`sensitive` otherwise)."""
+
+    def freeze(self, lot):
+        tip = self.tip(lot)
+        self.marks[lot] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        return tip
+
+    def ci(self, lot, *, draft=False, green=True, number=7):
+        tip = self.tip(lot)
+        return lambda branch: {"number": number, "green": green, "head": tip,
+                               "draft": draft}
+
+    def light(self, why="policy of /canon"):
+        return mock.patch.object(lot_class, "of_lot",
+                                 return_value={"class": "light", "why": why})
+
+    def test_a_light_lot_enters_without_a_verdict(self):
+        self.freeze(1)
+        with self.light():
+            row = self.enter(1, ci=self.ci(1))
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["class"], "light")
+        self.assertIn("class light", self.fake.notes[-1][1])
+
+    def test_a_light_lot_is_refused_from_a_draft_pr(self):
+        self.freeze(1)
+        with self.light():
+            with self.assertRaisesRegex(merge_queue.QueueError, "PR #7 is a draft"):
+                self.enter(1, ci=self.ci(1, draft=True))
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_light_lot_still_needs_a_green_ci(self):
+        self.freeze(1)
+        with self.light():
+            with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
+                self.enter(1, ci=self.ci(1, green=False))
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_release_lot_keeps_the_verdict(self):
+        # the release axis (target release/* or lot type release) is read by
+        # lot_class; whatever the policy says of the files, release is never light
+        self.freeze(1)
+        release = {"class": "release", "why": "target release/1.10.0"}
+        with mock.patch.object(lot_class, "of_lot", return_value=release):
+            with self.assertRaisesRegex(merge_queue.QueueError,
+                                        r"no review verdict ok.*class: release"):
+                self.enter(1, ci=self.ci(1))
+        self.ready(1)  # a verdict ok on the freeze
+        with mock.patch.object(lot_class, "of_lot", return_value=release):
+            self.assertEqual(self.enter(1, ci=self.ci(1))["state"], "queued")
+
+    def test_a_doubt_keeps_the_verdict_and_names_the_class(self):
+        self.freeze(1)
+        with mock.patch.object(lot_class, "of_lot", return_value={
+                "class": "sensitive", "why": "no readable canon"}):
+            with self.assertRaisesRegex(merge_queue.QueueError, "class: sensitive"):
+                self.enter(1, ci=self.ci(1))
+
+    def test_without_a_readable_class_the_verdict_is_still_required(self):
+        # no patch: with no canon configured, lot_class.of_lot answers
+        # `sensitive` itself and the queue must not take the doubt for a light lot
+        self.freeze(1)
+        with self.assertRaisesRegex(merge_queue.QueueError, r"class: sensitive"):
+            self.enter(1, ci=self.ci(1))
+
+    def test_the_queue_line_shows_the_class(self):
+        rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
+                 "title": "t", "assignee": "a1", "frozen_sha": "a" * 12, "reason": ""}]
+        self.assertIn("class light", merge_queue.show_lines(rows, {1: "light"})[1])
+
+
+class TargetResolutionTest(_Base):
+    """Revue #544 r2 : la cible résolue au départ (`project.target` compris)
+    porte la classification et l'admission ; le défaut du dépôt ne l'écrase
+    plus."""
+
+    def project(self):
+        return radar.Project(name="p", repo=self.repo, target="develop", github="o/r")
+
+    def test_the_project_target_carries_the_classification(self):
+        tip = self.tip(1)
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        bases = []
+
+        def of_lot(db, lot, **kw):
+            bases.append(kw.get("base"))
+            return {"class": "light" if kw.get("base") == "main" else "sensitive",
+                    "why": "base %s" % kw.get("base")}
+        with mock.patch.object(lot_class, "of_lot", side_effect=of_lot):
+            with self.assertRaisesRegex(merge_queue.QueueError, "class: sensitive"):
+                merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                                  ci=self.green(1), project=self.project())
+        self.assertEqual(bases, ["develop"])
+
+    def test_the_project_target_carries_the_admission(self):
+        self.ready(1)
+        with mock.patch.object(lot_class, "of_lot",
+                               return_value={"class": "sensitive", "why": "policy"}):
+            row = merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                                    ci=self.green(1), project=self.project())
+        self.assertEqual(row["target"], "develop")
+        self.assertEqual(self.fake.queue_rows[1]["target"], "develop")
+
+
+class ClassOfSourcesTest(unittest.TestCase):
+    """Revue #544 r1 : `_class_of` lit toutes les sources de la tête gelée et
+    garde la plus haute — une lecture calculée ne se rétrograde jamais, et un
+    doute ne se lit pas comme une classe sensible."""
+
+    def read(self, answers):
+        calls = []
+
+        def fake(db, lot, **kw):
+            calls.append(kw.get("base"))
+            return answers[kw.get("base")]
+        return calls, fake
+
+    def class_of(self, answers):
+        calls, fake = self.read(answers)
+        with mock.patch.object(plan_git, "_commit", return_value="c" * 40), \
+                mock.patch.object(lot_class, "of_lot", side_effect=fake):
+            out = merge_queue._class_of(None, 1, {"app": "ameesh"}, "depot", "clone",
+                                        "main", "f" * 40)
+        return out, calls
+
+    def test_la_plus_haute_des_lectures_l_emporte(self):
+        # le clone radar voit le changement sensible, le checkout de l'auteur
+        # ne le voit plus (cible déjà à la tête gelée) : sensitive gagne
+        out, calls = self.class_of({
+            merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": False,
+                                             "why": "clone"},
+            "main": {"class": "light", "doubt": False, "why": "checkout auteur"}})
+        self.assertEqual(out["class"], "sensitive")
+        self.assertEqual(out["why"], "clone")
+        self.assertEqual(calls, [merge_queue.QUEUE_REF + "main", "main"])
+
+    def test_un_doute_ne_se_lit_pas_comme_une_classe_sensible(self):
+        # deux lectures sensibles : la calculée explique mieux que le doute
+        out, _ = self.class_of({
+            merge_queue.QUEUE_REF + "main": {"class": "sensitive", "doubt": True,
+                                             "why": "diff illisible"},
+            "main": {"class": "sensitive", "doubt": False, "why": "policy"}})
+        self.assertEqual(out["class"], "sensitive")
+        self.assertEqual(out["doubt"], False)
+        self.assertEqual(out["why"], "policy")
+
+    def test_un_doute_ne_retrograde_jamais_vers_light(self):
+        out, _ = self.class_of({
+            merge_queue.QUEUE_REF + "main": {"class": "light", "doubt": False,
+                                             "why": "checkout"},
+            "main": {"class": "sensitive", "doubt": True, "why": "diff illisible"}})
+        self.assertEqual(out["class"], "sensitive")
+        self.assertEqual(out["doubt"], True)
+        self.assertEqual(out["why"], "diff illisible")
 
 
 class OrderTest(unittest.TestCase):
@@ -412,7 +606,7 @@ class PassTest(_Base):
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "pushed from another host")
         self.ready(1)  # frozen on the fresh tip; the agents still see the old one
         clone = resolutions.Replayer(agents, radar.clone_dir(self.cfg, "p"))
-        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=self.green(1), clone=clone)
         self.project = radar.Project(name="p", repo=agents, migrations=MIG)
         report = self.run_pass(repo=agents)
         self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
@@ -439,7 +633,7 @@ class PassTest(_Base):
         _git(self.tmp, "clone", "-q", self.repo, agents)
         self.ready(1)
         clone = resolutions.Replayer(agents, radar.clone_dir(self.cfg, "p"))
-        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=self.green(1), clone=clone)
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "B, pushed from another host")
         self.project = radar.Project(name="p", repo=agents, migrations=MIG)
         self.run_pass(repo=agents)
@@ -453,7 +647,7 @@ class PassTest(_Base):
         _git(self.tmp, "clone", "-q", self.repo, agents)
         self.ready(lot)
         clone = resolutions.Replayer(agents, radar.clone_dir(self.cfg, "p"))
-        merge_queue.enter(None, lot, repo=agents, actor="orch", ci=None, clone=clone)
+        merge_queue.enter(None, lot, repo=agents, actor="orch", ci=self.green(lot), clone=clone)
         self.project = radar.Project(name="p", repo=agents, migrations=MIG)
         return agents
 

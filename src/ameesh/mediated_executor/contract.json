@@ -3815,7 +3815,7 @@
   }
  ],
  "refused": {
-  "interface_total": 384,
+  "interface_total": 386,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3890,7 +3890,8 @@
     "human_known",
     "set_mode",
     "upsert_unleased",
-    "wake_check"
+    "wake_check",
+    "note_unleased"
    ],
    "approvals": [
     "candidates",
@@ -4150,6 +4151,7 @@
     "auto_takes_since",
     "backlog",
     "backlog_add",
+    "by_issue_ref",
     "by_package",
     "close",
     "close_merged",

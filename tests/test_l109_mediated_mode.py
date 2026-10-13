@@ -133,7 +133,9 @@ class GardesTest(MedieBase):
         # L112 dans L109 : la porte relayée au serveur est celle du contrôleur
         runner.host_gate.gate = mock.Mock(state=lambda: gate.GateState("draining", 3))
         self.responder.script["leases.reap"] = []
-        runner.sweep()
+        with mock.patch.object(runner, "_note_gate_wait") as note:
+            runner.sweep()
+        note.assert_called_once_with("host gate: " + runner.host_gate.describe())
         self.assertNotIn("agents.claimable", self.transport.ops())
         self.assertNotIn("leases.claim", self.transport.ops())
 

@@ -4573,6 +4573,11 @@ class Runner:
         dry_run: bool = False,
         max_turns: int | None = None,
     ):
+        from .host_gate import gate_choice
+        try:
+            gate_choice(cfg, runner_id=cfg.runner)
+        except ValueError as exc:
+            raise SystemExit("agent-runner: %s" % exc) from exc
         self.cfg = cfg
         self.db = db
         self.host = cfg.host
@@ -4822,7 +4827,13 @@ class Runner:
         Host (prêteur ou non, `drain_seconds` de l'offre) ; ne lève jamais."""
         from . import host_gate as host_gate_mod
         try:
-            kind = host_gate_mod.gate_kind(self.cfg, lending)
+            kind, reason = host_gate_mod.gate_choice(self.cfg, lending, runner_id=self.runner_id)
+            if getattr(self, "_host_gate_rejected", ""):
+                kind, reason = "", "ack permission denied; guest gate excluded"
+            choice = (kind, reason)
+            if getattr(self, "_host_gate_choice_logged", None) != choice:
+                self._host_gate_choice_logged = choice
+                log_async("host gate selected: %s (%s)" % (kind or "none", reason))
             key = (kind, bool(lending), host_gate_mod.drain_seconds(self.cfg, offer)) \
                 if kind else None
         except ValueError as exc:
@@ -4850,6 +4861,40 @@ class Runner:
             log_async("host gate: `host_gate: none` on a lending host")
         if running:
             new.start()
+
+    def reject_host_gate(self, controller, error: str) -> None:
+        """An ack permission denial identifies another user's gate for natives.
+
+        Guests never call this: they keep the gate closed on the same error.
+        Remember rejection through canon sync so it cannot recreate the gate.
+        """
+        from . import host_gate as host_gate_mod
+        if host_gate_mod.is_guest(self.cfg, self.runner_id):
+            return
+        with self._host_gate_lock:
+            if self.host_gate is not controller:
+                return
+            self._host_gate_rejected = "host gate: not my gate (ack permission denied: %s)" % error
+            self.host_gate, self._host_gate_key = None, None
+        # May run inside the controller tick: signal shutdown without joining
+        # a thread that could itself be waiting for that tick to finish.
+        controller._stop.set()
+        controller.gate.close()
+        log_async(self._host_gate_rejected + "; native claims open")
+        self.wake_all.set()
+
+    def _note_unleased(self, agent: dict, reason: str) -> None:
+        if getattr(self, "mediated", False):
+            return  # L107: this native diagnostic operation is REFUSED
+        error = "lease_not_taken: " + reason
+        if agent.get("last_error") != error:
+            storage.of(self.db).agents.note_unleased(agent["name"], self.host, error)
+
+    def _note_gate_wait(self, reason: str) -> None:
+        if getattr(self, "mediated", False):
+            return
+        for agent in registry.claimable(self.db, self.host, self.agents_filter):
+            self._note_unleased(agent, reason)
 
     def _start_host_gate(self) -> None:
         with self._host_gate_lock:
@@ -5001,8 +5046,19 @@ class Runner:
             return  # drainage : aucun nouvel agent, aucun nouveau tour
         if not self._gate_settled.is_set():
             return  # L159f : hôte prêteur ou non, su au premier `canon sync`
-        if self.gate_holds():
-            return  # L159f : porte d'hôte fermée — aucune réclamation
+        if not getattr(self, "mediated", False):
+            from .host_gate import GateController
+            gate = self.host_gate
+            if isinstance(gate, GateController):
+                gate.refresh()  # confirm ack permission before any new lease
+        gate = self.host_gate
+        if gate is not None and gate.holds_turns():
+            # The mediated gate has no local file acknowledgement.
+            error = "" if getattr(self, "mediated", False) else \
+                getattr(gate.gate, "ack_error", "")
+            self._note_gate_wait("host gate: %s%s" % (
+                gate.describe(), "; ack not written: " + error if error else ""))
+            return  # host gate closed: registry diagnosis without taking a lease
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -5010,6 +5066,7 @@ class Runner:
             admitted, slot = self._gate_slot(agent) if self.host_gate is not None \
                 else (True, None)
             if not admitted:
+                self._note_unleased(agent, "host gate: no concurrent slot available")
                 continue  # L159f : `caps.max_concurrent` de la porte, par hôte
             if slot is not None:
                 with self._gate_slots_lock:
@@ -5025,11 +5082,14 @@ class Runner:
                               % (self.host, self._host_max_agents,
                                  (getattr(self, "_host_limits_origin", None) or {}).get(
                                      "max_agents", "?"), agent["name"]))
+                self._note_unleased(agent, "host capacity: max_agents=%s" % self._host_max_agents)
                 continue
             # une exception (base, worker) rend la place de la porte ; un
             # worker inscrit la rend à sa fin (`sweep`)
             registered = False
             try:
+                if getattr(self, "_host_gate_rejected", ""):
+                    self._note_unleased(agent, self._host_gate_rejected)
                 lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
                 if not lease:
                     self._release_slot(agent["name"])
@@ -6994,7 +7054,13 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
     (`created_ts`): deleting the agent and recreating it under the same name,
     with its state directory kept, does not inherit the previous authorization.
     A legacy plain-text file (written before L685) carries neither and is
-    refused (fail-closed), with the same warning."""
+    refused (fail-closed), with the same warning.
+
+    L719: the harness and the incarnation are those of the registration
+    **claimed** by `attach_claim` (read under its row lock), never of the read
+    that preceded it; the caller passes an unmatchable incarnation when the two
+    differ, so a registration replaced while the attach was starting inherits
+    nothing."""
     path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
     try:
         with open(path, encoding="utf-8") as fh:
@@ -7115,6 +7181,22 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         return 1
     epoch = int(lease["lease_epoch"])
     log_async("[%s] attach lease taken (epoch %d)" % (name, epoch))
+    # L719 : le mode de permission est vérifié contre la registration
+    # **revendiquée** par `attach_claim` (harnais et created_ts lus sous son
+    # verrou), jamais contre la lecture qui a précédé la prise du bail : un
+    # enregistrement supprimé puis recréé entre les deux n'hérite pas de
+    # l'autorisation précédente. L'adaptateur, lui, vient de la lecture
+    # antérieure : si la registration revendiquée en diffère, aucun mode ne
+    # peut lui être lié — incarnation vide, donc jamais de correspondance.
+    incarnation_revendiquee = agent_incarnation(lease)
+    if (incarnation_revendiquee
+            and (lease.get("harness") or "") == (agent.get("harness") or "")
+            and incarnation_revendiquee == agent_incarnation(agent)):
+        harness_revendique = lease.get("harness") or ""
+        mode_incarnation = incarnation_revendiquee
+    else:
+        harness_revendique = lease.get("harness") or (agent.get("harness") or "")
+        mode_incarnation = ""
     stop = threading.Event()
     perdu = threading.Event()
     etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
@@ -7169,7 +7251,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
-                cfg, name, agent.get("harness") or "", agent_incarnation(agent)))
+                cfg, name, harness_revendique, mode_incarnation))
         env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
@@ -7350,6 +7432,12 @@ def main(argv: list[str] | None = None) -> int:
     if parsed.idle_nudge:
         cfg = dataclasses.replace(cfg, idle_nudge=parsed.idle_nudge)
 
+    from .host_gate import gate_choice
+    try:
+        gate_choice(cfg, runner_id=cfg.runner)
+    except ValueError as exc:
+        print("agent-runner: %s" % exc, file=sys.stderr)
+        return 2
     db = _connect_at_start(cfg, wait=not parsed.once)
     if db is None:
         return 1

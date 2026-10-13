@@ -35,6 +35,7 @@ AGENT_COLUMNS = """
     name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     lease_owner, lease_epoch,
+    extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from created_at)::float8        as created_ts,
@@ -317,6 +318,29 @@ class Agents(interface.Agents):
         sql += " ORDER BY last_seen"
         return self.db.query(sql, tuple(params))
 
+    def note_unleased(self, name, host, error) -> bool:
+        if not error.startswith("lease_not_taken: "):
+            raise ValueError("unleased diagnostic must start with lease_not_taken: ")
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, host, mode, status, lease_owner, lease_expires_at,
+                       last_error
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET last_error = %s, updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name AND verrou.host = %s
+               AND verrou.mode = 'execute'
+               AND verrou.status IN ('idle', 'queued', 'dead')
+               AND (verrou.lease_owner IS NULL OR verrou.lease_expires_at IS NULL
+                    OR verrou.lease_expires_at <= clock_timestamp())
+               AND verrou.last_error IS DISTINCT FROM %s
+            RETURNING r.name
+            """, (name, error, host, error))
+        return bool(rows)
+
     def mark_event_wake(self, name) -> None:
         self.db.execute(
             "UPDATE agent_registry SET last_event_at = now(), updated_at = now() WHERE name = %s",
@@ -477,6 +501,9 @@ class Leases(interface.Leases):
                        THEN NULL
                        ELSE r.current_prompt END,
                    status           = CASE WHEN r.status = 'dead' THEN 'idle' ELSE r.status END,
+                   last_error       = CASE
+                       WHEN starts_with(coalesce(r.last_error, ''), 'lease_not_taken: ')
+                       THEN NULL ELSE r.last_error END,
                    updated_at       = now()
               FROM verrou
              WHERE r.name = verrou.name
@@ -514,6 +541,11 @@ class Leases(interface.Leases):
         L46 : contrairement à `claimable` / `claim`, le mode n'est PAS filtré —
         `attach` est une session humaine interactive, ce qu'est par nature un
         agent `externe` ; l'exécuteur, lui, ne le réclamera jamais.
+
+        L719 : la ligne rendue porte `harness` et `created_ts` (l'identité de
+        l'enregistrement, lue sous le verrou `FOR UPDATE`) pour que l'appelant
+        lie ce qu'il applique à la registration **revendiquée**, et non à une
+        lecture antérieure.
         """
         sql = """
             WITH verrou AS (
@@ -542,7 +574,9 @@ class Leases(interface.Leases):
                AND NOT r.handoff_fenced
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
-                      extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+                      extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts,
+                      r.harness,
+                      extract(epoch from r.created_at)::float8 as created_ts
         """
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
