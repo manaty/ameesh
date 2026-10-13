@@ -8,6 +8,7 @@ import json
 import types
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -28,9 +29,22 @@ class ScopedConnections(PgTestCase):
         return self.db.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid=%s',
                              (pid,))[0]['n']
 
+    def released(self, pid, timeout=5.0):
+        """Constate la disparition du backend, en l'attendant un peu (#854).
+
+        Fermer une connexion est asynchrone côté serveur : le backend peut
+        rester quelques millisecondes dans pg_stat_activity, davantage sur un
+        runner chargé. La session est bien libérée ; la mesure ne doit pas
+        dépendre de cet ordonnancement.
+        """
+        deadline = time.monotonic() + timeout
+        while self.present(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return self.present(pid)
+
     def test_session_released_before_external_work(self):
         pid = self.scoped.query('SELECT pg_backend_pid() AS pid')[0]['pid']
-        self.assertEqual(self.present(pid), 0)
+        self.assertEqual(self.released(pid), 0)
         self.scoped.execute('INSERT INTO scoped_values VALUES (1)')
         self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [{'n': 1}])
 
@@ -43,7 +57,7 @@ class ScopedConnections(PgTestCase):
                 self.assertEqual(tx.query('SELECT n FROM scoped_values'), [{'n': 1}])
                 self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [])
                 raise ValueError('abort')
-        self.assertEqual(self.present(pid), 0)
+        self.assertEqual(self.released(pid), 0)
         self.assertEqual(self.db.query('SELECT n FROM scoped_values'), [])
 
     def test_nested_transaction_rollback_retains_outer_session(self):
@@ -60,6 +74,10 @@ class ScopedConnections(PgTestCase):
 
     def test_concurrent_transactions_do_not_join_each_other(self):
         ready = threading.Barrier(2, timeout=15)
+        #: ne sortir du bloc (donc ne COMMITer) qu'une fois les deux lectures
+        #: faites : sinon la ligne commitée par l'autre transaction devient
+        #: légitimement visible et le test dépend de l'ordonnancement (#854).
+        checked = threading.Barrier(2, timeout=15)
         errors, pids = [], []
 
         def run(value):
@@ -69,8 +87,10 @@ class ScopedConnections(PgTestCase):
                     tx.execute('INSERT INTO scoped_values VALUES (%s)', (value,))
                     ready.wait()
                     self.assertEqual(tx.query('SELECT n FROM scoped_values'), [{'n': value}])
+                    checked.wait()
             except BaseException as error:
                 errors.append(error)
+                checked.abort()
 
         threads = [threading.Thread(target=run, args=(value,)) for value in (1, 2)]
         for thread in threads:
@@ -80,7 +100,7 @@ class ScopedConnections(PgTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         self.assertEqual(len(set(pids)), 2)
-        self.assertTrue(all(self.present(pid) == 0 for pid in pids))
+        self.assertEqual([self.released(pid) for pid in pids], [0, 0])
 
     def test_capacity_query_works_with_each_driver(self):
         reading = db_capacity.read(self.db)
