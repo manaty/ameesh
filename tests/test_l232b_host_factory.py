@@ -243,7 +243,8 @@ class HostFactoryTest(unittest.TestCase):
             value.admit(self.enrollment)
         self.document('backup',dict(dsn='postgresql://backup@localhost/fixture-db',
             restore_dsn='postgresql://restore@localhost/fixture-db',
-            retention_seconds=1209600,remote=None))
+            retention_seconds=1209600,remote=None,
+            restore_capacity='/etc/ameesh-release/restore-capacity.json'))
         value=factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
             store=self.store,configuration_journal=self.journal,backup_root=self.backup,
             retention_root=self.retention,system=self.system,capabilities={})
@@ -251,6 +252,18 @@ class HostFactoryTest(unittest.TestCase):
         adapter=value.for_operation(dict(operation='release-fixture'),self.authority)
         self.assertTrue(callable(getattr(adapter.recovery_set,'perform',None)))
         self.assertTrue(callable(getattr(adapter.health,'perform',None)))
+
+    def test_admission_refuses_a_backup_document_without_the_target_volume(self):
+        # The restore cluster's volume must be attested; an enrollment that
+        # omits it binds no recovery backend (fail closed before any copy).
+        self.document('backup',dict(dsn='postgresql://backup@localhost/fixture-db',
+            restore_dsn='postgresql://restore@localhost/fixture-db',
+            retention_seconds=1209600,remote=None))
+        value=factory.HostFactory(self.db,self.enrollment,documents=factory.Documents(self.enrollment_root),
+            store=self.store,configuration_journal=self.journal,backup_root=self.backup,
+            retention_root=self.retention,system=self.system,capabilities={})
+        with self.assertRaisesRegex(factory.FactoryError,'sauvegarde-release'):
+            value.admit(self.enrollment)
 
     def test_every_controller_step_returns_exactly_request_plus_ok(self):
         adapter=self.adapter()

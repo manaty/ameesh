@@ -108,7 +108,8 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
     """Capture expected rows and the archive from one repeatable-read snapshot.
 
     The full database is dumped; the private inventory identifies the mesh
-    schema and representative tables that restoration must check.
+    schema and representative tables that restoration must check, and pins the
+    uncompressed live size (`source_bytes`) that bounds the target copy.
     """
     import psycopg
     from psycopg import sql
@@ -135,11 +136,17 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
         for table in sorted(set(tables)):
             counts[table] = source.execute(sql.SQL("SELECT count(*) FROM {}.{}")
                                           .format(sql.Identifier(schema), sql.Identifier(table))).fetchone()[0]
+        # The uncompressed live size bounds the copy a verified restore
+        # materialises in the target cluster; captured in the same snapshot.
+        size = source.execute("SELECT pg_database_size(current_database())").fetchone()[0]
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise BackupError("source did not report a usable database size")
         # The exporting transaction stays open until pg_dump imports and
         # finishes the snapshot, including writes made concurrently afterwards.
         dump_parameters(parameters, output, snapshot=snapshot)
         expected = {"schema": schema, "migrations": [list(row) for row in versions],
-                    "row_counts": counts, "artifact_sha256": digest(output)}
+                    "row_counts": counts, "artifact_sha256": digest(output),
+                    "source_bytes": size}
         with tempfile.TemporaryDirectory(prefix=".inventory-", dir=output.parent) as staging:
             candidate = Path(staging) / "inventory.json"
             with candidate.open("x") as stream:

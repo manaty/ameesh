@@ -308,11 +308,12 @@ class PrivateBackupTest(unittest.TestCase):
     def snapshot_fixture(self, *, versions=((1, "checksum"),)):
         source, context = mock.MagicMock(), mock.MagicMock()
         context.__enter__.return_value = source
-        cursors = [mock.MagicMock() for _ in range(5)]
+        cursors = [mock.MagicMock() for _ in range(6)]
         cursors[1].fetchone.return_value = ("00000003-000000AE-1",)
         cursors[2].fetchall.return_value = list(versions)
         cursors[3].fetchone.return_value = (5,)
         cursors[4].fetchone.return_value = (2,)
+        cursors[5].fetchone.return_value = (4096,)
         source.execute.side_effect = cursors
         return source, context, cursors
 
@@ -333,6 +334,7 @@ class PrivateBackupTest(unittest.TestCase):
         expected = json.loads(inventory.read_text())
         self.assertEqual(expected["row_counts"], {"agent_mailbox": 5, "agent_registry": 2})
         self.assertEqual(expected["migrations"], [[1, "checksum"]])
+        self.assertEqual(expected["source_bytes"], 4096)
         self.assertEqual(expected["artifact_sha256"], backup.digest(self.output))
         self.assertEqual(proof["artifact_sha256"], expected["artifact_sha256"])
         self.assertEqual(stat.S_IMODE(inventory.stat().st_mode), 0o600)

@@ -21,9 +21,11 @@
 
 `config` is the administrator-enrolled `backup.json` document (exact keys):
 `dsn` (backup identity), `restore_dsn` (separate restore identity),
-`retention_seconds` and an optional `remote` object naming the object host and
-the two private credential files. Credential values never enter arguments,
-receipts, errors or logs; the enrolled document holds references only.
+`retention_seconds`, `restore_capacity` (path to the fresh target-volume
+attestation the enrolled producer refreshes for that exact restore target) and
+an optional `remote` object naming the object host and the two private
+credential files. Credential values never enter arguments, receipts, errors or
+logs; the enrolled document holds references only.
 
 This module is source only: it is not installed, no service is enabled and no
 root, SSH, systemd, PostgreSQL migration or production effect is executed by
@@ -31,6 +33,7 @@ building or testing it. A definitive refusal answers False (the controller
 holds); an ambiguous effect raises so the durable intent reconciles.
 """
 from contextlib import contextmanager
+import hashlib
 import importlib.util
 import json
 import os
@@ -45,20 +48,29 @@ import uuid
 REQUIRED_STEPS = ('backup', 'pin', 'accept')
 REQUEST_FIELDS = {'operation', 'manifest_digest', 'action_id', 'manifest', 'step'}
 PENDING_FIELDS = {'artifact', 'manifest_digest', 'files', 'remote', 'remote_verified'}
-INVENTORY_FIELDS = {'schema', 'migrations', 'row_counts', 'artifact_sha256'}
+INVENTORY_FIELDS = {'schema', 'migrations', 'row_counts', 'artifact_sha256', 'source_bytes'}
 PROOF_FIELDS = {'artifact_sha256', 'restore_verified', 'disposable_database_removed'}
 CREDENTIAL_FIELDS = {'access_key', 'secret_key', 'bucket', 'region'}
 REMOTE_FIELDS = {'host', 'upload_credentials', 'restore_credentials'}
-CONFIG_FIELDS = {'dsn', 'restore_dsn', 'retention_seconds', 'remote'}
+#: Fresh target-volume attestation produced by the enrolled probe: exact keys,
+#: bound to the exact restore target, unusable once older than the TTL.
+CAPACITY_FIELDS = {'target_sha256', 'free_bytes', 'checked_at'}
+CONFIG_FIELDS = {'dsn', 'restore_dsn', 'retention_seconds', 'remote', 'restore_capacity'}
 IDENTIFIER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 OPERATION = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}')
 SHA256 = re.compile(r'[0-9a-f]{64}')
 MINIMUM_FREE_BYTES = 512 * 1024 * 1024
-# A verified restore copies the archive into the database cluster before the
-# disposable database is dropped. The release host keeps the cluster and the
-# release state on the same filesystem by default, so a fresh restore reserves
-# this multiple of the artifact on top of the release floor.
+# A verified restore materialises the uncompressed source database in the
+# target cluster before the disposable database is dropped. That volume is not
+# readable from the client, so the enrolled probe must keep attesting its free
+# space for the exact restore target; a live attestation covers this multiple
+# of the pinned uncompressed source size on top of the release floor. A missing,
+# stale or differently bound attestation is refused before any copy.
 RESTORE_SPACE_FACTOR = 2
+#: An attestation older than this is stale: the gate follows the refreshed
+#: document, never a value frozen at enrollment time.
+CAPACITY_TTL_SECONDS = 300
+CAPACITY_FUTURE_SKEW_SECONDS = 60
 # A recovery artifact left by an interrupted attempt is only evidence of the
 # current pre-migration state for a bounded window; an older set is recreated
 # from the live source instead of being pinned stale.
@@ -96,6 +108,10 @@ def configuration(document):
     seconds = document['retention_seconds']
     if type(seconds) is not int or not 3600 <= seconds <= 10 * 365 * 86400:
         raise RecoveryError('invalid recovery retention')
+    capacity = document['restore_capacity']
+    if (not isinstance(capacity, str) or not capacity.startswith('/') or '\x00' in capacity
+            or '..' in Path(capacity).parts):
+        raise RecoveryError('invalid restore capacity reference')
     remote = document['remote']
     if remote is not None:
         if not isinstance(remote, dict) or set(remote) != REMOTE_FIELDS:
@@ -112,7 +128,8 @@ def configuration(document):
         remote = {'host': host, 'upload_credentials': remote['upload_credentials'],
                   'restore_credentials': remote['restore_credentials']}
     return dict(dsn=document['dsn'], restore_dsn=document['restore_dsn'],
-                retention_seconds=seconds, remote=remote)
+                retention_seconds=seconds, remote=remote,
+                restore_capacity=capacity)
 
 
 def private_directory(path, what):
@@ -297,6 +314,40 @@ class RecoverySet:
             return False
         return free >= MINIMUM_FREE_BYTES + factor * size
 
+    def _capacity(self):
+        """Fresh free space attested for this exact restore target, or None.
+
+        `restore_capacity` is an enrolled reference, not a value: the enrolled
+        producer refreshes a private protected file (exact keys) at each
+        backup/restore step. Missing, unsafe, stale, future-dated beyond the
+        allowed skew or differently bound documents are unusable, so the
+        restore refuses before creating anything.
+        """
+        path = Path(self.config['restore_capacity'])
+        try:
+            info = path.lstat()
+        except OSError:
+            return None
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022):
+            return None
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(value, dict) or set(value) != CAPACITY_FIELDS:
+            return None
+        free, checked, target = value.get('free_bytes'), value.get('checked_at'), value.get('target_sha256')
+        now = self.clock()
+        if (isinstance(free, bool) or not isinstance(free, int) or not 0 <= free <= 10 ** 15
+                or isinstance(checked, bool) or not isinstance(checked, int)
+                or not now - CAPACITY_TTL_SECONDS <= checked <= now + CAPACITY_FUTURE_SKEW_SECONDS
+                or not isinstance(target, str) or SHA256.fullmatch(target) is None):
+            return None
+        if target != hashlib.sha256(self.config['restore_dsn'].encode()).hexdigest():
+            return None
+        return free
+
     def _restore(self, archive, proof_path, expected):
         if os.path.lexists(proof_path):
             if proof_path.is_symlink() or not proof_path.is_file():
@@ -305,8 +356,12 @@ class RecoverySet:
             if proof is not None:
                 return True
             proof_path.unlink()
-        size = self._size(archive)
-        if size is None or not self._room(self.retention, size, RESTORE_SPACE_FACTOR):
+        # The copy is materialised on the restore cluster's volume, not on the
+        # retention one: admit it against the live attestation of that volume
+        # and the pinned uncompressed source size, before any effect.
+        free = self._capacity()
+        needed = MINIMUM_FREE_BYTES + RESTORE_SPACE_FACTOR * expected['source_bytes']
+        if free is None or free < needed:
             return False
         with self._config_file(self.config['restore_dsn']) as config:
             try:
@@ -564,7 +619,10 @@ class RecoverySet:
                 or not isinstance(value.get('schema'), str) or not value['schema']
                 or '\x00' in value['schema']
                 or not isinstance(value.get('artifact_sha256'), str)
-                or SHA256.fullmatch(value['artifact_sha256']) is None):
+                or SHA256.fullmatch(value['artifact_sha256']) is None
+                or isinstance(value.get('source_bytes'), bool)
+                or not isinstance(value['source_bytes'], int)
+                or not 0 < value['source_bytes'] <= 10 ** 15):
             return None
         migrations, counts = value.get('migrations'), value.get('row_counts')
         if (not isinstance(migrations, list) or not migrations

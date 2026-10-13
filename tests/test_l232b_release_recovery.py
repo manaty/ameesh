@@ -36,16 +36,29 @@ class RecoverySetTest(unittest.TestCase):
         for path in (self.root, self.retention, self.store):
             path.mkdir(mode=0o700)
         self.clock = lambda: 2_000_000.0
+        self.capacity_path = base / 'restore-capacity.json'
         self.manifest = dict(host='fixture-host', commit='a' * 40, release='a' * 40 + '-' + 'b' * 64,
                              database='fixture-db', units=['ameesh-runner@one.service'],
                              policy='policy-' + 'c' * 64, rollback_until=2_000_000 + 3600)
         self.config = dict(dsn='postgresql://backup:CANARY-DSN@localhost/fixture-db',
                            restore_dsn='postgresql://restore:CANARY-RESTORE@localhost/fixture-db',
-                           retention_seconds=14 * 24 * 3600, remote=None)
+                           retention_seconds=14 * 24 * 3600, remote=None,
+                           restore_capacity=str(self.capacity_path))
+        self.write_capacity()
         self.value = recovery.RecoverySet(Database(), store=self.store, root=self.root,
                                           retention=self.retention, config=self.config,
                                           clock=self.clock)
         self.release = dict(commit='a' * 40)
+
+    def write_capacity(self, *, free_bytes=8 * 1024 ** 3, checked_at=None, target=None, mode=0o600):
+        """Refresh the live attestation the enrolled producer would write."""
+        document = dict(free_bytes=free_bytes,
+                        checked_at=int(self.clock() if checked_at is None else checked_at),
+                        target_sha256=(target if target is not None else
+                                       hashlib.sha256(self.config['restore_dsn'].encode()).hexdigest()))
+        self.capacity_path.write_text(json.dumps(document, sort_keys=True))
+        self.capacity_path.chmod(mode)
+        return document
 
     def perform(self, step, operation='release-fixture', manifest=None):
         return self.value.perform(step, self.request(step, operation=operation, manifest=manifest), self.release)
@@ -64,7 +77,8 @@ class RecoverySetTest(unittest.TestCase):
     def write_inventory(self, archive, value=None, inventory=None):
         digest = hashlib.sha256(Path(archive).read_bytes()).hexdigest()
         document = value or dict(schema='public', migrations=[[1, 'd' * 64]],
-                                 row_counts={'agent_registry': 4}, artifact_sha256=digest)
+                                 row_counts={'agent_registry': 4}, artifact_sha256=digest,
+                                 source_bytes=1024 * 1024)
         path = Path(inventory) if inventory is not None else Path(self.inventory())
         path.write_text(json.dumps(document, sort_keys=True))
         path.chmod(0o600)
@@ -353,34 +367,84 @@ class RecoverySetTest(unittest.TestCase):
         self.assertEqual(upload.call_count, 1)
         self.assertEqual(retrieve.call_count, 1)
 
-    # -- K2: admission checks the space every real copy needs ---------------
-    def test_restore_refuses_when_the_cluster_filesystem_is_full(self):
-        real = recovery.shutil.disk_usage
-        calls = []
-
-        def usage(path):
-            calls.append(path)
-            return real(path)._replace(free=recovery.MINIMUM_FREE_BYTES if len(calls) == 1
-                                       else recovery.MINIMUM_FREE_BYTES - 1)
-
-        with mock.patch.object(recovery.shutil, 'disk_usage', side_effect=usage), \
-                mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+    # -- K2: admission checks the target volume, not the retention one ------
+    def refused_restore(self):
+        """Run one backup attempt whose restore must be refused before any effect."""
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
                 mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore) as restore:
             self.assertFalse(self.perform('backup'))
         restore.assert_not_called()
+        return restore
+
+    def compressible_dump(self, config, output, inventory):
+        # A compressed-size check would admit this tiny archive; the pinned
+        # uncompressed source size is what bounds the restored copy.
+        Path(output).write_bytes(b'x')
+        Path(output).chmod(0o600)
+        document = self.write_inventory(
+            output, value=dict(schema='public', migrations=[[1, 'd' * 64]],
+                               row_counts={'agent_registry': 4},
+                               artifact_sha256=hashlib.sha256(b'x').hexdigest(),
+                               source_bytes=1024 * 1024 * 1024),
+            inventory=inventory)
+        return {'artifact_sha256': document['artifact_sha256'], 'inventory': str(inventory)}
+
+    def test_restore_refuses_when_the_target_volume_is_not_attested(self):
+        # Enrollment is valid; no fresh attestation exists yet. The retention
+        # filesystem is free, but the copy lands on the restore volume.
+        self.capacity_path.unlink()
+        self.refused_restore()
         self.assertTrue(self.archive().exists(), 'the published artifact stays for reconciliation')
         self.assertFalse((Path(self.root) / 'release-fixture.set.json').exists())
+
+    def test_restore_refuses_a_stale_target_volume_attestation(self):
+        self.write_capacity(checked_at=self.clock() - recovery.CAPACITY_TTL_SECONDS - 1)
+        self.refused_restore()
+
+    def test_restore_refuses_an_attestation_for_another_target(self):
+        self.write_capacity(target=hashlib.sha256(b'postgresql://restore@other/fixture-db').hexdigest())
+        self.refused_restore()
+
+    def test_restore_refuses_when_the_attested_free_space_is_too_small(self):
+        self.write_capacity(free_bytes=recovery.MINIMUM_FREE_BYTES + 2 * 1024 * 1024 - 1)
+        self.refused_restore()
+
+    def test_restore_refuses_a_compressible_archive_under_the_attested_floor(self):
+        self.write_capacity(free_bytes=recovery.MINIMUM_FREE_BYTES + 1024 * 1024 * 1024)
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.compressible_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore) as restore:
+            self.assertFalse(self.perform('backup'))
+        restore.assert_not_called()
+
+    def test_restore_follows_the_live_attestation_between_two_attempts(self):
+        # Same enrollment, same published artifact: the first attempt is
+        # admitted and fails definitively; the volume then fills and the
+        # refreshed attestation refuses the second attempt before any copy.
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore',
+                                  side_effect=recovery.backup.BackupError('no room')) as restore:
+            self.assertFalse(self.perform('backup'))
+        self.assertEqual(restore.call_count, 1)
+        self.write_capacity(free_bytes=recovery.MINIMUM_FREE_BYTES - 1)
+        self.refused_restore()
+
+    def test_restore_refuses_when_the_enrolled_capacity_is_not_referenced(self):
+        with self.assertRaisesRegex(recovery.RecoveryError, 'exact recovery enrollment'):
+            recovery.RecoverySet(Database(), store=self.store, root=self.root,
+                                 retention=self.retention,
+                                 config={key: value for key, value in self.config.items()
+                                         if key != 'restore_capacity'},
+                                 clock=self.clock)
 
     def test_remote_verification_refuses_when_staging_has_no_room(self):
         upload_credentials, restore_credentials = self.credential_files()
         self.value = self.remote_value(upload_credentials, restore_credentials)
         real = recovery.shutil.disk_usage
-        calls = []
 
         def usage(path):
-            calls.append(path)
-            free = (recovery.MINIMUM_FREE_BYTES + 4096 if len(calls) <= 2
-                    else recovery.MINIMUM_FREE_BYTES - 1)
+            # The retention volume has room; the private staging root does not.
+            free = (recovery.MINIMUM_FREE_BYTES - 1 if Path(path) == Path(self.root)
+                    else recovery.MINIMUM_FREE_BYTES + 4096)
             return real(path)._replace(free=free)
 
         with mock.patch.object(recovery.shutil, 'disk_usage', side_effect=usage), \
@@ -394,6 +458,9 @@ class RecoverySetTest(unittest.TestCase):
     # -- K1: acceptance expires accepted sets that reached their window -----
     def advance_past_window(self):
         self.value.clock = lambda: 2_000_000.0 + self.config['retention_seconds'] + 1
+        # The enrolled producer refreshes the target attestation at each step,
+        # so moving time forward must not leave the next backup on a stale one.
+        self.write_capacity(checked_at=int(self.value.clock()))
 
     def test_acceptance_expires_only_eligible_accepted_sets(self):
         self.assertTrue(self.backup())

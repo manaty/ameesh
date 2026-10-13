@@ -19,8 +19,10 @@ inventory. Archive and inventory must be new files in the same directory.
 The source uses a read-only repeatable-read transaction and exports its
 snapshot to `pg_dump`; that transaction stays open until the dump finishes.
 The archive covers the database, and the inventory records the selected mesh
-schema's migration versions/checksums, representative row counts and archive
-SHA-256. Defaults are `public`, `agent_registry` and `agent_mailbox`.
+schema's migration versions/checksums, representative row counts, archive
+SHA-256 and the uncompressed live size (`source_bytes`, the copy a verified
+restore materialises in the target cluster). Defaults are `public`,
+`agent_registry` and `agent_mailbox`.
 Concurrent writes after snapshot export do not change those expected counts.
 The inventory is published only after the archive succeeds and contains no
 connection credentials. Source configurations that store their mesh in another

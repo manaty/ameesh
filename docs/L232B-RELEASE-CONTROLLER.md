@@ -460,10 +460,10 @@ loaded by the service, never a module named by a job, transport message or
 enrollment document. It composes the protected documents under
 `/etc/ameesh-release` — `card.json` (effective configuration card),
 `destinations.json` (bounded destination map), `transport.json` (SSH restart
-endpoint) and `backup.json` (recovery identities, retention window and optional
-remote references) — with the fixed private state under `/var/lib/ameesh-release`
-and the
-versioned release store under `/opt/ameesh-release/store`. The store root is
+endpoint) and `backup.json` (recovery identities, retention window, target
+volume admission and optional remote references) — with the fixed private
+state under `/var/lib/ameesh-release` and the versioned release store under
+`/opt/ameesh-release/store`. The store root is
 part of the signed bootstrap directory inventory at mode 0700, like the
 administrator staging root; it is never created ad hoc. Enrollment, database
 and operation documents keep the exact shapes checked by the dispatcher and the
@@ -507,18 +507,26 @@ False on a definitive refusal, or raise for an ambiguous effect; the factory
 refuses admission while any is absent or its enrollment is missing.
 
 Recovery sets use an optional protected `backup.json` document (exact keys
-`dsn`, `restore_dsn`, `retention_seconds`, `remote`): the dump and the isolated
-disposable restore use separate identities, `remote` (when enrolled) names the
-object host plus one private upload credential file and one private recovery
-credential file, and no credential value enters a receipt, an argument, the
-child environment or an error. `backup` publishes the dump and its pinned row
-inventory in the private retention root, proves an isolated restore against
-that inventory, proves a configured remote copy can be retrieved with the
-recovery identity, and records the verified set in a private receipt. A fresh
-restore and a remote retrieval are admitted only with room for the copy (twice
-the artifact for the cluster copy, once for private staging) on top of the
-release disk floor; insufficient space is a definitive refusal, never a partial
-copy. `pin`
+`dsn`, `restore_dsn`, `retention_seconds`, `restore_capacity`, `remote`): the
+dump and the isolated disposable restore use separate identities,
+`restore_capacity` references the private file the enrolled producer refreshes
+with the free space of the exact restore target's volume, `remote` (when
+enrolled) names the object host plus one private upload credential file and one
+private recovery credential file, and no credential value enters a receipt, an
+argument, the child environment or an error. `backup` publishes the dump and
+its pinned row inventory in the private retention root, proves an isolated
+restore against that inventory, proves a configured remote copy can be
+retrieved with the recovery identity, and records the verified set in a
+private receipt. A fresh restore and a remote retrieval are admitted before
+any copy: the target cluster's volume is not readable from the client, so the
+live attestation (exact keys `target_sha256` of the enrolled `restore_dsn`,
+`free_bytes`, `checked_at` as integer epoch seconds; refreshed at the step,
+unusable after five minutes, `CAPACITY_TTL_SECONDS`) must cover twice the
+pinned uncompressed source size
+(`source_bytes` in the inventory) on top of the release disk floor; a missing,
+stale, unsafe or differently bound attestation is refused the same way. The
+private staging download reserves the artifact size. Insufficient or
+unattested space is a definitive refusal, never a partial copy. `pin`
 registers those exact bytes before migration with the manifest rollback deadline
 and the enrolled retention window; an unaccepted set is never expired. `accept`
 records release acceptance, drops the transient receipt and then expires the
