@@ -840,6 +840,74 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
             "pending": sorted(pending), "failed": sorted(failed)}
 
 
+#: L756 (#566): les déclencheurs d'une exécution de la suite **complète** —
+#: une poussée (main, release/**, selon le workflow du projet) ou un lancement
+#: manuel. Une PR, elle, peut n'avoir exécuté que le plan impacté, ou rien du
+#: tout quand elle ne change qu'une version : elle ne certifie jamais une
+#: release.
+FULL_SUITE_EVENTS = ("push", "workflow_dispatch")
+
+
+def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
+    """L756 (#566): une exécution de la suite complète, verte, sur `sha`.
+
+    Lit les exécutions de workflows du commit exact (`gh run list --commit`)
+    et ne garde que celles déclenchées par `FULL_SUITE_EVENTS`, la plus
+    récente par workflow : `{runs, green, pending: [workflows], failed:
+    [workflows]}`. `green` exige au moins une exécution, toutes terminées et
+    passantes. Une lecture impossible lève `plan_github.GithubError`, jamais
+    « pas de suite complète »."""
+    from datetime import datetime
+    from . import plan_github
+    slug = github_slug(project)
+    if not slug:
+        raise plan_github.GithubError("project %s declares no GitHub repository" % project.name)
+    gh = gh or plan_github.Gh()
+    rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
+                                  "100", "--json",
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,"
+                                  "event,headSha,createdAt,startedAt,updatedAt"])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise plan_github.GithubError("gh run list: unexpected output")
+    if len(rows) >= 100:
+        raise plan_github.GithubError("gh run list: result may be truncated; cannot certify "
+                                      "the full suite")
+    latest: dict = {}
+    times: dict = {}
+    for run in rows:
+        if run.get("headSha") != sha:
+            raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
+        if run.get("event") not in FULL_SUITE_EVENTS:
+            continue
+        identity = run.get("workflowDatabaseId")
+        if type(identity) is not int or identity <= 0:
+            raise plan_github.GithubError("gh run list: missing or invalid workflow identity")
+        try:
+            stamps = [datetime.fromisoformat(run[field].replace("Z", "+00:00"))
+                      for field in ("createdAt", "startedAt", "updatedAt")]
+            if any(t.utcoffset() is None for t in stamps):
+                raise ValueError("timestamp lacks timezone")
+            at = max(stamps)
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise plan_github.GithubError("gh run list: missing or invalid run timestamp") from exc
+        if identity in times and at == times[identity] and run != latest[identity]:
+            raise plan_github.GithubError("gh run list: ambiguous latest run for workflow %s"
+                                          % identity)
+        if identity not in times or at > times[identity]:
+            times[identity], latest[identity] = at, run
+
+    def label(identity, run):
+        return run.get("workflowName") or run.get("name") or str(identity)
+
+    pending = sorted(label(n, r) for n, r in latest.items()
+                     if (r.get("status") or "") != "completed")
+    failed = sorted(label(n, r) for n, r in latest.items()
+                    if (r.get("status") or "") == "completed"
+                    and (r.get("conclusion") or "").lower() not in CI_PASSING)
+    return {"runs": len(latest), "green": bool(latest) and not pending and not failed,
+            "pending": pending, "failed": failed}
+
+
 def gates_for(project, files) -> tuple:
     """L160g (#473): the gates of a merge that touches `files`: the
     unconditional ones, then each path gate one of whose globs matches one
