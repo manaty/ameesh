@@ -97,6 +97,13 @@
 # lue à l'exécution) : un test qui ne tient que sur la classe ordinaire
 # (horodatages, renommage entre périphériques, inodes, blocs) se révèle là. Le
 # job « autre système de fichiers » est alors exigé par le check agrégé.
+#
+# #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
+# `close` : le check restait `in_progress` pour toujours. Le job `tests`
+# (indépendant des publishers) conclut les orphelins en relisant l'état
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`) : `cancelled`,
+# jamais `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
+# `actions: read` et `checks: write` sur le job `tests`.
 name: tests
 
 on:
@@ -708,6 +715,10 @@ jobs:
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # #856 : relire l'état terminal des jobs d'une exécution
+      checks: write   # #856 : conclure les checks « tests (flux) » orphelins
     steps:
       - name: bilan des parts
         run: |
@@ -743,3 +754,14 @@ jobs:
           # #748 : la part sur l'autre système de fichiers n'existe que pour une
           # release (ou à la main) ; quand elle a tourné, elle compte
           test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped
+      # #856 : réconciliation indépendante du publisher — un runner arrêté
+      # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
+      # restait in_progress pour toujours. On relit l'état terminal réel du job
+      # et de l'exécution qui l'ont publié ; jamais `success` sans ligne `fin`,
+      # aucun check actif, d'une autre tête ou d'une autre tentative n'est touché.
+      - uses: actions/checkout@v4
+      - name: conclusion des checks de flux orphelins
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-flow.py sweep
