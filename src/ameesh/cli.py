@@ -1297,7 +1297,10 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
-        done = migrations.migrate(db, log=lambda line: print(line))
+        done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only)
+    except migrations.NonAdditiveMigration as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
     except db_mod.DbError as exc:
         print("migration failed: %s" % exc, file=sys.stderr)
         return 1

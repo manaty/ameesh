@@ -54,6 +54,9 @@ protocol can execute on a real host:
   shared across hosts/controllers, and reconciles already committed versions.
   Both dry-run and execution use the manifest commit with unconditional
   additive-only. Host-local serialization cannot elect that database worker.
+  The migration library now elects a worker before bootstrap/inventory and
+  commits each entire pass on the same backend as its transaction lock; the
+  release CLI also rechecks its additive guard inside that election.
 - `configure` validates and snapshots units, slices, drop-ins and guard policy.
   `activate` uses the single versioned code/venv pointer. `restart` is bounded.
   `health` verifies schema, doctor, actual cgroup caps, guard, CLI and one
@@ -117,6 +120,42 @@ while keeping the fence. These tests pass through both psycopg and psql.
 The database connection, registry trust, clock and final effect-time authority
 check must be enrolled independently; this read-only adapter does not bridge a
 controller/helper privilege boundary or remove the need for host-side checks.
+
+## Database migration worker
+
+`migrations.migrate()` now takes the existing `ameesh_migrations` advisory
+transaction lock before creating a schema/catalog or reading pending versions.
+PostgreSQL scopes this lock to its actual database: different host names,
+connection strings and schemas cannot elect simultaneous workers for that
+database. Election respects the configured statement timeout. Only after
+election is the SQL timeout lifted, matching the previous long-migration policy.
+
+The same transaction/backend executes the full pending batch and commits its
+version/checksum inventory. Failure or writer connection loss rolls back that
+batch and releases its lock; previously committed passes remain. A retry reads
+the inventory again under election, including after an uncertain commit reply.
+Success messages are emitted only after commit. This replaces per-file commits:
+a failure in migration N now also rolls back pending migrations 1..N-1 of the
+same pass. A long pass holds its DDL locks until the whole batch commits.
+
+`migrate --additive-only` retains its readable preflight, then passes the guard
+to the elected worker for a second check. A changed inventory between those
+checks cannot authorize a newly pending non-additive migration. Dry-run remains
+read-only and is an observation rather than election or authority. The psql
+transaction driver executes raw scripts on its existing backend, preserving SQL
+format strings and avoiding a new connection that would bypass the lock.
+
+The lock key remains compatible with the earlier per-file workers, excluding
+their SQL while a new worker owns election. Earlier workers still read inventory
+before their own lock and can later fail on stale inventory: upgrade every
+migration worker before relying on reconciliation. This library integration does
+not enroll controller/SSH adapters, select a migration identity or provide a
+host claim fence. Transactional approved migration SQL remains a prerequisite.
+
+Real disposable PostgreSQL tests cover competing workers before inventory,
+fresh-schema and DDL rollback, additive refusal after an obsolete CLI preflight,
+writer backend loss and retry, and bounded contention across schemas. Both
+drivers are covered; no production connection or host action is performed.
 
 ## Operation-specific code and environment recovery
 
