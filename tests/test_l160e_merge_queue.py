@@ -553,7 +553,7 @@ class PassTest(_Base):
                     "ssh://git@GitHub.com:22/Manaty/ameesh.git/"):
             with self.subTest(url):
                 _git(self.repo, "remote", "add", "origin", url)
-                self.assertEqual(merge_queue.source_of(self.repo), "github.com/Manaty/ameesh")
+                self.assertEqual(merge_queue.source_of(self.repo), "github.com/manaty/ameesh")
                 _git(self.repo, "remote", "remove", "origin")
         # r6: two servers on one host, by their ports, are two sources
         seen = []
