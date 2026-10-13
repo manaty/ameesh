@@ -181,8 +181,11 @@ def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, e
         raise OperatorError('probe runner unit outside the enrolled policy')
     pinned=template['plan']
     for name,field in TREES.items():
+        staged=str(trees[name])
+        if not staged.startswith('/'):
+            raise OperatorError('absolute staged '+name+' tree required')
         try:
-            digest=runtime.inventory(str(trees[name]))['digest']
+            digest=runtime.inventory(staged)['digest']
         except (runtime.RuntimeError,OSError,TypeError,ValueError):
             raise OperatorError('staged '+name+' tree unavailable') from None
         if digest!=pinned[field]:

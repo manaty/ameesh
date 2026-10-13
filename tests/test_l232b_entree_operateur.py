@@ -148,6 +148,8 @@ class OperatorEntryTest(unittest.TestCase):
             self.prepare(trees={'runtime':self.trees['runtime'],'sources':self.temp/'absent'})
         with self.assertRaises(entry.OperatorError):
             self.prepare(trees={'runtime':self.trees['runtime']})
+        with self.assertRaises(entry.OperatorError):
+            self.prepare(trees={'runtime':'relative-runtime','sources':self.trees['sources']})
         partial=dict(self.observed); partial.pop(sorted(partial)[0])
         with self.assertRaises(entry.OperatorError):
             self.prepare(observed=partial)
