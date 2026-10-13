@@ -14,11 +14,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import contextlib
 import dataclasses
+import io
 import unittest
 from unittest import mock
 
-from ameesh import adapters, harnesses, registry
+from ameesh import adapters, harness_cli, harnesses, registry
 from ameesh.runner import run_attach
 
 from .support import FAKEBIN, PgTestCase
@@ -154,11 +156,8 @@ class PermissionModeTest(unittest.TestCase):
         with mock.patch.object(adapters, "_option_choices", side_effect=RuntimeError("x")):
             self.assertEqual(claude.permission_mode(), "acceptEdits")
 
-    def test_codex_and_deepseek_unchanged(self):
+    def test_deepseek_unchanged(self):
         self._claude()
-        codex = adapters.adapter_for("codex")
-        self.assertEqual(codex.permission_mode(), "")
-        self.assertEqual(codex.interactive_command("t1"), [codex.binary, "resume", "t1"])
         dsh = adapters.adapter_for("deepseek")
         self.assertEqual(dsh.permission_mode("auto"), "")
 
@@ -200,6 +199,102 @@ class PermissionModeTest(unittest.TestCase):
         self.assertEqual(claude.permission_mode("bypassPermissions"), "bypassPermissions")
 
 
+class CodexPermissionTest(unittest.TestCase):
+    """L685: `ameesh attach <codex>` — bypass only from the agent setting, and
+    no shared background daemon (the owner is never asked to choose)."""
+
+    def setUp(self):
+        adapters._HELP_CACHE.clear()
+        self.addCleanup(adapters._HELP_CACHE.clear)
+        base = dict(_without_variable(), AMEESH_BIN_DIR=FAKEBIN)
+        patch = mock.patch.dict(os.environ, base, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.codex = adapters.adapter_for("codex")
+
+    def test_attach_defaults_unchanged(self):
+        # (3) mode not set: no bypass flag, codex keeps its permission prompts;
+        # --no-daemon (4) keeps the session off the shared background server
+        self.assertEqual(self.codex.permission_mode(), "")
+        argv = self.codex.interactive_command("t1")
+        self.assertEqual(argv, [self.codex.binary, "--no-daemon", "resume", "t1"])
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+
+    def test_explicit_bypass_adds_the_flag(self):
+        # (1)(2) the flag carries no `{mode}`: bypassPermissions selects
+        # `--dangerously-bypass-approvals-and-sandbox`
+        argv = self.codex.interactive_command("t1", permission_mode="bypassPermissions")
+        self.assertEqual(argv, [self.codex.binary, "--no-daemon",
+                                "--dangerously-bypass-approvals-and-sandbox",
+                                "resume", "t1"])
+
+    def test_bypass_never_from_env_nor_default(self):
+        # like claude: the mode is explicit only, no variable, no default
+        rule = harnesses.get("codex").interactive_permission
+        self.assertEqual(rule["env"], ())
+        self.assertEqual(rule["default"], "")
+        self.assertEqual(rule["choices"], ("bypassPermissions",))
+        self.assertEqual(rule["explicit_only"], ("bypassPermissions",))
+        # a descriptor that would make the bypass a default is refused and
+        # normalized back to an empty default
+        raw = {"modes": {"bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"]},
+               "default": "bypassPermissions"}
+        messages = [f.message for f in harnesses._check_interactive_permission(raw, "")]
+        self.assertTrue(any("reserved" in m and "default" in m for m in messages), messages)
+        self.assertEqual(harnesses._interactive_permission(raw)["default"], "")
+
+    def test_modes_deliver_every_choice_and_default(self):
+        # L685: without a `{mode}` template, a choice the mapping does not
+        # deliver would be silently ignored: validation refuses it
+        for key, value in (("choices", ["bypassPermissions", "plan"]), ("default", "plan")):
+            raw = {"modes": {"bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"]},
+                   key: value}
+            messages = [f.message for f in harnesses._check_interactive_permission(raw, "")]
+            self.assertTrue(any("plan" in m and "delivered" in m for m in messages), messages)
+
+    def test_modes_mapping_validation(self):
+        good = {"modes": {"bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"]}}
+        self.assertEqual([f for f in harnesses._check_interactive_permission(good, "")
+                          if f.severity == harnesses.ERROR], [])
+        self.assertEqual(harnesses._interactive_permission(good)["modes"],
+                         (("bypassPermissions",
+                           ("--dangerously-bypass-approvals-and-sandbox",)),))
+        for bad in ({"modes": ["--flag"]},
+                    {"modes": {"not a mode": ["--flag"]}},
+                    {"modes": {"plan": "--flag"}},
+                    {"modes": {"plan": []}},
+                    {"modes": {"plan": ["--permission-mode", "{mode}"]}},
+                    {}):
+            with self.subTest(raw=bad):
+                codes = [f.code for f in harnesses._check_interactive_permission(bad, "")]
+                self.assertIn("harness-permission-mode-invalid", codes)
+                self.assertEqual(harnesses._interactive_permission(bad), {})
+
+    def test_modes_only_delivery_is_never_probed(self):
+        # codex's flag carries no mode: `--help` is not read (the fake codex
+        # prints nothing) and the mode is still delivered
+        with mock.patch.object(adapters.subprocess, "run",
+                               side_effect=AssertionError("no --help probe")) as run:
+            self.assertEqual(self.codex.permission_mode("bypassPermissions"),
+                             "bypassPermissions")
+        run.assert_not_called()
+
+    def test_descriptor_valid(self):
+        path = harnesses.get("codex").path
+        with open(path, encoding="utf-8") as fh:
+            document = json.load(fh)
+        findings = harnesses.validate(document)
+        self.assertEqual([f for f in findings if f.severity == harnesses.ERROR], [])
+        self.assertNotIn("harness-key-unknown", [f.code for f in findings])
+        self.assertEqual(document["ameesh"]["interactive"], ["--no-daemon"])
+        # harness show renders the mapping
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            harness_cli._show_text(harnesses.get("codex"))
+        self.assertIn("bypassPermissions", out.getvalue())
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", out.getvalue())
+
+
 class AttachPermissionTest(PgTestCase):
     def setUp(self):
         super().setUp()
@@ -209,11 +304,11 @@ class AttachPermissionTest(PgTestCase):
         os.makedirs(cwd, exist_ok=True)
         self.register("perm", "claude", cwd=cwd)
 
-    def _attach(self, **env) -> list[str]:
+    def _attach(self, name: str = "perm", **env) -> list[str]:
         base = dict(_without_variable(), AMEESH_BIN_DIR=FAKEBIN,
                     AMEESH_TEST_LOG=self.turns_log, **env)
         with mock.patch.dict(os.environ, base, clear=True):
-            self.assertEqual(run_attach(self.cfg, self.db, "perm", ttl=30), 0)
+            self.assertEqual(run_attach(self.cfg, self.db, name, ttl=30), 0)
         return self.turns()[-1]["argv"]
 
     def test_attach_runs_claude_in_auto_mode(self):
@@ -248,12 +343,34 @@ class AttachPermissionTest(PgTestCase):
         proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         # a harness without an interactive permission mode refuses the setting
-        cwd = os.path.join(self.tmp, "work", "cx")
+        cwd = os.path.join(self.tmp, "work", "dsh")
         os.makedirs(cwd, exist_ok=True)
-        self.register("cx", "codex", cwd=cwd)
-        proc = self.mesh("set", "cx", "permission_mode=auto")
+        self.register("dsh", "deepseek", cwd=cwd)
+        proc = self.mesh("set", "dsh", "permission_mode=auto")
         self.assertEqual(proc.returncode, 2, proc.stdout)
         self.assertIn("declares no interactive permission mode", proc.stderr)
+
+    def test_attach_codex_bypass_explicit_and_without_daemon(self):
+        # L685: codex attach — the bypass flag only through the agent setting,
+        # and the session never joins the shared background daemon (the owner
+        # is not asked to choose on a settings conflict)
+        cwd = os.path.join(self.tmp, "work", "cx685")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("cx685", "codex", cwd=cwd)
+        argv = self._attach("cx685")
+        # no session yet: a fresh session, still without the daemon
+        self.assertEqual(argv[:1], ["--no-daemon"])
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        proc = self.mesh("set", "cx685", "permission_mode=auto")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("invalid permission_mode", proc.stderr)
+        proc = self.mesh("set", "cx685", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("interactive permission mode (attach): bypassPermissions", proc.stdout)
+        argv = self._attach("cx685")
+        self.assertEqual(argv[:2], ["--no-daemon",
+                                    "--dangerously-bypass-approvals-and-sandbox"])
+        self.assertIsNone(registry.get(self.db, "cx685")["lease_owner"])
 
     def test_attach_unreadable_setting_ignored(self):
         # codex verdict #182 (P2): byte 0xff in the agent setting
