@@ -713,6 +713,13 @@ class Credentials(Domain):
 # boîte aux lettres (`agent_mailbox`)
 # --------------------------------------------------------------------------
 
+class MailboxRefused(RuntimeError):
+    """L976 : le renvoi d'une boîte morte est refusé par l'état du registre,
+    relu SOUS VERROU dans la transaction qui copie — un destinataire relancé
+    entre la lecture et l'écriture, un successeur arrêté ou un nom absent.
+    L'appelant (`ameesh.undeliverable`) la rend en `Refused` lisible."""
+
+
 class Mailbox(Domain):
     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
 
@@ -815,7 +822,16 @@ class Mailbox(Domain):
         message, auteur du renvoi ; la signature, qui couvre le destinataire,
         ne suit pas) ; l'original passe remis, renvoi noté (`meta.forwarded`).
         Rend une ligne par message renvoyé : `original_id`, `new_id`,
-        `sender`, `kind`, `work_item_id`, `created_ts`."""
+        `sender`, `kind`, `work_item_id`, `created_ts`.
+
+        L976 : la décision est prise DANS cette transaction, les lignes du
+        registre de `old` et `new` verrouillées (`FOR UPDATE`, par ordre de
+        nom) et leur statut relu après l'attente éventuelle : `old` relancé,
+        `new` absent ou arrêté lèvent `MailboxRefused` — une relance ou un
+        arrêt concurrent ne peut plus se glisser entre la lecture et la
+        copie. Un `old` absent n'a pas de ligne à verrouiller : l'absence est
+        constatée dans la même transaction (une inscription qui se
+        committerait après est ordonnée après le renvoi)."""
 
     @abc.abstractmethod
     def expire_dead_letters(self, recipient: str, note: dict, before_ts: float,
@@ -827,7 +843,14 @@ class Mailbox(Domain):
         `meta.expired`. Un destinataire relancé entre la lecture et l'écriture
         garde son courrier. Rend une ligne par message expiré : `id`, `sender`,
         `kind`, `created_ts` ; `dry_run` : ceux qui le seraient, rien n'est
-        écrit."""
+        écrit.
+
+        L976 : le statut est relu DANS l'instruction, sous le verrou de la
+        ligne du registre (`FOR SHARE`), donc après l'attente éventuelle sur
+        une relance en cours : le courrier d'un vivant n'est jamais expiré
+        (relecture codex3, B1). Un nom absent n'a pas de ligne à verrouiller :
+        l'absence est constatée au début de l'instruction, sérialisée avant
+        toute inscription qui se committerait ensuite."""
 
     @abc.abstractmethod
     def human_messages(self, *, since_ts: float, humans: Sequence[str],

@@ -397,6 +397,29 @@ class Mailbox(interface.Mailbox):
         # message pris entre-temps par une remise (verrou de ligne, WHERE
         # réévalué) n'est pas renvoyé.
         with self.db.transaction() as tx:
+            # L976 (relecture codex3, B1) : la décision est prise ICI, sous le
+            # verrou des deux lignes du registre (`FOR UPDATE`, par ordre de
+            # nom : deux renvois croisés ne s'interbloquent pas) et le statut
+            # est relu après l'attente éventuelle. Une relance de `old` ou un
+            # arrêt de `new` committé entre la lecture et la copie bloquait
+            # jusqu'ici sans être revu : il bloque désormais sur ce verrou
+            # jusqu'à notre commit, donc jamais entre la décision et la copie.
+            locked = {row["name"]: row["status"] for row in tx.query(
+                "SELECT name, status FROM agent_registry"
+                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))}
+            if old == new:
+                raise interface.MailboxRefused(
+                    "old and new recipient are the same (%s)" % old)
+            if old in locked and locked[old] != "stopped":
+                raise interface.MailboxRefused(
+                    "%s is not stopped (status %s): its mailbox is read, forward refused"
+                    % (old, locked[old]))
+            if new not in locked:
+                raise interface.MailboxRefused(
+                    "%s is not in the registry: forward to a live agent" % new)
+            if locked[new] == "stopped":
+                raise interface.MailboxRefused(
+                    "%s is stopped: forward to a live agent" % new)
             ids = sorted(int(row["id"]) for row in tx.query(
                 "SELECT m.id FROM agent_mailbox m"
                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"
@@ -441,35 +464,42 @@ class Mailbox(interface.Mailbox):
         return sorted(rows, key=lambda row: int(row["original_id"]))
 
     def expire_dead_letters(self, recipient, note, before_ts, dry_run=False) -> list[dict]:
-        # L976 : expire le courrier en souffrance d'une boîte morte. Le
-        # destinataire est revérifié dans le WHERE : relancé entre la lecture
-        # et l'écriture, il garde son courrier. Mêmes exclusions que
-        # `dead_letters` (L124 : une demande de décision attend un humain) et
-        # que `forward` (réservation active : le message est peut-être montré).
-        # `before_ts` : seuls les messages reçus avant ce seuil (la rétention).
+        # L976 : expire le courrier en souffrance d'une boîte morte. La
+        # décision (boîte morte) est prise DANS l'instruction, sous le verrou
+        # de la ligne du registre (`FOR SHARE`) : une relance concurrente
+        # bloque jusqu'à notre commit, le statut est relu après l'attente —
+        # le courrier d'un vivant n'est jamais expiré (relecture codex3, B1).
+        # Nom absent : pas de ligne à verrouiller ; l'absence est constatée au
+        # début de l'instruction, donc une inscription committée ensuite est
+        # ordonnée après l'expiration. Mêmes exclusions que `dead_letters`
+        # (L124 : une demande de décision attend un humain) et que `forward`
+        # (réservation active : le message est peut-être montré). `before_ts` :
+        # seuls les messages reçus avant ce seuil (la rétention).
+        v = ("WITH v AS (SELECT name, status FROM agent_registry"
+             " WHERE name = %%s FOR SHARE) ")
         where = """
              WHERE m.recipient = %%s
                AND m.delivered_at IS NULL
                AND m.created_at <= to_timestamp(%%s)
                AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
                AND NOT (%s)
-               AND NOT EXISTS (SELECT 1 FROM agent_registry r
-                                WHERE r.name = m.recipient AND r.status <> 'stopped')
+               AND (NOT EXISTS (SELECT 1 FROM v) OR (SELECT status FROM v) = 'stopped')
             """ % _RESERVED_SQL
         columns = ("m.id, m.sender, m.kind,"
                    " extract(epoch from m.created_at)::float8 AS created_ts")
-        params = (recipient, float(before_ts))
         if dry_run:
-            rows = self.db.query("SELECT %s FROM agent_mailbox AS m%s"
-                                 % (columns, where), params)
+            rows = self.db.query((v + "SELECT %s FROM agent_mailbox AS m%s")
+                                 % (columns, where),
+                                 (recipient, recipient, float(before_ts)))
         else:
             rows = self.db.query(
-                """
+                (v + """
                 UPDATE agent_mailbox AS m
                    SET delivered_at = now(), status = 'delivered',
                        meta = m.meta || jsonb_build_object('expired', %%s::jsonb)
                 %s
                  RETURNING %s
-                """ % (where, columns),
-                (json.dumps(note or {}, ensure_ascii=False),) + params)
+                """) % (where, columns),
+                (recipient, json.dumps(note or {}, ensure_ascii=False), recipient,
+                 float(before_ts)))
         return sorted(rows, key=lambda row: int(row["id"]))

@@ -526,7 +526,12 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     Chaque message garde son expéditeur, sa date, sa nature et son lot ; la
     copie porte `meta.forwarded_from` (montré au destinataire), l'original
     passe remis avec `meta.forwarded` ; le renvoi est écrit dans le fil.
-    `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`."""
+    `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`.
+
+    L976 (relecture codex3, B1) : le statut de `old` et `new` est relu sous
+    verrou du registre DANS la transaction qui copie ; une relance de l'un ou
+    un arrêt de l'autre, committé entre la lecture et la copie, lève `Refused`
+    au lieu de copier le courrier d'un vivant vers un mort."""
     if old == new:
         raise Refused("old and new recipient are the same (%s)" % old)
     old_row, new_row = db_mod.batched(db, lambda d: [registry.get(d, old),
@@ -549,7 +554,13 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
                               "kind": r.get("kind"), "created_ts": r.get("created_ts")}
                              for r in rows],
                 "forwarded": []}
-    moved = storage.of(db).mailbox.forward(old, new, actor)
+    try:
+        moved = storage.of(db).mailbox.forward(old, new, actor)
+    except storage.MailboxRefused as exc:
+        # L976 (relecture codex3, B1) : le statut de `old`/`new` est relu sous
+        # verrou dans la transaction qui copie — une relance ou un arrêt
+        # concurrent gagne ici, jamais entre la lecture et la copie.
+        raise Refused(str(exc)) from None
     if moved:
         project = fil.project_for(cfg, team_of(new_row), team_of(old_row))
         fil.record(

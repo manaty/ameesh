@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import unittest
 
 from ameesh import exploitation, mail, notify, projects, registry, storage, undeliverable
 from ameesh.backend import PgBackend
+from ameesh.scoped_db import ScopedDb
 
 from .support import PgTestCase
 
@@ -686,6 +688,155 @@ class SweepTest(_Base):
         self.assertEqual(payload["forwarded"][0]["new"], "mesh-design")
         self.assertEqual(self.pending("claude3"), [])
         self.assertEqual(self.mesh("mail", "sweep", "--days", "-1").returncode, 2)
+
+    def test_expire_un_nom_absent_du_registre(self):
+        """Nom absent : rien à verrouiller, l'absence est constatée dans
+        l'instruction d'expiration — pas de ligne de registre créée."""
+        mail.send(self.db, "claude1", "fantome", "Rapport.")
+        self.age(8)
+        report = undeliverable.sweep(self.cfg, self.db)
+        [exp] = report["expired"]
+        self.assertEqual((exp["recipient"], exp["count"], exp["unknown"]),
+                         ("fantome", 1, True))
+        self.assertEqual(self.pending("fantome"), [])
+        self.assertEqual(self.db.query(
+            "SELECT name FROM agent_registry WHERE name = 'fantome'"), [])
+        self.assertEqual(self.alertes(), [])
+
+    # -- relecture codex3, B1 : la décision est relue SOUS VERROU -----------
+    #
+    # Chaque témoin tient une transaction DISTINCTE (une autre connexion) qui
+    # n'est pas committée ; le travail du balayage part ensuite et doit
+    # ATTENDRE le verrou du registre avant de décider. Sans le verrou, il
+    # déciderait sur l'instantané d'avant la relance et expédierait/expirerait
+    # le courrier d'un agent relancé.
+
+    def _attend_verrou(self, *needles, timeout=10.0):
+        """Attend qu'une AUTRE connexion soit réellement bloquée sur un verrou
+        (le texte de sa requête porte l'un des `needles`)."""
+        clause = " OR ".join(["query LIKE %s"] * len(needles))
+        params = tuple("%" + needle + "%" for needle in needles)
+        fin = time.monotonic() + timeout
+        while time.monotonic() < fin:
+            rows = self.db.query(
+                "SELECT count(*)::int AS n FROM pg_stat_activity"
+                " WHERE wait_event_type = 'Lock' AND (%s)" % clause, params)
+            if rows[0]["n"]:
+                return
+            time.sleep(0.05)
+        self.fail("aucune attente de verrou Postgres sur %s" % (needles,))
+
+    def _travail_concurrent(self, action):
+        """Lance `action(connexion)` dans un fil, rend (fil, resultats)."""
+        out: dict = {}
+
+        def run():
+            try:
+                out["value"] = action(ScopedDb(self.cfg))
+            except BaseException as exc:       # repris par le test
+                out["error"] = exc
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread, out
+
+    def test_expire_attend_une_relance_concurrente(self):
+        self.stop("claude3")
+        mid = mail.send(self.db, "claude1", "claude3", "Rapport.")
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'"
+                        " WHERE id = %s", (mid,))
+        started, release = threading.Event(), threading.Event()
+        errors = []
+
+        def hold():
+            try:
+                with ScopedDb(self.cfg).transaction() as tx:
+                    tx.execute("UPDATE agent_registry SET status = 'running'"
+                               " WHERE name = 'claude3'")
+                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
+                    started.set()
+                    release.wait(15)
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
+        worker, out = self._travail_concurrent(
+            lambda db: storage.of(db).mailbox.expire_dead_letters(
+                "claude3", {"by": "test"}, time.time()))
+        self._attend_verrou("jsonb_build_object('expired'")
+        release.set()
+        holder.join(20)
+        worker.join(20)
+        self.assertFalse(holder.is_alive() or worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertNotIn("error", out, out.get("error"))
+        self.assertEqual(out.get("value"), [])              # la relance gagne : rien expiré
+        self.assertEqual(self.pending("claude3"), ["Rapport."])
+
+    def test_forward_refuse_une_relance_concurrente_de_old(self):
+        self.stop("claude3")
+        mid = mail.send(self.db, "claude1", "claude3", "Rapport.")
+        started, release = threading.Event(), threading.Event()
+        errors = []
+
+        def hold():
+            try:
+                with ScopedDb(self.cfg).transaction() as tx:
+                    tx.execute("UPDATE agent_registry SET status = 'running'"
+                               " WHERE name = 'claude3'")
+                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
+                    started.set()
+                    release.wait(15)
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
+        worker, out = self._travail_concurrent(
+            lambda db: storage.of(db).mailbox.forward("claude3", "mesh-design", "test"))
+        self._attend_verrou("ORDER BY name FOR UPDATE", "ORDER BY m.id FOR UPDATE")
+        release.set()
+        holder.join(20)
+        worker.join(20)
+        self.assertFalse(holder.is_alive() or worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsInstance(out.get("error"), storage.MailboxRefused, out)
+        self.assertEqual(self.pending("claude3"), ["Rapport."])
+        self.assertEqual(self.pending("mesh-design"), [])
+
+    def test_forward_refuse_un_arret_concurrent_de_new(self):
+        self.stop("claude3")
+        mail.send(self.db, "claude1", "claude3", "Rapport.")
+        started, release = threading.Event(), threading.Event()
+        errors = []
+
+        def hold():
+            try:
+                with ScopedDb(self.cfg).transaction() as tx:
+                    tx.execute("UPDATE agent_registry SET status = 'stopped'"
+                               " WHERE name = 'mesh-design'")
+                    started.set()
+                    release.wait(15)
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
+        worker, out = self._travail_concurrent(
+            lambda db: storage.of(db).mailbox.forward("claude3", "mesh-design", "test"))
+        self._attend_verrou("ORDER BY name FOR UPDATE")
+        release.set()
+        holder.join(20)
+        worker.join(20)
+        self.assertFalse(holder.is_alive() or worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsInstance(out.get("error"), storage.MailboxRefused, out)
+        self.assertEqual(self.pending("claude3"), ["Rapport."])
+        self.assertEqual(self.pending("mesh-design"), [])
 
 
 if __name__ == "__main__":
