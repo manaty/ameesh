@@ -388,14 +388,14 @@ class Watcher:
         # #845 : la file se compte en jobs, pas en runs, et la date qui compte
         # est celle du job (le run peut être ancien et sa reprise récente, et
         # un run `in_progress` peut encore porter un job `queued`).
-        # Un job `always()` peut naître après l'annulation de son exécution
-        # (concurrence d'une PR, ou annulation à la main) : GitHub le laisse
-        # `queued` sans jamais l'exécuter, et l'exécution ne se conclut plus
-        # (relevé du 13/10 : jusqu'à 4 h, 13 exécutions). Ce n'est pas une
-        # attente de runner : un job en file né à l'instant où un job de la
-        # même exécution s'est terminé `cancelled` est un orphelin, écarté du
-        # nombre comme de l'âge — sinon `ci_queue_saturated` ne s'éteindrait
-        # plus alors que la file est vide.
+        # Rien n'est déduit des jobs `cancelled` du run : une matrice
+        # `fail-fast` annule ses parts sans annuler l'exécution, et le job né
+        # après cette annulation (agrégat `tests`, job indépendant) attend
+        # réellement un runner. Un orphelin d'exécution annulée (`if: always()`
+        # créé après l'annulation, que GitHub ne sert jamais) a la même forme
+        # qu'un job légitime né après une annulation de part : aucune
+        # inférence ne les sépare sans masquer une file réelle. Les orphelins
+        # se traitent à la source (`always() && !cancelled()` sur l'agrégat).
         queued: list[tuple[str, int]] = []
         holding: dict[str, str] = {}
         for run_id in sorted(not_done):
@@ -406,16 +406,10 @@ class Watcher:
                 self.log("CI %s: guard scan skipped (jobs of run %d truncated)"
                          % (repo, run_id))
                 return
-            cancelled_done = max(
-                (str(job["completed_at"]) for job in jobs
-                 if job.get("conclusion") == "cancelled" and job.get("completed_at")),
-                default="")
             for job in jobs:
                 job_status = (job.get("status") or "")
                 if job_status == "queued":
                     created = str(job.get("created_at") or job.get("started_at") or "")
-                    if cancelled_done and created >= cancelled_done:
-                        continue
                     queued.append((created, int(job.get("id") or 0)))
                 elif job_status == "in_progress" and job.get("runner_name"):
                     holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))

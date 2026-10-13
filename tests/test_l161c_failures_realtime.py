@@ -280,17 +280,12 @@ def runner_view(runner_id, name, *, busy=True, status="online"):
     return {"id": runner_id, "name": name, "status": status, "busy": busy}
 
 
-def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None,
-             conclusion=None, completed_at=None):
+def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None):
     job = {"name": name, "status": status, "runner_name": runner}
     if job_id is not None:
         job["id"] = job_id
     if created_at is not None:
         job["created_at"] = created_at
-    if conclusion is not None:
-        job["conclusion"] = conclusion
-    if completed_at is not None:
-        job["completed_at"] = completed_at
     return job
 
 
@@ -705,54 +700,30 @@ class WatcherTest(PgTestCase):
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
                           if a["type"] == "ci_queue_saturated"], [])
 
-    def test_garde_file_ignore_les_orphelins_d_une_execution_annulee(self):
-        """#845 : un job `always()` (ici `tests`) né à l'instant où son
-        exécution a été annulée reste `queued` sans jamais tourner : ce n'est
-        pas une attente de runner, il ne compte ni dans le nombre ni dans
-        l'âge — sinon `ci_queue_saturated` ne s'éteindrait plus."""
+    def test_garde_file_compte_un_job_ne_apres_une_annulation_de_part(self):
+        """#845 : une matrice `fail-fast` annule ses parts sans annuler
+        l'exécution ; le job né après cette annulation (ici l'agrégat `tests`)
+        attend réellement un runner et compte dans la file comme dans l'âge.
+        La garde ne déduit pas l'annulation de l'exécution de celle d'un job :
+        un orphelin d'exécution annulée a la même forme et se traite à la
+        source (`if: always() && !cancelled()`), pas par une inférence qui
+        masquerait une file réelle."""
         horloge = FauxHorloge()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
-        # exécution de PR annulée par la poussée suivante : plan et parts
-        # `cancelled`, agrégat `tests` né à la seconde de l'annulation
-        orphelin = run_view(907, "d1" * 20, "lot/1-x")
-        orphelin.update({"status": "queued", "created_at": iso(horloge.t - 3000)})
-        self.api.queued = [orphelin]
-        self.api.jobs[907] = [
-            job_view("plan", status="completed", conclusion="cancelled",
-                     created_at=iso(horloge.t - 3000), completed_at=iso(horloge.t - 2500)),
-            job_view("psql 1/1", status="completed", conclusion="cancelled",
-                     created_at=iso(horloge.t - 2500), completed_at=iso(horloge.t - 2500)),
-            job_view("tests", status="queued", job_id=9071,
-                     created_at=iso(horloge.t - 2500))]
-        # un vrai job en file, plus récent, reste compté
-        vrai = run_view(908, "d2" * 20, "lot/2-y")
-        vrai.update({"status": "queued", "created_at": iso(horloge.t - 60)})
-        self.api.queued.append(vrai)
-        self.api.jobs[908] = [job_view("plan", status="queued", job_id=9081,
-                                       created_at=iso(horloge.t - 60))]
-        self.watcher.tick(self.db)
-        (row,) = storage.of(self.db).ci.queued_oldest()
-        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9081))
-        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
-                          if a["type"] == "ci_queue_saturated"], [])
-
-    def test_garde_file_compte_un_job_anterieur_a_une_annulation(self):
-        """#845 : un job en file né avant qu'un autre job de la même exécution
-        soit annulé (part en échec de délai, reprise) reste une vraie attente :
-        il compte, même si l'exécution porte une annulation."""
-        horloge = FauxHorloge()
-        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
-        run = run_view(909, "e1" * 20, "main")
-        run.update({"status": "in_progress", "created_at": iso(horloge.t - 1300)})
-        self.api.live = [run]
-        self.api.jobs[909] = [
-            job_view("psycopg 1/4", status="queued", job_id=9091,
+        run = run_view(910, "f1" * 20, "lot/3-z")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 1900)})
+        self.api.queued = [run]
+        part = job_view("psycopg 1/4", status="completed",
+                        created_at=iso(horloge.t - 1900))
+        part.update({"conclusion": "cancelled", "completed_at": iso(horloge.t - 1200)})
+        self.api.jobs[910] = [
+            part,
+            job_view("tests", status="queued", job_id=9101,
                      created_at=iso(horloge.t - 1200)),
-            job_view("psql 1/1", status="completed", conclusion="cancelled",
-                     created_at=iso(horloge.t - 1200), completed_at=iso(horloge.t - 300))]
+        ]
         self.watcher.tick(self.db)
         (row,) = storage.of(self.db).ci.queued_oldest()
-        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9091))
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9101))
         (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
                      if a["type"] == "ci_queue_saturated"]
         self.assertIn("20 min", alerte["detail"])
