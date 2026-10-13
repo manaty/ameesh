@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Explicit local recovery-set retention; unknown backups are never expired.
+"""Explicit recovery-set retention; unknown backups are never expired.
 
 The enrolled controller supplies policy dates and accepts a release only
 after health verification. This helper does not authenticate that controller.
@@ -115,6 +115,7 @@ def validate(records):
     if not isinstance(records, dict):
         raise RetentionError("invalid retention catalog")
     names = set()
+    objects = set()
     for artifact, record in records.items():
         identifier(artifact)
         if not isinstance(record, dict) or record.get("state") not in ("retained", "deleting", "deleted"):
@@ -134,9 +135,27 @@ def validate(records):
             if name.startswith(".") or name in names or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
                 raise RetentionError("invalid or shared recovery file")
             names.add(name)
+        remote = record.get("remote", [])
+        if not isinstance(remote, list):
+            raise RetentionError("invalid remote recovery inventory")
+        for item in remote:
+            if not isinstance(item, dict):
+                raise RetentionError("invalid remote recovery object")
+            object_id = item.get("object_id")
+            if not isinstance(object_id, str) or object_id.count("/") != 1:
+                raise RetentionError("invalid remote recovery reference")
+            host, name = object_id.split("/")
+            identifier(host)
+            identifier(name)
+            if (object_id in objects or item.get("sha256") not in record["files"].values()
+                    or type(item.get("deleted")) is not bool
+                    or (item["deleted"] and record["state"] == "retained")
+                    or (not item["deleted"] and record["state"] == "deleted")):
+                raise RetentionError("invalid or shared remote recovery object")
+            objects.add(object_id)
 
 
-def register(root, artifact, files, *, expires_at, rollback_until):
+def register(root, artifact, files, *, expires_at, rollback_until, remote=()):
     identifier(artifact)
     timestamp(expires_at)
     timestamp(rollback_until)
@@ -150,7 +169,9 @@ def register(root, artifact, files, *, expires_at, rollback_until):
                 raise RetentionError("reserved filename")
             hashes[name] = private_digest(root / name)
         records[artifact] = dict(files=hashes, expires_at=expires_at,
-                                 rollback_until=rollback_until, accepted=False, hold=False, state="retained")
+                                 rollback_until=rollback_until, accepted=False, hold=False, state="retained",
+                                 remote=[dict(object_id=item["object_id"], sha256=item["sha256"], deleted=False)
+                                         for item in remote])
         validate(records)
         save(root, records)
 
@@ -168,7 +189,15 @@ def protect(root, artifact, *, accepted=None, hold=None):
         save(root, records)
 
 
-def prune(root, *, now):
+def prune(root, *, now, remote_adapter=None):
+    """Delete remote members before local files, under the protection lock.
+
+    An enrolled adapter implements inspect(object_id) -> SHA256 or None,
+    and delete_if_digest(object_id, sha256) -> exact absence receipt. The
+    latter must enforce the digest condition atomically, including races
+    after inspect; plain unconditional DELETE is not a valid implementation.
+    No provider backend is enrolled by this module.
+    """
     timestamp(now)
     with locked(root) as (root, records):
         candidates = {artifact: record for artifact, record in records.items()
@@ -183,10 +212,30 @@ def prune(root, *, now):
                     continue
                 if private_digest(path) != sha:
                     raise RetentionError("recovery artifact changed")
+            for item in record.get("remote", []):
+                if item["deleted"]:
+                    continue
+                if remote_adapter is None:
+                    raise RetentionError("remote retention adapter is not enrolled")
+                actual = remote_adapter.inspect(item["object_id"])
+                if actual != item["sha256"] and not (actual is None and record["state"] == "deleting"):
+                    raise RetentionError("remote recovery artifact changed or missing")
         for artifact, record in candidates.items():
             record.setdefault("deletion_started_at", now)
             record["state"] = "deleting"
             save(root, records)
+            for item in record.get("remote", []):
+                if item["deleted"]:
+                    continue
+                # Replay accepts already-absent objects only after durable
+                # intent. Exact receipts prevent a wrong object/SHA response
+                # from unlocking local deletion.
+                receipt = remote_adapter.delete_if_digest(item["object_id"], item["sha256"])
+                if (not isinstance(receipt, dict) or receipt.get("absent") is not True
+                        or receipt != {"object_id": item["object_id"], "sha256": item["sha256"], "absent": True}):
+                    raise RetentionError("remote deletion was not confirmed")
+                item["deleted"] = True
+                save(root, records)
             for name in record["files"]:
                 (root / name).unlink(missing_ok=True)
             sync(root)
@@ -205,6 +254,7 @@ def main():
     add.add_argument("files", nargs="+")
     add.add_argument("--expires-at", type=float, required=True)
     add.add_argument("--rollback-until", type=float, required=True)
+    add.add_argument("--remote-inventory")
     accept = commands.add_parser("accept")
     accept.add_argument("artifact")
     hold = commands.add_parser("hold")
@@ -215,7 +265,9 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "register":
-            register(args.root, args.artifact, args.files, expires_at=args.expires_at, rollback_until=args.rollback_until)
+            remote = json.loads(private_file(args.remote_inventory)) if args.remote_inventory else []
+            register(args.root, args.artifact, args.files, expires_at=args.expires_at,
+                     rollback_until=args.rollback_until, remote=remote)
         elif args.command == "accept":
             protect(args.root, args.artifact, accepted=True)
         elif args.command == "hold":

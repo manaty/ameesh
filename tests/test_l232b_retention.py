@@ -20,6 +20,24 @@ retention = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(retention)
 
 
+class RemoteAdapter:
+    """Simulated immutable object store with an atomic digest precondition."""
+    def __init__(self, objects):
+        self.objects = dict(objects)
+        self.calls = []
+
+    def inspect(self, object_id):
+        self.calls.append(("inspect", object_id))
+        return self.objects.get(object_id)
+
+    def delete_if_digest(self, object_id, sha256):
+        self.calls.append(("delete", object_id))
+        if self.objects.get(object_id) not in (None, sha256):
+            raise retention.RetentionError("remote digest precondition failed")
+        self.objects.pop(object_id, None)
+        return dict(object_id=object_id, sha256=sha256, absent=True)
+
+
 class RetentionTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ameesh-retention-")
@@ -169,6 +187,131 @@ class RetentionTest(unittest.TestCase):
         self.assertFalse((self.root / "old.dump").exists())
         self.assertTrue((self.root / "held.dump").exists())
         self.assertEqual(len(list(self.root.glob("ameesh-*.dump"))), 1)
+
+    def remote_artifact(self):
+        path = self.root / "remote.dump"
+        path.write_bytes(b"synthetic remote recovery")
+        path.chmod(0o600)
+        sha = retention.private_digest(path)
+        objects = {"host-1/remote.dump": sha, "host-2/remote.dump": sha}
+        retention.register(self.root, "remote", ["remote.dump"], expires_at=100, rollback_until=200,
+                           remote=[dict(object_id=key, sha256=value) for key, value in objects.items()])
+        return RemoteAdapter(objects)
+
+    def test_remote_protection_blocks_adapter_and_missing_adapter_blocks_local(self):
+        adapter = self.remote_artifact()
+        self.assertEqual(retention.prune(self.root, now=1000, remote_adapter=adapter), [])
+        self.assertEqual(adapter.calls, [])
+        retention.protect(self.root, "remote", accepted=True, hold=True)
+        self.assertEqual(retention.prune(self.root, now=1000, remote_adapter=adapter), [])
+        self.assertEqual(adapter.calls, [])
+        retention.protect(self.root, "remote", hold=False)
+        with self.assertRaises(retention.RetentionError):
+            retention.prune(self.root, now=1000)
+        self.assertTrue((self.root / "remote.dump").exists())
+
+    def test_remote_deletion_is_confirmed_before_local_deletion(self):
+        adapter = self.remote_artifact()
+        retention.protect(self.root, "remote", accepted=True)
+        delete = adapter.delete_if_digest
+
+        def delete_while_local_retained(object_id, sha):
+            self.assertTrue((self.root / "remote.dump").exists())
+            record = json.loads((self.root / ".retention.json").read_text())["remote"]
+            self.assertEqual(record["state"], "deleting")
+            return delete(object_id, sha)
+
+        with mock.patch.object(adapter, "delete_if_digest", side_effect=delete_while_local_retained):
+            self.assertEqual(retention.prune(self.root, now=1000, remote_adapter=adapter), ["remote"])
+        self.assertEqual(adapter.objects, {})
+        self.assertFalse((self.root / "remote.dump").exists())
+
+    def test_remote_changed_or_missing_before_intent_keeps_entire_batch(self):
+        for altered in (None, "f" * 64):
+            with self.subTest(altered=altered):
+                if not (self.root / ".retention.json").exists():
+                    adapter = self.remote_artifact()
+                    self.artifact("local")
+                    retention.protect(self.root, "remote", accepted=True)
+                    retention.protect(self.root, "local", accepted=True)
+                adapter.objects["host-2/remote.dump"] = altered
+                with self.assertRaises(retention.RetentionError):
+                    retention.prune(self.root, now=1000, remote_adapter=adapter)
+                self.assertFalse(any(call[0] == "delete" for call in adapter.calls))
+                self.assertTrue((self.root / "local.dump").exists())
+                self.assertTrue((self.root / "remote.dump").exists())
+
+    def test_remote_failure_after_one_confirmation_resumes_without_losing_local(self):
+        adapter = self.remote_artifact()
+        retention.protect(self.root, "remote", accepted=True)
+        delete = adapter.delete_if_digest
+
+        def fail_second(object_id, sha):
+            if object_id.startswith("host-2/"):
+                raise OSError("synthetic storage outage")
+            return delete(object_id, sha)
+
+        with mock.patch.object(adapter, "delete_if_digest", side_effect=fail_second), self.assertRaises(OSError):
+            retention.prune(self.root, now=1000, remote_adapter=adapter)
+        record = json.loads((self.root / ".retention.json").read_text())["remote"]
+        self.assertEqual([item["deleted"] for item in record["remote"]], [True, False])
+        self.assertTrue((self.root / "remote.dump").exists())
+        adapter.calls.clear()
+        self.assertEqual(retention.prune(self.root, now=1001, remote_adapter=adapter), ["remote"])
+        self.assertEqual(adapter.calls, [("inspect", "host-2/remote.dump"), ("delete", "host-2/remote.dump")])
+
+    def test_lost_remote_receipt_replays_absence_only_after_intent(self):
+        adapter = self.remote_artifact()
+        retention.protect(self.root, "remote", accepted=True)
+        delete = adapter.delete_if_digest
+
+        def lose_receipt(object_id, sha):
+            delete(object_id, sha)
+            return dict(object_id="wrong/object", sha256=sha, absent=True)
+
+        with mock.patch.object(adapter, "delete_if_digest", side_effect=lose_receipt), self.assertRaises(retention.RetentionError):
+            retention.prune(self.root, now=1000, remote_adapter=adapter)
+        self.assertTrue((self.root / "remote.dump").exists())
+        self.assertEqual(retention.prune(self.root, now=1001, remote_adapter=adapter), ["remote"])
+
+    def test_remote_object_changed_after_inspect_is_not_deleted(self):
+        adapter = self.remote_artifact()
+        retention.protect(self.root, "remote", accepted=True)
+        delete = adapter.delete_if_digest
+
+        def race(object_id, sha):
+            adapter.objects[object_id] = "f" * 64
+            return delete(object_id, sha)
+
+        with mock.patch.object(adapter, "delete_if_digest", side_effect=race), self.assertRaises(retention.RetentionError):
+            retention.prune(self.root, now=1000, remote_adapter=adapter)
+        self.assertTrue((self.root / "remote.dump").exists())
+        self.assertEqual(adapter.objects["host-1/remote.dump"], "f" * 64)
+
+    def test_cli_remote_expiry_fails_closed_without_backend(self):
+        self.remote_artifact()
+        retention.protect(self.root, "remote", accepted=True)
+        result = subprocess.run([sys.executable, str(PATH), "--root", str(self.root),
+                                 "prune", "--now", "1000"], capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"host-1", result.stderr)
+        self.assertTrue((self.root / "remote.dump").exists())
+
+    def test_remote_reference_and_digest_validation_preserves_catalog(self):
+        adapter = self.remote_artifact()
+        before = (self.root / ".retention.json").read_bytes()
+        candidate = self.root / "candidate.dump"
+        candidate.write_bytes(b"synthetic remote recovery")
+        candidate.chmod(0o600)
+        sha = retention.private_digest(candidate)
+        for object_id, digest in (("host/../escape", sha), ("host/object", "f" * 64),
+                                  ("host-1/remote.dump", sha)):
+            with self.subTest(object_id=object_id), self.assertRaises(retention.RetentionError):
+                retention.register(self.root, "candidate", ["candidate.dump"], expires_at=1, rollback_until=2,
+                                   remote=[dict(object_id=object_id, sha256=digest)])
+            self.assertEqual((self.root / ".retention.json").read_bytes(), before)
+        self.assertEqual(adapter.calls, [])
 
 
 if __name__ == "__main__":

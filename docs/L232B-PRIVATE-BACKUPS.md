@@ -83,7 +83,32 @@ The server installer installs this helper and removes the former age-only
 controller registers their policy. This can increase retained disk use; disk
 admission must count these artifacts and hold a release when capacity is
 insufficient. No implicit 14-day policy or remote object deletion is introduced.
-Remote retention and controller enrollment remain unfinished.
+An optional private `--remote-inventory FILE` registers exact `object_id`
+(`HOST/NAME`) and `sha256` entries for remote copies. Each digest must match
+a member of the local set, and object references cannot belong to two sets.
+The controller supplies this inventory only after verified remote retrieval
+and restoration. Registration still does not perform that verification.
+
+For these sets, the controller uses the Python `prune(..., remote_adapter=...)`
+interface. The adapter must inspect pinned object digests and perform an
+**atomic conditional** `delete_if_digest`, returning an exact object/digest
+absence receipt. An inspect followed by unconditional deletion cannot satisfy
+this contract. The entire eligible batch is checked before deletion; remote
+copies are removed and their receipts persisted before local files are
+removed. A storage failure or wrong receipt retains the local recovery copy.
+A crash after remote deletion but before saving its receipt can replay an
+already-absent object only when the catalog has a durable deletion intent.
+Confirmed members are skipped on retry. Protection changes use the same lock
+and cannot interrupt a deletion already in progress.
+
+No real provider adapter is installed yet. CLI/server pruning therefore
+fails closed for eligible sets with unconfirmed remote members, preserving
+local files. The simulated adapter tests cover interruption, digest change
+between inspect and delete, lost receipt and absent objects. A real backend
+must prove conditional deletion for its actual storage provider and use a
+separate narrowly scoped retention identity; neither the upload-only key nor
+the restore key is implicitly granted deletion authority. Provider adapter
+and controller enrollment remain unfinished.
 
 These utilities are a local development checkpoint. The release controller,
 host helper/bootstrap, remote retention and installer wiring for versioned
