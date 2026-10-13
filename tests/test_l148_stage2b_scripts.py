@@ -173,19 +173,29 @@ class CallersTest(unittest.TestCase):
         self.assertIn("scripts/map.py install", carte)
         self.assertIn("scripts/map.py merge", carte)
 
-    def test_aggregate_jobs_skip_a_cancelled_run(self):
-        # #876 : un agrégat `if: always()` seul est recréé après l'annulation
-        # d'une exécution, reste queued des heures puis la conclut en rouge —
-        # dont le check requis `tests`. `always() && !cancelled()` le saute.
-        for name, jobs in (("tests.yml", ("bilan", "tests")),
-                           ("carte.yml", ("carte",))):
-            text = (REPO / ".github" / "workflows" / name).read_text(encoding="utf-8")
-            for job in jobs:
-                with self.subTest(workflow=name, job=job):
-                    bloc = re.search(r"(?ms)^  %s:\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)" % job,
-                                     text)
-                    self.assertIsNotNone(bloc, job)
-                    self.assertIn("if: always() && !cancelled()", bloc.group(1), job)
+    def _job_block(self, workflow, job):
+        text = (REPO / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        bloc = re.search(r"(?ms)^  %s:\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)" % job, text)
+        self.assertIsNotNone(bloc, job)
+        return bloc.group(1)
+
+    def test_required_check_is_not_skipped_on_a_cancelled_run(self):
+        # #876 (R2 auditeur) : GitHub rapporte « success » pour un job sauté,
+        # même requis, et un check requis sauté ne bloque plus la fusion. Le
+        # check requis `tests` garde donc `always()` : une exécution annulée le
+        # conclut en rouge au lieu de laisser la PR fusionnable sans test.
+        bloc = self._job_block("tests.yml", "tests")
+        condition = re.search(r"(?m)^    if: (.+)$", bloc)
+        self.assertIsNotNone(condition, "if du job tests")
+        self.assertEqual(condition.group(1).strip(), "always()")
+
+    def test_non_required_aggregates_skip_a_cancelled_run(self):
+        # #876 : les agrégats non requis sautent l'exécution annulée (mesure
+        # #828 : 5 `bilan`, 1 `carte` restés queued après annulation).
+        for workflow, job in (("tests.yml", "bilan"), ("carte.yml", "carte")):
+            with self.subTest(workflow=workflow, job=job):
+                self.assertIn("if: always() && !cancelled()",
+                              self._job_block(workflow, job))
 
     def test_flow_module_keeps_the_json_contract(self):
         # The stored keys are out of stage 2b (§2.7): the renamed functions
