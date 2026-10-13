@@ -984,11 +984,19 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_syntax_and_dry_run_touches_nothing(self):
         subprocess.run(["bash", "-n", self.SCRIPT], check=True)
-        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--key",
-                              "ssh-ed25519 AAAAC3Nza test@poste", "--from", "203.0.113.7"],
+        # The account line depends on the host: install.sh prints useradd when
+        # the guest does not exist yet and usermod when it already does (the
+        # persistent CI runners, where the pilot installed it). Read the dry run
+        # on a guest name no machine carries, so the check does not depend on
+        # the state of the host (#954, canon §3).
+        guest = "ameesh-guest-dry-run"
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--user", guest,
+                              "--key", "ssh-ed25519 AAAAC3Nza test@poste",
+                              "--from", "203.0.113.7"],
                              capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("useradd", res.stdout)
+        self.assertIn("usermod -p * " + guest, res.stdout)
         self.assertIn('restrict,from="203.0.113.7",command="exec ', res.stdout)
         self.assertIn("MemoryMax=", res.stdout)
         self.assertIn("meta skuid", res.stdout)
