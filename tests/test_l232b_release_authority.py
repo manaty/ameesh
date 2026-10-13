@@ -40,9 +40,12 @@ class ReleaseAuthorityTest(PgTestCase):
 
     def signed_answer(self, text='apply', ttl=900):
         digest = decisions.answer_digest(self.view, text, text, 'human:fixture-owner')
+        # The validator runs on the test clock: the approval must expire a fixed
+        # `ttl` after it, never relative to a wall-clock instant the test clock
+        # does not share (a slow setUp otherwise leaves the expiry ahead).
         authority.create_approval(self.db, self.seed, approver='fixture-owner',
                                   action=decisions.APPROVAL_ACTION, artifact_kind=decisions.APPROVAL_KIND,
-                                  artifact_hash=digest, ttl=ttl)
+                                  artifact_hash=digest, ttl=(self.now + ttl) - time.time())
         return decisions.answer(self.cfg, self.db, self.view['id'], text,
                                 human='human:fixture-owner', channel='cli', signed=True)['decision']
 

@@ -356,7 +356,10 @@ last. The separately signed `revoke` action is not part of installation.
 `installateur-bootstrap.py.BootstrapHostAdapter` connects the concrete
 tree/account/file primitives. Inputs are staged under the fixed administrator
 path `/var/lib/ameesh-release-bootstrap/OPERATION/` as `runtime` and `sources`,
-never a transport-selected path. `LinuxHost` requires root, checks machine-id and
+never a transport-selected path. That root is itself part of the signed
+directory inventory at mode 0700: `layout` creates or validates it instead of
+leaving an ad hoc staging directory outside the reviewed plan. `LinuxHost`
+requires root, checks machine-id and
 the SHA-256 of the SSH Ed25519 host-key wire blob, uses fixed directory/account
 commands, and validates sudo syntax and effective SSH settings before reloading
 the fixed `sshd.service`. Revocation validates/reloads the restored settings.

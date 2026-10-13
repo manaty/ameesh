@@ -30,8 +30,11 @@ DIRECTORIES={
     '/etc/ameesh-release/operations':0o700,'/usr/local/libexec':0o755,
     '/etc/sudoers.d':0o750,'/etc/ssh/sshd_config.d':0o755,
     '/var/lib/ameesh-release':0o755,'/var/lib/ameesh-release/controller':0o700,
-    '/var/lib/ameesh-release/helper':0o700,'/var/lib/ameesh-release/bootstrap':0o700,
+    '/var/lib/ameesh-release/helper':0o700,
     '/var/lib/ameesh-release/ssh':0o755,
+    # Staging root the administrator fills before preflight: it belongs to the
+    # reviewed layout, never to an ad hoc directory outside the signed plan.
+    '/var/lib/ameesh-release-bootstrap':0o700,
 }
 
 

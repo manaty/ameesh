@@ -6,6 +6,7 @@ from tests import test_l232b_account as account_fixture
 import importlib.util
 import os
 from pathlib import Path
+import stat
 import unittest
 from unittest import mock
 
@@ -86,6 +87,22 @@ class InstallerTest(unittest.TestCase):
         with mock.patch.object(installer.account.os,'geteuid',return_value=0): host=installer.LinuxHost()
         with mock.patch.object(installer.runtime,'inventory',side_effect=OSError('fixture missing runtime')):
             self.assertFalse(host.ready(self.bundle))
+
+    def test_staging_root_belongs_to_the_reviewed_layout_with_exact_mode(self):
+        # The adapter reads the staged trees from this exact root and preflight
+        # runs before layout: the administrator fills a directory that must be
+        # part of the signed inventory, with the reviewed 0700 mode.
+        self.assertEqual(installer.DIRECTORIES.get('/var/lib/ameesh-release-bootstrap'), 0o700)
+        self.assertNotIn('/var/lib/ameesh-release/bootstrap', installer.DIRECTORIES)
+        self.assertEqual(self.bundle['directories']['/var/lib/ameesh-release-bootstrap'], 0o700)
+        stage = self.root/'var/lib/ameesh-release-bootstrap'/self.operation
+        self.assertTrue((stage/'runtime').is_dir())
+        self.assertTrue((stage/'sources').is_dir())
+        root = self.root/'var/lib/ameesh-release-bootstrap'
+        root.chmod(0o700)
+        self.assertEqual(self.run_bootstrap(), 'installed')
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+        self.assertEqual(root.stat().st_uid, os.geteuid())
 
     def test_lost_activation_reply_rechecks_configuration_and_never_recreates_account(self):
         original=self.system.activate_ssh_configuration; lost=[False]
