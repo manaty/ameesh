@@ -44,7 +44,12 @@ class OwnershipRaceTest(unittest.TestCase):
                     "if not pid:\n"
                     " signal.signal(signal.SIGUSR1,lambda *_:os.setsid())\n"
                     " signal.signal(signal.SIGUSR2,lambda *_:Path(%r).touch())\n"
-                    " Path(%r).write_text(str(os.getpid()))\n"
+                    # #843 : renommage atomique : un write_text laisse le
+                    # fichier visible (exists) avant d'avoir écrit le PID,
+                    # et le lecteur lit une chaîne vide (CI run 38370053962).
+                    " pidfile=Path(%r); tmp=pidfile.with_name(pidfile.name+'.tmp')\n"
+                    " tmp.write_text(str(os.getpid()))\n"
+                    " os.replace(tmp, pidfile)\n"
                     "time.sleep(60)\n") % (str(resumed), str(ready))
             parent = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
             child, handle = None, None
