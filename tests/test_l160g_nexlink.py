@@ -134,7 +134,10 @@ class ProtectedQueueTest(_Land):
         self.fake.lots[4]["branch_target"] = None
         self.project = dataclasses.replace(self.project, target="develop", protected=("main",))
         clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
-        row = merge_queue.enter(None, 4, repo=self.repo, ci=None, project=self.project, clone=clone)
+        # admission requires an explicit green CI (revue #544 r1); this test
+        # only carries the target choice
+        row = merge_queue.enter(None, 4, repo=self.repo, ci=self.green(4), project=self.project,
+                                clone=clone)
         self.assertEqual(row["target"], "develop")
 
     def test_explicit_protected_target_overrides_configured_default(self):

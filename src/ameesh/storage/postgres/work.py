@@ -200,16 +200,37 @@ class WorkItems(interface.WorkItems):
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, queued_note=None,
-            forced_note=None) -> dict:
+            forced_note=None, mark_item_id=None, mark_note="") -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
-        #540 : `queued_note` (voir l'interface)."""
+        #540 : `queued_note` (voir l'interface).
+        L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
+        si bien qu'un échec de la marque annule la création (et l'inverse).
+        La ligne marquée est verrouillée **avant** l'insertion et la
+        `issue_ref` est relue sous ce verrou : deux appels concurrents ne
+        peuvent pas créer deux lots pour la même référence (revue #544 r2)."""
         with self.db.transaction() as tx:
             behind = (WorkItems(tx)._pending(assignee, None)
                       if queued_note is not None and assignee else None)
             if behind is not None:
                 assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                                   else (None, queued_note.format(lot=behind)))
+            marked = None
+            if mark_item_id is not None:
+                marked = tx.query(
+                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                    (int(mark_item_id),))
+                if not marked:
+                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+                if str(issue_ref or "").strip():
+                    # le verrou sur la ligne marquée sérialise les créateurs :
+                    # le second relit la référence après le commit du premier
+                    duplicate = tx.query(
+                        "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                        " ORDER BY id LIMIT 1", (issue_ref,))
+                    if duplicate:
+                        raise DbError("issue_ref %s is already carried by lot #%d"
+                                      % (issue_ref, int(duplicate[0]["id"])))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -235,6 +256,10 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             if behind is not None:
                 item["forced_behind" if forced_note else "queued_behind"] = behind
+            if mark_item_id is not None and str(mark_note or "").strip():
+                WorkItems(tx)._event(
+                    int(mark_item_id), marked[0]["state"],
+                    str(mark_note).replace("{lot}", str(item["id"])), actor)
             return item
 
     def get(self, item_id) -> dict | None:
@@ -938,6 +963,13 @@ class WorkItems(interface.WorkItems):
             "        OR lower(branch) = lower(%%s)"
             "        OR lower(rtrim(split_part(btrim(title), ' ', 1), ':')) = lower(%%s))"
             " ORDER BY id" % ITEM_COLUMNS, (ref, ref, ref, ref))
+
+    def by_issue_ref(self, ref) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, quel que soit
+        leur état (un lot de relecture fermé reste l'identité de sa référence)."""
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE lower(issue_ref) = lower(%%s)"
+            " ORDER BY id" % ITEM_COLUMNS, (str(ref or ""),))
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(

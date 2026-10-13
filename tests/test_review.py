@@ -2,9 +2,11 @@
 """Politique de revue par classe de risque : portées, classes, refus (R19)."""
 from __future__ import annotations
 
+import types
 import unittest
+from unittest import mock
 
-from ameesh import review
+from ameesh import lot_class, review
 
 
 def policy(**over):
@@ -62,7 +64,8 @@ class GlobTest(unittest.TestCase):
         self.assertTrue(review.compile_glob("src/?/x.ts").match("src/a/x.ts"))
 
     def test_chemin_normalise(self):
-        self.assertEqual(review.normalize_path("./a\\b/./c"), "a/b/c")
+        # un backslash n'est pas un séparateur POSIX : il reste dans le chemin
+        self.assertEqual(review.normalize_path("./a\\b/./c"), "a\\b/c")
         self.assertEqual(review.normalize_path("a/../b/"), "b")
         self.assertEqual(review.normalize_path("../a"), "../a")
         self.assertTrue(review.compile_glob("./docs/**").match("docs/a.md"))
@@ -105,6 +108,18 @@ class ClassifyTest(unittest.TestCase):
             review.classify(policy(), [])
         with self.assertRaises(review.ReviewError):
             review.classify(policy(), [""])
+
+    def test_un_chemin_ne_se_relit_jamais_en_un_autre(self):
+        """Revue #544 r1 : backslash, `..` et composant vide sont refusés.
+
+        `.github/workflows/..\\..\\docs/evil.yml` n'est pas `docs/evil.yml` :
+        le relire en chemin POSIX ferait matcher une portée plus légère.
+        """
+        for raw in ("a/../b", ".github/workflows/..\\..\\docs/evil.yml",
+                    "docs\\evil.yml", "docs//evil.yml", "docs/", "docs\\..\\main.py"):
+            with self.subTest(raw):
+                with self.assertRaises(review.ReviewError):
+                    review.classify(policy(), [raw])
 
 
 class ParseTest(unittest.TestCase):
@@ -202,6 +217,166 @@ class FederationPolicyTest(unittest.TestCase):
         _parsed, problems = review.policy_from_federation(
             {"review_policies": {"risk_classes": {}}})
         self.assertEqual(problems, [])
+
+
+class ScopedPoliciesTest(unittest.TestCase):
+    """Les politiques par projet : les globs d'un projet ne classent pas un autre."""
+
+    def federation(self):
+        return {"review_policies": {"risk_classes": {
+            "projects": {
+                "ameesh": {"default": "light", "rules": [
+                    {"paths": ["src/ameesh/db.py"], "class": "sensitive"}]},
+                "nexlink": {"default": "normal", "rules": [
+                    {"paths": ["supabase/**"], "class": "sensitive"}]},
+            },
+            "default": "normal",
+        }}}
+
+    def test_chaque_projet_a_sa_politique(self):
+        scoped = review.scoped_from_federation(self.federation())
+        self.assertEqual(sorted(scoped.projects), ["ameesh", "nexlink"])
+        self.assertEqual(scoped.problems, ())
+        ameesh, problems = scoped.policy_of("ameesh")
+        self.assertEqual(problems, [])
+        self.assertEqual(ameesh.default, "light")
+        self.assertEqual(review.classify(ameesh, ["src/ameesh/db.py"])["class"], "sensitive")
+        self.assertEqual(review.classify(ameesh, ["docs/a.md"])["class"], "light")
+
+    def test_les_globs_d_un_projet_ne_classent_pas_un_autre(self):
+        scoped = review.scoped_from_federation(self.federation())
+        nexlink, _ = scoped.policy_of("nexlink")
+        self.assertEqual(review.classify(nexlink, ["supabase/x.sql"])["class"], "sensitive")
+        # le chemin sensible d'ameesh reste au défaut de nexlink
+        self.assertEqual(review.classify(nexlink, ["src/ameesh/db.py"])["class"], "normal")
+        ameesh, _ = scoped.policy_of("ameesh")
+        # et le glob de nexlink ne classe pas un chemin d'ameesh
+        self.assertEqual(review.classify(ameesh, ["supabase/x.sql"])["class"], "light")
+
+    def test_projet_inconnu_prend_le_repli_et_le_dit(self):
+        scoped = review.scoped_from_federation(self.federation())
+        policy, problems = scoped.policy_of("omarchy")
+        self.assertEqual(policy.default, "normal")
+        self.assertEqual([code for code, _s, _m in problems], [review.UNKNOWN_PROJECT])
+        self.assertEqual(problems[0][1], "warning")
+
+    def test_projet_inconnu_sans_repli_est_une_erreur(self):
+        """Pas de repli déclaré : un projet inconnu est un doute, pas un défaut."""
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "projects": {"ameesh": {"default": "light"}}}}})
+        _policy, problems = scoped.policy_of("nexlink")
+        self.assertEqual([code for code, _s, _m in problems], [review.UNKNOWN_PROJECT])
+        self.assertEqual(problems[0][1], "error")
+
+    def test_constats_d_un_projet_sont_prefixes(self):
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "projects": {"ameesh": {"default": "urgent"}}}}})
+        self.assertEqual([code for code, _s, _m in scoped.problems],
+                         [review.UNKNOWN_CLASS])
+        self.assertIn("project ameesh", scoped.problems[0][2])
+
+    def test_projects_non_mapping(self):
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "projects": ["ameesh"]}}})
+        self.assertEqual([code for code, _s, _m in scoped.problems], [review.BAD_PROJECT])
+
+    def test_forme_globale_inchangee(self):
+        scoped = review.scoped_from_federation({"review_policies": {"risk_classes": {
+            "default": "light", "rules": [{"paths": ["a/**"], "class": "sensitive"}]}}})
+        self.assertEqual(scoped.projects, {})
+        self.assertEqual(scoped.problems, ())
+        policy, problems = scoped.policy_of()
+        self.assertEqual(problems, [])
+        self.assertEqual(policy.default, "light")
+        self.assertEqual(review.classify(policy, ["a/x"])["class"], "sensitive")
+
+
+class LotClassTest(unittest.TestCase):
+    """La classe d'un LOT (L539) : axe release, portée par projet, et le doute
+    qui rend `sensitive` — jamais une classe rassurante par défaut."""
+
+    def canon(self, risk, root="canon"):
+        return types.SimpleNamespace(
+            root=root, sources=[],
+            federation={"review_policies": {"risk_classes": risk}})
+
+    def test_axe_release(self):
+        self.assertEqual(lot_class.release_reason({"branch_target": "release/v1.10.0"}),
+                         "target release/v1.10.0")
+        self.assertEqual(lot_class.release_reason({"type": "release"}), "lot type release")
+        self.assertEqual(lot_class.release_reason({"branch_target": "main", "type": "bug"}), "")
+
+    def test_axe_release_sur_la_cible_resolue_et_normalisee(self):
+        """Revue #544 r1 : `origin/release/1.10` et `refs/heads/release/1.10`
+        sont la même branche release, et la cible résolue à l'atterrissage
+        compte même quand la ligne du lot ne la porte pas."""
+        self.assertEqual(lot_class.release_reason({"branch_target": "origin/release/1.10"}),
+                         "target release/1.10")
+        self.assertEqual(lot_class.release_reason({"branch_target": "refs/heads/release/1.10"}),
+                         "target release/1.10")
+        self.assertEqual(lot_class.release_reason(
+            {"branch_target": "main"}, "refs/remotes/origin/release/1.10"),
+            "target release/1.10")
+        self.assertEqual(lot_class.release_reason({"branch_target": "main"}), "")
+
+    def test_of_lot_classe_release_sur_la_cible_resolue(self):
+        """Une cible de projet `origin/release/1.10`, sans cible sur le lot,
+        doit rendre `release` — jamais `light` sur le diff de doc (revue #544 r1)."""
+        row = {"id": 1, "app": "ameesh", "branch_target": "main", "type": "evolution"}
+        with mock.patch.object(lot_class.work, "get", return_value=row), \
+                mock.patch.object(lot_class, "default_base",
+                                  return_value="origin/release/1.10"):
+            out = lot_class.of_lot(None, 1, cfg=None, repo="/tmp/depot", head="a" * 40)
+        self.assertEqual(out["class"], lot_class.RELEASE)
+        self.assertEqual(out["doubt"], False)
+        self.assertIn("release/1.10", out["why"])
+
+    def test_un_canon_qui_ne_declare_pas_le_projet_ne_dit_rien(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "light"}}}),
+                  self.canon({"projects": {"nexlink": {
+                      "default": "sensitive",
+                      "rules": [{"paths": ["**"], "class": "sensitive"}]}}}, root="nexlink")]
+        result = lot_class.class_of_paths(canons, "ameesh", ["src/ameesh/x.py"])
+        self.assertEqual(result["class"], "light")
+        self.assertEqual(result["doubt"], False)
+
+    def test_aucun_canon_ne_declare_le_projet_est_un_doute(self):
+        canons = [self.canon({"projects": {"nexlink": {"default": "normal"}}})]
+        result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
+        self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertEqual(result["doubt"], True)
+        self.assertIn("not declared", result["why"])
+
+    def test_le_repli_declare_s_applique(self):
+        canons = [self.canon({"projects": {"nexlink": {"default": "light"}},
+                              "default": "normal"})]
+        result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
+        self.assertEqual(result["class"], "normal")
+        self.assertEqual(result["doubt"], False)
+
+    def test_la_plus_haute_des_lectures_l_emporte(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "light"}}}),
+                  self.canon({"projects": {"ameesh": {
+                      "default": "light",
+                      "rules": [{"paths": ["**/*.sql"], "class": "sensitive"}]}}},
+                      root="strict")]
+        result = lot_class.class_of_paths(canons, "ameesh", ["db/a.sql"])
+        self.assertEqual(result["class"], "sensitive")
+        self.assertEqual(result["doubt"], False)
+
+    def test_politique_illisible_rend_sensible(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "urgent"}}})]
+        result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
+        self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertEqual(result["doubt"], True)
+        self.assertIn("unreadable", result["why"])
+
+    def test_chemins_vides_rendent_un_doute(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "light"}}})]
+        result = lot_class.class_of_paths(canons, "ameesh", [])
+        self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertEqual(result["doubt"], True)
+        self.assertIn("cannot classify", result["why"])
 
 
 if __name__ == "__main__":

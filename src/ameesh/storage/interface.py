@@ -218,6 +218,12 @@ class Agents(Domain):
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
 
     @abc.abstractmethod
+    def note_unleased(self, name: str, host: str, error: str) -> bool:
+        """Native runner's lease_not_taken diagnostic, only on its host and
+        without a live lease, after taking the row lock. Keeps agent status.
+        Cleared by a successful claim; refused to mediated executors."""
+
+    @abc.abstractmethod
     def mark_event_wake(self, name: str) -> None:
         """Note l'instant du dernier réveil d'événements."""
 
@@ -286,7 +292,9 @@ class Leases(Domain):
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
                      require_responsible: bool) -> dict | None:
-        """Prend le bail pour une session interactive (`ameesh attach`)."""
+        """Prend le bail pour une session interactive (`ameesh attach`) ; la
+        ligne rendue porte `harness` et `created_ts` (L719), l'identité de
+        l'enregistrement revendiqué."""
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
@@ -1003,7 +1011,8 @@ class WorkItems(Domain):
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
             estimate_source: str | None = None, change_size: str | None = None,
-            queued_note: str | None = None, forced_note: str | None = None) -> dict:
+            queued_note: str | None = None, forced_note: str | None = None,
+            mark_item_id: int | None = None, mark_note: str = "") -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1015,7 +1024,15 @@ class WorkItems(Domain):
         (`{lot}` : le lot déjà en attente), rendu avec `queued_behind`.
         Avec `forced_note` aussi (`--force` motivé) : l'agent le reçoit quand
         même, journalisé par `forced_note`, rendu avec `forced_behind`.
-        Contrôle et écriture sous le verrou de transaction de l'agent."""
+        Contrôle et écriture sous le verrou de transaction de l'agent.
+
+        `mark_note`, si non vide, est écrit au journal de `mark_item_id` dans
+        la **même** transaction (L539 : la marque d'idempotence du lot de
+        relecture ne peut pas survivre seule à l'échec de l'autre écriture) ;
+        `{lot}` y est remplacé par l'identifiant du lot créé. La ligne
+        `mark_item_id` est verrouillée avant l'insertion et `issue_ref` y est
+        relue sous ce verrou : deux créations concurrentes de la même
+        référence ne peuvent pas aboutir toutes les deux (revue #544 r2)."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1183,6 +1200,12 @@ class WorkItems(Domain):
     def open_by_ref(self, ref: str) -> list[dict]:
         """L118 : les lots ouverts désignés par une référence (issue, fiche,
         branche, premier mot du titre)."""
+
+    @abc.abstractmethod
+    def by_issue_ref(self, ref: str) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, **quel que
+        soit leur état** — l'identité d'un lot de relecture après fusion
+        survit à sa fermeture, sinon un second lot serait ouvert."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
@@ -2123,14 +2146,18 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def plan_item(self, item_id: int, dates: dict, *, source: str | None,
-                  actor: str) -> dict | None:
+                  actor: str, expect: dict | None = None) -> dict | None:
         """Pose les dates prévues d'une tâche (`dates` : clés parmi `start`,
         `end`, `delivery` ; valeur None = date effacée ; clé absente =
         inchangée), avec qui et quand (`planned_by`, `planned_at`). Ce n'est
         PAS une activité de la tâche : ni `updated_at` ni le journal ne
         bougent (une replanification ne masque pas une stagnation). Rend
         `{id, planned_start, planned_end, planned_delivery, planned_source,
-        planned_by, planned_ts}`, ou None si la tâche est inconnue."""
+        planned_by, planned_ts}`, ou None si la tâche est inconnue.
+
+        #740 : avec `expect` (`planned_start`, `planned_end`,
+        `planned_source` lus avant), rien n'est écrit si l'un d'eux a changé
+        depuis la lecture ; None alors aussi."""
 
     @abc.abstractmethod
     def item_plans(self, ids: Sequence[int]) -> list[dict]:

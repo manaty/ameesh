@@ -29,11 +29,13 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
   serveur de production, dépense engagée) ; l'agent le propose à un humain et
   s'arrête là. Le circuit du projet (relecture, intégration par qui en a le
   droit) reste le seul chemin vers la production ;
-* les agents au forfait d'abord ; un agent payé au token ne prend rien sauf
-  `allow_paid`, et jamais pendant une alerte `balance_low` ;
-* un plafond de budget atteint (`CostBook.over`), un agent en pause budget
-  dans le mesh, une pression ou une batterie faible de l'hôte de l'agent : pas
-  de prise ;
+* les agents au forfait d'abord : ils prennent ce qui leur va, et les agents
+  payés au token prennent ce qu'ils laissent, dans le même passage — jamais
+  pendant une alerte `balance_low` ;
+* un plafond de budget atteint (`CostBook.over`), une pression ou une batterie
+  faible de l'hôte de l'agent : pas de prise ; un agent en pause budget ne
+  prend rien lui-même, mais n'arrête plus les autres (`idle_agents` l'écarte
+  déjà) ;
 * au plus `max_per_hour` prises par heure glissante, comptées en base pour
   tout le mesh (plusieurs `ameesh notify` ne se cumulent pas) ;
 * l'attribution est conditionnelle (assigné encore vide) : deux preneurs
@@ -336,7 +338,7 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
-              max_per_hour: int = DEFAULT_TAKE_MAX_PER_HOUR, allow_paid: bool = False,
+              max_per_hour: int = DEFAULT_TAKE_MAX_PER_HOUR,
               alerts: list | None = None, listing: list | None = None, paid=None,
               budget_check=None, dry_run: bool = False,
               lot_idle_s: float = DEFAULT_LOT_IDLE_S,
@@ -346,8 +348,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     valant `lot` (lot non assigné de l'équipe, L165) ou `backlog` (file
     d'amélioration, L119). Les lots de l'équipe passent d'abord ; tant qu'un
     lot du projet attend, personne ne prend d'amélioration. Un seuil nul
-    désactive la prise correspondante."""
-    from . import budget as budget_mod
+    désactive la prise correspondante.
+
+    Les candidats sont triés forfaits d'abord : chaque agent au forfait prend
+    ce qui lui va, puis les agents payés au token prennent ce qu'il reste
+    dans le même passage (#754, owner 13/10). Un agent en pause budget ou
+    au-dessus de son plafond ne prend rien et ne bloque personne ; un agent
+    au token ne prend jamais sous une alerte `balance_low`."""
     from . import mail, registry, sous_utilisation, work
 
     now = time.time() if now is None else float(now)
@@ -374,11 +381,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     except Exception:
         # Pas de prise quand le périmètre des rôles est illisible.
         return []
-    # un agent du mesh en pause budget : le plafond est atteint, on ne charge pas
-    if any(row.get("status") == "blocked"
-           and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX)
-           for row in listing):
-        return []
+    # #754 : un agent en pause budget ne prend rien — il n'est déjà pas un
+    # candidat (`idle_agents` écarte l'état `blocked`), et rien ici ne doit
+    # arrêter les autres : un forfait au seuil (Claude, Codex) privait tout le
+    # mesh de prise, y compris les agents au token qui avaient du budget
+    # (owner, 13/10 : « quand les forfaits Claude sont au seuil, le travail
+    # passe à DeepSeek et Codex »).
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
     # #254 : un hôte en pause ne prend pas de travail, ni ses agents
@@ -406,7 +414,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
-            if is_paid(row) and (not allow_paid or balance_low):
+            if is_paid(row) and balance_low:
                 continue
             out.append(row)
         # forfaits d'abord, puis le repos le plus long
@@ -428,7 +436,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             except Exception:
                 orchestras = []
         # L165b : un agent dont tous les lots attendent un autre est libre
-        for row in candidates(lot_idle_s, skip=set(orchestras), waiting_free=True):
+        pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
+        for row in pool:
             if len(taken) >= lot_room or not lots:
                 break
             if not within_budget(row):
@@ -486,7 +495,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     # avant toute amélioration
     if taken or sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
         return taken
-    for row in candidates(idle_s):
+    pool = candidates(idle_s)
+    for row in pool:
         if len(taken) >= room or not queue:
             break
         if not within_budget(row):

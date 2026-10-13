@@ -206,12 +206,12 @@ class CorrectionTest(_Base):
                                                         canons=[Canon()],
                                                         roles=work.CORRECTOR_ROLES), ["dev1"])
         with identite(), mock.patch.object(
-                assignments, "is_orchestrator", side_effect=lambda cfg, db, name, roles=None:
-                name == "dev1" and roles == work.CORRECTOR_ROLES):
+                assignments, "is_orchestrator", side_effect=lambda cfg, db, name, roles=None, history=True:
+                name == "dev1" and roles == work.CORRECTOR_ROLES and history):
             self.assertEqual(work.corrector(self.cfg, self.db, "dev1"), "dev1")
         with identite("dev1"), mock.patch.object(
-                assignments, "is_orchestrator", side_effect=lambda cfg, db, name, roles=None:
-                name == "dev1" and roles == work.CORRECTOR_ROLES):
+                assignments, "is_orchestrator", side_effect=lambda cfg, db, name, roles=None, history=True:
+                name == "dev1" and roles == work.CORRECTOR_ROLES and history):
             self.assertEqual(work.corrector(self.cfg, self.db), "dev1")
 
 

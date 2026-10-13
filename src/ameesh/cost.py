@@ -657,14 +657,20 @@ class CostBook:
                 continue
             path = os.path.abspath(os.path.join(self.agent_dir(agent), "events.jsonl"))
             try:
-                signature = _journal_signature(os.stat(path))
+                current = os.stat(path)
                 cached = self._claude_gauge_cache.get(path)
-                if cached is not None and cached[0] == signature:
+                # Recheck the age on a hit too: after a clock step back, a
+                # settled journal can be racy again and its signature blind.
+                if (cached is not None and cached[0] == _journal_signature(current)
+                        and not _racy(current, time.time_ns())):
                     readings = cached[1]
                 else:
+                    # Age measured before the read: slow processing must not
+                    # make a racy snapshot old enough to be cached.
+                    seen = time.time_ns()
                     events, stat, complete = _claude_account_tail(path)
                     readings = _claude_account_readings(events, stat.st_mtime)
-                    if complete and not _racy(stat):
+                    if complete and not _racy(stat, seen):
                         self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
                     else:
                         self._claude_gauge_cache.pop(path, None)
@@ -1821,10 +1827,12 @@ def _journal_signature(stat) -> tuple:
 RACY_CTIME_NS = 1_000_000_000
 
 
-def _racy(stat) -> bool:
-    """A journal changed less than RACY_CTIME_NS ago is not cached ("racy
-    git"): a write in the same clock tick would leave its signature intact."""
-    return time.time_ns() - stat.st_ctime_ns < RACY_CTIME_NS
+def _racy(stat, now_ns: int) -> bool:
+    """A journal changed less than RACY_CTIME_NS before `now_ns` is not cached
+    ("racy git"): a write in the same clock tick would leave its signature
+    intact. A ctime after `now_ns` (written since, or clock stepped back) is
+    racy too."""
+    return now_ns - stat.st_ctime_ns < RACY_CTIME_NS
 
 
 def _claude_account_readings(events: list, mtime: float) -> dict:

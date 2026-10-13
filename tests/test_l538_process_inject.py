@@ -126,6 +126,11 @@ class ProcessLectureTest(_TmpMixin, unittest.TestCase):
         findings = canon.validate(loaded)
         self.assertIn("fiche-title-missing", codes(findings, canon.ERROR))
         self.assertEqual(loaded.processes, [])
+        # #764: like the other Process card errors, it blocks no agent
+        trouves = [f for f in findings if f.code == "fiche-title-missing"]
+        self.assertTrue(all(f.process for f in trouves))
+        self.assertFalse([f for f in canon.blocking(findings).global_errors
+                          if f.code == "fiche-title-missing"])
 
     def test_dates_illisibles_signalees(self):
         loaded, _root = self.charge(carte(updated="12/10/2026", expire="bientôt"))

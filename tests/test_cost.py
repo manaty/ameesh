@@ -292,6 +292,43 @@ class AccountTailGaugeTest(Sandbox, unittest.TestCase):
         self.assertEqual(os.stat(path).st_size, before.st_size)
         self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.42)
 
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
+    def test_slow_read_does_not_age_a_racy_snapshot_into_the_cache(self):
+        # age taken before the read: a read lasting past the window stays racy
+        self.agent('long', 'claude')
+        self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
+        path = os.path.abspath(os.path.join(self.state, 'long', 'events.jsonl'))
+        ctime = os.stat(path).st_ctime_ns
+        now = [ctime + RACY_CTIME_NS // 2]
+        real_tail = cost._claude_account_tail
+
+        def slow_tail(target):
+            result = real_tail(target)
+            now[0] = ctime + 5 * RACY_CTIME_NS  # the read outlasts the window
+            return result
+        book = self.book()
+        with mock.patch.object(cost.time, 'time_ns', lambda: now[0]), \
+                mock.patch.object(cost, '_claude_account_tail', slow_tail):
+            self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+        self.assertIsNone(book._claude_gauge_cache.get(path))
+
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
+    def test_cache_hit_rechecks_age_after_a_clock_step_back(self):
+        self.agent('long', 'claude')
+        self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
+        path = os.path.abspath(os.path.join(self.state, 'long', 'events.jsonl'))
+        ctime = os.stat(path).st_ctime_ns
+        book = self.book()
+        with mock.patch.object(cost.time, 'time_ns', lambda: ctime + 5 * RACY_CTIME_NS):
+            book.claude_gauges('tertiary', 'primary')
+        self.assertIsNotNone(book._claude_gauge_cache.get(path))
+        tail = mock.Mock(wraps=cost._claude_account_tail)
+        with mock.patch.object(cost.time, 'time_ns', lambda: ctime), \
+                mock.patch.object(cost, '_claude_account_tail', tail):
+            book.claude_gauges('tertiary', 'primary')
+        tail.assert_called_once()
+        self.assertIsNone(book._claude_gauge_cache.get(path))
+
     def test_replacement_and_truncation_invalidate_cache(self):
         self.agent('long', 'claude')
         self.events('long', self.marker('tertiary', self.now), self.reading(0.89))

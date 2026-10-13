@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import land, mail, merge_queue, radar, resolutions, storage, work
+from ameesh import land, mail, merge_queue, radar, resolutions, review_lot, storage, work
 
 from .support import PgTestCase
 from .test_l160b_radar import MIG, _git
@@ -78,10 +78,12 @@ class _Land(_Base):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def enter(self, lot, ci=None):
-        """Admission fetches origin into the radar's clone (L160e1)."""
+    def enter(self, lot, ci="green"):
+        """Admission fetches origin into the radar's clone (L160e1); the CI is
+        green on the frozen head by default (revue #544 r1: it is required)."""
         clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
-        return merge_queue.enter(None, lot, repo=self.repo, actor="orch", ci=ci, clone=clone)
+        return merge_queue.enter(None, lot, repo=self.repo, actor="orch",
+                                 ci=self.green(lot) if ci == "green" else ci, clone=clone)
 
     def queued(self, lot):
         self.ready(lot)
@@ -166,6 +168,48 @@ class LocalLandTest(_Land):
         self.assertEqual(self.fake.queue_rows[3]["state"], "queued")
         off = dataclasses.replace(self.project, land="off")
         self.assertEqual(land.run_pass(self.cfg, None, off, report, owner="r"), [])
+
+
+class ReviewAfterMergeTest(LocalLandTest):
+    """L539 : la fusion confirmée d'un lot léger ouvre le lot de relecture §2."""
+
+    def test_light_merge_opens_the_review_lot(self):
+        self.queued(4)
+        calls = []
+
+        def opened(db, **kw):
+            calls.append(kw)
+            return {"lot": kw["lot"], "id": 900, "created": True, "class": "light",
+                    "why": "ouvert"}
+
+        with mock.patch.object(merge_queue, "_class_of",
+                               return_value={"class": "light", "why": "policy of ameesh"}), \
+                mock.patch.object(review_lot, "open_after_merge", side_effect=opened):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(out["review_lot"]["id"], 900)
+        (kw,) = calls
+        self.assertEqual(kw["lot"], 4)
+        self.assertEqual(kw["merged_sha"], _git(self.origin, "rev-parse", "main"))
+        self.assertEqual(kw["target"], "main")
+
+    def test_a_refused_landing_opens_nothing(self):
+        self.project = dataclasses.replace(self.project, gates=("exit 3",))
+        self.queued(4)
+        with mock.patch.object(review_lot, "open_after_merge") as opened:
+            out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        opened.assert_not_called()
+
+    def test_a_doubt_or_a_higher_class_opens_nothing(self):
+        """La classe relue n'est pas `light` : rien n'est ouvert."""
+        self.queued(4)
+        with mock.patch.object(merge_queue, "_class_of",
+                               return_value={"class": "sensitive", "why": "doute"}):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertFalse(out["review_lot"]["created"], out)
+        self.assertIn("sensitive", out["review_lot"]["why"])
 
 
 class FakeGh:
@@ -275,6 +319,31 @@ class PrLandTest(_Land):
         gh = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "[]", ""))
         self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
         self.assertIn("no open PR", self.fake.queue_rows[4]["reason"])
+
+    def test_the_already_merged_path_opens_the_review_lot(self):
+        """L539 : le chemin « déjà fusionné » (PR disparue, lot fusionné) ouvre
+        lui aussi le lot de relecture, avec le sha du jalon `merged`."""
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landing")
+        self.fake.lots[4]["state"] = "merged"
+        self.marks[4] = [{"id": 3, "kind": "merged", "sha": "d" * 40, "at_ts": 3.0}]
+        calls = []
+
+        def no_pr(args, timeout=60.0):
+            if args[:2] == ["pr", "list"]:
+                return subprocess.CompletedProcess(args, 0, "[]", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(review_lot, "open_after_merge",
+                               side_effect=lambda db, **kw: calls.append(kw)
+                               or {"id": 901, "created": True}):
+            out = self.land(4, gh=no_pr, locks=locks)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(out["review_lot"]["id"], 901)
+        self.assertEqual(calls[0]["merged_sha"], "d" * 40)
 
 
 def _steal_after_gates(test, key="p:main"):

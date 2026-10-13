@@ -35,13 +35,14 @@ class AssignmentError(RuntimeError):
     """Rattachement refusé : rien n'est déposé, le message dit quoi faire."""
 
 
-def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
+def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
     agent qui a confié des lots dans les 30 derniers jours, ou fiche Agent du
     canon dont `roles` nomme un orchestrateur (`sous_utilisation.orchestrators`,
     lu en dernier : le canon coûte une lecture du dépôt). `roles` : les rôles
     du canon qui comptent (défaut : orchestrateur ; `work.CORRECTOR_ROLES`
-    ajoute les agents de conception)."""
+    ajoute les agents de conception). `history=False` (#740) : les lots confiés
+    ne comptent pas, seule une déclaration compte."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -49,7 +50,7 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     if name in declared:
         return True
     try:
-        if name in {su._bare(n) for n in storage.of(db).operations.assigners(
+        if history and name in {su._bare(n) for n in storage.of(db).operations.assigners(
                 since_s=su.ASSIGNERS_SINCE_S)}:
             return True
     except Exception:
@@ -64,7 +65,8 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
             canons = [c for c in (canon.load_configured(cfg) if cfg is not None else [])
                       if row is not None and c.owns(row.get("canon"))]
         return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
-                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES)
+                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES,
+                                        history=history)
     except Exception:
         return False
 
