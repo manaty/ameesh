@@ -358,13 +358,15 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     refusé s'il existe déjà dans le dépôt ou s'il est réservé par un autre lot
     (index unique (dépôt, numéro) : la base tranche, même entre deux
     réservations simultanées). Un lot qui a déjà sa réservation la garde
-    (idempotent). `release` la libère. Rend le lot, avec `migration_file`."""
+    (idempotent). `release` la libère, y compris sur un lot déjà terminal
+    (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
+    Rend le lot, avec `migration_file`."""
     from . import migrations
 
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in ("merged", "promoted", "closed"):
+    if item["state"] in ("merged", "promoted", "closed") and not release:
         raise WorkError("lot %s already %s: no reservation" % (item_id, item["state"]))
     current = item.get("migration")
     if release:

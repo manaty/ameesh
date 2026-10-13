@@ -272,10 +272,10 @@ class WorkItems(interface.WorkItems):
         """Déplace le lot s'il est encore en `current` (sinon None, rien
         d'écrit), puis journalise la transition. `held` (L233) : et si une
         demande de décision ouverte le tient — vérifiée dans la même
-        instruction, la demande verrouillée (voir l'interface)."""
+        instruction, la demande verrouillée (voir l'interface). Un passage
+        vers un état terminal libère la réservation de migration (#956)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
-        rows = self.db.query(
-            """
+        sql = """
             UPDATE work_items
                SET state = %s,
                    loops = loops + %s,
@@ -285,14 +285,23 @@ class WorkItems(interface.WorkItems):
                                      THEN coalesce(started_at, now()) ELSE started_at END
              WHERE id = %s AND state = %s __HELD__
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", ITEM_COLUMNS).replace("__HELD__", _HELD if held else ""),
-            (state, loops, state, state, int(item_id), current)
-            + ((str(int(item_id)),) if held else ()),
-        )
-        if not rows:
-            return None
-        self._event(int(item_id), state, note, actor)
-        return rows[0]
+            """.replace("__COLUMNS__", ITEM_COLUMNS).replace("__HELD__", _HELD if held else "")
+        params = ((state, loops, state, state, int(item_id), current)
+                  + ((str(int(item_id)),) if held else ()))
+        if state not in ("merged", "promoted", "closed"):
+            rows = self.db.query(sql, params)
+            if not rows:
+                return None
+            self._event(int(item_id), state, note, actor)
+            return rows[0]
+        with self.db.transaction() as tx:
+            rows = tx.query(sql, params)
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), state, note, actor)
+            self._release_migration(tx, item_id, rows[0],
+                                    why="état %s" % state, actor=actor)
+            return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
@@ -655,6 +664,26 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- numéro de migration réservé (L122) ----------------------------------
+    def _release_migration(self, tx, item_id, row, *, why, actor) -> None:
+        """#956 : libère la réservation du lot qui entre dans un état terminal
+        (`merged`, `promoted`, `closed`), dans la transaction même de la
+        transition : une réservation tenue par un lot fusionné bloquait le
+        numéro pour toujours. Le numéro reste protégé tant qu'un fichier le
+        porte, puisque `repo_numbers` compte les fichiers de toutes les
+        branches du dépôt."""
+        if row.get("migration") is None:
+            return
+        number = row["migration"]
+        tx.execute(
+            "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
+            "       updated_at = now() WHERE id = %s", (int(item_id),))
+        # le lot rendu à l'appelant reflète l'état validé, pas la valeur d'avant
+        row["migration"] = None
+        row["migration_repo"] = None
+        WorkItems(tx)._event(
+            int(item_id), row["state"],
+            "migration %s released (%s, #956)" % (number, why), actor)
+
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
@@ -672,21 +701,45 @@ class WorkItems(interface.WorkItems):
             value, params = "NULL", ()
         elif number is None:
             value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
-                     "               WHERE migration_repo = %s))")
+                     "               WHERE migration_repo = %s"
+                     "                 AND state NOT IN ('merged', 'promoted', 'closed')))")
             params = (int(floor), repo)
         else:
             value, params = "%s", (int(number),)
+        # `release` libère aussi un lot déjà terminal (#956) ; les autres
+        # chemins ne visent qu'un lot ouvert.
+        guard = "" if release else " AND state NOT IN ('merged', 'promoted', 'closed')"
         deadline = time.monotonic() + _RESERVE_BUDGET_S
         wait = _RESERVE_WAIT_BASE_S
         while True:
             try:
                 with self.db.transaction() as tx:
-                    rows = tx.query(
-                        "UPDATE work_items SET migration = %s, migration_repo = %%s,"
-                        "       updated_at = now()"
-                        " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
-                        " RETURNING %s" % (value, ITEM_COLUMNS),
-                        params + (None if release else repo, int(item_id)))
+                    if not release:
+                        # #956 : une réservation héritée d'un lot terminal
+                        # (prise avant ce correctif) ne tient plus le numéro :
+                        # elle est libérée dans la transaction de la
+                        # réservation, avec sa ligne de journal. Les lignes
+                        # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
+                        # valeur déjà effacée.
+                        for old in tx.query(
+                                "SELECT id, migration, state FROM work_items"
+                                " WHERE migration_repo = %s"
+                                "   AND state IN ('merged', 'promoted', 'closed')"
+                                " FOR UPDATE", (repo,)):
+                            tx.execute(
+                                "UPDATE work_items SET migration = NULL,"
+                                "       migration_repo = NULL, updated_at = now()"
+                                " WHERE id = %s", (int(old["id"]),))
+                            WorkItems(tx)._event(
+                                int(old["id"]), old["state"],
+                                "migration %s released (lot %s %s, #956)" % (
+                                    old["migration"], old["id"], old["state"]), actor)
+                    sql = ("UPDATE work_items SET migration = %s, migration_repo = %%s,"
+                           "       updated_at = now()"
+                           " WHERE id = %%s" + guard +
+                           " RETURNING %s") % (value, ITEM_COLUMNS)
+                    rows = tx.query(sql,
+                                    params + (None if release else repo, int(item_id)))
                     if not rows:
                         return None
                     WorkItems(tx)._event(int(item_id), rows[0]["state"],
@@ -712,9 +765,12 @@ class WorkItems(interface.WorkItems):
                         "reservation contention, retry") from exc
 
     def migration_holder(self, number, repo) -> dict | None:
+        """Le lot OUVERT qui tient ce numéro (#956 : un lot terminal ne le
+        tient plus)."""
         rows = self.db.query(
             "SELECT id, title, state FROM work_items WHERE migration = %s"
-            " AND migration_repo = %s", (int(number), repo))
+            " AND migration_repo = %s"
+            " AND state NOT IN ('merged', 'promoted', 'closed')", (int(number), repo))
         return rows[0] if rows else None
 
     # -- prepared conflict resolutions (L160d, 0057) ---------------------------
@@ -972,6 +1028,7 @@ class WorkItems(interface.WorkItems):
                     if not latest or int(latest[0]["id"]) != int(frozen_id):
                         raise _Refrozen()
                 WorkItems(tx)._event(int(item_id), "merged", note, actor)
+                self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
                 tx.query(
                     "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
                     " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
@@ -996,6 +1053,7 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), "closed", note, actor)
+            self._release_migration(tx, item_id, rows[0], why="clôture", actor=actor)
             tx.query(
                 "INSERT INTO work_item_milestones (work_item_id, kind, actor, note)"
                 " VALUES (%s, 'closed', %s, %s) ON CONFLICT DO NOTHING RETURNING id",
