@@ -560,5 +560,71 @@ class Relecture424r7Test(_Cache):
         self.assertEqual(su._FOREIGN_WARNED, set())
 
 
+class Relecture424r8Test(_Cache):
+    """#424 r8 (qa-01, B/P1) : un canon configuré mais dont le manifeste n'a pas
+    pu être lu garde l'identité de son dossier (`canon.py`, `_identify` avant
+    manifeste) : son `owns` ne revendique plus la ligne du registre, et rien ne
+    prouve que l'agent n'est d'aucun canon. Conclure « étranger » serait une
+    baisse silencieuse : le verdict connu (cache) tient ; sinon, repli
+    critique. Même critère pour l'exécuteur, la reprise et le handoff."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(su._FOREIGN_WARNED.clear)
+        su._FOREIGN_WARNED.clear()
+        # le registre porte l'id du manifeste ; le canon chargé, pas encore lu
+        # en entier, n'a que le nom de son dossier
+        self.rows["codex1"] = {"name": "codex1", "canon": "org-B"}
+        self.cfg.canon_entries = ("a", "checkout-B")
+
+    def brise(self, code="federation-invalid"):
+        """A sain, B chargé mais pas lu en entier (manifeste invalide, ou erreur
+        avant le manifeste) : son identité reste « checkout-B »."""
+        from ameesh.canon import Finding
+        sain = _Canon("A", CARTES)
+        brise = _Canon("checkout-B", {"codex1": ["implementation"]})
+        brise.load_findings = [Finding(code, "error", "manifeste illisible")]
+        self.assertFalse(su.fully_read(brise))
+        return sain, brise
+
+    def test_manifeste_lu_l_identite_du_manifeste_possede(self):
+        # le cas sain d'abord : le dossier « checkout-B » n'est qu'un repli,
+        # l'id du manifeste (« org-B ») est bien propriétaire de la ligne
+        b = _Canon("org-B", {"codex1": ["relecture"]})
+        b.root = "checkout-B"
+        a = _Canon("A", CARTES)
+        self.assertEqual(su.foreign_canon(self.rows["codex1"], [a, b], complete=True), None)
+        self.assertTrue(self.critical(self.fake([a, b]), "codex1"))
+
+    def test_executeur_replie_critique_sur_identite_incertaine(self):
+        a, b = self.brise()
+        self.assertEqual(su.foreign_canon(self.rows["codex1"], [a, b], complete=True), None)
+        self.assertTrue(self.critical(self.fake([a, b]), "codex1"))
+        self.assertEqual(su._FOREIGN_WARNED, set())
+
+    def test_erreur_avant_manifeste_replie_critique(self):
+        a, b = self.brise("canon-git-error")
+        self.assertTrue(self.critical(self.fake([a, b]), "codex1"))
+
+    def test_auditeur_et_reprise_replient_critique(self):
+        from ameesh import auditor
+        a, b = self.brise()
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}), \
+                mock.patch("ameesh.runner.log_async"):
+            self.assertTrue(auditor.is_critical(self.cfg, None, "codex1", [a, b],
+                                                declared=(), agent=self.rows["codex1"]))
+        self.assertTrue(self.resume("codex1", [a, b]))
+
+    def test_verdict_critique_connu_tient(self):
+        # un verdict True déjà au cache n'est plus court-circuité par le repli
+        # « étranger » (qa-01) : le canon illisible ne le dégrade pas
+        self.assertTrue(su.remember_critical(self.cfg, "codex1", True))
+        a, b = self.brise()
+        self.assertTrue(self.critical(self.fake([a, b]), "codex1"))
+        self.assertTrue(self.resume("codex1", [a, b]))
+        self.assertIs(su.critical_memory(self.cfg).get("codex1"), True)
+        self.assertEqual(su._FOREIGN_WARNED, set())
+
+
 if __name__ == "__main__":
     unittest.main()

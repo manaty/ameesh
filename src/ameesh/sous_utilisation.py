@@ -633,11 +633,17 @@ _FOREIGN_WARNED: set = set()
 
 def foreign_canon(row, canons, *, complete: bool) -> str | None:
     """#424 r7 (mesh-design) : le canon de `row` quand AUCUN canon de l'hôte ne
-    le possède, tous les canons configurés chargés (`complete`) — un état
-    connu et permanent, pas une panne : l'agent garde le verdict d'avant
-    L242c (non critique). Un canon configuré mais illisible ou pas encore
-    chargé n'est pas étranger : la règle fail-safe s'applique. None sinon."""
-    if not complete or not canons or _owners(row, canons):
+    le possède, tous les canons configurés chargés (`complete`) ET lus en
+    entier (`fully_read`, #424 r8) — un état connu et permanent, pas une
+    panne : l'agent garde le verdict d'avant L242c (non critique). Un canon
+    configuré mais illisible ou pas encore chargé, ou dont le manifeste n'a
+    pas pu être lu, n'est pas étranger : son identité peut être restée le nom
+    du dossier (`canon.py`, `_identify` avant manifeste), donc rien ne prouve
+    que l'agent n'est d'aucun canon — le verdict connu/cache puis la règle
+    fail-safe s'appliquent (#424 r8). None sinon."""
+    if (not complete or not canons
+            or not all(fully_read(c) for c in canons)     # #424 r8
+            or _owners(row, canons)):
         return None
     return (row or {}).get("canon") or "?"
 
