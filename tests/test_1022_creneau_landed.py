@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1022 : une fusion lande le creneau de migration, une liberation sans
-atterrissage le rend `released` (suite de #711, ordonne avec #956)."""
+atterrissage le rend `released` (suite de #711, ordonne avec #956).
+#879 : un numero deja atterri ne redevient jamais `reserved`."""
 from __future__ import annotations
 
 import os
@@ -56,3 +57,21 @@ class MigrationSlotLandedTest(PgTestCase):
                         " migration = NULL, migration_repo = NULL WHERE id = %s",
                         (self.lot['id'],))
         self.assertEqual(self._creneau()['status'], 'released')
+
+    def test_merged_puis_blocked_ne_ressuscite_pas_le_creneau(self):
+        """#879 : `merged -> blocked` rejoue la projection avec `migration`
+        encore pose ; un `landed` de meme numero le reste."""
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (self.lot['id'],))
+        self.assertEqual(self._creneau()['status'], 'landed')
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.lot['id'],))
+        self.assertEqual(self._creneau()['status'], 'landed')
+
+    def test_nouveau_numero_apres_landed_reste_reserve(self):
+        """#879 : la garde ne fige pas la projection — un numero nouveau suit
+        son statut normal (`reserved`)."""
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (self.lot['id'],))
+        self.assertEqual(self._creneau()['status'], 'landed')
+        self.db.execute("UPDATE work_items SET state = 'blocked', migration = 401"
+                        " WHERE id = %s", (self.lot['id'],))
+        creneau = self._creneau()
+        self.assertEqual((creneau['number'], creneau['status']), (401, 'reserved'))
