@@ -6700,6 +6700,8 @@ def cmd_register(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     parser.add_argument("--model", default=None)
     parser.add_argument("--budget", type=float, default=None)
     parsed = parser.parse_args(args)
+    from .agent_names import resolve
+    parsed.name = resolve(parsed.name, db=db, operation="runner.register")
     cwd = os.path.abspath(os.path.expanduser(parsed.cwd)) if parsed.cwd else None
     row = registry.upsert(
         db, parsed.name, chantier=parsed.chantier, harness=parsed.harness, host=cfg.host,

@@ -167,6 +167,39 @@ class AgentAliasTest(PgTestCase):
         self.assertEqual(instance.agents_filter, ['worker'])
         self.assertEqual([r['name'] for r in registry.claimable(self.db, self.cfg.host, ['old-worker'])], ['worker'])
 
+    def test_enabled_alias_units_cover_primary_in_both_systemd_scopes(self):
+        from ameesh import hostcheck
+        for scope, template in (((), 'ameesh-runner-agent@%s.service'),
+                                ((hostcheck.SYSTEM,), 'ameesh-runner@%s.service')):
+            for explicit_filter in (False, True):
+                with self.subTest(scope=scope, explicit_filter=explicit_filter):
+                    unit = template % 'old-worker'
+                    commands = {
+                        scope + ('list-unit-files', '--type=service', '--no-legend', '--plain'):
+                            unit + ' enabled enabled\n',
+                        scope + ('show', unit, '-p', 'ExecStart', '--value'):
+                            'argv[]=/x/ameesh run' + (' --agents old-worker' if explicit_filter else ''),
+                    }
+                    coverage = hostcheck.runner_coverage(
+                        ['worker', 'reviewer'], db=self.db,
+                        run=lambda *args: commands.get(args, ''))
+                    self.assertEqual(coverage, {'worker': unit, 'reviewer': None})
+        self.assertTrue(self.db.query(
+            "SELECT 1 FROM agent_name_resolutions WHERE operation='systemd.runner'"))
+
+    def test_register_alias_keeps_worktree_marker_in_primary_state(self):
+        import subprocess
+        from pathlib import Path
+        directory = Path(self.tmp) / 'registered-worktree'
+        subprocess.run(['git', 'init', '-q', str(directory)], check=True)
+        result = self.register('old-worker', 'codex', cwd=str(directory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = Path(self.cfg.agent_dir('worker')) / 'worktree.json'
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads(marker.read_text())['cwd'], str(directory))
+        self.assertFalse((Path(self.cfg.agent_dir('old-worker')) / 'worktree.json').exists())
+        self.assertEqual(registry.get(self.db, 'worker')['cwd'], str(directory))
+
     def test_agent_key_alias_refers_to_the_same_key(self):
         authority.register_key(self.db, 'old-worker', b'x' * 32)
         self.assertEqual(authority.key_info(self.db, 'another-name')['public_key_fingerprint'],
@@ -287,6 +320,18 @@ class CanonAliasSyncTest(_CanonDbCase):
         self.assertEqual(canon.errors(canon.validate(loaded)), [])
         self.sync('banc')
         self.assertEqual(registry.get(self.db, 'old-worker')['cwd'], '/srv/acme/worker')
+
+    def test_conflicting_primary_and_alias_work_directories_close_admission(self):
+        from pathlib import Path
+        self.add_aliases(['old-worker'])
+        host = Path(self.root) / 'hotes/banc.md'
+        host.write_text(host.read_text().replace('  max_agents: 2',
+                        '  work_dirs: {ouvrier: /srv/primary, old-worker: /srv/alias}\n'
+                        '  max_agents: 2'))
+        findings = canon.validate(self.load())
+        self.assertIn('host-work-dir-alias-conflict', codes(findings))
+        self.sync('banc')
+        self.assertIsNone(registry.get(self.db, 'old-worker')['responsible'])
 
     def test_declarative_swap_resolves_both_directions(self):
         from pathlib import Path
