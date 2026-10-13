@@ -146,6 +146,12 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
+    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
+    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
+    # pas à déchiffrer un `status_text` français.
+    from . import progress
+    for row in rows:
+        row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
 
 
@@ -216,6 +222,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
         # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
+        from . import progress
         from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
@@ -243,6 +250,11 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             status = row.get("status") or "?"
             if row.get("status_text"):
                 status = "%s/%s" % (status, row["status_text"][:22])
+            if progress.paused_on_budget(row):
+                # #1070 : le mot « pause » doit survivre à la troncature de la
+                # colonne — « blocked/bud » masquait les pauses budget (le
+                # bilan du bureau en comptait zéro).
+                status = "paused/%s" % row["status_text"][:22]
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
