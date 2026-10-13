@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -193,7 +194,60 @@ def completed(root, release_id):
     return path
 
 
-def activate(store, release_id, *, fenced=False):
+def operation_file(root, operation):
+    if not isinstance(operation, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}", operation):
+        raise ReleaseError("invalid switch operation")
+    directory = root / ".operations"
+    if directory.is_symlink():
+        raise ReleaseError("linked operation directory")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.stat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ReleaseError("operation directory must be private and owned")
+    return directory / (operation + ".json")
+
+
+def switch_record(root, operation):
+    path = operation_file(root, operation)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ReleaseError("unsafe switch receipt")
+        record = json.load(stream)
+    if not isinstance(record, dict) or set(record) != {"previous", "target"}:
+        raise ReleaseError("invalid switch receipt")
+    completed(root, record["previous"])
+    completed(root, record["target"])
+    return record
+
+
+def pin_switch(store, operation, release_id):
+    """Pin the operation's prior pair before configuration/activation begins.
+
+    Enrollment of a first release (without a rollback pair) is separate. This
+    utility still does not grant authority or establish the runner claim fence.
+    """
+    with locked(store) as root:
+        completed(root, release_id)
+        path = operation_file(root, operation)
+        if os.path.lexists(path):
+            record = switch_record(root, operation)
+            if record["target"] != release_id:
+                raise ReleaseError("operation target changed")
+            return record
+        current = root / "current"
+        if not current.is_symlink():
+            raise ReleaseError("prior release required for autonomous rollback")
+        previous = os.readlink(current)
+        completed(root, previous)
+        record = {"previous": previous, "target": release_id}
+        atomic_json(path, record)
+        sync_directory(root)
+        return record
+
+
+def activate(store, release_id, *, fenced=False, operation=None):
     """One symlink serves current/source and current/venv as a matched pair.
 
     `fenced` is the caller's assertion, not an authorization receipt. The
@@ -207,13 +261,18 @@ def activate(store, release_id, *, fenced=False):
         previous = os.readlink(current) if current.is_symlink() else None
         if os.path.lexists(current) and previous is None:
             raise ReleaseError("current must be a release pointer")
+        if operation is not None:
+            record = switch_record(root, operation)
+            if record["target"] != release_id or previous not in (record["previous"], release_id):
+                raise ReleaseError("current or target differs from pinned operation")
         if previous == release_id:
             return
         if previous is not None:
             completed(root, previous)
         # Persist intent before switching. A crash leaves enough information
         # to determine which pointer is installed and restore the prior pair.
-        atomic_json(root / "switch.json", {"previous": previous, "target": release_id})
+        if operation is None:
+            atomic_json(root / "switch.json", {"previous": previous, "target": release_id})
         candidate = root / (".current-" + uuid.uuid4().hex)
         try:
             candidate.symlink_to(release_id)
@@ -223,13 +282,14 @@ def activate(store, release_id, *, fenced=False):
             candidate.unlink(missing_ok=True)
 
 
-def rollback(store, *, fenced=False):
+def rollback(store, *, fenced=False, operation=None):
     # Activation revalidates the pointer under its lock; rollback keeps the
     # same lock throughout, preventing a concurrent deployment being undone.
     if not fenced:
         raise ReleaseError("runner fence required before rollback")
     with locked(store) as root:
-        intent = json.loads((root / "switch.json").read_text())
+        intent = (switch_record(root, operation) if operation is not None
+                  else json.loads((root / "switch.json").read_text()))
         previous = intent["previous"]
         if previous is None:
             raise ReleaseError("no previous release")
@@ -259,16 +319,23 @@ def main():
     switch = commands.add_parser("activate")
     switch.add_argument("--release", required=True)
     switch.add_argument("--fenced", action="store_true")
+    switch.add_argument("--operation")
+    pin = commands.add_parser("pin-switch")
+    pin.add_argument("--operation", required=True)
+    pin.add_argument("--release", required=True)
     undo = commands.add_parser("rollback")
     undo.add_argument("--fenced", action="store_true")
+    undo.add_argument("--operation")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
             print(prepare(args.store, args.repository, json.loads(Path(args.manifest).read_text())))
         elif args.command == "activate":
-            activate(args.store, args.release, fenced=args.fenced)
+            activate(args.store, args.release, fenced=args.fenced, operation=args.operation)
+        elif args.command == "pin-switch":
+            pin_switch(args.store, args.operation, args.release)
         else:
-            rollback(args.store, fenced=args.fenced)
+            rollback(args.store, fenced=args.fenced, operation=args.operation)
         return 0
     except Exception:
         print("versioned release failed", file=sys.stderr)

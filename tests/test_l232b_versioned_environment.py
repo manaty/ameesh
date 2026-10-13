@@ -129,6 +129,81 @@ class VersionedEnvironmentTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.store / "current"), a)
         self.assertEqual(self.calls, calls)  # no dependency installation during rollback
 
+    def test_operation_pin_survives_lost_receipt_and_global_previous_changes(self):
+        a, b = self.prepare(), self.prepare(self.b)
+        release.activate(self.store, a, fenced=True)
+        pinned = release.pin_switch(self.store, "release-B", b)
+        self.assertEqual(pinned, {"previous": a, "target": b})
+        release.activate(self.store, b, fenced=True, operation="release-B")
+        self.assertEqual(release.pin_switch(self.store, "release-B", b), pinned)
+        # A shared/global previous marker is not this operation's authority.
+        (self.store / "switch.json").write_text(json.dumps({"previous": b, "target": b}))
+        calls = list(self.calls)
+        release.rollback(self.store, fenced=True, operation="release-B")
+        release.rollback(self.store, fenced=True, operation="release-B")
+        self.assertEqual(os.readlink(self.store / "current"), a)
+        self.assertEqual((self.store / "current/source/release.txt").read_text(), "A")
+        self.assertEqual((self.store / "current/venv/installed-release").read_text(), "A")
+        self.assertEqual(self.calls, calls)
+
+    def test_operation_switch_recovers_after_pointer_changed_without_reply(self):
+        a, b = self.prepare(), self.prepare(self.b)
+        release.activate(self.store, a, fenced=True)
+        release.pin_switch(self.store, "release-B", b)
+        actual_sync = release.sync_directory
+        def lost_reply(directory):
+            if Path(directory) == self.store:
+                raise OSError("lost reply after pointer changed")
+            return actual_sync(directory)
+        with mock.patch.object(release, "sync_directory", side_effect=lost_reply), self.assertRaises(OSError):
+            release.activate(self.store, b, fenced=True, operation="release-B")
+        self.assertEqual(os.readlink(self.store / "current"), b)
+        release.activate(self.store, b, fenced=True, operation="release-B")
+        release.rollback(self.store, fenced=True, operation="release-B")
+        self.assertEqual(os.readlink(self.store / "current"), a)
+
+    def test_operation_rollback_before_activation_and_conflicting_target(self):
+        a, b = self.prepare(), self.prepare(self.b)
+        release.activate(self.store, a, fenced=True)
+        release.pin_switch(self.store, "release-B", b)
+        # Configuration can fail before code activation has written any intent.
+        release.rollback(self.store, fenced=True, operation="release-B")
+        self.assertEqual(os.readlink(self.store / "current"), a)
+        with self.assertRaisesRegex(release.ReleaseError, "target changed"):
+            release.pin_switch(self.store, "release-B", a)
+        with self.assertRaisesRegex(release.ReleaseError, "pinned operation"):
+            release.activate(self.store, a, fenced=True, operation="release-B")
+
+    def test_operation_cannot_switch_or_undo_unrelated_current_release(self):
+        a, b = self.prepare(), self.prepare(self.b)
+        c = self.prepare(self.commit("C"))
+        release.activate(self.store, a, fenced=True)
+        release.pin_switch(self.store, "release-B", b)
+        release.activate(self.store, c, fenced=True)
+        with self.assertRaisesRegex(release.ReleaseError, "pinned operation"):
+            release.activate(self.store, b, fenced=True, operation="release-B")
+        with self.assertRaisesRegex(release.ReleaseError, "recorded switch"):
+            release.rollback(self.store, fenced=True, operation="release-B")
+        self.assertEqual(os.readlink(self.store / "current"), c)
+
+    def test_operation_pin_requires_prior_and_rejects_unsafe_receipts(self):
+        a, b = self.prepare(), self.prepare(self.b)
+        with self.assertRaisesRegex(release.ReleaseError, "prior release"):
+            release.pin_switch(self.store, "release-B", b)
+        release.activate(self.store, a, fenced=True)
+        with self.assertRaisesRegex(release.ReleaseError, "invalid switch operation"):
+            release.pin_switch(self.store, "../escape", b)
+        release.pin_switch(self.store, "release-B", b)
+        receipt = self.store / ".operations/release-B.json"
+        receipt.chmod(0o644)
+        with self.assertRaisesRegex(release.ReleaseError, "unsafe switch receipt"):
+            release.activate(self.store, b, fenced=True, operation="release-B")
+        receipt.unlink()
+        receipt.symlink_to(self.store / "switch.json")
+        with self.assertRaises(OSError):
+            release.activate(self.store, b, fenced=True, operation="release-B")
+        self.assertEqual(os.readlink(self.store / "current"), a)
+
     def test_failed_import_keeps_previous_pair_and_cleans_incomplete_build(self):
         a = self.prepare()
         release.activate(self.store, a, fenced=True)

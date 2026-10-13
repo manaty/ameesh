@@ -115,3 +115,22 @@ while keeping the fence. These tests pass through both psycopg and psql.
 The database connection, registry trust, clock and final effect-time authority
 check must be enrolled independently; this read-only adapter does not bridge a
 controller/helper privilege boundary or remove the need for host-side checks.
+
+## Operation-specific code and environment recovery
+
+Before configuration changes, the controller can use
+`environnement-versionne.py --store STORE pin-switch --operation OP --release ID`
+to persist the exact prior and target pair in a private operation receipt.
+The current pair and target must both have completed versioned-release receipts;
+a first installation without a prior release needs a separate bootstrap plan.
+Repeat pinning preserves the prior pair and rejects another target for that id.
+
+Pass the same `--operation OP` to `activate` and `rollback`. Activation permits
+only the pinned prior or target as current; rollback restores the pinned prior
+without consulting the shared legacy `switch.json`. A configuration failure
+before code activation can therefore still recover its prior pair. A third
+release installed in the meantime blocks either switch rather than being undone.
+Lost activation replies reconcile the actual pointer with the operation receipt.
+No pip command runs during rollback. Configuration snapshots, claims and signed
+authority still belong to the enrolled host adapter; `--fenced` remains a caller
+assertion in this utility, not proof of a fence or permission to deploy.
