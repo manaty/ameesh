@@ -469,3 +469,38 @@ Lost activation replies reconcile the actual pointer with the operation receipt.
 No pip command runs during rollback. Configuration snapshots, claims and signed
 authority still belong to the enrolled host adapter; `--fenced` remains a caller
 assertion in this utility, not proof of a fence or permission to deploy.
+
+## Operation-specific configuration file recovery
+
+`configuration-release.py` now prepares the file portion of configuration
+recovery. It has no CLI and is not yet wired into `HostFactory`. Administrator
+enrollment supplies a bounded, distinct destination map under
+`/etc/systemd/system` and `/etc/ameesh`; jobs supply no destination paths.
+User-owned desktop units need a separate enrollment policy. The versioned-release
+build manifest must contain the exact `configuration` inventory of named UTF-8
+contents and modes. Its full digest must match the release identity in the signed
+operation manifest, using the same encoding as `environnement-versionne.py`.
+Changing any target byte therefore invalidates that signed release binding.
+
+The `pin` action saves every prior byte and mode, including absent files, in one
+private durable operation journal before any replacement. Repeat pinning retains
+that original snapshot. Configure and rollback require signed authority and a
+live drained database gate held throughout file publication and journal updates.
+Authority is checked again after slow writes and after acquiring the gate;
+rollback also checks its signed deadline. Writes use private temporary files,
+atomic replacement and directory fsync. Links, hardlinks, unsafe ownership or
+modes, unexpected inventory and oversized files are refused.
+
+Lost publication or removal receipts reconcile the actual target/prior bytes
+without rewriting completed effects. Partial configuration can restore both
+written and untouched files. Rollback restores exact original modes and deletes
+only an operation's newly created files; unrelated content or mode changes hold
+recovery instead of being overwritten. Configure cannot resume after recovery has
+started. Configuration bytes stay in private journals, outside controller results.
+
+These are **file receipts only**, deliberately without the controller's `ok`
+field. The host adapter must still validate syntax, reconcile daemon reloads and
+verify effective units, caps and guard policy before returning a full configure
+or rollback receipt. That adapter and authenticated health/rollback pilot remain
+unfinished. Targeted tests exercise real disposable files with simulated signed
+authority and database gates; no real host configuration or service is changed.
