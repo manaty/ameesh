@@ -204,10 +204,11 @@ local files). The lease is the only authorization to run.
   adds a client delay (the same + 5 s) that abandons the subprocess if the
   server no longer responds at all. Migrations, for their part, lift the timeout for
   the duration of their transaction (`SET LOCAL statement_timeout = 0`) and bound their
-  wait for a table lock (`SET LOCAL lock_timeout = 5 s`; a migration that must wait
-  longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
+  wait for a lock — table or row (`SET LOCAL lock_timeout = 5 s`; a migration that must
+  wait longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
   lock fails in seconds and stays pending, instead of holding every reader and writer
-  of the table behind it.
+  of the table behind it. The same bound applies to a row lock (`select … for update`):
+  a data migration that must wait for another transaction's row sets its own timeout.
 * **Robust heartbeat** — a database outage during a turn does not leave the
   harness running without a lease: the heartbeat counts failures
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
