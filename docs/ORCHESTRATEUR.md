@@ -605,10 +605,17 @@ restée 4 h fusionnée sans être déployée :
    version, `ameesh release check <lot>` refuse une branche dont la base a
    bougé après le gel (le merge-base avec la cible n'est plus le périmètre) et
    l'absence d'une exécution de suite complète (poussée ou lancement manuel)
-   verte sur la tête gelée exacte. Un écart délibéré se justifie par
-   `ameesh release reason <lot> --text "…"` ; le périmètre et la raison vivent
-   au journal du lot. La file de fusion applique la même porte au lot de classe
-   release qu'elle traverse (`merge_queue.readiness`).
+   verte sur la **tête fraîche** exacte : un commit postérieur au gel (correctif
+   cherry-pické) est certifié lui-même, jamais par la CI de l'ancien gel. La
+   suite complète se **déclare** par ses fichiers de workflow dans
+   `radar.projects.<p>.full_suite` (une identité — le fichier —, jamais un nom
+   d'affichage libre) ; chacun doit avoir tourné sur le commit exact, vert
+   **jobs compris** : un job `skipped`/`neutral` ou illisible ne certifie rien,
+   et le dispatch d'un workflow non déclaré (docs seul) ne compte pas. Un écart
+   délibéré se justifie par `ameesh release reason <lot> --text "…"` ; le
+   périmètre et la raison vivent au journal du lot. La file de fusion applique
+   la même porte au lot de classe release qu'elle traverse
+   (`merge_queue.readiness`).
 7. **Essai à blanc avant toute étiquette de release.** Avant de poser une
    étiquette qui publie (application, installeur, image), le workflow de
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes

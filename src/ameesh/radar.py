@@ -59,7 +59,7 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref", "generated", "ci_required", "protected")
+                "lease_ref", "generated", "ci_required", "protected", "full_suite")
 #: #194 r6: where the lease of a target lives on the remote (local mode)
 LEASE_REF_DEFAULT = "refs/ameesh/land/"
 #: #194 r8: the only namespaces a lease ref may live in — never a branch that
@@ -76,6 +76,9 @@ MIGRATION_RE = re.compile(r"^([0-9]{3,4})_[^/]+\.sql$")
 MAX_CACHE = 20000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _GITHUB_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+#: L756 (#566): where GitHub reads workflows — a declared full suite is a file
+#: of this directory, never a display name (which renames).
+WORKFLOW_DIR = ".github/workflows/"
 #: URL `origin` d'un dépôt GitHub (https ou ssh)
 _ORIGIN_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 #: conclusions de check qui ne bloquent pas une PR verte
@@ -128,6 +131,11 @@ class Project:
     path_gates: tuple = ()
     ci_required: bool = False
     protected: tuple = ()
+    #: L756 (#566): the workflow files that make up the project's **full
+    #: suite** (`.github/workflows/…`), declared by path — the file is the
+    #: identity; a display name is free text and renames. A release lot
+    #: certifies its head with a green run of each, jobs included.
+    full_suite: tuple = ()
 
 
 @dataclass
@@ -234,6 +242,23 @@ def parse_settings(raw) -> Settings:
         if not isinstance(protected, (list, tuple)) or not all(
                 isinstance(p, str) and p.strip() for p in protected):
             raise SettingsError("%s.protected: a list of target globs expected" % where)
+        declared_suite = value.get("full_suite") or ()
+        if isinstance(declared_suite, str):
+            declared_suite = (declared_suite,)
+        if not isinstance(declared_suite, (list, tuple)) or not all(
+                isinstance(p, str) and p.strip() for p in declared_suite):
+            raise SettingsError("%s.full_suite: a list of workflow files expected "
+                                "(e.g. .github/workflows/backend-suite.yml)" % where)
+        full_suite = []
+        for path in declared_suite:
+            path = path.strip()
+            if (not path.startswith(WORKFLOW_DIR) or not path.endswith((".yml", ".yaml"))
+                    or any(part in ("", ".", "..") for part in path.split("/"))):
+                raise SettingsError("%s.full_suite: %r is not a %s*.yml workflow file"
+                                    % (where, path, WORKFLOW_DIR))
+            if path in full_suite:
+                raise SettingsError("%s.full_suite: duplicate workflow %s" % (where, path))
+            full_suite.append(path)
         gates = always
         if land != "off" and not (gates or by_path):
             raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
@@ -263,7 +288,8 @@ def parse_settings(raw) -> Settings:
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
                                  ci_required=ci_required,
-                                 protected=tuple(p.strip() for p in protected))
+                                 protected=tuple(p.strip() for p in protected),
+                                 full_suite=tuple(full_suite))
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -848,25 +874,95 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
 FULL_SUITE_EVENTS = ("push", "workflow_dispatch")
 
 
-def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
-    """L756 (#566): une exécution de la suite complète, verte, sur `sha`.
+def _full_suite_ids(gh, slug: str, declared) -> dict:
+    """L756 (#566): les identités (`id` de workflow) de la suite déclarée.
 
-    Lit les exécutions de workflows du commit exact (`gh run list --commit`)
-    et ne garde que celles déclenchées par `FULL_SUITE_EVENTS`, la plus
-    récente par workflow : `{runs, green, pending: [workflows], failed:
-    [workflows]}`. `green` exige au moins une exécution, toutes terminées et
-    passantes. Une lecture impossible lève `plan_github.GithubError`, jamais
-    « pas de suite complète »."""
+    Le dépôt est lu une fois (`repos/<slug>/actions/workflows`) : un chemin
+    déclaré absent, désactivé ou dupliqué lève `GithubError` — jamais « pas de
+    suite ». Un nom d'affichage n'est pas une identité (il se renomme) ; le
+    fichier l'est, résolu ici en identité stable."""
+    from . import plan_github
+    data = plan_github._json(gh, ["api", "repos/%s/actions/workflows?per_page=100" % slug])
+    if (not isinstance(data, dict) or type(data.get("total_count")) is not int
+            or not isinstance(data.get("workflows"), list)
+            or data["total_count"] != len(data["workflows"])
+            or data["total_count"] >= 100):
+        raise plan_github.GithubError("workflows: malformed or truncated response")
+    by_path: dict = {}
+    for workflow in data["workflows"]:
+        if (not isinstance(workflow, dict) or type(workflow.get("id")) is not int
+                or workflow["id"] <= 0 or not isinstance(workflow.get("path"), str)
+                or not workflow["path"]):
+            raise plan_github.GithubError("workflows: invalid workflow identity")
+        by_path[workflow["path"]] = workflow
+    out: dict = {}
+    for path in declared:
+        workflow = by_path.get(path)
+        if workflow is None:
+            raise plan_github.GithubError("workflows: the declared full suite %s is not a "
+                                          "workflow of %s" % (path, slug))
+        if (workflow.get("state") or "") != "active":
+            raise plan_github.GithubError("workflows: the declared full suite %s is %s"
+                                          % (path, workflow.get("state") or "unknown"))
+        out[path] = workflow["id"]
+    return out
+
+
+def _run_jobs(gh, run: dict) -> list:
+    """L756 (#566): les jobs d'une exécution, pour refuser un vert sans tests.
+
+    Rend `[(nom, statut, conclusion)]`. Une lecture impossible, vide ou
+    tronquée lève `GithubError` : un job qu'on ne peut pas lire ne vaut jamais
+    vert."""
+    from . import plan_github
+    run_id = run.get("databaseId")
+    if type(run_id) is not int or run_id <= 0:
+        raise plan_github.GithubError("gh run view: missing or invalid run id")
+    data = plan_github._json(gh, ["run", "view", str(run_id), "--json", "jobs"])
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list) or not data["jobs"]:
+        raise plan_github.GithubError("gh run view: no readable job for run %s" % run_id)
+    if len(data["jobs"]) >= 100:
+        raise plan_github.GithubError("gh run view: result may be truncated; cannot certify "
+                                      "the full suite")
+    out = []
+    for job in data["jobs"]:
+        if (not isinstance(job, dict) or not isinstance(job.get("name"), str)
+                or not job["name"] or not isinstance(job.get("status"), str)):
+            raise plan_github.GithubError("gh run view: invalid job")
+        out.append((job["name"], job["status"], (job.get("conclusion") or "").lower()))
+    return out
+
+
+def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
+    """L756 (#566): une exécution de la suite complète **déclarée** par le
+    projet, verte, sur `sha`, jobs compris.
+
+    La suite complète n'est pas « un workflow quelconque devenu vert » : le
+    projet la déclare par ses fichiers (`radar.projects.<p>.full_suite`),
+    résolus en identités de workflow. Chacune doit avoir, sur le commit exact,
+    une exécution `push` ou `workflow_dispatch` terminée, de conclusion
+    `success`, dont **tous les jobs** sont terminés et verts — un job
+    `skipped`, `neutral` ou illisible ne certifie rien, et une suite déclarée
+    qui n'a pas tourné n'est jamais verte (le plan impacté d'une PR, lui, ne
+    compte jamais). Rend `{runs, suites, green, pending, failed, missing}` ;
+    une lecture impossible lève `plan_github.GithubError`, jamais « pas de
+    suite complète »."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
     if not slug:
         raise plan_github.GithubError("project %s declares no GitHub repository" % project.name)
+    declared = tuple(getattr(project, "full_suite", ()) or ())
+    if not declared:
+        raise plan_github.GithubError("project %s declares no full suite "
+                                      "(radar.projects.%s.full_suite)"
+                                      % (project.name, project.name))
     gh = gh or plan_github.Gh()
+    suites = _full_suite_ids(gh, slug, declared)
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowDatabaseId,workflowName,name,status,conclusion,"
-                                  "event,headSha,createdAt,startedAt,updatedAt"])
+                                  "databaseId,workflowDatabaseId,workflowName,name,status,"
+                                  "conclusion,event,headSha,createdAt,startedAt,updatedAt"])
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
     if len(rows) >= 100:
@@ -882,6 +978,8 @@ def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
         identity = run.get("workflowDatabaseId")
         if type(identity) is not int or identity <= 0:
             raise plan_github.GithubError("gh run list: missing or invalid workflow identity")
+        if identity not in suites.values():
+            continue  # une suite non déclarée ne certifie rien (dispatch docs-only)
         try:
             stamps = [datetime.fromisoformat(run[field].replace("Z", "+00:00"))
                       for field in ("createdAt", "startedAt", "updatedAt")]
@@ -896,16 +994,30 @@ def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
         if identity not in times or at > times[identity]:
             times[identity], latest[identity] = at, run
 
-    def label(identity, run):
-        return run.get("workflowName") or run.get("name") or str(identity)
-
-    pending = sorted(label(n, r) for n, r in latest.items()
-                     if (r.get("status") or "") != "completed")
-    failed = sorted(label(n, r) for n, r in latest.items()
-                    if (r.get("status") or "") == "completed"
-                    and (r.get("conclusion") or "").lower() not in CI_PASSING)
-    return {"runs": len(latest), "green": bool(latest) and not pending and not failed,
-            "pending": pending, "failed": failed}
+    pending: list = []
+    failed: list = []
+    missing: list = []
+    for path, identity in suites.items():
+        run = latest.get(identity)
+        if run is None:
+            missing.append(path)
+            continue
+        name = run.get("workflowName") or run.get("name") or path
+        if (run.get("status") or "") != "completed":
+            pending.append(name)
+            continue
+        if (run.get("conclusion") or "").lower() != "success":
+            failed.append(name)
+            continue
+        for job_name, status, conclusion in _run_jobs(gh, run):
+            if status != "completed":
+                pending.append("%s/%s" % (name, job_name))
+            elif conclusion != "success":
+                failed.append("%s/%s" % (name, job_name))
+    return {"runs": len(latest), "suites": len(suites),
+            "green": bool(latest) and len(latest) == len(suites) and not pending
+            and not failed and not missing,
+            "pending": sorted(pending), "failed": sorted(failed), "missing": sorted(missing)}
 
 
 def gates_for(project, files) -> tuple:
