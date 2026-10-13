@@ -84,6 +84,13 @@ class Canon(interface.Canon):
             "SELECT %s FROM canon_state WHERE host = %%s ORDER BY canon" % self._STATE_COLUMNS,
             (host,))
 
+    def claim_commit(self, host, old, new, canon="") -> bool:
+        rows = self.db.query(
+            "UPDATE canon_state SET last_good_commit = %s, last_good_at = now() "
+            "WHERE host = %s AND canon = %s AND last_good_commit = %s RETURNING host",
+            (new, host, canon or "", old))
+        return bool(rows)
+
     def key_for_root(self, host, root) -> str | None:
         rows = self.db.query(
             "SELECT canon FROM canon_state WHERE host = %s AND root = %s AND canon <> '' "
