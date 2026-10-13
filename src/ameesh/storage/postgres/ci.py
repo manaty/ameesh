@@ -9,14 +9,15 @@ from .. import interface
 
 RUN_COLUMNS = """
     repo, run_id, head_sha, branch, event, base, work_item_id, status, superseded_by, url,
+    run_attempt,
     extract(epoch from first_seen_at)::float8 AS first_seen_ts,
     extract(epoch from concluded_at)::float8 AS concluded_ts,
     urgent_message_id, verdict_message_id
 """
 
 FAILURE_COLUMNS = """
-    repo, run_id, part, test, module, status, inherited, excerpt, replay, duration_s,
-    extract(epoch from failed_at)::float8 AS failed_ts, message_id
+    repo, run_id, run_attempt, part, test, module, status, inherited, excerpt, replay,
+    duration_s, extract(epoch from failed_at)::float8 AS failed_ts, message_id
 """
 
 
@@ -33,18 +34,41 @@ class CiResults(interface.CiResults):
         return rows[0] if rows else None
 
     def open_run(self, repo, run_id, *, head_sha, branch, event, base, work_item_id,
-                 url) -> dict:
+                 url, run_attempt=1) -> dict:
         rows = self.db.query(
             """
-            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id, url)
-            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
+            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id,
+                                 url, run_attempt)
+            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
             ON CONFLICT (repo, run_id) DO UPDATE
                SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id)
             RETURNING %s
             """ % RUN_COLUMNS,
             (repo, int(run_id), head_sha, branch, event or "", base or "main",
-             int(work_item_id) if work_item_id is not None else None, url))
+             int(work_item_id) if work_item_id is not None else None, url,
+             int(run_attempt)))
         return rows[0]
+
+    def reopen_run(self, repo, run_id, *, run_attempt) -> dict | None:
+        # #901 : GitHub dit l'exécution de nouveau `queued`/`in_progress` avec
+        # le même run_id : c'est une relance. La tête a pu bouger depuis (une
+        # relance d'exécution périmée ne doit pas ressusciter une ligne
+        # remplacée) : dans ce cas rien n'est rouvert.
+        rows = self.db.query(
+            """
+            UPDATE ci_runs r
+               SET status = 'running', concluded_at = NULL, superseded_by = NULL,
+                   run_attempt = %%s, urgent_message_id = NULL, verdict_message_id = NULL
+             WHERE r.repo = %%s AND r.run_id = %%s
+               AND r.status <> 'superseded'
+               AND NOT EXISTS (
+                   SELECT 1 FROM ci_runs n
+                    WHERE n.repo = r.repo AND n.branch = r.branch
+                      AND n.run_id > r.run_id AND n.head_sha <> r.head_sha)
+            RETURNING %s
+            """ % RUN_COLUMNS,
+            (int(run_attempt), repo, int(run_id)))
+        return rows[0] if rows else None
 
     def running(self, repo) -> list[dict]:
         return self.db.query(
@@ -78,46 +102,60 @@ class CiResults(interface.CiResults):
                         % column, (int(message_id), repo, int(run_id)))
 
     def failures(self, repo, run_id) -> list[dict]:
+        # l'attempt courant seulement : un échec de l'attempt précédent qui
+        # n'a pas été re-vu à la relance n'est plus imputé à l'exécution (#901)
         return self.db.query(
-            "SELECT %s FROM ci_test_failures WHERE repo = %%s AND run_id = %%s"
+            "SELECT %s FROM ci_test_failures"
+            " WHERE repo = %%s AND run_id = %%s"
+            "   AND run_attempt = (SELECT run_attempt FROM ci_runs"
+            "                       WHERE repo = %%s AND run_id = %%s)"
             " ORDER BY failed_at NULLS LAST, part, test" % FAILURE_COLUMNS,
-            (repo, int(run_id)))
+            (repo, int(run_id), repo, int(run_id)))
 
-    def add_failure(self, repo, run_id, *, part, test, module, status, inherited,
+    def add_failure(self, repo, run_id, *, run_attempt, part, test, module, status, inherited,
                     excerpt, replay, duration_s, failed_at) -> bool:
         rows = self.db.query(
             """
             INSERT INTO ci_test_failures
-                (repo, run_id, part, test, module, status, inherited, excerpt, replay,
-                 duration_s, failed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)
-            ON CONFLICT (repo, run_id, part, test) DO NOTHING
+                (repo, run_id, run_attempt, part, test, module, status, inherited, excerpt,
+                 replay, duration_s, failed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)
+            ON CONFLICT (repo, run_id, part, test) DO UPDATE
+               SET run_attempt = excluded.run_attempt, module = excluded.module,
+                   status = excluded.status, inherited = excluded.inherited,
+                   excerpt = excluded.excerpt, replay = excluded.replay,
+                   duration_s = excluded.duration_s, failed_at = excluded.failed_at,
+                   message_id = NULL, recorded_at = now()
+             WHERE ci_test_failures.run_attempt <> excluded.run_attempt
             RETURNING test
             """,
-            (repo, int(run_id), part or "", test, module or "", status or "echec",
-             bool(inherited), excerpt or "", replay or "", duration_s, failed_at or None))
+            (repo, int(run_id), int(run_attempt), part or "", test, module or "",
+             status or "echec", bool(inherited), excerpt or "", replay or "", duration_s,
+             failed_at or None))
         return bool(rows)
 
-    def set_failure_message(self, repo, run_id, tests, message_id) -> None:
+    def set_failure_message(self, repo, run_id, run_attempt, tests, message_id) -> None:
         if not tests:
             return
         for part, test in tests:
             self.db.execute(
                 "UPDATE ci_test_failures SET message_id = %s"
-                " WHERE repo = %s AND run_id = %s AND part = %s AND test = %s",
-                (int(message_id), repo, int(run_id), part, test))
+                " WHERE repo = %s AND run_id = %s AND run_attempt = %s AND part = %s"
+                " AND test = %s",
+                (int(message_id), repo, int(run_id), int(run_attempt), part, test))
 
     def base_failures(self, repo, branch) -> dict:
         rows = self.db.query(
             """
             WITH last AS (
-                SELECT run_id, head_sha FROM ci_runs
+                SELECT run_id, head_sha, run_attempt FROM ci_runs
                  WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
                  ORDER BY concluded_at DESC, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f
                 ON f.repo = %s AND f.run_id = last.run_id
+               AND f.run_attempt = last.run_attempt
             """, (repo, branch, repo))
         if not rows:
             return {}
