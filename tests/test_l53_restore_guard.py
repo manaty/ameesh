@@ -56,6 +56,62 @@ class RestoreGuardTest(PgTestCase):
         with open(self.destination) as fh:
             self.assertEqual(fh.read(), "live transcript")
 
+    def test_explicit_home_outside_the_key_owners_home_needs_the_flag(self):
+        """L731: --home must not overwrite a foreign home without the flag."""
+        foreign = os.path.join(self.tmp, "other-agent-home")
+        os.makedirs(foreign)
+        self.args.home = foreign
+        destination = os.path.join(foreign, "s1.jsonl")
+        with open(destination, "w") as fh:
+            fh.write("other agent live transcript")
+        with mock.patch.object(sb, "get") as get:
+            with self.assertRaisesRegex(sb.BackupError, "not the home of restore-a"):
+                sb.restore_agent(self.db, self.cfg, self.conf, self.args)
+        get.assert_not_called()
+        with open(destination) as fh:
+            self.assertEqual(fh.read(), "other agent live transcript")
+
+    def test_unprovable_owner_home_is_refused_without_the_flag(self):
+        """L731: any doubt about the owner's home refuses, never guesses."""
+        with mock.patch.object(sb, "_agent_home",
+                               side_effect=sb.BackupError("boom")), \
+                mock.patch.object(sb, "get") as get:
+            with self.assertRaisesRegex(sb.BackupError, "cannot identify the home of restore-a"):
+                sb.restore_agent(self.db, self.cfg, self.conf, self.args)
+        get.assert_not_called()
+
+    def test_explicit_home_of_the_key_owner_is_allowed(self):
+        own = os.path.join(self.tmp, "own-home")
+        os.makedirs(own)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": own}):
+            self.args.home = own
+            restored = sb.restore_agent(self.db, self.cfg, self.conf, self.args)
+        self.assertEqual(restored[2], ["s1.jsonl"])
+        with open(os.path.join(own, "s1.jsonl")) as fh:
+            self.assertEqual(fh.read(), "saved transcript")
+
+    def test_explicit_home_reached_through_a_symlink_is_allowed(self):
+        own = os.path.join(self.tmp, "own-home")
+        os.makedirs(own)
+        link = os.path.join(self.tmp, "own-home-link")
+        os.symlink(own, link)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": own}):
+            self.args.home = link
+            restored = sb.restore_agent(self.db, self.cfg, self.conf, self.args)
+        self.assertEqual(restored[2], ["s1.jsonl"])
+        with open(os.path.join(own, "s1.jsonl")) as fh:
+            self.assertEqual(fh.read(), "saved transcript")
+
+    def test_explicit_home_with_the_flag_still_allowed(self):
+        foreign = os.path.join(self.tmp, "other-agent-home")
+        os.makedirs(foreign)
+        self.args.home = foreign
+        self.args.allow_other_agent = True
+        restored = sb.restore_agent(self.db, self.cfg, self.conf, self.args)
+        self.assertEqual(restored[2], ["s1.jsonl"])
+        with open(os.path.join(foreign, "s1.jsonl")) as fh:
+            self.assertEqual(fh.read(), "saved transcript")
+
     def test_explicit_cross_agent_restore_still_refuses_active_key_owner(self):
         self.args.agent = "restore-b"
         self.args.allow_other_agent = True
@@ -120,6 +176,7 @@ class RestoreGuardTest(PgTestCase):
     def test_expired_idle_agent_can_restore(self):
         self.db.execute("UPDATE agent_registry SET status = 'idle', lease_owner = 'old', "
                         "lease_expires_at = now() - interval '1 second' WHERE name = 'restore-a'")
+        self.args.allow_other_agent = True  # L731: --home is not the agent's own home
         self.assertEqual(sb.restore_agent(self.db, self.cfg, self.conf, self.args)[2], ["s1.jsonl"])
         with open(self.destination) as fh:
             self.assertEqual(fh.read(), "saved transcript")
@@ -127,6 +184,7 @@ class RestoreGuardTest(PgTestCase):
     def test_registry_lock_excludes_runner_claim_until_extraction_completes(self):
         contender = db_mod.connect(self.cfg)
         original = sb.restore
+        self.args.allow_other_agent = True  # L731: --home is not the agent's own home
         def blocked_claim(*args, **kwargs):
             with self.assertRaises(db_mod.DbError):
                 with contender.transaction() as tx:
@@ -155,6 +213,20 @@ class RestoreGuardTest(PgTestCase):
             self.assertEqual(sb.main(["restore", "restore-a", "--key", self.key,
                                       "--home", self.args.home, "--overwrite"]), 1)
         self.assertIn("active agent", err.getvalue())
+        get.assert_not_called()
+
+    def test_cli_explicit_home_outside_the_key_owner_needs_the_flag(self):
+        foreign = os.path.join(self.tmp, "other-agent-home")
+        os.makedirs(foreign)
+        with mock.patch('ameesh.config.load', return_value=types.SimpleNamespace(
+                session_backup={"target": self.conf.target, "encrypt": False})), \
+                mock.patch.object(db_mod, "connect", return_value=self.db), \
+                mock.patch.object(self.db, "close"), \
+                mock.patch.object(sb, "get") as get, \
+                mock.patch('sys.stderr', io.StringIO()) as err:
+            self.assertEqual(sb.main(["restore", "restore-a", "--key", self.key,
+                                      "--home", foreign, "--overwrite"]), 1)
+        self.assertIn("not the home of restore-a", err.getvalue())
         get.assert_not_called()
 
     def test_cli_shared_home_cross_key_never_truncates_running_owner(self):
