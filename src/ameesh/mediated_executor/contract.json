@@ -3174,7 +3174,7 @@
     "natural": true
    },
    "rules": [
-    "L361b : verrou de la ligne, recomptage et expiration de l'index en une seule transaction ; le fichier a déjà été réécrit par l'appelant, sous son propre verrou",
+    "L361b/L361c : verrou de la ligne, census du fichier et écriture de l'index en une seule transaction — expiration (fichier réécrit) comme indexation (entrée écrite, #877) ; le fichier a déjà été écrit par l'appelant, sous son propre verrou",
     "le census de l'hôte (`kept`, `last`, `end`) fait foi : un `counted_until` au-delà de `end` (recomptage plus récent) n'est pas repris",
     "portée H : l'hôte est celui de l'exécuteur ; l'opération ne touche pas aux autres hôtes"
    ],

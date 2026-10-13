@@ -179,8 +179,13 @@ Shared threads keep **one year** of entries by default (0033 §9):
   local housekeeping there, expires through its executor connection (or
   opens one) and, when the index is missing, says so at most once a day (a
   day of the monotonic clock; an error of the notice is logged, the next one
-  still comes). Indexing an entry there works as before L361 (`threads.index`,
-  every entry counted).
+  still comes). Indexing an entry there is the same absolute census (L361c):
+  the host computes the file's census after writing the entry, and
+  `threads.recount` writes it — an entry indexed while an expiry census is in
+  flight is therefore neither counted twice nor erased by a shorter census
+  that lands after it. The mailbox trace (`agent_mailbox.meta`) stays a
+  separate, membership-checked `threads.index` write, with `count` false: the
+  trace quotes the entry without counting it.
 * **R12 outbox**: an undelivered copy older than thread retention is
   deleted by `Log.prune` (its thread entry would expire on arrival);
   younger ones still wait for delivery, past detail retention.
