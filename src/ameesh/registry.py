@@ -348,7 +348,7 @@ def pending_spend_get(db: Db, name: str) -> dict | None:
         "turn": row.get("turn") or "",
         "model": row.get("model"),
         "created_ts": row.get("created_ts"),
-        # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0422)
+        # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
         "work_item_id": row.get("work_item_id"),
         # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
         "turn_id": row.get("turn_id"),

@@ -86,15 +86,15 @@ class TurnCosts(interface.TurnCosts):
             cols.append("cache_write_tokens")
             values.append(int(cache_write_tokens))
         if work_item_id is not None:
-            # #796 (0422) : le lot servi par le tour
+            # #796 (0423) : le lot servi par le tour
             cols.append("work_item_id")
             values.append(int(work_item_id))
         if started_at is not None:
-            # #796 (0422) : début du tour, epoch de l'horloge de la base
+            # #796 (0423) : début du tour, epoch de l'horloge de la base
             cols.append("started_at")
             values.append(float(started_at))
         if turn_id is not None:
-            # #796 (0422) : l'identifiant du tour, pour le relier à ses
+            # #796 (0423) : l'identifiant du tour, pour le relier à ses
             # ressources (`turn_resources.turn_id`)
             cols.append("turn_id")
             values.append(str(turn_id))

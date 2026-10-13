@@ -647,7 +647,7 @@ class MeasurePgTest(PgTestCase):
                              (50.0, 10.0, 40.0, 0.0, 100.0))
             self.assertEqual((m["diff_files"], m["measured_size"], m["declared_size"],
                               m["size_match"], m["merge_sha"]), (2, "m", "s", False, sha))
-            # aucun tour attribué (lot d'avant 0422) : règle des états
+            # aucun tour attribué (lot d'avant 0423) : règle des états
             self.assertEqual(m["agent_source"], "states")
             # measured once: the next pass has nothing to do
             self.assertEqual(lot_measures.measure(self.db, None, repos=[repo], ci=ci), [])

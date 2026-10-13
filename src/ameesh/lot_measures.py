@@ -19,7 +19,7 @@ after the merge, and stores them in `work_item_measures` (migration 0056):
   4. `agent`  — the agent's own work on the lot: the union of the turn spans
      the ledger attributes to it (`turn_costs.work_item_id` + `started_at`,
      #796), clipped to the window and to the priority phases. Only when no
-     turn carries the lot — lots worked before migration 0422 — is it the
+     turn carries the lot — lots worked before migration 0423 — is it the
      rest of the timeline, as before.
 
   With attributed turns the phases no longer add up to the total: an instant
@@ -367,7 +367,7 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
     # the CI runs are read in the repository that holds the merge commit
     runs = ci(repo, cand.get("branch")) if ci and repo else None
     # #796 : les tours que le grand livre attribue au lot ; vide = inconnu
-    # (lots travaillés avant la migration 0422), la chronologie d'états sert
+    # (lots travaillés avant la migration 0423), la chronologie d'états sert
     # alors de mesure.
     spans = [(r["start_ts"], r["end_ts"]) for r in st.turn_spans(item_id)
              if r.get("start_ts") is not None and r.get("end_ts") is not None]
@@ -468,7 +468,7 @@ def describe_phases(v: dict) -> str:
 
     Le temps d'agent porte sa source (#796) : `turns` = union des tours
     attribués au lot, `states` = reste de la chronologie d'états. Sans source
-    connue (mesure d'avant 0422 non renseignée), rien n'est ajouté."""
+    connue (mesure d'avant 0423 non renseignée), rien n'est ajouté."""
     from . import estimates
 
     source = v.get("agent_source")

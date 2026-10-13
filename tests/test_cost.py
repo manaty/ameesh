@@ -788,7 +788,7 @@ class CostDbTest(Sandbox, PgTestCase):
         self.assertEqual((row["work_item_id"], row["turn_id"]), (int(lot["id"]), "tour-1"))
         self.assertAlmostEqual(row["start_ts"], debut, places=3)
         self.assertGreaterEqual(row["end_ts"], row["start_ts"])
-        # sans lot ni début (relais, ligne d'avant 0422) : colonnes laissées NULL
+        # sans lot ni début (relais, ligne d'avant 0423) : colonnes laissées NULL
         book.record("a1", turn="t-2")
         row = self.db.query(
             "select work_item_id, started_at, turn_id from turn_costs"

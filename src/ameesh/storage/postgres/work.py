@@ -1361,7 +1361,7 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def turn_spans(self, item_id) -> list[dict]:
-        """#796 : les tours attribués au lot (grand livre, 0422), dans l'ordre
+        """#796 : les tours attribués au lot (grand livre, 0423), dans l'ordre
         du début. `start_ts` = `turn_resources.started_at` quand le tour y est
         relié (le tour a pris la main), sinon `turn_costs.started_at` (le
         marqueur, posé avant le lancement) — jamais None : un tour sans aucun

@@ -441,7 +441,7 @@ class PendingSpend(Domain):
     def put(self, name: str, start_index: int, turn: str | None, model: str | None,
             work_item_id: int | None = None, turn_id: str | None = None) -> bool:
         """Pose (atomiquement) le marqueur du tour, en remplaçant le précédent.
-        `work_item_id` (#796, migration 0422) : le lot du tour, pour que la
+        `work_item_id` (#796, migration 0423) : le lot du tour, pour que la
         ligne écrite à la réparation — par le même exécuteur ou un autre —
         garde l'attribution ; None = lot inconnu.
         `turn_id` (#796) : l'identifiant du tour (`turn_resources.turn_id`),
@@ -507,7 +507,7 @@ class TurnCosts(Domain):
         0064) : `relay` pour la mesure du relais de modèle, `device` pour la
         déclaration d'un appareil médié (hors plafond) ; None = colonnes non
         écrites (`source` vaut alors `harness`).
-        `work_item_id` et `started_at` (#796, migration 0422) : le lot servi par
+        `work_item_id` et `started_at` (#796, migration 0423) : le lot servi par
         le tour et son instant de début (epoch, horloge de la base) ; None =
         inconnu, colonne non écrite. `turn_id` (#796) : l'identifiant du tour
         (`turn_resources.turn_id`), pour relier la ligne à ses ressources ;
@@ -1099,7 +1099,7 @@ class WorkItems(Domain):
         ligne). `start_ts` = `turn_resources.started_at` quand le tour y est
         relié (le tour a pris la main), sinon `turn_costs.started_at` (le
         marqueur, posé avant le lancement) ; None si aucun des deux n'est connu
-        (ligne d'avant 0422), et le tour est alors omis. Liste vide = aucun tour
+        (ligne d'avant 0423), et le tour est alors omis. Liste vide = aucun tour
         attribué, donc temps d'agent inconnu par les tours."""
 
     @abc.abstractmethod
@@ -2332,7 +2332,7 @@ class Operations(Domain):
         agent, harness, turn, model, session, usd, input_tokens,
         cached_input_tokens, output_tokens, work_item_id, started_ts,
         recorded_ts. `work_item_id` et `started_ts` (#796) valent None pour
-        une ligne d'avant la migration 0422 ou un tour sans lot."""
+        une ligne d'avant la migration 0423 ou un tour sans lot."""
 
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:

@@ -2579,13 +2579,13 @@ class AgentWorker(threading.Thread):
                                 # (fail-closed), jamais un repli sur un état
                                 # local mutable.
                                 model=modele,
-                                # #796 (0422) : le lot du tour et son instant de
+                                # #796 (0423) : le lot du tour et son instant de
                                 # début viennent du marqueur, pas de la mémoire
                                 # de ce worker : la réparation par un autre
                                 # worker écrit la même attribution.
                                 work_item_id=travail.get("work_item_id"),
                                 started_at=travail.get("created_ts"),
-                                # #796 (0422) : l'identifiant du tour, même
+                                # #796 (0423) : l'identifiant du tour, même
                                 # provenance — il relie la ligne à ses
                                 # ressources (`turn_resources`)
                                 turn_id=travail.get("turn_id"))

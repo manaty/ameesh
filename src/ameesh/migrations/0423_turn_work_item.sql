@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0422_turn_work_item — chaque tour dit le lot qu'il a servi et quand il a
+-- 0423_turn_work_item — chaque tour dit le lot qu'il a servi et quand il a
 -- commencé (étude harnais, constat 4 ; lot #796).
 --
 -- Le grand livre savait ce qu'un tour avait coûté, jamais **pour quel lot** :
@@ -32,8 +32,10 @@
 --    (le reste de la chronologie d'états, mesure d'avant, gardée pour les lots
 --    dont aucun tour n'est attribué). NULL : mesure d'avant la colonne.
 --
--- Numéro 0422 réservé par le lot #796 (`ameesh work`), premier libre après
--- 0421.
+-- Numéro 0423 réservé par le lot #796 (`ameesh work`) : 0422 était d'abord
+-- réservé par ce lot, puis laissé au lot #747 (PR #615, écrit sans réservation)
+-- pour ne pas invalider ses deux relectures déjà rendues. Deux fichiers de même
+-- numéro sont refusés par tests/test_l122_numeros_de_migration.py.
 
 alter table turn_costs add column if not exists work_item_id bigint;
 alter table turn_costs add column if not exists started_at timestamptz;

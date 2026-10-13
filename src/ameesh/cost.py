@@ -1231,10 +1231,10 @@ class CostBook:
             account=account, spend_key=key, void_reason=usage.void_reason,
             price_fallback=usage.price_fallback,
             cache_write_tokens=usage.cache_write_tokens,
-            # #796 (0422) : le lot du tour et son début, portés par le marqueur
+            # #796 (0423) : le lot du tour et son début, portés par le marqueur
             work_item_id=None if work_item_id is None else int(work_item_id),
             started_at=None if started_at is None else float(started_at),
-            # #796 (0422) : l'identifiant du tour, pour le relier à ses ressources
+            # #796 (0423) : l'identifiant du tour, pour le relier à ses ressources
             turn_id=turn_id)
         return usage
 
