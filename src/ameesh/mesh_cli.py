@@ -58,7 +58,7 @@ from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
-from . import fil, signing, storage, work
+from . import fil, release, signing, storage, work
 from .config import Config
 from .db import Db
 from .deprecated import HiddenAliasParser
@@ -733,6 +733,11 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh ci status` (L161c) : voir `ameesh.ci.cmd_ci`."""
     from . import ci
     return ci.cmd_ci(cfg, args)
+
+
+def cmd_release(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh release open|check|reason` (L750/L756) : voir `ameesh.release`."""
+    return release.run(cfg, args)
 
 
 def cmd_housekeeping(cfg: Config, args: argparse.Namespace) -> int:
@@ -2216,6 +2221,9 @@ def build_parser() -> argparse.ArgumentParser:
                              help="maximum runs shown (default 5)")
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
     p_ci_status.set_defaults(func=cmd_ci)
+
+    # L750/L756 : le périmètre d'une release et sa porte (`ameesh release`)
+    release.add_parser(sub, cmd_release)
 
     p_models = sub.add_parser("models", help="model catalog (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
