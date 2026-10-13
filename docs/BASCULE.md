@@ -1039,7 +1039,15 @@ The `installer` step follows the same practice.
    A persona in a long turn does not block the others: the script goes back
    over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
-   A unit that does not stay active stops the script.
+   A unit that does not stay active stops the script. So does a runner that
+   held its persona's lease before the restart and does not take it again
+   (#502, `bail.sh`): the lease must be held by the unit's own runner (its
+   `--runner-id`, else host:pid), at an epoch past the one read before, and
+   still valid at the database clock, within 24 tries 5 s apart. A persona
+   without a lease before the restart is not checked: a WARNING names it, and
+   the summary counts it. This is a check at restart, not monitoring: a lease
+   lost after the first good reading is not seen, and a slow runner costs up
+   to about 130 s.
 7. `poste.sh controler`: `ameesh doctor`, `ameesh budget`,
    `ameesh accounts list`, `ameesh projects`, `ameesh alerts`, failed
    units, `doctor` of the old database.
@@ -1061,7 +1069,9 @@ personas run under `ameesh-runner@<p>` (system service, user
    Detached checkout, installation with psycopg. The previous commit is
    recorded in `/opt/ameesh/precedent`.
 3. `vm.sh redemarrer`: refuses as long as 0041 and 0042 are not applied,
-   then restarts each server persona outside a turn, one by one.
+   then restarts each server persona outside a turn, one by one, with the
+   same lease check as `poste.sh redemarrer` (#502), the database clock and
+   the unit's `--runner-id` being read on the server.
 4. `vm.sh controler`: active units, fifteen log lines per persona,
    `ameesh show`, `ameesh doctor` on the server.
 
@@ -1278,6 +1288,38 @@ Rollback of such a separately approved operation requires the database backup.
 in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
 (`pip install <paquet>`), then resume at `migrer`.
+
+## Update to 1.10.0 (path B, mediated executor)
+
+1.10.0 brings path B, the mediated executor (L107 to L115,
+[EXECUTEUR-MEDIEE.md](EXECUTEUR-MEDIEE.md)): a lent device, without database
+access, runs agents by talking to the mesh server through `/api/exec/v1`
+(contract 1.1). Three migrations follow main's 0057 (0058 to 0061 belong to
+other lots):
+
+| Migration | Lot | Content |
+|---|---|---|
+| **0062** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| **0063** `executor_identity` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
+| **0064** `model_relay` | L111 | `turn_costs.source` (`harness` by default), `executor`, `lease_owner`, `lease_epoch` |
+
+**Nothing changes for a classic host.** The tables are new, the `source`
+column has a default, and a 1.9.x executor runs without error on a migrated
+database: the three migrations are additive, so the L151 order below
+applies unchanged (migrate, install, restart). The spending cap ignores rows
+with `source = 'device'`, which no classic host writes. Without a host gate
+configured (`AMEESH_HOST_GATE`), the executor behaves as in 1.9.0.
+
+**Nothing is switched on.** The `ameesh serve --exec-only` server, a
+Postgres role of its own for the server (`ameesh_exec`, to be created), the
+image release key (IMAGE-EXECUTEUR.md §9), the signed image and the
+enrolment of a first device (`ameesh host enroll`) are separate deployment
+steps, each submitted to the owner.
+
+Rollback: the previous code. The database stays migrated; the previous code
+ignores the tables of 0062 and 0063 and the `source` column of 0064 (it then
+also counts `device` rows, which only exist once a device has been
+enrolled).
 
 ---
 

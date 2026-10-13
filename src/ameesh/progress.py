@@ -31,6 +31,18 @@ leases, accounting marker, `turn_costs` ledger) — never by git or the board:
   epics, tasks, milestones and commitments, planned versus actual, today
   line, delays and source of each item; shown by default, `--no-gantt`
   removes it.
+* **versions** (L160f, #497, key `versions`, schema `ameesh-versions/1`):
+  per project and product (one per version-tag stream of its repository),
+  the last published version and its date (GitHub tags and releases) and
+  the next release — its open release lots, its planned date (the plan of
+  the lots, otherwise the p80 of the L157 reference table), its state and
+  its content (the release notes of the release branch, otherwise the lots
+  merged since the last tag grouped by theme, their PR read from the
+  database). GitHub is read **read-only** with the host's token
+  (`GH_TOKEN`/`GITHUB_TOKEN`, `gh` only as a local fallback), cached 5 min
+  and shared by `--serve`; every datum says its source and read time, an
+  unreadable GitHub is said in `versions.missing` and never fails the view.
+  `--no-versions` does not read it at all.
 
 The JSON follows the versioned schema `ameesh-progress/1`
 (`docs/PROGRESS.md`). `--html` writes a self-contained static page (no
@@ -62,6 +74,7 @@ from . import estimates as estimates_mod
 from . import plan as plan_mod
 from . import stagnation
 from . import storage
+from . import versions as versions_mod
 from . import work as work_mod
 
 SCHEMA = "ameesh-progress/1"
@@ -76,6 +89,8 @@ TASK_CHARS = 140
 LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
 AGENT_STATES = ("working", "idle", "paused", "stopped")
+#: `budget.PAUSE_PREFIX` (sans importer budget ici)
+BUDGET_PAUSE_PREFIX = "budget : "
 
 _FR_LOT = {"active": "active", "review": "in review", "blocked": "blocked",
            "approved": "approved", "merged": "merged", "closed": "closed"}
@@ -137,8 +152,8 @@ def parse_since(text: str | None, now: float) -> float:
 # lots
 # --------------------------------------------------------------------------
 
-def _jalons_de_lot(item: dict, events: Iterable[dict], actions: Iterable[dict],
-                   declared: Iterable[dict] | None = None) -> dict:
+def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
+                          declared: Iterable[dict] | None = None) -> dict:
     """Les jalons d'un lot : requested / frozen / verdict / merged.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
@@ -260,14 +275,19 @@ def lot_state(work_state: str, jalons: dict) -> str:
     return "active"
 
 
-def _jalons_declares(st, ids: list[int]) -> dict:
+def _declared_milestones(st, ids: list[int]) -> dict:
     """Les jalons de ces lots dans la table de L10 (`work_item_milestones`),
-    par lot ; `_jalons_de_lot` les préfère à la déduction dès qu'un gel ou un
+    par lot ; `_work_item_milestones` les préfère à la déduction dès qu'un gel ou un
     verdict y est déclaré."""
     out: dict = {}
     for row in st.lot_milestones(ids):
         out.setdefault(int(row["work_item_id"]), []).append(row)
     return out
+
+
+#: L148 (stage 2c): old spellings kept for the callers not yet renamed.
+_jalons_de_lot = _work_item_milestones
+_jalons_declares = _declared_milestones
 
 
 def _round(ts):
@@ -280,9 +300,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
               planned_wait: dict | None = None,
+              dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
               agent_externals: dict[str, str | None] | None = None) -> dict:
-    jalons = _jalons_de_lot(item, events, actions, declared)
+    jalons = _work_item_milestones(item, events, actions, declared)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
@@ -328,6 +349,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "stale": None if planned_wait else
                  stagnation.stale(item.get("state") or "", last, now, stale_after),
         "planned_wait": planned_wait,
+        "dependencies": dependencies or [],
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
         # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
@@ -360,6 +382,11 @@ def build_action(row: dict) -> dict:
 def agent_state(row: dict) -> str:
     """travaille | repos | pause | arrêt, depuis le statut et le bail."""
     status = row.get("status") or ""
+    # L242b (4) : une pause budget se lit « paused », quel que soit le statut
+    # (jamais « stopped » faute de bail pendant la pause)
+    if status not in ("stopped", "dead") \
+            and (row.get("status_text") or "").startswith(BUDGET_PAUSE_PREFIX):
+        return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
     if status == "blocked":
@@ -409,7 +436,8 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "model": row.get("model") or row.get("turn_model") or None,
         "effort": effort,
         "host": row.get("host") or None,
-        "project": row.get("team") or row.get("chantier") or None,
+        "project": (row.get("team") or row.get("workstream")
+                    or row.get("chantier") or None),
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),
@@ -599,17 +627,22 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
 def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
              book: cost_mod.CostBook | None = None, now: float | None = None,
              max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
-             stale_after: float | None = None, gantt: bool = True) -> dict:
+             stale_after: float | None = None, gantt: bool = True,
+             github: "versions_mod.Reader | None" = None) -> dict:
     """L'instantané `ameesh-progress/1` (voir docs/PROGRESS.md).
 
     Les bornes (`max_lots`, `max_actions`) ne limitent que le RENDU : les
     lots ouverts passent avant les fusionnés, et les jalons et l'état d'un
     lot affiché sont lus sans borne (son journal complet, toutes ses
     actions). Toute coupure est dite dans `truncated`.
+
+    `github` (L160f) : le lecteur GitHub des versions, partagé par `--serve`
+    (cache) ; None : les versions ne sont pas lues, la vue le dit.
     """
     now = time.time() if now is None else float(now)
     since_ts = parse_since(since, now)
-    st = storage.of(db).progress
+    store = storage.of(db)
+    st = store.progress
     items = st.lots(since_ts=since_ts, project=project, limit=max_lots)
     items.sort(key=lambda i: (i.get("created_ts") or 0, int(i["id"])))
     ids = [int(i["id"]) for i in items]
@@ -619,19 +652,23 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     by_item: dict = {}
     for row in st.lot_actions(ids):
         by_item.setdefault(int(row["work_item"]), []).append(row)
-    declared = _jalons_declares(st, ids)
+    declared = _declared_milestones(st, ids)
     package_rows = st.packages()
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
     states, externals = stagnation.availability_of(st.agents(None))
     from . import planned_waits
-    holds = planned_waits.read(db, items, now=now, packages=packages)
+    from . import work_dependencies
+    dependencies = work_dependencies.grouped(db, ids)
+    holds = planned_waits.read(db, items, now=now, packages=packages,
+                              dependencies=[e for edges in dependencies.values() for e in edges])
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])), agent_states=states,
                       planned_wait=holds.get(int(item["id"])),
+                      dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
     package_items = st.package_items()
@@ -691,6 +728,15 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         pending = [d for d in pending if d.get("project") == project]
     overview = build_overview(by_project["projects"], lots, plan["milestones"],
                               milestone_projects(package_rows, package_items), pending)
+    # L160f (#497) : les versions des produits et leurs prochaines releases,
+    # lues en lecture seule sur GitHub ; jamais une erreur, un manque est dit
+    try:
+        version_view = versions_mod.collect(store, db, cfg, project=project,
+                                            reader=github, now=now, packages=packages,
+                                            package_items=package_items)
+    except Exception as exc:  # noqa: BLE001 - une vue ne tombe pas pour GitHub
+        version_view = versions_mod.empty(
+            "versions: unreadable (%s)" % " ".join(str(exc).split())[:200])
 
     return {
         "schema": SCHEMA,
@@ -708,6 +754,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         # L304 (champs ajoutés) : une carte par projet, décisions en attente
         "overview": overview,
         "decisions": pending,
+        # L160f (#497) : versions publiées et prochaines releases par produit
+        "versions": version_view,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -775,6 +823,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
             {"generated_ts": now, "projects": snap["projects"]}, width,
             show_inactive=bool(snap.get("project")), indent="  "))
 
+    if snap.get("versions"):
+        # L160f (#497) : dernières versions publiées et prochaines releases
+        out.append("")
+        out.extend(versions_mod.format_lines(snap["versions"], width))
+
     if snap.get("roadmap"):
         # L96 : la feuille de route (Gantt texte), avant le détail des lots
         from . import roadmap as roadmap_mod
@@ -816,6 +869,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
         if extra:
             line(" · ".join(extra), "    ")
+        if lot.get("planned_wait"):
+            from .work_dependencies import wait_label
+            line(wait_label(lot["planned_wait"]), "    ")
         if lot.get("waiting_for"):
             line("waiting for: %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):
@@ -1008,6 +1064,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="window start: duration (16h, 2d) or ISO date (default 24h)")
     parser.add_argument("--no-gantt", action="store_true",
                         help="omit the Gantt roadmap (shown by default, L96)")
+    parser.add_argument("--no-versions", action="store_true",
+                        help="do not read GitHub tags and releases (L160f, #497)")
     parser.add_argument("--stale-after", default=None,
                         help="a lot is stale after this long without activity (default "
                              "AMEESH_STALE_AFTER, else 6h)")
@@ -1034,14 +1092,17 @@ def main(argv: list[str] | None = None) -> int:
                 raise ProgressError("--port out of range: %s" % port)
             return progress_serve.serve(cfg, port=port, since=args.since,
                                         stale_after=threshold, gantt=not args.no_gantt,
-                                        project=args.project)
+                                        project=args.project,
+                                        versions=not args.no_versions)
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db, defer=True)
+            # L160f (#497) : un lecteur GitHub par exécution (cache mémoire)
+            reader = None if args.no_versions else versions_mod.Reader()
             # L61 : lectures regroupées (db.batched) — deux allers-retours
             snap = db_mod.batched(db, lambda db: snapshot(
                 db, cfg, since=args.since, project=args.project, stale_after=threshold,
-                gantt=not args.no_gantt))
+                gantt=not args.no_gantt, github=reader))
         finally:
             db.close()
         if args.html:

@@ -1,0 +1,478 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L232a storage: reservations, lot-boundary fence and journaled CAS steps."""
+import json
+from contextlib import contextmanager
+
+from .. import interface
+from .registry import placement_admitted_sql
+from ... import db as db_mod
+
+COLUMNS = "*, extract(epoch from reserved_until)::float8 AS reserved_until_ts"
+TERMINAL = ("verified", "cancelled")
+
+
+class ControllerLost(db_mod.DbError):
+    """The controller no longer owns its journal epoch and lock backend."""
+
+
+class ControllerDb:
+    """Carry the controller epoch through every nested journal transaction.
+
+    The row lock makes epoch validation and writes atomic. A durable pending
+    effect blocks a successor even if the independent lock connection dies.
+    """
+    def __init__(self, db, operation, epoch, pid):
+        self.db, self.operation, self.epoch, self.pid = db, operation, epoch, pid
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    @contextmanager
+    def transaction(self):
+        with self.db.transaction() as tx:
+            row = tx.query("SELECT evidence FROM host_handoffs WHERE id=%s FOR UPDATE",
+                           (self.operation,))
+            key = "handoff-operation:" + self.operation
+            live = tx.query("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=%s"
+                            " AND locktype='advisory' AND granted AND objsubid=1"
+                            " AND classid=((hashtextextended(%s,0)>>32)&4294967295)::oid"
+                            " AND objid=(hashtextextended(%s,0)&4294967295)::oid) AS live",
+                            (self.pid, key, key))[0]["live"]
+            if not row or row[0]["evidence"].get("controller_epoch") != self.epoch or not live:
+                raise ControllerLost("handoff controller ownership lost")
+            yield ControllerDb(tx, self.operation, self.epoch, self.pid)
+
+
+class Handoffs(interface.Handoffs):
+    @contextmanager
+    def cancellation_guard(self, operation):
+        if not isinstance(self.db, ControllerDb) or self.db.operation != operation:
+            raise ControllerLost("cancellation requires the operation's controller epoch")
+        op = self.get(operation)
+        if not op:
+            raise ControllerLost("unknown cancellation operation")
+        from .hosts import Hosts
+        with Hosts(self.db).gate_guard(op["source"]) as hosts:
+            # Intent is committed separately before the host call. Completion
+            # and fence release commit here, on the backend holding the gate.
+            # Losing that backend rolls back both, even if the original
+            # journal connection survives and loss publication now proceeds.
+            guarded = ControllerDb(hosts.db, operation, self.db.epoch, self.db.pid)
+            yield Handoffs(guarded)
+
+    @contextmanager
+    def controller(self, operation, *, reconcile=False):
+        # Independent lock connection: each journal/fence change must commit
+        # before the next external effect, especially before enabling a turn.
+        lock_db = db_mod.connect(self.db.cfg)
+        try:
+            with lock_db.transaction() as tx:
+                rows = tx.query("SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS acquired",
+                                ("handoff-operation:" + operation,))
+                if not rows[0]["acquired"]:
+                    yield None
+                    return
+                pid = tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
+                with self.db.transaction() as journal:
+                    rows = journal.query(
+                        "UPDATE host_handoffs SET evidence=jsonb_set(evidence,'{controller_epoch}',"
+                        " to_jsonb(coalesce((evidence->>'controller_epoch')::bigint,0)+1))"
+                        " WHERE id=%s AND (%s OR NOT evidence ? 'pending_effect') RETURNING evidence",
+                        (operation, reconcile))
+                if not rows:
+                    # An unknown operation is diagnosed by the caller; an
+                    # unfinished effect requires explicit quiescence proof.
+                    yield None if self.get(operation) else self.db
+                    return
+                yield ControllerDb(self.db, operation, rows[0]["evidence"]["controller_epoch"], pid)
+        except db_mod.DbError:
+            raise ControllerLost("handoff controller lock connection lost") from None
+        finally:
+            lock_db.close()
+
+    def begin_effect(self, operation, expected, effect):
+        if not isinstance(self.db, ControllerDb):
+            raise ControllerLost("host effects require a controller epoch")
+        with self.db.transaction() as tx:
+            pending = {"name": effect, "epoch": self.db.epoch, "state": expected}
+            fields = {"pending_effect": pending}
+            if effect == "restore_source":
+                fields["cancel_requested"] = True
+            rows = tx.query(
+                "UPDATE host_handoffs SET evidence=evidence || %s::jsonb, updated_at=clock_timestamp()"
+                " WHERE id=%s AND state=%s AND NOT evidence ? 'pending_effect'"
+                " AND (%s OR reserved_until > clock_timestamp())"
+                " AND (%s OR NOT coalesce((evidence->>'cancel_requested')::boolean,false)) RETURNING id",
+                (json.dumps(fields), operation, expected, effect in ("restore_source", "revalidate"), effect == "restore_source"))
+            return Handoffs(tx).get(operation) if rows else None
+
+    def finish_effect(self, operation, epoch):
+        with self.db.transaction() as tx:
+            rows = tx.query("UPDATE host_handoffs SET evidence=evidence-'pending_effect'-'reconcile_epoch'"
+                            " WHERE id=%s AND (evidence->'pending_effect'->>'epoch')::bigint=%s RETURNING id",
+                            (operation, epoch))
+            if not rows:
+                raise ControllerLost("host effect intent changed")
+            return Handoffs(tx).get(operation)
+
+    def prepare_reconcile(self, operation, epoch):
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE host_handoffs SET evidence=evidence || %s::jsonb"
+                " WHERE id=%s AND (evidence->'pending_effect'->>'epoch')::bigint=%s RETURNING id",
+                (json.dumps({"reconcile_epoch": self.db.epoch}), operation, epoch))
+            if not rows:
+                raise ControllerLost("host effect intent changed before reconciliation")
+            return Handoffs(tx).get(operation)
+
+    def get(self, operation):
+        rows = self.db.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE id = %s", (operation,))
+        return rows[0] if rows else None
+
+    def active(self, agent):
+        rows = self.db.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE agent = %s"
+                             " AND state NOT IN ('verified','cancelled')", (agent,))
+        return rows[0] if rows else None
+
+    def occupancy(self, host):
+        return self.db.query("SELECT count(*)::int AS n FROM agent_registry WHERE host=%s"
+                             " AND mode='execute' AND status <> 'stopped'", (host,))[0]["n"]
+
+    def cooling(self, agent, seconds):
+        return bool(self.db.query("SELECT id FROM host_handoffs WHERE agent=%s AND state='verified'"
+                                  " AND updated_at > clock_timestamp()-make_interval(secs=>%s) LIMIT 1",
+                                  (agent, seconds)))
+
+    def hold(self, operation, expected):
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != expected:
+                return None
+            tx.query("SELECT name FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            op = tx.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE id=%s FOR UPDATE",
+                          (operation,))[0]
+            if op["state"] != expected:
+                return None
+            if expected not in ("planned", "prepared"):
+                tx.execute("UPDATE agent_registry SET handoff_fenced=true,updated_at=now() WHERE name=%s",
+                           (op["agent"],))
+                tx.execute("UPDATE host_handoffs SET fenced=true WHERE id=%s AND state=%s",
+                           (operation, expected))
+            return Handoffs(tx).transition(operation, expected, "held", evidence={"held_at": expected},
+                                           detail="prerequisite failed; operation held")
+
+    def events(self, operation):
+        return self.db.query("SELECT state, detail FROM host_handoff_events WHERE operation = %s"
+                             " ORDER BY id", (operation,))
+
+    def _event(self, operation, state, detail):
+        self.db.execute("INSERT INTO host_handoff_events(operation,state,detail) VALUES (%s,%s,%s)",
+                        (operation, state, detail))
+
+    def reserve(self, operation, plan, *, ttl):
+        with self.db.transaction() as tx:
+            loss = plan.get("reason") == "host_loss"
+            if loss:
+                from .hosts import Hosts
+                Hosts._lock_gate(tx, plan["source"])
+            # Physical host lock, shared by all canons and competing planners.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ("handoff-host:" + plan["target"],))
+            rows = tx.query("SELECT name, host, admitted_hosts, lease_owner, lease_epoch,"
+                            " status, mode, canon, (lease_expires_at > clock_timestamp()) AS live"
+                            " FROM agent_registry WHERE name = %s FOR UPDATE",
+                            (plan["agent"],))
+            if not rows:
+                return None
+            agent = rows[0]
+            api = Handoffs(tx)
+            if api.active(plan["agent"]):
+                return api.active(plan["agent"])
+            if plan.get("reason") in ("host_drain", "host_return", "host_loss"):
+                mode = {"host_drain": "draining", "host_return": "returning", "host_loss": "lost"}[plan["reason"]]
+                controls = tx.query("SELECT c.host FROM host_lifecycle c "
+                                    "JOIN host_lifecycle_agents a ON a.host=c.host AND a.generation=c.generation "
+                                    "WHERE c.host=%s AND c.generation=%s AND c.mode=%s AND a.agent=%s",
+                                    (plan.get("lifecycle_host"), plan.get("lifecycle_generation"), mode, plan["agent"]))
+                direction = plan["target"] if mode == "returning" else plan["source"]
+                if not controls or direction != plan.get("lifecycle_host"):
+                    return None
+            if (bool(agent["live"]) == loss or (agent["canon"] or "") != plan["canon"]
+                    or agent["host"] != plan["source"] or plan["target"] not in (agent["admitted_hosts"] or [])
+                    or agent["status"] == "stopped" or agent["mode"] != "execute"
+                    or agent["lease_owner"] != plan["owner"] or agent["lease_epoch"] != plan["epoch"]):
+                return None
+            if loss:
+                origins = tx.query("SELECT critical FROM host_lifecycle_agents "
+                                   "WHERE host=%s AND generation=%s AND agent=%s",
+                                   (plan["source"], plan["lifecycle_generation"], plan["agent"]))
+                threshold = 180 if origins[0]["critical"] else 900
+                if plan.get("loss_after") != threshold or not tx.query(
+                    "SELECT host FROM host_resources WHERE host=%s GROUP BY host "
+                    "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s)",
+                    (plan["source"], threshold)):
+                    return None
+            states = tx.query("SELECT host FROM canon_state WHERE host IN (%s,%s) AND canon=%s"
+                              " AND status='ok' AND last_good_commit=%s",
+                              (plan["source"], plan["target"], plan["canon"], plan["canon_revision"]))
+            if {r["host"] for r in states} != {plan["source"], plan["target"]}:
+                return None
+            reading = tx.query("SELECT extract(epoch from sampled_at)::float8 AS sampled_ts"
+                               " FROM host_resources WHERE host=%s AND sampled_at <= clock_timestamp()"
+                               " AND sampled_at > clock_timestamp()-interval '60 seconds'"
+                               " ORDER BY sampled_at DESC,id DESC LIMIT 1", (plan["target"],))
+            if not reading or reading[0]["sampled_ts"] != plan["sampled_ts"]:
+                return None
+            used = tx.query("SELECT count(*)::int AS slots, coalesce(sum(memory_bytes),0)::bigint AS memory,"
+                            " coalesce(sum(disk_bytes),0)::bigint AS disk FROM host_handoffs"
+                            " WHERE target = %s AND state NOT IN ('verified','cancelled')",
+                            (plan["target"],))[0]
+            occupants = tx.query("SELECT count(*)::int AS n FROM agent_registry WHERE host = %s"
+                                 " AND mode = 'execute' AND status <> 'stopped'", (plan["target"],))[0]["n"]
+            if (occupants + used["slots"] >= plan["max_agents"]
+                    or used["memory"] + plan["memory_bytes"] > plan["available_memory"]
+                    or used["disk"] + plan["disk_bytes"] > plan["available_disk"]):
+                return None
+            tx.execute("INSERT INTO host_handoffs(id,agent,source,target,plan,memory_bytes,disk_bytes,"
+                       " reserved_until) VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,"
+                       " clock_timestamp()+make_interval(secs=>%s))",
+                       (operation, plan["agent"], plan["source"], plan["target"], json.dumps(plan),
+                        plan["memory_bytes"], plan["disk_bytes"], ttl))
+            api._event(operation, "planned", "destination capacity reserved")
+            if loss:
+                tx.execute("UPDATE agent_registry SET handoff_fenced=true,updated_at=now() WHERE name=%s",
+                           (plan["agent"],))
+                tx.execute("UPDATE host_handoffs SET fenced=true WHERE id=%s", (operation,))
+            return api.get(operation)
+
+    def promote_loss(self, operation):
+        if not isinstance(self.db, ControllerDb):
+            raise ControllerLost("loss conversion requires a controller epoch")
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["plan"].get("reason") == "host_loss" or op["state"] in TERMINAL:
+                return op
+            checkpoint = op["evidence"].get("held_at") if op["state"] == "held" else op["state"]
+            if checkpoint in ("switched", "activated", "verified"):
+                return op
+            if op["evidence"].get("pending_effect"):
+                return None
+            from .hosts import Hosts
+            Hosts._lock_gate(tx, op["source"])
+            controls = tx.query("SELECT host,generation FROM host_lifecycle WHERE host=%s AND mode='lost'",
+                                (op["source"],))
+            if not controls:
+                return op
+            rows = tx.query("SELECT *, (lease_expires_at>clock_timestamp()) AS live "
+                            "FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            if not rows:
+                return None
+            agent, plan = rows[0], op["plan"]
+            if (agent["live"] or agent["host"] != op["source"] or agent["mode"] != "execute"
+                    or agent["status"] in ("paused", "stopped") or agent["harness"] != plan["harness"]
+                    or (agent["canon"] or "") != plan["canon"] or (agent["cwd"] or "") != plan["source_cwd"]
+                    or op["target"] not in (agent["admitted_hosts"] or [])):
+                return None
+            prepared = "prepared" if op["evidence"].get("release_revision") else "planned"
+            fields = {"reason": "host_loss", "lifecycle_host": op["source"],
+                      "lifecycle_generation": controls[0]["generation"],
+                      "owner": agent["lease_owner"], "epoch": agent["lease_epoch"],
+                      "previous_reason": plan["reason"]}
+            evidence = dict(op["evidence"])
+            for key in ("branch", "commit", "repository", "cwd", "session_mode", "source_recovered", "cancel_requested", "held_at"):
+                evidence.pop(key, None)
+            if op["state"] == "held":
+                evidence["held_at"] = prepared
+            state = "held" if op["state"] == "held" else prepared
+            tx.execute("UPDATE agent_registry SET handoff_fenced=true,updated_at=now() WHERE name=%s", (op["agent"],))
+            tx.execute("UPDATE host_handoffs SET plan=plan || %s::jsonb,evidence=%s::jsonb, "
+                       "state=%s,fenced=true,updated_at=clock_timestamp() WHERE id=%s",
+                       (json.dumps(fields), json.dumps(evidence), state, operation))
+            Handoffs(tx)._event(operation, state, "source lost; reservation retained for scoped recovery")
+            return Handoffs(tx).get(operation)
+
+    def recover_source(self, operation, *, proof):
+        if not isinstance(self.db, ControllerDb):
+            raise ControllerLost("source recovery requires a controller epoch")
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != "prepared" or op["plan"].get("reason") != "host_loss":
+                return None
+            from .hosts import Hosts
+            Hosts._lock_gate(tx, op["source"])
+            rows = tx.query("SELECT *, (lease_expires_at>clock_timestamp()) AS live "
+                            "FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            if not rows:
+                return None
+            agent, plan = rows[0], op["plan"]
+            controls = tx.query("SELECT host FROM host_lifecycle WHERE host=%s "
+                                "AND generation=%s AND mode='lost'",
+                                (op["source"], plan["lifecycle_generation"]))
+            if (not controls or agent["live"] or not agent["handoff_fenced"]
+                    or agent["host"] != op["source"] or agent["lease_epoch"] != plan["epoch"]
+                    or agent["lease_owner"] != plan["owner"] or agent["mode"] != "execute"
+                    or agent["status"] in ("paused", "stopped")
+                    or proof.get("source_recovered") is not True):
+                return None
+            if not tx.query("SELECT id FROM host_handoffs WHERE id=%s AND state='prepared' "
+                            "AND reserved_until>clock_timestamp() FOR UPDATE", (operation,)):
+                return None
+            updated = Handoffs(tx).transition(operation, "prepared", "published", evidence=proof,
+                                             detail="lost source quiesced; published checkpoint verified")
+            if not updated:
+                return None
+            # Revoke all source writes before changing placement. Physical
+            # quiescence is independently proved by the enrolled helper.
+            tx.execute("UPDATE agent_registry SET lease_epoch=lease_epoch+1,lease_owner=NULL, "
+                       "lease_expires_at=NULL,status='queued',updated_at=now() WHERE name=%s",
+                       (op["agent"],))
+            return updated
+
+    def renew(self, operation, *, ttl):
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != "held":
+                return None
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ("handoff-host:" + op["target"],))
+            agent = tx.query("SELECT * FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))[0]
+            destination = op["evidence"].get("held_at") in ("switched", "activated")
+            if (agent["host"] != (op["target"] if destination else op["source"])
+                    or (agent["canon"] or "") != op["plan"]["canon"]
+                    or agent["harness"] != op["plan"]["harness"] or agent["mode"] != "execute"
+                    or agent["status"] == "stopped" or op["target"] not in (agent["admitted_hosts"] or [])):
+                return None
+            fresh = tx.query("SELECT host FROM host_resources WHERE host=%s"
+                             " AND sampled_at <= clock_timestamp()"
+                             " AND sampled_at > clock_timestamp()-interval '60 seconds' LIMIT 1", (op["target"],))
+            states = tx.query("SELECT host FROM canon_state WHERE host IN (%s,%s) AND canon=%s"
+                              " AND status='ok' AND last_good_commit=%s",
+                              (op["source"],op["target"],op["plan"]["canon"],op["plan"]["canon_revision"]))
+            if not fresh or {r["host"] for r in states} != {op["source"],op["target"]}:
+                return None
+            row = tx.query("UPDATE host_handoffs SET reserved_until=clock_timestamp()+make_interval(secs=>%s),"
+                           " updated_at=clock_timestamp() WHERE id=%s AND state='held' RETURNING id",
+                           (ttl,operation))
+            if not row:
+                return None
+            Handoffs(tx)._event(operation, "held", "reservation renewed after explicit host reconciliation")
+            return Handoffs(tx).get(operation)
+
+    def transition(self, operation, expected, state, *, evidence=None, detail=""):
+        with self.db.transaction() as tx:
+            rows = tx.query("UPDATE host_handoffs SET state = %s, evidence=evidence || %s::jsonb,"
+                            " updated_at=clock_timestamp() WHERE id=%s AND state=%s RETURNING id",
+                            (state, json.dumps(evidence or {}), operation, expected))
+            if not rows:
+                return None
+            api = Handoffs(tx)
+            api._event(operation, state, detail)
+            return api.get(operation)
+
+    def drain(self, operation):
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != "prepared":
+                return None
+            plan = op["plan"]
+            agent = tx.query("SELECT *, (lease_expires_at > clock_timestamp()) AS live"
+                             " FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))[0]
+            op = tx.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE id=%s FOR UPDATE",
+                          (operation,))[0]
+            if op["state"] != "prepared":
+                return None
+            if (not agent["live"] or agent["host"] != op["source"]
+                    or agent["status"] in ("running", "stopped", "paused")
+                    or agent["lease_owner"] != plan["owner"] or agent["lease_epoch"] != plan["epoch"]):
+                return None
+            active_lot = tx.query("SELECT id FROM work_items WHERE assignee=%s"
+                                  " AND state NOT IN ('intake','merged','promoted','closed') LIMIT 1",
+                                  (op["agent"],))
+            if active_lot and plan.get("reason") not in ("host_drain", "host_return"):
+                return None
+            rows = tx.query("UPDATE host_handoffs SET state='drained', fenced=true,"
+                            " updated_at=clock_timestamp() WHERE id=%s AND state='prepared'"
+                            " AND reserved_until > clock_timestamp() RETURNING id", (operation,))
+            if not rows:
+                return None
+            tx.execute("UPDATE agent_registry SET handoff_fenced=true,updated_at=now() WHERE name=%s",
+                       (op["agent"],))
+            Handoffs(tx)._event(operation, "drained", "lot boundary fenced; source cannot start a turn")
+            return Handoffs(tx).get(operation)
+
+    def switch(self, operation, *, cwd, brief):
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != "session_ready" or not op["fenced"]:
+                return None
+            plan = op["plan"]
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ("handoff-host:" + op["target"],))
+            rows = tx.query("SELECT * FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            if not rows:
+                return None
+            agent = rows[0]
+            if ((agent["canon"] or "") != plan["canon"] or agent["mode"] != "execute"
+                    or agent["harness"] != plan["harness"] or (agent["cwd"] or "") != plan["source_cwd"]
+                    or agent["host"] != op["source"] or agent["status"] in ("running", "stopped", "paused")
+                    or agent["lease_epoch"] not in (plan["epoch"], plan["epoch"]+1)
+                    or agent["lease_owner"] not in (None, plan["owner"])
+                    or op["target"] not in (agent["admitted_hosts"] or [])):
+                return None
+            fresh = tx.query("SELECT id FROM host_handoffs WHERE id=%s"
+                             " AND reserved_until > clock_timestamp() FOR UPDATE", (operation,))
+            if not fresh:
+                return None
+            locked = Handoffs(tx).get(operation)
+            if locked["state"] != "session_ready" or not locked["fenced"]:
+                return None
+            states = tx.query("SELECT host FROM canon_state WHERE host IN (%s,%s) AND canon=%s"
+                              " AND status='ok' AND last_good_commit=%s",
+                              (op["source"],op["target"],plan["canon"],plan["canon_revision"]))
+            if {r["host"] for r in states} != {op["source"],op["target"]}:
+                return None
+            tx.execute("UPDATE agent_registry SET host=%s,cwd=%s,lease_owner=NULL,lease_expires_at=NULL,"
+                       " lease_epoch=lease_epoch+1,session_id=NULL,session_account=NULL,session_work_item=NULL,"
+                       " session_reset_at=clock_timestamp(),placement_ok=NULL,placement_profile=NULL,"
+                       " pending_prompt=concat_ws(E'\\n\\n',%s::text,pending_prompt),"
+                       " status='queued',status_text='host handoff',updated_at=now() WHERE name=%s",
+                       (op["target"], cwd, brief, op["agent"]))
+            return Handoffs(tx).transition(operation, "session_ready", "switched",
+                                           detail="source lease fenced; placement and session switched")
+
+    def unfence(self, operation, expected, state):
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != expected:
+                return None
+            tx.query("SELECT name FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            op = tx.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE id=%s FOR UPDATE",
+                          (operation,))[0]
+            if op["state"] != expected:
+                return None
+            if state in ("activated", "verified"):
+                if not tx.query("SELECT id FROM host_handoffs WHERE id=%s"
+                                " AND reserved_until > clock_timestamp()", (operation,)):
+                    return None
+                allowed = tx.query("SELECT name FROM agent_registry r WHERE name=%s AND host=%s"
+                                   " AND mode='execute' AND status NOT IN ('paused','stopped')"
+                                   " AND coalesce(canon,'')=%s AND harness=%s AND cwd=%s"
+                                   " AND %s=ANY(admitted_hosts) AND " + placement_admitted_sql("r")
+                                   + " AND EXISTS (SELECT 1 FROM canon_state s"
+                                   " WHERE s.host=r.host AND s.canon=coalesce(r.canon,'') AND s.status='ok'"
+                                   " AND s.last_good_commit=%s)",
+                                   (op["agent"],op["target"],op["plan"]["canon"],op["plan"]["harness"],op["evidence"].get("cwd"),
+                                    op["target"],op["plan"]["canon_revision"]))
+                if not allowed:
+                    return None
+            if state == "cancelled":
+                agent = tx.query("SELECT host,lease_owner,lease_epoch FROM agent_registry WHERE name=%s",
+                                 (op["agent"],))[0]
+                if (agent["host"] != op["source"]
+                        or agent["lease_owner"] not in (None, op["plan"]["owner"])
+                        or agent["lease_epoch"] not in (op["plan"]["epoch"], op["plan"]["epoch"]+1)):
+                    return None
+            tx.execute("UPDATE agent_registry SET handoff_fenced=false,updated_at=now() WHERE name=%s",
+                       (op["agent"],))
+            tx.execute("UPDATE host_handoffs SET fenced=false WHERE id=%s", (operation,))
+            return Handoffs(tx).transition(operation, expected, state, detail="claim fence released")

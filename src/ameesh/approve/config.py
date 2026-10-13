@@ -44,13 +44,11 @@ import ipaddress
 import json
 import os
 import re
-import secrets
 import socket
-import stat
 from dataclasses import dataclass, fields, replace
 from urllib.parse import urlsplit
 
-from .. import receipts
+from .. import httpkit, receipts
 
 DEFAULT_CONFIG = "~/.config/ameesh-approve/config.json"
 DEFAULT_STATE = "~/.local/state/ameesh-approve"
@@ -62,8 +60,8 @@ MAX_REQUEST_TTL = 900
 MIN_REQUEST_TTL = 60
 MIN_LINK_TTL = 30
 MAX_ENROLL_TTL = 86400
-MIN_TOKEN_LENGTH = 32
-MAX_TOKEN_FILE = 4096
+MIN_TOKEN_LENGTH = httpkit.MIN_TOKEN_LENGTH
+MAX_TOKEN_FILE = httpkit.MAX_TOKEN_FILE
 
 #: profils de validation (lot L27)
 PROFILE_STRICT = "strict"
@@ -76,7 +74,6 @@ BUILTIN_RESERVED_HOSTS = ("ameesh.nexlink.ph",)
 
 _RP_ID_RE = re.compile(
     r"^(localhost|[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)$")
-_TOKEN_RE = re.compile(r"^[\x21-\x7e]+$")
 _LOCAL_DEV_HOSTS = ("localhost",)
 
 
@@ -121,12 +118,7 @@ def parse_origin(origin: str) -> tuple[str, str, str]:
 
 
 def is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+    return httpkit.is_loopback(host)
 
 
 @dataclass(frozen=True)
@@ -425,70 +417,20 @@ def load(env: dict | None = None, *, path: str | None = None,
 # --------------------------------------------------------------------------
 
 def _check_private(st: os.stat_result, what: str, path: str) -> None:
-    if st.st_uid != os.geteuid():
-        raise ApproveConfigError("%s %s: not owned by the service user" % (what, path))
-    if stat.S_IMODE(st.st_mode) & 0o077:
-        raise ApproveConfigError(
-            "%s %s: permissions too open (%04o); chmod %s"
-            % (what, path, stat.S_IMODE(st.st_mode), "700" if stat.S_ISDIR(st.st_mode) else "600"))
+    httpkit.check_private(st, what, path, error=ApproveConfigError)
 
 
 def ensure_private_dir(path: str) -> str:
     """Crée (0700) ou contrôle un dossier privé : ni lien, ni ouvert aux autres."""
-    path = _expand(path)
-    if not os.path.lexists(path):
-        os.makedirs(path, mode=0o700, exist_ok=True)
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise ApproveConfigError("directory %s: real directory expected (not a link)" % path)
-    _check_private(st, "directory", path)
-    return path
+    return httpkit.ensure_private_dir(path, error=ApproveConfigError)
 
 
 def read_service_token(path: str) -> str:
     """Lit le jeton de service ; refuse un fichier lisible par d'autres."""
-    path = _expand(path)
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError as exc:
-        raise ApproveConfigError("service token not found: %s "
-                                 "(ameesh-approve gen-token)" % path) from exc
-    except OSError as exc:
-        raise ApproveConfigError("unreadable service token %s: %s" % (path, exc)) from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise ApproveConfigError("service token %s: regular file expected" % path)
-        _check_private(st, "service token", path)
-        if st.st_size > MAX_TOKEN_FILE:
-            raise ApproveConfigError("service token %s: file too large" % path)
-        raw = os.read(fd, MAX_TOKEN_FILE + 1)
-    finally:
-        os.close(fd)
-    try:
-        token = raw.decode("ascii").strip()
-    except UnicodeDecodeError as exc:
-        raise ApproveConfigError("service token %s: ASCII expected" % path) from exc
-    if len(token) < MIN_TOKEN_LENGTH or not _TOKEN_RE.fullmatch(token):
-        raise ApproveConfigError("service token %s: at least %d printable characters, "
-                                 "no spaces" % (path, MIN_TOKEN_LENGTH))
-    return token
+    return httpkit.read_token_file(path, what="service token",
+                                   hint="ameesh-approve gen-token", error=ApproveConfigError)
 
 
 def write_service_token(path: str) -> str:
     """Crée un jeton de service neuf (256 bits) en 0600 ; refuse d'écraser."""
-    path = _expand(path)
-    parent = os.path.dirname(path)
-    if not os.path.isdir(parent):
-        os.makedirs(parent, mode=0o700, exist_ok=True)
-    token = secrets.token_urlsafe(32)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError as exc:
-        raise ApproveConfigError("%s already exists: a token is never overwritten" % path) from exc
-    try:
-        os.write(fd, (token + "\n").encode("ascii"))
-    finally:
-        os.close(fd)
-    return path
+    return httpkit.write_token_file(path, error=ApproveConfigError)

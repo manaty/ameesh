@@ -69,10 +69,11 @@ def send(
     « all » regroupé en une entrée, import déjà écrit). `after_commit` (une
     liste) : l'écriture du fil y est ajoutée, à appeler par l'appelant après
     le commit de sa transaction — un envoi annulé n'en laisse aucune trace
-    dans le fil externe. Projet du fil : celui
-    de l'expéditeur, sinon du destinataire — son équipe (`team`) s'il est
-    gouverné par le canon, sinon son chantier —, sinon AMEESH_PROJECT, sinon
-    `default` ; lot : `work_item_id`.
+    dans le fil externe. Projet du fil : celui du lot (`work_items.app`, L118c)
+    quand le message est lié à un lot, sinon celui de l'expéditeur, sinon du
+    destinataire — son équipe (`team`) s'il est gouverné par le canon, sinon
+    son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
+    `work_item_id`.
     """
     fil.ensure_readable(body, allow_structured)
     row = storage.of(db).mailbox.send(
@@ -93,7 +94,8 @@ def send(
             fil.record(
                 cfg, target, sender=sender, recipients=[recipient], text=body,
                 ts=row.get("created_ts"),
-                project=fil.project_for(cfg, row.get("sender_project"),
+                project=fil.project_for(cfg, fil.lot_project(target, work_item_id),
+                                        row.get("sender_project"),
                                         row.get("recipient_project")),
                 lot=work_item_id, mailbox_ids=[message_id], meta=meta)
         if after_commit is not None:
@@ -113,8 +115,17 @@ def unread(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
 
 
 def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
-    """L125 : les non-lus qui ouvriront un tour (hors courrier passif)."""
-    return storage.of(db).mailbox.unread_active(recipient, limit)
+    """L125 : les non-lus qui ouvriront un tour (hors courrier passif).
+
+    Path B: `mailbox.unread_active` is not in contract 1.1, so a mediated
+    executor reads `mailbox.unread` (admitted) and drops passive mail here,
+    with the same rule as the SQL (`passive_reason`). Only the first
+    `UNREAD_LIMIT` unread messages are looked at there."""
+    st = storage.of(db)
+    if getattr(st, "driver", None) == "mediated":
+        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
+        return [row for row in rows if not passive_reason(row)][:int(limit)]
+    return st.mailbox.unread_active(recipient, limit)
 
 
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:

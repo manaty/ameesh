@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -57,7 +58,18 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "target", "github")
+PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
+                "lease_ref")
+#: #194 r6: where the lease of a target lives on the remote (local mode)
+LEASE_REF_DEFAULT = "refs/ameesh/land/"
+#: #194 r8: the only namespaces a lease ref may live in — never a branch that
+#: ameesh lands on
+LEASE_NAMESPACES = ("refs/ameesh/", "refs/heads/ameesh-land/")
+#: L160e2: who merges the head of the queue — nobody (`off`: the agent or the
+#: orchestrator), ameesh by a local merge pushed to the target, or ameesh
+#: through the PR (target merged into the lot branch, CI, PR merged by the API)
+LAND_MODES = ("off", "local", "pr")
+MERGE_METHODS = ("merge", "squash", "rebase")
 #: une migration numérotée : `NNNN_nom.sql`
 MIGRATION_RE = re.compile(r"^([0-9]{4})_[^/]+$")
 #: paires gardées au plus dans le cache d'un exécuteur
@@ -81,6 +93,15 @@ class Project:
     migrations: str = ""
     target: str = ""
     github: str = ""
+    #: L160e2: `off` (default), `local` or `pr`; the commands run on the merged
+    #: tree before it is pushed; how a PR is merged
+    land: str = "off"
+    gates: tuple = ()
+    merge_method: str = "merge"
+    #: #194 r6: prefix of the remote lease ref (`refs/ameesh/land/` by default;
+    #: a branch prefix such as `ameesh-land/` when the remote refuses custom
+    #: namespaces) — the lease of target T is `<prefix>T`
+    lease_ref: str = LEASE_REF_DEFAULT
 
 
 @dataclass
@@ -129,10 +150,69 @@ def parse_settings(raw) -> Settings:
             plan_git.check_ref(texts["target"], "cible")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
+        land = value.get("land") or "off"
+        if land not in LAND_MODES:
+            raise SettingsError("%s.land: %s expected" % (where, " | ".join(LAND_MODES)))
+        method = value.get("merge_method") or "merge"
+        if method not in MERGE_METHODS:
+            raise SettingsError("%s.merge_method: %s expected"
+                                % (where, " | ".join(MERGE_METHODS)))
+        gates = value.get("gates") or ()
+        if isinstance(gates, str):
+            gates = (gates,)
+        if not isinstance(gates, (list, tuple)) or not all(
+                isinstance(g, str) and g.strip() for g in gates):
+            raise SettingsError("%s.gates: a list of commands expected" % where)
+        if land != "off" and not gates:
+            raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
+                                "its gates, run on the merged tree" % (where, land))
+        lease_ref = value.get("lease_ref") or LEASE_REF_DEFAULT
+        if not isinstance(lease_ref, str) or not lease_ref.strip().endswith("/"):
+            raise SettingsError("%s.lease_ref: a ref prefix ending with / expected "
+                                "(refs/ameesh/land/, or a branch prefix such as ameesh-land/)"
+                                % where)
+        lease_ref = lease_ref.strip()
+        if not lease_ref.startswith("refs/"):
+            lease_ref = "refs/heads/" + lease_ref
+        if not lease_ref.startswith(LEASE_NAMESPACES):
+            raise SettingsError("%s.lease_ref: %s is not a lease namespace (%s, or a prefix "
+                                "under them)" % (where, lease_ref, " or ".join(LEASE_NAMESPACES)))
+        if texts["target"] and lease_collides(lease_ref, texts["target"]):
+            raise SettingsError("%s.lease_ref: %s collides with the target %s"
+                                % (where, lease_ref, texts["target"]))
+        try:
+            plan_git.check_ref(lease_ref + "main", "lease_ref")
+        except ValueError as exc:
+            raise SettingsError("%s.lease_ref: %s" % (where, exc)) from exc
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
-                                 github=texts["github"])
+                                 github=texts["github"], land=land,
+                                 gates=tuple(g.strip() for g in gates), merge_method=method,
+                                 lease_ref=lease_ref)
+    # Lease namespaces are reserved across the whole configuration. Checkout
+    # paths and remote aliases must not let one project's lease overwrite
+    # another project's target, including projects whose landing is off.
+    for holder in projects.values():
+        if holder.land != "local":
+            continue
+        for other in projects.values():
+            if other.target and lease_collides(holder.lease_ref, other.target):
+                raise SettingsError("`radar.projects.%s.lease_ref`: %s collides with the target %s of %s"
+                                    % (holder.name, holder.lease_ref, other.target, other.name))
     return Settings(projects=projects)
+
+
+def lease_collides(prefix: str, target: str) -> bool:
+    """#194 r8: the lease ref of `target` under `prefix` would be the target
+    branch itself, or one holds the other (a target inside the lease
+    namespace, a lease ref under the target's name)."""
+    branch = target
+    for head in ("origin/", "refs/heads/"):
+        branch = branch[len(head):] if branch.startswith(head) else branch
+    target_ref, lease = "refs/heads/" + branch, prefix + branch
+    return (lease == target_ref or target_ref.startswith(prefix)
+            or prefix.startswith(target_ref + "/") or lease.startswith(target_ref + "/")
+            or target_ref.startswith(lease + "/"))
 
 
 def settings_of(cfg) -> Settings:
@@ -217,9 +297,12 @@ class Cache:
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
+        # L160e: stacked replays of the merge queues; merge leases held (L160e2)
+        self.stacks: dict = {}
+        self.locks: dict = {}
 
     def trim(self) -> None:
-        for table in (self.merges, self.diffs, self.sizes, self.replays):
+        for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
             while len(table) > MAX_CACHE:
                 table.pop(next(iter(table)))
 
@@ -397,7 +480,7 @@ def write_journal(cfg, project: str, report: dict) -> dict:
 
 
 def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None = None,
-             now=time.time, ci="github") -> list[dict]:
+             now=time.time, ci="github", owner: str | None = None) -> list[dict]:
     """Un passage du radar sur les projets déclarés par l'hôte ; rend la ligne
     de journal de chacun, avec ses envois (`mail`, L160c). `ci` : la fonction
     `branche -> {number, green} | None`, par défaut lue sur GitHub."""
@@ -418,11 +501,14 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
         if not error:
             annotate_resolutions(cfg, db, project, report, lots, cache)
+            report["queue"] = run_queue(cfg, db, project, report, cache)
+            if project.land != "off":
+                report["land"] = run_land(cfg, db, project, report, cache, owner)
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
         sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
-        lines.append(dict(line, project=project.name, mail=sent))
+        lines.append(dict(line, project=project.name, mail=sent, land=report.get("land") or []))
     return lines
 
 
@@ -455,6 +541,29 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
         report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
 
 
+def run_queue(cfg, db, project: Project, report: dict, cache: Cache | None) -> dict:
+    """L160e: order and stacked replay of the merge queues of the project
+    (`ameesh.merge_queue.run_pass`). Never raises."""
+    from . import merge_queue
+    try:
+        return merge_queue.run_pass(cfg, db, project, report, cache=cache)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        return {"targets": {}, "mail": [], "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def run_land(cfg, db, project: Project, report: dict, cache: Cache | None,
+             owner: str | None) -> list[dict]:
+    """L160e2: ameesh merges the head of each queue (`ameesh.land.run_pass`).
+    Never raises."""
+    from . import land
+    owner = owner or "%s:%d" % (socket.gethostname(), os.getpid())
+    try:
+        return land.run_pass(cfg, db, project, report, owner=owner,
+                             locks=cache.locks if cache is not None else None)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        return [{"result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}]
+
+
 # --------------------------------------------------------------------------
 # courrier (L160c) : passif sur conflit nouveau, réveil seulement s'il bloque
 # --------------------------------------------------------------------------
@@ -484,10 +593,13 @@ def ci_green(rollup) -> bool:
     return True
 
 
-def github_ci(project: Project, gh=None):
-    """La fonction `branche -> {number, url, green} | None` du projet (PR
-    ouverte de la branche), lue avec `gh` ; None si le dépôt GitHub est inconnu.
-    Une erreur de `gh` vaut « pas verte » : le courrier reste passif."""
+def github_ci(project: Project, gh=None, *, strict: bool = False):
+    """La fonction `branche -> {number, url, head, green} | None` du projet
+    (PR ouverte de la branche, `head` : son commit de tête), lue avec `gh` ;
+    None si le dépôt GitHub est inconnu. Une erreur de `gh` vaut « pas
+    verte » : le courrier reste passif. `strict` (entrée en file, L160e) :
+    l'erreur est levée (`plan_github.GithubError`), jamais prise pour « pas
+    de PR »."""
     slug = github_slug(project)
     if not slug:
         return None
@@ -499,12 +611,15 @@ def github_ci(project: Project, gh=None):
             gh = gh or plan_github.Gh()
             rows = plan_github._json(gh, ["pr", "list", "--repo", slug, "--head", branch,
                                           "--state", "open", "--json",
-                                          "number,url,statusCheckRollup"]) or []
+                                          "number,url,headRefOid,statusCheckRollup"]) or []
         except plan_github.GithubError:
+            if strict:
+                raise
             return None
         if not rows:
             return None
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
+                "head": rows[0].get("headRefOid"),
                 "green": ci_green(rows[0].get("statusCheckRollup"))}
     return status
 
@@ -759,6 +874,19 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                                      for h in dup["lots"]),
             "; already in %s: %s" % (dup["target"], dup["in_target"])
             if dup["in_target"] else ""))
+    queue = report.get("queue") or {}
+    if queue.get("error"):
+        out.append("  file : %s" % queue["error"])
+    for target, listed in sorted((queue.get("targets") or {}).items()):
+        out.append("  file vers %s : %s" % (target, ", ".join(
+            "%d. %s%s" % (one["rank"], _lot(one["lot"]),
+                          " (éjecté)" if one["state"] == "ejected" else
+                          " (rejouée)" if (one.get("stack") or {}).get("state") == "replayed"
+                          else "") for one in listed) or "vide"))
+    for one in report.get("land") or ():
+        out.append("  fusion   %s : %s%s" % (_lot(one["lot"]) if one.get("lot") else "—",
+                                             one["result"], " (%s)" % one["error"]
+                                             if one.get("error") else ""))
     for one in report.get("skipped") or ():
         out.append("  skipped  %s %s: %s" % (_lot(one["work_item"]), one["branch"],
                                              one["reason"]))

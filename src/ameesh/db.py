@@ -84,8 +84,79 @@ _CONNECT_HINTS = (
 )
 
 
+#: code SQLSTATE de PostgreSQL pour une violation d'unicité
+UNIQUE_VIOLATION = "23505"
+#: une ligne de sévérité psql en verbosité `verbose` : « ERROR:  23505: … ».
+#: Le libellé de sévérité est traduit par le client (`ERREUR` en français) :
+#: on ne le reconnaît pas à son nom, mais à la forme « <mot>: <code>: » — le
+#: code, lui, ne dépend pas de la locale.
+_ERROR_LINE_RE = re.compile(r"^\w+:\s+([0-9A-Z]{5}):", re.MULTILINE)
+#: classes SQLSTATE qui ne sont pas des erreurs : succès (00), avertissement
+#: (01), absence de données (02). psql peut imprimer un NOTICE 00000 avant
+#: l'erreur qui fait échouer le script : ce n'est pas lui qui classe l'échec
+#: (codex #478 r3).
+_NON_ERROR_CLASSES = frozenset(("00", "01", "02"))
+#: le champ structuré « CONSTRAINT NAME: x » (psql, client en locale C) ; il
+#: porte le nom de l'index même quand celui-ci n'est pas une contrainte.
+_CONSTRAINT_LINE_RE = re.compile(r"^CONSTRAINT NAME:[ \t]+(\S.*?)[ \t]*$", re.MULTILINE)
+
+
+def _error_state(stderr: str) -> tuple[str, int] | None:
+    """(code SQLSTATE, position) de la PREMIÈRE ligne de sévérité du rapport
+    dont la classe n'est ni 00 (succès), ni 01 (avertissement), ni 02
+    (absence de données) ; `None` si le rapport n'en porte aucune.
+
+    La sévérité peut être traduite (`ERREUR` en français) : seule la forme de
+    la ligne tranche, jamais son libellé (codex #478 r3)."""
+    for match in _ERROR_LINE_RE.finditer(stderr):
+        if match.group(1)[:2] not in _NON_ERROR_CLASSES:
+            return match.group(1), match.start()
+    return None
+
+
+def _constraint_name(stderr: str, start: int) -> str | None:
+    """Le nom de contrainte du rapport d'erreur, ou `None` : le DERNIER champ
+    « CONSTRAINT NAME: » placé après la ligne de sévérité qui commence en
+    `start` (codex #478 r3).
+
+    psql écrit ses champs structurés après le message, DETAIL, HINT et
+    CONTEXT : un message multiligne qui recopie ce libellé reste avant le
+    vrai champ, seul retenu."""
+    name = None
+    for match in _CONSTRAINT_LINE_RE.finditer(stderr, start):
+        name = match.group(1)
+    return name
+
+
 class DbError(RuntimeError):
-    """Erreur SQL ou de protocole."""
+    """Erreur SQL ou de protocole. `sqlstate` et `constraint` : le code du
+    serveur et le nom de la contrainte violée, quand le pilote les donne
+    (psycopg par ses diagnostics, psql par ses champs `verbose`) ; None
+    sinon. Le texte du message ne sert jamais à classifier : il dépend de
+    `lc_messages` du serveur (codex #478 r2)."""
+
+    def __init__(self, message, *, sqlstate: str | None = None,
+                 constraint: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+        self.constraint = constraint
+
+
+def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bool:
+    """`exc` est-elle la violation d'unicité de `constraint` (ou d'une
+    contrainte quelconque quand il est None) ?
+
+    Seuls le code SQLSTATE 23505 et le nom EXACT de la contrainte tranchent
+    (codex #478 r2) : le texte du message est traduit par le serveur
+    (`lc_messages`), et une sous-chaîne confondrait
+    `work_items_migration_repo_idx` avec
+    `work_items_migration_repo_idx_other` — une violation de cette autre
+    contrainte ne doit pas être retentée en contention."""
+    if not isinstance(exc, DbError) or exc.sqlstate != UNIQUE_VIOLATION:
+        return False
+    if constraint is None:
+        return True
+    return exc.constraint == constraint
 
 
 class Unavailable(DbError):
@@ -370,11 +441,20 @@ class PsqlDriver:
         self.password, base = split_password(cfg.dsn)
         self.env = os.environ.copy()
         self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
+        #: psql traduit les libellés des champs de son rapport d'erreur
+        #: (`CONSTRAINT NAME`) selon la locale du *client* : la classification
+        #: les lit, donc le client est forcé en C. Le message du serveur, lui,
+        #: reste traduit par `lc_messages` — et n'est jamais analysé
+        #: (codex #478 r2).
+        self.env["LC_ALL"] = "C"
         if self.password:
             self.env["PGPASSWORD"] = self.password
+        # `VERBOSITY=verbose` : psql imprime alors le code SQLSTATE sur la
+        # ligne d'erreur et les champs structurés (CONSTRAINT NAME) — la
+        # seule source du nom exact, indépendante de `lc_messages`.
         base_args = [
             binary, "-X", "-q", "-A", "-t", "-P", "pager=off",
-            "-v", "ON_ERROR_STOP=1", "-d", base,
+            "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-d", base,
         ]
         self._args = list(base_args)
         # Un `psql -c` ne lit jamais stdin : l'écouteur interactif a donc sa
@@ -441,16 +521,27 @@ class PsqlDriver:
             raise DbError("psql: %s" % message)
 
     def _fail(self, proc: subprocess.CompletedProcess) -> DbError:
-        lines = [l for l in (proc.stderr or "").strip().splitlines() if l.strip()]
+        stderr = proc.stderr or ""
+        lines = [l for l in stderr.strip().splitlines() if l.strip()]
         message = lines[-1] if lines else "code %d" % proc.returncode
         for line in reversed(lines):
             if "ERROR" in line or "ERREUR" in line:
                 message = line.strip()
                 break
-        low = (proc.stderr or "").lower()
+        low = stderr.lower()
         if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
             return Unavailable("psql: %s" % message)
-        return DbError("psql: %s" % message)
+        # `VERBOSITY=verbose` : le code SQLSTATE est sur la ligne de sévérité
+        # et le nom exact de la contrainte dans son champ structuré — ni l'un
+        # ni l'autre ne dépend de `lc_messages` (codex #478 r2). La première
+        # sévérité qui n'est ni une notice ni un avertissement classe l'échec,
+        # et seul le dernier champ CONSTRAINT NAME après elle compte : un
+        # message multiligne peut recopier ce libellé (codex #478 r3).
+        state = _error_state(stderr)
+        name = _constraint_name(stderr, state[1]) if state else None
+        return DbError("psql: %s" % message,
+                       sqlstate=state[0] if state else None,
+                       constraint=name)
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
@@ -1103,13 +1194,29 @@ def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())[:300]
 
 
+def _sqlstate(exc: Exception) -> str | None:
+    """Le code SQLSTATE d'une exception de pilote, quand il le donne :
+    psycopg 3 (`sqlstate`), psycopg 2 (`pgcode`)."""
+    state = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return state if isinstance(state, str) and state else None
+
+
+def _constraint(exc: Exception) -> str | None:
+    """Le nom de la contrainte violée, quand le pilote le donne : psycopg 3
+    et psycopg 2 l'exposent dans `exc.diag.constraint_name` (codex #478 r2)."""
+    diag = getattr(exc, "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    return name if isinstance(name, str) and name else None
+
+
 def _map_error(exc: Exception) -> DbError:
     text = _one_line(exc).lower()
+    state = _sqlstate(exc)
     if any(hint in text for hint in _CONNECT_HINTS):
-        return Unavailable(_one_line(exc))
+        return Unavailable(_one_line(exc), sqlstate=state)
     if "does not exist" in text and ("relation" in text or "table" in text):
-        return SchemaMissing(_one_line(exc))
-    return DbError(_one_line(exc))
+        return SchemaMissing(_one_line(exc), sqlstate=state)
+    return DbError(_one_line(exc), sqlstate=state, constraint=_constraint(exc))
 
 
 def is_unavailable(exc: BaseException) -> bool:
@@ -1142,7 +1249,17 @@ def explain(exc: BaseException, limit: int = 160) -> str:
 # --------------------------------------------------------------------------
 
 def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDriver:
-    """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque."""
+    """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque.
+
+    L109 : `backend: mediated` (exécuteur médié, session du harnais dans la
+    VM) n'a pas de base : la « connexion » est le client de `/api/exec/v1`
+    (`storage.remote.RemoteDb`), que `storage.of()` reconnaît."""
+    if getattr(cfg, "backend", "") == "mediated":
+        from .storage import remote
+        from .mediated_executor import device
+        # L110 dans L109 : jeton d'accès par l'identité de l'appareil enrôlé
+        device.install_token_source()
+        return remote.connect(cfg)  # type: ignore[return-value]
     wanted = driver or cfg.driver
     errors: list[str] = []
     if wanted in ("auto", "psycopg"):

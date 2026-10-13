@@ -295,6 +295,9 @@ class PgBackend:
         else:
             targets = [dest]
         groups: dict[str, list[tuple[str, int]]] = {}
+        # #515 : un message lié à un lot se range dans le fil du projet du lot,
+        # quel que soit le projet de l'expéditeur ou des destinataires.
+        lot_project = fil.lot_project(self.db, work_item_id)
         for target in targets:
             # `signed` vient de authority.sign_message : signature, payload,
             # nonce, horodatage et échéance signés. Un envoi simple écrit son
@@ -305,7 +308,8 @@ class PgBackend:
                 kind=kind, payload=payload or None,
                 thread_meta=thread_meta, **dict(signed or {}))
             if dest == "all":
-                project = fil.project_for(self.cfg, projects.get(sender), projects.get(target))
+                project = fil.project_for(self.cfg, lot_project, projects.get(sender),
+                                          projects.get(target))
                 groups.setdefault(project, []).append((target, message_id))
         for project, sent in groups.items():
             fil.record(
@@ -388,6 +392,75 @@ class PgBackend:
         self.db.close()
 
 
+class MediatedBackend(PgBackend):
+    """L109 : la session du harnais dans la VM d'un exécuteur médié.
+
+    Elle n'a que le jeton de session lié au bail (`AMEESH_EXEC_TOKEN`) : les
+    opérations de la route `session/op` (identité par `leases.state`,
+    annuaire réduit, envoi, lots, proposition d'action) et, depuis le
+    contrat 1.1, les lignes `session: true` de la route `op` (réservation,
+    remise et relâche du courrier par le hook, `mailbox.unread` pour
+    `mail inbox`, index des fils), pour l'agent et l'epoch du jeton
+    seulement. Ce que le serveur ne lui ouvre pas est sauté ici :
+
+    * pas d'inscription par le hook : l'exécuteur a déjà tout écrit sous son
+      bail (`agents.upsert` exige le jeton d'exécuteur) ;
+    * l'envoi n'écrit pas la ligne du destinataire (pas de création
+      implicite à distance)."""
+
+    kind = "pg"
+    mediated = True
+    hook_delivery = True
+
+    def send(self, sender: str, dest: str, text: str, host: str | None = None,
+             signed: dict | None = None, work_item_id: str | None = None,
+             allow_structured: bool = False, kind: str = "notify",
+             urgent: bool = False, thread_meta: dict | None = None,
+             include_stopped: bool = False, skipped: list | None = None,
+             payload: dict | None = None, cc=()) -> list[str]:
+        """Same signature and payload rules as `PgBackend.send` (L125: ack,
+        copies, broadcast; « all » skips stopped agents unless
+        `include_stopped`). Each message is written with its own thread
+        entry: the grouped thread entry of a broadcast (`fil.record`) is not
+        written from a mediated session."""
+        fil.ensure_readable(text, allow_structured)
+        payload = _send_payload(dest, urgent, payload)
+        thread_meta = _send_thread_meta(thread_meta, payload, cc)
+        if dest == "all":
+            rows = registry.overview(self.db)
+            projects = {row["name"]: fil.agent_project(row) for row in rows}
+            own = projects.get(sender)
+            team = [row for row in rows if row["name"] != sender
+                    and (not own or projects.get(row["name"]) == own)]
+            stopped = [row["name"] for row in team
+                       if row.get("status") == "stopped" and not include_stopped]
+            if skipped is not None:
+                skipped.extend(stopped)
+            targets = [row["name"] for row in team if row["name"] not in stopped]
+        else:
+            targets = [dest]
+        for target in targets:
+            mail.send(self.db, sender, target, text, host=host, work_item_id=work_item_id,
+                      allow_structured=allow_structured, thread=True, kind=kind,
+                      payload=payload or None, thread_meta=thread_meta,
+                      **dict(signed or {}))
+        for name in cc or ():
+            mail.send(self.db, sender, name, text, host=host, kind="event",
+                      payload={"cc": dest}, allow_structured=allow_structured,
+                      thread=False)
+        return targets
+
+    def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,
+                 *, leased: bool = True) -> None:
+        return None
+
+    def get_status(self, name: str) -> str:
+        return ""
+
+    def set_status(self, name: str, text: str) -> None:
+        raise db_mod.DbError("statut libre : non admis depuis une session médiée")
+
+
 def open_backend(cfg: Config) -> tuple[FileBackend | PgBackend, str | None]:
     """Ouvre le backend voulu. Renvoie (backend, avertissement lisible ou None).
 
@@ -399,6 +472,9 @@ def open_backend(cfg: Config) -> tuple[FileBackend | PgBackend, str | None]:
     mode = cfg.backend
     if mode == "file":
         return FileBackend(cfg), None
+    if mode == "mediated":
+        # L109 : pas de repli fichier dans la VM (rien n'y serait lu)
+        return MediatedBackend(cfg, db_mod.connect(cfg)), None
     try:
         db = db_mod.connect(cfg)
         db_mod.require_schema(db, defer=True)

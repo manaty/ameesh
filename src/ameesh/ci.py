@@ -5,7 +5,7 @@
 
 Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
 pendant les tests, chaque part de la CI publie un check run « tests (flux) »
-(`scripts/ci-flux.py publier`) dont la sortie porte, en JSON lignes, chaque
+(`scripts/ci-flow.py publish`) dont la sortie porte, en JSON lignes, chaque
 test en échec au schéma `ameesh-test-event/1` (L161b). `ameesh notify`, sur
 l'hôte que désigne `github.host` (comme les issues des lots, L126), fait à
 chaque passage un relevé (`Watcher.tick`) :
@@ -57,7 +57,7 @@ WORKFLOWS = ("tests.yml",)
 #: exécution en attente d'un runner est vue dès la poussée, avant que
 #: l'exécution qu'elle remplace soit annulée
 LIVE_STATUSES = ("in_progress", "queued")
-#: préfixe du nom des check runs publiés par `scripts/ci-flux.py publier`
+#: préfixe du nom des check runs publiés par `scripts/ci-flow.py publish`
 CHECK_PREFIX = "tests (flux)"
 SCHEMA = "ameesh-test-event/1"
 #: branches de base : une exécution n'y est jamais remplacée, et ses échecs

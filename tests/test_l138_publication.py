@@ -225,6 +225,28 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.gh()["releases"]["v1.0.0"]["notes"], "Real notes.\n\nPR : #5")
 
+    def test_348_r2_rejected_notes_leave_local_tags_untouched(self):
+        # #348 r2 P3: notes reduced to the tool footer are refused before any
+        # tag is fetched; the release's own tag comes only once they pass
+        tool = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+        other = os.path.join(self.tmp, "autre")
+        subprocess.run(["git", "clone", "-q", self.remote, other], check=True,
+                       env=self.env)
+        _git(other, "tag", "-a", "v1.0.0", "-m", "x", self.v100)
+        _git(other, "tag", "-a", "v0.9.0", "-m", "x", self.v100)
+        _git(other, "push", "-q", "origin", "v1.0.0", "v0.9.0")
+        tags = _git(self.repo, "for-each-ref", "refs/tags")
+        self.pr(5, self.v100, body=tool)
+        done = self.run_script("publier", self.v100)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("sans notes", done.stderr)
+        self.assertEqual(_git(self.repo, "for-each-ref", "refs/tags"), tags)
+        self.pr(5, self.v100, body="Real notes.")
+        done = self.run_script("publier", self.v100)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("étiquette : déjà posée", done.stdout)
+        self.assertEqual(_git(self.repo, "tag", "-l"), "v1.0.0")    # its own tag only
+
     def test_p3_a_note_about_generation_is_kept(self):
         note = "\U0001F916 Generated with now displays the selected tool."
         self.pr(5, self.v100, body=note)

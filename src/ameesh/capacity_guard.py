@@ -22,6 +22,7 @@ The guard itself (`ameesh guard`, L159e) and the common measure
 """
 from __future__ import annotations
 
+import os
 import re
 
 from . import resources as resources_mod
@@ -45,19 +46,61 @@ REASONS = (
     "idle", "user_active", "battery", "window_end", "metered", "owner_pause",
     "lease_lost", "shutdown",
     # virtual machines (ameesh guard)
-    "app_memory", "app_cpu", "app_busy", "disk_low", "maintenance", "guard_stopping")
+    "app_memory", "app_cpu", "app_busy", "disk_low", "maintenance", "guard_stopping",
+    # the guard starts closed without a readable offer (mesh-design #459 r4c)
+    "no_offer", "offer_invalid")
 
 #: caps without which an offer would lend without a bound: all required
 LEND_CAPS = ("cpu_max", "memory_max", "disk_max")
 LEND_SIZES = ("memory_max", "agent_memory_max", "disk_max")
 LEND_KEYS = LEND_CAPS + ("cpu_weight", "agent_memory_max", "windows", "reclaim",
                          "drain_seconds", "calm_seconds")
+#: the three reclaim keys the guard reads itself (L159a): the contract's
+#: reader knows them too, so a valid host fiche using them is not reported
+#: as a `host-lend-unknown` warning
+GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
 RECLAIM_KEYS = ("memory_available_min", "cpu_pressure_max", "memory_pressure_max",
-                "busy_units", "busy_max")
+                "busy_units", "busy_max") + GUARD_RECLAIM_KEYS
 DEFAULT_DRAIN_SECONDS = 90
 DEFAULT_CALM_SECONDS = 600
 #: systemd `CPUWeight=` bounds
 WEIGHT_MIN, WEIGHT_MAX = 1, 10000
+
+#: codes of the problems of `parse_lend` (`LendProblem.code`): callers that
+#: must tell the tolerated family from a real refusal classify on the code,
+#: never by searching the message — it quotes the value the operator wrote
+#: (mesh-design #459 r4c)
+PROBLEM_INVALID = "invalid"
+PROBLEM_CAP_MISSING = "cap_missing"
+#: a refused `disk_paths` entry (relative path, `..`, NUL): security
+PROBLEM_DISK_PATHS = "disk_paths_refused"
+#: a size the previous reader truncated to <= 0 (`0`, `-0`, `"0.5B"`): the
+#: offer falls, but an update must not refuse a fiche main accepted
+PROBLEM_SIZE_ZERO = "size_le_zero"
+#: the family "main accepted it" (mesh-design #459 r4c): the offer is
+#: dropped, the guard starts closed and lends nothing, and `install-pilot.sh`
+#: installs instead of refusing the fiche
+TOLERATED_CODES = (PROBLEM_DISK_PATHS, PROBLEM_SIZE_ZERO)
+
+
+class LendProblem(str):
+    """One problem of `policy.lend`: its message, and its code.
+
+    It is a `str`, so callers that only join or compare messages are
+    unchanged; `code` is what a caller reads to classify."""
+
+    def __new__(cls, code: str, message: str) -> "LendProblem":
+        problem = super().__new__(cls, message)
+        problem.code = code
+        return problem
+
+
+def tolerated_only(problems) -> bool:
+    """True when there is at least one problem and every one of them belongs
+    to `TOLERATED_CODES`: the offer is dropped, the guard starts closed, and
+    an update keeps the fiche (mesh-design #459 r4c)."""
+    return bool(problems) and all(
+        getattr(problem, "code", None) in TOLERATED_CODES for problem in problems)
 
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY = r"(?:%s)" % "|".join(DAYS)
@@ -86,19 +129,33 @@ def gate_state(doc, now: float, *, lending: bool) -> str:
     classic host an absent or null `expires_ts` is admitted (the gate
     predates it); anything else unreadable or stale falls back to
     `available`, as before."""
-    fallback = FALLBACK_LENDING if lending else FALLBACK_CLASSIC
-    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA_HOST_STATE \
-            or doc.get("state") not in STATES:
-        return fallback
+    if state_problem(doc, now, lending=lending) is not None:
+        return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
+    return doc["state"]
+
+
+def state_problem(doc, now: float, *, lending: bool) -> str | None:
+    """Why a guest may not obey the state document `doc` at `now`, or None
+    when it may (the rule of `gate_state`, with its reason for the logs)."""
+    if not isinstance(doc, dict):
+        return "not an object"
+    if doc.get("schema") != SCHEMA_HOST_STATE:
+        return "schema %s expected" % SCHEMA_HOST_STATE
+    if doc.get("state") not in STATES:
+        return "unknown state %r" % (doc.get("state"),)
     seq, expires = doc.get("seq"), doc.get("expires_ts")
     if isinstance(seq, bool) or not isinstance(seq, int):
-        return fallback
+        return "seq: integer expected"
     if expires is None and not lending:
-        return doc["state"]
+        return None
     expires = _finite(expires)
-    if expires is None or not now < expires <= now + MAX_STATE_TTL_S:
-        return fallback
-    return doc["state"]
+    if expires is None:
+        return "no finite expires_ts (required on a lending host)"
+    if now >= expires:
+        return "stale (expired %ds ago)" % int(now - expires)
+    if expires > now + MAX_STATE_TTL_S:
+        return "expires_ts more than %ds ahead" % int(MAX_STATE_TTL_S)
+    return None
 
 
 def parse_window(text) -> dict | None:
@@ -149,25 +206,38 @@ def _positive_int(value, minimum: int = 0) -> int | None:
     return value
 
 
-def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
+def parse_lend(raw, warnings: list[str] | None = None) -> tuple[dict | None, list[str], list[str]]:
     """(offer, problems, unknown keys) of `policy.lend`.
 
     The offer keeps sizes in bytes, `cpu_max` in CPUs (float), percentages
     as numbers from 0 to 100, `windows` as written (each one checked) and
     the defaults of `drain_seconds` and `calm_seconds`. With any problem,
-    the offer is None: the host lends nothing until its fiche is fixed."""
+    the offer is None: the host lends nothing until its fiche is fixed.
+
+    `warnings` (optional): legacy spellings of `disk_paths` that main
+    accepted and that are normalized instead of refusing the offer, so the
+    caller can show them (`ameesh canon check`). An upgrade must not stop
+    the guard from starting on an offer that was valid before (codex #459
+    r3).
+
+    Each problem is a `LendProblem`: its message, and its code. The
+    tolerated family (`TOLERATED_CODES`) is the one main accepted — a
+    refused `disk_paths` entry, a size it truncated to <= 0 — and only the
+    code tells it apart from a real refusal (mesh-design #459 r4c)."""
     if not isinstance(raw, dict):
-        return None, ["mapping expected"], []
-    problems: list[str] = []
+        return None, [LendProblem(PROBLEM_INVALID, "mapping expected")], []
+    problems: list[LendProblem] = []
     offer: dict = {}
     for key in LEND_CAPS:
         if raw.get(key) is None:
-            problems.append("`%s` required (an offer without it would lend without a bound)"
-                            % key)
+            problems.append(LendProblem(
+                PROBLEM_CAP_MISSING,
+                "`%s` required (an offer without it would lend without a bound)" % key))
     cpu = raw.get("cpu_max")
     if cpu is not None:
         if _finite(cpu) is None or cpu <= 0:
-            problems.append("`cpu_max`: finite number of CPUs > 0 expected")
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`cpu_max`: finite number of CPUs > 0 expected"))
         else:
             offer["cpu_max"] = _finite(cpu)
     for key in LEND_SIZES:
@@ -175,17 +245,21 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
             continue
         octets = resources_mod.parse_bytes(raw[key])
         if not octets:
-            problems.append("`%s`: size in bytes > 0 expected (e.g. 14GiB)" % key)
+            # main refused these too: a cap of 0 bytes is not a cap, so this
+            # is not the tolerated family (mesh-design #459 r4c)
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`%s`: size in bytes > 0 expected (e.g. 14GiB)" % key))
         else:
             offer[key] = octets
     if offer.get("agent_memory_max") and offer.get("memory_max") \
             and offer["agent_memory_max"] > offer["memory_max"]:
-        problems.append("`agent_memory_max` above `memory_max`")
+        problems.append(LendProblem(PROBLEM_INVALID, "`agent_memory_max` above `memory_max`"))
     if raw.get("cpu_weight") is not None:
         weight = _positive_int(raw["cpu_weight"], WEIGHT_MIN)
         if weight is None or weight > WEIGHT_MAX:
-            problems.append("`cpu_weight`: integer from %d to %d expected"
-                            % (WEIGHT_MIN, WEIGHT_MAX))
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`cpu_weight`: integer from %d to %d expected"
+                % (WEIGHT_MIN, WEIGHT_MAX)))
         else:
             offer["cpu_weight"] = weight
     if raw.get("windows") is not None:
@@ -193,14 +267,16 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
         if isinstance(windows, str):
             windows = [windows]
         if not isinstance(windows, list) or not windows:
-            problems.append("`windows`: list of windows expected (e.g. \"mon-fri 18:00-08:00 "
-                            "UTC\")")
+            problems.append(LendProblem(
+                PROBLEM_INVALID,
+                "`windows`: list of windows expected (e.g. \"mon-fri 18:00-08:00 UTC\")"))
         else:
             bad = [w for w in windows if parse_window(w) is None]
             if bad:
-                problems.append("`windows`: unreadable %s (expected \"<days> [HH:MM-HH:MM] "
-                                "[zone]\", days among %s)" % (", ".join(map(repr, bad)),
-                                                              "/".join(DAYS)))
+                problems.append(LendProblem(
+                    PROBLEM_INVALID,
+                    "`windows`: unreadable %s (expected \"<days> [HH:MM-HH:MM] "
+                    "[zone]\", days among %s)" % (", ".join(map(repr, bad)), "/".join(DAYS))))
             else:
                 offer["windows"] = [w.strip() for w in windows]
     for key, default in (("drain_seconds", DEFAULT_DRAIN_SECONDS),
@@ -210,55 +286,173 @@ def parse_lend(raw) -> tuple[dict | None, list[str], list[str]]:
             continue
         seconds = _positive_int(raw[key], 1 if key == "drain_seconds" else 0)
         if seconds is None:
-            problems.append("`%s`: whole number of seconds expected" % key)
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`%s`: whole number of seconds expected" % key))
         else:
             offer[key] = seconds
     unknown = sorted(str(k) for k in raw if k not in LEND_KEYS)
     if raw.get("reclaim") is not None:
-        reclaim, more, extra = _parse_reclaim(raw["reclaim"])
-        problems += ["`reclaim.%s" % p[1:] if p.startswith("`") else "`reclaim`: " + p
-                     for p in more]
+        reclaim, more, extra = _parse_reclaim(raw["reclaim"], warnings)
+        for problem in more:
+            message = ("`reclaim.%s" % problem[1:] if problem.startswith("`")
+                       else "`reclaim`: " + problem)
+            problems.append(LendProblem(problem.code, message))
         unknown += ["reclaim.%s" % k for k in extra]
         if reclaim:
             offer["reclaim"] = reclaim
     return (None if problems else offer), problems, unknown
 
 
-def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
+def _reclaim_path(value, warnings: list[str] | None = None) -> str | None:
+    """One path of `disk_paths`: absolute and normalized (codex #459 r1).
+
+    Refused: a relative path (probed from the guard's own directory, it
+    would watch another filesystem than the one the fiche names), a `..`
+    component (`/srv/../etc` is not `/etc` when `/srv` is a symbolic link),
+    a NUL (it raises while measuring) and a blank.
+
+    Accepted and normalized with a warning (codex #459 r3): the spellings
+    that provably name the same directory on Linux — several leading slashes
+    (`//srv`), `//` inside, a `.` component (`/srv/.`), and a trailing slash
+    except for the root. Main accepted them; refusing them would stop the
+    guard from starting after the update. The warning tells the operator to
+    fix the fiche."""
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if not path or "\x00" in path or not path.startswith("/"):
+        return None
+    if ".." in path.split("/"):
+        return None
+    normalized = os.path.normpath("/" + path.lstrip("/"))
+    # the written spelling, trailing slash included: "/srv/" is the same
+    # directory as "/srv", and main accepted it — the warning asks for a
+    # clean fiche (mesh-design #459 r4c; the comparison used to strip the
+    # trailing slash first, so those spellings said nothing)
+    if normalized != path and warnings is not None:
+        warnings.append("`reclaim.disk_paths`: %r normalized to %r (same directory; "
+                        "update the fiche)" % (path, normalized))
+    return normalized
+
+
+def _reclaim_bytes(value) -> tuple[int | None, bool]:
+    """(octets, tronqué) of a size threshold.
+
+    An exact whole number of bytes passes as is. Otherwise the value is the
+    one the previous reader returned by truncating, and `truncated` is true:
+    main accepted these sizes, an update must not invalidate an existing
+    offer (mesh-design, #459 r4b). Only a result <= 0 is still refused:
+    zero bytes watches nothing.
+
+    A text with more digits than Python converts to an integer is refused
+    instead of read through the float path: main accepted it, but the exact
+    reader cannot check it, and a size it cannot check is not a size it
+    lends on — the problem names the key (codex #459 r4)."""
+    exact = resources_mod.parse_bytes(value, decimal_ok=False)
+    if exact is not None:
+        return exact, False
+    limit = resources_mod.bytes_digit_limit()
+    if limit and isinstance(value, str) and sum(c.isdigit() for c in value) > limit:
+        return None, False
+    truncated = resources_mod.parse_bytes(value, decimal_ok=True)
+    if truncated is None:
+        return None, False
+    return truncated, True
+
+
+def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list, list[str]]:
     """The thresholds of the application at which the guest gives way."""
     if not isinstance(raw, dict):
-        return {}, ["mapping expected"], []
+        return {}, [LendProblem(PROBLEM_INVALID, "mapping expected")], []
     out: dict = {}
-    problems: list[str] = []
-    if raw.get("memory_available_min") is not None:
-        octets = resources_mod.parse_bytes(raw["memory_available_min"])
+    problems: list[LendProblem] = []
+    for key in RECLAIM_KEYS:
+        if key in raw and raw[key] is None:
+            # an explicit null is not an absent key: it used to disable the
+            # threshold or fall back to a default, silently (codex #459 r1)
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`%s`: value expected, explicit null refused" % key))
+    for key in ("memory_available_min", "disk_free_min"):
+        if raw.get(key) is None:
+            continue
+        octets, truncated = _reclaim_bytes(raw[key])
         if octets is None:
-            problems.append("`memory_available_min`: size in bytes expected (e.g. 6GiB)")
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`%s`: size in bytes > 0 expected (e.g. %s)"
+                % (key, "6GiB" if key == "memory_available_min" else "10GiB")))
+        elif octets <= 0:
+            # main read it by truncating to 0 and accepted it: the offer
+            # falls, but the tolerated family must not refuse the fiche
+            # (mesh-design #459 r4c)
+            problems.append(LendProblem(
+                PROBLEM_SIZE_ZERO, "`%s`: size in bytes > 0 expected (e.g. %s)"
+                % (key, "6GiB" if key == "memory_available_min" else "10GiB")))
         else:
-            out["memory_available_min"] = octets
-    for key in ("cpu_pressure_max", "memory_pressure_max"):
+            out[key] = octets
+            if truncated and warnings is not None:
+                # main truncated it; the offer stays valid, the operator is
+                # told to write a whole number of bytes (codex #459 r4b)
+                warnings.append("`%s`: %r truncated to %d bytes (the previous reader "
+                                "truncated it too; write a whole number of bytes)"
+                                % (key, raw[key], octets))
+    for key in ("cpu_pressure_max", "memory_pressure_max", "io_pressure_max"):
         if raw.get(key) is None:
             continue
         percent = resources_mod.parse_percent(raw[key])
         if percent is None:
-            problems.append("`%s`: percentage from 0 to 100 expected (PSI some, avg60)" % key)
+            problems.append(LendProblem(
+                PROBLEM_INVALID,
+                "`%s`: percentage from 0 to 100 expected (PSI some, avg60)" % key))
         else:
             out[key] = percent
+    if raw.get("disk_paths") is not None:
+        paths = raw["disk_paths"]
+        if isinstance(paths, list) and not paths:
+            # main read an empty list as its own default (`/`); refusing it
+            # would stop the guard from starting after the update (codex #459 r3)
+            if warnings is not None:
+                warnings.append("`reclaim.disk_paths`: empty list read as [\"/\"] "
+                                "(update the fiche)")
+            out["disk_paths"] = ["/"]
+        elif not isinstance(paths, list):
+            problems.append(LendProblem(
+                PROBLEM_INVALID,
+                "`disk_paths`: non-empty list of absolute, normalized paths "
+                "expected (e.g. [\"/\", \"/srv/ameesh-guest\"])"))
+        else:
+            clean = [_reclaim_path(p, warnings) for p in paths]
+            unique = list(dict.fromkeys(clean))
+            refused = [p for p, kept in zip(paths, clean) if kept is None]
+            if refused:
+                # mesh-design #459 r4b: a relative path, `..` and NUL stay
+                # refused (security); the offer falls, but the guard starts
+                problems.append(LendProblem(
+                    PROBLEM_DISK_PATHS,
+                    "`disk_paths`: refused path(s) %s (absolute, without "
+                    "`..` or NUL expected, e.g. [\"/\", \"/srv/ameesh-guest\"])"
+                    % ", ".join(repr(p) for p in refused)))
+            else:
+                if len(unique) != len(clean) and warnings is not None:
+                    warnings.append("`reclaim.disk_paths`: duplicate paths collapsed to %s "
+                                    "(the same path is watched once; update the fiche)"
+                                    % ", ".join(repr(p) for p in unique))
+                out["disk_paths"] = unique
     if raw.get("busy_units") is not None:
         units = raw["busy_units"]
         if isinstance(units, str):
             units = [units]
         if not isinstance(units, list) or not units or not all(
                 isinstance(u, str) and u.strip() for u in units):
-            problems.append("`busy_units`: list of systemd unit patterns expected")
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`busy_units`: list of systemd unit patterns expected"))
         else:
             out["busy_units"] = [u.strip() for u in units]
     if raw.get("busy_max") is not None:
         busy = _positive_int(raw["busy_max"], 0)
         if busy is None:
-            problems.append("`busy_max`: whole number expected")
+            problems.append(LendProblem(PROBLEM_INVALID, "`busy_max`: whole number expected"))
         else:
             out["busy_max"] = busy
     if "busy_max" in out and "busy_units" not in out:
-        problems.append("`busy_max` without `busy_units`")
+        problems.append(LendProblem(PROBLEM_INVALID, "`busy_max` without `busy_units`"))
     return out, problems, sorted(str(k) for k in raw if k not in RECLAIM_KEYS)

@@ -16,9 +16,11 @@ ce module garde les règles et les signatures publiques.
 """
 from __future__ import annotations
 
+import sys
+
 from typing import Sequence
 
-from . import storage
+from . import persona_sessions, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import registry as _pg
@@ -246,10 +248,12 @@ def reap(db: Db, host: str | None = None) -> list[dict]:
     return storage.of(db).leases.reap(host)
 
 
-def set_session(db: Db, name: str, session_id: str, account: str | None = None) -> None:
+def set_session(db: Db, name: str, session_id: str, account: str | None = None, *,
+                harness: str | None = None, cwd: str | None = None) -> None:
     """Enregistre la session et, L39 (0030), le compte sous lequel elle tourne
-    (`session_account` ; None : aucun compte déclaré pour le harnais)."""
-    storage.of(db).agents.set_session(name, session_id, account)
+    (`session_account` ; None : aucun compte déclaré pour le harnais) ; #408,
+    le harnais et le dossier de son ouverture s'ils sont donnés."""
+    storage.of(db).agents.set_session(name, session_id, account, harness=harness, cwd=cwd)
 
 
 def set_session_account(db: Db, name: str, account: str | None) -> bool:
@@ -268,6 +272,20 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     les autres opérations de bail.
     """
     return storage.of(db).leases.clear_session(name, owner, epoch)
+
+
+def record_session_history(db: Db, name: str, session_id: str,
+                           account: str | None = None) -> None:
+    """Record an accepted session after runner or hook session filtering."""
+    _record_history(lambda: persona_sessions.record_start(db, name, session_id, account=account))
+
+
+def _record_history(action):
+    """History never blocks the agent, including before its migration is installed."""
+    try:
+        return action()
+    except Exception as exc:  # noqa: BLE001
+        print("ameesh: session history could not be recorded: %s" % exc, file=sys.stderr)
 
 
 def pause(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:

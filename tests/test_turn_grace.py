@@ -118,7 +118,161 @@ class NoteTest(unittest.TestCase):
         self.assertTrue(all(t[:8] in texte for t in dits))
 
 
+@unittest.skipUnless(hasattr(os, "fork") and sys.platform.startswith("linux"), "Linux")
+class ZombieTest(unittest.TestCase):
+    """#458 : un zombie du groupe dont le parent n'est pas l'exécuteur (un
+    sous-moissonneur au-dessus de lui, ex. l'exécuteur qui fait tourner
+    l'agent qui lance ces tests) ne garde pas la ressource « orpheline »."""
+
+    ENFANT = ("import os, sys, time\n"
+              "pid = os.fork()\n"
+              "if pid == 0:\n"
+              "    os.setpgid(0, 0)\n"
+              "    os._exit(4)\n"
+              "print(pid, flush=True)\n"
+              "time.sleep(30)\n")
+
+    def test_zombie_d_un_autre_parent_ferme_done(self):
+        # parent qui ne moissonne pas : son fils, seul de son groupe, reste zombie
+        parent = subprocess.Popen([sys.executable, "-c", self.ENFANT],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(parent.wait)
+        self.addCleanup(parent.kill)
+        pid = int(parent.stdout.readline())
+        fin = time.monotonic() + 10
+        while not any(p["pid"] == pid and p["zombie"] for p in platform.process_table()):
+            self.assertLess(time.monotonic(), fin, "pas de zombie")
+            time.sleep(0.02)
+        self.assertTrue(background._group_alive(pid))  # signal 0 : le zombie répond
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *_a: None)
+        now = time.time()
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=pid, ended=now,
+                                 deadline=now + 1200, grace_s=1200, lineage={pid})
+        entry.jobs[pid] = background.Job(pid, 'pid %d "sh"' % pid)
+        tracker.entries = [entry]
+        with mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=now)
+        self.assertEqual(entry.state, "done")
+        of.return_value.turn_resources.close_turn.assert_called_once_with(
+            entry.turn_id, orphan=False, containers=None)
+
+
 @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX")
+class PgidRecycleTest(unittest.TestCase):
+    """#458 r2 (test de mty-amh-qa-01) : le passage de suivi voit le groupe du
+    tour vide, puis son numéro est recyclé avant la fermeture de la
+    ressource. Le verdict du passage fait foi : la ressource se ferme `done`
+    (orphan=False), rien n'est signalé au groupe étranger. Sans Postgres."""
+
+    PGID = 4242       # pid du harnais du tour == pgid de son groupe
+    JOB = 4243        # tâche de fond du tour, vue dans la lignée
+
+    @staticmethod
+    def _p(pid, ppid, pgid, name="x", zombie=False) -> dict:
+        return {"pid": pid, "ppid": ppid, "pgid": pgid, "name": name,
+                "start": 0.0, "zombie": zombie}
+
+    def _tick_with_recycled_group(self, now: float, recycled: list):
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *a: None)
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=self.PGID,
+                                 ended=now - 30.0, deadline=now + 1200.0,
+                                 grace_s=1200, lineage={self.PGID, self.JOB})
+        entry.jobs[self.JOB] = background.Job(self.JOB, 'pid %d "pytest"' % self.JOB)
+        tracker.entries = [entry]
+        # 1re lecture (le passage) : groupe vide ; ensuite : un groupe étranger
+        reads = [[]]
+        signaux: list = []
+        with mock.patch.object(background.platform, "process_table",
+                               side_effect=lambda: reads.pop(0) if reads else list(recycled)), \
+                mock.patch.object(background, "_group_alive", side_effect=bool), \
+                mock.patch.object(background.os, "killpg",
+                                  side_effect=lambda p, s: signaux.append((p, s))), \
+                mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=now)
+        self.assertEqual(entry.state, "done")
+        of.return_value.turn_resources.close_turn.assert_called_once_with(
+            entry.turn_id, orphan=False, containers=None)
+        self.assertEqual(signaux, [], "nothing may be signalled")
+
+    def test_numero_recycle_ferme_done(self):
+        """Un membre étranger du groupe recyclé (pid != pgid, hors lignée)."""
+        self._tick_with_recycled_group(10000.0, [self._p(99999, 1, self.PGID, "unrelated")])
+
+    def test_numero_recycle_chef_du_nouveau_groupe(self):
+        """Le chef du nouveau groupe a pour pid l'ancien pgid, donc un pid de
+        la lignée apprise : seul le verdict du passage tranche."""
+        self._tick_with_recycled_group(10000.0, [self._p(self.PGID, 1, self.PGID, "unrelated")])
+
+
+class KillVerdictTest(unittest.TestCase):
+    """#458 r3 (codex) : un signal refusé (EPERM) n'est pas un groupe
+    disparu ; le survivant garde la ressource orpheline. Sans Postgres."""
+
+    def _expire(self, error, *, shutdown=False):
+        runner = mock.Mock()
+        runner.db = None
+        runner.harness_pids = set()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *a: None)
+        tracker.TERM_GRACE_S = 0
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=4242, ended=0.0,
+                                 deadline=1.0, grace_s=1, lineage={4242})
+        handle = background.ProcessHandle(4242, 42)
+        entry.handles[4242] = handle
+        tracker.entries = [entry]
+        alive = True
+        vivant = [{"pid": 4242, "ppid": 1, "pgid": 4242, "name": "x", "start": 0.0,
+                   "zombie": False}]
+
+        def send(fd, signum):
+            nonlocal alive
+            if isinstance(error, ProcessLookupError):
+                alive = False
+            raise error
+
+        with mock.patch.object(background.platform, "process_table",
+                               side_effect=lambda: vivant if alive else []), \
+                mock.patch.object(handle, "live", side_effect=lambda: alive), \
+                mock.patch.object(handle, "location", return_value=(4242, 4242)), \
+                mock.patch.object(handle, "state", return_value="S"), \
+                mock.patch.object(handle, "duplicate", return_value=mock.Mock(
+                    reap=mock.Mock(return_value=None))), \
+                mock.patch.object(signal, "pidfd_send_signal", side_effect=send, create=True), \
+                mock.patch.object(background.os, "close") as close_fd, \
+                mock.patch.object(background.os, "killpg") as killpg, \
+                mock.patch.object(background.time, "monotonic", side_effect=[0, 1, 2, 9]), \
+                mock.patch.object(background.storage, "of") as of:
+            if shutdown:
+                tracker.stop_all("test")
+            else:
+                tracker.tick(now=10.0)
+        self.assertEqual(entry.state, "stopped" if shutdown else "expired")
+        close_fd.assert_called_once_with(42)
+        killpg.assert_not_called()
+        return of.return_value.turn_resources.close_turn
+
+    def test_signal_refuse_le_groupe_vivant_reste_orphelin(self):
+        self._expire(PermissionError(1, "EPERM")).assert_called_once_with(
+            "t" * 32, orphan=True, containers=None)
+
+    def test_groupe_disparu_ferme_non_orphelin(self):
+        self._expire(ProcessLookupError(3, "ESRCH")).assert_called_once_with(
+            "t" * 32, orphan=False, containers=None)
+
+
+    def test_shutdown_refused_signal_keeps_orphan(self):
+        self._expire(PermissionError(1, "EPERM"), shutdown=True).assert_called_once_with(
+            "t" * 32, orphan=True, containers=None)
+
+    def test_shutdown_vanished_process_closes_without_orphan(self):
+        self._expire(ProcessLookupError(3, "ESRCH"), shutdown=True).assert_called_once_with(
+            "t" * 32, orphan=False, containers=None)
+
+
 class PlatformTest(unittest.TestCase):
     def test_moisson_d_un_enfant_et_table_des_processus(self):
         proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])
@@ -194,6 +348,84 @@ class _Base(PgTestCase):
 
 
 class GraceTest(_Base):
+    def test_failed_handoff_scan_cleans_captured_detached_child_as_uncertain(self):
+        runner, worker = self._worker("fond-handoff-fail")
+        pidfile = os.path.join(self.tmp, "detached.pid")
+        ready = os.path.join(self.tmp, "detached.ready")
+
+        def failed_scan(turn_id, pgid, *, handles):
+            # Detach an already captured real child before failing the handoff.
+            with open(pidfile) as f:
+                pid = int(f.read())
+            self.assertIn(pid, handles)
+            self.wait_for(lambda: os.path.exists(ready), timeout=5)
+            os.kill(pid, signal.SIGUSR1)
+            self.wait_for(lambda: os.getpgid(pid) == pid, timeout=5)
+            raise RuntimeError("handoff table unavailable")
+
+        code = ("import os,signal,time; from pathlib import Path; "
+                "signal.signal(signal.SIGUSR1,lambda *_:os.setsid()); "
+                "Path(%r).touch(); time.sleep(60)" % ready)
+        import shlex
+        command = "exec %s -c %s" % (shlex.quote(sys.executable), shlex.quote(code))
+        with mock.patch.object(runner.background, "survivors", side_effect=failed_scan):
+            self._tour(worker, AMEESH_TEST_BACKGROUND=command,
+                       AMEESH_TEST_BACKGROUND_PID=pidfile)
+        pid = self._pid(pidfile)
+        try:
+            resource = self.db.query(
+                "SELECT status FROM turn_resources WHERE agent = %s", (worker.name,))[0]
+            self.assertEqual(resource["status"], "orphan")
+            self.wait_for(lambda: not platform.alive(pid), timeout=5)
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def test_failed_handoff_preserves_child_migrated_to_another_turn(self):
+        runner, worker = self._worker("fond-migrated")
+        pidfile = os.path.join(self.tmp, "migrated.pid")
+        ready = os.path.join(self.tmp, "migrated.ready")
+        foreign_turn = "foreign-live-turn"
+
+        def failed_scan(turn_id, pgid, *, handles):
+            with open(pidfile) as f:
+                pid = int(f.read())
+            self.assertIn(pid, handles)
+            self.wait_for(lambda: os.path.exists(ready), timeout=5)
+            storage.of(self.db).turn_resources.open_turn(
+                foreign_turn, "other-agent", runner.host, pgid=pid, label="foreign")
+            os.kill(pid, signal.SIGUSR1)
+            self.wait_for(lambda: os.getpgid(pid) == pid, timeout=5)
+            raise RuntimeError("handoff table unavailable")
+
+        # A process can only join a group in its own session. This foreign
+        # live resource is registered for the migrated child's resulting group.
+        code = ("import os,signal,time; from pathlib import Path; "
+                "signal.signal(signal.SIGUSR1,lambda *_:os.setpgid(0,0)); "
+                "Path(%r).touch(); time.sleep(60)") % ready
+        import shlex
+        command = "exec %s -c %s" % (shlex.quote(sys.executable), shlex.quote(code))
+        try:
+            with mock.patch.object(runner.background, "survivors", side_effect=failed_scan):
+                self._tour(worker, AMEESH_TEST_BACKGROUND=command,
+                           AMEESH_TEST_BACKGROUND_PID=pidfile)
+            pid = self._pid(pidfile)
+            self.assertTrue(platform.alive(pid))
+            resource = storage.of(self.db).turn_resources.get(
+                self.db.query("SELECT turn_id FROM turn_resources WHERE agent=%s",
+                              (worker.name,))[0]["turn_id"])
+            self.assertEqual(resource["status"], "orphan")
+        finally:
+            if os.path.exists(pidfile):
+                with open(pidfile) as f:
+                    migrated = int(f.read())
+                try:
+                    os.kill(migrated, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_la_fin_du_tour_laisse_finir_le_travail_de_fond(self):
         runner, worker = self._worker("fond-ok")
         pidfile, stop = os.path.join(self.tmp, "fond.pid"), os.path.join(self.tmp, "fond.stop")

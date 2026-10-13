@@ -14,10 +14,11 @@ from .. import interface
 from .registry import canon_governed_sql
 
 #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
-#: gouverné par le canon, sinon son chantier (un paramètre : le nom de l'agent)
+#: gouverné par le canon, sinon son chantier, désormais `workstream` (un
+#: paramètre : le nom de l'agent)
 PROJECT_SQL = (
     "SELECT CASE WHEN " + canon_governed_sql("r")
-    + " AND coalesce(btrim(r.team), '') <> '' THEN btrim(r.team) ELSE r.chantier END"
+    + " AND coalesce(btrim(r.team), '') <> '' THEN btrim(r.team) ELSE r.workstream END"
     " FROM agent_registry r WHERE r.name = %s")
 
 MAIL_COLUMNS = """
@@ -76,6 +77,15 @@ PASSIVE_SQL = (
 
 
 class Mailbox(interface.Mailbox):
+
+    def lock_recipient(self, recipient):
+        # L148 : `workstream` est le nom courant ; `chantier` reste émis, à la
+        # même valeur, pour les lecteurs qui ne sont pas encore renommés.
+        rows = self.db.query(
+            "SELECT name, workstream, workstream AS chantier"
+            " FROM agent_registry WHERE name = %s FOR SHARE",
+            (recipient,))
+        return rows[0] if rows else None
 
     def send(self, sender, recipient, body, *, host, kind, payload, work_item_id,
              signature, signature_key, signed_payload, nonce, created_us,
@@ -192,7 +202,7 @@ class Mailbox(interface.Mailbox):
     # est alors marqué `deja_consigne` et signalé « re-livré ».
 
     @staticmethod
-    def _bail_sql(owner, *, reservation=False) -> str:
+    def _lease_sql(owner, *, reservation=False) -> str:
         if owner:
             return ("v.lease_owner = %s AND v.lease_epoch = %s"
                     " AND v.lease_expires_at > clock_timestamp()")
@@ -206,7 +216,7 @@ class Mailbox(interface.Mailbox):
         return "TRUE"
 
     @staticmethod
-    def _bail_params(owner, epoch) -> tuple:
+    def _lease_params(owner, epoch) -> tuple:
         return (owner, int(epoch)) if owner else ()
 
     ACTIVE_SQL = """
@@ -254,9 +264,9 @@ class Mailbox(interface.Mailbox):
               FROM cibles
              WHERE m.id = cibles.id
             RETURNING %s, cibles.deja AS deja_avant
-        """ % (filtre, self._bail_sql(owner, reservation=True), self.ACTIVE_SQL,
+        """ % (filtre, self._lease_sql(owner, reservation=True), self.ACTIVE_SQL,
                MAIL_COLUMNS.replace("id,", "m.id,", 1))
-        params = ((recipient, recipient) + self._bail_params(owner, epoch)
+        params = ((recipient, recipient) + self._lease_params(owner, epoch)
                   + (int(limit), owner or None, int(epoch) if owner else None,
                      token, porteur, float(ttl_seconds)))
         rows = self.db.query(sql, params)
@@ -283,8 +293,8 @@ class Mailbox(interface.Mailbox):
                AND m.meta->'consigne'->>'jeton' = %%s
                AND %s
             RETURNING m.id
-            """ % (", ".join(str(i) for i in clean), self._bail_sql(owner)),
-            (recipient, recipient, token) + self._bail_params(owner, epoch),
+            """ % (", ".join(str(i) for i in clean), self._lease_sql(owner)),
+            (recipient, recipient, token) + self._lease_params(owner, epoch),
         )
         return sorted(int(row["id"]) for row in rows)
 

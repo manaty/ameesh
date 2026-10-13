@@ -6,6 +6,7 @@
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N] [--take-paid]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
+                [--handoff-max-per-hour N] [--handoff-idle S]
         follows the operations alerts (`ameesh alerts --follow`, same
         thresholds, same dedupe keys) and sends each raised alert and each
         resolution to the responsible human, on their channels.
@@ -16,6 +17,10 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
+        L233b: before any take, the intake and build lots of a non-critical
+        Claude agent paused on budget go to a free DeepSeek agent of the
+        same project (`ameesh.handoff.budget_handoff`);
+        `--handoff-max-per-hour 0` turns it off.
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
         (`ameesh.plan_github.Projector`) and polls the running CI: each
@@ -79,7 +84,8 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
-                 "host_not_ready", "host_power_low", "backlog_empty", "mail_undeliverable",
+                 "host_not_ready", "host_power_low",
+                 "host_unavailable", "host_drain_overdue", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
@@ -92,9 +98,17 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226b : un agent attend un compte authentifié sain
                  "auth_blocked",
                  # L226a : un identifiant est en échec, ou expire bientôt
-                 "credential_failing", "credential_expiring",
+                 "credential_failing", "credential_expiring", "module_deviation",
                  # L317c : analyse profonde demandée, sans rapport dans les 30 min
-                 "deep_analysis_overdue")
+                 "deep_analysis_overdue",
+                 # #411: Docker storage needs an explicit owner cleanup decision.
+                 "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
+                 # L242b : un agent critique est en pause budget
+                 "critical_budget_pause",
+                 # L160e2: a merge queue no longer moves
+                 "merge_blocked",
+                 # #194 r6: a PR merged into a wrong base, or not checked
+                 "land_uncertain")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -146,6 +160,8 @@ TYPE_LABELS = {
     "mail_undeliverable": "undeliverable mail",
     "decision_pending": "decision pending",
     "decision_overdue": "decision unanswered by its deadline",
+    "host_unavailable": "host unavailable",
+    "host_drain_overdue": "host drain overdue",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "turn_churn": "bursts of short turns",
@@ -155,17 +171,25 @@ TYPE_LABELS = {
     "ci_main_red": "CI red on main",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
+    "docker_orphan_volumes": "Docker orphan volumes accumulating",
+    "docker_build_cache": "Docker reclaimable build cache above threshold",
+    "docker_storage_unavailable": "Docker storage inventory unavailable",
     "turn_unpriced": "turn without a known price",
     # L233: briefed to the assignee and the orchestrators (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
     "waiting_without_question": "lot waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
+    "merge_blocked": "merge queue blocked",
+    "land_uncertain": "PR merged by ameesh into a wrong or unchecked base",
+
+    "module_deviation": "module procedure deviation",
+    "critical_budget_pause": "critical agent paused on budget",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing")
+                "credential_failing", "critical_budget_pause", "land_uncertain")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -804,6 +828,15 @@ class Router:
 
     def resolve(self, alert: dict) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
+        if alert.get("type") == "module_deviation":
+            # A project procedure finding belongs to the lot, even when its
+            # assignee (or their host/responsible human) belongs elsewhere.
+            for source, value in (("lot", self.lot_responsible(alert.get("lot"))),
+                                  ("defaut", self.ncfg.default_human)):
+                human = normalize_human(value)
+                if human:
+                    return human, source
+            return None, None
         agent = alert.get("agent")
         steps = (
             ("alerte", lambda: alert.get("responsible")),
@@ -917,7 +950,8 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
-_KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
+_KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
+         "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
          "provider", "currency", "urgent",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
@@ -940,10 +974,13 @@ class Notifier:
 
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
-                 take: dict | None = None):
+                 take: dict | None = None, handoff: dict | None = None):
         self.cfg, self.ncfg = cfg, ncfg
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
+        #: L233b : réglages de la reprise sur pause budget
+        #: (`handoff.budget_handoff`) ; None la coupe
+        self.handoff = handoff
         self.state = state if state is not None else empty_state()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
@@ -968,6 +1005,13 @@ class Notifier:
         wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
+        # Persisted deliveries from an older routing policy must not retry or
+        # resolve to an assignee's human after a project's owner is selected.
+        for entry in list(active.values()) + list(self.state["resolved"].values()):
+            if entry["alert"].get("type") == "module_deviation":
+                human, source = router.resolve(entry["alert"])
+                if human != entry.get("human"):
+                    entry.update(human=human, source=source, status="nouvelle", channels={})
         for key in list(active):
             if key in wanted:
                 continue
@@ -1000,7 +1044,7 @@ class Notifier:
             else:
                 if alert.get("type") == "orphan_lot" and alert.get("grouped"):
                     entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
-                if entry["status"] in ("sans_destinataire", "sans_canal"):
+                if entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
                     # un responsable (ou une route) a pu apparaître depuis
                     self._raise(entry, router, now)
                 else:
@@ -1012,6 +1056,8 @@ class Notifier:
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
+        if self.handoff:
+            self._budget_handoff(db, now)
         if self.take:
             self._auto_take(db, current, now)
         self._github_issues(db, now)
@@ -1116,6 +1162,23 @@ class Notifier:
                      else "file d'amélioration"}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
 
+    def _budget_handoff(self, db, now: float) -> None:
+        from . import handoff
+        try:
+            moved = handoff.budget_handoff(self.cfg, db, now=now, dry_run=self.dry_run,
+                                           **self.handoff)
+        except db_mod.DbError:
+            raise
+        except Exception as exc:     # la reprise ne fait jamais tomber les alertes
+            self.log("budget handoff failed: %s" % _clean(exc, 200))
+            return
+        for move in moved:
+            item = move["item"]
+            entry = {"alert": {"type": "budget_handoff", "agent": move["agent"],
+                               "lot": int(item["id"]), "title": item.get("title")},
+                     "human": None, "source": "pause budget de %s" % move["previous"]}
+            self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
+
     # -- levée ----------------------------------------------------------------
     def _raise(self, entry: dict, router: Router, now: float) -> None:
         alert = entry["alert"]
@@ -1217,13 +1280,16 @@ class Notifier:
             return
         from . import mail, work
         try:
-            listing = list(router.agents().values())
+            listing = storage.of(db).operations.listing()
             from . import canon as canon_mod
             try:
                 canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
-            except Exception:  # noqa: BLE001 - sans canon : l'agent `auditeur` seul
+            except Exception:  # noqa: BLE001 - aucun auditeur explicite sans canon
                 canons = []
             auditors = alert_briefs.auditors(listing, canons)
+            module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
+            from . import sous_utilisation
+            module_orchestrators = sous_utilisation.role_orchestrators(canons)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
@@ -1235,7 +1301,10 @@ class Notifier:
                     item = storage.of(db).work.get(int(lot))
                     if item:
                         titles[int(lot)] = item.get("title") or ""
-                briefs = alert_briefs.briefs(alert, listing, titles, auditors)
+                briefs = alert_briefs.briefs(
+                    alert, listing, titles,
+                    module_auditors if kind == "module_deviation" else auditors,
+                    orchestrator_names=module_orchestrators)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 continue
@@ -1245,28 +1314,68 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
-            for field_ in ("lot", "agents", "lots", "harness", "account", "gauge",
+            if kind in URGENT_TYPES:
+                payload["urgent"] = True        # L242b (5) : le point de l'auditeur
+            for field_ in ("module", "rule", "project", "declaration_id", "subject",
+                           "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):
                 if alert.get(field_) is not None:
                     payload[field_] = alert[field_]
             # pas de `work_item_id` : un message lié au lot compterait comme
             # son activité (stagnation) et effacerait l'alerte qu'il signale
+            delivered = []
             for name, text in sorted(briefs.items()):
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
                 try:
-                    mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
-                              payload=payload)
+                    if kind == "module_deviation":
+                        if not self._send_module_brief(db, alert, name, text, payload):
+                            continue
+                    else:
+                        mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
+                                  payload=payload)
+                    delivered.append(name)
                     self.log("[%s] %s delivered to %s" % (
                         kind, "reminder" if entry is not None else "mail", name))
                 except Exception as exc:  # noqa: BLE001
                     self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
+            if kind == "module_deviation" and not delivered:
+                continue
             if entry is None:
                 sent[key] = {"type": kind, "sent_ts": now, "reminded": False,
-                             "to": sorted(briefs)}
+                             "to": delivered if kind == "module_deviation" else sorted(briefs)}
             else:
                 entry["reminded"] = True
+
+    def _send_module_brief(self, db, alert, name, text, payload):
+        """Reauthorize under a recipient row lock, held through mailbox commit.
+
+        Canon roles are reread after the lock, not reused from collection or
+        preparation. Thread recording happens only after commit and explicitly
+        in the finding's project, independently of the recipient's team.
+        """
+        from . import canon, fil, mail, sous_utilisation, work
+        project = alert.get("project")
+        if not project:
+            return False
+        with db.transaction() as tx:
+            row = storage.of(tx).mailbox.lock_recipient(name)
+            if row is None:
+                return False
+            canons = canon.load_configured(self.cfg) if self.cfg.canon else []
+            orchestrators = sous_utilisation.role_orchestrators(canons)
+            auditors = sous_utilisation.role_orchestrators(canons, alert_briefs.AUDITOR_ROLES)
+            authorized = (name in orchestrators and row.get("chantier") == project
+                          and name in (alert.get("orchestrators") or ())) \
+                or (name in auditors and row.get("chantier") in (None, "", project))
+            if not authorized:
+                return False
+            message_id = mail.send(tx, work.SYSTEM_SENDER, name, text, kind="event",
+                                   payload=payload, thread=False)
+        fil.record(self.cfg, db, sender=work.SYSTEM_SENDER, recipients=[name], text=text,
+                   project=project, mailbox_ids=[message_id], meta={"kind": "event"})
+        return True
 
     # -- résolution -----------------------------------------------------------
     def _resolved(self, key: str, entry: dict, now: float) -> None:
@@ -1450,7 +1559,7 @@ def _format(record: dict) -> str:
     who = record.get("human") or "—"
     what = "[%s] %s" % (record.get("type"), _subject(record))
     event = {"raised": "raised", "resolved": "resolved", "summary": "summary",
-             "auto_take": "auto-take"}.get(
+             "auto_take": "auto-take", "budget_handoff": "budget handoff"}.get(
         record["event"], record["event"])
     channels = ", ".join("%s %s" % (k, v) for k, v in sorted(record["channels"].items()))
     delivery = record["delivery"]
@@ -1503,7 +1612,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="send a test message on each of this human's channels")
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
-    from . import backlog
+    from . import backlog, handoff
     parser.add_argument("--take-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_IDLE",
                                                         backlog.DEFAULT_TAKE_IDLE_S),
@@ -1530,7 +1639,28 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
                         help="maximum team lots taken per rolling hour, for the whole mesh "
                              "(default 6)")
+    # L233b : reprise des lots d'un agent Claude en pause budget
+    parser.add_argument("--handoff-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_HANDOFF_MAX_PER_HOUR", handoff.DEFAULT_MAX_PER_HOUR)),
+                        help="maximum lots handed per rolling hour from non-critical Claude "
+                             "agents paused on budget to free DeepSeek agents of the same "
+                             "project (default 4; 0 turns this off)")
+    parser.add_argument("--handoff-idle", type=float,
+                        default=exploitation._env_float("AMEESH_HANDOFF_IDLE",
+                                                        handoff.DEFAULT_IDLE_S),
+                        help="a DeepSeek agent takes a handed lot once idle for S seconds "
+                             "(default 300)")
     return parser
+
+
+def handoff_settings(args) -> dict | None:
+    """Réglages de `handoff.budget_handoff` lus des options ; None si coupée."""
+    most = int(getattr(args, "handoff_max_per_hour", 0) or 0)
+    if most <= 0:
+        return None
+    return {"max_per_hour": most,
+            "idle_s": max(0.0, float(getattr(args, "handoff_idle", 0) or 0))}
 
 
 def take_settings(args) -> dict | None:
@@ -1601,7 +1731,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             print(_format(record), flush=True)
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
-                        take=take_settings(args))
+                        take=take_settings(args), handoff=handoff_settings(args))
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None

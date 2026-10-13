@@ -11,4 +11,5 @@ test_l159a_capacity_guard  # docs/schemas (JSON schemas of the capacity guard, L
 test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
 test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
 test_l33_chatbot  # docs/design et site/docs (index du chatbot), site/landing
+test_l84_serve  # docs/api/openapi-v1.json (OpenAPI contract of the read API, L84)
 test_site_art  # site/landing/index.html

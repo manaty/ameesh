@@ -50,7 +50,8 @@ class TurnCosts(interface.TurnCosts):
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,
-               spend_key=None, void_reason=None, price_fallback=None,
+               spend_key=None, source=None, executor=None, lease_owner=None,
+               lease_epoch=None, void_reason=None, price_fallback=None,
                cache_write_tokens=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
@@ -64,6 +65,13 @@ class TurnCosts(interface.TurnCosts):
             # nommé — un hôte sans comptes déclarés n'en dépend pas.
             cols.append("account")
             values.append(account)
+        # L111 (migration 0064) : provenance et bail, écrits seulement quand
+        # ils sont donnés (relais de modèle, déclaration d'un appareil médié).
+        for column, value in (("source", source), ("executor", executor),
+                              ("lease_owner", lease_owner), ("lease_epoch", lease_epoch)):
+            if value is not None:
+                cols.append(column)
+                values.append(value)
         if void_reason is not None:
             # L225 : tour sans tarif connu ni majorant sûr, écarté dès l'écriture
             cols.append("void_reason")
@@ -91,9 +99,11 @@ class TurnCosts(interface.TurnCosts):
         return bool(self.db.query(sql + suffix + " returning id", tuple(values)))
 
     def spent(self, seconds, *, agent, harnesses, account=None) -> float:
-        # L95 (0043) : une ligne écartée par `cost correct` ne compte plus
+        # L95 (0043) : une ligne écartée par `cost correct` ne compte plus ;
+        # L111 : la déclaration d'un appareil médié ne compte pas, le relais
+        # de modèle a mesuré la même dépense (`source = 'relay'`).
         clauses = ["recorded_at >= now() - make_interval(secs => %s)",
-                   "void_reason IS NULL"]
+                   "void_reason IS NULL", "source <> 'device'"]
         params: list = [float(seconds)]
         if agent != "all":
             clauses.append("agent = %s")
@@ -116,9 +126,22 @@ class TurnCosts(interface.TurnCosts):
         rows = self.db.query(
             "select coalesce(sum(usd), 0)::float8 as usd from turn_costs"
             " where recorded_at > to_timestamp(%s) and recorded_at <= to_timestamp(%s)"
-            " and void_reason is null and harness in (" + ", ".join(["%s"] * len(names)) + ")",
+            " and void_reason is null and source <> 'device' and harness in ("
+            + ", ".join(["%s"] * len(names)) + ")",
             tuple([float(from_ts), float(to_ts)] + names))
         return float(rows[0]["usd"]) if rows else 0.0
+
+    def paid_lines(self, from_ts, *, harnesses) -> list[dict]:
+        names = list(harnesses)
+        if not names:
+            return []
+        return self.db.query(
+            "select harness, account, extract(epoch from recorded_at)::float8 as ts,"
+            " usd::float8 as usd from turn_costs"
+            " where recorded_at > to_timestamp(%s) and void_reason is null"
+            " and source <> 'device'"
+            " and harness in (" + ", ".join(["%s"] * len(names)) + ")",
+            tuple([float(from_ts)] + names))
 
     def unpriced(self, since_ts, prefix) -> list[dict]:
         return self.db.query(

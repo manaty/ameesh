@@ -255,6 +255,9 @@ class PageBuilderTest(unittest.TestCase):
         self.assertIn("function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }", html)
         self.assertIn("var seen = Object.create(null);", html)
         self.assertNotIn("var seen = {};", html)
+        # un harnais « constructor » sans comptes déclarés garde sa jauge
+        self.assertIn('covered = Object.create(null);', html)
+        self.assertNotIn('covered = {};', html)
         self.assertIn("var hasTask = Object.create(null);", html)
         self.assertIn('open.length || !g.rows.length ? "" : " done"', html)
         self.assertIn("f = addDays(midnight(Math.min.apply(null, mts)), -1);", html)

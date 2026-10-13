@@ -1,0 +1,171 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "family": "hosts",
+ "cases": [
+  {
+   "name": "hosts.record/ok",
+   "op": "hosts.record",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0759aa88-8472-56b0-ab69-0959cc76aa9b"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.record",
+     "args": [
+      {
+       "host": "anna-portable",
+       "mem_available_bytes": 5368709120,
+       "swap_used_bytes": 0,
+       "load1": 0.4,
+       "cpu_count": 4,
+       "disk_free_bytes": 21474836480,
+       "disk_path": "/var/lib/ameesh-exec",
+       "turns_in_progress": 1
+      }
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "host": "anna-portable",
+      "mem_available_bytes": 5368709120,
+      "swap_used_bytes": 0,
+      "load1": 0.4,
+      "cpu_count": 4,
+      "disk_free_bytes": 21474836480,
+      "disk_path": "/var/lib/ameesh-exec",
+      "turns_in_progress": 1,
+      "id": 77,
+      "sampled_ts": 1791640000.12
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "hosts.latest/ok",
+   "op": "hosts.latest",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.latest",
+     "args": [
+      "anna-portable"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "host": "anna-portable",
+      "mem_available_bytes": 5368709120,
+      "swap_used_bytes": 0,
+      "load1": 0.4,
+      "cpu_count": 4,
+      "disk_free_bytes": 21474836480,
+      "disk_path": "/var/lib/ameesh-exec",
+      "turns_in_progress": 1,
+      "id": 77,
+      "sampled_ts": 1791640000.12
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "hosts.current/ok",
+   "op": "hosts.current",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.current",
+     "args": [
+      "anna-portable"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "host": "anna-portable",
+       "mem_available_bytes": 5368709120,
+       "swap_used_bytes": 0,
+       "load1": 0.4,
+       "cpu_count": 4,
+       "disk_free_bytes": 21474836480,
+       "disk_path": "/var/lib/ameesh-exec",
+       "turns_in_progress": 1,
+       "id": 77,
+       "sampled_ts": 1791640000.12
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "hosts.turns_in_progress/ok",
+   "op": "hosts.turns_in_progress",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.turns_in_progress",
+     "args": [
+      "anna-portable"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 1,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

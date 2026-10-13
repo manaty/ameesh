@@ -112,7 +112,7 @@ restée sans lot : `ameesh work unrecorded --since 24h`.
   « le propriétaire a décidé… ».
 
 Si tu perds cette consigne (contexte résumé), relis-la :
-`ameesh chat --consigne`.
+`ameesh chat --instruction`.
 
 Commence maintenant : lance `ameesh decisions` et montre les décisions en
 attente à $human.

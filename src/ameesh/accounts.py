@@ -112,6 +112,9 @@ TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
 #: per-account settings `cap`, `overage_cap` and `priority`
 PRIMARY_CAP = 0.50          #: the harness's default account leaves half of each window to the owner
+#: L242b (2): a non-critical agent stops this much below the pace cap, so that
+#: the critical agents keep the margin up to it
+RESERVE = 0.10
 OVERAGE_CAP = 0.80          #: an account that may be billed beyond its plan stops early
 PRIMARY_PRIORITY = 100      #: the default account comes last
 OTHER_PRIORITY = 50
@@ -540,6 +543,8 @@ class Evaluation:
     gauges: list = field(default_factory=list)
     until: float | None = None           #: remise à zéro attendue si au seuil
     problems: list = field(default_factory=list)
+    #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
+    held: tuple | None = None
     #: L226b: {gauge key: (cap, label)}, the cap each window is held to
     limits: dict = field(default_factory=dict)
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
@@ -616,7 +621,8 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
     return fixed
 
 
-def limits(profile: Profile, gauges, now: float, *, critical: bool = False) -> dict:
+def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
+           reserve: bool = False) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
@@ -624,26 +630,37 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False) -> d
     * the account's fixed cap (`account_cap`: 50 % for the primary);
     * `overage_cap` (80 %) when the account may be billed beyond its plan.
 
-    `critical` (L242b): see `fixed_caps`.
+    `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
+    non-critical agent): the pace cap, or the short window cap that replaces
+    it, is lowered by `RESERVE`, and never exceeds the pace cap minus
+    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
+    cut = RESERVE if reserve else 0.0
     out = {}
     for gauge in gauges:
+        pace = (max(0.0, gauge.pace_cap(now) - cut), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
-            base = (profile.short_window_cap, "short window cap")
+            base = (max(0.0, profile.short_window_cap - cut), "short window cap")
+            if reserve:
+                # #373 r1 : jamais au-dessus du rythme moins la réserve,
+                # min(80 %, écoulé), même quand le plafond court le remplace
+                base = min(base, pace, key=lambda pair: pair[0])
         else:
-            base = (gauge.pace_cap(now), "pace cap")
+            base = pace
         out[gauge.key] = min([base, *fixed], key=lambda pair: pair[0])
     return out
 
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
-             environ=None, *, record: bool = True, critical: bool = False) -> Evaluation:
+             environ=None, *, record: bool = True, critical: bool = False,
+             reserve: bool = False) -> Evaluation:
     """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
 
     `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
     `critical` (L242b) : pour un agent critique, sans le plafond implicite de
-    50 % du compte par défaut (`fixed_caps`)."""
+    50 % du compte par défaut (`fixed_caps`). `reserve` : pour un agent non
+    critique, le rythme moins `RESERVE` (`limits`)."""
     result = Evaluation(profile)
     result.problems = check(profile, environ)
     if result.problems:
@@ -663,7 +680,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
-    result.limits = limits(profile, result.gauges, now, critical=critical)
+    result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve)
     depasses = []
     for gauge in result.gauges:
         # fenêtre remise à zéro depuis le relevé : vierge (L71 : `used_at`
@@ -678,6 +695,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # not what holds the account
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
                                                     result.limits[depasses[0].key])
+        result.held = (gauge.key, gauge.used)
         if label == "pace cap":
             result.reason = ("plan %s %s: %.0f%% used with %.0f%% of the window elapsed "
                              "(pace cap %.0f%%)" % (
@@ -686,8 +704,15 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         else:
             result.reason = "%s plan %s: %.0f%% used (%s %.0f%%)" % (
                 profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
+        if reserve and not hard:
+            result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
         resets = [g.resets_at for g in depasses if g.resets_at]
         result.until = max(resets) if len(resets) == len(depasses) else None
+        if result.until is not None:
+            # #373 r2 : la pause affichée est celle de la fenêtre qui bloque
+            # le plus longtemps
+            late = max(depasses, key=lambda g: float(g.resets_at))
+            result.held = (late.key, late.used)
         return result
     if profile.hourly_usd > 0 and book.db is not None:
         spent = book.spent("all", 3600, account=profile.name, harnesses=[profile.harness])
@@ -735,6 +760,19 @@ class Choice:
     #: L242b : choix propre à un agent critique — le dernier choix partagé
     #: (`account_active`) n'a pas bougé, aucun forçage n'a été levé
     per_agent: bool = False
+
+
+def pause_label(evaluations: dict) -> str:
+    """L242b (4) : la pause en court, devant sa raison détaillée — le compte
+    qui se libère le premier : « pause (account secondaire, five_hour 96 %)
+    until 14:20; ». Vide si aucun compte n'a de remise à zéro datée."""
+    dated = [ev for ev in evaluations.values() if ev.until and ev.held]
+    if not dated:
+        return ""
+    first = min(dated, key=lambda ev: ev.until)
+    from .cost import until_label
+    return "pause (account %s, %s %.0f %%) until %s; " % (
+        first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until))
 
 
 def _label(evaluations: dict) -> str:
@@ -853,7 +891,7 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
-           paced: bool = True, critical: bool = False) -> Choice:
+           paced: bool = True, critical: bool = False, margin: bool = False) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -880,6 +918,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     sans autre compte, le compte par défaut sert au-delà de son plafond
     implicite de 50 % (jamais en overage ; rythme et `overage_cap` tenus,
     même avec `paced=False`), en dernier.
+
+    `margin` (L242b (3), #389 r1) : un agent critique qui tourne sous un
+    harnais emprunté ne revient au sien qu'avec la réserve des non-critiques
+    (`RESERVE`) sous le rythme — sans cette marge, chaque franchissement du
+    plafond coûterait une rotation avec résumé.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -894,7 +937,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     def ev(profile: Profile) -> Evaluation:
         if profile.name not in cache:
             cache[profile.name] = evaluate(book, profile, items, now, environ,
-                                           record=not simulate)
+                                           record=not simulate,
+                                           reserve=margin or not critical)
         return cache[profile.name]
 
     active_name = row.get("account")
@@ -965,12 +1009,14 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     beyond = False
     if not ranked and critical:
         # L242b : le compte par défaut au-delà de son plafond de 50 %, pour un
-        # agent critique seulement, en dernier (jamais en overage)
+        # agent critique seulement, en dernier (jamais en overage) ; au retour
+        # d'un emprunt, avec la même marge (#389 r2)
         relaxed = dict(cache)
         for profile in candidates:
             if profile.default and profile.cap is None:
                 relaxed[profile.name] = evaluate(book, profile, items, now, environ,
-                                                 record=False, critical=True)
+                                                 record=False, critical=True,
+                                                 reserve=margin)
         # le rythme tient ici même garde désactivée (#324 r1)
         ranked = rank(candidates, relaxed, now)
         if ranked:
@@ -989,8 +1035,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                               harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
                                   "reason") or "authentication failing")
                                   for p in items if p.name in sick)))
-        return Choice(None, active, reason="all %s accounts at threshold — %s"
-                      % (harness, _label(cache)))
+        return Choice(None, active, reason="%sall %s accounts at threshold — %s"
+                      % (pause_label(cache), harness, _label(cache)))
     target = ranked[0]
     why = reason_of(ranked, cache, now)
     if beyond:

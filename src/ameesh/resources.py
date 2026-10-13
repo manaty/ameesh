@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 from . import platform, storage
@@ -129,7 +130,10 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
 
     Rend None si la valeur est absente ou illisible (l'appelant décide du
     défaut ou du constat). Un texte négatif n'est pas un octet valide.
-    """
+    `decimal_ok=False` exige un nombre entier d'octets : « 4.5GiB » (exact)
+    passe, « 0.001KiB » (1.024 octet) est refusé au lieu d'être tronqué à 1
+    (codex #459 r2), et chaque chiffre compte, même au-delà des 28 chiffres
+    du contexte décimal (codex #459 r3)."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -137,7 +141,9 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
         return value if value >= 0 and finite_float(value) is not None else None
     if isinstance(value, float):
         # .inf, .nan (YAML): no size, never an unbounded one
-        if not decimal_ok or not math.isfinite(value) or value < 0:
+        if not math.isfinite(value) or value < 0:
+            return None
+        if not decimal_ok and not value.is_integer():
             return None
         return int(value)
     if not isinstance(value, str):
@@ -149,10 +155,40 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     if unit not in _UNITS:
         return None
     factor = _UNITS[unit]
-    if not decimal_ok and "." in number and factor == 1:
-        return None
     size = float(number) * factor
-    return int(size) if math.isfinite(size) else None
+    if not math.isfinite(size):
+        return None
+    if decimal_ok:
+        return int(size)
+    # arithmétique entière exacte : le texte doit désigner un nombre entier
+    # d'octets, et aucun chiffre ne doit être perdu. Une multiplication
+    # `Decimal` garde le contexte par défaut (28 chiffres significatifs) et
+    # arrondit : « 1.0000000000000000000000000001GiB » passait pour 1 GiB
+    # (codex #459 r3). On multiplie donc le nombre entier de chiffres par le
+    # facteur, puis on exige que l'échelle décimale divise exactement.
+    whole, _, fraction = number.partition(".")
+    try:
+        exact = int(whole + fraction) * factor
+    except ValueError:
+        # plus de chiffres que la limite de conversion des entiers de Python
+        # (4300 par défaut) : aucune taille, jamais une exception (codex #459
+        # r4 : `1.` suivi de 4300 zéros levait un ValueError non rattrapé)
+        return None
+    scale = 10 ** len(fraction)
+    if exact % scale:
+        return None
+    return exact // scale
+
+
+def bytes_digit_limit() -> int:
+    """The digit count beyond which Python refuses to convert a text to an
+    integer (`sys.get_int_max_str_digits()`, 4300 by default); 0 when the
+    running interpreter has no such limit (before 3.11).
+
+    A size written with more digits cannot be checked by the exact reader of
+    `parse_bytes(decimal_ok=False)`: the caller refuses it rather than reading
+    it through the float path (codex #459 r4)."""
+    return getattr(sys, "get_int_max_str_digits", lambda: 0)()
 
 
 def parse_fraction(value) -> float | None:
@@ -187,10 +223,17 @@ def finite_float(value) -> float | None:
 
 
 def parse_percent(value) -> float | None:
-    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None."""
+    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None. Le signe
+    `%` est unique et à la fin (codex #459 r1 : « 20%% » n'est pas 20)."""
     if isinstance(value, str):
-        value = value.strip().rstrip("%").strip()
-    number = finite_float(value)
+        text = value.strip()
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        if "%" in text:
+            return None
+        number = finite_float(text)
+    else:
+        number = finite_float(value)
     if number is None or not 0.0 <= number <= 100.0:
         return None
     return number
@@ -463,9 +506,12 @@ def volumes(paths) -> list[dict]:
     of `paths`: `path` (the first that names it), `paths`, `disk_free_bytes`,
     `btrfs_unallocated_bytes`, `btrfs_metadata_headroom_bytes` (None when
     unreadable or not btrfs); `unreadable` when the filesystem cannot be
-    reached at all (#306)."""
+    reached at all (#306); `fstype` from the mount table (L64: a btrfs whose
+    allocation is not read is told apart from a filesystem that has none),
+    None without one."""
     out: list[dict] = []
     seen: dict[str, dict] = {}
+    mounts = platform.mountinfo() if platform.is_linux() else []
     for path in paths or ():
         if not path:
             continue
@@ -475,7 +521,9 @@ def volumes(paths) -> list[dict]:
             if path not in seen[key]["paths"]:
                 seen[key]["paths"].append(path)
             continue
-        volume = {"path": path, "paths": [path]}
+        mount = platform.covering_mount(os.path.realpath(path), mounts) if mounts else None
+        volume = {"path": path, "paths": [path],
+                  "fstype": mount["fstype"] if mount is not None else None}
         if _anchor(path) is None:  # #306: out of reach, read as unknown
             volume.update(dict.fromkeys(f for _floor, f in VOLUME_FLOORS), unreadable=True)
         else:
@@ -866,6 +914,41 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
+#: L64: the measures a reading carries, and their names for a human. One
+#: missing from a reading (None) is a measure this OS, or this host, cannot
+#: give (PSI before Linux 4.20 or outside Linux, load on Windows, an
+#: unreadable guest cgroup…): `unmeasured` says it instead of publishing
+#: nothing without a word. A share that needs two readings (`app_cpu`) is
+#: not listed: its first reading is always None.
+MEASURES = (
+    ("mem_available_bytes", "available memory"),
+    ("swap_used_bytes", "swap"),
+    ("load1", "load"),
+    ("cpu_count", "CPU count"),
+    ("disk_free_bytes", "free disk"),
+    ("tmp_fstype", "type of /tmp (tmpfs ceiling)"),
+    ("psi_cpu_some", "CPU pressure (PSI)"),
+    ("psi_mem_some", "memory pressure (PSI)"),
+    ("psi_io_some", "I/O pressure (PSI)"),
+    ("guest_mem_bytes", "guest memory (cgroup)"),
+)
+
+
+def unmeasured(reading: dict | None) -> list[str]:
+    """The names of the `MEASURES` that `reading` does not carry (None), in
+    table order, then each btrfs volume whose allocation is not read (#246:
+    the floors that `disk_free` cannot replace); [] without a reading."""
+    if not reading:
+        return []
+    out = [label for key, label in MEASURES if reading.get(key) is None]
+    for volume in reading.get("volumes") or ():
+        if (isinstance(volume, dict) and volume.get("fstype") == "btrfs"
+                and any(volume.get(f) is None for f in ("btrfs_unallocated_bytes",
+                                                        "btrfs_metadata_headroom_bytes"))):
+            out.append("btrfs allocation (%s)" % volume.get("path"))
+    return out
+
+
 def restart_record(record) -> dict | None:
     """L159e6: a `guard.restart` record ({ts, started, skipped}) checked and
     copied; None when ill-typed."""
@@ -902,13 +985,16 @@ def guard_restart(path: str | None = None, *, now: float | None = None) -> dict 
     return record
 
 
-def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
+def collect(cfg, db: Db, *, now: float | None = None, policy=None,
+            gate: dict | None = None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
     Le nombre de tours en cours vient de la base (agents de l'hôte au bail
     vivant et en tour) : c'est un état, pas une mesure locale. `policy` : la
     politique de ménage de l'hôte, pour la racine du cache des dépendances
-    (#253).
+    (#253). L159f : `gate` est l'état de la porte d'hôte que l'exécuteur suit
+    (`gate_state`, `gate_seq`, `gate_reason`), None sans porte ; le
+    déplacement le lit.
     """
     host = cfg.host or ""
     try:
@@ -925,8 +1011,13 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
         basis = None
     reading.update(lendable(reading, basis))
     reading["guard_restart"] = guard_restart(now=now)
+    reading.update({key: (gate or {}).get(key) for key in GATE_KEYS})
     storage.of(db).hosts.record(reading)
     return reading
+
+
+#: L159f: the host gate in a reading (`host_gate.GateController.snapshot`)
+GATE_KEYS = ("gate_state", "gate_seq", "gate_reason")
 
 
 # --------------------------------------------------------------------------

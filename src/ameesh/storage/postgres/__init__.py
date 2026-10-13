@@ -23,6 +23,8 @@ from .costs import TurnCosts
 from .conversations import Conversations
 from .credentials import Credentials
 from .grants import Grants
+from .host_lifecycle import HostLifecycle
+from .handoffs import Handoffs
 from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
 from .menage import Housekeeping
@@ -38,6 +40,8 @@ from .threads import Threads
 from .wakeups import Wakeups
 from .watches import Watches
 from .work import WorkItems
+from .work_dependencies import WorkDependencies
+from .lot_sessions import LotSessions
 
 
 class PostgresStorage(interface.Storage):
@@ -62,6 +66,8 @@ class PostgresStorage(interface.Storage):
         self.approvals = Approvals(db)
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
+        self.work_dependencies = WorkDependencies(db)
+        self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
         self.actions = Actions(db)
         self.action_source = ActionSource(db)
@@ -76,7 +82,9 @@ class PostgresStorage(interface.Storage):
         self.decisions = Decisions(db)
         self.roadmap = Roadmap(db)
         self.operations = Operations(db)
+        self.handoffs = Handoffs(db)
         self.hosts = Hosts(db)
+        self.host_lifecycle = HostLifecycle(db)
         self.turn_resources = TurnResources(db)
         self.visibility = Visibility(db)
         self.housekeeping = Housekeeping(db)

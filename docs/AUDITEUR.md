@@ -27,6 +27,12 @@ qu'il ne fait jamais, et comment il en rend compte.
   est retirée (module IT, L317a) : analyse profonde ciblée sur ce lot, premier
   rapport dans les 30 min (voir « Sur un bug de priorité 1 ou une release
   retirée ») ;
+* le courrier `event` urgent « Critical agent paused on budget: … »
+  d'`ameesh` (L242b) : un agent critique est en pause budget. Passage court
+  centré sur ce point : quel compte, jusqu'à quand (`ameesh accounts list`,
+  `ameesh budget --json`) ; le geste revient à l'orchestrateur ou à l'humain
+  (libérer un compte, relever un plafond, confier le travail urgent à un
+  autre agent). S'il le fait lui-même, c'est au niveau 3 : il propose ;
 * le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
   traiter (L132) : « Stale lot: … », « Underused plan: … »,
   « Idle capacity: … », et leur « Reminder, alert still active … » 6 h plus
@@ -64,7 +70,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot ouvert |
+| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
 | 4 | Dépense et solde | `ameesh budget --json`, `ameesh cost balance`, `ameesh cost gauges` | dépense réelle au-dessus de l'estimation, plafond proche, `balance_low` |
@@ -76,6 +82,29 @@ le JSON plutôt que le texte.
 | 10 | Demandes d'humains sans lot (L130) | `ameesh work unrecorded --since 2h --json` (`--since 24h` en analyse profonde) | message d'un humain, réponse à une décision ou demande transmise par son chat qui n'est rattachée à aucun lot, n'en cite aucun et dont aucun lot ne reprend la phrase ; le rapport la nomme (numéro du message, expéditeur, destinataire, extrait) à l'orchestrateur du projet, qui l'enregistre ([ORCHESTRATEUR.md](ORCHESTRATEUR.md), « Toute demande d'un humain devient un lot ») |
 | 11 | Estimations (L157, L157b, L157c) | `ameesh alerts --json` (`estimate_bias`), `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`), `ameesh work show <id> --json` (`measure`), `ameesh work schedule --json` | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré ; L157c: delivered lots without a measure (`measure` null) or with CI unknown; measured size differing from the declared size (`size_match` false) for one estimator again and again; the phase that carries the gap (agent, CI, review, human); open lots left unplanned by `work schedule` |
 | 12 | Conformité aux procédures (L234) | `ameesh work list --json`, `ameesh decisions --json`, `ameesh fil show <projet> --last 200`, `ameesh work show <id> --json`, requêtes 10–12, journaux et forge | attente humaine sans demande ouverte ; question hors `ameesh decide` ; réparation manuelle par humain/bureau ; annonce sans fait correspondant — suivre la méthode ci-dessous |
+| 13 | Version numbers (L158) | `gh release list -L 5`, then for each version published since the last pass `python3 ameesh/scripts/version-level.py release v<n>` (after `git -C ameesh fetch --tags`) | `WRONG NUMBER`: the number is below what its content needs (a minor shipped as a patch, a break without a major) or skips a number; a level above the floor found with no reason in the release notes; a published version without its `v<n>` tag. Level 3: it reports it to the owner, who decides whether to publish a corrected number |
+
+### Contrôles apportés par les modules (point 12, L317b)
+
+Le cœur de l'auditeur reste générique. À chaque passage court, lire aussi
+`ameesh alerts --json` : les modules actifs par projet y apportent leurs
+écarts sous `module_deviation`. Le constat contient le module, la règle, le
+projet, le lot et la référence de la déclaration concernée. Suivre la règle
+et l'action du module ; ne jamais exécuter un artefact pour compléter un audit.
+Le circuit `ameesh notify` transmet le constat au canal configuré du
+propriétaire, aux orchestrateurs du projet et aux auditeurs déclarés par rôle
+dans le canon, affectés à ce projet ou sans projet (auditeurs globaux).
+Les orchestrateurs doivent aussi avoir un rôle explicite dans le canon.
+L'envoi revérifie rôle et projet sous verrou de la ligne du destinataire
+jusqu'au dépôt en boîte ; le fil est écrit dans le projet du constat.
+Le responsable humain vient du paquet de travail du lot, sinon de la
+configuration par défaut, jamais de l'assigné ou de son hôte.
+Le nom `auditeur` seul ne donne pas accès aux constats des modules ; aucun
+repli vers les agents d'un autre projet. Sans destinataire agent, le canal
+propriétaire reste le circuit de signalement. Une décision
+nécessaire ensuite passe par `ameesh decide`, jamais par courrier libre au
+propriétaire. Au passage suivant, vérifier que le constat a disparu après
+la correction, ou expliquer la preuve encore manquante.
 
 ### Conformité aux procédures (point 12, L234)
 
@@ -586,6 +615,7 @@ FIN
 | agent arrêté, mort ou au repos avec du travail | `ameesh resume <agent>` | `ameesh set` ou arrêt par le responsable |
 | session trop grosse, agent qui tourne en rond, **hors tour** | `ameesh restart <agent> --brief -` (brief de reprise court sur l'entrée standard) | la session précédente reste dans l'historique |
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
+| « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
@@ -683,6 +713,7 @@ d'un serveur, `vm.sh verifier` l'affiche), puis
 écart porte autre chose que des corrections de bugs (une évolution fusionnée
 mais pas encore déployée, une migration qui n'est pas additive), il ne déploie
 pas : il le signale au propriétaire, et sa correction attend avec le reste.
+`python3 ameesh/scripts/version-level.py level <installé> <sha>` (L158) gives the same answer from the content: it deploys only on `patch`.
 
 ```sh
 git -C ameesh fetch -q origin && git -C ameesh checkout -q --detach <sha>
@@ -883,7 +914,9 @@ Environment=AUDITEUR_RESERVE_DIR=<dossier des scripts de la réserve>
 ```
 
 L'exécuteur ne relance un agent au repos qu'**une fois** : après un tour de
-relance, il attend du courrier. Les passages viennent donc de trois minuteurs.
+relance, il attend du courrier. (#408 : s'il détient un lot actionnable, la règle 1
+le réveille aussi pour ce lot, borné ; `ameesh set auditeur lot_wake=off`
+l'en dispense.) Les passages viennent donc de trois minuteurs.
 Le passage horaire (`ameesh-auditeur-heure.service` et `.timer`) :
 
 ```ini

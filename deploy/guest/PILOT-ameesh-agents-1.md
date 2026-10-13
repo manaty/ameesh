@@ -1,0 +1,268 @@
+# Pilot (a1) on ameesh-agents-1: the owner's commands (L159g)
+
+The exact commands of the first lending host, for its owner, as root. The
+general steps and the report are in
+[EXPLOITATION.md](../../docs/EXPLOITATION.md#lending-host-pilot-mode-a1--ameesh-hosts-host---report-l159g);
+the design in the [L159 study](../../docs/design/etudes/l159-capacite-des-hotes.md),
+sections 2.1, 3 and 4. Validated by mesh-design on 2026-10-12 (lot #192):
+
+* guests: `deepseek6` and `deepseek1` (today the last two personas on
+  manaty-mesh-1; `deepseek5` became a native agent of the host with
+  manaty/home#27), DeepSeek through `dsh`, no subscription account; installed
+  in observation only;
+* the script's default offer: `cpu_max 2`, `cpu_weight 10`, `memory_max
+  9GiB`, `agent_memory_max 4.5GiB`, `disk_max 40GiB`; reclaim at 6 GiB
+  available, CPU pressure 20 %, memory 2 %, I/O 20 %, 10 GiB free on `/`;
+  drain 120 s, calm 600 s;
+* the host's own agents stay thirteen (manaty/home#22, #23, #26, #27), to be
+  reviewed with the report of 20/10; the canon's `max_agents` goes from 13
+  to 15 because it counts every placement of the host, the guests' included
+  (13 would make the fiche invalid); manaty-mesh-1 goes to `max_agents: 0`
+  and carries only the mesh database (validated by the owner, relayed by
+  bureau on 2026-10-12 at 19:40).
+
+## Before
+
+* On `main`: the gate (L159f, #191), `--once` (L159f4, #378) and this
+  script (L159g, #192).
+* **A checkout that only root can change.** The script installs
+  `/opt/ameesh/venv` from it, as root: never run it from an agent's clone
+  (`/home/ameesh/work/…` is writable by the agents).
+
+  ```sh
+  sudo git clone https://github.com/manaty/ameesh /root/ameesh   # or: git -C /root/ameesh pull
+  cd /root/ameesh && git log -1 --oneline                        # the reviewed commit of main
+  ```
+
+* **The guest's volume: a 40 GB Block Storage volume** (the owner's
+  decision 10408, 2026-10-12, option a). `/srv/ameesh-guest` is not a
+  mount point today: one local 150 GB disk (`l_ssd`), 109 GB free; the VM
+  is a GP1-S in `fr-par-1`. The volume, 5K IOPS, is mounted on
+  `/srv/ameesh-guest`: a guest that fills it never reaches the system nor
+  the host's own agents (study §4.1). Its size holds the offer's `disk_max
+  40GiB` (no filesystem quota; the guard's reclaim watches `/`). Cost:
+  €0.000130/GB/hour excluding VAT (scaleway.com/en/pricing/storage, read on
+  2026-10-12), about **€3.80 per month** (730 h), snapshots not included.
+  `deploy/guest/volume-pilot.sh` does the steps below, idempotent, with
+  its rollback (`unmount`, then `detach [--delete]`); read its `--dry-run`
+  first:
+
+  ```sh
+  deploy/guest/volume-pilot.sh create --project-id <project-id>   # workstation, scw
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>   # host
+  sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
+  ```
+
+  `--project-id` is the ameesh project (`scw account project list`): every
+  list is filtered by it, the server and the volume checked against it,
+  never the CLI's default project. It finds the disk by the volume's id,
+  formats it only when both probes (`blkid`, `wipefs`) succeed and find
+  nothing, and writes the fstab line with the filesystem's UUID last, once
+  the mount point is checked free and empty. By hand, from a
+  workstation with the `scw` CLI configured for the ameesh project:
+
+  ```sh
+  scw block volume create name=ameesh-guest perf-iops=5000 from-empty.size=40GB \
+    project-id=<project-id> zone=fr-par-1
+  scw block volume wait <volume-id> zone=fr-par-1          # until "available"
+  scw instance server list name=ameesh-agents-1 project-id=<project-id> zone=fr-par-1
+  scw instance server attach-volume server-id=<server-id> volume-id=<volume-id> \
+    volume-type=sbs_volume zone=fr-par-1
+  ```
+
+  Then on the host (the new disk is the one `lsblk` did not list before,
+  without partitions; check its size):
+
+  ```sh
+  lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+  sudo mkfs.ext4 -L ameesh-guest /dev/<new disk>
+  sudo mkdir -p /srv/ameesh-guest
+  echo "UUID=$(sudo blkid -p -s UUID -o value /dev/<new disk>) /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2" \
+    | sudo tee -a /etc/fstab
+  sudo systemctl daemon-reload && sudo mount /srv/ameesh-guest
+  findmnt /srv/ameesh-guest                                # the volume, 40 GB
+  ```
+
+  `nofail`: the host boots even without the volume. The guest's runners
+  do not start then (`RequiresMountsFor=/srv/ameesh-guest`): they never
+  write on the root disk instead; the host's agents are not affected.
+
+  `--allow-rootfs` (the guest on `/`, `disk_max` indicative only) is not
+  used on this host.
+
+* **An existing volume.** On 2026-10-12 at about 17:40Z,
+  `/srv/ameesh-guest` was found already mounted from an SBS volume
+  (`/dev/disk/by-id/scsi-0SCW_sbs_volume-24f1ba5b-…`), an ext4 labelled
+  `ameesh-guest`, with a by-hand line in `/etc/fstab`:
+
+  ```
+  LABEL=ameesh-guest /srv/ameesh-guest ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2
+  ```
+
+  The script adopts such a volume as it is, never formatting it and
+  keeping that line: give its id to `mount` (nothing to `create`), then
+  `check`:
+
+  ```sh
+  scw block volume get <volume-id> zone=fr-par-1     # workstation: ameesh-guest, 40 GB, the project
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id> --dry-run
+  sudo deploy/guest/volume-pilot.sh mount --volume-id <volume-id>
+  sudo deploy/guest/volume-pilot.sh check --volume-id <volume-id>
+  ```
+
+  It is adopted only when it is shown to be the pilot's: the disk of
+  `<volume-id>` is an ext4 labelled `ameesh-guest`; the label names that
+  disk and no other (udev's `/dev/disk/by-label/ameesh-guest`, and every
+  disk probed again with `blkid`), or the line would mount another disk at
+  the next boot; the filesystem mounted on `/srv/ameesh-guest`, if any, is
+  that disk's, its UUID too. Anything else is refused, nothing changed.
+  `check` says `ok` for the `LABEL=` line on the same conditions (the label
+  and the mounted UUID are the volume's, by udev's links); without
+  `--volume-id` it cannot tell, and says `NOT ok`. `unmount` removes that
+  line like its own, on the same conditions. `create` and `detach` take it
+  only if Scaleway says it is the pilot's (named `ameesh-guest`, 40 GB, in
+  the project: the `scw block volume get` above); otherwise they refuse it,
+  and it is renamed or replaced by hand first.
+
+## Install (guard in observation, no guest runner started)
+
+`dsh` is in `/opt/node/bin`, which `sudo`'s `secure_path` does not contain:
+give it with `--path`.
+
+```sh
+cd /root/ameesh
+sudo deploy/guest/install-pilot.sh --dry-run --host ameesh-agents-1 \
+  --agent deepseek6 --agent deepseek1 --path /opt/node/bin    # read it all
+sudo deploy/guest/install-pilot.sh --host ameesh-agents-1 \
+  --agent deepseek6 --agent deepseek1 --path /opt/node/bin
+```
+
+Then the secrets (files created empty, `0640 root:ameesh-guest`, never
+overwritten by the script):
+
+```sh
+sudoedit /etc/ameesh/guest.env             # AMEESH_DSN=… the host's login role (L56)
+sudoedit /etc/ameesh/guest-deepseek1.env   # DEEPSEEK_API_KEY=…, GH_TOKEN=…
+sudoedit /etc/ameesh/guest-deepseek6.env
+sudo deploy/guest/install-pilot.sh --check # every line "ok"
+```
+
+## Enable the two guests
+
+Only once the canon PR (manaty/home#24, a draft until that day) is merged: the Host fiche gets `policy.lend` (the
+offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 15` (13
+own agents + 2 guests), without `volatile`; `policy.work_dirs` puts the guests'
+work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek6 and
+deepseek1 move from manaty-mesh-1 to ameesh-agents-1, which keeps
+`max_agents: 0` there. Their runners on manaty-mesh-1 are
+stopped first: an agent runs on one host at a time.
+
+`--enable` first prepares what each guest needs to work (lot #483: the
+three steps bureau did by hand on the first activation), then starts the
+runners. Everything is checked before anything is done:
+
+* **its clone**: the agent's project (`team`, here `nexlink`) and its work
+  folder (`policy.work_dirs`, `/srv/ameesh-guest/work/{agent}`) are read in
+  the canon (`--canon`, at `origin/main`, by ameesh's reader, as the
+  checkout's owner); the canon holds no forge for a project, so `--repo`
+  gives it: `https` only, no user or token in the URL. The guest clones it
+  there, detached on `origin/<branch>`. A folder outside
+  `/srv/ameesh-guest/work`, an agent not placed on the host, a folder
+  holding anything but a clone of that repository: refused. A clone already
+  there is kept as it is (never fetched nor reset);
+* **its git credential**: `/opt/ameesh/git-credential-guest` (root, 0755),
+  named in each clone's own `.git/config`, after an empty
+  `credential.helper` that resets the ones read before it (the system's,
+  the guest's `~/.gitconfig`); nothing is written in `~/.gitconfig`. It
+  hands git the runner's `GH_TOKEN`, which systemd reads in
+  `/etc/ameesh/guest-<agent>.env`, for `https://github.com` only. A kept
+  clone with any other credential setting git would read after that reset
+  (any `credential.*` but `credential.helper`, a `credential.<url>.helper`
+  for one, anywhere, the guest's `~/.gitconfig` included; a
+  `credential.helper` in `config.worktree` or in an include) is refused:
+  remove it first, `--enable` says where it is. For the clone itself (and
+  the branch asked first), git, run as the guest, is given an inline
+  helper that reads `GH_TOKEN` in the agent's file itself (the guest's to
+  read, as its runner does), on each request, for `https://github.com`
+  only: root hands git no token (no file, argument, environment or open
+  descriptor), and nothing is printed. A clone without `GH_TOKEN` in the
+  agent's file is refused. **The guests of one host share a UID
+  (`ameesh-guest`), so their tokens**: any guest agent, or a git hook it
+  runs, can read every `guest-<agent>.env`. Use one GitHub token per guest
+  host, with the fewest rights possible (`--check` says it too);
+* **the dsh profile**: `hooks.json` and the plain files of
+  `~/.dsh/profiles/*/` from `--dsh-from` (by default the `sudo` user's
+  `~/.dsh`), never its sessions, keys, logs or modules; refused if a file
+  looks like it holds a key, token or password. Kept if the guest has one;
+  `--check` reads it by the same rules.
+
+What lands in the guest's home or work is written by the guest
+(`runuser -u ameesh-guest`), never by root. `--check` reports each of them
+(with `--canon`, the folders the canon gives; without, `work/<agent>`).
+
+The commands below are this host's (its guests, its project and forge, as
+of the pilot): an example of `--repo`, never a default. ameesh names no
+project; `--repo` is given on each run of `--enable` and is stored nowhere.
+
+```sh
+sudo deploy/guest/install-pilot.sh --dry-run --enable deepseek6 deepseek1 \
+  --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \
+  --repo nexlink=https://github.com/manaty/nexlink.git#develop   # read it all
+sudo deploy/guest/install-pilot.sh --enable deepseek6 deepseek1 \
+  --canon /home/ameesh/canon --dsh-from /home/ameesh/.dsh \
+  --repo nexlink=https://github.com/manaty/nexlink.git#develop
+sudo deploy/guest/install-pilot.sh --check --canon /home/ameesh/canon
+systemctl status 'ameesh-guest-runner@*'
+```
+
+On ameesh-agents-1, where bureau made the clones, the credential and the
+profile by hand on 2026-10-12: the clones and the profile are kept (said
+`kept`), each clone's `.git/config` names the helper after its reset (the
+same `GH_TOKEN`, from the same file), and `--check` shows them all. A
+helper bureau set for `https://github.com` in the guest's `~/.gitconfig`
+(`credential.https://github.com.helper`) is refused: unset it first
+(`git config --global --unset-all credential.https://github.com.helper`,
+as the guest); a plain `credential.helper` there may stay.
+
+After a day of observation without a missed target
+(`ameesh hosts ameesh-agents-1 --report --days 1`):
+
+```sh
+sudo deploy/guest/install-pilot.sh --set-guard-mode enforce
+```
+
+## Rollback
+
+From the lightest to the full one; each step is enough on its own.
+
+| When | Command |
+|---|---|
+| The guard's caps get in the way of the host | `sudo deploy/guest/install-pilot.sh --set-guard-mode observe` (stops the guard, takes its caps off the slice and the runners, starts it again observing) |
+| A guest misbehaves | `sudo deploy/guest/install-pilot.sh --disable deepseek1` (its turn drains first, 180 s at most) |
+| The pilot stops (§4.4 target missed, natives delayed) | `sudo deploy/guest/install-pilot.sh --uninstall` |
+| Nothing of the pilot must stay | `sudo deploy/guest/install-pilot.sh --uninstall --purge` |
+
+An observing guard starts no runner again: one the enforcing guard had
+stopped (level 4) shows `inactive` in `--check`, and `--enable` starts it.
+
+`--uninstall` follows the study's order (§4.3): `ameesh guard drain`, the
+guest runners then the guard stopped and disabled, units, drop-ins and gate
+directories removed; the host's own agents (`ameesh-agents.slice`) are not
+touched. `--purge` also removes the secrets, the offer, and the user, the
+venv and the guest's directories, only those the script created: it
+records each one, by its absolute path, before creating it
+(`/etc/ameesh/pilot-install.state`); a directory or a secrets file that
+was there before, a tree with a mount point in it, or anything outside them
+stays (a mount point is read in `/proc/self/mountinfo`, binds included).
+What stays keeps its record, so a later `--purge` can still remove it,
+the user too when `userdel` fails (its processes still running). A `--root`
+through a symbolic link is refused: give the resolved path. The install refuses a volume bigger than `disk_max` (nothing else
+holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
+deepseek6 and deepseek1 back on manaty-mesh-1 (its `max_agents` back to 2) and removes `policy.lend`, and
+the host's login role (L56) is dropped. The volume: `sudo
+deploy/guest/volume-pilot.sh unmount --volume-id <volume-id>` on the host
+(only that volume's filesystem, by its source and UUID; its fstab line, or
+an older by-hand `LABEL=ameesh-guest` one), then
+`deploy/guest/volume-pilot.sh detach --project-id <project-id> [--delete]`
+from the workstation (`--delete`: its data lost, its billing stopped; only
+the pilot's volume, its name, project and size checked).

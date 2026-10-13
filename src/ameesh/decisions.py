@@ -374,7 +374,7 @@ def resolve_owner(cfg: Config, db, requester_row: dict | None, item: dict
 
 def _project(db, item: dict, requester_row: dict | None) -> str | None:
     """Le projet affiché d'une demande : celui du lot (`app`, `workstream`,
-    équipe de sa fiche), sinon celui du demandeur (équipe, chantier)."""
+    équipe de sa fiche), sinon celui du demandeur (équipe, `workstream`)."""
     def text(value) -> str:
         return " ".join(str(value or "").split())
     name = text(item.get("app")) or text(item.get("workstream"))
@@ -382,7 +382,8 @@ def _project(db, item: dict, requester_row: dict | None) -> str | None:
         name = text((storage.of(db).packages.get(item["package_id"]) or {}).get("team"))
     if not name:
         row = requester_row or {}
-        name = text(row.get("team")) or text(row.get("chantier"))
+        name = (text(row.get("team")) or text(row.get("workstream"))
+                or text(row.get("chantier")))
     return name or None
 
 
