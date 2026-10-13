@@ -300,14 +300,20 @@ class IdentityTest(_Base):
         self.assertEqual(self.tip(), self.base)          # rien n'a bougé non plus
 
     def test_a_local_origin_with_a_github_slug_is_refused_before_any_read(self):
-        """Le cas inverse du témoin R1 (cx3) : depuis un transport local, une
-        clé GitHub n'est pas vérifiable — refus avant gh, admission et push."""
+        """Le cas inverse du témoin R1 (cx3) : une PR de B, protégée, et les
+        remotes de A — refus avant gh, avant la résolution radar et avant
+        toute admission ou écriture."""
         gh = self.gh()
-        with mock.patch.object(merge_pr.merge_queue, "readiness",
-                               side_effect=AssertionError("admission reached")):
+        protected_b = radar.Project(name="b", repo=self.repo, github="b/repo",
+                                    protected=("main",))
+        with mock.patch.object(merge_pr.merge_queue, "radar_project",
+                               return_value=protected_b) as resolved, \
+                mock.patch.object(merge_pr.merge_queue, "readiness",
+                                  side_effect=AssertionError("admission reached")):
             with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
                 self.merge(gh, slug="b/repo")
         self.assertEqual(gh.calls, [])
+        self.assertEqual(resolved.call_count, 0)
         self.assertEqual(self.tip(), self.base)
 
     def test_a_pr_of_another_repository_is_refused(self):
