@@ -19,6 +19,20 @@ from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9._-]+)\.sql$")
 _LOCK = "ameesh_migrations"
+#: Attente maximale d'un verrou de table par une migration (L835) : la
+#: transaction lève le statement_timeout (une migration peut être longue),
+#: mais une migration qui attend ACCESS EXCLUSIVE fait la queue devant tous
+#: les lecteurs et écrivains de la table — sans borne, elle les bloque
+#: indéfiniment. Passé ce délai, la transaction est annulée : la migration
+#: échoue, reste en attente, et rien n'est enregistré (le DDL est
+#: transactionnel). Une migration qui doit attendre plus pose son propre
+#: `set local lock_timeout` : elle s'exécute après, son réglage l'emporte.
+#:
+#: Le verrou consultatif qui sérialise les migrations, lui, n'est pas borné
+#: (posé avant ce réglage) : deux `migrate` concurrents s'attendent au lieu de
+#: s'échouer l'un l'autre — et l'attente du second est bornée par le premier,
+#: qui ne peut lui-même attendre un verrou de table plus de LOCK_TIMEOUT.
+LOCK_TIMEOUT = "5s"
 
 BOOTSTRAP = """
 create table if not exists schema_migrations (
@@ -263,10 +277,16 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR, log
             # transaction (SET LOCAL retombe au commit), sinon le
             # statement_timeout par défaut la couperait.
             "SET LOCAL statement_timeout = 0;\n"
-            "select pg_advisory_xact_lock(hashtext('%s'));\n%s\n"
+            "select pg_advisory_xact_lock(hashtext('%s'));\n"
+            # ... puis on borne l'attente des verrous de table (L835) : sans
+            # cela une migration qui attend ACCESS EXCLUSIVE bloque derrière
+            # elle tous les lecteurs et écrivains de la table. Posé après le
+            # verrou consultatif, qui doit pouvoir attendre son tour.
+            "SET LOCAL lock_timeout = '%s';\n%s\n"
             "insert into schema_migrations (version, name, checksum) values (%d, %s, %s);\n"
             % (
                 _LOCK,
+                LOCK_TIMEOUT,
                 migration.sql,
                 migration.version,
                 _lit(migration.name),
