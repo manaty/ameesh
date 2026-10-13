@@ -1019,7 +1019,8 @@ class WorkItems(Domain):
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
         si `change_size`, L157b) et sa première ligne de journal ; rend le
         lot. #540 : avec `queued_note`, un `assignee` qui a déjà un lot
-        ouvert non démarré (sans `started_at`) ne le reçoit pas : le lot va
+        ouvert qui l'occupe (L165b : non démarré, ni en attente d'un autre,
+        ni prévu après aujourd'hui) ne le reçoit pas : le lot va
         dans la file d'équipe (sans assigné), journalisé par `queued_note`
         (`{lot}` : le lot déjà en attente), rendu avec `queued_behind`.
         Avec `forced_note` aussi (`--force` motivé) : l'agent le reçoit quand
@@ -1254,10 +1255,10 @@ class WorkItems(Domain):
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`). #540 : avec
         `queued_note`, un lot non démarré ne va pas à un `assignee` qui a déjà
-        un autre lot ouvert non démarré : il passe dans la file d'équipe
-        (sans assigné), comme `add` (`forced_note` de même). `take=True` (la
-        prise automatique, `backlog.auto_take`) : même contrôle sous le même
-        verrou, mais le lot reste où il est et `PendingLot` est levée."""
+        un autre lot ouvert qui l'occupe (L165b, comme `add`) : il passe dans
+        la file d'équipe (sans assigné) (`forced_note` de même). `take=True`
+        (la prise automatique, `backlog.auto_take`) : même contrôle sous le
+        même verrou, mais le lot reste où il est et `PendingLot` est levée."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,

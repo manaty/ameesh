@@ -10,6 +10,7 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import random
 import time
@@ -62,6 +63,10 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
+#: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
+#: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
+_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -333,12 +338,19 @@ class WorkItems(interface.WorkItems):
 
     def _pending(self, assignee, item_id) -> int | None:
         """#540, dans la transaction ouverte et sous le verrou de l'agent : son
-        plus ancien lot ouvert non démarré autre que `item_id`, ou None."""
+        plus ancien lot ouvert qui l'occupe, autre que `item_id`, ou None.
+        L165b : n'occupent pas l'agent le lot qui attend un autre (`qa`,
+        `waiting_human`, `blocked`) ni celui dont le début est prévu après
+        aujourd'hui — le jour local du processus qui attribue, comme
+        `operations.listing`."""
+        today = _dt.date.today().isoformat()
         self.db.query(PENDING_LOCK, (assignee,))
         rows = self.db.query(
             "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
-            "   AND state NOT IN %s AND id <> %%s ORDER BY id LIMIT 1" % _CLOSED,
-            (assignee, int(item_id or 0)))
+            "   AND state NOT IN %s AND state NOT IN %s"
+            "   AND (planned_start IS NULL OR planned_start <= %%s)"
+            "   AND id <> %%s ORDER BY id LIMIT 1" % (_CLOSED, _WAITING_ON_OTHERS),
+            (assignee, today, int(item_id or 0)))
         return int(rows[0]["id"]) if rows else None
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:

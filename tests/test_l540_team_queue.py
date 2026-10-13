@@ -14,7 +14,7 @@ from unittest import mock
 from ameesh import db as db_mod, estimates, registry, storage, work
 from ameesh.storage.postgres import work as pg_work
 
-from .support import PgTestCase
+from .support import PgTestCase, hold_for_owner
 from .test_l119_backlog import HEURE, _Base as _BacklogBase
 
 
@@ -59,6 +59,34 @@ class AttributionTest(_Base):
         first = self.lot("A", "dev1")
         work.close(self.db, int(first["id"]), actor="orch", abandoned=True)
         self.assertEqual(self.assignee(self.lot("B", "dev1")), "dev1")
+
+    def test_lot_qui_attend_un_autre_ne_retient_pas(self):
+        """L165b (revue r3, defaut B/P2) : un lot en `waiting_human` n'occupe
+        pas l'agent ; le suivant lui est attribue, pas mis en file."""
+        first = self.lot("A", "dev1")
+        hold_for_owner(self.db, int(first["id"]))
+        self.assertEqual(work.get(self.db, int(first["id"]))["state"], "waiting_human")
+        second = self.lot("B", "dev1")
+        self.assertEqual(self.assignee(second), "dev1")
+        self.assertNotIn("queued_behind", second)
+
+    def test_debut_prevu_apres_aujourd_hui_ne_retient_pas(self):
+        """L165b : un lot prevu pour plus tard n'occupe pas l'agent non plus."""
+        first = self.lot("A", "dev1")
+        self.db.execute("UPDATE work_items SET planned_start = current_date + 2"
+                        " WHERE id = %s", (int(first["id"]),))
+        second = self.lot("B", "dev1")
+        self.assertEqual(self.assignee(second), "dev1")
+        self.assertNotIn("queued_behind", second)
+
+    def test_lot_qui_attend_un_autre_libere_la_prise(self):
+        """L165b : meme regle pour la prise automatique (`take=True`)."""
+        first = self.lot("A", "dev1")
+        hold_for_owner(self.db, int(first["id"]))
+        st = storage.of(self.db)
+        taken = st.work.assign(int(self.lot("B")["id"]), "dev1", current=None,
+                               note="prise", actor="orch", take=True)
+        self.assertEqual(taken["assignee"], "dev1")
 
     def test_reassigner_un_lot_non_demarre(self):
         self.lot("A", "dev1")
