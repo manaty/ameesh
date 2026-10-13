@@ -8,8 +8,11 @@
 # propre Postgres :
 #   - psycopg : la suite complète, en 4 parts, sur chaque PR et chaque push ;
 #   - psql    : sur une PR, seulement les modules « pilote »
-#               (tests/parts/pilote-psql.txt) ; la suite complète, en 6 parts,
-#               sur push vers main ou release/*, et à la main (workflow_dispatch).
+#               (tests/parts/pilote-psql.txt), en 3 parts (#947 : huit jobs se
+#               partagent chaque hôte auto-hébergé, une part unique de ~24 min
+#               au repos atteignait le plafond de 30 min sous saturation) ;
+#               la suite complète, en 6 parts, sur push vers main ou
+#               release/*, et à la main (workflow_dispatch).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
@@ -236,7 +239,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt)
+        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt),
+        # en 3 parts (scripts/test-plan.py, PARTS) : sous saturation, une part
+        # unique atteignait le plafond de 30 min (#947)
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
