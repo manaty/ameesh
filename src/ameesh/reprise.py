@@ -58,6 +58,10 @@ LOTS_MAX = 40
 #: (nouvelle session, rotation, reprise), avant le rôle et la consigne.
 PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
 
+#: #538 : canon configuré mais illisible : le brief le dit (jamais silencieux).
+PROCESS_RULES_UNAVAILABLE = ("(working rules unavailable: the agent's canon is "
+                             "not readable)")
+
 
 class RepriseError(ValueError):
     """Refus d'adoption ou de reprise : le message dit pourquoi et quoi faire."""
@@ -261,54 +265,89 @@ def _clip(text: str, limit: int) -> str:
     return data[: max(0, limit - 4)].decode("utf-8", "ignore") + " […]"
 
 
-def _process_rules(cfg: Config) -> str:
-    """#538 : le texte des fiches Process valides du canon, prêt pour un brief.
+def _process_rules(cfg: Config, *, agent: str = "", host: str = "") -> str:
+    """#538 : le texte des fiches Process du canon DE L'AGENT, prêt pour un brief.
 
-    Une fiche invalide (clé obligatoire manquante) n'est jamais injectée ; un
-    canon illisible ne casse pas le brief (mêmes règles que `_role`)."""
+    Le canon est celui de l'agent, comme son rôle (`_role`) : le premier canon
+    configuré dont la fiche porte son nom — les règles d'une organisation ne
+    vont jamais aux agents d'une autre (L42/L43, isolation). Le canon doit être
+    **approuvé** (lu depuis git, pas l'arbre de travail) et **validé pour son
+    hôte** (`canon sync` : ni erreur globale, ni erreur de sa fiche Host) ; une
+    fiche invalide n'est jamais injectée. Un canon illisible est dit, pas tu."""
     if not getattr(cfg, "canon", None):
         return ""
     try:
         from . import canon as canon_mod
         canons = canon_mod.load_configured(cfg)
+        charge = next((c for c in canons
+                       if agent and c.agent(agent) is not None), None)
+        if charge is None:
+            return PROCESS_RULES_UNAVAILABLE if any(not c.readable for c in canons) else ""
+        if not charge.readable:
+            return PROCESS_RULES_UNAVAILABLE
+        if charge.untrusted:
+            return ""
+        from . import canon_sync
+        if canon_sync.assess(charge, host)[0] != canon_sync.CANON_OK:
+            return ""
     except Exception:
         return ""
     blocs = []
-    for charge in canons:
-        for process in getattr(charge, "processes", ()) or ():
-            if not process.valid:
-                continue
-            entete = ["### %s" % process.title,
-                      "- responsible: %s" % process.responsible,
-                      "- updated: %s" % process.updated]
-            if process.expire:
-                entete.append("- expire: %s" % process.expire)
-            corps = (process.body or "").strip()
-            blocs.append("\n".join(entete) + ("\n\n" + corps if corps else ""))
+    for process in getattr(charge, "processes", ()) or ():
+        if not process.valid:
+            continue
+        entete = ["### %s" % process.title,
+                  "- responsible: %s" % process.responsible,
+                  "- updated: %s" % process.updated]
+        if process.expire:
+            entete.append("- expire: %s" % process.expire)
+        corps = (process.body or "").strip()
+        blocs.append("\n".join(entete) + ("\n\n" + corps if corps else ""))
     return "\n\n".join(blocs).strip()
 
 
-def with_process_rules(cfg: Config, text: str) -> str:
-    """#538 : ouvre `text` sur les règles du canon, sans doubler ni couper la
-    consigne. Les règles sont bornées pour tenir dans `BRIEF_MAX_BYTES` avec le
-    texte : la consigne prime toujours."""
-    if text.startswith(PROCESS_RULES_HEADER):
-        return text
-    rules = _process_rules(cfg)
+def process_rules_block(cfg: Config, *, agent: str = "", host: str = "") -> str:
+    """#538 : le bloc de règles prêt à ouvrir une session neuve, ou "".
+
+    Ne lève jamais : une erreur de mise en forme laisse l'appelant sans règles
+    plutôt que d'interrompre l'ouverture de session (revue codex #510 r1, P1)."""
+    try:
+        rules = _process_rules(cfg, agent=agent, host=host)
+    except Exception:
+        return ""
     if not rules:
-        return text
-    entete = PROCESS_RULES_HEADER + "\n"
-    place = BRIEF_MAX_BYTES - _octets(text) - _octets(entete) - 2
-    if place <= 0:
-        return text
-    if _octets(rules) > place:
-        # `_clip` ajoute « […] » (2 octets de plus que la limite demandée) :
-        # on lui laisse la marge, sinon le brief dépasse d'autant.
-        coupe = place - 2
-        if coupe <= 6:
+        return ""
+    return PROCESS_RULES_HEADER + "\n" + rules
+
+
+def with_process_rules(cfg: Config, text: str, *, agent: str = "",
+                       host: str = "") -> str:
+    """#538 : ouvre `text` sur les règles du canon de `agent`, sans doubler ni
+    couper la consigne. Les règles sont bornées pour tenir dans
+    `BRIEF_MAX_BYTES` avec le texte : la consigne prime toujours.
+
+    Ne lève jamais (revue codex #510 r1, P1) : un texte déjà ouvert par
+    l'en-tête est rendu tel quel, toute autre erreur de mise en forme aussi."""
+    try:
+        if text.startswith(PROCESS_RULES_HEADER):
             return text
-        rules = _clip(rules, coupe)
-    return entete + rules + "\n\n" + text
+        rules = _process_rules(cfg, agent=agent, host=host)
+        if not rules:
+            return text
+        entete = PROCESS_RULES_HEADER + "\n"
+        place = BRIEF_MAX_BYTES - _octets(text) - _octets(entete) - 2
+        if place <= 0:
+            return text
+        if _octets(rules) > place:
+            # `_clip` ajoute « […] » (2 octets de plus que la limite demandée) :
+            # on lui laisse la marge, sinon le brief dépasse d'autant.
+            coupe = place - 2
+            if coupe <= 6:
+                return text
+            rules = _clip(rules, coupe)
+        return entete + rules + "\n\n" + text
+    except Exception:
+        return text
 
 
 def _role(cfg: Config, name: str) -> list[str]:
@@ -459,7 +498,8 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
         fil_sec.append(line)
     text = "\n".join(head + ident + [""] + lots_sec + fil_sec + [""] + courrier + [""]
                      + ancienne + fin)
-    return with_process_rules(cfg, _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES))
+    return with_process_rules(cfg, _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES),
+                              agent=name, host=row.get("host") or "")
 
 
 # --------------------------------------------------------------------------

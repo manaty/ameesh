@@ -12,6 +12,13 @@ Attendu (bureau → mesh-design, 2026-10-12 23:39, courrier 14173) :
     est signalé ; il ouvre le brief déterministe et le résumé de rotation ;
 (3) une modification d'une fiche Process, après `canon sync`, est poussée aux
     agents de l'hôte (message `event`) pour leur prochain tour.
+
+Revue codex #510 r1 (2026-10-13) : le canon de l'agent seulement (isolation),
+approuvé et validé pour son hôte seulement, chemin `processus/` exigé, texte
+encodable (surrogates), poussée aux seuls agents de cet hôte gouvernés par ce
+canon, comparaison à la référence approuvée, session neuve ordinaire couverte,
+règles relues à l'ouverture (une fiche retirée ne reste pas en attente), canon
+illisible dit dans le brief.
 """
 from __future__ import annotations
 
@@ -23,17 +30,19 @@ import shutil
 import unittest
 from unittest import mock
 
-from ameesh import canon, canon_sync, mail, registry, reprise
+from ameesh import canon, canon_sync, config as config_mod, mail, registry, reprise
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
-from .test_canon import EXAMPLE, _TmpMixin, codes, commit_all, fiche, publish, write
+from .test_canon import (EXAMPLE, HAS_PYYAML, _TmpMixin, codes, commit_all, fiche,
+                         git, publish, write)
 
 RACINE = "processus/lots.md"
 TITRE = "Processus de lot"
+REGLE = "une règle de travail"
 
 
-def carte(body: str = "# Processus de lot\n\n- une règle de travail\n", **fields) -> str:
+def carte(body: str = "# Processus de lot\n\n- %s\n" % REGLE, **fields) -> str:
     """Une fiche Process minimale : frontmatter + corps (les règles)."""
     champs = {"type": "Process", "title": TITRE,
               "description": "Règles de travail des agents",
@@ -55,24 +64,33 @@ def _demain() -> str:
     return (dt.date.today() + dt.timedelta(days=1)).isoformat()
 
 
+def _canon_approuve(tmp: str, nom: str = "acme", contenu: str = "") -> str:
+    """Un canon git approuvé (clone d'un dépôt nu) sous `tmp/canons/<nom>`."""
+    clone = publish(os.path.join(tmp, "canons"), nom, EXAMPLE)[1]
+    if contenu:
+        write(clone, RACINE, contenu)
+        commit_all(clone, "règles de travail")
+    return clone
+
+
 class ProcessLectureTest(_TmpMixin, unittest.TestCase):
     """(1) lecture et validation des fiches Process."""
 
-    def charge(self, contenu: str, **kwargs):
+    def charge(self, contenu: str, chemin: str = RACINE, **kwargs):
         root = self.example_copy()
-        write(root, RACINE, contenu)
+        write(root, chemin, contenu)
         return canon.load(root, untrusted=True, **kwargs), root
 
     def test_une_fiche_process_est_lue_avec_son_texte(self):
         loaded, _root = self.charge(carte(
-            body="# Processus de lot\n\n- une règle de travail\n", expire=_demain()))
+            body="# Processus de lot\n\n- %s\n" % REGLE, expire=_demain()))
         self.assertEqual(len(loaded.processes), 1)
         regle = loaded.processes[0]
         self.assertEqual(regle.title, TITRE)
         self.assertEqual(regle.updated, "2026-10-12")
         self.assertEqual(regle.responsible, "human:alice")
         self.assertEqual(regle.expire, _demain())
-        self.assertIn("une règle de travail", regle.body)
+        self.assertIn(REGLE, regle.body)
         self.assertTrue(regle.valid)
         self.assertEqual(codes(canon.validate(loaded)), {"canon-untrusted"})
 
@@ -145,22 +163,43 @@ class ProcessLectureTest(_TmpMixin, unittest.TestCase):
         self.assertEqual(data["processes"][0]["updated"], "2026-10-12")
         self.assertEqual(data["processes"][0]["responsible"], "human:alice")
 
+    def test_une_fiche_process_hors_processus_est_refusee(self):
+        # revue codex #510 r1 (P2) : `type: Process` dans agents/ n'est pas une
+        # règle de travail — constat, jamais injecté.
+        loaded, _root = self.charge(carte(), chemin="agents/etrangere.md")
+        findings = canon.validate(loaded)
+        self.assertIn("process-path", codes(findings, canon.ERROR))
+        self.assertEqual(len(loaded.processes), 1)
+        self.assertFalse(loaded.processes[0].valid)
+
+    def test_un_surrogate_ne_casse_pas_la_lecture(self):
+        # revue codex #510 r1 (P1) : `title: "\uD800"` passe la validation puis
+        # faisait échouer tout encodage. Le texte lu est encodable.
+        if not HAS_PYYAML:
+            self.skipTest("PyYAML absent : l'échappement YAML n'est pas résolu")
+        loaded, _root = self.charge(carte(title='"\\uD800"'))
+        self.assertEqual(len(loaded.processes), 1)
+        titre = loaded.processes[0].title
+        self.assertEqual(titre.encode("utf-8").decode("utf-8"), titre)
+        self.assertNotIn("\ud800", titre)
+        self.assertTrue(loaded.processes[0].valid)
+
 
 class BriefProcessTest(PgTestCase):
-    """(2) injection en tête du brief déterministe."""
+    """(2) injection en tête du brief déterministe — canon approuvé et validé."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.root = os.path.join(self.tmp, "canon-acme")
-        shutil.copytree(EXAMPLE, self.root)
-        write(self.root, RACINE, carte())
-        self.cfg = dataclasses.replace(self.cfg, canon=self.root, canon_ref="",
-                                       canon_untrusted=True)
+        self.clone = _canon_approuve(self.tmp, "acme", carte())
+        self.cfg = dataclasses.replace(self.cfg, canon=self.clone, canon_ref="",
+                                       canon_untrusted=False)
 
-    def _row(self, name: str = "ouvrier") -> dict:
-        return {"name": name, "harness": "deepseek", "host": self.cfg.host,
-                "cwd": os.path.join(self.tmp, "travail"), "team": "acme-web",
-                "responsible": "human:alice"}
+    def _row(self, name: str = "ouvrier", **extra) -> dict:
+        row = {"name": name, "harness": "deepseek", "host": self.cfg.host,
+               "cwd": os.path.join(self.tmp, "travail"), "team": "acme-web",
+               "responsible": "human:alice"}
+        row.update(extra)
+        return row
 
     def _brief(self, cfg=None, row=None) -> str:
         return reprise.deterministic_brief(cfg or self.cfg, self.db,
@@ -174,7 +213,7 @@ class BriefProcessTest(PgTestCase):
         self.assertIn(TITRE, texte)
         self.assertIn("human:alice", texte)
         self.assertIn("2026-10-12", texte)
-        self.assertIn("une règle de travail", texte)
+        self.assertIn(REGLE, texte)
         self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
 
     def test_sans_fiche_process_le_brief_est_inchange(self):
@@ -183,7 +222,8 @@ class BriefProcessTest(PgTestCase):
         self.assertNotIn(reprise.PROCESS_RULES_HEADER, texte)
 
     def test_les_regles_sont_bornees_et_ne_coupent_pas_la_consigne(self):
-        write(self.root, RACINE, carte(body="# Règles\n\n" + ("- règle\n" * 3000)))
+        write(self.clone, RACINE, carte(body="# Règles\n\n" + ("- règle\n" * 3000)))
+        commit_all(self.clone, "règles longues")
         texte = self._brief()
         self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
         self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
@@ -191,29 +231,80 @@ class BriefProcessTest(PgTestCase):
         self.assertIn("[…]", texte)   # le texte de la fiche est coupé, pas le brief
 
     def test_with_process_rules_prefixe_sans_doubler(self):
-        une_fois = reprise.with_process_rules(self.cfg, "Résumé de l'agent.")
+        une_fois = reprise.with_process_rules(self.cfg, "Résumé de l'agent.",
+                                              agent="ouvrier", host=self.cfg.host)
         self.assertTrue(une_fois.startswith(reprise.PROCESS_RULES_HEADER))
         self.assertIn("Résumé de l'agent.", une_fois)
-        deux = reprise.with_process_rules(self.cfg, une_fois)
+        deux = reprise.with_process_rules(self.cfg, une_fois, agent="ouvrier",
+                                          host=self.cfg.host)
         self.assertEqual(deux, une_fois)
         self.assertEqual(reprise.with_process_rules(
             dataclasses.replace(self.cfg, canon="", canon_untrusted=False),
-            "Résumé de l'agent."), "Résumé de l'agent.")
+            "Résumé de l'agent.", agent="ouvrier"), "Résumé de l'agent.")
+
+    def test_un_canon_non_approuve_n_injecte_rien(self):
+        # revue codex #510 r1 (P1) : l'arbre de travail n'a pas l'autorité d'un
+        # canon fusionné — ses règles ne s'affichent pas comme approuvées.
+        root = os.path.join(self.tmp, "copie")
+        shutil.copytree(EXAMPLE, root)
+        write(root, RACINE, carte())
+        cfg = dataclasses.replace(self.cfg, canon=root, canon_untrusted=True)
+        texte = self._brief(cfg=cfg)
+        self.assertNotIn(reprise.PROCESS_RULES_HEADER, texte)
+
+    def test_un_canon_invalide_pour_l_hote_n_injecte_rien(self):
+        # revue codex #510 r1 (P1) : une fiche Host qui bloque ferme les règles
+        # de cet hôte (assess), même si la fiche Process est valide.
+        write(self.clone, "hotes/atelier.md", fiche(
+            type="Host", title="atelier", responsible="human:bruno",
+            policy="illisible"))
+        commit_all(self.clone, "hôte invalide")
+        texte = self._brief(row=self._row(host="atelier"))
+        self.assertNotIn(reprise.PROCESS_RULES_HEADER, texte)
+
+    def test_le_canon_d_un_autre_agent_n_injecte_pas_ses_regles(self):
+        # revue codex #510 r1 (P1) : isolation entre organisations — les règles
+        # du canon B ne vont pas à un agent déclaré par le canon A.
+        autre = _canon_approuve(self.tmp, "beta", carte(
+            body="# Règles de beta\n\n- la règle de l'autre organisation\n"))
+        cfg = dataclasses.replace(
+            self.cfg, extra_canons=(config_mod.CanonEntry(autre, "", False),))
+        texte = self._brief(cfg=cfg)
+        self.assertIn(REGLE, texte)
+        self.assertNotIn("la règle de l'autre organisation", texte)
+
+    def test_un_canon_illisible_est_dit_dans_le_brief(self):
+        # revue codex #510 r1 (P3) : l'échec de lecture n'est pas silencieux.
+        cfg = dataclasses.replace(self.cfg, canon=os.path.join(self.tmp, "absent"),
+                                  canon_untrusted=False)
+        texte = self._brief(cfg=cfg)
+        self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
+        self.assertIn(reprise.PROCESS_RULES_UNAVAILABLE, texte)
+
+    def test_un_titre_avec_surrogate_ne_casse_pas_l_injection(self):
+        # revue codex #510 r1 (P1) : la mise en forme ne lève jamais.
+        if not HAS_PYYAML:
+            self.skipTest("PyYAML absent : l'échappement YAML n'est pas résolu")
+        write(self.clone, RACINE, carte(title='"\\uD800"'))
+        commit_all(self.clone, "titre hostile")
+        texte = self._brief()
+        texte.encode("utf-8")
+        self.assertIn(reprise.PROCESS_RULES_HEADER, texte)
+        self.assertIn(REGLE, texte)
 
 
 class RotationProcessTest(PgTestCase):
-    """(2) le résumé de rotation — écrit par l'agent — reçoit les règles."""
+    """(2) le résumé de rotation — écrit par l'agent — est gardé brut ; les
+    règles sont relues à la construction du prompt de la session neuve."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.root = os.path.join(self.tmp, "canon-acme")
-        shutil.copytree(EXAMPLE, self.root)
-        write(self.root, RACINE, carte(
+        self.clone = _canon_approuve(self.tmp, "acme", carte(
             body="# Processus de lot\n\n- la règle que la rotation doit porter\n"))
 
-    def _worker(self, name: str = "rot538"):
-        cfg = dataclasses.replace(self.cfg, canon=self.root, canon_ref="",
-                                  canon_untrusted=True,
+    def _worker(self, name: str = "ouvrier") -> AgentWorker:
+        cfg = dataclasses.replace(self.cfg, canon=self.clone, canon_ref="",
+                                  canon_untrusted=False,
                                   session_min_turns=1, session_max_turn_seconds=0.0,
                                   session_max_tokens=0.0)
         runner = Runner(cfg, self.db, once=True)
@@ -223,23 +314,80 @@ class RotationProcessTest(PgTestCase):
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         return AgentWorker(runner, registry.get(self.db, name), lease)
 
-    def test_le_resume_de_rotation_porte_les_regles_en_tete(self):
+    def _rotate(self, worker: AgentWorker, resume: str) -> None:
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(worker.run_turn(
+                {"kind": "prompt", "prompt": "premier tour", "ids": []}))
+            with mock.patch.dict(os.environ, {"AMEESH_TEST_RESULT": resume}):
+                self.assertTrue(worker.maybe_rotate())
+
+    def test_le_resume_de_rotation_est_brut_et_les_regles_injectees(self):
         worker = self._worker()
         resume = "## État\n\nLe lot avance."
+        try:
+            self._rotate(worker, resume)
+            # le résumé gardé (mémoire et disque) est celui de l'agent, brut
+            self.assertEqual(worker.resume_summary, resume)
+            # les règles ouvrent le prompt de la session neuve, avant le résumé
+            prompt = worker._resume_prompt()
+            self.assertIn("la règle que la rotation doit porter", prompt)
+            self.assertLess(prompt.index(reprise.PROCESS_RULES_HEADER),
+                            prompt.index(resume))
+            # l'historique de session garde le résumé de l'agent, sans les règles
+            with open(os.path.join(worker.state_dir, "session-history.jsonl"),
+                      encoding="utf-8") as fh:
+                self.assertEqual(json.loads(fh.readline())["resume"], resume)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_une_fiche_retiree_ne_reste_pas_dans_le_resume_en_attente(self):
+        # revue codex #510 r1 (P2) : l'en-tête déjà présent ne fige pas des
+        # règles périmées — elles sont relues à l'ouverture de la session.
+        worker = self._worker("relecteur")
+        try:
+            self._rotate(worker, "## État\n\nLe lot avance.")
+            self.assertIn(reprise.PROCESS_RULES_HEADER, worker._resume_prompt())
+            write(self.clone, RACINE, None)
+            commit_all(self.clone, "règle retirée")
+            prompt = worker._resume_prompt()
+            self.assertNotIn(reprise.PROCESS_RULES_HEADER, prompt)
+            self.assertIn("Le lot avance.", prompt)
+        finally:
+            worker.watchdog_stop.set()
+
+
+class PremiereSessionProcessTest(PgTestCase):
+    """(2) une session neuve ordinaire (sans résumé en attente) s'ouvre sur les
+    règles du canon — revue codex #510 r1 (P2)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.clone = _canon_approuve(self.tmp, "acme", carte(
+            body="# Processus de lot\n\n- la règle du premier démarrage\n"))
+
+    def test_le_premier_tour_d_une_session_neuve_porte_les_regles(self):
+        cfg = dataclasses.replace(self.cfg, canon=self.clone, canon_ref="",
+                                  canon_untrusted=False)
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "ouvrier")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("ouvrier", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "ouvrier", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "ouvrier"), lease)
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
         try:
             with mock.patch.dict(os.environ, env, clear=False):
                 self.assertTrue(worker.run_turn(
                     {"kind": "prompt", "prompt": "premier tour", "ids": []}))
-                with mock.patch.dict(os.environ, {"AMEESH_TEST_RESULT": resume}):
-                    self.assertTrue(worker.maybe_rotate())
-            self.assertIn("la règle que la rotation doit porter", worker.resume_summary)
-            self.assertLess(worker.resume_summary.index(reprise.PROCESS_RULES_HEADER),
-                            worker.resume_summary.index(resume))
-            # l'historique de session garde le résumé de l'agent, sans les règles
-            with open(os.path.join(worker.state_dir, "session-history.jsonl"),
-                      encoding="utf-8") as fh:
-                self.assertEqual(json.loads(fh.readline())["resume"], resume)
+            self.assertEqual(worker.resume_summary, "")
+            tours = self.turns()
+            self.assertTrue(tours)
+            prompt = " ".join(tours[-1]["argv"])
+            self.assertIn(reprise.PROCESS_RULES_HEADER, prompt)
+            self.assertIn("la règle du premier démarrage", prompt)
+            self.assertLess(prompt.index(reprise.PROCESS_RULES_HEADER),
+                            prompt.index("premier tour"))
         finally:
             worker.watchdog_stop.set()
 
@@ -255,11 +403,15 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         write(self.clone, RACINE, carte())
         commit_all(self.clone, "règles de travail")
 
-    def sync(self) -> canon_sync.SyncReport:
-        return canon_sync.sync(self.db, canon.load(self.clone), "atelier")
+    def sync(self, ref: str = "") -> canon_sync.SyncReport:
+        return canon_sync.sync(self.db, canon.load(self.clone, ref=ref), "atelier")
 
     def _sujets(self, name: str) -> list[dict]:
         return mail.unread(self.db, name)
+
+    def _change(self, body: str, message: str = "nouvelle règle") -> None:
+        write(self.clone, RACINE, carte(body=body))
+        commit_all(self.clone, message)
 
     def test_premier_sync_ne_pousse_rien(self):
         self.sync()
@@ -268,9 +420,7 @@ class PushProcessTest(_TmpMixin, PgTestCase):
     def test_une_modification_est_poussee_au_prochain_tour(self):
         self.sync()
         self.assertEqual(self._sujets("orchestre"), [])
-        write(self.clone, RACINE, carte(
-            body="# Processus de lot\n\n- la règle nouvelle\n"))
-        commit_all(self.clone, "nouvelle règle")
+        self._change("# Processus de lot\n\n- la règle nouvelle\n")
         self.sync()
         recus = self._sujets("orchestre")
         self.assertEqual(len(recus), 1, recus)
@@ -292,3 +442,55 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         self.assertEqual(self._sujets("orchestre"), [])
 
+    def test_une_fiche_process_hors_processus_ne_pousse_rien(self):
+        # revue codex #510 r1 (P2) : un type Process hors `processus/` n'est
+        # jamais poussé comme règle.
+        self.sync()
+        write(self.clone, "agents/etrangere.md", carte(
+            body="# Règles\n\n- une règle hors dossier\n"))
+        commit_all(self.clone, "process hors dossier")
+        self.sync()
+        self.assertEqual(self._sujets("orchestre"), [])
+
+    def test_un_agent_d_un_autre_hote_admis_ne_recoit_pas(self):
+        # revue codex #510 r1 (P2) : la poussée ne va qu'aux agents de CET hôte.
+        write(self.clone, "placements/ouvrier-deux-hotes.md", fiche(
+            type="Placement", title="ouvrier@deux-hotes", agent="ouvrier",
+            hosts="[banc, atelier]", credential_mode="api-key"))
+        commit_all(self.clone, "ouvrier admis sur deux hôtes")
+        self.sync()
+        # le registre dit qu'ouvrier tourne sur l'autre hôte admis
+        registry.upsert(self.db, "ouvrier", harness="deepseek", host="banc",
+                        cwd=os.path.join(self.workspace, "ouvrier"))
+        self._change("# Processus de lot\n\n- la règle nouvelle\n")
+        self.sync()
+        self.assertEqual(len(self._sujets("orchestre")), 1)
+        self.assertEqual(self._sujets("ouvrier"), [])
+
+    def test_un_agent_d_un_autre_canon_ne_recoit_pas(self):
+        # revue codex #510 r1 (P2) : un nom tenu par un autre canon est écarté
+        # du sync (conflit) — il ne reçoit pas non plus les règles.
+        self.sync()
+        self.db.execute(
+            "UPDATE agent_registry SET canon_ref = %s, canon = %s WHERE name = %s",
+            ("autre:home:agents/orchestre.md@0000000", "autre", "orchestre"))
+        self._change("# Processus de lot\n\n- la règle nouvelle\n")
+        self.sync()
+        self.assertEqual(self._sujets("orchestre"), [])
+
+    def test_la_reference_approuvee_avance_sans_checkout(self):
+        # revue codex #510 r1 (P2) : la comparaison porte sur `source.commit`,
+        # pas sur HEAD ni l'arbre de travail. La référence approuvée avance
+        # (origin/main) sans que le checkout suive : la règle doit partir.
+        self.sync()
+        self._change("# Processus de lot\n\n- la règle de la référence\n")
+        git(self.clone, "reset", "--hard", "HEAD~1")
+        avance = canon.load(self.clone, ref="origin/main").sources[0].commit
+        report = self.sync(ref="origin/main")
+        self.assertEqual(report.processes.changed, [TITRE])
+        self.assertGreaterEqual(report.processes.sent, 1)
+        self.assertIn(avance, (canon_sync.state(self.db, "atelier") or {}).get(
+            "last_good_commit", ""))
+        recus = self._sujets("orchestre")
+        self.assertEqual(len(recus), 1, recus)
+        self.assertIn("la règle de la référence", recus[0]["body"])

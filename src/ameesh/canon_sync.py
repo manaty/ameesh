@@ -1200,6 +1200,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
 
     rows = _rows(db, host, sorted(set(admitted_here) | set(other_admitted)))
 
+    #: #538 : les agents réellement gouvernés par CE canon sur CET hôte — les
+    #: seuls destinataires d'une poussée de règles (jamais un agent écarté pour
+    #: un autre canon, ni un agent exécuté sur un autre hôte admis).
+    process_agents: set[str] = set()
     for name in sorted(admitted_here):
         admission = admitted_here[name]
         agent = canon.agent(name)
@@ -1229,6 +1233,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 "running on %s, an admitted host: \"canon sync\" does not move it"
                 % row.get("host")))
             continue
+        if row is None or row.get("host") in (None, host):
+            # l'agent est (ou devient) de cet hôte : il reçoit les règles
+            process_agents.add(name)
         reasons = block.reasons(name, [host])
         responsible = canon.resolve_human(agent.responsible) if not reasons else None
         verdict = placement_mod.evaluate(canon, name, host)
@@ -1394,7 +1401,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # #538 : les règles de travail modifiées partent aux agents de cet hôte
         # AVANT que l'état n'avance (le repère de comparaison est l'ancien
         # commit, encore dans canon_state).
-        processes = sync_processes(db, canon, host, sorted(admitted_here))
+        processes = sync_processes(db, canon, host, sorted(process_agents))
         # les conflits de noms (L42) figurent au diagnostic, sans fermer le canon
         status, diagnostic = assess(canon, host, findings)
         record_state(db, host, status, diagnostic, canon, key=key)
@@ -1549,7 +1556,12 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     if not old or old == source.commit:
         return done
     try:
-        touched = set(canon_mod.git_changed_paths(source.repo, old))
+        # #538 : la comparaison porte sur la RÉFÉRENCE APPROUVÉE (`source.commit`),
+        # pas sur HEAD ni l'arbre de travail : si la référence avance sans que le
+        # checkout suive, le changement est quand même poussé (sinon le point de
+        # reprise avancerait en silence, et la règle serait perdue).
+        touched = set(canon_mod.git_changed_paths_between(source.repo, old,
+                                                          source.commit))
     except canon_mod.GitError as exc:
         done.error = str(exc)
         return done

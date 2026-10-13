@@ -1446,10 +1446,11 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
-        # #538 : les règles de travail du canon ouvrent le résumé qui porte la
-        # session neuve ; l'historique garde le résumé rendu par l'agent, brut.
-        from . import reprise
-        if not self._resume_keep(reprise.with_process_rules(self.cfg, resume), "agent"):
+        # #538 : le résumé de l'agent est gardé BRUT ; les règles de travail du
+        # canon sont injectées à la construction du prompt de la session neuve
+        # (`_resume_prompt`), donc relues à ce moment-là : une fiche retirée ne
+        # reste pas dans un résumé en attente.
+        if not self._resume_keep(resume, "agent"):
             self._fil_note("Session rotation cancelled: the resume summary could not "
                            "be kept on disk. The old session is kept.",
                            meta={"action": "rotation", "etat": "annulee"})
@@ -3273,10 +3274,20 @@ class AgentWorker(threading.Thread):
     def _resume_prompt(self) -> str:
         """Le cadre et le résumé de reprise qui ouvriront la session neuve après
         une rotation (0018), ou "" sans résumé en attente. Le résumé est
-        délimité et n'a aucune autorité (`adapters.resume_prompt`)."""
+        délimité et n'a aucune autorité (`adapters.resume_prompt`).
+
+        #538 : les règles de travail du canon de l'agent sont relues MAINTENANT
+        pour un résumé écrit par l'agent (origine `agent`) ; un brief
+        déterministe (origine `ameesh`) les porte déjà."""
         if not self.resume_summary:
             return ""
-        return adapters.resume_prompt(self.resume_summary, origin=self.resume_origin)
+        resume = self.resume_summary
+        if self.resume_origin == "agent":
+            from . import reprise
+            resume = reprise.with_process_rules(
+                self.cfg, resume, agent=self.name,
+                host=(self.agent or {}).get("host") or self.cfg.host)
+        return adapters.resume_prompt(resume, origin=self.resume_origin)
 
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
@@ -3563,6 +3574,15 @@ class AgentWorker(threading.Thread):
             # Session neuve après rotation (0018) : le résumé de reprise, encadré
             # et délimité (il n'a aucune autorité), ouvre le tour.
             resume = self._resume_prompt()
+        elif not session and not self.session_turns:
+            # #538 : une session neuve SANS résumé en attente (premier
+            # démarrage) s'ouvre elle aussi sur les règles de travail du canon.
+            from . import reprise
+            bloc = reprise.process_rules_block(
+                self.cfg, agent=self.name,
+                host=(self.agent or {}).get("host") or self.cfg.host)
+            if bloc:
+                resume = bloc + "\n\n"
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))

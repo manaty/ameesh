@@ -70,6 +70,9 @@ PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage
                  "Process")
 #: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
 PROCESS_TYPE = "Process"
+#: #538 : dossier du canon où vivent les fiches Process ; un `type: Process`
+#: posé ailleurs n'est pas une règle de travail et n'est jamais injecté.
+PROCESS_DIR = "processus"
 #: #538 : deux pages ≈ 6 000 caractères ; au-delà `canon check` signale un
 #: dépassement (avertissement, jamais bloquant) et le brief coupe le texte.
 PROCESS_BODY_MAX = 6000
@@ -1415,7 +1418,18 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
     proc = _git(repo, "diff", "--name-status", "-z", "--find-renames", base)
     if proc.returncode != 0:
         raise GitError("git diff %s: %s" % (base, _git_message(proc)))
-    fields = proc.stdout.decode("utf-8", "replace").split("\0")
+    paths.update(_name_status_paths(proc.stdout))
+    proc = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    if proc.returncode != 0:
+        raise GitError("git ls-files: %s" % _git_message(proc))
+    paths.update(name for name in proc.stdout.decode("utf-8", "replace").split("\0") if name)
+    return sorted(paths)
+
+
+def _name_status_paths(raw: bytes) -> set[str]:
+    """Chemins d'une sortie `git diff --name-status -z` (renommages : les deux)."""
+    paths: set[str] = set()
+    fields = raw.decode("utf-8", "replace").split("\0")
     index = 0
     while index < len(fields):
         status = fields[index]
@@ -1432,11 +1446,30 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
                 break
             paths.add(fields[index + 1])
             index += 2
-    proc = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    return paths
+
+
+def git_changed_paths_between(repo: str, base: str, tip: str) -> list[str]:
+    """Chemins changés **entre deux commits** (L10, #538), sans l'arbre de travail.
+
+    `git_changed_paths` compare une référence à HEAD et à l'arbre de travail :
+    c'est ce qu'un gel emporterait. Ici, l'appelant compare un commit déjà
+    appliqué (`canon_state.last_good_commit`) à la référence approuvée qui va
+    l'être (`source.commit`) : si la référence avance sans que le checkout
+    suive, le changement doit quand même être vu. Un renommage compte pour ses
+    deux chemins, comme `git_changed_paths`. `GitError` sur référence inconnue
+    ou dépôt illisible : jamais une liste vide rassurante."""
+    resolved = {}
+    for name in (base, tip):
+        sha = git_commit(repo, name)
+        if sha is None:
+            raise GitError("unknown git reference: %s" % name)
+        resolved[name] = sha
+    proc = _git(repo, "diff", "--name-status", "-z", "--find-renames",
+                resolved[base], resolved[tip])
     if proc.returncode != 0:
-        raise GitError("git ls-files: %s" % _git_message(proc))
-    paths.update(name for name in proc.stdout.decode("utf-8", "replace").split("\0") if name)
-    return sorted(paths)
+        raise GitError("git diff %s %s: %s" % (base, tip, _git_message(proc)))
+    return sorted(_name_status_paths(proc.stdout))
 
 
 def git_toplevel(directory: str) -> str | None:
@@ -2811,9 +2844,26 @@ class _Loader:
         """#538 : une fiche Process (`processus/*.md`) — `title`, `updated` et
         `responsible` sont obligatoires. Une clé manquante ou illisible rend la
         fiche invalide (elle n'est jamais injectée dans un brief), sans bloquer
-        aucun agent : c'est une règle, pas un droit."""
+        aucun agent : c'est une règle, pas un droit.
+
+        Le chemin est contraint : `type: Process` dans `agents/…` n'est pas une
+        règle (constat, jamais injecté). Le texte est rendu encodable en UTF-8
+        (un surrogate YAML isolé ne doit pas faire échouer le brief ni un envoi)."""
         subject = {"process": fiche.title}
+        chemin = fiche.path.replace("\\", "/").split("/")
+        if len(chemin) < 2 or chemin[0] != PROCESS_DIR:
+            self.add("process-path", ERROR,
+                     "Process card outside `%s/`: %s (never injected as a working "
+                     "rule)" % (PROCESS_DIR, fiche.path), **where, **subject)
+            fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
+            self.canon.processes.append(Process(
+                fiche=fiche, description=_utf8_safe(_text(fiche.data.get("description")) or ""),
+                responsible="", updated="", expire="",
+                body=_utf8_safe(body), valid=False))
+            return
+        fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
         responsible = _text(fiche.data.get("responsible"))
+        responsible = _utf8_safe(responsible) if responsible else responsible
         if not responsible:
             self.add("process-responsible-missing", ERROR,
                      "Process card without `responsible` (the human who answers "
@@ -2824,9 +2874,10 @@ class _Loader:
         valid = bool(responsible) and updated is not None \
             and (declared_expire in (None, "") or expire is not None)
         self.canon.processes.append(Process(
-            fiche=fiche, description=_text(fiche.data.get("description")) or "",
+            fiche=fiche,
+            description=_utf8_safe(_text(fiche.data.get("description")) or ""),
             responsible=responsible or "", updated=updated or "", expire=expire or "",
-            body=body, valid=valid))
+            body=_utf8_safe(body), valid=valid))
 
     def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
                      **subject) -> str | None:
@@ -2869,6 +2920,13 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _utf8_safe(text: str) -> str:
+    """Un texte encodable en UTF-8 (#538) : un échappement YAML peut produire un
+    surrogate UTF-16 isolé (`title: "\\uD800"`), qui passe la lecture puis fait
+    échouer tout encodage — brief, fil, envoi. Remplacé ici, à la lecture."""
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 # ==========================================================================
