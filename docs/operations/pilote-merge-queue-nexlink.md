@@ -41,7 +41,7 @@ atterrissage (L160e2) ; vérifié sur `ameesh-agents-1` (`ameesh --version` →
 
 ## 2. Carte — l'entrée `nexlink` de `cfg.radar`
 
-À ajouter sous `radar.projects` du profil désigné (§3), **sans
+À ajouter sous `radar.projects` du **profil dédié** (§3), **sans
 écraser les autres projets** ni les autres clés de `nexlink` (`full_suite`
 viendra de [#916](https://github.com/manaty/ameesh/issues/916), après #756) :
 
@@ -118,15 +118,15 @@ Pourquoi chaque clé (au regard des conditions de l'orchestrateur) :
   (la file ordonne, l'orchestrateur fusionne le rang 1) est immédiat, sans
   redéploiement.
 
-**Validation** — lire le **profil réellement désigné** par l'unité (sur
-`pc-smichea`, l'unité de `mesh-design` lit `runner-profiles/critiques-2.json`,
-pas `config.json`), avec l'interpréteur de l'exécuteur, pas `python3` du
-système (l'installation vit dans un venv). `AMEESH_CONFIG` est résolu en
-**chemin absolu depuis le répertoire courant** du processus : le renseigner en
-absolu, ou se placer dans le répertoire de l'unité.
+**Validation** — lire le **profil dédié retenu** (§3), celui que l'unité
+désignée lira après la recharge — pas le `critiques-2.json` partagé par trois
+unités — avec l'interpréteur de l'exécuteur, pas `python3` du système
+(l'installation vit dans un venv). `AMEESH_CONFIG` est résolu en **chemin
+absolu depuis le répertoire courant** du processus : le renseigner en absolu,
+ou se placer dans le répertoire de l'unité.
 
 ```bash
-CFG="${AMEESH_CONFIG:-$HOME/.config/ameesh/config.json}"   # profil désigné par l'unité
+CFG="${AMEESH_CONFIG:?chemin absolu du profil dédié (§3)}"   # refus si non renseigné
 REPO=~/development/manaty/nexlink
 AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
 "$AMEESH_PY" - "$CFG" <<'PY'
@@ -177,17 +177,26 @@ absente des trois profils locaux de `pc-smichea` (`config.json`,
 `runner-profiles/critiques-2.json`, `runner-profiles/relecteurs-codex1.json`) ;
 `ameesh conflicts --project nexlink` rend `reports=[]` et la file `develop` est
 vide. Ne pas la déclarer sur deux hôtes : deux passes lanceraient deux
-exécuteurs pour la même file (courrier radar en double).
+exécuteurs pour la même file (courrier radar en double) — le même raisonnement
+vaut pour deux unités du même hôte, d'où le profil dédié ci-dessous.
 
 Deux choix reviennent au bureau avant l'application :
 
-* **un seul exécuteur, un seul profil** — le fichier de configuration
-  réellement lu par l'unité qui portera le radar. L'unité de `mesh-design` lit
-  `runner-profiles/critiques-2.json`, pas `config.json` ; les autres profils et
-  les comptes restent en place, un seul fichier est modifié ;
+* **un profil dédié, une seule unité** — `runner-profiles/critiques-2.json`
+  n'est pas le profil d'**une** unité mais de **trois** sur `pc-smichea`
+  (`mesh-design`, auditeur, orchestrateur ; drop-ins vérifiés par
+  `mesh-design` le 13/10 23:21) : y ajouter `radar.projects.nexlink` armerait
+  trois passes radar à leurs prochaines reprises, donc trois exécuteurs pour la
+  même file. Créer un **profil dédié** — copie du profil de comptes approprié,
+  section `accounts` **inchangée**, plus la seule carte §2 — et le faire lire
+  par **une seule unité** (drop-in `Environment=AMEESH_CONFIG=<chemin absolu>`
+  ou unité dédiée). Les trois unités existantes gardent `critiques-2.json`,
+  sans clé `radar` ;
 * **la méthode de recharge** — l'exécuteur lit la configuration à son
-  démarrage : redémarrer l'unité (`systemctl --user restart
+  démarrage : redémarrer **la seule unité désignée** (`systemctl --user restart
   ameesh-runner-agent@<agent>.service`), ou attendre son prochain redémarrage.
+  Avant recharge, vérifier qu'une seule unité référence le profil dédié et que
+  les autres n'ont pas la clé `radar` (§4, étape 4).
 
 Hôte et clone, confirmés de première main le 13/10 :
 
@@ -205,11 +214,13 @@ Le schéma et l'existence du dépôt sont deux contrôles distincts :
 
 ## 4. Runbook d'application (sur décision du bureau)
 
-Profil désigné par l'unité — sur `pc-smichea`, le fichier retenu par le bureau
-(§3), pas forcément `config.json` :
+**Profil dédié** retenu par le bureau (§3) — pas le `critiques-2.json` partagé.
+`SRC` est le profil de comptes d'origine (sa section `accounts` est reprise
+telle quelle), `CFG` le nouveau fichier dédié :
 
 ```bash
-CFG="${AMEESH_CONFIG:-$HOME/.config/ameesh/config.json}"   # profil réellement lu par l'unité
+SRC=~/runner-profiles/critiques-2.json     # profil de comptes d'origine (chemin réel de l'unité)
+CFG=~/runner-profiles/radar-nexlink.json   # nouveau profil dédié, une seule unité
 REPO=~/development/manaty/nexlink
 AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
 ```
@@ -229,14 +240,18 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    # attendu : True True
    ```
 
-1. **Sauvegarder le profil désigné** (lui seul) :
+1. **Créer le profil dédié et le sauvegarder** — copie du profil de comptes
+   (section `accounts` inchangée) ; le profil partagé `critiques-2.json` n'est
+   **pas** modifié :
 
    ```bash
+   cp -a "$SRC" "$CFG"                          # accounts reprise telle quelle
    cp -a "$CFG" "$CFG.bak-$(date +%F-%H%M)"
    ```
 
-2. **Fusionner** le bloc §2 dans `radar.projects` (éditer, ne rien écraser ;
-   JSON sans commentaire ni virgule finale).
+2. **Ajouter** le bloc §2 sous `radar.projects` du profil dédié `$CFG` (éditer,
+   ne rien écraser ; JSON sans commentaire ni virgule finale) ; le profil
+   partagé reste intact.
 
 3. **Valider** le schéma du profil entier (lève ici si la carte est fausse ;
    même interpréteur qu'à l'étape 0), **puis** vérifier le dépôt par git :
@@ -253,9 +268,12 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    git -C "$REPO" rev-parse --show-toplevel   # parse_settings ne vérifie pas le dépôt
    ```
 
-4. **Recharger** : redémarrer l'unité qui porte le profil désigné
-   (`systemctl --user restart ameesh-runner-agent@<agent>.service`), ou
-   attendre son prochain redémarrage ; l'exécuteur ne relit pas la
+4. **Faire pointer une seule unité sur le profil dédié, puis la recharger** —
+   drop-in `Environment=AMEESH_CONFIG=<chemin absolu de $CFG>` sur l'unité
+   désignée ; les autres unités restent sur `critiques-2.json`. Contrôler
+   `systemctl --user show -p Environment <unité>` (+ les drop-ins) : une seule
+   unité référence `$CFG`, aucune autre n'a la clé `radar`. Puis
+   `systemctl --user restart <unité>` ; l'exécuteur ne relit pas la
    configuration à chaud.
 
 5. **Contrôle à blanc** (lecture seule) :
@@ -269,8 +287,8 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    lots Nexlink (courrier passif aux assignés) : c'est attendu et sans effet de
    bord.
 
-6. **Tracer** dans #183 : profil modifié, hôte, date, sauvegarde, sortie des
-   contrôles, et le nom de qui a appliqué.
+6. **Tracer** dans #183 : profil dédié créé, unité désignée, hôte, date,
+   sauvegarde, sortie des contrôles, et le nom de qui a appliqué.
 
 ## 5. Jour de pilote — déroulé
 
@@ -295,7 +313,9 @@ plus de commit** : pour repousser, `ameesh work queue remove <lot>` d'abord.
 * **Atterrissage** : repasser `land` à `"off"` dans la configuration (ou
   retirer l'entrée `nexlink`), recharger l'exécuteur : la file continue
   d'ordonner, l'orchestrateur fusionne le rang 1 à la main.
-* **Configuration** : restaurer la sauvegarde de l'étape 1 et recharger.
+* **Configuration** : restaurer la sauvegarde de l'étape 1 (ou supprimer le
+  profil dédié et retirer le drop-in `AMEESH_CONFIG` de l'unité, qui reprend
+  `critiques-2.json`), puis recharger **cette seule unité**.
 
 ## 7. Décisions et points ouverts
 
@@ -314,8 +334,12 @@ Tranché le 13/10 :
 
 À confirmer par le bureau avant démarrage :
 
-5. **Profil et recharge** — un seul exécuteur et un seul profil parmi ceux de
-   `pc-smichea`, et la méthode de recharge (§3).
+5. **Profil dédié, unité et recharge** — un **profil dédié** (copie du profil
+   de comptes, `accounts` inchangée) lu par **une seule unité** de
+   `pc-smichea` ; `critiques-2.json` reste partagé par les trois unités, sans
+   clé `radar` ; la recharge est le redémarrage de cette seule unité (§3, §4).
+   `mesh-design` (13/10 23:21) confirme : ne pas ajouter `radar` au profil
+   partagé, sinon les trois unités s'arment à leurs reprises.
 6. **Créneau du 14/10** — après REL-11 ; la **liste initiale des PR** est
    fixée au démarrage par l'orchestrateur Nexlink, hors sensibles `915`, `695`
    et `943` en vol.
