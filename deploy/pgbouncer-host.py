@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import socket
@@ -24,6 +25,26 @@ from urllib.request import urlopen
 VERSION = '1.26.0'
 SHA256 = 'afd25dd61ee6775d37b40629b87ce08736b3e6955f3057bb212e410fbf21c71d'
 URL = f'https://www.pgbouncer.org/downloads/files/{VERSION}/pgbouncer-{VERSION}.tar.gz'
+APPROVED_OPERATORS = {
+    'ameesh-agents-1': 'ameesh',
+    'ameesh-agents-2': 'ameesh',
+}
+
+
+def approved_home():
+    # Check the operating-system identity, not an environment variable or a
+    # configurable mesh host label. Root must invoke the reviewed recipe as
+    # the runner's user; it cannot silently install into /root.
+    uid = os.getuid()
+    if uid == 0 or os.geteuid() != uid:
+        raise ValueError('run as the approved non-root runner user')
+    account = pwd.getpwuid(uid)
+    if APPROVED_OPERATORS.get(socket.gethostname()) != account.pw_name:
+        raise ValueError('host/user pair is not approved')
+    home = Path(account.pw_dir)
+    if Path.home() != home:
+        raise ValueError('HOME differs from the approved user home')
+    return home
 
 
 def private_dir(path):
@@ -91,7 +112,24 @@ def userlist_quote(value):
     return '"' + value.replace('"', '""') + '"'
 
 
+def socket_conninfo(dsn, socket_dir):
+    import psycopg
+    params = psycopg.conninfo.conninfo_to_dict(dsn)
+    # Upstream TLS negotiation/certificates/binding do not apply to the Unix
+    # connection. In particular direct negotiation is invalid with TLS off.
+    for key in list(params):
+        if key.startswith('ssl') or key in ('hostaddr', 'channel_binding'):
+            del params[key]
+    params.update(host=str(socket_dir), port='6432', sslmode='disable', password='')
+    return psycopg.conninfo.make_conninfo(**params)
+
+
 def install(home, state, config):
+    binary = home / '.local/bin/pgbouncer'
+    # Refuse even a symlink or dangling symlink before running it or creating
+    # any installation file. --version is not proof of binary provenance.
+    if os.path.lexists(binary):
+        raise ValueError('preexisting binary has no verified provenance; refusing reuse')
     import psycopg
     from ameesh.config import load
     cfg = load()
@@ -118,10 +156,9 @@ def install(home, state, config):
         raise ValueError('unsupported upstream identifiers')
     if not password:
         raise ValueError('upstream password unavailable')
-    if not (home / '.local/bin/pgbouncer').exists():
-        compile_binary(home)
-    # Fail rather than silently accept an unknown preexisting binary.
-    result = subprocess.run([str(home / '.local/bin/pgbouncer'), '--version'],
+    compile_binary(home)
+    # Only the binary just built from the pinned archive may be executed.
+    result = subprocess.run([str(binary), '--version'],
                             capture_output=True, text=True, check=True)
     if f'PgBouncer {VERSION}' not in result.stdout:
         raise ValueError('unexpected binary version')
@@ -160,12 +197,7 @@ log_connections = 0
 log_disconnections = 0
 log_stats = 0
 ''')
-    socket_params = psycopg.conninfo.conninfo_to_dict(cfg.dsn)
-    # hostaddr takes precedence over host; retaining it would bypass the pool.
-    socket_params.pop('hostaddr', None)
-    socket_params.update(host=str(state / 'socket'), port='6432',
-                         sslmode='disable', password='')
-    socket_dsn = psycopg.conninfo.make_conninfo(**socket_params)
+    socket_dsn = socket_conninfo(cfg.dsn, state / 'socket')
     # Socket DSN is persisted only in a private file, not printed.
     write_new(state / 'socket.dsn', socket_dsn)
     unit = home / '.config/systemd/user/ameesh-pgbouncer.service'
@@ -314,7 +346,7 @@ def main():
     parser.add_argument('action', choices=['install', 'verify', 'switch', 'rollback', 'measure'])
     parser.add_argument('--label', choices=['before', 'after', 'rollback'], default='before')
     args = parser.parse_args()
-    home = Path.home()
+    home = approved_home()
     # Plain reviewed paths are required by PgBouncer and systemd unit syntax.
     if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(home)):
         raise ValueError('unsupported home path')

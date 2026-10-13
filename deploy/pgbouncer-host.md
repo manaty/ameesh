@@ -1,7 +1,11 @@
 # Per-host session pooling (#653)
 
 This recipe is for **bureau**, after review, on `agents-1` and `agents-2`,
-under the Unix user running Ameesh. Agents prepare the files and tests;
+under the Unix user running Ameesh. The script checks the system hostname and
+real/effective UID before creating directories or dispatching any action.
+Only `ameesh-agents-1` / `ameesh` and `ameesh-agents-2` / `ameesh` are accepted;
+root and a mismatched HOME are refused. Bureau must invoke the script as that
+user, with its user-systemd environment. Agents prepare the files and tests;
 they do not install, switch configuration or restart services on these VMs.
 
 Use the Python from the installed Ameesh environment (with psycopg and psutil).
@@ -24,8 +28,10 @@ export TMPDIR="$HOME/.local/state/pgbouncer-build"
 ~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py verify
 ```
 
-Installation refuses an existing configuration/service and does not overwrite
-an existing binary. Version 1.26.0 is compiled under `ameesh heavy --` from the
+Installation refuses an existing configuration/service or **any preexisting
+binary**, including symlinks. A matching `--version` is not proof of provenance.
+Only a binary freshly compiled by this invocation may be executed.
+Version 1.26.0 is compiled under `ameesh heavy --` from the
 [official archive](https://www.pgbouncer.org/downloads/files/1.26.0/pgbouncer-1.26.0.tar.gz),
 with pinned SHA256 `afd25dd61ee6775d37b40629b87ce08736b3e6955f3057bb212e410fbf21c71d`.
 The source download is capped at 32 MiB; the temporary build is removed.
@@ -66,6 +72,9 @@ The config backup is exclusive and 0600:
 `~/.config/ameesh/config.json.before-pgbouncer-653`. Switch/rollback write the
 configuration atomically with mode 0600. A running process keeps its original
 DSN until restart. No runner is restarted by the script.
+The socket DSN retains SQL startup options while removing upstream TLS
+negotiation, certificate and channel-binding settings and `hostaddr`;
+`sslnegotiation=direct` is never combined with local `sslmode=disable`.
 
 Before/after JSON records contain server-wide client count, `max_connections`,
 counts by client IP and state, local runner count and direct TCP connections
@@ -84,6 +93,10 @@ after bureau runs these commands; unit tests are not production measurements.
 including equality (210 of 300). It is a default urgent notification;
 `doctor` prints used/max/idle and returns KO at that threshold. Explicit custom
 notification type filters still apply. Mediated clients do not run SQL probes.
+If the capacity probe fails, the alert command reports the database error.
+The notifier retries the failed pass before updating its active state: an
+unobserved capacity value never resolves an existing warning or raises it
+again on recovery. A successful reading below the threshold resolves it.
 
 Rollback, by bureau:
 

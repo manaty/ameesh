@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Connection saturation warning shared by alerts and doctor (#653)."""
-from . import db as db_mod
 
 THRESHOLD_PERCENT = 70
 
@@ -25,10 +24,10 @@ def line(reading):
 
 
 def alerts(db):
-    try:
-        reading = read(db)
-    except db_mod.DbError:
-        return []  # The existing database availability diagnostics still apply.
+    # An unsuccessful observation is not evidence of resolution. Propagate
+    # DbError before Notifier.run_pass changes state; its service retries the
+    # failed pass with the existing active warning intact.
+    reading = read(db)
     if reading is None or not pressured(reading):
         return []
     return [dict(schema='ameesh-alert/1', type='db_connections_high', agent=None,

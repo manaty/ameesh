@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Connection retention, transaction isolation and capacity warning (#653)."""
 import importlib.util
+import copy
 from pathlib import Path
 import json
+import types
 import tempfile
 import threading
 import unittest
 from unittest import mock
 
 from .support import PgTestCase, REPO
-from ameesh import db_capacity, notify
+from ameesh import balance, db as db_mod, db_capacity, exploitation, notify
+from ameesh.runner import Runner
 from ameesh.scoped_db import ScopedDb
 
 
@@ -84,6 +87,55 @@ class ScopedConnections(PgTestCase):
         self.assertGreaterEqual(reading['used'], 1)
         self.assertLessEqual(reading['idle'], reading['used'])
 
+    def test_runner_balance_pass_releases_session_before_provider_fetch(self):
+        # Execute the runner boundary and the real balance.record path. A
+        # rollback of runner.balance_once to db_mod.connect keeps its driver
+        # open during fetch and makes this test fail, even with ScopedDb intact.
+        opened = []
+        original_connect = db_mod.connect
+
+        def connect(cfg):
+            driver = original_connect(cfg)
+            driver.close = mock.Mock(wraps=driver.close)
+            opened.append(driver)
+            return driver
+
+        source = mock.Mock(provider='deepseek')
+        source.configured.return_value = True
+
+        def fetch():
+            self.assertTrue(opened, 'balance.record must query before HTTP')
+            self.assertTrue(all(driver.close.called for driver in opened),
+                            'runner retained an auxiliary session during HTTP')
+            return [balance.BalanceReading('deepseek', 'USD', 42.0)]
+
+        source.fetch.side_effect = fetch
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch('ameesh.db.connect', side_effect=connect):
+            self.assertEqual(runner.balance_once([source], min_interval_s=1), 1)
+        source.fetch.assert_called_once()
+
+    def test_probe_failure_keeps_notifier_warning_without_repeated_raise(self):
+        notifier = notify.Notifier(self.cfg, notify.parse_config({
+            'default_human': 'human:operator', 'default': ['desktop'],
+            'types': ['db_connections_high']}), dry_run=True, log=lambda _: None)
+        high = {'used': 210, 'maximum': 300, 'idle': 200}
+        with mock.patch.object(exploitation, 'alerts',
+                               side_effect=lambda _cfg, db, **_: db_capacity.alerts(db)), \
+                mock.patch.object(db_capacity, 'read', return_value=high):
+            first = notifier.run_pass(self.db)
+            self.assertEqual([r['event'] for r in first], ['raised'])
+            previous = copy.deepcopy(notifier.state)
+            with mock.patch.object(db_capacity, 'read', side_effect=db_mod.DbError('probe')):
+                with self.assertRaises(db_mod.DbError):
+                    notifier.run_pass(self.db)
+            self.assertEqual(notifier.state, previous)
+            self.assertEqual(notifier.run_pass(self.db), [])
+            with mock.patch.object(db_capacity, 'read', return_value={
+                    'used': 209, 'maximum': 300, 'idle': 200}):
+                resolved = notifier.run_pass(self.db)
+                self.assertEqual([r['event'] for r in resolved], ['resolved'])
+
 
 class CapacityWarning(unittest.TestCase):
     def test_boundary_and_default_push(self):
@@ -114,6 +166,72 @@ class OperatorRecipe(unittest.TestCase):
             'pgbouncer_host', Path(REPO) / 'deploy/pgbouncer-host.py')
         cls.recipe = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.recipe)
+
+    def test_host_user_guard_runs_before_every_action_mutation(self):
+        for action in ('install', 'switch', 'rollback', 'measure', 'verify'):
+            for host, user, uid, effective, home_ok in (
+                    ('wrong-host', 'ameesh', 1001, 1001, True),
+                    ('ameesh-agents-1', 'wrong-user', 1001, 1001, True),
+                    ('ameesh-agents-1', 'root', 0, 0, True),
+                    ('ameesh-agents-1', 'ameesh', 1001, 0, True),
+                    ('ameesh-agents-1', 'ameesh', 1001, 1001, False)):
+                with self.subTest(action=action, host=host, user=user, uid=uid,
+                                  effective=effective, home_ok=home_ok), \
+                        mock.patch('sys.argv', ['recipe', action]), \
+                        mock.patch.object(self.recipe.socket, 'gethostname', return_value=host), \
+                        mock.patch.object(self.recipe.os, 'getuid', return_value=uid), \
+                        mock.patch.object(self.recipe.os, 'geteuid', return_value=effective), \
+                        mock.patch.object(self.recipe.pwd, 'getpwuid', return_value=types.SimpleNamespace(
+                            pw_name=user, pw_dir='/home/ameesh')), \
+                        mock.patch.object(Path, 'home', return_value=Path(
+                            '/home/ameesh' if home_ok else '/wrong-home')), \
+                        mock.patch.object(self.recipe, 'private_dir') as mutation:
+                    with self.assertRaises(ValueError):
+                        self.recipe.main()
+                    mutation.assert_not_called()
+        for host in ('ameesh-agents-1', 'ameesh-agents-2'):
+            with mock.patch.object(self.recipe.socket, 'gethostname', return_value=host), \
+                    mock.patch.object(self.recipe.os, 'getuid', return_value=1001), \
+                    mock.patch.object(self.recipe.os, 'geteuid', return_value=1001), \
+                    mock.patch.object(self.recipe.pwd, 'getpwuid', return_value=types.SimpleNamespace(
+                        pw_name='ameesh', pw_dir='/home/ameesh')), \
+                    mock.patch.object(Path, 'home', return_value=Path('/home/ameesh')):
+                self.assertEqual(self.recipe.approved_home(), Path('/home/ameesh'))
+
+    def test_socket_dsn_removes_upstream_tls_and_preserves_startup_options(self):
+        try:
+            import psycopg
+        except ImportError:
+            self.skipTest('operator recipe requires psycopg; covered by the psycopg job')
+        upstream = psycopg.conninfo.make_conninfo(
+            host='upstream', hostaddr='192.0.2.1', port='5432', user='ameesh', dbname='ameesh',
+            sslmode='require', sslnegotiation='direct', sslcert='/private/cert',
+            sslkey='/private/key', sslrootcert='/private/root', channel_binding='require',
+            options='-c search_path=test_schema -c statement_timeout=12345')
+        local = psycopg.conninfo.conninfo_to_dict(
+            self.recipe.socket_conninfo(upstream, Path('/private/socket')))
+        self.assertEqual(local['host'], '/private/socket')
+        self.assertEqual(local['sslmode'], 'disable')
+        self.assertEqual(local['options'], '-c search_path=test_schema -c statement_timeout=12345')
+        self.assertFalse(set(local) & {'sslnegotiation', 'sslcert', 'sslkey',
+                                      'sslrootcert', 'hostaddr', 'channel_binding'})
+
+    def test_preexisting_binary_is_refused_without_execution_or_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            binary = home / '.local/bin/pgbouncer'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\necho "PgBouncer 1.26.0"\n')
+            binary.chmod(0o755)
+            state = home / '.local/state/pgbouncer'
+            config = home / '.config/pgbouncer/pgbouncer.ini'
+            with mock.patch.object(self.recipe.subprocess, 'run') as execute, \
+                    mock.patch.object(self.recipe, 'private_dir') as mutation:
+                with self.assertRaisesRegex(ValueError, 'provenance'):
+                    self.recipe.install(home, state, config)
+                execute.assert_not_called()
+                mutation.assert_not_called()
+                self.assertFalse(config.exists())
 
     def test_secret_quoting_and_control_character_rejection(self):
         self.assertEqual(self.recipe.userlist_quote('p"a\\ss'), '"p""a\\ss"')
