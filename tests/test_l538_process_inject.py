@@ -629,6 +629,19 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.sync()
         self.assertEqual(len(self._sujets("orchestre")), 1)
 
+    def test_deux_synchros_concurrentes_poussent_une_seule_fois(self):
+        # #793: two syncs of the host read the same previous state before
+        # either records the new commit; the rules go out once
+        self.sync()
+        stale = canon_sync.state(self.db, "atelier", canon.load(self.clone))
+        self._change("# Processus de lot\n\n- la règle nouvelle\n")
+        with mock.patch.object(canon_sync, "state", lambda *a, **k: dict(stale)):
+            first = self.sync()
+            second = self.sync()
+        self.assertEqual(len(self._sujets("orchestre")), 1)
+        self.assertGreater(first.processes.sent, 0)
+        self.assertEqual((second.processes.sent, second.processes.changed), (0, []))
+
     def test_une_modification_hors_process_ne_pousse_rien(self):
         self.sync()
         write(self.clone, "agents/ouvrier.md", fiche(
