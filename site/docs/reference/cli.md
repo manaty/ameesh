@@ -1,7 +1,10 @@
 # CLI reference
 
 This reference is written from the real `--help` output of ameesh v1 and its
-integrated lots. The built-in help is in French; option names are identical.
+integrated lots. The built-in help follows the English drive (L148, L156); a
+few recently added subcommands still carry French labels, and the French
+spellings of the renamed commands and options remain hidden aliases
+([Switch from a v0 setup](../guides/switch-from-v0.md)).
 Run `ameesh <command> --help` for the authoritative text.
 
 Three entry points are installed by the package:
@@ -30,7 +33,8 @@ on its first line.
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
-agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title" [--estimate 2h]]
+agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF]
+                [--new-lot "title" [--estimate 2h] [--app PROJECT]]
                 [--kind request|reply|notify|event] [--urgent] [--ack] [--cc NAME[,NAME…]]
                 [--sign --key FILE] [--expires 24h] [--queue]
 agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
@@ -145,8 +149,16 @@ ameesh list [--json]                       # every agent (--json: schema ameesh-
 ameesh projects [--project P] [--all] [--json]  # projects in progress: who works on what (ameesh-projects/1)
 ameesh show <agent> [--json]               # one agent
 ameesh hosts [HOST] [--history N] [--json] # host resources: last reading, limits, short history
-ameesh decisions [--for human:ID] [--json] # what waits for a human
-ameesh progress [--json] [--html FILE] [--project P] [--since SINCE]
+ameesh decisions [--all] [--for human:ID] [--json]  # what waits for a human
+ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since SINCE]
+                [--no-gantt] [--no-versions] [--stale-after S]
+ameesh plan add|list|accept|done|cancel|propose|show   # roadmap and dated commitments (L96)
+ameesh budget [show|set|unset] [--json]    # budget caps stored in the database (L70)
+ameesh accounts list|use|auto|healthy|check  # provider accounts and failover (L30, L226)
+ameesh heavy [--nice N] [--max-duration 90m] -- <command> | --status [--json]
+ameesh harness list|show|check|versions    # harness descriptors and versions per host (L120)
+ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi  # read API (L84)
+ameesh module <name> …                     # installed project module commands
 ameesh cost report [--json]                # agent, harness, model, spend, gauges
 ameesh cost spent [agent] [seconds]        # spend (USD) over a sliding window
 ameesh cost over [agent]                   # exit 0 if the plan's pace is exceeded
@@ -154,6 +166,26 @@ ameesh cost turns [--agent A] [--since SINCE] [--limit N] [--json]      # usage 
 ameesh cost gauges [--harness H] [--since SINCE] [--json]               # history of plan gauges
 ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 ```
+
+`ameesh progress --serve` (L304) serves the same page and its JSON at
+`/api/progress.json` locally, read-only, with a Refresh button; `--html FILE`
+writes a standalone static page instead. `--no-gantt` drops the roadmap
+section, `--no-versions` skips the GitHub reads of the **versions** tab
+(L160f): per project and product, the last published version and the next
+release (its open lots, planned date, state and content — the release notes
+of the release branch, otherwise the lots merged since the last tag), every
+datum carrying its source and read time.
+
+`ameesh budget show` lists the caps in force; `set --per-hour X [--per-day Y]
+[--agent A]` writes one in the database (reloaded live, no restart), and
+`unset` removes a database cap (a config-file cap stays). `ameesh accounts`
+shows the declared accounts, the active one and the switches; `use` forces an
+account, `auto` hands back to the automatic choice, `healthy` lifts an
+`auth_blocked`, and `check` probes every credential of the host (L226a).
+`ameesh heavy --max-duration 90m` caps the command's duration (default
+`AMEESH_HEAVY_MAX_S`, then `heavy_max_seconds`, then 60 minutes; `0` = none):
+a message then SIGTERM/SIGKILL and exit 124. A test suite a turn launches
+outside `ameesh heavy` gets the same cap, recognised on its argv (#453).
 
 `--since` takes a duration (`16h`, `2d`) or an ISO date. `cost balance
 --record` reads the balance now (read-only, free).
@@ -178,18 +210,25 @@ history (`--history`, default 10 readings); `--json` gives one object per host
 
 ```
 ameesh set <agent> key=value [key=value …]   # model=… effort=… tier=… session_policy=par-lot|taille|jamais
+                                             # lot_wake=on|off context_max_tokens=15M|0
+                                             # turn_max_seconds=30m|2h|0 turn_mail_max=20|0
+                                             # turn_grace_seconds=20m|0 mail_batch=90s|2m|0
                                              # mode=execute|externe
                                              # (empty value = default; effect at the next turn)
 ameesh alerts [--json] [--follow] [--interval S] [--long-turn S] [--idle-mail S]
               [--dead-grace S] [--session-tokens N] [--stale-lot S]
               [--orphan-lot S] [--delegation-grace S] [--mail-undeliverable S]
+              [--turn-churn N] [--short-turn S]
 ameesh notify [--once] [--dry-run] [--json] [--interval S] [alert thresholds…]
 ameesh notify --test human:ID [--json]
+ameesh watch enable --agent A [--every 30m] | disable --agent A | show [--json]
 ameesh restart <agent> --brief FILE|- [--wait S] [--json]
 ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account ACCOUNT]
              [--cwd DIR] [--brief FILE|-] [--chantier C] [--force] [--json]
 ameesh resume <agent> [--brief FILE|-] [--fresh] [--json]
 ameesh interrupt <agent> <message…> [--from SENDER]
+ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]   # durable host withdrawal (L232e)
+ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION  # reserved host move (L232a)
 ```
 
 | Option | Meaning |
@@ -204,6 +243,9 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 | `--orphan-lot` | `intake`/`build` lot without activity nor a turn of its assignee for S seconds (default 1800) |
 | `--delegation-grace` | grace period after a delegation's deadline before `delegation_expired` is raised (default 300) |
 | `--mail-undeliverable` | mail pending for S seconds in the mailbox of a stopped agent or of a name absent from the registry (default 900; 0 disables `mail_undeliverable`) |
+| `--turn-churn`, `--short-turn` | `turn_churn`: at least N short turns in the last hour (default 12), a turn being short under S seconds (default 120; L125) |
+| `set … lot_wake=` | wake a runner when an open lot of the agent becomes actionable (default on; per agent, local state of its host) |
+| `set … context_max_tokens=`, `turn_max_seconds=`, `turn_mail_max=`, `turn_grace_seconds=`, `mail_batch=` | per-agent ceilings and batching window (see [Configuration](configuration.md#runner)) |
 | `set … mode=` | `execute` (default: run by a runner under a lease) or `externe` (a human's session, mailbox only, never woken by ameesh) |
 | `notify --once` | a single pass, then exit |
 | `notify --dry-run` | print what would be sent; send nothing, write no state |
@@ -221,13 +263,33 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 [Operate agents](../guides/operate-agents.md) for the schemas, the alert types,
 `adopt`, `resume` and the `notify` configuration.
 
+The **watch** (L121) is a timer on the host that sends the agent the versioned
+instruction `consignes/veille.md` every `--every` (default 30 m); `show` lists
+the watches of the mesh, `disable` removes the timer and the watch. A **host
+drain** (L232e) durably withdraws a host: claims, turns and prompt consumption
+close while the current turn finishes, critical agents first; `undrain` returns
+it, `status` reads the lifecycle state, and an unplanned loss is recovered only
+after a proof scoped to the source, agent and lease epoch. `ameesh handoff
+plan` reserves a host move at a lot boundary with a durable journal (L232a).
+
 ## Readable threads: `ameesh fil`
 
 ```
 ameesh fil list
 ameesh fil show <project> [<lot>] [--last N] [--meta]
 ameesh fil tail <project> [<lot>] [--last N] [--meta] [--interval S]   # default 0.5 s
+ameesh fil expire [--days N] [--dry-run]                              # retention (L361)
 ```
+
+**Retention (L361, decision 0033 §9).** Entries older than one year
+(`thread_retention_days`, `AMEESH_THREAD_RETENTION_DAYS`; `0` = never) are
+removed by `ameesh fil expire`, also run daily by the runner's housekeeping.
+Only the **oldest run** of complete ameesh entries goes: undated text stops
+the expiry and stays. The file is rewritten whole under the thread's exclusive
+lock and renamed over the old one, so a concurrent reader or writer reopens
+the named file and no append is lost. Entry ids stay valid (logical offsets);
+the header keeps the shift, the cut-off date and the number of entries removed
+so far, and an expired id reads as "from the oldest kept entry".
 
 **Mail linked to lots (L118).** When the sender is an orchestrator (declared
 in `AMEESH_ALERT_ORCHESTRATORS`, `roles: [orchestrateur]` on its canon Agent
@@ -244,9 +306,15 @@ record, or an agent that assigned lots in the last 30 days):
 * `--new-lot "title"` (any sender) creates the lot, assigned to the recipient,
   and attaches the message to it; `--estimate 2h` gives its estimated duration,
   **mandatory when the sender is an agent** (refused otherwise, nothing is
-  delivered, exit 2; a warning for a human, L157);
+  delivered, exit 2; a warning for a human, L157); `--app PROJECT` files it in
+  that project, which must be known — the refusal names the close projects —
+  unless `--new-project` accepts an unknown one on purpose (#495);
 * a single `agent/…` branch quoted in the message is set on the attached lot
   when it has none.
+
+A message sent with `--lot` is filed in the **lot's project thread**
+(`work_items.app`), not the sender's or the recipient's (L118c); the fallbacks
+are unchanged ([Readable threads](../concepts/threads.md)).
 
 From any other sender, `--lot` assigns nothing; when it designates an open
 lot (number, or a reference matching a single open lot) the message is tied
@@ -257,19 +325,31 @@ to the lot's number, otherwise it stays a plain thread label. See
 
 ```
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
-                [--body BODY] [--issue-ref REF] [--workstream W]
+                [--new-project] [--body BODY] [--issue-ref REF] [--workstream W]
                 [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
                 [--branch agent/…] [--target BRANCH] [--priority 1|2|3]
                 [--estimate 90m|2h|1h30|1,5h|2d|MINUTES] [--estimate-source S]
-ameesh work plan <id|record> [--debut DAY] [--fin DAY] [--livraison DAY] [--source S]
+ameesh work plan <id|record> [--start DAY] [--end DAY] [--delivery DAY] [--source S]
                 [--estimate DURATION] [--estimate-source S]
 ameesh work estimates [--app PROJECT] [--json]   # actual/estimated ratios (ameesh-estimates/1)
-ameesh work list [--state S] [--assignee A] [--limit N] [--json]
+ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
 ameesh work merged <id> --sha SHA [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
+ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
+ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
+ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID)
+ameesh work sync-merges [--dry-run] [--json]          # close frozen lots whose content is merged (L29)
+ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
+ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
+ameesh work measure [<id>…] [--no-ci] [--json]        # actual time per phase, merged diff size (L157c)
+ameesh work project-github --app PROJECT [--repo R] [--dry-run]   # one issue per lot (L126), a view
+ameesh work resolve <lot> --with <other> [--json]     # prepare a conflict resolution (L160d)
+ameesh work queue add <id> | remove <id> | show [--target BRANCH] [--json]   # merge queue (L160e)
+ameesh work land <id> [--project P] [--json]          # land the queue head (L160e2)
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
@@ -281,6 +361,26 @@ ameesh work backlog add --title T --value "expected value" --score 1-100
 ameesh work backlog list [--all] [--limit N] [--json]
 ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 ```
+
+**Plumbing around the lot.** `work dependencies` records explicit blocking
+prerequisites between lots (L385). `work migration` reserves the next free
+migration number for the lot, per repository, **before** the file is written
+(L122); `--number` reserves an exact one, `--release` gives it back. It is
+idempotent and visible in `work show`. `work set-app` corrects a
+lot's project and `work backfill-app` fills the uniquely inferred ones, both
+with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
+(`--none` detaches it),
+`work close` closes an abandoned or superseded lot, and `work sync-merges`
+closes the frozen lots whose content is already merged (L29). `work schedule`
+proposes the planned dates of open assigned lots at the p80 of the L157
+reference table (`--apply` writes), and `work measure` records the actual time
+per phase and the merged diff size. `work project-github` projects the lots (or
+the plan) onto GitHub issues — a view, never a source (L126). `work resolve`
+prepares the resolution of a conflict between two lots ahead of the merge
+(L160d); `work queue add` enters a ready lot into its target's merge queue
+(`remove` and `show` consult it) and `work land` merges the queue head by hand
+(L160e, L160e2). `work list --stale-after`
+changes the staleness window (default 6 h).
 
 **Every human request becomes a lot** (L130). Orchestrators, design agents and
 the owner's chat record every request from a human as a lot right away, with
@@ -369,6 +469,52 @@ identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a
 warning — never an empty actor. `work delegate` keeps its meaning (`--actor`
 is the delegator).
 
+## Decisions: `ameesh decide`
+
+```
+ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
+                  --option a="…" [--option b="…" …] [--recommend a [--why "…"]]
+                  [--urgent] [--by 2h|18:00|"2026-10-12 09:00"] [--needs-signature]
+                  [--from-mail <id>] [--json]
+ameesh decide <id> <option | "free text"> [--key FILE [--as NAME] | --signed] [--json]
+ameesh decide withdraw <id> [--why "…"] [--json]
+ameesh decide show <id> [--json]
+ameesh decisions [--all] [--for human:ID] [--json]
+```
+
+An agent files a request with `decide ask`: it is attached to the project and
+the work item, which moves to `waiting_human` (it returns to its previous state
+on the answer), the target owner is notified, and the answer comes back by mail
+(it wakes the requester). Only the **owner** answers, by `ameesh decide`, from
+the CLI, the chat or a signed approval; the answer records the identity, the
+channel and the exact text (L124, L233). `--from-mail <id>` converts a decision
+written in prose in mail (the lot of the mail by default). `ameesh decisions`
+lists the queue across projects, alongside gated actions and the prose decisions
+waiting with no question (`--all` includes the answered ones).
+
+## Personas and their sessions
+
+```
+ameesh activity <persona> [--since 24h] [--limit N] [--json]   # bounded activity log (L59)
+ameesh sessions <persona> [--limit N] [--json]                 # current and past sessions (L52)
+ameesh session list <agent> [--host H]                         # off-device session backups (L53)
+ameesh session backup <agent> [--force]                        # back up the current session now
+ameesh session restore <agent> [--session S] [--key K] [--home DIR] [--overwrite]
+                        [--allow-other-agent]                  # restore the latest backup (or K)
+ameesh memory status <persona>        # repository, working copy and unpushed changes
+ameesh memory consolidate <persona>   # ask its session to consolidate journals into memories
+ameesh memory close <persona>         # push remaining work, then remove the local copy
+ameesh chat [--harness claude|codex] [--instruction] [--dry-run]  # the owner's conversation agent (L123)
+```
+
+A **persona** is a durable identity whose sessions, activity and memory are kept
+across harnesses (L51, L52, L54, L59). Session backups are off-device, with an
+explicit S3 endpoint (`AMEESH_BACKUP_S3_*`); `memory consolidate` asks the
+persona's session to fold its journals into memories, `close` pushes the
+remaining work then removes the local copy. `ameesh chat` is the owner's
+conversation agent: it gathers decisions of all projects, forwards requests to
+orchestrators and never takes another agent's session (L123).
+
 ## Canon and placement
 
 ```
@@ -391,6 +537,80 @@ ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] 
 | `--ttl` (spawn) | expiry: `30m`, `2h`, `1d` (max `7d`) |
 | `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused. Two repos never share a segment and one repo keeps the same segment in every canon (a divergent mesh is refused); a configured canon that cannot be read also refuses generation, naming the canon and its ref |
 | `--diff` (review-class) | files changed since REF (`REF..HEAD` + working tree) |
+
+## Hosts, capacity and enrolment
+
+```
+ameesh hosts [HOST] [--history N] [--json]     # host resources (L31)
+ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]   # lifecycle (L232e)
+ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
+ameesh guard check|run|drain                   # capacity guard of a lending VM (L159e)
+ameesh offload run [--host H] [--profile P] [--repo NAME] [--timeout S] [--env K=V]…
+                [--fallback local|none] -- <command…>
+        | status [<job>] | cancel [<job>]      # heavy suites on a lending VM (L159b)
+ameesh host enroll|revoke|list|show            # enrol lending devices (L110; human only)
+ameesh device enroll|challenge|show            # device-side enrolment (L110)
+```
+
+`guard check` prints one measure, the decision and the state; `guard run` is the
+guard loop (offer, levels 0–4, enforcement, drain and stop); `guard drain` asks
+the running guard for a drain (L159e). A host fiche read by the canon's offer
+reader knows the guard's three reclaim keys (`io_pressure_max`, `disk_free_min`,
+`disk_paths`; L159a/#479). `offload run` snapshots the working tree through a
+temporary index (no history travels), sends a thin pack to the VM and runs the
+command in a throwaway checkout: output and exit code come back unchanged, and
+`--fallback local` (the default) runs it here when the VM is unreachable before
+the job starts (L159b). `host enroll` emits an enrolment code, `host revoke`
+revokes an executor, `host list|show` reads them; `device enroll|challenge|show`
+is the device side (L110; authorised human only).
+
+## Housekeeping, shared dependencies, conflicts
+
+```
+ameesh housekeeping [--dry-run | --apply] [--by BY] [--json]   # cleanup (L73; ex menage)
+ameesh deps link|local|unlink|status|entries                   # shared node_modules (L231)
+ameesh conflicts [--project P] [--all] [--json]                # conflict radar (L160b)
+ameesh harness list|show|check|versions                        # descriptors, versions per host (L120)
+ameesh module <name> …                                         # installed project module commands
+```
+
+`housekeeping` is the L148 name of the old `menage` (the French spelling stays a
+hidden alias): `--apply` is for a human or the runner only, never an agent
+session; it frees the build output of idle worktrees and removes merged kept
+worktrees after 24 h (L230), and it never promises to delete a `/tmp` entry that
+appeared during another agent's turn (L222). `deps` shares one `node_modules`
+per lockfile and per host, sealed read-only; `local` (alias `unlink`) restores a
+local install before packaging (L231). `conflicts` is the passive conflict radar
+between lots (L160b). `harness versions` tracks the harness versions per host and
+their differences (L120).
+
+## Read API and the UI
+
+```
+ameesh serve [--port 8780] [--token-file FILE] [--human human:ID] [--organisation NAME]
+ameesh serve --openapi        # print the OpenAPI 3.1 document (docs/api/openapi-v1.json)
+```
+
+A read-only local HTTP server on 127.0.0.1 (L84): GET and HEAD only, Bearer
+token in a `0600` file, each response the same serialisation as the matching
+`--json` output (one source of truth). `GET /ui/` serves the standalone page
+built from `ui/` (L88); `GET /.well-known/ameesh` and `/api/v1/openapi.json`
+need no token. The contract is `docs/api/openapi-v1.json`.
+
+## Mediated executor (path B)
+
+```
+ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
+ameesh host enroll|revoke|list|show
+ameesh device enroll|challenge|show
+```
+
+The mediated executor lets a device run agents through the mesh server without
+database, forge or provider credentials (L107–L114): contract 1.1, mediated
+storage and runner, single-use enrolment and revocation, host gate, model relay,
+server-side work repositories, executor image entry point and signing helper.
+Operator procedure: `docs/EXECUTEUR-MEDIEE.md`; review notes:
+`docs/PATH-B-REVIEW.md`.
 
 ## Actions: `ameesh action`
 

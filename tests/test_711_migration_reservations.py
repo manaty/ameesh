@@ -351,6 +351,12 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(errors, [])
         self.assertIsNotNone(results[0])
 
+    def test_legacy_import_and_named_allocation_lock_repository_before_lot(self):
+        self._legacy_writer_concurrent_with_named(
+            lambda api: reservations.import_reservations(
+                api.db, [{'number': 400, 'label': 'legacy', 'who': 'dev', 'status': 'reserved'}],
+                {'400': self.a['id']}, repo='manaty/nexlink', apply=True, actor='dev'))
+
     def test_set_app_and_named_allocation_lock_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
             lambda api: api.set_app(self.a['id'], 'other', actor='dev'))

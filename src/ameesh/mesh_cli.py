@@ -1097,10 +1097,10 @@ def _deep_analysis_line(found: dict) -> str:
 def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
     """La classe de revue d'un changement (décision 0018 point 1, R19).
 
-    La politique est lue au canon (`review_policies.classes`) ; les fichiers
-    viennent des arguments ou de `--diff REF` (ref..HEAD + arbre de travail).
-    Une déclaration invalide refuse de classer : jamais une classe par défaut
-    rassurante sur une politique illisible.
+    La politique est lue au canon (`review_policies.risk_classes`), par projet
+    (`--project`, §8) ; les fichiers viennent des arguments ou de `--diff REF`
+    (ref..HEAD + arbre de travail). Une déclaration invalide refuse de classer :
+    jamais une classe par défaut rassurante sur une politique illisible.
     """
     from . import canon as canon_mod
     from . import canon_cli, review as review_mod
@@ -1109,7 +1109,16 @@ def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
     if not canon.readable:
         print("error: unreadable canon (%s)" % canon.root, file=sys.stderr)
         return 1
-    policy, problems = review_mod.policy_from_federation(canon.federation)
+    scoped = review_mod.scoped_from_federation(canon.federation)
+    project = args.project
+    if project is None and scoped.projects:
+        # Sans projet, la politique d'un dépôt ne se devine pas : chaque projet
+        # déclare ses propres chemins sensibles (§8), les mélanger serait pire
+        # qu'une erreur.
+        print(USAGE_HINT % ("review-class: name the project (--project): declared here: %s"
+                            % ", ".join(sorted(scoped.projects))), file=sys.stderr)
+        return 1
+    policy, problems = scoped.policy_of(project)
     if problems:
         for code, _severity, message in problems:
             print("%s: %s" % (code, message), file=sys.stderr)
@@ -1153,7 +1162,8 @@ def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
         # `policy_ref` : le commit du canon lu, pour que la classe affichée soit
         # rattachable à la politique qui l'a produite (mesh-design).
         policy_ref = canon.sources[0].commit if canon.sources else ""
-        print(json.dumps(dict(result, root=canon.root, repo=repo, policy_ref=policy_ref),
+        print(json.dumps(dict(result, root=canon.root, repo=repo, project=project,
+                              policy_ref=policy_ref),
                          ensure_ascii=False, indent=2))
         return 0
     print("class: %s" % result["class_display"])
@@ -1257,6 +1267,14 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
                                   if int(r["work_item_id"]) == lot_id), None)
         except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
             item["queue"] = None
+        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
+        # doute rend `sensitive` et le dit)
+        from . import lot_class
+        try:
+            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
+                                    "why": "unreadable (%s)" % exc, "files": []}
         # L157c: actual time by phase and merged diff size, once delivered
         from . import lot_measures
         item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
@@ -1837,7 +1855,7 @@ def cmd_set(cfg: Config, args) -> int:
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
     """
-    from . import adapters, harnesses
+    from . import adapters, harnesses, runner
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
@@ -1847,6 +1865,8 @@ def cmd_set(cfg: Config, args) -> int:
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
             return 1
+        harness = agent.get("harness") or ""
+        incarnation = runner.agent_incarnation(agent)
         valeurs: dict = {}
         for couple in args.values:
             cle, sep, valeur = couple.partition("=")
@@ -1911,7 +1931,6 @@ def cmd_set(cfg: Config, args) -> int:
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
-                harness = agent.get("harness") or ""
                 descriptor = harnesses.get(harness)
                 rule = descriptor.interactive_permission if descriptor else {}
                 if not rule:
@@ -1925,9 +1944,27 @@ def cmd_set(cfg: Config, args) -> int:
                           % (valeur, " | ".join(allowed) or "e.g. auto, acceptEdits"),
                           file=sys.stderr)
                     return 2
+                if not incarnation:
+                    # L685 r2 (P1): sans l'identité d'enregistrement le mode ne
+                    # peut pas être lié à l'incarnation de l'agent : refusé
+                    # plutôt que d'écrire une autorisation au nom seul
+                    print("permission_mode: cannot bind the mode to the registration "
+                          "of %s (creation date unreadable)" % args.agent,
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):
+            if cle == "permission_mode":
+                # L685: le mode est enregistré avec le harnais et l'incarnation
+                # de l'agent qui l'autorisent ; `attach` refuse de l'appliquer
+                # ensuite (autre harnais, ou agent supprimé puis recréé).
+                try:
+                    runner.write_attach_permission_mode(
+                        cfg, args.agent, harness, incarnation, valeur)
+                except runner.PermissionModeWriteError as exc:
+                    print("permission_mode: %s" % exc, file=sys.stderr)
+                    return 2
+            elif cle in ("model", "effort", "tier", "mail_batch"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
@@ -2575,6 +2612,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="files to classify, relative to the repository")
     p_review.add_argument("--diff", default=None, metavar="REF",
                           help="files changed since REF (ref..HEAD + working tree)")
+    p_review.add_argument("--project", default=None, metavar="NAME",
+                          help="project whose risk_classes apply (required when the "
+                               "canon declares several)")
     canon_cli._canon_options(p_review)
     p_review.set_defaults(func=cmd_review_class)
 

@@ -164,6 +164,10 @@ MESH_COMMANDS = (
     "budget",
     # L131 : suites lourdes plafonnées par hôte (`ameesh heavy -- <commande>`)
     "heavy",
+    # L161c (#744) : la CI lue par `ameesh ci status <lot>` — le parseur existait
+    # dans mesh_cli, mais aucune liste de routage ne le servait : code 2 avant
+    # même de regarder la base.
+    "ci",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")

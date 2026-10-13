@@ -51,9 +51,22 @@ Before each turn, the runner checks:
   agents for the last sixty minutes, `AMEESH_BUDGET_USD_PER_HOUR` (default
   **10 USD/h**; `0` disables the guard). Subscription usage does not count in
   this sum;
+- the **daily cap** (L70), a sliding 24 h window: `AMEESH_BUDGET_USD_PER_DAY`
+  (default `0`, off) or a cap set in the database with `ameesh budget set
+  --per-day`, which wins over the configuration;
 - the **pace guard** of subscriptions: a plan is going too fast when its usage
   reaches `min(90 %, elapsed share of the window + 10 points)`. The 10-point
   margin covers orchestrators and humans, who share the same plan.
+
+A cap set in the database with `ameesh budget set --per-hour/--per-day` is
+reloaded live; `--agent` scopes it to one agent. Critical agents — the canon's
+orchestrator, design and auditor roles, plus `critical_agents` — are never
+paused while an account has margin; above `noncritical_hourly_share` of the
+cap, a non-critical agent stops. A critical agent at threshold switches
+account on its own, then falls back to Codex, then DeepSeek, and comes back
+(L242b). When a credential is exhausted or revoked, the sentinel declares
+`auth_blocked` and the runner fails over to a healthy account — primaries
+last and capped, never overage (L226b).
 
 The decision is fresh at every turn. A paused agent shows the reason in
 `ameesh list`, and the thread keeps a trace.
@@ -67,6 +80,8 @@ ameesh cost over [agent]                # exit 0 if the plan's pace is exceeded
 ameesh cost turns [--agent A] [--since 24h] [--json]     # the per-turn ledger
 ameesh cost gauges [--harness H] [--since 7d] [--json]   # history of plan gauges
 ameesh cost balance [--provider deepseek] [--record] [--json]   # provider balance, real spend per hour and day
+ameesh budget show | set --per-hour X [--per-day Y] [--agent A] | unset …   # caps in the database
+ameesh accounts list | use ACCOUNT | auto | healthy | check # accounts and failover
 ameesh set <agent> model=… effort=… tier=…   # routing: applied at the next turn
 ameesh progress                         # includes spend and gauges
 ```

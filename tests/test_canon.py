@@ -1305,6 +1305,39 @@ class ReviewPolicyTest(_TmpMixin, unittest.TestCase):
         commit_all(clone, "orphelin", push=False)
         self.assertIn("c.txt", canon.git_changed_paths(clone, "main"))
 
+    def test_plage_depuis_le_merge_base_de_la_cible(self):
+        """`git_range_paths` part du merge-base, pas de la tête de la cible :
+        c'est le diff qu'un lot gelé emporte depuis sa cible (L539)."""
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "home")
+        git(clone, "checkout", "-q", "-b", "lot")
+        write(clone, "c.txt", "lot\n")
+        lot = commit_all(clone, "le lot")
+        # la cible avance après la fourche : ses fichiers ne sont pas du lot
+        git(clone, "checkout", "-q", "main")
+        write(clone, "d.txt", "cible\n")
+        commit_all(clone, "la cible avance")
+        self.assertEqual(canon.git_range_paths(clone, "main", lot), ["c.txt"])
+
+    def test_renommage_compte_les_deux_chemins(self):
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "home")
+        write(clone, "ancien.txt", "un\n")
+        base = commit_all(clone, "base")
+        git(clone, "mv", "ancien.txt", "nouveau.txt")
+        head = commit_all(clone, "renomme")
+        self.assertEqual(canon.git_range_paths(clone, base, head),
+                         ["ancien.txt", "nouveau.txt"])
+
+    def test_reference_inconnue_leve_jamais_une_plage_vide(self):
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "home")
+        head = git(clone, "rev-parse", "HEAD")
+        with self.assertRaises(canon.GitError):
+            canon.git_range_paths(clone, "ref-qui-n-existe-pas", head)
+        with self.assertRaises(canon.GitError):
+            canon.git_range_paths(clone, "main", "ref-qui-n-existe-pas")
+
 
 class CanonCliTest(_CanonDbCase):
     def cli_env(self, **extra) -> dict:
