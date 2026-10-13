@@ -34,6 +34,8 @@ import re
 import socket
 from dataclasses import dataclass, field, replace
 
+from . import dsn as dsn_mod
+
 #: DSN du banc local, **sans mot de passe** : le secret vient de PGPASSWORD ou
 #: de ~/.pgpass, ou d'un DSN complet dans AMEESH_DSN / le fichier de config.
 DEFAULT_DSN = "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh"
@@ -736,19 +738,26 @@ def _canons_from_file(raw: dict, where: str) -> dict:
             "extra_canons": tuple(entries[1:])}
 
 
+#: ce qu'un DSN affichable montre à la place de son mot de passe (L537)
+MASKED_PASSWORD = "password=***"
+
+
 def mask_dsn(dsn: str) -> str:
-    """DSN affichable : le mot de passe n'apparaît jamais dans un journal."""
-    if "://" in dsn:
-        head, rest = dsn.split("://", 1)
-        if "@" in rest:
-            creds, tail = rest.rsplit("@", 1)
-            user = creds.split(":", 1)[0]
-            return "%s://%s:***@%s" % (head, user, tail)
-        return dsn
-    out = []
-    for token in dsn.split():
-        if token.startswith("password="):
-            out.append("password=***")
-        else:
-            out.append(token)
-    return " ".join(out)
+    """DSN affichable : le mot de passe n'apparaît jamais dans un journal.
+
+    Le DSN sans son mot de passe est celui d'`ameesh.dsn.split_password`, qui
+    suit les règles de libpq : mot de passe de l'userinfo, paramètre
+    `password` de la requête, couples clé/valeur (blancs autour du `=`, valeurs
+    citées, échappements), dernière entrée gagnante. `MASKED_PASSWORD` marque
+    qu'il y en avait un ; un DSN que libpq refuserait s'affiche `<invalid DSN>`,
+    jamais cité. L'environnement (PGSERVICE) ne compte pas : on ne lit que le
+    DSN."""
+    try:
+        password, rest = dsn_mod.split_password(dsn, {})
+    except dsn_mod.DsnError:
+        return "<invalid DSN>"
+    if not password:
+        return rest
+    if rest.startswith(("postgresql://", "postgres://")):
+        return rest + ("&" if "?" in rest else "?") + MASKED_PASSWORD
+    return ("%s %s" % (rest, MASKED_PASSWORD)) if rest else MASKED_PASSWORD
