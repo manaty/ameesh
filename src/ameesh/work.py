@@ -126,7 +126,7 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
                            "\"%s\"; pass --actor <agent|human:id>" % UNKNOWN_ACTOR)
 
 
-def corrector(cfg, db, explicit: str | None = None) -> str:
+def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> str:
     """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
     si la correction lui est refusée.
 
@@ -137,7 +137,8 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
     fiche Agent au canon, `AMEESH_ALERT_ORCHESTRATORS`, ou lots confiés
     récemment) ; elle ne peut pas corriger au nom d'un autre. Une session sans
     identité d'agent (un humain à son terminal) dit qui corrige : `--actor
-    human:<id>`, un humain connu, ou un orchestrateur."""
+    human:<id>`, un humain connu, ou un orchestrateur. `history=False` (#740) :
+    les lots confiés récemment ne comptent pas, seul un rôle déclaré compte."""
     from . import assignments, identity, registry
 
     text = (explicit or "").strip()
@@ -155,7 +156,8 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
         if text and text != binding.name:
             raise WorkError("correction refused: this session belongs to %s, it does not "
                             "correct on behalf of %s" % (binding.name, text))
-        if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES):
+        if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES,
+                                       history=history):
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
@@ -166,9 +168,21 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
     if human:
         return human
     if registry.get(db, text) is not None \
-            and assignments.is_orchestrator(cfg, db, text, roles=CORRECTOR_ROLES):
+            and assignments.is_orchestrator(cfg, db, text, roles=CORRECTOR_ROLES,
+                                            history=history):
         return text
     raise WorkError(refus % text)
+
+
+def pin_authority(cfg, db, actor: str | None = None) -> str | None:
+    """#740: who may protect a date from the schedule (`work plan`, `work
+    schedule --pin`): the actor `corrector` accepts on a declared role (a
+    human, or an orchestrator or design role in the canon or
+    AMEESH_ALERT_ORCHESTRATORS; having assigned lots is not enough), or None."""
+    try:
+        return corrector(cfg, db, actor, history=False)
+    except WorkError:
+        return None
 
 
 def add(
