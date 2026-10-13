@@ -92,7 +92,10 @@ The reviewer of a review can be **designated on entry to `qa`** (#705):
 a design agent designates, never the lot's assignee. The wait then names that
 reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
-designate one.
+designate one. A reviewer whose **declared harness** is the author's (claude,
+codex and deepseek are distinct families) gets an indicative warning on
+stderr (#800): the designation is kept — canon §2 asks for another model
+family, and the real family is judged on the review turn (decision 18855a).
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
