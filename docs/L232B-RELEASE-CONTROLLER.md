@@ -298,6 +298,43 @@ No SSH connection, authenticated host-key check or real systemd action is run.
 This remains source-only and requires the bootstrap/runtime/forced command,
 independent service and complete release adapter before a real host pilot.
 
+## Prepared SSH/sudo delegation inventory
+
+`delegation-release.py.render(plan)` prepares the exact root-owned forced
+command wrapper, sudoers entry, public authorized-key file and SSH account Match
+configuration. It performs no installation, creates no account and enables no
+service. The plan binds the logical host, exact machine-id, independently
+verified host-key digest, full runtime/source tree digests, restart policy,
+one bare Ed25519 controller public key and a canonical controller IP network.
+Credential values, authorized-key options/comments, shell text and arbitrary
+paths are refused. Every output file has a fixed destination, ownership, mode,
+content and SHA-256; the complete review inventory has its own digest.
+
+The public-key file is root-owned 0644 so the dedicated SSH account can read it;
+the enclosing root-owned directory must be searchable. Enrollment, database,
+operation and journal files remain root-private. Both the key and account force
+the same wrapper. Account settings disable forwarding, TTY, user rc and alternate
+password/interactive authentication. The wrapper refuses arguments and any
+`SSH_ORIGINAL_COMMAND`, then clears the environment before the fixed sudo call.
+The sudo grant names only the immutable interpreter with the exact isolated
+dispatcher arguments; it grants no shell, systemctl or arbitrary Python program.
+
+`question(bundle)` prepares reviewable signed-decide text including the complete
+digest-bound inventory and revocation plan. It does not send a question or
+authorize root execution. The proposed revocation removes only exact matching
+delegation files and preserves runtime, private operation/helper/controller
+journals, credentials and live release fences. Changed files require a separately
+reviewed diff. Revoking SSH access does not fabricate completion or reopen claims.
+
+This is a preparation component, **not the completed bootstrap installer**.
+An administrator still must establish the dedicated account, verify the full
+immutable runtime/source closure and host identity, install private enrollment,
+validate effective sudo/SSH configuration and arrange the independent service
+before enabling the key. The initial system account, runtime-copy verification,
+installation script with snapshots/undo and service/full adapter remain build
+work. Tests verify the deterministic inventory, digest binding, input refusals
+and wrapper rejection paths without executing sudo or a host action.
+
 ## Operation-specific code and environment recovery
 
 Before configuration changes, the controller can use
