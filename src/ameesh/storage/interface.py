@@ -286,7 +286,9 @@ class Leases(Domain):
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
                      require_responsible: bool) -> dict | None:
-        """Prend le bail pour une session interactive (`ameesh attach`)."""
+        """Prend le bail pour une session interactive (`ameesh attach`) ; la
+        ligne rendue porte `harness` et `created_ts` (L719), l'identité de
+        l'enregistrement revendiqué."""
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
@@ -993,13 +995,22 @@ class WorkItems(Domain):
             package_id: str | None = None, package_parent: str | None = None,
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
-            estimate_source: str | None = None, change_size: str | None = None) -> dict:
+            estimate_source: str | None = None, change_size: str | None = None,
+            mark_item_id: int | None = None, mark_note: str = "") -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
         si `change_size`, L157b) et sa première ligne de journal ; rend le
-        lot."""
+        lot.
+
+        `mark_note`, si non vide, est écrit au journal de `mark_item_id` dans
+        la **même** transaction (L539 : la marque d'idempotence du lot de
+        relecture ne peut pas survivre seule à l'échec de l'autre écriture) ;
+        `{lot}` y est remplacé par l'identifiant du lot créé. La ligne
+        `mark_item_id` est verrouillée avant l'insertion et `issue_ref` y est
+        relue sous ce verrou : deux créations concurrentes de la même
+        référence ne peuvent pas aboutir toutes les deux (revue #544 r2)."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1167,6 +1178,12 @@ class WorkItems(Domain):
     def open_by_ref(self, ref: str) -> list[dict]:
         """L118 : les lots ouverts désignés par une référence (issue, fiche,
         branche, premier mot du titre)."""
+
+    @abc.abstractmethod
+    def by_issue_ref(self, ref: str) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, **quel que
+        soit leur état** — l'identité d'un lot de relecture après fusion
+        survit à sa fermeture, sinon un second lot serait ouvert."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
@@ -2101,14 +2118,18 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def plan_item(self, item_id: int, dates: dict, *, source: str | None,
-                  actor: str) -> dict | None:
+                  actor: str, expect: dict | None = None) -> dict | None:
         """Pose les dates prévues d'une tâche (`dates` : clés parmi `start`,
         `end`, `delivery` ; valeur None = date effacée ; clé absente =
         inchangée), avec qui et quand (`planned_by`, `planned_at`). Ce n'est
         PAS une activité de la tâche : ni `updated_at` ni le journal ne
         bougent (une replanification ne masque pas une stagnation). Rend
         `{id, planned_start, planned_end, planned_delivery, planned_source,
-        planned_by, planned_ts}`, ou None si la tâche est inconnue."""
+        planned_by, planned_ts}`, ou None si la tâche est inconnue.
+
+        #740 : avec `expect` (`planned_start`, `planned_end`,
+        `planned_source` lus avant), rien n'est écrit si l'un d'eux a changé
+        depuis la lecture ; None alors aussi."""
 
     @abc.abstractmethod
     def item_plans(self, ids: Sequence[int]) -> list[dict]:
@@ -2385,12 +2406,36 @@ class HostLifecycle(Domain):
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
 
+    #254 : la pause d'un hôte voulue par le propriétaire (`host_holds`, 0392).
+
     Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
     1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
     tours en cours ; L159d: PSI, application and guest shares, lendable
     capacity. Les mesures illisibles sont NULL : on ne devine pas.
     Instants rendus en secondes epoch (`sampled_ts`).
     """
+
+    @abc.abstractmethod
+    def holds(self) -> list[dict]:
+        """#254 : les pauses en cours (`until` pas encore passé, heure de la
+        base) : host, reason, author, created_ts, until_ts."""
+
+    @abc.abstractmethod
+    def hold(self, host: str, *, reason: str, author: str, seconds: float | None = None,
+             until_ts: float | None = None) -> dict | None:
+        """#254 : pose (ou remplace) la pause de `host`, pour `seconds` ou
+        jusqu'à `until_ts`, bornée à l'heure de la base (après maintenant,
+        24 h au plus) ; None hors de ces bornes. L'historique
+        (`host_hold_events`) est écrit dans la même transaction."""
+
+    @abc.abstractmethod
+    def release(self, host: str, *, author: str) -> bool:
+        """#254 : lève la pause de `host` (historique compris) ; faux s'il
+        n'y en avait pas."""
+
+    @abc.abstractmethod
+    def hold_events(self, host: str | None = None) -> list[dict]:
+        """#254 : l'historique des pauses et levées, dans l'ordre."""
 
     @abc.abstractmethod
     def gate_guard(self, host: str):

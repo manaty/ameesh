@@ -20,6 +20,9 @@ from ameesh import cost
 
 from .support import PgTestCase
 
+#: the real racy window, for the tests that rewrite a journal in place
+RACY_CTIME_NS = cost.RACY_CTIME_NS
+
 # Un `result` Claude porte toujours l'usage du tour ; sans lui, le coût se lit
 # appel par appel au barème (L221), pas dans le cumul.
 U = {"input_tokens": 1}
@@ -41,6 +44,11 @@ class Sandbox:
 
     def setUp(self) -> None:
         super().setUp()                     # PgTestCase : schéma, TRUNCATE, dossiers
+        # journals written by a test count as settled, so caching is observable;
+        # the in-place rewrite tests restore the real racy window
+        racy = mock.patch.object(cost, "RACY_CTIME_NS", 0)
+        racy.start()
+        self.addCleanup(racy.stop)
         self.tmp_cost = tempfile.mkdtemp(prefix="ameesh-cost-")
         self.addCleanup(shutil.rmtree, self.tmp_cost, ignore_errors=True)
         self.state = os.path.join(self.tmp_cost, "state")
@@ -267,7 +275,9 @@ class AccountTailGaugeTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(book.claude_gauges('secondary', 'primary')[0].used, 0.42)
         self.assertEqual(book.claude_gauges('primary', 'primary'), [])
 
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
     def test_rewrite_same_size_and_mtime_invalidates_cache(self):
+        # in one clock tick ctime does not move: a fresh journal is never cached
         self.agent('long', 'claude')
         self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
         path = os.path.join(self.state, 'long', 'events.jsonl')
@@ -281,6 +291,43 @@ class AccountTailGaugeTest(Sandbox, unittest.TestCase):
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertEqual(os.stat(path).st_size, before.st_size)
         self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.42)
+
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
+    def test_slow_read_does_not_age_a_racy_snapshot_into_the_cache(self):
+        # age taken before the read: a read lasting past the window stays racy
+        self.agent('long', 'claude')
+        self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
+        path = os.path.abspath(os.path.join(self.state, 'long', 'events.jsonl'))
+        ctime = os.stat(path).st_ctime_ns
+        now = [ctime + RACY_CTIME_NS // 2]
+        real_tail = cost._claude_account_tail
+
+        def slow_tail(target):
+            result = real_tail(target)
+            now[0] = ctime + 5 * RACY_CTIME_NS  # the read outlasts the window
+            return result
+        book = self.book()
+        with mock.patch.object(cost.time, 'time_ns', lambda: now[0]), \
+                mock.patch.object(cost, '_claude_account_tail', slow_tail):
+            self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+        self.assertIsNone(book._claude_gauge_cache.get(path))
+
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
+    def test_cache_hit_rechecks_age_after_a_clock_step_back(self):
+        self.agent('long', 'claude')
+        self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
+        path = os.path.abspath(os.path.join(self.state, 'long', 'events.jsonl'))
+        ctime = os.stat(path).st_ctime_ns
+        book = self.book()
+        with mock.patch.object(cost.time, 'time_ns', lambda: ctime + 5 * RACY_CTIME_NS):
+            book.claude_gauges('tertiary', 'primary')
+        self.assertIsNotNone(book._claude_gauge_cache.get(path))
+        tail = mock.Mock(wraps=cost._claude_account_tail)
+        with mock.patch.object(cost.time, 'time_ns', lambda: ctime), \
+                mock.patch.object(cost, '_claude_account_tail', tail):
+            book.claude_gauges('tertiary', 'primary')
+        tail.assert_called_once()
+        self.assertIsNone(book._claude_gauge_cache.get(path))
 
     def test_replacement_and_truncation_invalidate_cache(self):
         self.agent('long', 'claude')

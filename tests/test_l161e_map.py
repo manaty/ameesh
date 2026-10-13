@@ -251,6 +251,8 @@ class FusionTest(unittest.TestCase):
         self.assertEqual(c["mesure"]["sous_processus_sans_mesure"],
                          {"test_l1": ["python -m ameesh.cli"]})
         self.assertEqual(c["mesure"]["surcout"], {"psycopg": 2.0})
+        # L148 stage 6 : la mesure est émise dans les deux graphies, une release.
+        self.assertEqual(c["measure"], c["mesure"])
         self.assertIn("work_items", c["migrations"]["src/ameesh/migrations/0053_work_item_migration.sql"])
         self.assertIn("src/ameesh/radar.py", c["blocs"])
         self.assertIn("src/ameesh/radar.py::github_slug", c["sans_test"])  # rien mesuré ici
@@ -260,6 +262,8 @@ class FusionTest(unittest.TestCase):
         self.assertEqual([e["test"] for e in modules["test_l1"]["echecs"]],
                          ["vieux", "tests.test_l1.T.test_a"])
         self.assertEqual(modules["test_l1"]["durees"], {"psycopg": 4.0})
+        # L148 stage 6 : les durées sortent aussi en anglais, mêmes valeurs.
+        self.assertEqual(modules["test_l1"]["durations"], {"psycopg": 4.0})
         self.assertNotIn("test_l2", modules)
 
     def test_ecrire_lire_et_durees_pour_les_parts(self):

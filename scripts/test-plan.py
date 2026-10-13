@@ -511,7 +511,11 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
     if card:
         table = {}
         for module, info in card.get("modules", {}).items():
-            for d, s in info.get("durees", {}).items():
+            # L148 stage 6 : `durations` (anglais) puis l'ancienne `durees`.
+            par_pilote = info.get("durations")
+            if par_pilote is None:
+                par_pilote = info.get("durees", {})
+            for d, s in par_pilote.items():
                 table.setdefault(d, {})[module] = s
         if not table.get(driver):
             table = None

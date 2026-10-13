@@ -96,13 +96,56 @@ def fresh_target(replayer, project, target: str) -> str:
                               "rev-parse")
 
 
-def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
+def _shell(command: str, path: str, timeout: float) -> str | None:
+    """Runs `command` in `path`: None if it passes, else the tail of its output."""
+    try:
+        proc = subprocess.run(command, shell=True, cwd=path, capture_output=True,
+                              timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return "timeout after %.0f s" % timeout
+    if proc.returncode == 0:
+        return None
+    out = (proc.stdout + proc.stderr).decode("utf-8", "replace").splitlines()
+    return "\n".join(out[-GATE_TAIL:]) or "exit %d" % proc.returncode
+
+
+def _regenerate(path: str, generated, touched, *, timeout: float = GATE_TIMEOUT_S) -> dict:
+    """L160g (#473): regenerates, on the merged tree in `path`, each
+    generated file in `touched`, stages
+    it, then runs its check: `{ok, files, file, output}`."""
+    from . import resolutions
+    done = []
+    for item in generated:
+        if item.path not in touched:
+            continue
+        failed = _shell(item.regen, path, timeout)
+        if failed is None:
+            staged = resolutions._run(path, "add", "-A", "--", item.path)
+            if staged.returncode != 0:
+                failed = "cannot stage generated output: %s" % resolutions._err(staged)
+            else:
+                failed = _shell(item.check, path, timeout) if item.check else None
+                if failed is None and resolutions._run(
+                        path, "diff", "--exit-code", "--", item.path).returncode != 0:
+                    failed = "generated check changed the staged output"
+        if failed is not None:
+            return {"ok": False, "files": done, "file": item.path, "output": failed}
+        done.append(item.path)
+    return {"ok": True, "files": done, "file": None, "output": ""}
+
+
+def merge(replayer, base: str, row: dict, rows: list[dict], *, generated=()) -> dict:
     """Merges the frozen commit of `row` into `base` in the clone, `rerere`
     primed by the resolutions `rows` of the lot. Leaves the merge committed
-    at HEAD: `{state: clean|replayed|conflict, files, sha}`."""
+    at HEAD: `{state: clean|replayed|conflict|generated, files, sha,
+    regenerated}`. `generated` (L160g, `radar.Generated`): those files are
+    never taken from a merge nor from rerere — regenerated on the merged
+    tree for every merge, including input-only changes, then checked (`generated`:
+    the regeneration or its check failed, `output`)."""
     from . import resolutions
     path, run = replayer.path, resolutions._run
     lot = int(row["work_item_id"])
+    paths = {g.path for g in generated}
     commits = [r["commit_sha"] for r in rows
                if lot in (int(r["work_item_id"]), int(r["other_item_id"]))]
     missing = set(replayer.prime(commits)) if commits else set()
@@ -112,20 +155,34 @@ def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
     for sha in commits:
         if sha in trained and sha not in missing:
             shutil.copytree(replayer._store(sha), replayer._rr_cache(), dirs_exist_ok=True)
-    proc = run(path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+    proc = run(path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                "merge", "--no-ff", "--no-commit", "--quiet", row["frozen_sha"])
-    state, files = "clean", []
+    state, files, regenerated = "clean", [], []
     try:
         if proc.returncode != 0:
             files = resolutions.unmerged(path)
-            remaining = resolutions.rerere_remaining(path) if files else []
-            left = sorted(set(remaining) | set(resolutions.with_markers(path, files)))
+            resolutions.exclude_generated(path, files, paths)
+            resolutions._check(run(path, "-c", "rerere.enabled=true", "-c",
+                                   "rerere.autoUpdate=false", "rerere"), "rerere")
+            others = [f for f in files if f not in paths]
+            remaining = [f for f in resolutions.rerere_remaining(path) if f not in paths] \
+                if others else []
+            left = sorted(set(remaining) | set(resolutions.with_markers(path, others)))
             if not files or left:
                 run(path, "merge", "--abort")
                 return {"state": "conflict", "files": left or files,
                         "error": "" if files else resolutions._err(proc)[:300]}
-            resolutions._check(run(path, "add", "--", *files), "add")
-            state = "replayed"
+            if others:
+                resolutions._check(run(path, "add", "--", *others), "add")
+                state = "replayed"
+        touched = paths
+        if touched:
+            made = _regenerate(path, generated, touched)
+            if not made["ok"]:
+                run(path, "merge", "--abort")
+                return {"state": "generated", "files": [made["file"]],
+                        "output": made["output"]}
+            regenerated = made["files"]
         message = "Merge #%d « %s » (%s)\n\n%s: %d\n" % (
             lot, row.get("title") or "", row.get("branch") or row["frozen_sha"][:12],
             TRAILER, lot)
@@ -134,22 +191,29 @@ def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
     finally:
         replayer._empty_cache()
     sha = resolutions._check(run(path, "rev-parse", "HEAD"), "rev-parse")
-    return {"state": state, "files": files, "sha": sha}
+    return {"state": state, "files": [f for f in files if f not in paths], "sha": sha,
+            "regenerated": regenerated}
 
 
-def gates(project, path: str, *, timeout: float = GATE_TIMEOUT_S) -> dict:
+def changed(path: str, base: str, sha: str) -> list | None:
+    """L160g (#473): the files the merge `sha` changes on `base`; None if
+    git cannot tell (then every path gate runs)."""
+    from . import resolutions
+    proc = resolutions._run(path, "diff", "--name-only", "--no-renames", base, sha)
+    if proc.returncode != 0:
+        return None
+    return [f for f in resolutions._text(proc).splitlines() if f.strip()]
+
+
+def gates(project, path: str, *, files=None, timeout: float = GATE_TIMEOUT_S) -> dict:
     """Runs the project's gates in `path`: `{ok, gate, output}` (the
-    failed gate and the tail of its output)."""
-    for gate in project.gates:
-        try:
-            proc = subprocess.run(gate, shell=True, cwd=path, capture_output=True,
-                                  timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "gate": gate, "output": "timeout after %.0f s" % timeout}
-        if proc.returncode != 0:
-            out = (proc.stdout + proc.stderr).decode("utf-8", "replace").splitlines()
-            return {"ok": False, "gate": gate,
-                    "output": "\n".join(out[-GATE_TAIL:]) or "exit %d" % proc.returncode}
+    failed gate and the tail of its output); with its path gates (L160g)
+    for the `files` the merge touches (`radar.gates_for`)."""
+    from . import radar
+    for gate in radar.gates_for(project, files):
+        failed = _shell(gate, path, timeout)
+        if failed is not None:
+            return {"ok": False, "gate": gate, "output": failed}
     return {"ok": True, "gate": None, "output": ""}
 
 
@@ -318,13 +382,15 @@ class _Landing:
     stale holder's writes fail, and it reports `busy`; the lease is released
     once, at the end (`land_head`)."""
 
-    def __init__(self, db, project, row, key, owner, epoch, locks, projects=()):
+    def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
+                 cfg=None, clone=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
         self.key, self.owner, self.epoch, self.locks = key, owner, epoch, locks
         self.release = False
         self.projects = projects
+        self.cfg, self.clone = cfg, clone
         self.entry = tuple(row.get(k) for k in
                            ("generation", "target", "frozen_id", "frozen_sha"))
 
@@ -395,6 +461,34 @@ class _Landing:
                       work.SYSTEM_SENDER)
         return "history"
 
+    def required_ci(self):
+        if getattr(self.project, "ci_required", False):
+            try:
+                merge_queue._required_ci(self.project, self.row["frozen_sha"])
+            except merge_queue.QueueError as exc:
+                return self.eject(str(exc), "Restore green CI on the frozen commit, then "
+                                  "ameesh work queue add %d." % self.lot)
+        return None
+
+    def review_after_merge(self, *, merged_sha: str = "", pr=None) -> dict:
+        """L539 : ouvre le lot de relecture d'un lot **léger** (canon §2), une
+        seule fois, après que la fusion est un fait enregistré. La classe est
+        relue sur le diff gelé (`merge_queue._class_of`, canon §8) ; un doute
+        ou une classe supérieure n'ouvre rien. Ne lève jamais."""
+        from . import merge_queue, review_lot
+        try:
+            item = work.get(self.db, self.lot)
+            klass = merge_queue._class_of(
+                self.db, self.lot, item, self.project.repo, self.clone,
+                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg)
+            return review_lot.open_after_merge(
+                self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
+                pr=pr, target=self.row.get("target") or "")
+        except Exception as exc:  # noqa: BLE001 - la fusion est un fait, jamais défait
+            return {"lot": self.lot, "id": None, "created": False, "class": "",
+                    "why": "lot de relecture non ouvert : %s: %s"
+                           % (type(exc).__name__, str(exc)[:200])}
+
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
@@ -410,7 +504,9 @@ class _Landing:
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
         how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
             row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
-        return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr},
+        review = self.review_after_merge(merged_sha=str(merged.get("sha") or ""), pr=pr)
+        return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
+                     "review_lot": review},
                     **({"warning": "queue entry changed: recorded as history only (a newer entry is "
                         "queued)"} if how == "history" else {"warning": "remote merge succeeded; recording failed"}
                        if how == "unrecorded" else {}))
@@ -423,6 +519,12 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     from . import radar, resolutions
     locks = locks if locks is not None else {}
     lot = int(row["work_item_id"])
+    source = merge_queue.normalize_source(row.get("source") or "")
+    if not source or source != merge_queue.source_of(project.repo):
+        return {"lot": lot, "result": "error", "error": (
+            "queue source %s does not match project %s repository; select the source "
+            "project (or requeue a legacy entry without a source)"
+            % (source or "<missing>", project.name))}
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work
@@ -434,11 +536,24 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         locks.pop(key, None)
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
-    landing = _Landing(db, project, row, key, owner, epoch, locks, projects)
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+    landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
+                       cfg=cfg, clone=getattr(replayer, "path", None))
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
+        try:
+            merge_queue.radar_project(cfg, project.repo)
+        except merge_queue.QueueError as exc:
+            return landing.eject(str(exc), "Resolve the repository landing configuration, "
+                                 "then ameesh work queue add %d." % lot)
+        glob = radar.protected_target(project, row["target"])
+        if glob:
+            # L160g (#473): queued before the target was protected — never
+            # landed; ejected under the lease, like any ejection
+            return landing.eject("%s is a protected target (%s)" % (row["target"], glob),
+                                 "Merging into %s is the orchestrator's gesture: ask it."
+                                 % row["target"])
         return _land(landing, replayer, slug, gh)
     except (GitError, LandError, OSError, ValueError) as exc:
         error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
@@ -461,6 +576,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     if row["state"] == "landing" and project.land == "pr":
         return _follow_pr(landing, slug, gh=gh, replayer=replayer)
+
     replayer.ensure()
     url = _origin(project) or project.repo
     branch = _branch_of(row["target"])
@@ -506,18 +622,31 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             base).returncode == 0:
         # #194 r4: another executor (an earlier epoch) already pushed it
         return landing.landed({"sha": base, "state": "already", "files": []}, base)
-    merged = merge(replayer, base, row, landing.ops.resolutions([lot]))
+    refused = landing.required_ci()
+    if refused is not None:
+        return refused
+    merged = merge(replayer, base, row, landing.ops.resolutions([lot]),
+                   generated=getattr(project, "generated", ()))
+    if merged["state"] == "generated":
+        return landing.eject("generated file %s: regeneration or check failed on the merged "
+                             "tree" % merged["files"][0],
+                             "Its output:\n%s\nFix the generator or its inputs on your branch, "
+                             "freeze again, then ameesh work queue add %d."
+                             % (merged["output"], lot), output=merged["output"])
     if merged["state"] == "conflict":
         return landing.eject("conflict on %s with %s at %s" % (
             ", ".join(merged["files"][:6]) or "?", row["target"], base[:12]),
             "Integrate %s into your branch (or prepare the resolution), freeze again, "
             "then ameesh work queue add %d." % (row["target"], lot))
-    checked = gates(project, replayer.path)
+    checked = gates(project, replayer.path, files=changed(replayer.path, base, merged["sha"]))
     if not checked["ok"]:
         return landing.eject("gate `%s` failed on the merged tree" % checked["gate"],
                              "Its output:\n%s\nFix it on your branch, freeze again, then "
                              "ameesh work queue add %d." % (checked["output"], lot),
                              output=checked["output"])
+    refused = landing.required_ci()
+    if refused is not None:
+        return refused
     if project.land == "local":
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
@@ -639,7 +768,8 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
                                  note="merge queue of %s: landed" % row["target"],
                                  actor=work.SYSTEM_SENDER):
                 return landing.busy("lease on %s lost" % landing.key)
-            return {"lot": lot, "result": "landed"}
+            review = landing.review_after_merge(merged_sha=_merged_sha(landing.db, lot))
+            return {"lot": lot, "result": "landed", "review_lot": review}
         return landing.eject("its PR is no longer open",
                              "Reopen it, then ameesh work queue add %d." % lot)
     if status.get("base") != branch:
@@ -676,6 +806,11 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return landing.eject("PR #%s changed right before its merge (base %s, head %s)" % (
             status["number"], now["base"] or "?", (now["head"] or "?")[:12]),
             "Check the PR, freeze again, then ameesh work queue add %d." % lot)
+    refused = landing.required_ci()
+    if refused is not None:
+        return refused
+    if not landing.held():
+        return landing.busy("lease lost before merging PR #%s" % status["number"])
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     # #194 r8: past this call, the PR may be merged: nothing raises any more,
     # and every outcome is read back from GitHub
@@ -710,6 +845,19 @@ def _after_merge(landing: _Landing, pr, after, unread) -> dict:
         return _merged_in_doubt(landing, pr, after, unread)
     return landing.landed({"sha": landing.row["landing_sha"], "state": "pr", "files": []},
                           None, pr=pr)
+
+
+def _merged_sha(db, lot: int) -> str:
+    """Le sha de fusion déclaré au jalon `merged`, si connu (chemin « déjà
+    fusionné » de `_follow_pr`, L539)."""
+    try:
+        rows = work.milestones(db, int(lot))
+    except Exception:  # noqa: BLE001 - jalon illisible : sha inconnu
+        return ""
+    for row in rows or ():
+        if str(row.get("kind") or "") == "merged" and row.get("sha"):
+            return str(row["sha"])
+    return ""
 
 
 #: #194 r6: reasons of a PR merged where it should not have been, or that

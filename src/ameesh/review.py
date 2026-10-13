@@ -15,6 +15,12 @@ haute des règles qui matchent, et la classe d'un changement est la plus haute d
 ses fichiers. Une portée qui ne matche rien prend `default` (`normal` si la clé
 est absente).
 
+La déclaration peut être **par projet** : `risk_classes.projects.<nom>` porte la
+politique d'un dépôt, les clés restées au premier niveau (`default`, `rules`)
+celle d'un projet non listé. Les globs d'un projet ne classent donc jamais les
+fichiers d'un autre (§8 du canon : « chaque dépôt déclare ses chemins
+sensibles ») ; la forme globale d'avant reste lue telle quelle.
+
 Ce module est pur (aucune E/S) : `canon check` valide la déclaration avec
 [`parse`], `ameesh review-class` calcule une classe avec [`classify`], et les
 deux partagent les mêmes règles.
@@ -39,6 +45,12 @@ BAD_RULE = "review-policies-rule-invalid"
 BAD_GLOB = "review-policies-glob-invalid"
 #: une politique existe mais ne dit pas sa classe par défaut (avertissement)
 NO_DEFAULT = "review-policies-default-missing"
+#: la clé qui porte les politiques par projet
+PROJECTS_KEY = "projects"
+#: un projet demandé n'est pas déclaré sous `risk_classes.projects` (avertissement)
+UNKNOWN_PROJECT = "review-policies-project-unknown"
+#: `risk_classes.projects` n'est pas un mapping nom → politique
+BAD_PROJECT = "review-policies-project-invalid"
 
 _SEVERITY = {"error", "warning"}
 #: un chemin absolu Windows (`C:/…`) n'est pas un chemin de dépôt non plus
@@ -79,11 +91,16 @@ class ReviewPolicy:
 def normalize_path(path: str) -> str:
     """Chemin de dépôt : séparateurs POSIX, segments `.` et vides retirés.
 
+    Un backslash **n'est pas** converti en séparateur : sur un dépôt POSIX
+    c'est un caractère de nom de fichier comme un autre, et le relire en `/`
+    ferait matcher une portée qui ne couvre pas ce fichier (revue #544 r1).
+    [`classify`] refuse un tel chemin, comme un `..` ou un composant vide.
+
     Les `..` **intérieurs** sont résolus (`a/../b` → `b`), un `..` qui sortirait
     du dépôt est conservé pour que [`classify`] le refuse, et un `/` de tête
     aussi (un chemin absolu n'est pas un chemin de dépôt).
     """
-    value = str(path).strip().replace("\\", "/")
+    value = str(path).strip()
     prefix = "/" if value.startswith("/") else ""
     parts: list[str] = []
     for part in value.split("/"):
@@ -226,25 +243,111 @@ def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
     return ReviewPolicy(default=default, rules=tuple(rules)), problems
 
 
-def policy_from_federation(federation) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
-    """La politique de revue lue au canon (profil ameesh, spec §4.2).
+@dataclass(frozen=True)
+class ScopedPolicies:
+    """`review_policies.risk_classes` : les politiques par projet, et le repli.
+
+    `problems` porte les constats de **toute** la déclaration (le nom du projet
+    préfixe les siens), pour que `canon check` les rapporte d'un coup.
+    """
+
+    projects: dict = field(default_factory=dict)
+    fallback: ReviewPolicy = ReviewPolicy()
+    #: le repli est déclaré (`default`/`rules` au premier niveau) : il classe
+    #: vraiment un projet non listé. Sinon un projet inconnu est un doute.
+    fallback_declared: bool = False
+    problems: tuple = ()
+
+    def policy_of(self, project=None) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
+        """La politique de `project` (None : le repli), et ses constats.
+
+        Un projet nommé mais non déclaré n'est classable que si le repli est
+        déclaré : sinon c'est un **doute** (constat `error`), pour qu'un
+        appelant prudent — la fusion automatique d'un lot, un transfert pour
+        budget — refuse au lieu de classer avec une politique qui n'est pas
+        celle du projet.
+        """
+        problems = list(self.problems)
+        if project is None or not self.projects:
+            # Pas de projet demandé, ou déclaration globale d'avant (aucun
+            # projet déclaré) : le repli est la politique.
+            return self.fallback, problems
+        if project in self.projects:
+            return self.projects[project], problems
+        if self.fallback_declared:
+            problems.append((UNKNOWN_PROJECT, "warning",
+                             "project %r is not declared under risk_classes.projects "
+                             "(the declared fallback policy applies)" % (project,)))
+        else:
+            problems.append((UNKNOWN_PROJECT, "error",
+                             "project %r is not declared under risk_classes.projects "
+                             "and no fallback policy is declared" % (project,)))
+        return self.fallback, problems
+
+
+def parse_scoped(raw) -> ScopedPolicies:
+    """`risk_classes` en politiques par projet, sans jamais lever.
+
+    Deux formes cohabitent :
+    - `projects: {nom: politique}` : chaque politique est validée comme une
+      politique globale, ses constats préfixés du nom du projet ;
+    - les clés `default` et `rules` restées au premier niveau forment le repli,
+      celui d'un projet non listé — c'est la forme globale d'avant, inchangée.
+    """
+    if raw is None:
+        return ScopedPolicies()
+    if not isinstance(raw, dict):
+        return ScopedPolicies(
+            problems=((INVALID, "error",
+                       "review_policies.risk_classes must be a mapping"),))
+    rest = {key: value for key, value in raw.items() if key != PROJECTS_KEY}
+    fallback, problems = parse(rest if rest else None)
+    found: list[tuple[str, str, str]] = list(problems)
+    projects: dict[str, ReviewPolicy] = {}
+    raw_projects = raw.get(PROJECTS_KEY)
+    if raw_projects is not None:
+        if not isinstance(raw_projects, dict):
+            found.append((BAD_PROJECT, "error",
+                          "review_policies.risk_classes.projects must be a mapping"))
+        else:
+            for name in sorted(raw_projects, key=str):
+                if not isinstance(name, str) or not name.strip():
+                    found.append((BAD_PROJECT, "error",
+                                  "project names must be non-empty strings: %r" % (name,)))
+                    continue
+                policy, project_problems = parse(raw_projects[name])
+                projects[name] = policy
+                found.extend((code, severity, "project %s: %s" % (name, message))
+                             for code, severity, message in project_problems)
+    return ScopedPolicies(projects=projects, fallback=fallback,
+                          fallback_declared=bool(rest), problems=tuple(found))
+
+
+def scoped_from_federation(federation) -> ScopedPolicies:
+    """`risk_classes` lu au canon, par projet (profil ameesh, spec §4.2)."""
+    if not isinstance(federation, dict):
+        return ScopedPolicies()
+    policies = federation.get("review_policies")
+    if policies is None:
+        return ScopedPolicies()
+    if not isinstance(policies, dict):
+        return ScopedPolicies(problems=((INVALID, "error",
+                                         "review_policies must be a mapping"),))
+    if "risk_classes" not in policies:
+        return ScopedPolicies()
+    return parse_scoped(policies["risk_classes"])
+
+
+def policy_from_federation(federation, project=None) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
+    """La politique de revue d'un projet lue au canon (profil ameesh, spec §4.2).
 
     Elle vit sous `review_policies.risk_classes` : `review_policies` porte aussi
     les politiques d'OKF Federation (par exemple `self_approval`), qu'ameesh ne
     redéfinit pas et n'interprète pas ici — un manifeste qui ne déclare pas
-    `risk_classes` garde la politique par défaut, sans constat.
+    `risk_classes` garde la politique par défaut, sans constat. `project` absent
+    ou non déclaré : la politique de repli (`ScopedPolicies.policy_of`).
     """
-    if not isinstance(federation, dict):
-        return ReviewPolicy(), []
-    policies = federation.get("review_policies")
-    if policies is None:
-        return ReviewPolicy(), []
-    if not isinstance(policies, dict):
-        return ReviewPolicy(), [(INVALID, "error",
-                                 "review_policies must be a mapping")]
-    if "risk_classes" not in policies:
-        return ReviewPolicy(), []
-    return parse(policies["risk_classes"])
+    return scoped_from_federation(federation).policy_of(project)
 
 
 def classify(policy: ReviewPolicy, paths) -> dict:
@@ -259,6 +362,12 @@ def classify(policy: ReviewPolicy, paths) -> dict:
         value = str(raw).strip()
         if value.startswith("/") or _WINDOWS_ABSOLUTE.match(value):
             raise ReviewError("absolute path: %r" % raw)
+        if "\\" in value or any(part in ("", "..") for part in value.split("/")):
+            # Un backslash n'est pas un séparateur POSIX ; `..` et un composant
+            # vide ne sont pas des chemins de dépôt. Les relire en un autre
+            # chemin (`.github/workflows/..\\..\\docs/x` → `docs/x`) ferait
+            # matcher une portée plus légère : refus, donc doute (revue #544 r1).
+            raise ReviewError("path is not a repository path: %r" % raw)
         path = normalize_path(value)
         if not path or path == ".." or path.startswith("../"):
             raise ReviewError("path outside the repository: %r" % raw)
