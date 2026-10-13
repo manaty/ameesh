@@ -502,6 +502,38 @@ class ScopedReservationsTest(PgTestCase):
                     self.a['id'], 'build', current=self.a['state'], loops=0, note='move', actor='dev')
         self.assertEqual(len(attempts), 1)
 
+    def test_import_does_not_replay_a_deadlock_in_the_caller_transaction(self):
+        """#879 B2 : une transaction appelante ne rejoue pas la victime 40P01.
+
+        `import_reservations` tient sa transaction sur plusieurs lignes ; sous
+        psql l'erreur a fermé la session et la reprise rouvrirait une
+        transaction neuve — l'import ne serait plus atomique (des numéros
+        réservés, d'autres non). Témoin multi-lignes, joué psql et psycopg.
+        """
+        rows = [{'number': number, 'label': 'legacy', 'who': 'dev', 'status': 'reserved'}
+                for number in (400, 401)]
+        mapping = {'400': self.a['id'], '401': self.b['id']}
+        real = pg_work._lock_migration_writer
+        attempts = []
+
+        def flaky(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            if len(attempts) == 1:
+                raise DbError('deadlock detected', sqlstate='40P01')
+            return real(tx, item_id, proposed)
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=flaky):
+            with self.assertRaises(DbError) as raised:
+                reservations.import_reservations(
+                    self.db, rows, mapping, repo='manaty/nexlink', apply=True, actor='dev')
+        self.assertEqual(raised.exception.sqlstate, '40P01')
+        self.assertEqual(attempts, [self.a['id']])          # la victime ne rejoue pas
+        # rien n'est écrit : la transaction appelante est annulée en entier
+        self.assertEqual(reservations.listing(self.db, self.a['id']), [])
+        self.assertEqual(reservations.listing(self.db, self.b['id']), [])
+        self.assertEqual(work.get(self.db, self.a['id'])['migration'], None)
+        self.assertEqual(work.get(self.db, self.b['id'])['migration'], None)
+
     def test_merged_to_blocked_does_not_resurrect_a_landed_slot(self):
         """#879 : `merged -> blocked` ne rouvre pas un numéro déjà atterri.
 

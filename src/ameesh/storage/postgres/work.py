@@ -15,7 +15,7 @@ import json
 import random
 import time
 
-from ...db import DbError, is_unique_violation
+from ...db import DbError, in_transaction, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
 
@@ -179,7 +179,12 @@ def _retry_deadlock(writer):
 
     Chaque essai ouvre sa propre transaction : la reprise reprend les verrous
     dans l'ordre du code courant (dépôt avant ligne de lot). Le nombre
-    d'essais est borné, et seule la victime 40P01 est rejouée."""
+    d'essais est borné, et seule la victime 40P01 est rejouée.
+
+    Jamais en transaction appelante (#879 B2) : sous psql l'erreur a fermé la
+    session, et la reprise en rouvrirait une neuve, hors du bloc atomique de
+    l'appelant (`import_reservations`) ; sous psycopg la transaction est
+    avortée. C'est à l'appelant de décider de l'échec ou de la reprise."""
 
     @functools.wraps(writer)
     def wrapped(self, *args, **kwargs):
@@ -187,7 +192,8 @@ def _retry_deadlock(writer):
             try:
                 return writer(self, *args, **kwargs)
             except DbError as exc:
-                if not _deadlock_victim(exc) or attempt == _DEADLOCK_ATTEMPTS - 1:
+                if (not _deadlock_victim(exc) or attempt == _DEADLOCK_ATTEMPTS - 1
+                        or in_transaction(self.db)):
                     raise
                 time.sleep(random.uniform(
                     0.0, min(_DEADLOCK_WAIT_MAX_S, _DEADLOCK_WAIT_BASE_S * 2 ** attempt)))
@@ -737,7 +743,9 @@ class WorkItems(interface.WorkItems):
         DbError de l'index (#478). Seule la violation d'unicité de cet index
         réessaie : une autre erreur qui le nomme remonte telle quelle
         (codex #478 r1). Un `number` explicite déjà pris lève la DbError de
-        l'index, sans réessai."""
+        l'index, sans réessai. En transaction appelante (`import_reservations`,
+        #879 B2), aucune reprise locale : la transaction y est perdue, la
+        DbError remonte et l'appelant décide."""
         if release:
             value, params = "NULL", ()
         elif number is None:
@@ -768,7 +776,7 @@ class WorkItems(interface.WorkItems):
                                          actor)
                     return rows[0]
             except DbError as exc:
-                if (number is not None or release
+                if (number is not None or release or in_transaction(self.db)
                         or not (is_unique_violation(exc, MIGRATION_INDEX)
                                 or is_unique_violation(exc, "work_migration_reservations_active_idx"))):
                     raise

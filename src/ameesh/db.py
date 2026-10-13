@@ -1254,6 +1254,18 @@ def is_unavailable(exc: BaseException) -> bool:
     return isinstance(exc, Unavailable)
 
 
+def in_transaction(db) -> bool:
+    """`db` porte-t-il une transaction ouverte ?
+
+    Pilote psql : `db` EST la transaction (`_PsqlTransaction`) une fois entré
+    dans le bloc ; psycopg : le pilote lui-même porte sa profondeur
+    (`_tx_depth`). Sert aux écrivains qui ne doivent pas rejouer une erreur en
+    transaction appelante : sous psql l'erreur a fermé la session, et la
+    reprise rouvrirait une transaction neuve, hors du bloc atomique de
+    l'appelant (#879)."""
+    return isinstance(db, _PsqlTransaction) or getattr(db, "_tx_depth", 0) > 0
+
+
 def explain(exc: BaseException, limit: int = 160) -> str:
     """Cause lisible d'une erreur de base, sur une ligne, pour un statut ou un
     journal (L72). Un délai de connexion dépassé n'est pas un problème de
