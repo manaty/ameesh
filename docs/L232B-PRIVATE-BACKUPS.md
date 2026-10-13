@@ -112,7 +112,9 @@ and controller enrollment remain unfinished.
 
 These utilities are a local development checkpoint. The release controller,
 host helper/bootstrap, remote retention and installer wiring for versioned
-environments are still being built. Retrieval tests simulate storage and do not claim
+environments are still being built. The durable ordering engine is described in
+[L232b controller protocol](L232B-RELEASE-CONTROLLER.md); its authority and host
+adapters are simulated and not enrolled for execution. Retrieval tests simulate storage and do not claim
 an authenticated remote-storage pilot. `tests.test_l232b_backup_restore`
 uses the explicit test-bench DSN and newly created source/restoration
 databases to exercise real `pg_dump` and `pg_restore`. It verifies that
