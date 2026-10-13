@@ -30,13 +30,13 @@ ciflux = _charger("ci_flux_856", "ci-flow.py")
 TETE = "a" * 40
 AUTRE_TETE = "b" * 40
 EXECUTION = 500
-LIEN_EXECUTION = "https://github.com/manaty/ameesh/actions/runs/%d" % EXECUTION
 
 
 def check(ident=11, name="tests (flux) psql 1/1", status="in_progress",
           execution=EXECUTION, details=True):
+    lien = "https://github.com/manaty/ameesh/actions/runs/%d" % execution
     return {"id": ident, "name": name, "status": status,
-            "details_url": LIEN_EXECUTION if details else "",
+            "details_url": lien if details else "",
             "output": {"title": "3 test(s) passés, en cours",
                        "summary": "Part psql 1/1 : en cours.",
                        "text": "<!-- ameesh-test-event/1 -->\n```jsonl\n```"}}
@@ -52,10 +52,11 @@ def job(name="psql 1/1", status="completed", conclusion="cancelled"):
 
 class FauxGitHub:
     def __init__(self, checks=(), jobs=None, run_state=None, refus=False,
-                 ready=True, tete=TETE):
+                 ready=True, tete=TETE, par_execution=None):
         self.checks = list(checks)
         self.job_list = jobs if jobs is not None else [job()]
         self.run_state = run_state if run_state is not None else run()
+        self.par_execution = par_execution or {}
         self.refus = refus
         self._ready = ready
         self.tete = tete
@@ -74,10 +75,10 @@ class FauxGitHub:
     def run(self, execution):
         if self.refus:
             raise ciflux.urllib.error.URLError("boom")
-        return self.run_state
+        return self.par_execution.get(execution, (self.run_state, self.job_list))[0]
 
     def jobs(self, execution):
-        return self.job_list
+        return self.par_execution.get(execution, (self.run_state, self.job_list))[1]
 
     def update(self, ident, output, conclusion=None):
         if self.refus:
@@ -168,6 +169,19 @@ class ReconciliationTest(unittest.TestCase):
         ciflux.sweep(args(), gh=gh)
         self.assertEqual([m[0] for m in gh.maj], [11, 12])
         self.assertEqual(len(gh.lectures), 1)
+
+    def test_autre_tentative_active_non_touchee(self):
+        """Seul l'orphelin de la tentative terminale est conclu ; le check de
+        la tentative active qui porte le même nom reste ouvert."""
+        ancienne = check(ident=11, execution=500)
+        active = check(ident=12, execution=501)
+        gh = FauxGitHub([ancienne, active], par_execution={
+            500: (run("completed"), [job()]),
+            501: (run("in_progress"), [job(status="in_progress", conclusion=None)]),
+        })
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual([m[0] for m in gh.maj], [11])
+        self.assertEqual(gh.maj[0][2], "cancelled")
 
 
 class FauxGitHubPublication:
