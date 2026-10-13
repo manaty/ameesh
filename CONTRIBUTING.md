@@ -16,7 +16,7 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `scripts/test.sh` en local (ou `scripts/test-parallele.sh -n 4`, en parts
   parallèles), l'intégration continue sur chaque PR : psycopg complet et psql
   sur les modules de `tests/parts/pilote-psql.txt`, en 3 parts pour rester sous
-  le plafond de 30 min des hôtes auto-hébergés mutualisés (#947) ; le psql
+  le plafond de 45 min des hôtes auto-hébergés mutualisés (#880) ; le psql
   complet tourne sur `main` et `release/*`. Un module de test qui touche la
   couche base ou un comportement propre à un pilote s'ajoute à cette liste. Une PR qui ne change
   **que le numéro de version** (`pyproject.toml` seul, la seule ligne

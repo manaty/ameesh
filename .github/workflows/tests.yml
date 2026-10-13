@@ -237,11 +237,12 @@ jobs:
     needs: plan
     if: needs.plan.outputs.psql != '[]'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
-    # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
-    # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
-    # elle était annulée par le plafond de 30 min sans échec de test (PR #640,
-    # run 38381239685). 45 min laisse la marge sous charge et reste un plafond
-    # borné (§3 du processus de lot : aucun job ne retient un runner des heures).
+    # #880 : le plafond psql est passé à 45 min ; la part pilote UNIQUE d'avant
+    # (mesurée 21,7-26,1 min au repos et 30,4-31,0 min sous saturation, 8/8
+    # runners) était annulée au plafond de 30 min sans échec de test (PR #640,
+    # run 38381239685). #947 la découpe en plus en 3 parts (matrix ci-dessous) ;
+    # 45 min laisse la marge sous charge et reste un plafond borné (§3 du
+    # processus de lot : aucun job ne retient un runner des heures).
     # psycopg garde 30 min : ses parts tournent en 6-8 min, même à 3× plus lent
     # elles tiennent dans le plafond.
     timeout-minutes: 45
