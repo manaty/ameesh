@@ -323,7 +323,9 @@ jobs:
   # provisional green, for the two-week review (L161i); never required
   bilan:
     name: bilan des impactés
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    # #876 : « always() » seul recrée le job après l'annulation de l'exécution
+    # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
@@ -372,7 +374,9 @@ jobs:
   # L158: on a PR, the version number check must pass)
   tests:
     name: tests
-    if: always()
+    # #876 : seul check requis ; sur une exécution annulée, « always() » seul le
+    # laissait queued des heures (agrégat créé après l'annulation) puis rouge.
+    if: always() && !cancelled()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5

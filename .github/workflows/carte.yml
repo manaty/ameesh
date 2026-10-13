@@ -131,7 +131,9 @@ jobs:
   carte:
     name: carte
     needs: mesure
-    if: always()
+    # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
+    # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
+    if: always() && !cancelled()
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:

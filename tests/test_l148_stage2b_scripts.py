@@ -21,6 +21,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -171,6 +172,20 @@ class CallersTest(unittest.TestCase):
         carte = (REPO / ".github" / "workflows" / "carte.yml").read_text(encoding="utf-8")
         self.assertIn("scripts/map.py install", carte)
         self.assertIn("scripts/map.py merge", carte)
+
+    def test_aggregate_jobs_skip_a_cancelled_run(self):
+        # #876 : un agrégat `if: always()` seul est recréé après l'annulation
+        # d'une exécution, reste queued des heures puis la conclut en rouge —
+        # dont le check requis `tests`. `always() && !cancelled()` le saute.
+        for name, jobs in (("tests.yml", ("bilan", "tests")),
+                           ("carte.yml", ("carte",))):
+            text = (REPO / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            for job in jobs:
+                with self.subTest(workflow=name, job=job):
+                    bloc = re.search(r"(?ms)^  %s:\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)" % job,
+                                     text)
+                    self.assertIsNotNone(bloc, job)
+                    self.assertIn("if: always() && !cancelled()", bloc.group(1), job)
 
     def test_flow_module_keeps_the_json_contract(self):
         # The stored keys are out of stage 2b (§2.7): the renamed functions
