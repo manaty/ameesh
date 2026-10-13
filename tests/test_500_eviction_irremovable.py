@@ -445,6 +445,40 @@ class EvictionTest(unittest.TestCase):
         self.assertEqual(result["files"], 1)
 
     @unittest.skipUnless(platform.is_linux(), "mountinfo is Linux-only")
+    def test_a_bind_mount_is_seen_through_a_symlinked_ancestor(self):
+        # r6 (codex P1 r5): mountinfo names canonical paths; the managed root
+        # can sit under a symlinked ancestor (/state -> /disk/state), and the
+        # walk then never matches a mount point by `normpath` — the mount is
+        # crossed by the scan and emptied by the prune.
+        alias = os.path.join(self.base, "alias")
+        os.symlink(self.base, alias)
+        root = os.path.join(alias, "tmp")
+        mine = os.path.join(root, "codex3")
+        mount = os.path.join(mine, "bind")
+        inside = os.path.join(mount, "sub", "f")
+        _write(inside)
+        keep = os.path.join(mount, "sub", "empty")
+        os.makedirs(keep)
+        loose = os.path.join(mine, "loose")
+        _write(loose, age_s=10 * HOUR)
+        real = platform.mountinfo
+        dev = os.lstat(mount).st_dev
+
+        def with_bind(path=None):
+            listed = real(path)
+            listed.append({"id": 99999, "point": os.path.join(self.mine, "bind"),
+                           "dev": dev, "fstype": "ext4", "source": "/dev/root"})
+            return listed
+
+        with mock.patch.object(platform, "mountinfo", with_bind):
+            result = menage.evict_lru([mine], root, 0)
+        self.assertTrue(os.path.exists(inside), "the bind mount was crossed")
+        self.assertTrue(os.path.isdir(keep), "a directory inside the mount was pruned")
+        self.assertFalse(os.path.exists(loose))
+        self.assertEqual(result["before"], B)            # the mount is out of the scan
+        self.assertEqual(result["files"], 1)
+
+    @unittest.skipUnless(platform.is_linux(), "mountinfo is Linux-only")
     def test_unreadable_mount_table_evicts_and_prunes_nothing(self):
         # r5 (codex P1 r4): fail-closed — without the mount table, no directory
         # can be told from a bind mount: nothing is scanned, evicted or pruned
@@ -551,18 +585,47 @@ class EvictionTest(unittest.TestCase):
 
     def test_hard_links_and_blocks_count_once(self):
         # r2 (codex P2): sizes are st_blocks*512 and a hard link is not a
-        # second file
+        # second file.
+        # r6 (codex P2 r5): every name of the inode inside the root is removed
+        # before its bytes leave `counted`; one link left behind frees nothing,
+        # and the pass must not stop believing it freed them.
         first = os.path.join(self.mine, "a")
-        _write(first, size=5)                    # 5 bytes: one 4096 block
+        _write(first, size=5, age_s=10 * HOUR)   # 5 bytes: one 4096 block
         os.link(first, os.path.join(self.mine, "b"))
-        self.assertEqual(menage.size_of(self.mine), B)
+        other = os.path.join(self.mine, "other")
+        _write(other, size=5, age_s=9 * HOUR)    # newer than the linked inode
+        self.assertEqual(menage.size_of(self.mine), 2 * B)
         found = list(menage._files(self.mine))
-        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found), 2)
         self.assertEqual(found[0][1], B)
-        result = menage.evict_lru([self.mine], self.root, 0)
+        result = menage.evict_lru([self.mine], self.root, B)
         self.assertEqual(result["files"], 1)
-        self.assertEqual(sum(os.path.exists(os.path.join(self.mine, name))
-                             for name in ("a", "b")), 1)
+        self.assertEqual(result["evicted"], B)
+        self.assertFalse(os.path.exists(first))
+        self.assertFalse(os.path.exists(os.path.join(self.mine, "b")),
+                         "a hard link of the evicted inode was left behind")
+        self.assertTrue(os.path.exists(other), "the newer file was evicted to make up")
+        self.assertEqual(result["after"], B)
+        self.assertFalse(result["over_quota"])
+
+    def test_a_hard_link_that_cannot_be_removed_keeps_the_inode_counted(self):
+        # r6 (codex P2 r5): the inode is only freed when its last name is; a
+        # name in a directory this user cannot write keeps the whole inode
+        # unremovable, and the pass stops instead of evicting a newer file.
+        linked = os.path.join(self.mine, "a")
+        _write(linked, size=5, age_s=10 * HOUR)
+        os.makedirs(os.path.join(self.mine, "rootdir"))
+        os.link(linked, os.path.join(self.mine, "rootdir", "b"))
+        self.addCleanup(_read_only(os.path.join(self.mine, "rootdir")))
+        newer = os.path.join(self.mine, "newer")
+        _write(newer, size=5, age_s=9 * HOUR)
+        result = menage.evict_lru([self.mine], self.root, B)
+        self.assertTrue(os.path.exists(linked), "an inode still held was counted as freed")
+        self.assertTrue(os.path.exists(os.path.join(self.mine, "rootdir", "b")))
+        self.assertTrue(os.path.exists(newer))
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["unremovable"], B)
+        self.assertEqual(result["after"], 2 * B)
 
     def test_turn_end_logs_unremovable_instead_of_wiping(self):
         cfg = _Cfg(os.path.join(self.base, "state"))

@@ -798,8 +798,16 @@ def _mount_points(root: str) -> set | None:
 
 def _is_mount_point(directory: str, mounts: set | None) -> bool:
     """#500 r5 : `directory` est un point de montage de `mounts` (comparaison
-    de chemins : on ne `stat` pas un dossier qu'un montage peut cacher)."""
-    return bool(mounts) and os.path.normpath(directory) in mounts
+    de chemins : on ne `stat` pas un dossier qu'un montage peut cacher).
+
+    #500 r6 (codex P1 r5) : `mounts` ne contient que des chemins canoniques
+    (mountinfo) ; `normpath` ne résout pas un ancêtre symbolique (`/state` →
+    `/disk/state`), donc la marche par `/state/...` ne verrait pas le montage.
+    Comparaison sur `realpath` : un dossier dont l'ancêtre est un lien est vu
+    comme le montage qu'il cache."""
+    if not mounts:
+        return False
+    return os.path.realpath(directory) in mounts
 
 
 def _files(top: str, limit: int | None = None, *, state: dict | None = None,
@@ -811,7 +819,9 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
     est fourni.
 
     #500 : les octets d'un même inode (liens durs) ne comptent qu'une fois ;
-    la taille est celle des blocs occupés (`_used_bytes`).
+    la taille est celle des blocs occupés (`_used_bytes`). Avec `state`, tous
+    les noms de l'inode vus par la marche sont gardés dans `state["links"]`
+    (l'éviction les retire tous avant de compter les octets, #500 r6).
     Avec `protect_git`, un dossier qui porte un marqueur git est reconnu AVANT
     d'en lister les fichiers et n'est pas parcouru : sa racine est ajoutée à
     `state["protected"]`, donc le sous-arbre n'est jamais évincé, même quand
@@ -862,6 +872,14 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
                         stack.append(entry.path)
                         continue
                     inode = (st.st_dev, st.st_ino)
+                    # #500 r6 (codex P2 r5): every name of the inode seen by
+                    # the walk is kept, so the eviction can remove them all
+                    # before counting the bytes (a link left behind means the
+                    # bytes were not freed).
+                    names = state.setdefault("links", {}).setdefault(inode, []) \
+                        if state is not None else None
+                    if names is not None:
+                        names.append(entry.path)
                     if inode in seen:            # #500: hard link, counted once
                         continue
                     seen.add(inode)
@@ -1187,7 +1205,11 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     mount) is neither crossed nor pruned, and the whole remaining subtree of a
     candidate that became protected leaves `counted` at once. When the mount
     table is unreadable on Linux (`mounts_unreadable`), nothing is scanned,
-    evicted or pruned: fail-closed."""
+    evicted or pruned: fail-closed. #500 r6 (codex P1/P2 r5): a mount point is
+    recognised through a symlinked ancestor (`realpath`, mountinfo is
+    canonical), and every name of a hard-linked inode inside the root is
+    removed before its bytes leave `counted` — a link left behind frees
+    nothing."""
     now = time.time() if now is None else float(now)
     try:
         root_dev = os.stat(root).st_dev
@@ -1266,6 +1288,30 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 failed.append(path)
                 break
             if not dry_run:
+                # #500 r6 (codex P2 r5): an inode with hard links is counted
+                # once, but it can still have several names inside the managed
+                # root. Removing only one leaves the bytes in place while
+                # `counted` drops, so the pass stops believing it freed them.
+                # Every name the scan saw goes first; the bytes only leave
+                # `counted` once none is left. A name that cannot be removed
+                # keeps the whole inode counted, and stops the pass like any
+                # other refused deletion.
+                others = [p for p in (scan.get("links") or {}).get(
+                    (st.st_dev, st.st_ino), ()) if p != path and _located_in(p, root)]
+                kept = False
+                for other in others:
+                    try:
+                        _unlink_in_root(other, root, expected=st, device=root_dev)
+                    except StaleCandidate as exc:
+                        kept = kept or exc.reason != "gone"
+                    except OSError:
+                        kept = True
+                if kept:
+                    unremovable += size
+                    counted -= size
+                    blocked = unremovable > quota
+                    failed.append(path)
+                    break
                 try:
                     _unlink_in_root(path, root, expected=st, device=root_dev)
                 except StaleCandidate as exc:
