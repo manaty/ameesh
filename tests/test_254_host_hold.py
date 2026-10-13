@@ -15,7 +15,7 @@ from ameesh import backlog, exploitation, host_holds, mail, registry, relocation
 
 from . import test_l119_backlog
 from .test_l31_relocation import _MoveCase
-from .test_l94_sous_utilisation import HEURE, JOUR, _Base, _seuils, _types
+from .test_l94_underuse import HEURE, JOUR, _Base, _seuils, _types
 
 
 class ParseUntilTest(unittest.TestCase):
