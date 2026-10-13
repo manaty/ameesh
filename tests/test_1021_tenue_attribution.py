@@ -16,9 +16,10 @@ import os
 import time
 from unittest import mock
 
-from ameesh import account_turn, backlog, registry, work
+from ameesh import account_turn, backlog, budget, exploitation, registry, work
 
 from .test_l242b_critical_accounts import _Comptes
+from .test_l94_underuse import _seuils, _types
 
 
 class TenueAttributionTest(_Comptes):
@@ -50,7 +51,7 @@ class TenueAttributionTest(_Comptes):
         with self.assertRaises(work.WorkError) as ctx:
             work.assign(self.db, lot["id"], self.name, cfg=self.cfg)
         msg = str(ctx.exception)
-        self.assertIn("held by a budget pause", msg)
+        self.assertIn("is held —", msg)
         self.assertIn("until ", msg)                 # l'échéance est nommée
         self.assertIn("codex", msg)
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
@@ -135,6 +136,85 @@ class TenueAttributionTest(_Comptes):
         self.cfg = dataclasses.replace(self.cfg, critical_fallback_harnesses=())
         with self.assertRaises(work.WorkError):
             work.check_assignee(self.db, self.name, cfg=self.cfg)
+
+    def test_plafond_journalier_ne_refuse_pas_si_le_rythme_est_coupe(self):
+        # B1 de la R1 (#1021) : garde de rythme coupée (`per_hour = 0`).
+        # L'exécuteur (`Runner.budget_ok`) ne juge alors que les règles
+        # absolues des comptes (L226b, déjà vues par `accounts.choose`), pas
+        # les plafonds payés au token — les appliquer ici refuserait un tour
+        # qu'il autorise.
+        cfg = dataclasses.replace(
+            self.cfg, budget_usd_per_hour=0.0, budget_usd_per_day=10.0,
+            budget_explicit=("budget_usd_per_hour", "budget_usd_per_day"),
+            accounts={"deepseek": [{"name": "cle", "type": "api_key_env",
+                                    "key_env": "AMEESH_TEST_CLE_1021"}]})
+        registry.upsert(self.db, "ouvrier-deepseek", harness="deepseek",
+                        host=cfg.host, cwd=self.tmp)
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, recorded_at)"
+            " VALUES ('ouvrier-deepseek', 'deepseek', 'm', 20.0, now())")
+        row = registry.get(self.db, "ouvrier-deepseek")
+        coupe = budget.Limits(per_hour=0.0, per_hour_source=budget.SOURCE_CONFIG,
+                              per_day=10.0, per_day_source=budget.SOURCE_CONFIG)
+        with mock.patch.object(budget, "current", return_value=coupe):
+            self.assertEqual(
+                account_turn.turn_hold(cfg, self.db, "ouvrier-deepseek", row), "")
+            self.assertEqual(work.check_assignee(self.db, "ouvrier-deepseek",
+                                                 cfg=cfg)["assignee"],
+                             "ouvrier-deepseek")
+        # garde de rythme active : le plafond journalier du mesh tient
+        actif = dataclasses.replace(coupe, per_hour=50.0)
+        with mock.patch.object(budget, "current", return_value=actif):
+            hold = account_turn.turn_hold(cfg, self.db, "ouvrier-deepseek", row)
+        self.assertIn("daily budget", hold)
+
+    def test_tenue_d_authentification_non_levee_par_le_repli(self):
+        # B2 de la R1 (#1021) : le seul compte sous son seuil est en échec
+        # d'authentification ; l'exécuteur retient ce compte (aucun repli
+        # n'est engagé), puis `auth_ready` bloque l'agent. Un repli sain ne
+        # doit pas lever cette tenue-là — le lot dormirait.
+        self.cfg = dataclasses.replace(
+            self.cfg,
+            accounts={"codex": [{"name": "primaire"}, self.secondaire],
+                      "claude": self._claude_comptes()},
+            critical_agents=(self.name,),
+            critical_fallback_harnesses=("claude",))
+        self.jauge("primaire", 10)       # sous son seuil, mais en panne
+        self.jauge("secondaire", 96)     # au seuil
+        self._report("codex", "primaire", "failing", source="turn")
+        row = registry.get(self.db, self.name)
+        with self._adapters():
+            hold = account_turn.turn_hold(self.cfg, self.db, self.name, row)
+            self.assertIn("no healthy codex account", hold)
+            with self.assertRaises(work.WorkError) as ctx:
+                work.check_assignee(self.db, self.name, cfg=self.cfg)
+        self.assertIn("no healthy codex account", str(ctx.exception))
+
+    # -- l'alerte de sous-utilisation non plus ----------------------------
+
+    def test_alerte_de_sous_utilisation_ne_propose_pas_un_agent_en_tenue(self):
+        # N1 de la R1 (#1021) : un agent encore `idle` dont les comptes
+        # viennent de franchir le seuil (la pause n'est écrite qu'au sondage
+        # suivant de son exécuteur) n'est pas proposé par l'alerte, ni par les
+        # briefs d'orchestrateurs qui la reprennent.
+        self.jauge("primaire", 96)
+        self.jauge("secondaire", 96)
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle', lease_owner = %s,"
+            " lease_expires_at = now() + interval '1 hour',"
+            " status_since = now() - interval '2 hours',"
+            " last_turn_at = now() - interval '2 hours' WHERE name = %s",
+            ("runner-%s@h" % self.name, self.name))
+        work.add(self.db, title="travail en attente")
+        out = _types(exploitation.alerts(self.cfg, self.db, now=time.time(),
+                                         **_seuils()), "idle_capacity")
+        self.assertEqual(out, [])
+        # agent sain : l'alerte revient, et le nomme
+        self.jauge("primaire", 10)
+        self.jauge("secondaire", 10)
+        out = _types(exploitation.alerts(self.cfg, self.db, now=time.time(),
+                                         **_seuils()), "idle_capacity")
+        self.assertEqual([a["agents"] for a in out], [[self.name]])
 
     # -- la prise automatique ne prend pas pour un agent en tenue ----------
 

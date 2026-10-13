@@ -544,7 +544,8 @@ def turn_hold(cfg, db, name: str, row: dict, *, now: float | None = None) -> str
       `accounts.choose` en simulation (réserve des non-critiques, L226b ;
       rythme levé si la garde est coupée), puis les plafonds du mesh pour le
       tour payé au token ; un agent critique cède à un harnais de repli qui a
-      de la marge (L242b (3)).
+      de la marge (L242b (3)), sauf tenue d'authentification (le repli
+      n'existe pas dans l'exécuteur pour celle-ci : `auth_ready` bloque).
 
     Les comptes d'un autre hôte ne sont pas lisibles ici (leurs journaux sont
     sur son disque) : pour un agent distant, seule la pause annoncée est
@@ -573,11 +574,21 @@ def turn_hold(cfg, db, name: str, row: dict, *, now: float | None = None) -> str
     margin = not critical
     environ = _declared_environ(cfg)
     try:
-        reason = _own_hold(cfg, db, name, harness, items, limites, now=now,
-                           critical=critical, paced=paced, margin=margin,
-                           environ=environ)
-        if reason and critical and _fallback_available(cfg, db, name, harness, limites,
-                                                       now=now, environ=environ):
+        reason, auth = _own_hold(cfg, db, name, harness, items, limites, now=now,
+                                 critical=critical, paced=paced, margin=margin,
+                                 environ=environ)
+        # L242b (3) : le repli ne lève qu'une tenue BUDGET. Une tenue
+        # d'authentification (`choice.auth_blocked`) est conservée par
+        # l'exécuteur — `account_turn.choose` retient le compte malade sans
+        # raison budget, aucun repli n'est engagé, puis `auth_ready` bloque
+        # l'agent : la lever par un repli fictif ferait dormir le lot.
+        # Comme `Runner._critical_fallback` : jamais une configuration ni un
+        # état de comptes illisibles.
+        if reason and not auth and critical \
+                and not reason.startswith(("invalid account configuration",
+                                            "account state unavailable")) \
+                and _fallback_available(cfg, db, name, harness, limites,
+                                        now=now, environ=environ):
             return ""
     except db_mod.Unavailable:
         raise
@@ -614,22 +625,32 @@ def _declared_environ(cfg) -> dict:
 
 
 def _own_hold(cfg, db, name: str, harness: str, items: list, limites, *, now: float,
-              critical: bool, paced: bool, margin: bool, environ=None) -> str:
-    """Raison de tenue sur le harnais de l'agent, '' si un tour peut partir.
+              critical: bool, paced: bool, margin: bool,
+              environ=None) -> tuple[str, bool]:
+    """`(raison de tenue sur le harnais de l'agent, tenue d'authentification)`,
+    `('', False)` si un tour peut partir.
 
     Réplique la décision de `Runner.budget_reason` sans exécuteur : le compte
-    (ou la pause), puis le plafond payé au token restant."""
+    (ou la pause), puis le plafond payé au token restant — sauf garde de
+    rythme coupée (`paced=False`), où l'exécuteur (`Runner.budget_ok`) ne juge
+    que les règles absolues de L226b, déjà vues par `accounts.choose`."""
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={name: harness},
                              **limites.book_kwargs())
     choice = accounts.choose(db, cfg.host, harness, items, book, now=now, agent=name,
                              environ=environ, simulate=True, critical=critical,
                              paced=paced, margin=margin)
     if choice.profile is None:
-        return choice.reason
+        return choice.reason, False
     if choice.auth_blocked:
-        return choice.why
+        return choice.why, True
+    if not paced:
+        # B1 de la R1 (#1021) : avec `limites.per_hour <= 0` l'exécuteur ne
+        # consulte pas `book.over` du tout (ni plafond journalier du mesh, ni
+        # plafond propre à l'agent) ; les appliquer ici refuserait un tour que
+        # l'exécuteur autorise.
+        return "", False
     part = getattr(cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
-    return book.over(name, pace=False, hourly_share=part)
+    return book.over(name, pace=False, hourly_share=part), False
 
 
 def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
