@@ -201,7 +201,7 @@ class MeshCliTest(PgTestCase):
     # -- work_items --------------------------------------------------------
     def test_work_cycle_cli(self):
         proc = self.mesh("work", "add", "--title", "Banc v1 points 3-5",
-                         "--type", "evolution", "--app", "nexlink",
+                         "--type", "evolution", "--app", "nexlink", "--new-project",
                          "--assignee", AGENT, "--actor", "orchestrateur")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("lot #1", proc.stdout)
@@ -229,7 +229,8 @@ class MeshCliTest(PgTestCase):
         item = json.loads(proc.stdout)
         self.assertEqual(item["state"], "blocked")
         self.assertEqual(item["events"][0]["note"], "relance demain")
-        self.assertEqual(item["events"][-1]["note"], "created")
+        self.assertEqual(item["events"][-1]["note"],   # #506: an undeclared project
+                         "created; project 'nexlink' introduced by orchestrateur (--new-project)")
 
     def test_work_etat_inconnu(self):
         proc = self.mesh("work", "add", "--title", "x")

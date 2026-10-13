@@ -3503,6 +3503,7 @@ class AgentWorker(threading.Thread):
         supprimé** ici."""
         if not getattr(self, "_turn_open", False):
             return
+        from .turn_processes import group_running
         self._turn_open = False
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
@@ -3511,7 +3512,7 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = survives or bool(conteneurs) or bool(pgid and self._group_alive(pgid))
+        orphelin = survives or bool(conteneurs) or group_running(pgid)
         try:
             storage.of(self.db).turn_resources.close_turn(
                 turn_id, orphan=orphelin, containers=conteneurs or None)
@@ -5729,6 +5730,7 @@ class Runner:
                 runtime=self.container_runtime(),
                 # L230: the worktrees are walked at most every few hours
                 artifact_scan=build_artifacts.due(time.time()))
+            self.expire_threads_once(db)
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("cleanup: %s" % "; ".join(
@@ -5761,6 +5763,41 @@ class Runner:
                 log_async("[%s] session %s of lot #%s forgotten (lot finished or reassigned)"
                           % (row["agent"], row["session_id"], row["work_item_id"]))
         return purges
+
+    def expire_threads_once(self, db, now: float | None = None,
+                            clock: float | None = None) -> list | None:
+        """L361: thread retention (0033 §9), at most once a day, from the
+        housekeeping pass: entries older than `thread_retention_days` leave
+        this host's thread files. Never raises."""
+        now = time.time() if now is None else now
+        # the day counted on the monotonic clock (r8), the wall clock kept
+        # for the retention thresholds
+        tick = time.monotonic() if clock is None else clock
+        due = getattr(self, "_threads_expire_next", None)
+        if due is not None and tick < due:
+            return None
+        self._threads_expire_next = tick + 86400.0
+        if getattr(self, "mediated", False):  # no database, no local housekeeping
+            log_async("thread expiry skipped: %s" % fil.EXPIRY_UNAVAILABLE)
+            return None
+        try:
+            reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
+        except fil.ExpiryUnavailable as exc:  # mediated host: said once per pass
+            log_async("thread expiry skipped: %s" % exc)
+            return None
+        except Exception as exc:  # never fatal for the runner
+            log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        for report in reports:
+            if report.get("error") or report.get("held"):
+                log_async("thread expiry %s: %s" % (report["thread"],
+                                                     report.get("error") or report["held"]))
+            if report["dropped"]:
+                log_async("thread %s: %d entr%s before %s %s, %d kept" % (
+                    report["thread"], report["dropped"],
+                    "y" if report["dropped"] == 1 else "ies", report["before"],
+                    "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
+        return reports
 
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
@@ -5858,10 +5895,29 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="branches").start()
 
+    def _start_thread_expiry_notice(self) -> None:
+        """#421 r7 : un exécuteur médié n'a pas de ménage local ; l'expiration
+        des fils non disponible y est dite au démarrage puis une fois par
+        jour (`expire_threads_once`), quel que soit l'intervalle du ménage."""
+        def avis() -> None:
+            try:
+                self.expire_threads_once(None)
+            except Exception as exc:  # the notice's thread never dies of it
+                log_async("thread expiry notice failed (%s: %s)" % (type(exc).__name__, exc))
+
+        def boucle() -> None:
+            avis()
+            while not self.stop.wait(3600.0):
+                avis()
+
+        threading.Thread(target=boucle, daemon=True, name="fils-expiration").start()
+
     def start_housekeeping_poll(self) -> None:
         """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
         600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
         interval = max(0.0, float(getattr(self.cfg, "housekeeping_interval", 0) or 0))
+        if getattr(self, "mediated", False) and not self.once:
+            self._start_thread_expiry_notice()
         if interval <= 0 or self.once or getattr(self, "mediated", False):
             return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
 
@@ -6409,9 +6465,10 @@ class Runner:
         (`AMEESH_TURN_ID`, hérité même après `setsid`), ni un conteneur
         étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
         Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
-        réutilisé), processus à l'environnement illisible lancé après la
-        ligne, moteur muet, table des processus ou démarrage de l'hôte
-        inconnus. Pas avant le feu vert du démarrage (`_boot_settle_ready` :
+        réutilisé ; les zombies seuls ne comptent pas), processus à
+        l'environnement illisible lancé après la ligne, moteur muet, table
+        des processus ou démarrage de l'hôte inconnus. Pas avant le feu vert
+        du démarrage (`_boot_settle_ready` :
         un conteneur relancé par sa politique peut manquer encore). Une ligne
         n'est soldée que si elle n'a pas changé depuis sa lecture
         (`settle_unchanged`). Rien n'est supprimé ; au plus
@@ -6419,6 +6476,7 @@ class Runner:
         Rend les lignes soldées. Ne lève jamais."""
         from . import containers as containers_mod, platform as os_layer
         from . import resources as resources_mod
+        from .turn_processes import running_groups
         self.live_review_at = time.monotonic() + LIVE_REVIEW_EVERY_S
         boot = resources_mod.boot_time()
         if not boot or not self._boot_settle_ready(time.time() - boot):
@@ -6442,8 +6500,13 @@ class Runner:
             self._live_review_after = after if more else 0
             if more:
                 self.live_review_at = time.monotonic()  # la suite sans attendre
+            if not rows:
+                return []
+            groups = running_groups(int(row["pgid"]) for row in rows if row.get("pgid"))
+            if groups is None:
+                return []  # unknown membership never proves a turn dead
             candidates = [row for row in rows
-                          if row.get("pgid") and not AgentWorker._group_alive(int(row["pgid"]))]
+                          if row.get("pgid") and int(row["pgid"]) not in groups]
             if not candidates:
                 return []
             try:
