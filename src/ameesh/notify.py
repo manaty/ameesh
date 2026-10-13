@@ -169,6 +169,8 @@ TYPE_LABELS = {
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`
     "slo_breach": "internal deadline (SLO) overdue",
+    # #1107 (n2 P3 de #1035) : un lot que la passe SLO ne sait pas lire
+    "slo_unreadable": "SLO pass cannot read a work item",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
