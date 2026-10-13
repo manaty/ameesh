@@ -275,9 +275,11 @@ PR_BODY_CACHE_MAX = 5000
 TARGET_GIT_KEY = "ameesh.target"
 DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
 #: une ligne `ameesh-work: <id>` désigne un lot précis (message d'un commit de
-#: fusion, ou corps d'une PR : `plan_github`)
+#: fusion, ou corps d'une PR : `plan_github`) ; le mot `final` après le numéro
+#: déclare cette PR comme la dernière étape du lot (#759)
 WORK_TRAILER_RE = re.compile(
-    r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})[ \t]*$")
+    r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})"
+    r"(?:[ \t]+(final))?[ \t]*$")
 #: L118b : une ligne `ameesh-work-partial: <id>` (corps d'une PR, message d'un
 #: commit de fusion) : la PR ne livre qu'une partie du lot, qui reste ouvert
 #: (lots parapluie, #139)
@@ -522,6 +524,15 @@ def short_branch(name: str | None) -> str:
 def partial_lots(body: str | None) -> set[int]:
     """Les lots qu'une PR déclare ne livrer qu'en partie (L118b)."""
     return {int(m.group(1)) for m in PARTIAL_TRAILER_RE.finditer(body or "")}
+
+
+def final_lots(body: str | None) -> set[int]:
+    """Les lots qu'une PR déclare livrer en dernier : une ligne
+    `ameesh-work: <id> final` (#759). Une PR finale ferme le lot, même si une
+    autre PR ouverte ou une branche déclarée y reste liée ; `ameesh-work-partial:`
+    l'emporte (une PR partielle ne ferme jamais)."""
+    return {int(m.group(1)) for m in WORK_TRAILER_RE.finditer(body or "")
+            if m.group(2)}
 
 
 def merge_citing(merges: list[dict], lot: int, *, since_ts: float | None = None,

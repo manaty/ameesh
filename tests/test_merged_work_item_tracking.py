@@ -126,7 +126,9 @@ class MergedCommandTest(_Base):
 
 
 class CorrectionTest(_Base):
-    """`ameesh work move <id> merged --correct "raison"` : un promoted à tort."""
+    """`ameesh work move <id> <état> --correct "raison"` : un état posé par
+    erreur — `promoted` à tort revient en `merged`, `merged` à tort (PR d'une
+    étape fermée trop tôt, #759) revient en `build`."""
 
     def setUp(self):
         super().setUp()
@@ -179,13 +181,36 @@ class CorrectionTest(_Base):
             self.assertEqual(proc.returncode, 1, (extra, env, proc.stdout))
             self.assertIn(attendu, proc.stderr, (extra, env))
         self.assertEqual(work.get(self.db, self.lot["id"])["state"], "promoted")
-        # seule correction possible : promoted → merged ; et une raison
+        # seules corrections possibles : promoted → merged et merged → build
         autre = work.add(self.db, title="autre")
         with self.assertRaises(work.WorkError) as ctx:
             work.move(self.db, autre["id"], "merged", actor="orch", correct="raison")
         self.assertIn("correction refused: intake → merged", str(ctx.exception))
         with self.assertRaises(work.WorkError):
             work.move(self.db, self.lot["id"], "merged", actor="orch", correct="  ")
+
+    def test_759_merged_a_tort_revient_en_build(self):
+        # #759 : une PR d'étape a fermé le lot trop tôt ; l'orchestrateur le
+        # corrige en `build`, le journal le dit, et le lot repart.
+        lot = work.add(self.db, title="fermé trop tôt")
+        work.merged(self.db, lot["id"], sha=SHA, actor="orch")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.move(self.db, lot["id"], "build", actor="orch")
+        self.assertIn("--correct", str(ctx.exception))          # la marche à suivre
+        proc = self.mesh("work", "move", str(lot["id"]), "build", "--correct",
+                         "PR d'étape fusionnée trop tôt (#759)",
+                         env=self.env(AGENT_MAIL_NAME="orch",
+                                      AMEESH_ALERT_ORCHESTRATORS="orch"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["state"], "build")
+        self.assertEqual(work.events(self.db, lot["id"])[0]["note"],
+                         "correction: merged → build — PR d'étape fusionnée trop tôt (#759)")
+        # le jalon de fusion reste : la fusion a bien eu lieu
+        self.assertEqual(sum(1 for m in work.milestones(self.db, lot["id"])
+                             if m["kind"] == "merged"), 1)
+        # et le lot repart dans la machine à états
+        self.assertEqual(work.move(self.db, lot["id"], "qa")["state"], "qa")
 
     def test_role_de_conception_au_canon(self):
         class Fiche:
