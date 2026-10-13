@@ -59,6 +59,7 @@ test_l317_project_modules  # storage: transactional module guards, structured ev
 test_l317b_module_audit  # storage: current evidence audit and notification on both drivers (L317b)
 test_l368_planned_waits  # storage: unbounded activity, item plans and commitment dependencies (L368)
 test_l385_work_dependencies  # storage: serialized dependency graph, rollback, audit and blocker states (L385)
+test_l514_wake_on_event  # stockage : réservation/remise du hook, verdict de CI vers l'assigné, réveil de l'exécuteur (L514)
 test_l52_persona_sessions  # storage: session history SQL, resume and lease-fenced rotation (L52)
 test_l53_restore_guard  # storage: restoration refuses active leases and blocks concurrent claims through extraction (L53)
 test_l54_memory_runner  # storage: memory isolation and designation/sync through a fake-harness turn (L54)
