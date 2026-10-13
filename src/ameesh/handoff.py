@@ -253,7 +253,7 @@ def target_message(item: dict, source: str) -> str:
     branch = item.get("branch")
     return (
         "Work item #%d \"%s\" is now yours: %s is paused on budget. State: %s.%s "
-        "The codex review stays required before any merge. When %s's pause ends, "
+        "A review by another family stays required before any merge. When %s's pause ends, "
         "nothing comes back on its own: the orchestrator decides. Never take an "
         "irreversible or production action without the usual approval." % (
             int(item["id"]), item.get("title") or "", source, item["state"],

@@ -248,7 +248,7 @@ class HandoffTest(_Handoff):
                           ("claude1", "event", str(intake["id"])),
                           ("deepseek2", "event", str(build["id"])),
                           ("claude1", "event", str(build["id"]))])
-        self.assertIn("codex review stays required", mails[2]["body"])
+        self.assertIn("review by another family stays required", mails[2]["body"])
         self.assertIn("pushed branch lot/import", mails[2]["body"])
         self.assertIn("Do not push to lot/import", mails[3]["body"])
         payload = mails[0]["payload"]
