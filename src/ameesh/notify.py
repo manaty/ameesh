@@ -105,10 +105,12 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #330: an owner key registered or replaced lately
+                 "owner_key_registered",
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain")
+                 "land_uncertain", "db_connections_high")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -132,6 +134,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
+    "db_connections_high": "database connection capacity",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -146,6 +149,8 @@ TYPE_LABELS = {
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
     "tmp_orphan": "/tmp entry left by a turn",
+    "tmp_unremovable": "temporary directory over quota with files it cannot remove",
+    "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
     "plan_underused": "underused plan",
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",
@@ -183,13 +188,17 @@ TYPE_LABELS = {
     "merge_blocked": "merge queue blocked",
     "land_uncertain": "PR merged by ameesh into a wrong or unchecked base",
 
+    "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    # #254: not pushed by default (add it to `notify.types`)
+    "host_hold": "host on hold",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing", "critical_budget_pause", "land_uncertain")
+                "credential_failing", "critical_budget_pause", "owner_key_registered",
+                "land_uncertain", "db_connections_high")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.

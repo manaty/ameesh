@@ -39,6 +39,8 @@ SIGNATURES = {
     "standing_approvals": {"receipt", "nonce", "challenge"},
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
+    "key_holders": {"public_key"},     # #330
+    "mesh_keys": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
     # exécuteurs médiés (voie B, 0062 et 0063)
     "executor_tokens": {"token_sha256"},

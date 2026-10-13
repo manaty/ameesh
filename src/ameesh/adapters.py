@@ -1094,7 +1094,13 @@ class HarnessAdapter:
         mode = self.permission_mode(permission_mode)
         if mode:
             rule = self.descriptor.interactive_permission
-            argv += [part.replace("{mode}", mode) for part in rule["flag"]]
+            fixed = dict(rule.get("modes") or ())
+            if mode in fixed:
+                # L685: the flag carries no `{mode}`: the mode selects a whole
+                # argument list (codex `bypassPermissions` → bypass flag)
+                argv += list(fixed[mode])
+            else:
+                argv += [part.replace("{mode}", mode) for part in rule["flag"]]
         if session_id:
             argv += [*self.spec.session_flag, session_id]
         return argv
@@ -1108,10 +1114,13 @@ class HarnessAdapter:
         the classifier keeps the guardrails on secrets, persistent configuration
         and production). Only modes in the descriptor's allowlist (`choices`)
         are kept, and those in `explicit_only` (`bypassPermissions`) only from
-        the agent setting: any other is dropped with a warning. The chosen mode
-        is passed only if the installed binary's help lists it among the
-        option's choices; otherwise (older version, unreadable or timed-out
-        help) the descriptor's fallback (`acceptEdits`) replaces it.
+        the agent setting: any other is dropped with a warning. A mode is
+        delivered by the descriptor's `flag` template (Claude) or by its `modes`
+        mapping (L685, codex: fixed arguments). With a `{mode}` template the
+        chosen mode is passed only if the installed binary's help lists it among
+        the option's choices; otherwise (older version, unreadable or timed-out
+        help) the descriptor's fallback (`acceptEdits`) replaces it. A `modes`
+        mapping carries no mode in the command line: it is never probed.
         """
         rule = self.descriptor.interactive_permission
         if not rule:
@@ -1142,8 +1151,15 @@ class HarnessAdapter:
         # setting, never from the default nor the fallback
         if mode in reserved and not by_agent:
             mode = ""
+        fixed = dict(rule.get("modes") or ())
+        if mode and not rule["flag"] and mode not in fixed:
+            # L685: an invalid descriptor (validation refuses it) must not pass
+            # a mode the command line cannot deliver
+            print("ameesh: permission mode %r ignored (descriptor delivers no such mode)"
+                  % mode, file=sys.stderr)
+            return ""
         fallback = "" if rule["fallback"] in reserved else rule["fallback"]
-        if mode and fallback and mode != fallback:
+        if mode and fallback and mode != fallback and rule["flag"]:
             try:
                 known = _help_choices(self.binary, _flag_name(rule["flag"]))
             except Exception:  # noqa: BLE001 — reading the help must never fail the attach

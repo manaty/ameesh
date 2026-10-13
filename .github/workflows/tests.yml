@@ -76,12 +76,17 @@ env:
   AMEESH_BALANCE_INTERVAL: "0"
   PYTHONPATH: src
 
+# Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
+# four runners): GitHub's free tier caps hosted jobs at 20 for the whole
+# organisation. A pull request from a fork never reaches that host (the
+# repository is public: its code would run on a shared, persistent machine);
+# it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # merge commit against its target) and the plan of the run, from the map
   plan:
     name: plan
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       version_only: ${{ steps.plan.outputs.version_only }}
@@ -121,7 +126,7 @@ jobs:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     needs: plan
     if: needs.plan.outputs.psycopg != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -134,7 +139,7 @@ jobs:
           POSTGRES_USER: ameesh
           POSTGRES_PASSWORD: ameesh-ci
           POSTGRES_DB: ameesh
-        ports: ["5432:5432"]
+        ports: ["5432"]  # host port chosen by docker: several runners share the host
         # base jetable : données en mémoire
         options: >-
           --tmpfs /var/lib/postgresql/data
@@ -148,18 +153,22 @@ jobs:
       FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     steps:
       - uses: actions/checkout@v4
+      - &dsn
+        name: port de la base jetable
+        run: echo "AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ameesh" >> "$GITHUB_ENV"
       - id: py
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
-      # environnement Python en cache : la clé suit pyproject.toml
+      # environnement Python en cache : la clé suit pyproject.toml et le type de
+      # runner (un venv de runner hébergé pointe vers /opt/hostedtoolcache)
       - id: venv
         uses: actions/cache@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
+          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
       - name: dépendances (pilote psycopg)
         if: steps.venv.outputs.cache-hit != 'true'
         run: |
@@ -175,6 +184,9 @@ jobs:
       - &git
         name: identité git des tests (dépôts temporaires)
         run: |
+          # own global config per job: runners sharing the host never race on ~/.gitconfig
+          export GIT_CONFIG_GLOBAL="$RUNNER_TEMP/gitconfig"
+          echo "GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL" >> "$GITHUB_ENV"
           git config --global user.name "ameesh ci"
           git config --global user.email "ci@ameesh.invalid"
           git config --global init.defaultBranch main
@@ -219,7 +231,7 @@ jobs:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     needs: plan
     if: needs.plan.outputs.psql != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -233,7 +245,7 @@ jobs:
           POSTGRES_USER: ameesh
           POSTGRES_PASSWORD: ameesh-ci
           POSTGRES_DB: ameesh
-        ports: ["5432:5432"]
+        ports: ["5432"]  # host port chosen by docker: several runners share the host
         options: >-
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
@@ -246,6 +258,7 @@ jobs:
       FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     steps:
       - uses: actions/checkout@v4
+      - *dsn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -294,7 +307,7 @@ jobs:
     name: lecteurs de la doc
     needs: plan
     if: needs.plan.outputs.docs_only == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
@@ -312,7 +325,7 @@ jobs:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     steps:
@@ -343,7 +356,7 @@ jobs:
   version:
     name: version number
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -361,7 +374,7 @@ jobs:
     name: tests
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: bilan des parts

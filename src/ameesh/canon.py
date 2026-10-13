@@ -42,6 +42,7 @@ simples, blocs `|`/`>`).
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as _dt
 import fnmatch
@@ -50,6 +51,7 @@ import os
 import posixpath
 import re
 import subprocess
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
@@ -64,8 +66,18 @@ except Exception:  # pragma: no cover - dépend de l'environnement
     _yaml = None
 
 #: `Persona` (L51, 0029/0032) replaces `Agent`; both card types remain
-#: readable during the transition.
-PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage")
+#: readable during the transition. `Process` (#538) carries the working rules
+#: (`processus/*.md`), read to open every agent's brief.
+PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage",
+                 "Process")
+#: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
+PROCESS_TYPE = "Process"
+#: #538 : dossier du canon où vivent les fiches Process ; un `type: Process`
+#: posé ailleurs n'est pas une règle de travail et n'est jamais injecté.
+PROCESS_DIR = "processus"
+#: #538 : deux pages ≈ 6 000 caractères ; au-delà `canon check` signale un
+#: dépassement (avertissement, jamais bloquant) et le brief coupe le texte.
+PROCESS_BODY_MAX = 6000
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -682,6 +694,21 @@ def split_frontmatter(text: str) -> str | None:
     raise YamlError("unclosed frontmatter (or larger than %d KiB)" % (FRONTMATTER_MAX // 1024))
 
 
+def body_of(text: str) -> str:
+    """Le corps d'une fiche Markdown : ce qui suit le frontmatter (`---`).
+
+    Sans frontmatter fermé, le texte entier est le corps ; c'est ce que lit le
+    brief (#538, fiches Process) et la feuille de route (L96, fiches Decision).
+    """
+    lines = text.lstrip("﻿").split("\n")
+    if not lines or lines[0].rstrip("\r \t") != "---":
+        return text
+    for idx in range(1, len(lines)):
+        if lines[idx].rstrip("\r \t") in ("---", "..."):
+            return "\n".join(lines[idx + 1:])
+    return ""
+
+
 _TYPED_RE = re.compile(r"^type:\s*[\"']?(%s)[\"']?\s*(#.*)?$" % "|".join(PROFILE_TYPES), re.M)
 
 
@@ -702,6 +729,7 @@ class Finding:
     host: str = ""          # hôte concerné (une erreur bloque ses agents)
     untrusted: bool = False  # lu hors source approuvée
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
+    process: str = ""       # fiche Process concernée (ne bloque aucun agent)
 
     def to_dict(self) -> dict:
         out = {"code": self.code, "severity": self.severity, "member": self.member,
@@ -712,6 +740,8 @@ class Finding:
             out["host"] = self.host
         if self.package:
             out["package"] = self.package
+        if self.process:
+            out["process"] = self.process
         if self.untrusted:
             out["untrusted"] = True
         return out
@@ -755,6 +785,10 @@ class Fiche:
                             # `<canon>/<membre>:<chemin>@<commit>` sinon (L42)
     data: dict              # frontmatter complet (clés inconnues conservées)
     untrusted: bool = False
+    #: #538 : chemin RELATIF au bundle (`processus/lots.md`) quand il diffère du
+    #: chemin affiché (`knowledge/processus/lots.md` dans un bundle imbriqué) ;
+    #: les restrictions de dossier d'une fiche Process portent sur lui.
+    bundle_path: str = ""
 
 
 @dataclass
@@ -1018,6 +1052,38 @@ class DecisionNote:
 
 
 @dataclass
+class Process:
+    """#538 : une fiche `Process` du canon (`processus/*.md`) — les règles de
+    travail, lues pour ouvrir le brief des agents et poussées après un sync.
+
+    `valid` est faux quand une clé obligatoire manque ou est illisible : la
+    fiche reste listée (`canon show`), jamais injectée dans un brief.
+    """
+
+    fiche: Fiche
+    description: str = ""
+    responsible: str = ""
+    updated: str = ""       # jour ISO (AAAA-MM-JJ), obligatoire
+    expire: str = ""        # jour ISO, vide sans échéance
+    body: str = ""
+    valid: bool = True
+
+    @property
+    def title(self) -> str:
+        return self.fiche.title
+
+    def to_dict(self) -> dict:
+        out = {"title": self.title, "member": self.fiche.member,
+               "path": self.fiche.path, "ref": self.fiche.ref,
+               "description": self.description, "responsible": self.responsible,
+               "updated": self.updated, "expire": self.expire,
+               "body_bytes": len(self.body.encode("utf-8")), "valid": self.valid}
+        if self.fiche.untrusted:
+            out["untrusted"] = True
+        return out
+
+
+@dataclass
 class Canon:
     root: str
     sources: list[Source] = field(default_factory=list)
@@ -1028,6 +1094,8 @@ class Canon:
     packages: list[WorkPackage] = field(default_factory=list)
     #: L96 : fiches Decision (frontmatter et corps), pour `ameesh plan propose`
     decisions: list[DecisionNote] = field(default_factory=list)
+    #: #538 : fiches Process (règles de travail), injectées dans les briefs
+    processes: list[Process] = field(default_factory=list)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -1133,6 +1201,12 @@ class Canon:
                 return package
         return None
 
+    def process(self, title: str) -> Process | None:
+        for process in self.processes:
+            if process.title == title:
+                return process
+        return None
+
     def placements_of(self, agent: str) -> list[Placement]:
         return [p for p in self.placements if p.agent == agent]
 
@@ -1196,6 +1270,7 @@ class Canon:
                               responsible=w.responsible, team=w.team, scope=w.scope,
                               status=w.status, **fiche(w.fiche))
                          for w in self.packages],
+            "processes": [p.to_dict() for p in self.processes],
             "federation": {"id": (self.federation or {}).get("id"),
                            "roles": self.roles, "review_policies": self.review_policies,
                            "naming": self.naming.to_dict() if self.naming else None},
@@ -1319,6 +1394,45 @@ def _git_message(proc: subprocess.CompletedProcess) -> str:
     return text or ("code %d" % proc.returncode)
 
 
+def _diff_name_status(repo: str, base: str, head: str | None = None) -> set[str]:
+    """Les chemins de `git diff --name-status --find-renames base [head]`.
+
+    Un renommage compte pour ses **deux** chemins, l'ancien et le nouveau,
+    parce que la politique de revue les couvre tous les deux. `head` absent :
+    l'arbre de travail. Toute erreur git lève [`GitError`].
+    """
+    args = ["diff", "--name-status", "-z", "--find-renames", base]
+    if head is not None:
+        args.append(head)
+    proc = _git(repo, *args)
+    if proc.returncode != 0:
+        raise GitError("git diff %s: %s" % (base, _git_message(proc)))
+    return _name_status_paths(proc.stdout)
+
+
+def _name_status_paths(raw: bytes) -> set[str]:
+    """Chemins d'une sortie `git diff --name-status -z` (renommages : les deux)."""
+    paths: set[str] = set()
+    fields = raw.decode("utf-8", "replace").split("\0")
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        if not status:
+            break
+        if status[0] in ("R", "C"):
+            if index + 2 >= len(fields):
+                break
+            paths.add(fields[index + 1])
+            paths.add(fields[index + 2])
+            index += 3
+        else:
+            if index + 1 >= len(fields):
+                break
+            paths.add(fields[index + 1])
+            index += 2
+    return paths
+
+
 def git_changed_paths(repo: str, ref: str = "") -> list[str]:
     """Les chemins d'un changement, relatifs à la racine du dépôt (L10).
 
@@ -1346,31 +1460,57 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
             base = proc.stdout.decode("utf-8", "replace").strip()
         else:
             base = verified
-    proc = _git(repo, "diff", "--name-status", "-z", "--find-renames", base)
-    if proc.returncode != 0:
-        raise GitError("git diff %s: %s" % (base, _git_message(proc)))
-    fields = proc.stdout.decode("utf-8", "replace").split("\0")
-    index = 0
-    while index < len(fields):
-        status = fields[index]
-        if not status:
-            break
-        if status[0] in ("R", "C"):
-            if index + 2 >= len(fields):
-                break
-            paths.add(fields[index + 1])
-            paths.add(fields[index + 2])
-            index += 3
-        else:
-            if index + 1 >= len(fields):
-                break
-            paths.add(fields[index + 1])
-            index += 2
+    paths.update(_diff_name_status(repo, base))
     proc = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
     if proc.returncode != 0:
         raise GitError("git ls-files: %s" % _git_message(proc))
     paths.update(name for name in proc.stdout.decode("utf-8", "replace").split("\0") if name)
     return sorted(paths)
+
+
+def git_changed_paths_between(repo: str, base: str, tip: str) -> list[str]:
+    """Chemins changés **entre deux commits** (L10, #538), sans l'arbre de travail.
+
+    `git_changed_paths` compare une référence à HEAD et à l'arbre de travail :
+    c'est ce qu'un gel emporterait. Ici, l'appelant compare un commit déjà
+    appliqué (`canon_state.last_good_commit`) à la référence approuvée qui va
+    l'être (`source.commit`) : si la référence avance sans que le checkout
+    suive, le changement doit quand même être vu. Un renommage compte pour ses
+    deux chemins, comme `git_changed_paths`. `GitError` sur référence inconnue
+    ou dépôt illisible : jamais une liste vide rassurante."""
+    resolved = {}
+    for name in (base, tip):
+        sha = git_commit(repo, name)
+        if sha is None:
+            raise GitError("unknown git reference: %s" % name)
+        resolved[name] = sha
+    proc = _git(repo, "diff", "--name-status", "-z", "--find-renames",
+                resolved[base], resolved[tip])
+    if proc.returncode != 0:
+        raise GitError("git diff %s %s: %s" % (base, tip, _git_message(proc)))
+    return sorted(_name_status_paths(proc.stdout))
+
+
+def git_range_paths(repo: str, base: str, head: str) -> list[str]:
+    """Les chemins changés entre `base` et `head` (renommage : les deux).
+
+    `base` est ramené à son **merge-base avec `head`** : c'est le diff qu'un lot
+    gelé emporte depuis sa cible, donc ce que sa classe de revue couvre (canon
+    §1). Toute erreur git — référence inconnue, dépôt illisible — lève
+    [`GitError`] : jamais une liste vide qui se lirait « rien à relire ».
+    """
+    verified_base = git_commit(repo, base)
+    if verified_base is None:
+        raise GitError("unknown git reference: %s" % base)
+    verified_head = git_commit(repo, head)
+    if verified_head is None:
+        raise GitError("unknown git reference: %s" % head)
+    proc = _git(repo, "merge-base", verified_base, verified_head)
+    if proc.returncode == 0 and proc.stdout.strip():
+        start = proc.stdout.decode("utf-8", "replace").strip()
+    else:
+        start = verified_base
+    return sorted(_diff_name_status(repo, start, verified_head))
 
 
 def git_toplevel(directory: str) -> str | None:
@@ -2316,7 +2456,7 @@ class _Loader:
                     if _profile_type(content):
                         ignored.append(path)
                     continue
-                self._fiche(source, path, content, version)
+                self._fiche(source, path, content, version, bundle_path=rel)
             if ignored:
                 self.canon.out_of_scope[source.member] = len(ignored)
                 self.add("ameesh-scope-ignored", INFO,
@@ -2326,7 +2466,8 @@ class _Loader:
                             ", ".join(ignored[:3])),
                          member=source.member, path=source.prefix)
 
-    def _fiche(self, source: Source, path: str, content: bytes | None, version: str) -> None:
+    def _fiche(self, source: Source, path: str, content: bytes | None, version: str,
+               *, bundle_path: str = "") -> None:
         where = {"member": source.member, "path": path}
         if content is None:
             self.add("canon-git-error", ERROR, "unreadable git object", **where)
@@ -2366,14 +2507,22 @@ class _Loader:
         title = _text(data.get("title"))
         fiche = Fiche(type=kind, title=title or "", member=source.member, path=path,
                       ref=make_ref(self.canon, source.member, path, version), data=data,
-                      untrusted=source.mode != "git")
+                      untrusted=source.mode != "git", bundle_path=bundle_path or path)
         if not title and kind != "Placement":
             subject = {"package": _package_stem(path)} if kind == "WorkPackage" else {}
+            if kind == PROCESS_TYPE:
+                # a Process card error blocks no agent (#538): without a title,
+                # the card is named by its path
+                subject = {"process": path}
             self.add("fiche-title-missing", ERROR, "%s card without `title`" % kind, **where,
                      **subject)
             return
         build = getattr(self, "_build_" + kind.lower())
-        build(fiche, where)
+        if kind == PROCESS_TYPE:
+            # #538 : le corps de la fiche (les règles) est lu avec elle
+            build(fiche, where, body=body_of(text))
+        else:
+            build(fiche, where)
 
     # -- types ---------------------------------------------------------------------
     def _list(self, fiche: Fiche, key: str, where: dict, code: str, **subject) -> list[str] | None:
@@ -2737,16 +2886,71 @@ class _Loader:
                      **where, **subject)
             return None
 
+    def _build_process(self, fiche: Fiche, where: dict, *, body: str = "") -> None:
+        """#538 : une fiche Process (`processus/*.md`) — `title`, `updated` et
+        `responsible` sont obligatoires. Une clé manquante ou illisible rend la
+        fiche invalide (elle n'est jamais injectée dans un brief), sans bloquer
+        aucun agent : c'est une règle, pas un droit.
+
+        Le chemin est contraint, RELATIF AU BUNDLE : `type: Process` dans
+        `agents/…` n'est pas une règle (constat, jamais injecté), mais un canon
+        imbriqué (`knowledge/`) garde ses `processus/*.md` (verdict codex
+        #510 r2, P2). Le texte est rendu encodable en UTF-8 (un surrogate YAML
+        isolé ne doit pas faire échouer le brief ni un envoi)."""
+        subject = {"process": fiche.title}
+        chemin = (fiche.bundle_path or fiche.path).replace("\\", "/").split("/")
+        if len(chemin) < 2 or chemin[0] != PROCESS_DIR:
+            self.add("process-path", ERROR,
+                     "Process card outside `%s/`: %s (never injected as a working "
+                     "rule)" % (PROCESS_DIR, fiche.path), **where, **subject)
+            fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
+            self.canon.processes.append(Process(
+                fiche=fiche, description=_utf8_safe(_text(fiche.data.get("description")) or ""),
+                responsible="", updated="", expire="",
+                body=_utf8_safe(body), valid=False))
+            return
+        fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
+        responsible = _text(fiche.data.get("responsible"))
+        responsible = _utf8_safe(responsible) if responsible else responsible
+        if not responsible:
+            self.add("process-responsible-missing", ERROR,
+                     "Process card without `responsible` (the human who answers "
+                     "for the rule)", **where, **subject)
+        updated = self._process_day(fiche, "updated", where, required=True, **subject)
+        expire = self._process_day(fiche, "expire", where, required=False, **subject)
+        declared_expire = fiche.data.get("expire")
+        valid = bool(responsible) and updated is not None \
+            and (declared_expire in (None, "") or expire is not None)
+        self.canon.processes.append(Process(
+            fiche=fiche,
+            description=_utf8_safe(_text(fiche.data.get("description")) or ""),
+            responsible=responsible or "", updated=updated or "", expire=expire or "",
+            body=_utf8_safe(body), valid=valid))
+
+    def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
+                     **subject) -> str | None:
+        """#538 : un jour ISO d'une fiche Process (`AAAA-MM-JJ`). Vide : erreur
+        si la clé est obligatoire, silence sinon ; illisible : erreur."""
+        value = fiche.data.get(key)
+        if value is None or value == "":
+            if required:
+                self.add("process-%s-missing" % key, ERROR,
+                         "Process card without `%s` (expected YYYY-MM-DD)" % key,
+                         **where, **subject)
+            return None
+        text = str(value).strip()[:10]
+        try:
+            return _dt.date.fromisoformat(text).isoformat()
+        except ValueError:
+            self.add("process-%s-invalid" % key, ERROR,
+                     "`%s`: unreadable date %r (expected YYYY-MM-DD)" % (key, value),
+                     **where, **subject)
+            return None
+
     def _decision(self, source, path: str, content: bytes, version: str, data: dict) -> None:
         """L96 : garde une fiche Decision (frontmatter et corps, borné)."""
         title = _text(data.get("title")) or _package_stem(path)
-        text = content[:DECISION_BODY_MAX].decode("utf-8", "replace")
-        lines = text.lstrip("\ufeff").split("\n")
-        body = text
-        for idx in range(1, len(lines)):
-            if lines[idx].rstrip("\r \t") in ("---", "..."):
-                body = "\n".join(lines[idx + 1:])
-                break
+        body = body_of(content[:DECISION_BODY_MAX].decode("utf-8", "replace"))
         fiche = Fiche(type=DECISION_TYPE, title=title, member=source.member, path=path,
                       ref=make_ref(self.canon, source.member, path, version), data=data,
                       untrusted=source.mode != "git")
@@ -2764,6 +2968,13 @@ def _text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _utf8_safe(text: str) -> str:
+    """Un texte encodable en UTF-8 (#538) : un échappement YAML peut produire un
+    surrogate UTF-16 isolé (`title: "\\uD800"`), qui passe la lecture puis fait
+    échouer tout encodage — brief, fil, envoi. Remplacé ici, à la lecture."""
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 # ==========================================================================
@@ -2901,10 +3112,41 @@ def check_identities(canons: list[Canon]) -> None:
         seen[canon.id] = canon
 
 
+#: Canons read inside an explicit, short-lived window (`configured_cache`).
+#: A read command asks for them several times — once per alert family, and
+#: once per dry pass of `db.batched` — and every `load_configured` re-reads
+#: git and the fiches, which dominated `alerts` (L521).
+_CANONS = threading.local()
+
+
+@contextlib.contextmanager
+def configured_cache():
+    """Read the configured canons once inside the block.
+
+    The cache never outlives the block: a long-lived process (`alerts
+    --follow`, the runner) must see canon changes at its next read."""
+    previous = getattr(_CANONS, "loaded", None)
+    _CANONS.loaded = {}
+    try:
+        yield
+    finally:
+        _CANONS.loaded = previous
+
+
+def _configured_key(cfg, fetch: bool) -> tuple:
+    return (tuple((entry.path, getattr(entry, "ref", ""),
+                   bool(getattr(entry, "untrusted", False)))
+                  for entry in configured(cfg)), bool(fetch))
+
+
 def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
     """Les canons configurés qui se laissent charger, le canon par défaut
     d'abord (lecture seule : seuils, hôtes). Une configuration fautive d'un
     canon ne masque pas les autres ; un identifiant en double est écarté."""
+    cache = getattr(_CANONS, "loaded", None)
+    key = _configured_key(cfg, fetch) if cache is not None else None
+    if cache is not None and key in cache:
+        return list(cache[key])
     out: list[Canon] = []
     for index, entry in enumerate(configured(cfg)):
         try:
@@ -2915,6 +3157,8 @@ def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
         if any(c.id == canon.id for c in out):
             continue
         out.append(canon)
+    if cache is not None:
+        cache[key] = out
     return out
 
 
@@ -3228,8 +3472,9 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
-    # La déclaration vit dans `federation.yaml`, sous `review_policies.classes` :
-    # `canon check` la valide, `ameesh review-class` la relit avec le même code.
+    # La déclaration vit dans `federation.yaml`, sous `review_policies.classes`,
+    # éventuellement par projet (`risk_classes.projects.<nom>`, §8) :
+    # `canon check` la valide en entier, `ameesh review-class` la relit.
     root_member = canon.sources[0].member if canon.sources else ""
     from . import modules as project_modules
     try:
@@ -3237,8 +3482,8 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     except ValueError as exc:
         add("project-modules-invalid", ERROR, str(exc),
             **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
-    _policy, policy_problems = review_mod.policy_from_federation(canon.federation)
-    for code, severity, message in policy_problems:
+    _scoped = review_mod.scoped_from_federation(canon.federation)
+    for code, severity, message in _scoped.problems:
         add(code, severity, message,
             **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
 
@@ -3251,6 +3496,9 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
 
     # -- plan de travail (L29) ----------------------------------------------------------
     _validate_packages(canon, add)
+
+    # -- règles de travail (#538) -------------------------------------------------------
+    _validate_processes(canon, add)
 
     # -- avertissements -----------------------------------------------------------------
     for agent in canon.agents:
@@ -3362,6 +3610,31 @@ def _validate_packages(canon: Canon, add) -> None:
                 package=package.id)
 
 
+def _validate_processes(canon: Canon, add) -> None:
+    """#538 : fiches Process (`processus/*.md`) — les règles de travail.
+
+    Un texte plus long que `PROCESS_BODY_MAX` (environ deux pages) et une
+    échéance dépassée sont des avertissements : ils ne bloquent la réclamation
+    d'aucun agent (voir `blocking`). Les clés obligatoires sont vérifiées à la
+    lecture (`_build_process`), qui marque la fiche invalide."""
+    today = _dt.date.today().isoformat()
+    for process in canon.processes:
+        where = process.fiche
+        subject = {"process": process.title}
+        taille = len(process.body.encode("utf-8"))
+        if taille > PROCESS_BODY_MAX:
+            add("process-too-long", WARNING,
+                "Process card %s: %d bytes of rules (limit %s, about two pages); "
+                "a brief keeps only the beginning" % (process.title, taille,
+                                                      PROCESS_BODY_MAX),
+                where, **subject)
+        if process.expire and process.expire < today:
+            add("process-expired", WARNING,
+                "Process card %s marked `expire: %s`, a past date: the rule is "
+                "still read, review it" % (process.title, process.expire),
+                where, **subject)
+
+
 def errors(findings: Iterable[Finding]) -> list[Finding]:
     return [f for f in findings if f.severity == ERROR]
 
@@ -3384,11 +3657,12 @@ class Blocking:
 
 def blocking(findings: Iterable[Finding]) -> Blocking:
     """Une erreur liée à un agent bloque cet agent ; à un hôte, les agents qui y
-    sont placés ; à une fiche du plan (WorkPackage, L29), aucun agent ; sinon
-    (fédération, frontmatter d'une fiche du profil, …) tous."""
+    sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
+    travail (Process, #538), aucun agent ; sinon (fédération, frontmatter d'une
+    fiche du profil, …) tous."""
     result = Blocking([], defaultdict(list), defaultdict(list))
     for finding in errors(findings):
-        if finding.package:
+        if finding.package or finding.process:
             continue
         if finding.agent:
             result.by_agent[finding.agent].append(finding)

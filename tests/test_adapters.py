@@ -141,7 +141,9 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(claude.interactive_command("s1"),
                              [claude.binary, "--permission-mode", "auto", "--resume", "s1"])
             codex = adapters.adapter_for("codex")
-            self.assertEqual(codex.interactive_command("t1"), [codex.binary, "resume", "t1"])
+            # L685: no shared background daemon, bypass only from the setting
+            self.assertEqual(codex.interactive_command("t1"),
+                             [codex.binary, "--no-daemon", "resume", "t1"])
             dsh = adapters.adapter_for("deepseek")
             self.assertEqual(dsh.interactive_command("d1"),
                              [dsh.binary, "--profile", "agent", "--session-id", "d1"])
