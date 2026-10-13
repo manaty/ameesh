@@ -72,7 +72,7 @@ EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
-#: #747 : attente d'un runner au-delà de laquelle `ci_queue_starved` est levée
+#: #747 : seuil de la vue des exécutions suivies en attente (sans notification)
 QUEUE_STARVED_S = 20 * 60.0
 
 
