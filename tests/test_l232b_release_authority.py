@@ -122,6 +122,22 @@ class ReleaseAuthorityTest(PgTestCase):
                         (approval_id,))
         self.assertFalse(self.validate())
 
+    def test_approval_replaced_between_reads_cannot_extend_signed_expiry(self):
+        answered = self.signed_answer(ttl=50)
+        proof = answered['answer']['proof']
+        api = storage.of(self.db)
+        rows = api.approvals.recent(action=decisions.APPROVAL_ACTION,
+                                    artifact_hash=proof['digest'], limit=20)
+        row = dict(rows[0])
+        parts = row['signed_payload'].split('|', 2)
+        document = json.loads(parts[2])
+        document['expires'] += 1_000_000_000
+        row['signed_payload'] = '|'.join(parts[:2]) + '|' + json.dumps(document)
+        row['expires_ts'] += 1000
+        self.now += 60
+        with mock.patch.object(type(api.approvals), 'recent', side_effect=[rows, [row]]):
+            self.assertFalse(self.validate())
+
     def test_corrupt_signature_and_foreign_nonce_consumption_are_refused(self):
         answered = self.signed_answer()
         proof = answered['answer']['proof']

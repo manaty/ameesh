@@ -9,7 +9,7 @@ import hashlib
 import json
 import time
 
-from ameesh import authority, decisions, storage
+from ameesh import authority, decisions, signing, storage
 
 PREFIX = 'Approve the exact host release and bounded rollback below:\n'
 OPTIONS = [{'key': 'apply', 'label': 'Apply this exact release and its bounded rollback'},
@@ -100,7 +100,17 @@ class SignedDecisionAuthority:
                     or int(round(float(row['expires_ts']) * 1_000_000)) != signed['expires']
                     or int(round(float(row['created_ts']) * 1_000_000)) != signed['ts']):
                 return False
+            # Verify THIS captured row as well: a row replaced between the
+            # generic proof check and this read must not extend signed expiry.
+            key = authority.key_info(self.db, row['approver']) or {}
+            if (key.get('key_role') != 'owner' or key.get('key_revoked_ts')
+                    or key.get('public_key_fingerprint') != row.get('signature_key')
+                    or row.get('consumed_by') != 'decision:%d' % self.decision_id
+                    or not signing.verify(authority.unb64(key['public_key']),
+                                          row['signed_payload'].encode('utf-8'),
+                                          authority.unb64(row['signature']))):
+                return False
             nonce = storage.of(self.db).nonces.state(row['approver'], row['nonce'])
             return bool(nonce and nonce.get('consumed_by') == 'decision:%d' % self.decision_id)
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except (KeyError, TypeError, ValueError, OverflowError, authority.AuthorityError):
             return False

@@ -123,3 +123,16 @@ that a wrong expected count fails verification, and that the disposable
 restore database is removed while the source remains intact. It requires
 compatible PostgreSQL clients and test-role database-creation permission.
 These tests do not claim a completed production backup or release pilot.
+
+The current transfer endpoint is Scaleway Object Storage. Its
+[object operations documentation](https://www.scaleway.com/en/docs/object-storage/api-cli/object-operations/)
+describes deletion of an explicit `versionId`; an unqualified delete in a
+versioned bucket creates a delete marker. Its
+[conditional writes documentation](https://www.scaleway.com/en/docs/object-storage/api-cli/using-conditional-writes/)
+describes conditional uploads, not a conditional DeleteObject contract.
+Inference for the unfinished adapter: support for conditional uploads is
+insufficient evidence for safely deleting a digest-pinned recovery object.
+Either verify conditional-delete semantics for the enrolled backend or pin an
+immutable provider version through upload, retrieval, verification and expiry.
+The current name/digest inventory does not capture those version ids, and no
+bucket-versioning or storage-policy change has been made by this lot.

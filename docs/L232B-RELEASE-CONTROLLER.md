@@ -100,7 +100,9 @@ all subsequent release and recovery steps. The approval nonce must have been
 consumed by this exact decision; this is not a new unconsumed approval.
 
 Both the deadline embedded in the signed question and the original signed
-approval expiry must still be valid. Changes to the unsigned `due_ts` cannot
+approval expiry must still be valid. The expiry row captured after the generic
+proof check has its own signature reverified; replacing that row between reads
+cannot extend the original signature window. Changes to the unsigned `due_ts` cannot
 extend execution. Signed creation/expiry timestamps must match their database
 rows; changing `expires_at` cannot resurrect authority. The operation id fixes
 reuse to the same reconciled host operation; durable host receipts must still
@@ -108,7 +110,7 @@ prevent duplicate effects from two controllers. Standing delegations are not
 implemented by this adapter.
 
 Tests use a publicly known synthetic fixture seed and disposable PostgreSQL
-schemas, never an actual owner's key. Eleven tests cover real signatures,
+schemas, never an actual owner's key. Tests cover real signatures,
 consumption, expiry, row tampering, revocation/replacement and a full controller
 sequence with a simulated host. Revocation after fencing stops before migration
 while keeping the fence. These tests pass through both psycopg and psql.
