@@ -5,8 +5,34 @@ from __future__ import annotations
 NAME = "it"
 TYPES = ("release", "publication")
 
+#: L244 (#420) : états de cycle de vie qu'une règle `require_qa` peut garder.
+QA_STATES = ("merged", "promoted")
 
-def descriptor():
+
+def descriptor(options=None):
+    """L244 : `options` porte `require_qa` (états gardés par un verdict QA `ok`)."""
+    options = dict(options or {})
+    require_qa = options.pop("require_qa", None)
+    if options:
+        raise ValueError("unknown IT module option(s): %s" % ", ".join(sorted(options)))
+    if require_qa is not None:
+        if not isinstance(require_qa, list) or any(not isinstance(s, str) for s in require_qa):
+            raise ValueError("it.require_qa must be a list of lifecycle states")
+        if len(set(require_qa)) != len(require_qa):
+            raise ValueError("it.require_qa: duplicate state")
+        for state in require_qa:
+            if state not in QA_STATES:
+                raise ValueError("it.require_qa: state %r cannot require QA (choose from %s)"
+                                 % (state, ", ".join(QA_STATES)))
+    rules = [{"types": list(TYPES), "states": ["merged", "promoted"],
+              "milestones": {"verdict": ["ok"]},
+              "subject_kind": "delivery", "evidence_kind": "proof"}]
+    if require_qa:
+        # The gate reads the current delivery and demands a matching QA verdict
+        # `ok`; a `blocked` verdict or an older delivery keeps it closed.
+        rules.append({"types": list(TYPES), "states": list(require_qa),
+                      "subject_kind": "delivery", "evidence_kind": "qa",
+                      "evidence_verdict": "ok"})
     return {
         "types": list(TYPES),
         "schemas": {
@@ -17,10 +43,19 @@ def descriptor():
                       "subject_field": "sha256", "binding_kind": "delivery",
                       "writer_role": "ameesh_it_proof",
                       "patterns": {"sha256": "^[0-9a-f]{64}$"}},
+            "qa": {"strings": ["sha256", "verdict", "report"],
+                   "arrays": ["scope"],
+                   "patterns": {"sha256": "^[0-9a-f]{64}$", "verdict": "^(ok|blocked)$"},
+                   "subject_field": "sha256", "binding_kind": "delivery",
+                   "writer_role": "ameesh_it_qa",
+                   # L244 : le verdict vient d'un porteur du rôle `qa`, distinct
+                   # de l'assigne, de l'auteur de la livraison et de celui de la
+                   # preuve (séparation des devoirs, refus `qa-same-actor`).
+                   "actor_role": "qa",
+                   "separation_of_duties": {"assignee": True, "declaration": True,
+                                            "evidence": "proof"}},
         },
-        "rules": [{"types": list(TYPES), "states": ["merged", "promoted"],
-                   "milestones": {"verdict": ["ok"]},
-                   "subject_kind": "delivery", "evidence_kind": "proof"}],
+        "rules": rules,
     }
 
 
@@ -64,6 +99,27 @@ def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60
                         actor=actor, binding_id=delivery["id"])
 
 
+def record_qa(db, item_id, *, sha256, verdict, scope, report, actor):
+    """L244 (#420): le verdict QA d'un porteur du rôle `qa`, lié à la livraison courante.
+
+    Le contrôle de rôle et la séparation des devoirs sont faits par le garde SQL
+    (sous le verrou du lot), pas ici : cette fonction ne fait que valider la
+    forme et la liaison à la déclaration courante."""
+    from ..storage import ModuleStore
+    item(db, item_id)
+    store = ModuleStore(db)
+    delivery = store.latest(item_id, NAME, "delivery")
+    if delivery is None:
+        raise ValueError("declare the delivered artifact before recording its QA")
+    if sha256 != delivery["subject"]:
+        raise ValueError("QA digest differs from the current delivery; "
+                         "declare or prove that artifact first")
+    payload = {"sha256": sha256, "verdict": verdict, "scope": [s for s in scope if s],
+               "report": report}
+    return store.record(item_id, NAME, "qa", sha256, payload,
+                        actor=actor, binding_id=delivery["id"])
+
+
 def main(db, argv, *, actor):
     import argparse
     import json
@@ -79,6 +135,12 @@ def main(db, argv, *, actor):
         if name == "proof":
             command.add_argument("--runner", help="optional interpreter/compatibility executable")
             command.add_argument("--timeout", type=float, default=60)
+    qa = sub.add_parser("qa")
+    qa.add_argument("lot", type=int)
+    qa.add_argument("--sha256", required=True, help="digest of the delivered artifact")
+    qa.add_argument("--verdict", required=True, choices=("ok", "blocked"))
+    qa.add_argument("--scope", default="", help="what was exercised, comma-separated")
+    qa.add_argument("--report", required=True, help="link to the QA report")
     show = sub.add_parser("show")
     show.add_argument("lot", type=int)
     args = parser.parse_args(options)
@@ -88,6 +150,10 @@ def main(db, argv, *, actor):
         row = ModuleStore(db).milestones(args.lot)
     elif args.operation == "delivery":
         row = declare(db, args.lot, args.artifact, actor=actor)
+    elif args.operation == "qa":
+        scope = [s.strip() for s in args.scope.split(",")]
+        row = record_qa(db, args.lot, sha256=args.sha256, verdict=args.verdict,
+                        scope=scope, report=args.report, actor=actor)
     else:
         from .proof_service import request
         project_row = item(db, args.lot)
@@ -98,8 +164,17 @@ def main(db, argv, *, actor):
     return 0
 
 
+def _qa_states(policy):
+    """États gardés par une règle `require_qa` du module IT (L244)."""
+    states = []
+    for rule in (policy or {}).get("rules") or []:
+        if rule.get("evidence_kind") == "qa":
+            states.extend(rule.get("states") or [])
+    return sorted(set(states))
+
+
 def audit(store, project):
-    """Point 12: a release/publication without current execution evidence."""
+    """Point 12: execution evidence and, under `require_qa`, the QA verdict."""
     out = []
     for row in store.audit_evidence(project, NAME, TYPES, "delivery", "proof"):
         if row["proved"]:
@@ -118,5 +193,48 @@ def audit(store, project):
                     "since": row["declaration_ts"] or row["created_ts"],
                     "value": 1, "threshold": 0,
                     "reason": "it:execution-proof:%s" % (declaration or "undeclared"),
+                    "detail": detail, "action": detail})
+    out.extend(_qa_findings(store, project))
+    return out
+
+
+def _qa_findings(store, project):
+    """L244: `missing_qa` (pas de verdict `ok` courant) et `stale_qa` (verdict lié à une
+    livraison antérieure), sur les seuls états gardés par `require_qa`."""
+    policy = store.policy(project, NAME)
+    states = _qa_states(policy)
+    if not states:
+        return []
+    out = []
+    for row in store.audit_qa(project, NAME, TYPES, "delivery", "qa", states):
+        if row["declaration_id"] is None:
+            continue  # la livraison manquante est déjà un constat execution-proof
+        evidence = row["evidence_id"]
+        if evidence is not None and row["evidence_binding"] == row["declaration_id"]:
+            if row["evidence_verdict"] == "ok":
+                continue
+            rule = "missing_qa"
+            detail = ("IT procedure deviation: QA verdict is %r for the current delivery of %s lot "
+                      "#%s in project %s; the gate stays closed until a QA holder records `ok` with "
+                      "ameesh module it qa."
+                      % (row["evidence_verdict"], row["type"], row["id"], project))
+        elif evidence is not None:
+            rule = "stale_qa"
+            detail = ("IT procedure deviation: QA verdict of %s lot #%s in project %s is bound to an "
+                      "earlier delivery; the current delivery needs its own verdict with ameesh "
+                      "module it qa." % (row["type"], row["id"], project))
+        else:
+            rule = "missing_qa"
+            detail = ("IT procedure deviation: %s lot #%s in project %s is in %s and requires QA for "
+                      "its current delivery; record the verdict with ameesh module it qa after real "
+                      "execution." % (row["type"], row["id"], project, row["state"]))
+        out.append({"type": "module_deviation", "module": NAME,
+                    "rule": rule, "project": project, "lot": row["id"],
+                    "title": row["title"], "agent": None, "assignee": row["assignee"],
+                    "lot_state": row["state"],
+                    "declaration_id": row["declaration_id"], "subject": row["subject"],
+                    "since": row["declaration_ts"] or row["created_ts"],
+                    "value": 1, "threshold": 0,
+                    "reason": "it:%s:%s" % (rule, row["declaration_id"]),
                     "detail": detail, "action": detail})
     return out

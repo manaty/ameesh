@@ -9,23 +9,29 @@ SELECT 'CREATE ROLE ameesh_canon_sync NOLOGIN'
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_canon_sync') \gexec
 SELECT 'CREATE ROLE ameesh_it_proof NOLOGIN'
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_proof') \gexec
-SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof', :'schema') \gexec
+-- L244 (#420): the QA verdict has its own isolated writer, distinct from the
+-- execution proof writer.
+SELECT 'CREATE ROLE ameesh_it_qa NOLOGIN'
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_qa') \gexec
+SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 -- Canon sync executes the existing registry/authenticator/package transaction.
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
 SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
-SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof', :'schema') \gexec
-SELECT format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM ameesh_it_proof', :'schema') \gexec
-SELECT format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM ameesh_it_proof', :'schema') \gexec
-SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module_milestones TO ameesh_it_proof',
+SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+SELECT format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+SELECT format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa',
               :'schema', :'schema', :'schema') \gexec
 -- SELECT FOR NO KEY UPDATE needs UPDATE on at least one column.
-SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof', :'schema') \gexec
-SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof', :'schema') \gexec
-SELECT format('GRANT USAGE ON SEQUENCE %I.work_module_milestones_id_seq TO ameesh_it_proof', :'schema') \gexec
+SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+SELECT format('GRANT USAGE ON SEQUENCE %I.work_module_milestones_id_seq TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+-- The QA guard reads the actor's declared roles and projects under a share lock.
+SELECT format('GRANT SELECT ON %I.agent_registry TO ameesh_it_qa', :'schema') \gexec
 DO $audit$
 DECLARE r record;
 BEGIN
-    FOR r IN SELECT * FROM pg_roles WHERE rolname IN ('ameesh_it_proof', 'ameesh_canon_sync') LOOP
+    FOR r IN SELECT * FROM pg_roles WHERE rolname IN ('ameesh_it_proof', 'ameesh_it_qa', 'ameesh_canon_sync') LOOP
         IF r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls OR r.rolreplication OR r.rolcanlogin THEN
             RAISE EXCEPTION 'module writer groups must be nonadministrative NOLOGIN roles';
         END IF;
@@ -38,6 +44,9 @@ BEGIN
     END LOOP;
     IF has_table_privilege('ameesh_it_proof', 'project_modules', 'INSERT,UPDATE,DELETE') THEN
         RAISE EXCEPTION 'proof writer must not change module policies, including PUBLIC grants';
+    END IF;
+    IF has_table_privilege('ameesh_it_qa', 'project_modules', 'INSERT,UPDATE,DELETE') THEN
+        RAISE EXCEPTION 'QA writer must not change module policies, including PUBLIC grants';
     END IF;
 END
 $audit$;

@@ -34,16 +34,35 @@ def declarations(federation):
             raise ValueError("invalid module project: %r" % (project,))
         if not isinstance(spec, dict) or set(spec) - {"modules"}:
             raise ValueError("project %s expects {modules: [installed names]}" % project)
+        # L244 (#420): a project may pass options to a module, either as
+        # `modules: [it]` (no option) or `modules: {it: {require_qa: [promoted]}}`.
         modules = spec.get("modules", [])
-        if not isinstance(modules, list) or any(not isinstance(m, str) for m in modules):
-            raise ValueError("project %s modules must be a list of installed names" % project)
-        if len(set(modules)) != len(modules):
-            raise ValueError("duplicate modules for project %s" % project)
+        if isinstance(modules, list):
+            if any(not isinstance(m, str) for m in modules):
+                raise ValueError("project %s modules must be a list of installed names" % project)
+            if len(set(modules)) != len(modules):
+                raise ValueError("duplicate modules for project %s" % project)
+            options = {name: {} for name in modules}
+        elif isinstance(modules, dict):
+            options = {}
+            for name, module_options in modules.items():
+                if not isinstance(name, str):
+                    raise ValueError("project %s modules must be a list of installed names "
+                                     "or a {name: options} mapping" % project)
+                if module_options is None:
+                    module_options = {}
+                if not isinstance(module_options, dict):
+                    raise ValueError("project %s module %s options must be a mapping"
+                                     % (project, name))
+                options[name] = module_options
+        else:
+            raise ValueError("project %s modules must be a list of installed names "
+                             "or a {name: options} mapping" % project)
         seen_types = set()
-        for name in modules:
+        for name, module_options in options.items():
             if name not in registry:
                 raise ValueError("unknown installed module: %s" % name)
-            descriptor = registry[name].descriptor()
+            descriptor = registry[name].descriptor(module_options)
             if seen_types.intersection(descriptor["types"]):
                 raise ValueError("conflicting module types for project %s" % project)
             seen_types.update(descriptor["types"])

@@ -150,8 +150,10 @@ class RoleExecutorTest(PgTestCase):
 
     def test_module_writer_role_contract_and_executor_separation(self):
         q = db_mod.quote_ident
-        names = ("ameesh_canon_sync", "ameesh_it_proof")
-        existing = {r["rolname"] for r in self.db.query("SELECT rolname FROM pg_roles WHERE rolname IN (%s,%s)", names)}
+        names = ("ameesh_canon_sync", "ameesh_it_proof", "ameesh_it_qa")
+        placeholders = ", ".join(["%s"] * len(names))
+        existing = {r["rolname"] for r in self.db.query(
+            "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
         script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
         try:
             for _ in range(2):
@@ -165,10 +167,11 @@ class RoleExecutorTest(PgTestCase):
             with self.db.transaction() as tx:
                 tx.execute("SET LOCAL ROLE ameesh_canon_sync")
                 ModuleStore(tx).replace("", modules.declarations(federation()))
-            # Neither executor nor proof writer is a policy writer.
-            with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
-                tx.execute("SET LOCAL ROLE ameesh_it_proof")
-                ModuleStore(tx).replace("", [])
+            # Neither executor nor proof/QA writer is a policy writer.
+            for writer in ("ameesh_it_proof", "ameesh_it_qa"):
+                with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
+                    tx.execute("SET LOCAL ROLE %s" % writer)
+                    ModuleStore(tx).replace("", [])
         finally:
             for name in names:
                 self.db.execute("DROP OWNED BY %s" % q(name))
