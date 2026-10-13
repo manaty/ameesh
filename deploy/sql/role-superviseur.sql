@@ -221,7 +221,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'last_good_at', 'diagnostic', 'checked_at', 'auth_status',
         'auth_diagnostic', 'auth_checked_at',
         -- L42 (0032) : état par (hôte, canon)
-        'canon', 'canon_id'
+        'canon', 'canon_id',
+        -- #793 (0425) : repère des envois Process
+        'process_commit'
     ]),
     ('mesh_approvals', ARRAY[
         'id', 'approver', 'action', 'artifact_kind', 'artifact_hash',
