@@ -442,6 +442,37 @@ Then declare the account with the `oauth_token` type (after the lot above).
 To rotate a token, run the same steps again and revoke the old token in the
 claude.ai settings.
 
+### Git HTTPS: the helper written by `gh auth setup-git` carries an absolute path
+
+The provisioning step of the [L232 study](design/etudes/l232-autonomous-host-provisioning.md)
+(`gh auth setup-git`) writes in the global config, for `https://github.com`
+and `https://gist.github.com`, the empty reset helper followed by
+`!<absolute path of the gh binary that ran it> auth git-credential`. That
+path is frozen at the moment of the command: a config copied from another
+host (a VM's `/home/ubuntu/.local/bin/gh`) or a `gh` moved since (mise
+update) leaves a helper that no longer exists. Every HTTPS GitHub operation
+then fails on the credential lookup while `gh auth status` stays healthy —
+the sentinel probes `gh`, not `git`, so it sees nothing (incident #1063).
+
+Repair on the host itself, keeping a trace of the previous file; the empty
+line is what clears a helper inherited from another scope:
+
+```sh
+cp ~/.gitconfig ~/.gitconfig.bak-$(date +%Y%m%d-%H%M)
+for url in https://github.com https://gist.github.com; do
+  git config --global --replace-all "credential.$url.helper" ""
+  git config --global --add "credential.$url.helper" "!gh auth git-credential"
+done
+git ls-remote https://github.com/<org>/<private-repo> HEAD >/dev/null && echo ok
+```
+
+Re-running `gh auth setup-git` on the host has the same effect, with that
+host's current absolute path. The PATH form above survives a later move of
+`gh`, as long as `git` runs with a PATH that finds it (the runner units set
+the mise shims explicitly). Never copy `~/.gitconfig` between two hosts:
+re-run the command on the target and verify it with a private
+`git ls-remote`.
+
 
 ## 7. Critical agents: never paused while an account has headroom (L242b)
 
