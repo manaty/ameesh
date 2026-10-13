@@ -125,6 +125,8 @@ def source_of(repo: str) -> str:
         return os.path.realpath(os.path.join(repo, local))
     path = path.strip("/")
     path = path[:-len(".git")] if path.endswith(".git") else path
+    if host.lower() == "github.com":
+        path = path.lower()
     return "%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path)
 
 
@@ -510,7 +512,10 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         scan decide it; only a row with no source, if any, falls back on the
         scan."""
         if row.get("source"):
-            return row["source"] == source
+            queued_source = row["source"]
+            if queued_source.lower().startswith("github.com/"):
+                queued_source = queued_source.lower()
+            return queued_source == source
         return int(row["work_item_id"]) in branches
 
     mine = [r for r in rows if r["state"] in ("queued", "landing") and ours(r)]

@@ -58,18 +58,22 @@ cannot read the diff, all path gates run. Globs use `fnmatch`: `*` can cross a
 slash, so a gate may run more often than its GitHub workflow. List an
 unconditional gate when every merge needs a minimum check.
 
-`ci_required: true` reads GitHub Actions runs for the **frozen SHA** before
-queue admission and again during local landing, including immediately before
-the target push after the merged-tree gates. Workflows are grouped by their
-GitHub database ID, so identical display names cannot hide a failure. Missing
-identities or invalid timestamps refuse certification. The latest run of every
-returned workflow must be completed and successful, neutral or skipped; at
-least one run must exist. Missing,
-running, failed, unreadable or potentially truncated results refuse admission
-and eject a queued lot during local landing.
+`ci_required: true` reads GitHub Actions runs, external app checks and classic
+commit statuses for the **frozen SHA** before queue admission and again during
+landing. It checks before preparing the merge, after the merged-tree gates,
+and immediately before a PR merge. Workflows are grouped by their GitHub
+database ID, so identical display names cannot hide a failure. Run ordering
+uses the latest of creation, start and update timestamps, including reruns of
+older runs. Missing identities or invalid timestamps refuse certification.
+Every latest workflow and external app check must be completed and successful,
+neutral or skipped; classic statuses must be successful. At least one check
+must exist. Missing, running, failed, unreadable or potentially truncated
+results refuse admission and eject a queued lot before landing.
 The branch's current green CI cannot vouch for a different frozen commit.
-Ambiguous project configurations for the same repository are refused even from
-an exact configured checkout, including one without an origin URL.
+Ambiguous project configurations for the same repository are refused at
+admission and landing, even from an exact configured checkout without origin.
+GitHub repository path case is normalized for admission and queue ownership,
+including entries queued before normalization was introduced.
 Authentication uses the host's existing `gh` setup. The local gates then run
 on the actual merged tree before the target push. Trial-ref workflows are a
 separate future option; this configuration uses local gates plus frozen CI.

@@ -908,7 +908,7 @@ class Review194r8Test(_Land):
             radar.parse_settings(raw)
         # Bypass settings validation: landing itself still refuses the write.
         project = dataclasses.replace(self.project, land="local", lease_ref="refs/heads/ameesh-land/")
-        other = radar.Project(name="q", repo=self.repo, target="ameesh-land/main")
+        other = radar.Project(name="q", repo=self.repo + "-q", target="ameesh-land/main")
         self.project = project
         self.queued(4)
         _git(self.origin, "branch", "ameesh-land/main", "main")

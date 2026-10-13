@@ -15,7 +15,7 @@ import types
 from ameesh import land, merge_queue, plan_github, radar, resolutions
 
 from .test_l160b_radar import _git
-from .test_l160e2_land import _Land
+from .test_l160e2_land import _Land, FakeGh
 from .test_l160d_resolutions import _manual_resolution
 
 import unittest
@@ -148,17 +148,24 @@ class ProtectedQueueTest(_Land):
 class _Gh:
     """`gh run list` answering `rows` (or failing)."""
 
-    def __init__(self, rows=None, code=0):
+    def __init__(self, rows=None, code=0, checks=None, statuses=None):
         self.rows, self.code, self.calls = rows or [], code, []
+        self.checks = checks or []
+        self.statuses = statuses or []
 
     def run(self, argv, stdin=None):
         self.calls.append(argv)
-        return self.code, json.dumps(self.rows), "boom" if self.code else ""
+        data = self.rows
+        if argv[0] == "api":
+            data = ({"total_count": len(self.checks), "check_runs": self.checks}
+                    if "check-runs" in argv[1] else
+                    {"sha": "a" * 40, "total_count": len(self.statuses), "statuses": self.statuses})
+        return self.code, json.dumps(data), "boom" if self.code else ""
 
 
 def _run(name, status="completed", conclusion="success", at="2026-10-12T20:00:00Z"):
     return {"workflowName": name, "name": name, "status": status, "conclusion": conclusion,
-            "createdAt": at, "headSha": "a" * 40,
+            "createdAt": at, "startedAt": at, "updatedAt": at, "headSha": "a" * 40,
             "workflowDatabaseId": sum(map(ord, name))}
 
 
@@ -182,7 +189,8 @@ class CommitCiTest(unittest.TestCase):
                 _run("ci", at="2026-10-12T20:00:00Z")]          # re-run, green
         self.assertTrue(radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))["green"])
         rows.reverse()
-        rows[0]["createdAt"], rows[1]["createdAt"] = rows[1]["createdAt"], rows[0]["createdAt"]
+        for field in ("createdAt", "startedAt", "updatedAt"):
+            rows[0][field], rows[1][field] = rows[1][field], rows[0][field]
         self.assertFalse(radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))["green"])
 
     def test_distinct_workflows_with_the_same_name_do_not_hide_failure(self):
@@ -197,7 +205,8 @@ class CommitCiTest(unittest.TestCase):
         for key, value in (("workflowDatabaseId", None), ("workflowDatabaseId", ""),
                            ("workflowDatabaseId", True), ("createdAt", None),
                            ("createdAt", ""), ("createdAt", "yesterday"),
-                           ("createdAt", "2026-10-12T21:00:00")):
+                           ("createdAt", "2026-10-12T21:00:00"),
+                           ("startedAt", None), ("updatedAt", "yesterday")):
             with self.subTest(key=key, value=value):
                 with self.assertRaises(plan_github.GithubError):
                     radar.commit_ci(self.project, "a" * 40,
@@ -207,7 +216,8 @@ class CommitCiTest(unittest.TestCase):
         rows = [_run("ci", conclusion="failure", at="2026-10-12T20:00:00+02:00"),
                 _run("ci", at="2026-10-12T19:00:00Z")]
         self.assertTrue(radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))["green"])
-        rows[0]["createdAt"] = "2026-10-12T21:00:00+02:00"
+        for field in ("createdAt", "startedAt", "updatedAt"):
+            rows[0][field] = "2026-10-12T21:00:00+02:00"
         with self.assertRaises(plan_github.GithubError):
             radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))
 
@@ -226,6 +236,55 @@ class CommitCiTest(unittest.TestCase):
             with self.subTest(rows=rows[:1]):
                 with self.assertRaises(plan_github.GithubError):
                     radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))
+
+
+    def test_older_run_rerun_failure_or_pending_overrides_newer_created_success(self):
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status):
+                rows = [dict(_run("ci", status, conclusion, at="2026-10-12T10:00:00Z"),
+                             updatedAt="2026-10-12T12:00:00Z", startedAt="2026-10-12T12:00:00Z"),
+                        dict(_run("ci", at="2026-10-12T11:00:00Z"),
+                             updatedAt="2026-10-12T11:01:00Z", startedAt="2026-10-12T11:00:00Z")]
+                self.assertFalse(radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))["green"])
+
+    def test_external_check_failure_or_pending_blocks_actions_success(self):
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status):
+                checks = [{"id": 42, "app": {"id": 99, "slug": "external-ci"},
+                           "name": "quality", "head_sha": "a" * 40,
+                           "status": status, "conclusion": conclusion}]
+                self.assertFalse(radar.commit_ci(self.project, "a" * 40,
+                                                gh=_Gh([_run("ci")], checks=checks))["green"])
+
+    def test_external_commit_status_blocks_actions_success(self):
+        for state in ("failure", "error", "pending"):
+            with self.subTest(state=state):
+                self.assertFalse(radar.commit_ci(self.project, "a" * 40,
+                    gh=_Gh([_run("ci")], statuses=[{"context": "legacy-ci", "state": state}]))["green"])
+
+
+    def test_external_green_can_certify_and_apps_with_same_name_stay_distinct(self):
+        check = {"id": 1, "app": {"id": 9, "slug": "ci-app"}, "name": "ci",
+                 "head_sha": "a" * 40, "status": "completed", "conclusion": "success"}
+        self.assertTrue(radar.commit_ci(self.project, "a" * 40, gh=_Gh(checks=[check]))["green"])
+        other = dict(check, id=2, app={"id": 10, "slug": "other"}, conclusion="failure")
+        self.assertFalse(radar.commit_ci(self.project, "a" * 40,
+                                        gh=_Gh(checks=[check, other]))["green"])
+        self.assertTrue(radar.commit_ci(self.project, "a" * 40,
+            gh=_Gh(statuses=[{"context": "ci", "state": "success"}]))["green"])
+
+    def test_external_read_errors_and_truncation_refuse_certification(self):
+        for bad in ({}, {"total_count": 1, "check_runs": []},
+                    {"total_count": 0, "check_runs": [], "sha": "b" * 40}):
+            gh = _Gh([_run("ci")])
+            real = gh.run
+            def run(argv, stdin=None):
+                if argv[0] == "api":
+                    return 0, json.dumps(bad), ""
+                return real(argv, stdin)
+            gh.run = run
+            with self.subTest(bad=bad), self.assertRaises(plan_github.GithubError):
+                radar.commit_ci(self.project, "a" * 40, gh=gh)
 
 
 class GatesForTest(unittest.TestCase):
@@ -341,6 +400,65 @@ class RequiredCiLandTest(_Land):
         self.assertEqual(out["result"], "ejected", out)
         self.assertIn("unreadable", self.fake.queue_rows[4]["reason"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+
+    def test_new_ambiguous_repository_configuration_prevents_landing(self):
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        self.cfg.radar = {"projects": {
+            "p": {"repo": self.repo, "github": "o/r", "land": "local", "gates": ["true"]},
+            "strict": {"repo": self.repo + "-other", "github": "o/r", "land": "local",
+                       "gates": ["true"], "ci_required": True, "protected": ["main"]}}}
+        out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("ambiguous", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+
+class PrFrozenCiR3Test(_Land):
+    LAND = "pr"
+    GREEN = {"runs": 1, "green": True, "pending": [], "failed": []}
+    RED = {"runs": 1, "green": False, "pending": [], "failed": ["ci"]}
+
+    def test_frozen_ci_is_rechecked_before_pr_merge(self):
+        self.check_follow(True)
+
+    def test_ci_enabled_while_waiting_for_pr_merge_checks_frozen_sha(self):
+        self.check_follow(False)
+
+    def check_follow(self, enabled_before_push):
+        self.queued(4)
+        gh = FakeGh()
+        gh.head = self.tip(4)
+        self.project = dataclasses.replace(self.project, ci_required=enabled_before_push)
+        with mock.patch.object(radar, "commit_ci", return_value=self.GREEN):
+            out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "landing", out)
+        gh.head, gh.ci = out["sha"], "green"
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        with mock.patch.object(radar, "commit_ci", return_value=self.RED) as ci:
+            out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "ejected", out)
+        ci.assert_called_once_with(self.project, self.tip(4))
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+
+class SourceCaseR3Test(unittest.TestCase):
+    def test_github_source_case_has_one_queue_identity(self):
+        with mock.patch.object(merge_queue.plan_git, "_out", side_effect=[
+                "git@github.com:ACME/Product.git", "https://github.com/acme/product"]):
+            self.assertEqual(merge_queue.source_of("/alias"), merge_queue.source_of("/configured"))
+
+
+class OldSourceCaseR3Test(_Land):
+    def test_old_mixed_case_source_is_ranked_by_normalized_project(self):
+        self.queued(4)
+        self.fake.queue_rows[4]["source"] = "github.com/ACME/Product"
+        report = {"branches": [{"work_item": 4}], "against_target": []}
+        with mock.patch.object(merge_queue, "source_of", return_value="github.com/acme/product"):
+            out = merge_queue.run_pass(self.cfg, None, self.project, report)
+        self.assertIn("main", out["targets"], out)
+        self.assertEqual(out["targets"]["main"][0]["lot"], 4)
 
 
 class GeneratedQueueTest(_Land):

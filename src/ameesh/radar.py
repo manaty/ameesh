@@ -732,9 +732,10 @@ CI_PASSING = ("success", "skipped", "neutral")
 
 def commit_ci(project: Project, sha: str, gh=None) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
-    (`gh run list --commit`), the latest run of each workflow database ID: `{runs,
+    (Actions, external app checks and commit statuses), the latest activity
+    of each workflow database ID: `{runs,
     green, pending: [workflows], failed: [workflows]}`; green needs at least
-    one run, all concluded and passing. Raises `plan_github.GithubError`
+    one check, all concluded and passing. Raises `plan_github.GithubError`
     when it cannot be read (never taken for « no CI »)."""
     from datetime import datetime
     from . import plan_github
@@ -744,7 +745,7 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     gh = gh or plan_github.Gh()
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,headSha"]) or []
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha"])
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
     if len(rows) >= 100:
@@ -758,9 +759,11 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
         if type(identity) is not int or identity <= 0:
             raise plan_github.GithubError("gh run list: missing or invalid workflow identity")
         try:
-            at = datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00"))
-            if at.utcoffset() is None:
+            stamps = [datetime.fromisoformat(run[field].replace("Z", "+00:00"))
+                      for field in ("createdAt", "startedAt", "updatedAt")]
+            if any(t.utcoffset() is None for t in stamps):
                 raise ValueError("timestamp lacks timezone")
+            at = max(stamps)
         except (KeyError, AttributeError, TypeError, ValueError) as exc:
             raise plan_github.GithubError("gh run list: missing or invalid run timestamp") from exc
         if identity in times and at == times[identity] and run != latest[identity]:
@@ -774,8 +777,51 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     pending = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") != "completed")
     failed = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") == "completed"
                     and (r.get("conclusion") or "").lower() not in CI_PASSING)
-    return {"runs": len(latest), "green": bool(latest) and not pending and not failed,
-            "pending": pending, "failed": failed}
+    # Actions alone cannot certify a commit: GitHub Apps and classic commit
+    # statuses can also block it. Read the same exact SHA, never the PR head.
+    checks = plan_github._json(gh, ["api", "repos/%s/commits/%s/check-runs?filter=all&per_page=100"
+                                   % (slug, sha)])
+    if (not isinstance(checks, dict) or type(checks.get("total_count")) is not int
+            or not isinstance(checks.get("check_runs"), list)
+            or checks["total_count"] != len(checks["check_runs"])
+            or checks["total_count"] >= 100):
+        raise plan_github.GithubError("commit checks: malformed or truncated response")
+    external = {}
+    for check in checks["check_runs"]:
+        if (not isinstance(check, dict) or check.get("head_sha") != sha
+                or not isinstance(check.get("app"), dict)
+                or type(check["app"].get("id")) is not int
+                or type(check.get("id")) is not int or not check.get("name")):
+            raise plan_github.GithubError("commit checks: invalid identity or frozen SHA")
+        if check["app"].get("slug") == "github-actions":
+            continue  # workflow attempts above account for all their jobs
+        key = (check["app"]["id"], check["name"])
+        if key not in external or check["id"] > external[key]["id"]:
+            external[key] = check
+    for check in external.values():
+        label = "%s/%s" % (check["app"]["id"], check["name"])
+        if check.get("status") != "completed":
+            pending.append(label)
+        elif (check.get("conclusion") or "").lower() not in CI_PASSING:
+            failed.append(label)
+    statuses = plan_github._json(gh, ["api", "repos/%s/commits/%s/status?per_page=100"
+                                     % (slug, sha)])
+    if (not isinstance(statuses, dict) or statuses.get("sha") != sha
+            or type(statuses.get("total_count")) is not int
+            or not isinstance(statuses.get("statuses"), list)
+            or statuses["total_count"] != len(statuses["statuses"])
+            or statuses["total_count"] >= 100):
+        raise plan_github.GithubError("commit statuses: malformed, truncated or wrong SHA response")
+    for status in statuses["statuses"]:
+        if not isinstance(status, dict) or not status.get("context"):
+            raise plan_github.GithubError("commit statuses: invalid context")
+        if status.get("state") == "pending":
+            pending.append(status["context"])
+        elif status.get("state") != "success":
+            failed.append(status["context"])
+    count = len(latest) + len(external) + len(statuses["statuses"])
+    return {"runs": count, "green": bool(count) and not pending and not failed,
+            "pending": sorted(pending), "failed": sorted(failed)}
 
 
 def gates_for(project, files) -> tuple:

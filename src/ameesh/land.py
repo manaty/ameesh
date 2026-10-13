@@ -459,6 +459,15 @@ class _Landing:
                       work.SYSTEM_SENDER)
         return "history"
 
+    def required_ci(self):
+        if getattr(self.project, "ci_required", False):
+            try:
+                merge_queue._required_ci(self.project, self.row["frozen_sha"])
+            except merge_queue.QueueError as exc:
+                return self.eject(str(exc), "Restore green CI on the frozen commit, then "
+                                  "ameesh work queue add %d." % self.lot)
+        return None
+
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
@@ -503,6 +512,11 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
+        try:
+            merge_queue.radar_project(cfg, project.repo)
+        except merge_queue.QueueError as exc:
+            return landing.eject(str(exc), "Resolve the repository landing configuration, "
+                                 "then ameesh work queue add %d." % lot)
         glob = radar.protected_target(project, row["target"])
         if glob:
             # L160g (#473): queued before the target was protected — never
@@ -532,15 +546,6 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     if row["state"] == "landing" and project.land == "pr":
         return _follow_pr(landing, slug, gh=gh, replayer=replayer)
-
-    def required_ci():
-        if project.land == "local" and getattr(project, "ci_required", False):
-            try:
-                merge_queue._required_ci(project, row["frozen_sha"])
-            except merge_queue.QueueError as exc:
-                return landing.eject(str(exc), "Restore green CI on the frozen commit, then "
-                                     "ameesh work queue add %d." % lot)
-        return None
 
     replayer.ensure()
     url = _origin(project) or project.repo
@@ -587,7 +592,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             base).returncode == 0:
         # #194 r4: another executor (an earlier epoch) already pushed it
         return landing.landed({"sha": base, "state": "already", "files": []}, base)
-    refused = required_ci()
+    refused = landing.required_ci()
     if refused is not None:
         return refused
     merged = merge(replayer, base, row, landing.ops.resolutions([lot]),
@@ -609,10 +614,10 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
                              "Its output:\n%s\nFix it on your branch, freeze again, then "
                              "ameesh work queue add %d." % (checked["output"], lot),
                              output=checked["output"])
+    refused = landing.required_ci()
+    if refused is not None:
+        return refused
     if project.land == "local":
-        refused = required_ci()
-        if refused is not None:
-            return refused
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
         # #194 r6: one atomic push, two compare-and-swaps that the server
@@ -770,6 +775,11 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return landing.eject("PR #%s changed right before its merge (base %s, head %s)" % (
             status["number"], now["base"] or "?", (now["head"] or "?")[:12]),
             "Check the PR, freeze again, then ameesh work queue add %d." % lot)
+    refused = landing.required_ci()
+    if refused is not None:
+        return refused
+    if not landing.held():
+        return landing.busy("lease lost before merging PR #%s" % status["number"])
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     # #194 r8: past this call, the PR may be merged: nothing raises any more,
     # and every outcome is read back from GitHub
