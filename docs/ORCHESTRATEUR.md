@@ -92,7 +92,9 @@ un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
   auteur sont écrits au journal du lot ; une raison vide ne force rien (même
   sortie que sans `--force`). L'auteur est l'identité liée de la session :
   un `--actor` ou un `--from` qui en nomme un autre est refusé ; une session
-  sans identité dit qui force (`--actor human:<id>`).
+  sans identité dit qui force, et seulement par une identité humaine
+  explicite (`--actor human:<id>`) : un nom d'agent y est refusé, un agent ne
+  force que depuis sa session liée (bail du runner ou `ameesh mail bind`).
 * Hors de la règle : un lot déjà démarré (réassigner un travail en cours reste
   permis), un humain (`human:…`) ou un agent externe (`--externe`), le lot
   d'une demande de décision (`ameesh decide ask --new-lot`, que son auteur

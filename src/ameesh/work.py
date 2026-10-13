@@ -177,7 +177,10 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
     identité d'agent force en son nom, jamais au nom d'un autre (`--actor` ou
     `--from` différent : refus) ; une identité refusée ne retombe pas sur le
     terminal humain. Une session sans identité (un humain à son terminal)
-    dit qui force (`--actor human:<id>`)."""
+    dit qui force, et seulement par une identité humaine explicite
+    (`--actor human:<id>`) : sans liaison, un nom d'agent est refusé (revue
+    r2, B/P2) — sinon n'importe quelle session signerait un forçage au nom
+    d'un agent."""
     from . import identity
 
     text = (explicit or "").strip()
@@ -193,7 +196,12 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
         return binding.name
     if not text:
         raise WorkError("--force: say who forces (--actor human:<id>)")
-    return text
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "--force refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); an agent forces from its "
+        "own bound session, a human terminal says --actor human:<id>" % text)
 
 
 def add(

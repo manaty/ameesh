@@ -16,9 +16,12 @@ class MailProjectTests(_Base):
             self.agent(name)
 
     def send_new(self, *options):
+        # #540 revue r2 : le forçage exige une session liée ; ce fixture force
+        # au nom d'orch, la session est donc liée à orch.
         return self.cli("send", "dev1", "Build the release.", "--from", "orch",
                         "--new-lot", "Release", "--estimate", "1h", *options,
-                        env=self.env(AMEESH_ALERT_ORCHESTRATORS="orch"))
+                        env=self.env(AGENT_MAIL_NAME="orch",
+                                     AMEESH_ALERT_ORCHESTRATORS="orch"))
 
     def project(self, name, *, team=None, chantier=""):
         self.db.execute("UPDATE agent_registry SET team = %s, chantier = %s WHERE name = %s",

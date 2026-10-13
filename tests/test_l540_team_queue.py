@@ -170,7 +170,7 @@ class ForcageTest(_Base):
                          "dev1", "--estimate", "1h", "--force", "")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("team queue", proc.stderr)
-        env = self.env(AMEESH_ALERT_ORCHESTRATORS="orch")
+        env = self.env(AGENT_MAIL_NAME="orch", AMEESH_ALERT_ORCHESTRATORS="orch")
         proc = self.cli("send", "dev1", "Et celui-ci.", "--from", "orch", "--new-lot", "D",
                         "--estimate", "1h", "--app", "ameesh", "--force", "demande du client",
                         env=env)
@@ -210,6 +210,38 @@ class ForcageTest(_Base):
         with self.assertRaises(work.WorkError):
             work.forcer(self.cfg, self.db, None)
         self.assertEqual(work.forcer(self.cfg, self.db, "human:owner"), "human:owner")
+
+    def test_sans_liaison_un_nom_d_agent_est_refuse_par_les_deux_cli(self):
+        """Revue r2 (B/P2) : une session sans identité liée ne force pas au nom
+        d'un agent ; seul un humain explicite (`human:<id>`) force. Les deux
+        CLI refusent avant d'écrire quoi que ce soit."""
+        self.lot("A", "dev1")
+        lot = self.lot("B", "dev2")
+        events = len(work.events(self.db, lot["id"]))
+        with self.assertRaises(work.WorkError):
+            work.forcer(self.cfg, self.db, "ameesh-dev5")
+        self.assertEqual(work.forcer(self.cfg, self.db, "human:owner"), "human:owner")
+        # work assign/add --force --actor <agent> : refus, lot et journal intacts
+        proc = self.mesh("work", "assign", str(lot["id"]), "dev1", "--force", "urgent",
+                         "--actor", "ameesh-dev5")
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--force refused", proc.stderr)
+        self.assertEqual(self.assignee(lot), "dev2")
+        self.assertEqual(len(work.events(self.db, lot["id"])), events)
+        proc = self.mesh("work", "add", "--title", "C", "--app", "ameesh", "--assignee",
+                         "dev1", "--force", "urgent", "--actor", "ameesh-dev5")
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--force refused", proc.stderr)
+        self.assertEqual(self.db.query("SELECT id FROM work_items WHERE title = 'C'"), [])
+        # agent-mail send --force --from <agent> : refus, ni lot ni message
+        proc = self.cli("send", "dev1", "Prends ce lot.", "--from", "ameesh-dev5",
+                        "--new-lot", "D", "--estimate", "1h", "--app", "ameesh",
+                        "--force", "urgent")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("--force refused", proc.stderr)
+        self.assertEqual(self.db.query("SELECT id FROM work_items WHERE title = 'D'"), [])
+        self.assertEqual(self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = 'dev1'"), [])
 
 
 class ExemptionsTest(_Base):
