@@ -2882,14 +2882,17 @@ class CiResults(Domain):
     @abc.abstractmethod
     def observe_queue(self, repo: str, *, oldest_id: int | None, oldest_at: str | None,
                       queued: int) -> None:
-        """Enregistre la file vue du dépôt : le run `queued` le plus ancien
-        (son `created_at` ; proxy du plus vieux job en file) et le nombre de
-        runs `queued` vus. `queued=0` efface le relevé précédent."""
+        """Enregistre la file vue du dépôt : le plus vieux **job** `queued`
+        (`oldest_id` : identifiant GitHub du job ; `oldest_at` : son
+        `created_at`) et le nombre de jobs `queued` vus, toutes exécutions non
+        conclues. Un run peut être ancien (reprise) ou `in_progress` et porter
+        un job en file : la date du run ne date pas ses jobs. `queued=0` efface
+        le relevé précédent."""
 
     @abc.abstractmethod
     def queued_oldest(self) -> list[dict]:
         """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
-        queued, seen_ts}` (les dépôts sans run `queued` ont `oldest_ts` NULL)."""
+        queued, seen_ts}` (les dépôts sans job `queued` ont `oldest_ts` NULL)."""
 
 
 class Handoffs(Domain):

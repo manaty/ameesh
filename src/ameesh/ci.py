@@ -341,12 +341,14 @@ class Watcher:
     def _guard(self, db, repo: str) -> None:
         """#845 : l'état des runners et de la file, relevé par l'API (sans SSH).
 
-        La file se relève à chaque passage (le plus vieux run encore `queued`
-        et leur nombre). Le rapprochement « runner `busy` sans job
-        `in_progress` à son nom » coûte un appel par exécution non conclue : il
-        est mené au plus toutes les `GUARD_SCAN_S` secondes, et sauté quand le
-        relevé est incomplet (liste tronquée, trop d'exécutions), car une
-        comparaison partielle crierait à tort.
+        La file est l'âge du plus vieux **job** encore `queued`, toutes
+        exécutions non conclues : un run reste `queued` tant qu'un de ses jobs
+        attend, et son `created_at` ne date pas ses jobs (une re-exécution
+        garde la date du run, un run `in_progress` peut encore porter un job en
+        file). La mesure coûte un appel par exécution non conclue — le même que
+        le rapprochement des runners : elle est menée au plus toutes les
+        `GUARD_SCAN_S` secondes, et sautée quand le relevé est incomplet (liste
+        tronquée, trop d'exécutions), car une mesure partielle crierait à tort.
 
         Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
         journalisée et n'empêche ni les échecs, ni les verdicts.
@@ -371,42 +373,49 @@ class Watcher:
                 truncated = True
             for r in runs:
                 not_done.setdefault(int(r["id"]), r)
-        queued = [r for r in not_done.values() if (r.get("status") or "") == "queued"]
-        if queued:
-            oldest = min(queued, key=lambda r: (str(r.get("created_at") or ""), int(r["id"])))
-            st.ci.observe_queue(repo, oldest_id=int(oldest["id"]),
-                                oldest_at=oldest.get("created_at"), queued=len(queued))
-        else:
-            st.ci.observe_queue(repo, oldest_id=None, oldest_at=None, queued=0)
         now = float(self.clock())
         last = self._guard_scans.get(repo)
         if last is not None and now - last < GUARD_SCAN_S:
             return
         self._guard_scans[repo] = now
         if truncated:
-            self.log("CI %s: runner scan skipped (run list truncated)" % repo)
+            self.log("CI %s: guard scan skipped (run list truncated)" % repo)
             return
         if len(not_done) > GUARD_SCAN_MAX_RUNS:
-            self.log("CI %s: runner scan skipped (%d non-completed runs)"
+            self.log("CI %s: guard scan skipped (%d non-completed runs)"
                      % (repo, len(not_done)))
             return
-        data = self.api("repos/%s/actions/runners?per_page=%d" % (repo, GUARD_PER_PAGE)) or {}
-        runners = data.get("runners") or ()
-        if int(data.get("total_count") or 0) > len(runners):
-            self.log("CI %s: runner scan skipped (runner list truncated)" % repo)
-            return
+        # #845 : la file se compte en jobs, pas en runs, et la date qui compte
+        # est celle du job (le run peut être ancien et sa reprise récente, et
+        # un run `in_progress` peut encore porter un job `queued`)
+        queued: list[tuple[str, int]] = []
         holding: dict[str, str] = {}
         for run_id in sorted(not_done):
             jobs_data = self.api("repos/%s/actions/runs/%d/jobs?per_page=%d"
                                  % (repo, run_id, GUARD_PER_PAGE)) or {}
             jobs = jobs_data.get("jobs") or ()
             if int(jobs_data.get("total_count") or 0) > len(jobs):
-                self.log("CI %s: runner scan skipped (jobs of run %d truncated)"
+                self.log("CI %s: guard scan skipped (jobs of run %d truncated)"
                          % (repo, run_id))
                 return
             for job in jobs:
-                if (job.get("status") or "") == "in_progress" and job.get("runner_name"):
+                job_status = (job.get("status") or "")
+                if job_status == "queued":
+                    created = str(job.get("created_at") or job.get("started_at") or "")
+                    queued.append((created, int(job.get("id") or 0)))
+                elif job_status == "in_progress" and job.get("runner_name"):
                     holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))
+        if queued:
+            created, job_id = min(queued, key=lambda q: (q[0], q[1]))
+            st.ci.observe_queue(repo, oldest_id=job_id, oldest_at=created or None,
+                                queued=len(queued))
+        else:
+            st.ci.observe_queue(repo, oldest_id=None, oldest_at=None, queued=0)
+        data = self.api("repos/%s/actions/runners?per_page=%d" % (repo, GUARD_PER_PAGE)) or {}
+        runners = data.get("runners") or ()
+        if int(data.get("total_count") or 0) > len(runners):
+            self.log("CI %s: runner scan skipped (runner list truncated)" % repo)
+            return
         state = []
         for r in runners:
             name = str(r.get("name") or "")

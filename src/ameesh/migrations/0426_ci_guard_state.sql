@@ -6,9 +6,13 @@
 --       `in_progress` qui lui est attribué. L'API ne dit pas depuis quand ; le
 --       relevé (`ci.Watcher`, `ameesh notify`) date le début de l'épisode dans
 --       `ci_runner_state.stuck_since`, remis à NULL dès qu'il finit.
---   (b) `ci_queue_saturated` : l'âge du plus vieux job `queued` du dépôt,
---       au-delà du SLO de file (15 min, canon §9). C'est un signal de
---       capacité (#824), pas une panne — d'où la distinction d'avec (a).
+--   (b) `ci_queue_saturated` : l'âge du plus vieux job `queued` du dépôt
+--       (toutes exécutions non conclues), au-delà du SLO de file (15 min,
+--       canon §9). C'est un signal de capacité (#824), pas une panne — d'où la
+--       distinction d'avec (a). La date est celle du job : un run reste
+--       `queued` tant qu'un de ses jobs attend, une re-exécution garde le
+--       `created_at` de son run, et un run `in_progress` peut encore porter un
+--       job en file.
 --
 -- `ci_queue_starved` (#747) reste l'alerte symétrique : une exécution attend
 -- un runner alors que les runners sont idle. Ici les runners sont occupés (a)
@@ -34,9 +38,10 @@ create index if not exists ci_runner_state_stuck_idx
 
 create table if not exists ci_queue_state (
     repo       text not null primary key,
-    -- plus vieux run `queued` vu (le job le plus ancien de la file)
+    -- identifiant GitHub du plus vieux job `queued` vu, et sa date de création
     oldest_id  bigint,
     oldest_at  timestamptz,
+    -- nombre de jobs `queued` vus, toutes exécutions non conclues
     queued     integer not null default 0,
     seen_at    timestamptz not null default now()
 );
