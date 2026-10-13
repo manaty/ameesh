@@ -76,7 +76,8 @@ class MailTest(PgTestCase):
         ids = [mail.send(self.db, "alpha", "beta", "message %d" % i, host="laptop")
                for i in range(5)]
         with self.db.transaction() as tx:
-            debut = tx.query("select extract(epoch from now())::float8 as t")[0]["t"]
+            debut = tx.query(
+                "select extract(epoch from now())::float8 as at_epoch")[0]["at_epoch"]
             tx.query("select pg_sleep(0.05)")
             self.assertEqual(mail.mark_delivered(tx, ids), len(ids))
             stamps = [row["delivered_ts"] for row in tx.query(
@@ -84,7 +85,7 @@ class MailTest(PgTestCase):
                 " from agent_mailbox where id in (%s) order by id"
                 % ", ".join(str(int(i)) for i in ids))]
             fin = tx.query(
-                "select extract(epoch from clock_timestamp())::float8 as t")[0]["t"]
+                "select extract(epoch from clock_timestamp())::float8 as at_epoch")[0]["at_epoch"]
         self.assertEqual(len(stamps), len(ids))
         # l'instant de chaque message tombe dans la fenêtre de la remise, lue
         # sur la même horloge que les timbres...
