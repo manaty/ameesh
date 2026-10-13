@@ -170,6 +170,26 @@ class BudgetBaseTest(PgTestCase):
             abo.close()
             autre.close()
 
+    def test_notify_immediat_apres_abonnement(self):
+        """#681 : un NOTIFY émis dès le retour de l'abonnement ne doit pas être
+        perdu. Le pilote psql exécute les LISTEN de façon asynchrone :
+        `subscribe` attend donc la sonde qui prouve qu'ils sont actifs."""
+        abo = storage.of(self.db).wakeups.subscribe([CHANNEL_BUDGET])
+        if abo is None:
+            self.skipTest("LISTEN/NOTIFY indisponible avec ce pilote")
+        autre = self.connect()
+        try:
+            storage.of(autre).budgets.put("", 3600, 12.0, actor="human:t")
+        finally:
+            autre.close()
+        try:
+            item = abo.wait(timeout=3.0)
+            self.assertIsNotNone(item, "réveil ameesh_budget perdu (course LISTEN/NOTIFY)")
+            self.assertEqual(item.get("channel"), CHANNEL_BUDGET)
+            self.assertEqual(json.loads(item["payload"])["window_s"], 3600)
+        finally:
+            abo.close()
+
     # -- exécuteur : relecture à chaud -------------------------------------
     def _worker(self, name: str = "b70", plafond: float = 100.0):
         cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=plafond,
