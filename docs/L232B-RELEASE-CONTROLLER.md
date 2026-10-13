@@ -501,6 +501,43 @@ started. Configuration bytes stay in private journals, outside controller result
 These are **file receipts only**, deliberately without the controller's `ok`
 field. The host adapter must still validate syntax, reconcile daemon reloads and
 verify effective units, caps and guard policy before returning a full configure
-or rollback receipt. That adapter and authenticated health/rollback pilot remain
-unfinished. Targeted tests exercise real disposable files with simulated signed
-authority and database gates; no real host configuration or service is changed.
+or rollback receipt; `verification-release.py` (below) now supplies that
+effectiveness half. The concrete factory and the authenticated health/rollback
+pilot remain unfinished. Targeted tests exercise real disposable files with
+simulated signed authority and database gates; no real host configuration or
+service is changed.
+
+## Effective configuration verification
+
+`verification-release.py` completes the host half of configuration recovery. It
+has no CLI and accepts no job-supplied command: the pinned factory supplies a
+protected host card and the system adapter. `HostConfiguration(files, card,
+system)` consumes the same `ConfigurationFiles` journal and release document as
+configuration recovery, so published bytes and their effective systemd view
+share one signed identity.
+
+The card is administrator enrollment: the exact unit set whose effective state
+must hold after any configuration change (`units`), declared systemd properties
+compared byte for byte (`properties`), an optional active guard unit (`guard`)
+and a bounded command deadline (`seconds`, 5 to 120). Every release manifest
+unit must belong to the card; a card property outside those units, an unknown
+property name, an unsafe value, a unit outside the card or an unbounded deadline
+is refused before any system command runs.
+
+For `configure`, every enrolled destination must still carry the exact published
+bytes; for `rollback`, an absent document is the expected restored state.
+Enrolled unit files are checked with the fixed root-owned `systemd-analyze
+verify`, then `systemctl daemon-reload` runs, and authority is rechecked after
+that slow command. Every card unit is read with the fixed `systemctl show`: it
+must be loaded, `NeedDaemonReload` must be `no`, its fragment and every drop-in
+must resolve to a regular root-owned non-linked file that is not group- or
+world-writable, and declared properties must match exactly. A declared guard
+unit must be active. Commands use absolute fixed executables, a scrubbed
+environment, bounded output and a bounded deadline; systemd output never enters
+a receipt or an error.
+
+Receipts are counts and booleans only (`units`, `guard`, `reloaded`,
+`syntax_checked`, `documents_checked`) — deliberately without the controller's
+`ok` field, which the host factory adds once its remaining adapter obligations
+are met. Tests use real disposable files and simulated systemd; no host unit,
+daemon, guard or service is touched.
