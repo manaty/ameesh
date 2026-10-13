@@ -306,7 +306,8 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["tests"], o["urgent"]) for o in out],
                          [(["tests.test_b.T.test_2"], False)])
-        # fin de l'exécution : verdict rouge, ordinaire
+        # fin de l'exécution : verdict rouge, urgent (#795 : la fin de CI
+        # préempte le tour en cours)
         self.api.live = []
         self.api.done[201] = {"status": "completed", "conclusion": "failure"}
         out = self.watcher.tick(self.db)
@@ -315,7 +316,7 @@ class WatcherTest(PgTestCase):
         self.assertEqual(len(mails), 3)
         verdict = mails[-1]
         self.assertIn("red, 2 failure(s)", verdict["body"])
-        self.assertFalse(mail.is_urgent(verdict))
+        self.assertTrue(mail.is_urgent(verdict))
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 201)["status"], "failure")
         # ameesh ci status
         report = ci.status_of(self.db, self.lot["id"])
@@ -331,6 +332,8 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["status"], o["to"]) for o in out], [("success", "dev-a")])
         self.assertIn(": green.", self.mails("dev-a")[0]["body"])
+        # #795 : le verdict vert aussi perce le tour en cours
+        self.assertTrue(mail.is_urgent(self.mails("dev-a")[0]))
 
     def test_annulee_sans_message(self):
         self.api.live = [run_view(203, "e" * 40, "lot/1-un")]

@@ -425,7 +425,11 @@ class Watcher:
                           "branch": row["branch"], "kind": "verdict", "status": status,
                           "failures": len([f for f in failures if not f.get("inherited")]),
                           "inherited": len([f for f in failures if f.get("inherited")])}}
-        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
+        # #795 : la fin de CI est un événement qui perce le tour en cours
+        # (0018 §2) — le verdict (vert ou rouge) part urgent, comme la première
+        # alerte d'échec. L'exécuteur ne le préempte que s'il est vérifiable en
+        # base (`interrupt_allowed` : exécution relevée + lot de l'agent).
+        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=True)
         st.ci.set_message(repo, int(row["run_id"]), "verdict", message_id)
         return [{"action": "verdict", "repo": repo, "run_id": row["run_id"], "status": status,
                  "to": to, "message_id": message_id}]
