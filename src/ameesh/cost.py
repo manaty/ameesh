@@ -1424,10 +1424,11 @@ class CostBook:
         soldes) fait foi ; l'estimation du grand livre ne sert qu'entre deux
         relevés, corrigée par le rapport réel/estimé de son compte.
 
-        Un agent reçoit, de chaque baisse, la part de son estimation dans
-        l'estimation du compte sur l'intervalle ; un intervalle qui porte
-        moins de `balance.GAP_MIN_USD` estimés ne dit pas cette part : son
-        estimation, corrigée par le rapport du compte."""
+        La fenêtre décide d'abord ce que le mesh compte de chaque baisse
+        (L242b, `paid_hour`) ; un agent reçoit, de ce montant, la part de ses
+        estimations dans celles de son compte **dans la fenêtre**. Une baisse
+        sans estimation dans la fenêtre n'est attribuable à personne : la part
+        de l'agent est nulle (le mesh garde, lui, le repli temporel)."""
         ledger = self.spent(agent, seconds, harnesses=paid)
         if self.db is None or not paid:
             return ledger
@@ -1488,25 +1489,32 @@ class CostBook:
                     if high <= start or not drop:
                         continue
                     pair = estimated(mine, low, high)
-                    if agent != "all":
-                        part = estimated(ours, max(low, start), high)
-                        # #513 r2 (P2 des deux relecteurs) : `part <= pair`
-                        # (mêmes lignes, fenêtre incluse), donc
-                        # `drop * part / pair` est borné par `drop` : `pair > 0`
-                        # suffit, `GAP_MIN_USD` n'est pas requis pour la
-                        # stabilité du quotient. Sous le seuil, l'ancien repli
-                        # `part * ratio` ignorait la baisse réelle quand le
-                        # compte entier restait sous le seuil (ratio = 1,0) :
-                        # un agent seul, 0,40 $ estimés pour 0,80 $ de baisse,
-                        # n'en comptait que 0,40 $ et passait sous son plafond.
-                        # `pair == 0` n'attribue rien (`part` l'est aussi).
-                        real_in += drop * part / pair if pair > 0 else part * ratio
-                    elif low >= start:
-                        real_in += drop
+                    # la fenêtre décide d'abord ce que le mesh compte de cette
+                    # baisse (L242b, inchangé) : l'intervalle entier, sinon la
+                    # part de l'estimation du compte, sinon le prorata temporel
+                    if low >= start:
+                        share = drop
                     elif pair >= balance.GAP_MIN_USD:
-                        real_in += drop * estimated(mine, start, high) / pair
+                        share = drop * estimated(mine, start, high) / pair
                     else:
-                        real_in += drop * (high - start) / (high - low)
+                        share = drop * (high - start) / (high - low)
+                    if agent == "all":
+                        real_in += share
+                        continue
+                    # #513 r3 (B/P2 de la relecture) : l'agent reçoit une part
+                    # de ce que le mesh compte DÉJÀ sur la fenêtre, répartie
+                    # comme ses propres estimations dans la fenêtre ; `part <=
+                    # window` (mêmes lignes, filtrées), donc sa part est bornée
+                    # par `share`. #513 r2 : dès qu'il y a une estimation
+                    # (`window > 0`), l'ancien repli `part * ratio` (ratio 1,0
+                    # sous le seuil) laissait l'agent sous son plafond quand le
+                    # compte entier restait sous `GAP_MIN_USD` (0,40 $ estimés
+                    # pour 0,80 $ de baisse). Sans estimation dans la fenêtre,
+                    # rien n'est attribuable (`part` est nul, `part * ratio`
+                    # aussi) : le mesh garde le repli temporel de L242b.
+                    window = estimated(mine, max(low, start), high)
+                    part = estimated(ours, max(low, start), high)
+                    real_in += share * part / window if window > 0 else part * ratio
                 outside = estimated(ours, start, min(first, now)) \
                     + estimated(ours, max(last, start), now)
                 total += real_in + outside * ratio

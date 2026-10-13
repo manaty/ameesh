@@ -207,6 +207,56 @@ class MeasuredCapsTest(_Paye):
                                places=3)
         self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 86400), 0.80, places=3)
 
+    def test_fenetre_partielle_l_agent_ne_depasse_pas_le_mesh(self):
+        # #513 r3 (B/P2 de la relecture du 13/10) : fenêtre glissante qui
+        # commence entre deux relevés. L242b répartit la baisse au temps tant
+        # que l'intervalle porte moins de GAP_MIN_USD estimés ; la part de
+        # l'agent doit être une part de ce que le mesh compte sur la fenêtre,
+        # pas l'estimation entière : mesh 0,40 $ contre 0,80 $ pour l'agent
+        # faisait déclencher seul le plafond de 0,50 $.
+        self.solde(10.0, 10 * HEURE)
+        self.ligne(0.40, 4 * HEURE)
+        self.solde(9.20, 0)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE), 0.40, places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE, "ds"), 0.40,
+                               places=3)
+
+    def test_fenetre_partielle_le_plafond_de_l_agent_suit_le_mesh(self):
+        # même géométrie sur l'heure : relevés à -83 et -10 min, ligne de
+        # 0,40 $ à -50 min, baisse de 0,80 $ ; le mesh garde le prorata
+        # temporel (0,40 $ < 0,50 $ estimés) et l'agent suit.
+        self.solde(10.0, 83 * 60)
+        self.ligne(0.40, 50 * 60)
+        self.solde(9.20, 10 * 60)
+        mesh = 0.80 * 50 / 73
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], HEURE), mesh, places=2)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], HEURE, "ds"), mesh, places=2)
+        self.book.agent_limits = {"ds": {HEURE: 0.60}}
+        self.assertEqual(self.book.over("ds", paid_harnesses=["deepseek"], pace=False), "")
+
+    def test_fenetre_partielle_les_parts_des_agents_somment_au_mesh(self):
+        # deux agents, 0,15 $ dans la fenêtre et 0,05 $ avant : la part de
+        # chacun est une part du montant du mesh (0,15 sur 0,30 dans la
+        # fenêtre), pas la baisse entière répartie sur l'intervalle relevé.
+        self.solde(10.0, 10 * HEURE)
+        self.ligne(0.15, 4 * HEURE)
+        self.ligne(0.05, 8 * HEURE)
+        self.ligne(0.15, 3 * HEURE, agent="autre")
+        self.ligne(0.05, 7 * HEURE, agent="autre")
+        self.solde(9.20, 0)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE), 0.40, places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE, "ds"), 0.20, places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE, "autre"), 0.20,
+                               places=3)
+
+    def test_fenetre_partielle_sans_estimation_le_mesh_garde_le_temps(self):
+        # L242b inchangé : aucune estimation sur l'intervalle, le mesh garde
+        # le prorata temporel ; rien n'est attribuable à un agent.
+        self.solde(10.0, 10 * HEURE)
+        self.solde(9.20, 0)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE), 0.40, places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 5 * HEURE, "ds"), 0.0, places=3)
+
     def test_le_plafond_horaire_decide_sur_le_solde_le_grand_livre_reste_brut(self):
         # 30 $ comptés dans l'heure, 6 $ réels : pas de pause sous 20 $
         self.solde(100.0, 50 * 60)
