@@ -283,7 +283,7 @@ class WorkItems(interface.WorkItems):
         return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor,
-               queued_note=None, forced_note=None) -> dict | None:
+               queued_note=None, forced_note=None, take=False) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
@@ -291,11 +291,13 @@ class WorkItems(interface.WorkItems):
         `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
             behind = None
-            if queued_note is not None and assignee:
+            if (queued_note is not None or take) and assignee:
                 lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
                                " WHERE id = %s FOR UPDATE", (int(item_id),))
                 if lot and lot[0]["fresh"]:
                     behind = WorkItems(tx)._pending(assignee, int(item_id))
+            if behind is not None and take:
+                raise interface.PendingLot(behind)
             if behind is not None:
                 assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                                   else (None, queued_note.format(lot=behind)))

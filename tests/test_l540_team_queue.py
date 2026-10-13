@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import threading
 import time
+from unittest import mock
 
-from ameesh import db as db_mod, estimates, registry, work
+from ameesh import db as db_mod, estimates, registry, storage, work
 from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
+from .test_l119_backlog import HEURE, _Base as _BacklogBase
 
 
 class _Base(PgTestCase):
@@ -160,7 +162,8 @@ class ForcageTest(_Base):
     def test_force_en_cli_et_courrier(self):
         self.lot("A", "dev1")
         lot = self.lot("B", "dev2")
-        proc = self.mesh("work", "assign", str(lot["id"]), "dev1", "--force", "revue urgente")
+        proc = self.mesh("work", "assign", str(lot["id"]), "dev1", "--force", "revue urgente",
+                         env=self.env(AGENT_MAIL_NAME="orch"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.assignee(lot), "dev1")
         proc = self.mesh("work", "add", "--title", "C", "--app", "ameesh", "--assignee",
@@ -178,6 +181,37 @@ class ForcageTest(_Base):
             "SELECT id FROM agent_mailbox WHERE recipient = 'dev1'")), 1)
 
 
+    def test_l_auteur_du_forcage_est_l_identite_de_la_session(self):
+        """Revue r1 (1) : une session liée à dev2 ne force pas au nom d'un
+        autre ; le journal nomme l'identité liée."""
+        self.lot("A", "dev1")
+        lot = self.lot("B", "dev2")
+        as_dev2 = self.env(AGENT_MAIL_NAME="dev2")
+        proc = self.mesh("work", "assign", str(lot["id"]), "dev1", "--force", "urgent",
+                         "--actor", "human:owner", env=as_dev2)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("on behalf of human:owner", proc.stderr)
+        self.assertEqual(self.assignee(lot), "dev2")
+        self.assertFalse(any("forced" in (n or "") for n in self.notes(lot)))
+        proc = self.mesh("work", "assign", str(lot["id"]), "dev1", "--force", "urgent",
+                         env=as_dev2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(any("forced by dev2" in (n or "") for n in self.notes(lot)),
+                        self.notes(lot))
+        # le courrier : --from différent de l'identité liée, rien de déposé
+        proc = self.cli("send", "dev1", "Et celui-ci.", "--from", "orch", "--new-lot", "C",
+                        "--estimate", "1h", "--app", "ameesh", "--force", "urgent",
+                        env=self.env(AGENT_MAIL_NAME="dev2",
+                                     AMEESH_ALERT_ORCHESTRATORS="orch"))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("on behalf of orch", proc.stderr)
+        self.assertEqual(self.db.query("SELECT id FROM work_items WHERE title = 'C'"), [])
+        # sans identité ni --actor : personne à écrire au journal, refus
+        with self.assertRaises(work.WorkError):
+            work.forcer(self.cfg, self.db, None)
+        self.assertEqual(work.forcer(self.cfg, self.db, "human:owner"), "human:owner")
+
+
 class ExemptionsTest(_Base):
     def test_assigne_humain_hors_regle(self):
         self.lot("A", "human:owner")
@@ -191,6 +225,17 @@ class ExemptionsTest(_Base):
         out = decisions.ask(self.cfg, self.db, requester="dev1", question="A ou B ?",
                             options=["a=A", "b=B"], new_lot="Choix")
         self.assertEqual(work.get(self.db, int(out["lot"]))["assignee"], "dev1")
+
+    def test_l_exemption_de_decision_n_est_pas_un_parametre(self):
+        """Revue r1 (2) : `work.add` n'offre aucun contournement ; seul
+        `decisions.ask` garde le lot de sa question au demandeur."""
+        self.lot("A", "dev1")
+        with self.assertRaises(TypeError):
+            work.add(self.db, title="B", app="ameesh", assignee="dev1", actor="orch",
+                     team_queue=False)
+        second = work.add(self.db, title="B", app="ameesh", assignee="dev1", actor="orch",
+                          source="decision")
+        self.assertIsNone(self.assignee(second))
 
 
 class ConcurrenceTest(_Base):
@@ -218,3 +263,60 @@ class ConcurrenceTest(_Base):
             return work.add(conn, title="B", app="ameesh", assignee="dev1", actor="orch")
         finally:
             conn.close()
+
+
+class PriseAutomatiqueTest(_BacklogBase):
+    """Revue r1 (3) : la prise automatique (L119, L165) suit la même règle, sous
+    le même verrou par agent."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent("claude1", team="nexlink")
+
+    def queued(self, title):
+        item = work.add(self.db, title=title, app="nexlink")
+        self.db.execute("UPDATE work_items SET created_at = created_at - make_interval("
+                        "secs => %s) WHERE id = %s", (HEURE, item["id"]))
+        return item
+
+    def test_course_avec_une_attribution(self):
+        """claude1, choisi au repos, reçoit un lot non démarré entre sa
+        sélection et l'écriture : la prise n'en ajoute pas un second."""
+        lot = self.queued("B")
+        check = work.check_assignee
+        pending = {}
+
+        def concurrent_add(db, name, **kw):
+            if name == "claude1" and not pending:
+                pending["lot"] = None
+                other = db_mod.connect(self.cfg)
+                try:
+                    pending["lot"] = work.add(other, title="A", app="nexlink",
+                                              assignee="claude1", actor="orch")
+                finally:
+                    other.close()
+            return check(db, name, **kw)
+
+        with mock.patch.object(work, "check_assignee", side_effect=concurrent_add):
+            out = self.take(orchestras=[])
+        self.assertEqual(pending["lot"]["assignee"], "claude1")
+        self.assertEqual(out, [])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM work_items WHERE assignee = 'claude1'"), [{"n": 1}])
+
+    def test_ecriture_refusee_sous_le_verrou(self):
+        st = storage.of(self.db)
+        first = work.add(self.db, title="A", app="nexlink", assignee="claude1", actor="orch")
+        lot = self.queued("B")
+        events = len(work.events(self.db, lot["id"]))
+        with self.assertRaises(storage.PendingLot) as raised:
+            st.work.assign(int(lot["id"]), "claude1", current=None, note="prise", actor="x",
+                           take=True)
+        self.assertEqual(raised.exception.lot, int(first["id"]))
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(len(work.events(self.db, lot["id"])), events)
+        estimates.mark_started(self.db, "claude1", [first["id"]])
+        done = st.work.assign(int(lot["id"]), "claude1", current=None, note="prise",
+                              actor="x", take=True)
+        self.assertEqual(done["assignee"], "claude1")

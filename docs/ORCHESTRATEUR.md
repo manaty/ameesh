@@ -73,8 +73,10 @@ assigné, sans début mesuré (aucun tour de son assigné dessus, jamais passé 
 un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
 `intake`), où un agent au repos de l'équipe le prendra (L165 ci-dessus).
 
-* Concerne `ameesh work add --assignee`, `ameesh work assign`, et `--lot` ou
-  `--new-lot` d'`agent-mail send`. Le contrôle et l'écriture se font dans la
+* Concerne `ameesh work add --assignee`, `ameesh work assign`, `--lot` ou
+  `--new-lot` d'`agent-mail send`, et la prise automatique (L119, L165) : un
+  agent choisi au repos qui a reçu un lot non démarré entre-temps ne prend
+  rien, le lot reste en file pour le suivant. Le contrôle et l'écriture se font dans la
   même transaction, sous un verrou par agent : deux attributions simultanées
   ne donnent pas deux lots non démarrés au même agent.
 * `work add` et `work assign` réussissent, avec l'avertissement « lot #N put
@@ -88,11 +90,14 @@ un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
 * Forcer, pour tout appelant : `--force "<raison>"` (sur `work add`, `work
   assign` et `agent-mail send`) donne le lot malgré tout. La raison et son
   auteur sont écrits au journal du lot ; une raison vide ne force rien (même
-  sortie que sans `--force`).
+  sortie que sans `--force`). L'auteur est l'identité liée de la session :
+  un `--actor` ou un `--from` qui en nomme un autre est refusé ; une session
+  sans identité dit qui force (`--actor human:<id>`).
 * Hors de la règle : un lot déjà démarré (réassigner un travail en cours reste
   permis), un humain (`human:…`) ou un agent externe (`--externe`), le lot
   d'une demande de décision (`ameesh decide ask --new-lot`, que son auteur
-  attend), la délégation à échéance (L40) et son retour, la reprise sur pause
+  attend ; seul ce chemin en dispose, ce n'est pas un paramètre de
+  `work.add`), la délégation à échéance (L40) et son retour, la reprise sur pause
   budget (L233b, dont le preneur n'a déjà aucun lot).
 
 ## Toute demande d'un humain devient un lot (L130)

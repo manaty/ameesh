@@ -437,13 +437,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
-        from . import assignments, plan_git
+        from . import assignments, plan_git, work
         try:
+            if (force or "").strip():
+                # #540 : l'auteur du forçage est l'identité de la session
+                sender = work.forcer(cfg, bk.db, sender)
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
                 estimate=estimate, app=app, new_project=new_project, force=force)
-        except assignments.AssignmentError as exc:
+        except (assignments.AssignmentError, work.WorkError) as exc:
             print("message not dropped — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]

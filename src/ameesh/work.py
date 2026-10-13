@@ -171,6 +171,31 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
     raise WorkError(refus % text)
 
 
+def forcer(cfg, db, explicit: str | None = None) -> str:
+    """#540 : l'auteur d'un `--force "<raison>"`, écrit au journal du lot ;
+    WorkError si la session ne peut pas le prouver. Une session qui porte une
+    identité d'agent force en son nom, jamais au nom d'un autre (`--actor` ou
+    `--from` différent : refus) ; une identité refusée ne retombe pas sur le
+    terminal humain. Une session sans identité (un humain à son terminal)
+    dit qui force (`--actor human:<id>`)."""
+    from . import identity
+
+    text = (explicit or "").strip()
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("--force refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("--force refused: this session belongs to %s, it does not "
+                            "force on behalf of %s" % (binding.name, text))
+        return binding.name
+    if not text:
+        raise WorkError("--force: say who forces (--actor human:<id>)")
+    return text
+
+
 def add(
     db: Db,
     *,
@@ -194,7 +219,6 @@ def add(
     estimate_source: str | None = None,
     size: str | None = None,
     note: str = "",
-    team_queue: bool = True,
     force: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
@@ -215,10 +239,33 @@ def add(
     with --new-project).
 
     #540 : un agent qui a déjà un lot non démarré ne reçoit pas celui-ci : il
-    va dans la file d'équipe (`queued_behind`, `queue_warning`) ; sauf
-    `team_queue=False` (le lot d'une demande de décision, que son auteur
-    attend). `force` : la raison d'un forçage (`--force "<raison>"`), écrite
-    au journal avec son auteur ; vide, aucun forçage."""
+    va dans la file d'équipe (`queued_behind`, `queue_warning`). `force` : la
+    raison d'un forçage (`--force "<raison>"`), écrite au journal avec son
+    auteur ; vide, aucun forçage. L'exemption du lot d'une demande de
+    décision n'est pas un paramètre : `_decision_lot`, interne, réservé à
+    `decisions.ask`."""
+    return _create(db, title=title, type=type, source=source, app=app, body=body,
+                   issue_ref=issue_ref, workstream=workstream, assignee=assignee,
+                   budget_usd=budget_usd, actor=actor, package=package, externe=externe,
+                   cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
+                   estimate=estimate, estimate_source=estimate_source, size=size,
+                   note=note, force=force, team_queue=True)
+
+
+def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
+    """#540 : le lot de la question de `requester` (`decisions.ask`), à son
+    nom même s'il a déjà un lot non démarré : il attend la réponse, ce lot
+    ne va jamais dans la file d'équipe. Seul appelant : `decisions.ask`."""
+    return _create(db, title=title, assignee=requester, actor=requester,
+                   source="decision", app=app, cfg=cfg, team_queue=False)
+
+
+def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
+            body="", issue_ref=None, workstream=None, assignee=None, budget_usd=None,
+            actor="", package=None, externe=False, cfg=None, branch=None,
+            branch_target=None, priority=None, estimate=None, estimate_source=None,
+            size=None, note="", force=None, team_queue: bool) -> dict:
+    """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -630,11 +677,17 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     return out
 
 
+def takes_rule(check: dict) -> bool:
+    """#540 : l'assigné normalisé par `check_assignee` est soumis à la règle
+    « au plus un lot non démarré » (ni humain ni agent externe)."""
+    return not (check["externe"] or check["assignee"].startswith(HUMAN_PREFIX))
+
+
 def _queued_note(check: dict, head: str) -> str | None:
     """#540 : la note du journal d'un lot mis dans la file d'équipe faute de
     place chez l'agent (`{lot}` : son lot déjà en attente) ; None pour un
     humain ou un agent externe, hors de la règle."""
-    if check["externe"] or check["assignee"].startswith(HUMAN_PREFIX):
+    if not takes_rule(check):
         return None
     return "%s; team queue (#540): %s already has lot #{lot} not started" % (
         _braces(head), check["assignee"])

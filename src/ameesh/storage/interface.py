@@ -961,6 +961,15 @@ class Nonces(Domain):
 # lots (`work_items`, `work_item_events`)
 # --------------------------------------------------------------------------
 
+class PendingLot(RuntimeError):
+    """#540 : `assign(…, take=True)` refusé : l'agent a déjà le lot non
+    démarré `lot` (lu sous son verrou) ; rien n'est écrit."""
+
+    def __init__(self, lot: int):
+        super().__init__("lot #%d not started" % lot)
+        self.lot = lot
+
+
 class ReservationContention(RuntimeError):
     """L122, #478 : le budget de réessais d'une réservation automatique est
     épuisé — le prochain numéro libre n'a pas pu être réservé à temps sous la
@@ -1217,13 +1226,15 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
                actor: str, queued_note: str | None = None,
-               forced_note: str | None = None) -> dict | None:
+               forced_note: str | None = None, take: bool = False) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`). #540 : avec
         `queued_note`, un lot non démarré ne va pas à un `assignee` qui a déjà
         un autre lot ouvert non démarré : il passe dans la file d'équipe
-        (sans assigné), comme `add` (`forced_note` de même)."""
+        (sans assigné), comme `add` (`forced_note` de même). `take=True` (la
+        prise automatique, `backlog.auto_take`) : même contrôle sous le même
+        verrou, mais le lot reste où il est et `PendingLot` est levée."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
