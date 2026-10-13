@@ -2295,8 +2295,10 @@ class Operations(Domain):
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee. Les plus anciennement actifs d'abord. `limit=None` lit
-        toute la vérité avant le filtrage des attentes planifiées (L368)."""
+        assignee, `lot_team` (équipe du lot : la sienne, sinon celle de son
+        paquet ou du parent, sinon son `app`). Les plus anciennement actifs
+        d'abord. `limit=None` lit toute la vérité avant le filtrage des
+        attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
