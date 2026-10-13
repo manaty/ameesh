@@ -303,12 +303,33 @@ class GitHub:
         GitHub laisse le `details_url` par défaut `…/runs/<id_du_check>` sur
         les checks publiés par un jeton d'exécution : il ne nomme alors pas
         l'exécution, mais le `check_suite` du check la retrouve exactement."""
-        return self.read("actions/runs?check_suite_id=%d&per_page=100" % suite
-                         ).get("workflow_runs") or []
+        return self._listed("actions/runs?check_suite_id=%d" % suite,
+                            "workflow_runs", maximum=1000)
+
+    def _listed(self, path: str, key: str, *, maximum: int | None = None) -> list[dict]:
+        """Une liste complète et stable, sinon une erreur (pas une liste vide)."""
+        items, page, total = [], 1, None
+        separator = "&" if "?" in path else "?"
+        while True:
+            response = self.read("%s%sper_page=100&page=%d" % (path, separator, page))
+            page_items = response.get(key)
+            count = response.get("total_count")
+            if (not isinstance(page_items, list) or type(count) is not int
+                    or count < 0 or (maximum is not None and count > maximum)
+                    or (total is not None and count != total)
+                    or any(not isinstance(item, dict) for item in page_items)):
+                raise ValueError("liste %s incomplète" % key)
+            total = count
+            items.extend(page_items)
+            if len(items) == total:
+                return items
+            if not page_items or len(items) > total:
+                raise ValueError("page de %s manquante" % key)
+            page += 1
 
     def jobs(self, execution: int) -> list[dict]:
         """Les jobs d'une exécution : leur état terminal fait foi (#856)."""
-        return self.read("actions/runs/%d/jobs?per_page=100" % execution).get("jobs") or []
+        return self._listed("actions/runs/%d/jobs" % execution, "jobs")
 
     def create(self, nom: str, output: dict) -> int:
         corps = {"name": nom, "head_sha": self.tete, "status": "in_progress", "output": output}
@@ -488,13 +509,19 @@ def _proved_terminal(check: dict, executions: list[int], gh: GitHub,
                      etats: dict[int, tuple[dict, list[dict]] | None]) -> bool:
     """Le publisher est-il mort dans *toutes* les exécutions candidates ? (#856)
 
-    Vrai si chaque exécution est terminale et que le job homonyme y est terminal
-    (ou absent, l'exécution terminale faisant foi). Une lecture en erreur rend
-    faux : on ne conclut jamais sans preuve."""
+    Le job homonyme doit être terminal dans chaque candidate, même si d'autres
+    jobs de l'exécution tournent encore. Si ce job est absent d'une liste lue
+    complètement, seule une exécution terminale fait foi. Une réponse illisible
+    ou une liste incomplète ne permet jamais de conclure."""
     for execution in executions:
         if execution not in etats:
             try:
-                etats[execution] = (gh.run(execution), gh.jobs(execution))
+                run, jobs = gh.run(execution), gh.jobs(execution)
+                if (not isinstance(run, dict) or not isinstance(run.get("status"), str)
+                        or not run["status"] or not isinstance(jobs, list)
+                        or any(not isinstance(job, dict) for job in jobs)):
+                    raise ValueError("réponse d'exécution ou de jobs illisible")
+                etats[execution] = (run, jobs)
             except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
                 print("ci-flow : exécution %d illisible (%s)" % (execution, exc),
                       file=sys.stderr)
