@@ -43,8 +43,9 @@ import time
 from collections import deque
 from decimal import Decimal
 from typing import Any, Iterable, Sequence, Union
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
+from . import dsn as dsn_mod
 from .config import Config, mask_dsn
 
 #: sonde de connexion ET de schéma (L61) : une seule requête pour les deux
@@ -398,23 +399,8 @@ def _batch_item(item) -> tuple[str, Sequence[Any]]:
 # DSN
 # --------------------------------------------------------------------------
 
-def split_password(dsn: str) -> tuple[str, str]:
-    """(mot de passe, DSN sans mot de passe) — le secret ne traîne pas en argv."""
-    if "://" in dsn:
-        parts = urlsplit(dsn)
-        password = ""
-        if parts.netloc and "@" in parts.netloc:
-            creds, host = parts.netloc.rsplit("@", 1)
-            user, _, pwd = creds.partition(":")
-            password = unquote(pwd)
-            netloc = "%s@%s" % (quote(user), host)
-            dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    else:
-        match = re.search(r"(?:^|\s)password=(\S+)", dsn)
-        password = match.group(1).strip("'\"") if match else ""
-        if match:
-            dsn = (dsn[: match.start()] + " " + dsn[match.end():]).strip()
-    return password, dsn
+# #518: libpq's own parsing, in ameesh.dsn (also run by deploy/mise-a-jour/poste.sh)
+split_password = dsn_mod.split_password
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +424,10 @@ class PsqlDriver:
             cfg.statement_timeout_ms / 1000.0 + 5.0
             if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0 else None
         )
-        self.password, base = split_password(cfg.dsn)
+        try:
+            self.password, base = split_password(cfg.dsn)
+        except dsn_mod.DsnError as exc:   # #518: libpq would refuse it too
+            raise Unavailable("psql: invalid DSN: %s" % exc) from None
         self.env = os.environ.copy()
         self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
         #: psql traduit les libellés des champs de son rapport d'erreur
