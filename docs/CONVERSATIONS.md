@@ -109,10 +109,76 @@ contains the same agent/sequence/turn for auditing. The full thread copy
 is bounded at 100,000 characters; truncation is explicit.
 
 Detail defaults to 90 days (0033 §9). `Log.prune(days=90)` removes older
-entries, retaining any undelivered R12 copy and the sequence head. Recorder
-startup drains pending copies then prunes its agent's detail. A deployment
-can call the same API periodically for dormant agents or choose a longer
-canon retention. This lot does not prune shared, append-only R12 files.
-The transport currently retains them indefinitely;
-automatic one-year thread expiry from 0033 is not implemented by this
-detail-store change. L79 supplies the terminal client and L83 the web input.
+entries, retaining the sequence head and any undelivered R12 copy younger
+than thread retention. Recorder startup prunes its agent's detail, then
+drains pending copies. A deployment can call the same API periodically for
+dormant agents or choose a longer canon retention.
+
+### Thread expiry (L361)
+
+Shared threads keep **one year** of entries by default (0033 §9):
+`thread_retention_days` in the host configuration, or
+`AMEESH_THREAD_RETENTION_DAYS`; `0` keeps them forever.
+
+* **Who**: the runner's housekeeping pass (`AMEESH_HOUSEKEEPING_INTERVAL`)
+  expires this host's thread files at most once a day and logs each thread
+  it shortens. `ameesh fil expire [--days N] [--dry-run]` does the same by
+  hand.
+* **What**: the oldest run of entries dated before the cut-off. The scan
+  stops at the first newer entry, the first entry without a readable date,
+  and the first text that is not a complete ameesh entry (a heading it does
+  not recognise, a hand-written note): text that cannot be dated is never
+  removed, nor anything after it. The file stays in append order; an R12
+  copy delivered late with an old date leaves with its neighbours.
+  Everything after the cut is kept byte for byte, including a torn last
+  entry. A thread whose header holds such text does not expire at all;
+  `fil expire` and the runner's log say so.
+* **How**: under the thread's exclusive lock, the kept part is written to a
+  new file in the same directory, under an unpredictable name created
+  exclusively (never through a link; leftovers of an interrupted expiry are
+  only unlinked), synced, then renamed over the thread: a crash leaves the
+  old file or the new one. A writer or reader that locked the replaced file
+  notices it no longer carries the thread's name and reopens: no append is
+  lost.
+* **Ids**: entry ids (`<project>/<lot>#<offset>`) are logical offsets and do
+  not change. The header holds the shift between logical and physical
+  offsets, so `fil tail` cursors, `thread_index.last_entry_id`, mailbox
+  traces and `conversation_log.thread_entry` keep pointing at the same
+  entry. A cursor on an expired entry reads from the oldest kept one.
+* **Audit**: the header says, in plain text and in an `ameesh` comment,
+  the cut-off date, the date of the last expiry and how many entries have
+  been removed in total.
+* **Index**: expiry takes the thread's `thread_index` row lock before the
+  file lock, the order the R12 drain already uses, and indexing takes the
+  same row lock. The index then holds the number of entries kept and the
+  most recent one; an emptied thread quotes no entry. An entry expired
+  between its write and its indexing is neither counted nor quoted. The
+  recount records, in the same transaction, the thread's logical end
+  (`thread_index.counted_until`, migration 0395): an entry before it is
+  already counted and indexing it later does not count it twice. The file is
+  not proof of a recount: after an expiry without a database (`fil expire`
+  without one), or whose recount did not commit (failure, crash after the
+  rename), the index is behind the file's last expiry, and the next indexing
+  or expiry of that thread first recounts it from the file as it is.
+  Between two entries with the same timestamp, the later one is the most
+  recent.
+* **Mediated executor host** (L109): no transaction or lock holds from one
+  remote request to the next, so the executor contract admits neither
+  `threads.lock` nor `threads.expired`. Indexing there works as before
+  L361 (no lock, no recount, every entry counted: `threads.index` with
+  `count` left at its default, true). Such a host does not expire its
+  threads yet, whether its connection to the server works or not
+  (`backend: mediated` is enough, and so is `host_mediated`, whose threads
+  stay local whatever its backend): `fil expire` answers with an error and
+  changes nothing; `--dry-run` lists the entries past retention, says that
+  expiry is not available and fails too. The runner, which has no local
+  housekeeping there, logs it at start and then once a day (a day of the
+  monotonic clock; an error of the notice is logged, the next one still
+  comes).
+  The server-side operation that does lock, recount and expiry in a single
+  transaction is the follow-up of #421.
+* **R12 outbox**: an undelivered copy older than thread retention is
+  deleted by `Log.prune` (its thread entry would expire on arrival);
+  younger ones still wait for delivery, past detail retention.
+
+L79 supplies the terminal client and L83 the web input.

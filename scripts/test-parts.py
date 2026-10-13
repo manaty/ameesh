@@ -126,7 +126,12 @@ def map_durations(chemin: str | os.PathLike) -> dict:
         return {}
     table: dict = {}
     for module, infos in carte.get("modules", {}).items():
-        for pilote, duree in infos.get("durees", {}).items():
+        # L148 stage 6 : la carte porte `durations` (anglais) et l'ancienne
+        # `durees` pendant une release ; l'anglaise est lue en premier.
+        durees = infos.get("durations")
+        if durees is None:
+            durees = infos.get("durees", {})
+        for pilote, duree in durees.items():
             table.setdefault(pilote, {})[module] = duree
     return table
 
@@ -325,7 +330,7 @@ class _Result(unittest.TextTestResult):
     Avec un flux (L161b), une ligne par test à sa fin."""
 
     durations: collections.Counter
-    flux: Flow | None = None
+    flow: Flow | None = None
     classes: dict = {}
     measure = None  # L161e : _Mesure de la part, ou None
     #: L161f: P0 and P1 modules of the part, for the provisional green
@@ -344,10 +349,10 @@ class _Result(unittest.TextTestResult):
 
     def _report_impacted(self) -> None:
         """L161f: one `impacted` event, once no P0 or P1 module is left."""
-        if self._impactes_dit or self.flux is None or self.impactes is None:
+        if self._impactes_dit or self.flow is None or self.impactes is None:
             return
         self._impactes_dit = True
-        self.flux.write("impacted", statut="rouge" if self._impactes_rouges else "vert",
+        self.flow.write("impacted", statut="rouge" if self._impactes_rouges else "vert",
                          modules=list(self.impactes), rouges=sorted(self._impactes_rouges))
 
     def stopTestRun(self):
@@ -407,7 +412,7 @@ class _Result(unittest.TextTestResult):
 
     def _emit(self, test, statut: str, duree: float, extrait: str) -> None:
         self.comptes[statut] += 1
-        if self.flux is None:
+        if self.flow is None:
             return
         module = _module_of(test)
         if statut in ("echec", "erreur") and module in (self.impactes or ()):
@@ -420,7 +425,7 @@ class _Result(unittest.TextTestResult):
             ligne["extrait"] = extrait
         if statut in ("echec", "erreur") and not nom.startswith(("setUp", "tearDown")):
             ligne["rejouer"] = f"python -m unittest {nom}"
-        self.flux.write("test", **ligne)
+        self.flow.write("test", **ligne)
 
     def stopTest(self, test):
         super().stopTest(test)
@@ -495,12 +500,12 @@ def _load(part: list[str], measure: _Measure | None) -> unittest.TestSuite:
     return chargeur.suiteClass(suites)
 
 
-def _result_class(flux: Flow | None, classes: dict, measure: _Measure | None,
+def _result_class(flow: Flow | None, classes: dict, measure: _Measure | None,
                   impactes: tuple | None) -> type:
     """La classe de résultat de la part : chaque clé porte le nom de
-    l'attribut que lit `_Result` (`measure`, `flux`, `classes`, `impactes`)."""
+    l'attribut que lit `_Result` (`measure`, `flow`, `classes`, `impactes`)."""
     return type("_ResultatPart", (_Result,),
-                {"flux": flux, "classes": classes, "measure": measure,
+                {"flow": flow, "classes": classes, "measure": measure,
                  "impactes": impactes})
 
 
@@ -538,9 +543,9 @@ def run(args) -> int:
         print(f"  d'abord, touchés par les {len(changes)} fichier(s) changé(s) depuis "
               f"{args.since} : {', '.join(touches) or 'aucun'}", flush=True)
     etiquette = args.label or f"{args.driver} {args.part}/{args.parts}"
-    flux = Flow(args.flow, ci_context(etiquette)) if args.flow else None
-    if flux:
-        flux.write("debut", pilote=args.driver, modules=part,
+    flow = Flow(args.flow, ci_context(etiquette)) if args.flow else None
+    if flow:
+        flow.write("debut", pilote=args.driver, modules=part,
                     classes={m: classes.get(m, ("P3", ""))[0] for m in part},
                     estimee_s=round(estimee, 1))
     os.chdir(REPO)
@@ -549,7 +554,7 @@ def run(args) -> int:
     suite = _load(part, measure)
     impactes = None if entree is None else tuple(
         m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1"))
-    resultat_cls = _result_class(flux, classes, measure, impactes)
+    resultat_cls = _result_class(flow, classes, measure, impactes)
     runner = unittest.TextTestRunner(verbosity=2, resultclass=resultat_cls)
     debut, resultat = time.monotonic(), None
     try:
@@ -557,15 +562,15 @@ def run(args) -> int:
     finally:
         if measure is not None:
             measure.stop()
-        if flux:
+        if flow:
             if resultat is None:  # interrompu (SIGINT, délai du job)
                 statut, comptes = "interrompu", {}
             else:
                 statut = "succes" if resultat.wasSuccessful() else "echec"
                 comptes = dict(resultat.comptes)
-            flux.write("fin", statut=statut, comptes=comptes,
+            flow.write("fin", statut=statut, comptes=comptes,
                         duree_s=round(time.monotonic() - debut, 1))
-            flux.close()
+            flow.close()
     durations = {m: round(t, 1) for m, t in sorted(resultat.durations.items())}
     if args.output_durations:
         pathlib.Path(args.output_durations).write_text(

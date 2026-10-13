@@ -87,8 +87,14 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
         print("interactive    : %s" % (" ".join(descriptor.interactive) or "—"))
         rule = descriptor.interactive_permission
         if rule:
+            delivery = " ".join(rule["flag"])
+            if rule.get("modes"):
+                # L685: the mode selects a fixed argument list (no `{mode}`)
+                mapped = "; ".join("%s → %s" % (mode, " ".join(args))
+                                   for mode, args in rule["modes"])
+                delivery = "%s; %s" % (delivery, mapped) if delivery else "modes: %s" % mapped
             print("permission     : %s (default %s%s%s)" % (
-                " ".join(rule["flag"]), rule["default"] or "—",
+                delivery or "—", rule["default"] or "—",
                 ", env: %s" % ", ".join(rule["env"]) if rule["env"] else "",
                 ", fallback: %s" % rule["fallback"] if rule["fallback"] else ""))
             if rule.get("choices"):

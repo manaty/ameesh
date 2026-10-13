@@ -218,6 +218,12 @@ class Agents(Domain):
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
 
     @abc.abstractmethod
+    def note_unleased(self, name: str, host: str, error: str) -> bool:
+        """Native runner's lease_not_taken diagnostic, only on its host and
+        without a live lease, after taking the row lock. Keeps agent status.
+        Cleared by a successful claim; refused to mediated executors."""
+
+    @abc.abstractmethod
     def mark_event_wake(self, name: str) -> None:
         """Note l'instant du dernier réveil d'événements."""
 
@@ -286,7 +292,9 @@ class Leases(Domain):
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
                      require_responsible: bool) -> dict | None:
-        """Prend le bail pour une session interactive (`ameesh attach`)."""
+        """Prend le bail pour une session interactive (`ameesh attach`) ; la
+        ligne rendue porte `harness` et `created_ts` (L719), l'identité de
+        l'enregistrement revendiqué."""
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
@@ -864,7 +872,8 @@ class Wakeups(Domain):
 # --------------------------------------------------------------------------
 
 class Keys(Domain):
-    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`)."""
+    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`) et
+    des humains (`key_holders`, #330), lues ensemble dans la vue `mesh_keys`."""
 
     @abc.abstractmethod
     def info(self, agent: str) -> dict | None:
@@ -876,13 +885,40 @@ class Keys(Domain):
         """Enregistre la clé publique (base64) ; faux si l'agent est inconnu."""
 
     @abc.abstractmethod
+    def register_human(self, name: str, human: str, public_key: str, fingerprint: str,
+                       role: str, *, replace: bool = False) -> str:
+        """Enregistre la clé d'un humain sous `name`, hors du registre des
+        agents (`key_holders`, #330) : `created` ; `exists` si le détenteur
+        existe déjà (sans `replace`) ; `agent` si un agent porte ce nom.
+        `replace` (geste du propriétaire, #326 r1) remplace la clé, même
+        révoquée : `replaced` ; la base le refuse hors du rôle propriétaire.
+        Les règles sont celles de la base (0364) : une erreur de la base
+        remonte telle quelle. La ligne de contournement du 12/10 (`smichea`)
+        quitte le registre."""
+
+    @abc.abstractmethod
     def revoke(self, agent: str) -> bool:
         """Révoque la clé active ; faux s'il n'y en avait pas."""
 
     @abc.abstractmethod
+    def owner_registrations(self, since: float) -> list[dict]:
+        """Clés owner enregistrées ou remplacées (#326 r2-r3), lues dans le
+        journal `key_events`, qu'aucune révocation n'efface : par le geste du
+        propriétaire, depuis `since` ; sans ce geste, tant que le propriétaire
+        ne les a pas confirmées (`confirm`). id, name, holder, event,
+        fingerprint, db_user, owner_gesture, at_ts."""
+
+    @abc.abstractmethod
+    def confirm(self, name: str) -> int:
+        """Le propriétaire confirme les enregistrements de la clé de `name`
+        (#326 r3) : un événement `confirmed`, que la base refuse hors de son
+        geste (rôle propriétaire) ; rend son id, 0 sans clé de ce nom."""
+
+    @abc.abstractmethod
     def registered(self) -> list[dict]:
-        """Agents qui ont une clé publique (révoquée comprise), par nom :
-        name, public_key_fingerprint, key_role, key_updated_ts, key_revoked_ts."""
+        """Détenteurs d'une clé publique (révoquée comprise), par nom : name,
+        holder (`human` ou `agent`), public_key_fingerprint, key_role,
+        key_updated_ts, key_revoked_ts."""
 
 
 class Approvals(Domain):
@@ -965,13 +1001,22 @@ class WorkItems(Domain):
             package_id: str | None = None, package_parent: str | None = None,
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
-            estimate_source: str | None = None, change_size: str | None = None) -> dict:
+            estimate_source: str | None = None, change_size: str | None = None,
+            mark_item_id: int | None = None, mark_note: str = "") -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
         si `change_size`, L157b) et sa première ligne de journal ; rend le
-        lot."""
+        lot.
+
+        `mark_note`, si non vide, est écrit au journal de `mark_item_id` dans
+        la **même** transaction (L539 : la marque d'idempotence du lot de
+        relecture ne peut pas survivre seule à l'échec de l'autre écriture) ;
+        `{lot}` y est remplacé par l'identifiant du lot créé. La ligne
+        `mark_item_id` est verrouillée avant l'insertion et `issue_ref` y est
+        relue sous ce verrou : deux créations concurrentes de la même
+        référence ne peuvent pas aboutir toutes les deux (revue #544 r2)."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1069,7 +1114,7 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str, source: str = "") -> dict | None:
+                  actor: str, source: str = "", frozen_id: int | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1079,15 +1124,37 @@ class WorkItems(Domain):
     def queue_update(self, item_id: int, *, state: str | None = None,
                      rank: int | None = None, reason: str | None = None,
                      landing_sha: str | None = None, note: str = "",
-                     actor: str = "", clear_rank: bool = False) -> dict | None:
+                     actor: str = "", clear_rank: bool = False,
+                     lease: tuple | None = None,
+                     freeze: tuple | None = None, entry: tuple | None = None) -> dict | None:
         """L160e (0058): changes the state, rank, reason or landing commit of
         a queued lot (`queued` and `ejected` clear the landing commit;
         `ejected` or `clear_rank` clear the rank); a journal line when
-        `note` is given. None if the lot is not queued."""
+        `note` is given. None if the lot is not queued. `lease` (#194 r5):
+        `(target key, owner, epoch)` — the write happens only while that
+        lease holds (`merge_locks`, not expired), in the same statement.
+        `freeze` (#194 r8): `(frozen_sha, landing_sha)` — the write happens
+        only while the lot is still `landing` on that freeze and that
+        landing commit (a merge that happened, recorded without its lease).
+        `entry` (#517): `(generation, target, frozen_id, frozen_sha)` compares
+        the admission identity and current latest freeze, with or without a
+        lease. Freeze insertion and this comparison share the lot row lock."""
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
         """L160e (0058): takes the lot out of the queue, with a journal line."""
+
+    @abc.abstractmethod
+    def land_lock(self, key: str, owner: str, ttl_s: float, *,
+                  epoch: int | None = None) -> int | None:
+        """L160e2 (0058): takes (or, with its `epoch`, renews) the merge lease
+        of `key` (project and target) for `owner`; returns its epoch, None if
+        another owner holds a lease that has not expired. Its own owner takes it
+        again at a new epoch (an executor restarted mid-landing)."""
+
+    @abc.abstractmethod
+    def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
+        """L160e2 (0058): frees the lease, if still held at that epoch."""
 
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
@@ -1117,6 +1184,12 @@ class WorkItems(Domain):
     def open_by_ref(self, ref: str) -> list[dict]:
         """L118 : les lots ouverts désignés par une référence (issue, fiche,
         branche, premier mot du titre)."""
+
+    @abc.abstractmethod
+    def by_issue_ref(self, ref: str) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, **quel que
+        soit leur état** — l'identité d'un lot de relecture après fusion
+        survit à sa fermeture, sinon un second lot serait ouvert."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
@@ -1811,13 +1884,29 @@ class Threads(Domain):
     @abc.abstractmethod
     def index(self, *, project: str, lot: str, transport: str, host: str, location: str,
               entry_id: str, mailbox_ids: Sequence[int], author: str, excerpt: str,
-              ts: float, trace: dict) -> None:
-        """Compte l'entrée dans l'index du fil et, si elle porte des messages
+              ts: float, trace: dict, count: bool = True) -> None:
+        """Compte l'entrée (sauf `count` faux) dans l'index du fil et, si elle porte des messages
         de la boîte, y note `trace` (id externe) — en une seule écriture."""
 
     @abc.abstractmethod
     def indexed(self) -> list[dict]:
         """Fils indexés, du plus récemment écrit au plus ancien."""
+
+    @abc.abstractmethod
+    def lock(self, *, project: str, lot: str, transport: str, host: str,
+             location: str) -> int | None:
+        """Verrouille la ligne du fil jusqu'à la fin de la transaction (créée
+        vide au besoin) : expiration et indexation d'un même fil passent l'une
+        après l'autre (L361). Rend `counted_until` : la fin logique du fil au
+        dernier recomptage (`expired`), None s'il n'a jamais été recompté."""
+
+    @abc.abstractmethod
+    def expired(self, *, project: str, lot: str, transport: str, host: str,
+                kept: int, last: dict | None, end: int) -> None:
+        """Après une expiration (L361), sous `lock` : `kept` entrées restent ;
+        `last` (entry_id, mailbox_id, author, excerpt, ts) est la plus récente
+        gardée, None si le fil est vide (aucune entrée expirée n'est citée) ;
+        `end`, la fin logique du fil recompté, devient `counted_until`."""
 
 
 # --------------------------------------------------------------------------
@@ -2035,14 +2124,18 @@ class Roadmap(Domain):
 
     @abc.abstractmethod
     def plan_item(self, item_id: int, dates: dict, *, source: str | None,
-                  actor: str) -> dict | None:
+                  actor: str, expect: dict | None = None) -> dict | None:
         """Pose les dates prévues d'une tâche (`dates` : clés parmi `start`,
         `end`, `delivery` ; valeur None = date effacée ; clé absente =
         inchangée), avec qui et quand (`planned_by`, `planned_at`). Ce n'est
         PAS une activité de la tâche : ni `updated_at` ni le journal ne
         bougent (une replanification ne masque pas une stagnation). Rend
         `{id, planned_start, planned_end, planned_delivery, planned_source,
-        planned_by, planned_ts}`, ou None si la tâche est inconnue."""
+        planned_by, planned_ts}`, ou None si la tâche est inconnue.
+
+        #740 : avec `expect` (`planned_start`, `planned_end`,
+        `planned_source` lus avant), rien n'est écrit si l'un d'eux a changé
+        depuis la lecture ; None alors aussi."""
 
     @abc.abstractmethod
     def item_plans(self, ids: Sequence[int]) -> list[dict]:
@@ -2319,12 +2412,36 @@ class HostLifecycle(Domain):
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
 
+    #254 : la pause d'un hôte voulue par le propriétaire (`host_holds`, 0392).
+
     Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
     1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
     tours en cours ; L159d: PSI, application and guest shares, lendable
     capacity. Les mesures illisibles sont NULL : on ne devine pas.
     Instants rendus en secondes epoch (`sampled_ts`).
     """
+
+    @abc.abstractmethod
+    def holds(self) -> list[dict]:
+        """#254 : les pauses en cours (`until` pas encore passé, heure de la
+        base) : host, reason, author, created_ts, until_ts."""
+
+    @abc.abstractmethod
+    def hold(self, host: str, *, reason: str, author: str, seconds: float | None = None,
+             until_ts: float | None = None) -> dict | None:
+        """#254 : pose (ou remplace) la pause de `host`, pour `seconds` ou
+        jusqu'à `until_ts`, bornée à l'heure de la base (après maintenant,
+        24 h au plus) ; None hors de ces bornes. L'historique
+        (`host_hold_events`) est écrit dans la même transaction."""
+
+    @abc.abstractmethod
+    def release(self, host: str, *, author: str) -> bool:
+        """#254 : lève la pause de `host` (historique compris) ; faux s'il
+        n'y en avait pas."""
+
+    @abc.abstractmethod
+    def hold_events(self, host: str | None = None) -> list[dict]:
+        """#254 : l'historique des pauses et levées, dans l'ordre."""
 
     @abc.abstractmethod
     def gate_guard(self, host: str):

@@ -163,6 +163,58 @@ def _date(text: str | None) -> _dt.date | None:
 _UNSET = object()
 
 
+_AUTHORITY = ("only a human, an orchestrator or a design agent may: a person at a "
+              "terminal passes --actor human:<id>, an agent asks the orchestrator")
+
+
+def _day(value) -> str | None:
+    return str(value)[:10] if value else None
+
+
+def _hand_source(db, current: dict, dates: dict, source: str | None,
+                 actor: str) -> tuple[str | None, str | None]:
+    """The source of a date set by hand on a task (#704), and a warning when
+    that date stays unprotected (#740).
+
+    Without `--source`, the stored source is kept as it is. When the planner
+    (`work schedule --apply`) dated the task, that source is the planner's, and
+    its next pass would overwrite the date set by hand: the date then records
+    who set it, if the start or the end really changes (set or cleared;
+    resubmitting the current dates pins nothing) and if the actor may pin a
+    date: a human, an orchestrator or a design agent (`work.pin_authority`).
+    Another agent's date is written and stays the planner's, with a warning.
+    A source the caller passes is a claim on the dates too: one that takes
+    them from the planner or gives them back, or that writes or replaces a
+    "set by" marker, needs the same authority; without it the stored source
+    stays, with a warning. Only the start and the end count: the planner
+    never writes the delivery date."""
+    from .lot_schedule import MARKER, SOURCE  # lot_schedule imports work, not this module
+
+    stored = str(current.get("planned_source") or "")
+    cfg = getattr(db, "cfg", None)
+    warnings = []
+    if source is not None and source != stored and (
+            source.startswith(SOURCE) != stored.startswith(SOURCE)
+            or source.startswith(MARKER) or stored.startswith(MARKER)):
+        if work_mod.pin_authority(cfg, db, actor) is None:
+            warnings.append("source %r not recorded: it would change who owns the dates, "
+                            "and %s may not (%s)" % (source, actor or "this session",
+                                                     _AUTHORITY))
+            source = None
+    if source is not None or not stored.startswith(SOURCE):
+        return source, "; ".join(warnings) or None
+    if not any(key in dates and _day(dates[key]) != _day(current.get("planned_" + key))
+               for key in ("start", "end")):
+        return None, "; ".join(warnings) or None
+    who = work_mod.pin_authority(cfg, db, actor)
+    if who is None:
+        warnings.append("date not protected: %s may not pin it (%s), so the next work "
+                        "schedule --apply may move it" % (actor or "this session",
+                                                          _AUTHORITY))
+        return None, "; ".join(warnings)
+    return MARKER + who, "; ".join(warnings) or None
+
+
 def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str | None = None,
          actor: str = "", now: float | None = None) -> dict:
     """Pose les dates prévues d'une tâche (`target` entier ou `#N`) ou d'une
@@ -178,14 +230,25 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
     text = str(target).strip().lstrip("#")
     st = storage.of(db)
     if text.isdigit():
-        current = (st.roadmap.item_plans([int(text)]) or [None])[0]
-        if current is None:
-            raise RoadmapError("task %s not found" % text)
-        _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
-        row = st.roadmap.plan_item(int(text), dates, source=source, actor=actor)
-        if row is None:
-            raise RoadmapError("task %s not found" % text)
-        return {"target": int(text), "kind": "task", "plan": row}
+        # #740: the row is written only as it was read (a schedule applied in
+        # between would leave its source on the date set here): read again
+        for _attempt in range(3):
+            current = (st.roadmap.item_plans([int(text)]) or [None])[0]
+            if current is None:
+                raise RoadmapError("task %s not found" % text)
+            _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
+            hand, warning = _hand_source(db, current, dates, source, actor)
+            row = st.roadmap.plan_item(int(text), dates, source=hand, actor=actor,
+                                       expect=current)
+            if row is not None:
+                break
+        else:
+            raise RoadmapError("task %s changed while it was being planned: run it again"
+                               % text)
+        out = {"target": int(text), "kind": "task", "plan": row}
+        if warning:
+            out["warning"] = warning
+        return out
     package = st.packages.get(text)
     if package is None:
         raise RoadmapError("neither a task nor a WorkPackage: %r (a task: its number; a "

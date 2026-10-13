@@ -102,6 +102,13 @@ _DEFAULT_PORTS = {"ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418, "http": 
                   "https": 443}
 
 
+def normalize_source(source: str) -> str:
+    """Normalize a stored queue source, retaining server ports and fork identity."""
+    if source.partition("/")[0].split(":")[0].lower() == "github.com":
+        return source.lower()
+    return source
+
+
 def source_of(repo: str) -> str:
     """The repository a lot is queued from, as a radar pass compares it: its
     origin as `host/path` (`git@github.com:o/r.git` and
@@ -125,7 +132,7 @@ def source_of(repo: str) -> str:
         return os.path.realpath(os.path.join(repo, local))
     path = path.strip("/")
     path = path[:-len(".git")] if path.endswith(".git") else path
-    return "%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path)
+    return normalize_source("%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path))
 
 
 def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
@@ -185,16 +192,44 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
-def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
+def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
+              commit_ci=None, cfg=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
-    pr}`; QueueError says what is missing. Commit ids are resolved to full
-    ones before being compared; `ci` (`radar.github_ci(..., strict=True)`)
-    must report the PR green on the frozen commit itself, and an error
-    reading it refuses the lot."""
-    from . import plan_github
+    pr, class, class_why}`; QueueError says what is missing. Commit ids are
+    resolved to full ones before being compared; `ci` (`radar.github_ci(...,
+    strict=True)`) must report the PR green on the frozen commit itself, and
+    an error reading it refuses the lot. A project with `ci_required` (L160g)
+    also needs GitHub's CI green on the frozen commit itself, PR or not
+    (`commit_ci`, `radar.commit_ci` by default).
+
+    L539 (§8): a **light** lot needs no review verdict — its class comes from
+    `lot_class.of_lot` on the frozen diff — but it still needs a green CI on
+    the frozen head, a non-draft PR, and a target that is not `release/*`.
+    Any doubt about the class (unreadable canon, unreachable diff, `cfg`
+    absent) leaves the verdict requirement in place; the class and its reason
+    are traced in the queue note. The target resolved here (`branch_target`,
+    then the project's, then the repository's default) carries through the
+    classification and the admission (revue #544 r2).
+
+    The CI is required **explicitly**: for a project without `ci_required`,
+    `ci=None` (no reader) and a reader that answers nothing are refused, like
+    a red CI — an absent status is not a green one (revue #544 r1). A project
+    with `ci_required` may instead certify admission with GitHub's CI on the
+    frozen commit when no PR vouches for it (`ci=None`, or a reader that
+    answers nothing because there is no open PR): a green commit CI is not
+    blocked by the absence of a PR (revue #544 r2)."""
+    from . import lot_class
+    from . import plan_github, radar
     row = work.get(db, lot)
     if row is None:
         raise QueueError("lot #%d not found" % lot)
+    target = row.get("branch_target") or getattr(project, "target", "") or plan_git.default_target(repo)
+    glob = radar.protected_target(project, target)
+    if glob:
+        # L160g (#473): main, release branches and tags stay an orchestrator's gesture
+        raise QueueError("%s is a protected target of project %s (%s): the merge queue "
+                         "never merges there; it is the orchestrator's gesture"
+                         % (target, project.name, glob))
     if row.get("state") in work.MERGED_STATES or row.get("state") == "closed":
         raise QueueError("lot #%d is %s: nothing to merge" % (lot, row["state"]))
     if not row.get("branch"):
@@ -219,18 +254,30 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
+    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
+    light = klass.get("class") == lot_class.LIGHT
     verdict = latest_verdict(marks)
     reviewed = pinned(where, verdict["sha"]) if verdict and verdict.get("sha") else None
-    if not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip):
-        raise QueueError("lot #%d has no review verdict ok on its freeze %s%s"
+    if not light and (not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip)):
+        raise QueueError("lot #%d has no review verdict ok on its freeze %s%s (class: %s)"
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
-                            if verdict else ""))
-    try:
-        status = ci(row["branch"]) if ci else None
-    except plan_github.GithubError as exc:
-        raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
-                         "gh works" % (row["branch"], exc)) from exc
+                            if verdict else "", klass.get("class") or "?"))
+    needs_commit_ci = project is not None and getattr(project, "ci_required", False)
+    status = None
+    if ci is None:
+        if not needs_commit_ci:
+            raise QueueError("lot #%d has no CI reader: a green CI on the frozen head %s is "
+                             "required before entering the queue" % (lot, tip[:12]))
+    else:
+        try:
+            status = ci(row["branch"])
+        except plan_github.GithubError as exc:
+            raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
+                             "gh works" % (row["branch"], exc)) from exc
+        if not status and not needs_commit_ci:
+            raise QueueError("no CI status for branch %s (lot #%d): a green CI on the frozen "
+                             "head %s is required" % (row["branch"], lot, tip[:12]))
     if status:
         if not _same(status.get("head"), tip):
             raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
@@ -239,24 +286,105 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-    target = row.get("branch_target") or plan_git.default_target(repo)
-    return {"target": target, "frozen_sha": tip, "pr": (status or {}).get("number")}
+        if light and status.get("draft"):
+            raise QueueError("PR #%s is a draft: a light lot merges only from a "
+                             "non-draft PR" % status.get("number"))
+    if needs_commit_ci:
+        _required_ci(project, tip, commit_ci)
+    return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
+            "pr": (status or {}).get("number"), "class": klass.get("class"),
+            "class_why": klass.get("why") or ""}
+
+
+def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
+              tip: str, *, cfg=None) -> dict:
+    """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
+
+    Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
+    référence de la cible y est tentée, puis le dépôt du projet. `cfg` absent
+    ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`, drapeau
+    `doubt`), et la file garde l'exigence de verdict.
+
+    Les lectures sont **toutes** comparées : la plus haute l'emporte, une
+    lecture calculée ne se rétrograde jamais devant une autre, et un doute ne
+    se lit pas comme une classe sensible (le clone radar peut voir des
+    changements sensibles que le checkout de l'auteur ne voit plus — revue
+    #544 r1)."""
+    from . import lot_class
+    paths = []
+    if target:
+        base_repo = where or repo
+        for candidate in (QUEUE_REF + target, target):
+            if plan_git._commit(base_repo, candidate):
+                paths.append((base_repo, candidate))
+                break
+        if where and where != repo:
+            paths.append((repo, target))
+    if not paths:
+        paths.append((repo, target))
+    best = None
+    for path, base in paths:
+        current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base,
+                                   head=tip)
+        if best is None or _class_worse(current, best):
+            best = current
+    return best
+
+
+def _class_worse(candidate: dict, best: dict) -> bool:
+    """La plus haute des deux lectures l'emporte ; à classe égale, une lecture
+    calculée explique mieux qu'un doute."""
+    from . import lot_class
+    def rank(result):
+        return lot_class.RANK.get(str(result.get("class") or ""),
+                                  lot_class.RANK[lot_class.SENSITIVE])
+    if rank(candidate) != rank(best):
+        return rank(candidate) > rank(best)
+    return bool(best.get("doubt")) and not candidate.get("doubt")
+
+
+def _required_ci(project, sha: str, commit_ci=None) -> None:
+    """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
+    `sha` itself; QueueError otherwise (no run, running, red, unreadable)."""
+    from . import plan_github, radar
+    try:
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+    except plan_github.GithubError as exc:
+        raise QueueError("project %s requires CI on the frozen commit (ci_required), "
+                         "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
+    if not runs["runs"]:
+        raise QueueError("project %s requires CI on the frozen commit (ci_required): no run "
+                         "on %s yet (push it, let the workflows run)" % (project.name, sha[:12]))
+    if runs["pending"]:
+        raise QueueError("the CI on the frozen commit %s is still running (%s)"
+                         % (sha[:12], ", ".join(runs["pending"])))
+    if runs["failed"]:
+        raise QueueError("the CI on the frozen commit %s is red (%s)"
+                         % (sha[:12], ", ".join(runs["failed"])))
+    if not runs.get("green"):
+        raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None) -> dict:
+          clone=None, commit_ci=None, cfg=None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes."""
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
-    ready = readiness(db, lot, repo, ci=ci, clone=clone)
+    ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project,
+                      commit_ci=commit_ci, cfg=cfg)
     row = storage.of(db).work.queue_add(
-        lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s" % (
+        lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
+        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s" % (
             ready["target"], ready["frozen_sha"][:12],
-            ", PR #%s green" % ready["pr"] if ready["pr"] else ""), actor=actor)
+            ", PR #%s green" % ready["pr"] if ready["pr"] else "",
+            ready.get("class") or "?", " (%s)" % ready["class_why"]
+            if ready.get("class_why") else ""), actor=actor)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
+    # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
+    row["class"] = ready.get("class")
+    row["class_why"] = ready.get("class_why")
     return row
 
 
@@ -326,13 +454,15 @@ def order(entries: list[dict], pairs: dict) -> list[dict]:
 # stacked replay in the radar's clone
 # --------------------------------------------------------------------------
 
-def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dict:
+def stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *, generated=()) -> dict:
     """Replays the queue stacked: from `target_head`, merges each lot of
     `lots` (`{work_item, tip}`, in order) with `rerere` primed by the
     resolutions (`rows`) of this lot with the lots already stacked. A lot
     that leaves a conflict is skipped. Returns `{lot: {state: clean|
-    replayed|conflict, files}}`."""
-    from . import resolutions
+    replayed|conflict|generated, files}}`. Generated conflicts are excluded
+    before rerere; each trial tree is regenerated and checked."""
+    from . import land, resolutions
+    paths = {g.path for g in generated}
     latest: dict = {}
     for row in rows:
         latest.setdefault(frozenset((int(row["work_item_id"]), int(row["other_item_id"]))), row)
@@ -361,24 +491,38 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dic
                         and row["commit_sha"] in replayer.trained():
                     shutil.copytree(replayer._store(row["commit_sha"]), replayer._rr_cache(),
                                     dirs_exist_ok=True)
-            merge = run(path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+            merge = run(path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                         "merge", "--no-ff", "--no-commit", "--quiet", one["tip"])
             state, files = "clean", []
             if merge.returncode != 0:
                 files = resolutions.unmerged(path)
-                remaining = resolutions.rerere_remaining(path) if files else []
-                left = sorted(set(remaining) | set(resolutions.with_markers(path, files)))
+                resolutions.exclude_generated(path, files, paths)
+                resolutions._check(run(path, "-c", "rerere.enabled=true", "-c",
+                                       "rerere.autoUpdate=false", "rerere"), "rerere")
+                others = [f for f in files if f not in paths]
+                remaining = [f for f in resolutions.rerere_remaining(path) if f not in paths] \
+                    if others else []
+                left = sorted(set(remaining) | set(resolutions.with_markers(path, others)))
                 if not files or left:
                     run(path, "merge", "--abort")
                     run(path, "reset", "-q", "--hard", base)
                     out[lot] = {"state": "conflict", "files": left or files,
                                 "error": "" if files else resolutions._err(merge)[:300]}
                     continue
-                resolutions._check(run(path, "add", "--", *files), "add")
-                state = "replayed"
+                if others:
+                    resolutions._check(run(path, "add", "--", *others), "add")
+                    state = "replayed"
+            if paths:
+                made = land._regenerate(path, generated, paths)
+                if not made["ok"]:
+                    run(path, "merge", "--abort")
+                    run(path, "reset", "-q", "--hard", base)
+                    out[lot] = {"state": "generated", "files": [made["file"]],
+                                "output": made["output"]}
+                    continue
             resolutions._check(run(path, "-c", "rerere.enabled=false", "commit", "--quiet",
                                    "--no-verify", "-m", "queue: #%d" % lot), "commit")
-            out[lot] = {"state": state, "files": files}
+            out[lot] = {"state": state, "files": [f for f in files if f not in paths]}
             stacked.append(lot)
     finally:
         run(path, "reset", "-q", "--hard")
@@ -460,7 +604,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         scan decide it; only a row with no source, if any, falls back on the
         scan."""
         if row.get("source"):
-            return row["source"] == source
+            return normalize_source(row["source"]) == source
         return int(row["work_item_id"]) in branches
 
     mine = [r for r in rows if r["state"] in ("queued", "landing") and ours(r)]
@@ -474,6 +618,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
     ejected: set = set()
     by_target: dict = {}
     live = []
+    landing: dict = {}
     for row in mine:
         if row.get("item_state") in work.MERGED_STATES:
             storage.of(db).work.queue_update(int(row["work_item_id"]), state="landed",
@@ -522,6 +667,11 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         if head is None:
             defer(row, "target %s not found on %s" % (row["target"], place))
             continue
+        if row["state"] == "landing" and (_same(tip, row["frozen_sha"])
+                                          or _same(tip, row.get("landing_sha"))):
+            # being merged by ameesh (L160e2): its branch may hold the merge commit
+            landing.setdefault(row["target"], []).append(row)
+            continue
         if not _same(tip, row["frozen_sha"]):
             reason = "branch moved past its freeze (%s, frozen %s)" % (
                 tip[:12], row["frozen_sha"][:12])
@@ -537,35 +687,45 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         # the radar tried the target its checkout had: only a conflict with
         # the target fetched now ejects; otherwise the stacked trial below,
         # on that target, decides
-        if clash and clash.get("target") == row["target"] \
+        ordinary = [f for f in (clash or {}).get("files", ())
+                    if f not in {g.path for g in getattr(project, "generated", ())}]
+        if clash and ordinary and clash.get("target") == row["target"] \
                 and _same(clash.get("tip"), row["frozen_sha"]) \
                 and _same(clash.get("target_head"), head):
             # no resolution is prepared against the target: the agent integrates it
             reason = "conflict with %s on %s" % (row["target"], ", ".join(
-                clash["files"][:6] or ["?"]))
+                ordinary[:6]))
             out["mail"].append(_eject(db, row, reason, (
                 "Merge queue of %s, lot #%d « %s »: out of the queue, its frozen commit "
                 "conflicts with %s on %s. Integrate %s into %s, freeze again, have it "
                 "reviewed, then ameesh work queue add %d."
                 % (row["target"], lot, row.get("title") or "", row["target"],
-                   ", ".join(clash["files"][:6]), row["target"], row.get("branch") or "?",
+                   ", ".join(ordinary[:6]), row["target"], row.get("branch") or "?",
                    lot)),
                 {"project": project.name, "target": row["target"], "kind": "ejected",
-                 "files": clash["files"]}))
+                 "files": ordinary}))
             ejected.add(lot)
             continue
         # stacked on the target as origin has it now, not the agents' cached one
         by_target.setdefault(row["target"], []).append(dict(row, tip=tip, target_head=head))
     try:
         resolution_rows = storage.of(db).work.resolutions(
-            [int(r["work_item_id"]) for rs in by_target.values() for r in rs]) \
+            [int(r["work_item_id"]) for rs in list(by_target.values()) + list(landing.values())
+             for r in rs]) \
             if by_target else []
     except Exception:  # noqa: BLE001 - database without 0057: no replay
         resolution_rows = []
     stacks = getattr(cache, "stacks", None) if cache is not None else None
     stacks = {} if stacks is None else stacks
+    for target in sorted(set(landing) - set(by_target)):
+        out["targets"][target] = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
+                                   "reason": r.get("reason") or "", "stack": None}
+                                  for r in landing[target]]
     for target, entries in sorted(by_target.items()):
         ranked = order(entries, pairs)
+        first = len(landing.get(target) or ())
+        for one in ranked:
+            one["rank"] += first
         rows_by_id = {int(e["work_item_id"]): e for e in entries}
         for one in ranked:
             row = rows_by_id[one["work_item"]]
@@ -576,23 +736,40 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         result: dict = {}
         if len(heads) == 1:
             commits = tuple(sorted(r["commit_sha"] for r in resolution_rows))
-            key = (heads.pop(), tuple((o["work_item"], rows_by_id[o["work_item"]]["tip"])
-                                      for o in ranked), commits)
+            # a lot being landed goes first: the lots behind it merge after it
+            stacked = [{"work_item": int(r["work_item_id"]), "tip": r["frozen_sha"]}
+                       for r in landing.get(target) or ()] + \
+                [{"work_item": o["work_item"], "tip": rows_by_id[o["work_item"]]["tip"]}
+                 for o in ranked]
+            generated = tuple(getattr(project, "generated", ()))
+            key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits,
+                   generated)
             if key not in stacks:
                 try:
                     replayer.ensure()
-                    stacks[key] = stack(replayer, key[0],
-                                        [{"work_item": o["work_item"],
-                                          "tip": rows_by_id[o["work_item"]]["tip"]}
-                                         for o in ranked], resolution_rows)
+                    stacks[key] = stack(replayer, key[0], stacked, resolution_rows,
+                                        generated=generated)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
             result = stacks[key]
-        listed = []
+        listed = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
+                   "reason": r.get("reason") or "", "stack": None}
+                  for r in landing.get(target) or ()]
         for one in ranked:
             row = rows_by_id[one["work_item"]]
             trial = result.get(one["work_item"]) if isinstance(result, dict) else None
             state = "queued"
+            if trial and trial["state"] == "generated":
+                lot = one["work_item"]
+                reason = "stacked trial: generated file %s: regeneration or check failed" % trial["files"][0]
+                out["mail"].append(_eject(db, row, reason, (
+                    "Merge queue of %s, lot #%d: out of the queue. %s.\n%s\n"
+                    "Fix the generator or its inputs, freeze again, then ameesh work queue add %d."
+                    % (target, lot, reason, trial["output"], lot)),
+                    {"project": project.name, "target": target, "kind": "ejected",
+                     "files": trial["files"]}))
+                state = "ejected"
+                ejected.add(lot)
             if trial and trial["state"] == "conflict":
                 lot = one["work_item"]
                 reason = "stacked trial: conflict not covered on %s" % ", ".join(
@@ -665,16 +842,20 @@ def add_parser(work_sub, func) -> None:
     parser.set_defaults(func=func)
 
 
-def show_lines(rows: list[dict]) -> list[str]:
+def show_lines(rows: list[dict], classes: dict | None = None) -> list[str]:
+    """Les lignes de `ameesh work queue` ; `classes` (L539) ajoute la classe de
+    revue de chaque lot quand elle est connue ({lot: « light »…})."""
     out = []
     target = None
     for r in rows:
         if r["target"] != target:
             target = r["target"]
             out.append("queue of %s:" % target)
-        out.append("  %-3s %-8s #%d « %s » (%s, frozen %s)%s" % (
+        klass = (classes or {}).get(int(r["work_item_id"]))
+        out.append("  %-3s %-8s #%d « %s » (%s, frozen %s%s)%s" % (
             r["rank"] if r.get("rank") else "—", r["state"], int(r["work_item_id"]),
             r.get("title") or "", r.get("assignee") or "unassigned", r["frozen_sha"][:12],
+            ", class %s" % klass if klass else "",
             " : %s" % r["reason"] if r.get("reason") else ""))
     return out
 
@@ -682,13 +863,26 @@ def show_lines(rows: list[dict]) -> list[str]:
 def radar_project(cfg, repo: str):
     """The radar project (`radar.projects`) of the repository `repo`, if any:
     its private clone receives the fetches of `readiness`."""
-    from . import radar
+    from . import radar, migrations
     try:
-        projects = radar.settings_of(cfg).projects.values()
-    except radar.SettingsError:
-        return None
+        projects = list(radar.settings_of(cfg).projects.values())
+    except radar.SettingsError as exc:
+        raise QueueError("cannot read repository landing conditions: %s" % exc) from exc
     real = os.path.realpath(repo)
-    return next((p for p in projects if os.path.realpath(p.repo) == real), None)
+    identities = {p.name: {migrations.repo_key(p.github),
+                           migrations.repo_key(migrations.origin_repo(p.repo))} - {""}
+                  for p in projects}
+    slugs = {migrations.repo_key(migrations.origin_repo(repo))} - {""}
+    # A checkout without origin still has its configured repository identity.
+    # An exact path contributes matches; it never suppresses another project's.
+    for p in projects:
+        if os.path.realpath(p.repo) == real:
+            slugs.update(identities[p.name])
+    matching = [p for p in projects if os.path.realpath(p.repo) == real or
+                slugs & identities[p.name]]
+    if len(matching) > 1:
+        raise QueueError("multiple radar projects match this repository; landing conditions are ambiguous")
+    return matching[0] if matching else None
 
 
 def run(cfg, db, args) -> int:
@@ -700,10 +894,12 @@ def run(cfg, db, args) -> int:
             project = radar_project(cfg, repo)
             clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
                 if project else None
-            row = enter(db, args.id, repo=repo, actor=args.actor, project=project, clone=clone)
+            row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
+                        clone=clone, cfg=cfg)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
-                  "lot #%d queued for %s at %s; the radar orders the queue at its next pass"
-                  % (args.id, row["target"], row["frozen_sha"][:12]))
+                  "lot #%d queued for %s at %s, class %s; the radar orders the queue at its "
+                  "next pass" % (args.id, row["target"], row["frozen_sha"][:12],
+                                 row.get("class") or "?"))
             return 0
         if args.queue_command == "remove":
             done = leave(db, args.id, actor=args.actor, reason=args.message)
@@ -712,10 +908,18 @@ def run(cfg, db, args) -> int:
                                   else "was not queued"))
             return 0
         rows = storage.of(db).work.queue(args.target)
+        # L539 : la classe de chaque lot de la file (lecture seule, best effort)
+        from . import lot_class
+        classes = {}
+        for r in rows:
+            info = lot_class.of_lot(db, int(r["work_item_id"]), cfg=cfg)
+            classes[int(r["work_item_id"])] = info.get("class")
+            r["class"] = info.get("class")
+            r["class_why"] = info.get("why")
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         else:
-            print("\n".join(show_lines(rows)) if rows else "no lot queued")
+            print("\n".join(show_lines(rows, classes)) if rows else "no lot queued")
         return 0
     except (QueueError, GitError, plan_git.MergeProbeError, ValueError) as exc:
         print("error: %s" % exc, file=sys.stderr)

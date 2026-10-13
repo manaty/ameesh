@@ -63,8 +63,8 @@ Comptes : 63 opérations, dont 25 lectures et 38 écritures. 53 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (359
-opérations après intégration de main le 12/10) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (377
+opérations après intégration de main et de #330) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 `turn_resources.running_started_before` est une lecture de portée H :
@@ -134,6 +134,12 @@ The latest main merge also refuses host-history reads, waiting-episode
 reads and decision-source/prose reads. `work.move` accepts the optional
 `held=false` argument added by main; it adds a database-side open-request
 check for a move, without exposing the decision operations to the device.
+
+The three key-holder operations added by #330 remain refused:
+`keys.register_human`, `keys.owner_registrations` and `keys.confirm`.
+Human key registration, owner registration auditing and owner confirmation
+are outside the mediated executor's scope, alongside key registration and
+revocation. The admitted operations and contract version remain unchanged.
 
 ## Requête et réponse
 

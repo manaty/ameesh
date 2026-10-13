@@ -15,7 +15,9 @@ One Markdown file per thread, under `AMEESH_THREADS` (default
 
 - The **project** is the sender's team or project, else the recipient's, else
   `AMEESH_PROJECT`, else `default`. For an agent declared in the canon, it is
-  its `team`.
+  its `team`. Since L118c (#496), a message sent **with `--lot`** is filed in
+  the **lot's project thread** (`work_items.app`), not the sender's or the
+  recipient's; the fallbacks above are unchanged.
 - The **lot** is the message's `--lot`; without one, the message goes to the
   project's thread.
 
@@ -63,7 +65,21 @@ file lock, and the files are opened without following symbolic links.
 ameesh fil list                                    # known threads (index + local files)
 ameesh fil show <project> [<lot>] [--last N] [--meta]
 ameesh fil tail <project> [<lot>] [--last N]       # follow; Ctrl-C to exit
+ameesh fil expire [--days N] [--dry-run]           # retention (L361)
 ```
+
+## Retention
+
+Entries older than one year (`thread_retention_days`,
+`AMEESH_THREAD_RETENTION_DAYS`; `0` = never) are removed by `ameesh fil
+expire`, also run daily by the runner's housekeeping (L361, decision 0033 §9).
+Only the **oldest run** of complete ameesh entries goes: text that cannot be
+dated stops the expiry and stays. The file is rewritten whole under the
+thread's exclusive lock, then renamed over the old one, so a writer or reader
+holding the replaced file reopens it and no append is lost. Entry ids stay
+valid — they are logical offsets — and the header keeps the shift, the cut-off
+date and the number of entries removed; an expired id reads as "from the
+oldest kept entry".
 
 !!! note "Scope of the guarantee"
     The thread covers messages that **go through ameesh**. Messages exchanged

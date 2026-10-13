@@ -39,7 +39,7 @@ ITEM_COLUMNS = """
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
     q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
-    q.queued_by, q.source,
+    q.queued_by, q.source, q.generation, q.frozen_id,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -194,10 +194,32 @@ class WorkItems(interface.WorkItems):
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
-            estimate_source=None, change_size=None) -> dict:
+            estimate_source=None, change_size=None, mark_item_id=None,
+            mark_note="") -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
-        avec sa durée estimée (et sa ligne d'historique), en UNE transaction."""
+        avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
+        L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
+        si bien qu'un échec de la marque annule la création (et l'inverse).
+        La ligne marquée est verrouillée **avant** l'insertion et la
+        `issue_ref` est relue sous ce verrou : deux appels concurrents ne
+        peuvent pas créer deux lots pour la même référence (revue #544 r2)."""
         with self.db.transaction() as tx:
+            marked = None
+            if mark_item_id is not None:
+                marked = tx.query(
+                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                    (int(mark_item_id),))
+                if not marked:
+                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+                if str(issue_ref or "").strip():
+                    # le verrou sur la ligne marquée sérialise les créateurs :
+                    # le second relit la référence après le commit du premier
+                    duplicate = tx.query(
+                        "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                        " ORDER BY id LIMIT 1", (issue_ref,))
+                    if duplicate:
+                        raise DbError("issue_ref %s is already carried by lot #%d"
+                                      % (issue_ref, int(duplicate[0]["id"])))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -221,6 +243,10 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if mark_item_id is not None and str(mark_note or "").strip():
+                WorkItems(tx)._event(
+                    int(mark_item_id), marked[0]["state"],
+                    str(mark_note).replace("{lot}", str(item["id"])), actor)
             return item
 
     def get(self, item_id) -> dict | None:
@@ -541,11 +567,11 @@ class WorkItems(interface.WorkItems):
         pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         return self.db.query(
             """
-            SELECT id, work_item_id, state, note, actor,
-                   extract(epoch from created_at)::float8 as created_ts
-              FROM work_item_events
-             WHERE note LIKE %s AND created_at >= to_timestamp(%s)
-             ORDER BY id
+            SELECT e.id, e.work_item_id, e.state, e.note, e.actor, w.assignee,
+                   extract(epoch from e.created_at)::float8 as created_ts
+              FROM work_item_events e JOIN work_items w ON w.id = e.work_item_id
+             WHERE e.note LIKE %s AND e.created_at >= to_timestamp(%s)
+             ORDER BY e.id
             """,
             (pattern, float(since_ts)),
         )
@@ -735,37 +761,69 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="") -> dict | None:
+                  source="", frozen_id=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state FROM work_items WHERE id = %s"
-                           " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
+                           " AND state NOT IN ('merged', 'promoted', 'closed')"
+                           " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
+            latest = tx.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+                              " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+            latest_id = latest[0]["id"] if latest else None
+            if frozen_id is not None and frozen_id != latest_id:
+                return None
             tx.execute(
-                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source)"
-                " VALUES (%s, %s, %s, %s, %s)"
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by, source, frozen_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
-                "   source = excluded.source,"
-                "   landing_sha = NULL,"
+                "   source = excluded.source, frozen_id = excluded.frozen_id,"
+                "   generation = nextval('merge_queue_generation_seq'), landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
                 "   updated_at = now()",
-                (int(item_id), target, frozen_sha, actor or "", source or ""))
+                (int(item_id), target, frozen_sha, actor or "", source or "", latest_id))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return self._queue_row(tx, item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False) -> dict | None:
+                     note="", actor="", clear_rank=False, lease=None,
+                     freeze=None, entry=None) -> dict | None:
+        key, owner, epoch = lease if lease is not None else (None, None, None)
+        frozen, landing = freeze if freeze is not None else (None, None)
+        generation, target, frozen_id, entry_sha = entry if entry is not None else (None,) * 4
         with self.db.transaction() as tx:
+            if entry is not None:
+                # Same lock as add_milestone/queue_add: read the latest freeze
+                # after waiting for any concurrent refreeze to finish.
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
+            # #194 r6: the lease row is locked by the same statement (an
+            # acquisition waits for this write, or this write sees its new
+            # epoch), its expiry read on the wall clock, not the transaction's
             rows = tx.query(
-                "UPDATE merge_queue SET state = coalesce(%s, state),"
+                "WITH lease AS (SELECT 1 FROM merge_locks l"
+                "    WHERE l.target = %s AND l.owner = %s AND l.epoch = %s"
+                "      AND l.expires_at > clock_timestamp() FOR UPDATE)"
+                " UPDATE merge_queue SET state = coalesce(%s, state),"
                 "   rank = CASE WHEN %s THEN NULL ELSE coalesce(%s, rank) END,"
                 "   landing_sha = CASE WHEN %s IN ('queued', 'ejected') THEN NULL"
                 "                      ELSE coalesce(%s, landing_sha) END,"
                 "   reason = coalesce(%s, reason), updated_at = now()"
-                " WHERE work_item_id = %s RETURNING work_item_id",
-                (state, state == "ejected" or bool(clear_rank), rank, state or "", landing_sha, reason,
-                 int(item_id)))
+                " WHERE work_item_id = %s"
+                "   AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM lease))"
+                # #194 r8: or under the freeze — still `landing`, same freeze
+                # and same landing commit (a new freeze is never overwritten)
+                "   AND (%s::text IS NULL OR (state = 'landing' AND frozen_sha = %s"
+                "        AND landing_sha IS NOT DISTINCT FROM %s))"
+                "   AND (NOT %s OR (generation = %s AND target = %s"
+                "        AND frozen_id IS NOT DISTINCT FROM %s AND frozen_sha = %s"
+                "        AND frozen_id IS NOT DISTINCT FROM (SELECT id FROM work_item_milestones"
+                "          WHERE work_item_id = %s AND kind = 'frozen'"
+                "          ORDER BY at DESC, id DESC LIMIT 1)))"
+                " RETURNING work_item_id",
+                (key, owner, epoch, state, state == "ejected" or bool(clear_rank), rank,
+                 state or "", landing_sha, reason, int(item_id), key, frozen, frozen,
+                 landing, entry is not None, generation, target, frozen_id, entry_sha, int(item_id)))
             if not rows:
                 return None
             if note:
@@ -782,6 +840,31 @@ class WorkItems(interface.WorkItems):
             lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return True
+
+    def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
+        if epoch is not None:  # renewal: only the holder, at its epoch
+            rows = self.db.query(
+                "UPDATE merge_locks SET expires_at = clock_timestamp()"
+                " + %s * interval '1 second'"
+                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                (float(ttl_s), key, owner, int(epoch)))
+            return int(rows[0]["epoch"]) if rows else None
+        rows = self.db.query(
+            "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
+            " VALUES (%s, %s, 1, clock_timestamp() + %s * interval '1 second')"
+            " ON CONFLICT (target) DO UPDATE SET owner = excluded.owner,"
+            "   epoch = merge_locks.epoch + 1, expires_at = excluded.expires_at"
+            " WHERE merge_locks.owner IS NULL OR merge_locks.expires_at < clock_timestamp()"
+            "    OR merge_locks.owner = excluded.owner"
+            " RETURNING epoch", (key, owner, float(ttl_s)))
+        return int(rows[0]["epoch"]) if rows else None
+
+    def land_unlock(self, key, owner, epoch) -> bool:
+        rows = self.db.query(
+            "UPDATE merge_locks SET owner = NULL, expires_at = NULL"
+            " WHERE target = %s AND owner = %s AND epoch = %s RETURNING target",
+            (key, owner, int(epoch)))
+        return bool(rows)
 
     def queue(self, target=None) -> list[dict]:
         return self.db.query(
@@ -841,6 +924,13 @@ class WorkItems(interface.WorkItems):
             "        OR lower(branch) = lower(%%s)"
             "        OR lower(rtrim(split_part(btrim(title), ' ', 1), ':')) = lower(%%s))"
             " ORDER BY id" % ITEM_COLUMNS, (ref, ref, ref, ref))
+
+    def by_issue_ref(self, ref) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, quel que soit
+        leur état (un lot de relecture fermé reste l'identité de sa référence)."""
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE lower(issue_ref) = lower(%%s)"
+            " ORDER BY id" % ITEM_COLUMNS, (str(ref or ""),))
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(

@@ -72,8 +72,11 @@ AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "inter
                "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
                "cost", "permissions", "acp", "accounts", "install", "resident", "backup")
 #: known keys of `ameesh.interactive_permission` (L223: permission mode of an
-#: interactive session, `ameesh attach` and `ameesh chat`)
-INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
+#: interactive session, `ameesh attach` and `ameesh chat`); `modes` maps a mode
+#: to fixed arguments for a harness whose flag carries no `{mode}` (L685: codex
+#: `bypassPermissions` → `--dangerously-bypass-approvals-and-sandbox`)
+INTERACTIVE_PERMISSION_KEYS = ("flag", "modes", "default", "env", "fallback", "choices",
+                               "explicit_only")
 #: a permission mode passed to the harness: a short identifier
 PERMISSION_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 #: modes that switch every permission check off: reserved for the agent setting
@@ -967,9 +970,31 @@ def _setting(value: Any) -> Setting:
                    default=default)
 
 
+def _permission_modes(value: Any) -> dict[str, tuple[str, ...]]:
+    """`modes` (L685): a mode → fixed arguments mapping, invalid entries dropped.
+
+    Codex's flag carries no `{mode}`: the mode selects a whole argument list
+    (`bypassPermissions` → `--dangerously-bypass-approvals-and-sandbox`), so
+    there is nothing to substitute and no `--help` probe to run.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for name, args in value.items():
+        parts = _strings(args)
+        if not (isinstance(name, str) and PERMISSION_MODE_RE.match(name)) or not parts:
+            continue
+        if any("{mode}" in part for part in parts):
+            continue
+        out[name] = tuple(parts)
+    return out
+
+
 def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
-    """`ameesh.interactive_permission` (L223): flag with a `{mode}` template,
-    default mode, override variables, fallback mode, allowlist of modes
+    """`ameesh.interactive_permission` (L223): how an interactive session passes
+    its permission mode — a `flag` template containing `{mode}`, or `modes`, a
+    mapping mode → fixed arguments for a flag that carries no `{mode}` (L685) —
+    plus the default mode, override variables, fallback mode, allowlist of modes
     (`choices`) and the modes only an explicit agent setting may set
     (`explicit_only`)."""
     if value is None:
@@ -983,11 +1008,43 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
             findings.append(Finding("harness-key-unknown", WARNING,
                                     "`ameesh.interactive_permission.%s`: unknown key (ignored)"
                                     % key, path))
-    flag = _strings(value.get("flag"))
-    if not flag or not any("{mode}" in part for part in flag):
+    raw_flag = value.get("flag")
+    flag = _strings(raw_flag)
+    template = bool(flag) and any("{mode}" in part for part in flag)
+    if raw_flag is not None and not template:
         findings.append(Finding("harness-permission-mode-invalid", ERROR,
                                 "`ameesh.interactive_permission.flag`: list of strings "
                                 "containing `{mode}` expected", path))
+    elif raw_flag is None and value.get("modes") is None:
+        findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                "`ameesh.interactive_permission`: `flag` with `{mode}` or a "
+                                "`modes` mapping expected", path))
+    delivered: set[str] = set()
+    raw_modes = value.get("modes")
+    if raw_modes is not None:
+        if not isinstance(raw_modes, dict):
+            findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                    "`ameesh.interactive_permission.modes`: object mapping "
+                                    "modes to argument lists expected", path))
+        else:
+            for name, args in raw_modes.items():
+                parts = _strings(args)
+                if not (isinstance(name, str) and PERMISSION_MODE_RE.match(name)):
+                    findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                            "`ameesh.interactive_permission.modes`: mode "
+                                            "expected as key", path))
+                    continue
+                if not parts:
+                    findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                            "`ameesh.interactive_permission.modes.%s`: list of "
+                                            "strings expected" % name, path))
+                    continue
+                if any("{mode}" in part for part in parts):
+                    findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                            "`ameesh.interactive_permission.modes.%s`: fixed "
+                                            "arguments expected (no `{mode}`)" % name, path))
+                    continue
+                delivered.add(name)
     for key in ("default", "fallback"):
         mode = value.get(key)
         if mode is not None and not (isinstance(mode, str) and PERMISSION_MODE_RE.match(mode)):
@@ -1015,6 +1072,23 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
                 findings.append(Finding("harness-permission-mode-invalid", ERROR,
                                         "`ameesh.interactive_permission.%s`: %r not in "
                                         "`choices`" % (key, mode), path))
+    if not template:
+        # L685: without a `{mode}` template every mode of the contract must be
+        # delivered by `modes` — an undelivered choice would be silently ignored.
+        # Checked even when `modes` is empty (or absent): review r1 found
+        # `{"modes": {}, "choices": ["plan"], "default": "plan"}` passing
+        # validation and then normalizing to `{}` (nothing delivered).
+        for key in ("default", "fallback"):
+            mode = value.get(key)
+            if isinstance(mode, str) and mode and mode not in delivered:
+                findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                        "`ameesh.interactive_permission.%s`: %r is not delivered "
+                                        "by `modes`" % (key, mode), path))
+        for name in choices:
+            if name not in delivered:
+                findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                        "`ameesh.interactive_permission.choices`: %r is not "
+                                        "delivered by `modes`" % name, path))
     # codex r3 (#182): a reserved mode is never a default nor a fallback
     reserved = set(m for m in (_strings(value.get("explicit_only")) or []))
     reserved.update(ALWAYS_EXPLICIT_PERMISSION_MODES)
@@ -1033,7 +1107,9 @@ def _interactive_permission(value: Any) -> dict:
     if not isinstance(value, dict):
         return {}
     flag = _strings(value.get("flag")) or []
-    if not any("{mode}" in part for part in flag):
+    template = any("{mode}" in part for part in flag)
+    fixed = _permission_modes(value.get("modes"))
+    if not template and not fixed:
         return {}
 
     def mode(key: str) -> str:
@@ -1047,7 +1123,8 @@ def _interactive_permission(value: Any) -> dict:
 
     def unreserved(key: str) -> str:
         return "" if mode(key) in reserved else mode(key)
-    return {"flag": tuple(flag), "default": unreserved("default"),
+    return {"flag": tuple(flag) if template else (), "modes": tuple(sorted(fixed.items())),
+            "default": unreserved("default"),
             "fallback": unreserved("fallback"),
             "env": tuple(n for n in (_strings(value.get("env")) or []) if ENV_RE.match(n)),
             "choices": modes("choices"), "explicit_only": reserved}

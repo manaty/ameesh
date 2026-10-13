@@ -97,16 +97,27 @@ class Snapshots:
         return {n for n in names if n}
 
 
-def db_builder(cfg, *, since: str, stale_after: float, gantt: bool):
-    """La construction réelle : une connexion en lecture seule par instantané."""
+def db_builder(cfg, *, since: str, stale_after: float, gantt: bool,
+               versions: bool = True):
+    """La construction réelle : une connexion en lecture seule par instantané.
+
+    L160f (#497) : un seul lecteur GitHub pour tout le serveur (son cache
+    mémoire n'est pas reconstruit à chaque instantané). Le serveur lit GitHub
+    par le jeton (`GH_TOKEN`/`GITHUB_TOKEN`) : il n'appelle jamais la CLI
+    `gh` (mesh-design) ; sans jeton, la vue dit le manque."""
     ro = dataclasses.replace(cfg, read_only=True)
+    reader = None
+    if versions:
+        from . import versions as versions_mod
+        reader = versions_mod.Reader(allow_gh=False)
 
     def build(project):
         db = db_mod.connect(ro)
         try:
             db_mod.require_schema(db, defer=True)
             return db_mod.batched(db, lambda db: progress.snapshot(
-                db, ro, since=since, project=project, stale_after=stale_after, gantt=gantt))
+                db, ro, since=since, project=project, stale_after=stale_after, gantt=gantt,
+                github=reader))
         finally:
             db.close()
     return build
@@ -245,10 +256,11 @@ def url_of(server) -> str:
 
 
 def serve(cfg, *, port: int, since: str, stale_after: float, gantt: bool,
-          project: str | None = None, out=None) -> int:
+          project: str | None = None, versions: bool = True, out=None) -> int:
     """`ameesh progress --serve` : sert jusqu'à Ctrl-C."""
     out = out or sys.stdout
-    snapshots = Snapshots(db_builder(cfg, since=since, stale_after=stale_after, gantt=gantt))
+    snapshots = Snapshots(db_builder(cfg, since=since, stale_after=stale_after, gantt=gantt,
+                                     versions=versions))
     # une première lecture : base injoignable ou schéma absent, dit tout de suite
     snapshots.get(project)
     server = make_server(snapshots, port=port, project=project)

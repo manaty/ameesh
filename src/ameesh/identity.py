@@ -23,7 +23,7 @@ Une session a une identité si, et seulement si :
 Le dossier courant ne donne **jamais** d'identité : lire la documentation d'un
 autre agent dans son worktree ne doit pas consommer son courrier (incident
 mesh-design du 2026-10-09). Les alias restent, pour ce qu'ils sont : une
-convention d'affichage (chantier, barre d'état, diagnostic).
+convention d'affichage (workstream, barre d'état, diagnostic).
 """
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ class Binding:
 
 
 def aliases(cfg: Config) -> list[tuple[str, str, str]]:
-    """[(dossier réel, nom, chantier)] triés du préfixe le plus long au plus court."""
+    """[(dossier réel, nom, workstream)] triés du préfixe le plus long au plus court."""
     out: list[tuple[str, str, str]] = []
     try:
         with open(cfg.aliases_path, encoding="utf-8") as fh:
@@ -81,8 +81,8 @@ def aliases(cfg: Config) -> list[tuple[str, str, str]]:
                     continue
                 parts = line.split("\t")
                 if len(parts) >= 2 and parts[0] and parts[1]:
-                    chantier = parts[2] if len(parts) > 2 else ""
-                    out.append((os.path.realpath(os.path.expanduser(parts[1])), parts[0], chantier))
+                    workstream = parts[2] if len(parts) > 2 else ""
+                    out.append((os.path.realpath(os.path.expanduser(parts[1])), parts[0], workstream))
     except FileNotFoundError:
         pass
     return sorted(out, key=lambda t: -len(t[0]))
@@ -95,7 +95,7 @@ def legacy_name(cwd: str | None, cfg: Config) -> str:
     consomment rien et ne donnent aucune autorité.
     """
     real = os.path.realpath(cwd or os.getcwd())
-    for path, name, _chantier in aliases(cfg):
+    for path, name, _workstream in aliases(cfg):
         if real == path or real.startswith(path + os.sep):
             return name
     base = re.sub(r"[^A-Za-z0-9._-]", "-", os.path.basename(real) or "racine")
@@ -177,9 +177,9 @@ def _session_binding(cfg: Config, db, harness: str | None,
 
 
 def workstream_of(name: str, cfg: Config) -> str:
-    for _path, alias, chantier in aliases(cfg):
+    for _path, alias, workstream in aliases(cfg):
         if alias == name:
-            return chantier
+            return workstream
     return ""
 
 
@@ -187,7 +187,7 @@ def workstream_of(name: str, cfg: Config) -> str:
 chantier_of = workstream_of
 
 
-def write_alias(cfg: Config, name: str, directory: str, chantier: str = "") -> str:
+def write_alias(cfg: Config, name: str, directory: str, workstream: str = "") -> str:
     """Ajoute/remplace un alias sans jamais laisser le fichier à moitié écrit."""
     os.makedirs(cfg.config_dir, mode=0o700, exist_ok=True)
     path = os.path.realpath(os.path.expanduser(directory))
@@ -197,7 +197,7 @@ def write_alias(cfg: Config, name: str, directory: str, chantier: str = "") -> s
             for line in fh.read().splitlines():
                 if line.split("\t")[0] != name:
                     keep.append(line)
-    keep.append("\t".join([name, path] + ([chantier] if chantier else [])))
+    keep.append("\t".join([name, path] + ([workstream] if workstream else [])))
     fd, tmp = tempfile.mkstemp(dir=cfg.config_dir, prefix=".aliases.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

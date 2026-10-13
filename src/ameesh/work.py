@@ -126,7 +126,7 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
                            "\"%s\"; pass --actor <agent|human:id>" % UNKNOWN_ACTOR)
 
 
-def corrector(cfg, db, explicit: str | None = None) -> str:
+def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> str:
     """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
     si la correction lui est refusée.
 
@@ -137,7 +137,8 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
     fiche Agent au canon, `AMEESH_ALERT_ORCHESTRATORS`, ou lots confiés
     récemment) ; elle ne peut pas corriger au nom d'un autre. Une session sans
     identité d'agent (un humain à son terminal) dit qui corrige : `--actor
-    human:<id>`, un humain connu, ou un orchestrateur."""
+    human:<id>`, un humain connu, ou un orchestrateur. `history=False` (#740) :
+    les lots confiés récemment ne comptent pas, seul un rôle déclaré compte."""
     from . import assignments, identity, registry
 
     text = (explicit or "").strip()
@@ -155,7 +156,8 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
         if text and text != binding.name:
             raise WorkError("correction refused: this session belongs to %s, it does not "
                             "correct on behalf of %s" % (binding.name, text))
-        if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES):
+        if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES,
+                                       history=history):
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
@@ -166,9 +168,21 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
     if human:
         return human
     if registry.get(db, text) is not None \
-            and assignments.is_orchestrator(cfg, db, text, roles=CORRECTOR_ROLES):
+            and assignments.is_orchestrator(cfg, db, text, roles=CORRECTOR_ROLES,
+                                            history=history):
         return text
     raise WorkError(refus % text)
+
+
+def pin_authority(cfg, db, actor: str | None = None) -> str | None:
+    """#740: who may protect a date from the schedule (`work plan`, `work
+    schedule --pin`): the actor `corrector` accepts on a declared role (a
+    human, or an orchestrator or design role in the canon or
+    AMEESH_ALERT_ORCHESTRATORS; having assigned lots is not enough), or None."""
+    try:
+        return corrector(cfg, db, actor, history=False)
+    except WorkError:
+        return None
 
 
 def add(
@@ -193,6 +207,9 @@ def add(
     estimate=None,
     estimate_source: str | None = None,
     size: str | None = None,
+    note: str = "",
+    mark_item_id: int | None = None,
+    mark_note: str = "",
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -207,7 +224,11 @@ def add(
     posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
     un agent » est appliquée par les points d'entrée (`estimates.check`).
     L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
-    clé de la table de référence des durées."""
+    clé de la table de référence des durées.
+    #506: `note` is appended to the creation event (a project introduced
+    with --new-project). L539 : `mark_item_id` et `mark_note` écrivent la
+    marque d'idempotence du lot de relecture au journal de ce lot, dans la
+    même transaction que la création (`{lot}` y vaut l'identifiant créé)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -234,13 +255,15 @@ def add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
         budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
-        + ("; estimate: %s" % span(minutes * 60) if minutes else ""),
+        + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+        + ("; %s" % note if note else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
-        if minutes else None, change_size=size or None)
+        if minutes else None, change_size=size or None,
+        mark_item_id=mark_item_id, mark_note=mark_note)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
