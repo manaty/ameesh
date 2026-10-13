@@ -199,7 +199,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
-        'projects'
+        'projects',
+        -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
+        'workstream'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -546,7 +548,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- STATE, no content) and the per-target merge lease
     ('merge_queue', ARRAY[
         'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
-        'queued_by', 'queued_at', 'updated_at', 'source'
+        'queued_by', 'queued_at', 'updated_at', 'source',
+        -- L160e2 (0412): admission generation and frozen milestone identity
+        'generation', 'frozen_id'
     ]),
     ('merge_locks', ARRAY[
         'target', 'owner', 'epoch', 'expires_at'

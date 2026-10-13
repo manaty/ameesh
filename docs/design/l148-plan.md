@@ -552,9 +552,27 @@ Zero-downtime recipe, no applied migration touched:
    `alter table agent_registry add column if not exists workstream text not null default '';`
    backfill from `chantier`, then a `before insert or update` trigger keeping both columns in
    sync in both directions (last write wins on the pair). Old code keeps working unchanged.
+   **A (2026-10-12, #147)**: `src/ameesh/migrations/0410_rename_chantier_workstream.sql`
+   (number reserved by `ameesh work migration 147`) adds the column, backfills it, and
+   installs `agent_registry_workstream_sync`: whichever column is written is copied onto the
+   other, and the new name wins when one statement writes both differently. Tested by
+   `tests/test_l148_stage3_workstream.py` (both drivers).
 2. **PR B** — switch readers/writers to `workstream` in the free files first (`identity.py`,
    `projects.py`, `plan_github.py`, `stagnation.py`), and emit both `workstream` and `chantier`
    in the JSON listing (duplicate key, deprecated) so the progress page keeps working.
+   **B (2026-10-12, #147)**: the free reads of `storage/postgres/projects.py`,
+   `progress.py` and `mailbox.py` select `workstream` (plus `workstream AS chantier`, the
+   deprecated duplicate) and the project filter reads `workstream`; `decisions.py`'s
+   `register_chat` writes `workstream`. The free Python readers (`projects.agent_project`,
+   `progress.build_agent`, `decisions._project`, `plan_github.lot_project`) read `workstream`
+   then fall back to `chantier`, so a row that only carries the old key still works. The hot
+   writers/readers (`storage/postgres/registry.py`, `work.py`, `operations.py`,
+   `storage/interface.py`, `backend.py`, `fil.py`, `notify.py`, `alert_briefs.py`,
+   `exploitation.py`, `mesh_cli.py`, `reprise.py`, `runner.py`) still write and read
+   `chantier`, which the trigger mirrors; PR C switches them and drops the duplicate key.
+   Tested by
+   `tests/test_l148_stage3b_workstream_readers.py` (both drivers). `identity.py`'s
+   `chantier_of` was already renamed by stage 2c; `stagnation.py` reads no `chantier`.
 3. **PR C (later)** — switch the hot files when their PRs merge, stop emitting `chantier`, then
    **Migration D** drops the trigger and the `chantier` column after one release.
 

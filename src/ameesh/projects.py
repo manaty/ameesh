@@ -3,7 +3,7 @@
 
   ameesh projects [--json] [--project P] [--all]
 
-For each project (the agent's `team`, otherwise its `chantier`):
+For each project (the agent's `team`, otherwise its `workstream`):
 
 * its agents, with their state (working, paused, idle, stopped) and the
   reason for a pause or a stop, the current lot (the last open lot the
@@ -85,8 +85,10 @@ def _short(text, limit: int = TITLE_CHARS) -> str:
 
 
 def agent_project(row: dict) -> str | None:
-    """Le projet d'un agent : son équipe, à défaut son chantier."""
-    return _text(row.get("team")) or _text(row.get("chantier")) or None
+    """Le projet d'un agent : son équipe, à défaut son `workstream` (ancien
+    `chantier`, encore lu tant que des lecteurs ne sont pas renommés)."""
+    return (_text(row.get("team")) or _text(row.get("workstream"))
+            or _text(row.get("chantier")) or None)
 
 
 def lot_project(lot: dict, agent_projects: dict[str, str | None] | None = None) -> str | None:

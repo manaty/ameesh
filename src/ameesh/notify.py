@@ -106,7 +106,11 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
                  # #330: an owner key registered or replaced lately
-                 "owner_key_registered")
+                 "owner_key_registered",
+                 # L160e2: a merge queue no longer moves
+                 "merge_blocked",
+                 # #194 r6: a PR merged into a wrong base, or not checked
+                 "land_uncertain")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -178,6 +182,8 @@ TYPE_LABELS = {
     "waiting_without_question": "lot waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
+    "merge_blocked": "merge queue blocked",
+    "land_uncertain": "PR merged by ameesh into a wrong or unchecked base",
 
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
@@ -186,7 +192,7 @@ TYPE_LABELS = {
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing", "critical_budget_pause", "owner_key_registered")
+                "credential_failing", "critical_budget_pause", "owner_key_registered", "land_uncertain")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
