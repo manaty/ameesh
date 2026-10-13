@@ -336,6 +336,18 @@ def _primary_project(agent: dict) -> str:
     return names[0] if names else ""
 
 
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run):
+    from . import lot_workdir, work
+    reason = lot_workdir.problem(cfg, agent, project, canons=canons)
+    if reason is None:
+        return True
+    if not dry_run:
+        note = "L243-4: %s cannot pick up project %s: %s" % (agent["name"], project, reason)
+        if not any(e.get("note") == note for e in work.events(db, item["id"])):
+            work.note(db, item["id"], note, actor=SENDER)
+    return False
+
+
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
     """Les orchestrateurs du registre à prévenir d'une prise : ceux d'un des
     projets du lot, sinon tous."""
@@ -460,15 +472,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
-            # L243 : tant que le dossier de travail par lot n'existe pas
-            # (#811), la prise automatique reste sur le projet primaire — un
-            # lot d'un autre projet ne s'attribue qu'explicitement.
-            primary = _primary_project(agent)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"])):
                     continue
-                if (item.get("lot_team") or "").strip() != primary:
+                if not _directory_ready(cfg, db, agent, item,
+                                        (item.get("app") or item["lot_team"]).strip(),
+                                        canons=canons, dry_run=dry_run):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -520,15 +530,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not auditor_mod.may_take(agent, canons):
             continue
         auditors = auditor_mod.cards([agent], canons)
-        primary = _primary_project(agent)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"])):
                 continue
-            # L243 : même règle que les lots — un élément d'un autre projet
-            # attend une attribution explicite (#811).
             team = (item.get("team") or "").strip()
-            if team and team != primary:
+            if not _directory_ready(cfg, db, agent, item, (item.get("app") or team).strip(),
+                                    canons=canons, dry_run=dry_run):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
