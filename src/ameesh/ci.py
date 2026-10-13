@@ -25,7 +25,11 @@ chaque passage un relevé (`Watcher.tick`) :
    garde son `run_id` et change d'`run_attempt` (#901) : si GitHub la dit de
    nouveau en cours, sa ligne est rouverte et suivie jusqu'à son verdict ; un
    échec de l'attempt précédent qui n'est pas re-vu à la relance n'est plus
-   imputé à l'exécution, et un échec qui revient compte comme nouveau.
+   imputé à l'exécution, et un échec qui revient compte comme nouveau. Chaque
+   ligne publiée par `scripts/ci-flow.py` porte son attempt : tant que la
+   relance n'a pas republié son check run, celui de l'attempt précédent reste
+   le dernier de la tête et n'est pas relu ; une ligne sans marque vaut
+   attempt 1 et n'est jamais imputée à une relance.
 
 Courrier, de `ameesh` à l'assigné du lot, rangé dans le fil du lot, selon
 L125 :
@@ -87,9 +91,27 @@ class CiError(RuntimeError):
 # lecture des check runs
 # --------------------------------------------------------------------------
 
-def events_of(check_runs, run_id: int) -> list[dict]:
+def event_attempt(ev: dict) -> int:
+    """L'attempt qui a publié une ligne d'échec (#901) ; 1 si la ligne n'a pas
+    de marque (publiée avant le marquage) ou si elle est illisible : elle n'est
+    jamais imputée à une relance."""
+    try:
+        return max(1, int(ev.get("attempt") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def events_of(check_runs, run_id: int, attempt: int | None = None) -> list[dict]:
     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
-    la sortie des check runs « tests (flux) » d'une tête."""
+    la sortie des check runs « tests (flux) » d'une tête.
+
+    #901 : `ci-flow.py` marque chaque ligne publiée de son attempt GitHub.
+    Une relance garde le `run_id` : pendant qu'elle est en file, le dernier
+    check run publié est encore celui de l'attempt précédent. `attempt=None`
+    (le relevé) rend les lignes de tous les attempts, chacune avec sa
+    provenance (`event_attempt`) : le relevé les enregistre sous leur propre
+    attempt et n'impute à la relance que les lignes de l'attempt courant. Un
+    entier ne rend que les lignes de cet attempt."""
     out, seen = [], set()
     for check in check_runs or ():
         if not str(check.get("name") or "").startswith(CHECK_PREFIX):
@@ -109,7 +131,12 @@ def events_of(check_runs, run_id: int) -> list[dict]:
                 continue
             if ev.get("execution") is not None and str(ev["execution"]) != str(run_id):
                 continue
-            key = (str(ev.get("part") or ""), ev["test"])
+            if attempt is not None and event_attempt(ev) != int(attempt):
+                continue
+            # la clé porte l'attempt : un check de l'attempt précédent et celui
+            # de la relance peuvent coexister dans la réponse, aucun ne masque
+            # l'autre (#901)
+            key = (event_attempt(ev), str(ev.get("part") or ""), ev["test"])
             if key not in seen:
                 seen.add(key)
                 out.append(ev)
@@ -393,13 +420,18 @@ class Watcher:
         before = set(reference.get("tests") or ())
         new = []
         for ev in events:
+            source = event_attempt(ev)
             failure = {"part": str(ev.get("part") or ""), "test": ev["test"],
                        "module": ev.get("module") or "", "status": ev.get("statut"),
                        "inherited": ev["test"] in before,
                        "excerpt": ev.get("extrait") or "", "replay": ev.get("rejouer") or "",
                        "duration_s": ev.get("duree_s"), "failed_at": ev.get("ts")}
-            if st.ci.add_failure(repo, run_id, run_attempt=attempt, **failure):
-                new.append(failure)
+            if st.ci.add_failure(repo, run_id, run_attempt=source, **failure):
+                # une ligne de l'attempt précédent (check run pas encore
+                # republié par la relance) est enregistrée sous le sien, jamais
+                # imputée à l'attempt courant (#901)
+                if source == attempt:
+                    new.append(failure)
         own = [f for f in new if not f["inherited"]]
         if not own:
             return []

@@ -50,9 +50,12 @@ def ev_test(test, statut="echec", execution=101, part="psycopg 1/4", **extra):
                  "rejouer": "python -m unittest %s" % test}, **extra)
 
 
-def check_run(events, name="tests (flux) psycopg 1/4"):
-    """Un check run tel que GitHub le rend, sortie produite par ci-flow.py."""
-    return {"name": name, "output": ciflux.check_output(events)}
+def check_run(events, name="tests (flux) psycopg 1/4", attempt=1):
+    """Un check run tel que GitHub le rend, sortie produite par ci-flow.py.
+
+    `attempt` est celui de la part qui publie (#901) : GitHub ne rend, pour un
+    même nom, que le dernier check publié."""
+    return {"name": name, "output": ciflux.check_output(events, attempt)}
 
 
 # --------------------------------------------------------------------------
@@ -107,6 +110,30 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(ci.events_of([{"name": "tests (flux) p", "output": sortie}], 102), [])
         # un check run d'un autre nom est ignoré
         self.assertEqual(ci.events_of([{"name": "tests", "output": sortie}], 101), [])
+        # #901 : la sortie publiée à l'attempt 2 n'est relue que pour l'attempt
+        # 2 ; celle de l'attempt 1 (encore le dernier check publié tant que la
+        # relance n'a pas republié) n'est jamais imputée à la relance
+        relance = [{"name": "tests (flux) p 1/1", "output": ciflux.check_output(events, 2)}]
+        self.assertEqual([e["test"] for e in ci.events_of(relance, 101, 2)],
+                         ["tests.test_a.T.test_ko", "tests.test_a.T.test_err"])
+        self.assertEqual([e["attempt"] for e in ci.events_of(relance, 101, 2)], [2, 2])
+        self.assertEqual(ci.events_of(relance, 101, 1), [])
+        # sans filtre, le relevé voit toutes les lignes avec leur provenance
+        self.assertEqual([ci.event_attempt(e) for e in ci.events_of(relance, 101)], [2, 2])
+        # l'ancien check et celui de la relance, du même nom, ne se masquent pas
+        les_deux = [{"name": "tests (flux) p 1/1", "output": sortie},
+                    {"name": "tests (flux) p 1/1", "output": ciflux.check_output(events, 2)}]
+        self.assertEqual([ci.event_attempt(e) for e in ci.events_of(les_deux, 101)],
+                         [1, 1, 2, 2])
+        # une ligne publiée avant #901 (sans marque) vaut attempt 1 et n'est
+        # jamais imputée à une relance
+        sans_marque = {"name": "tests (flux) p 1/1",
+                       "output": {"text": ciflux.MARKER + "\n```jsonl\n"
+                                  + json.dumps(ev_test("tests.test_a.T.test_ko")) + "\n```"}}
+        self.assertEqual([e["test"] for e in ci.events_of([sans_marque], 101, 1)],
+                         ["tests.test_a.T.test_ko"])
+        self.assertEqual(ci.events_of([sans_marque], 101, 2), [])
+        self.assertEqual([ci.event_attempt(e) for e in ci.events_of([sans_marque], 101)], [1])
 
     def test_sortie_bornee(self):
         gros = "x" * 3000 + "\n"
@@ -464,7 +491,9 @@ class WatcherTest(PgTestCase):
 
     def test_relance_rouvre_la_ligne_et_suit_l_attempt(self):
         """`gh run rerun` garde le run_id et passe à l'attempt suivant : la
-        ligne conclue est rouverte, l'attempt suivi, le verdict envoyé."""
+        ligne conclue est rouverte, l'attempt suivi, le verdict envoyé. Tant
+        que la relance est en file, le check run de l'attempt 1 reste le
+        dernier publié : ses échecs ne sont pas imputés à l'attempt 2."""
         sha = "9" * 40
         # attempt 1 : un échec, puis annulation (le cas du seuil psql)
         self.api.live = [run_view(801, sha, "lot/1-un", attempt=1)]
@@ -477,16 +506,19 @@ class WatcherTest(PgTestCase):
         row = storage.of(self.db).ci.run(DEPOT, 801)
         self.assertEqual((row["status"], row["run_attempt"]), ("cancelled", 1))
         # relance : GitHub redit le même run `in_progress`, attempt 2 ; le
-        # check run de l'attempt 1 n'est plus le dernier publié (le nouveau
-        # job le remplace), la relance est rouverte sans message
+        # check run de l'attempt 1 est encore le dernier publié (le nouveau job
+        # n'a pas encore publié le sien) : sa ligne n'est pas relue
         self.api.live = [run_view(801, sha, "lot/1-un", attempt=2)]
-        self.api.checks[sha] = []
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["action"], o.get("attempt")) for o in out], [("rerun", 2)])
         row = storage.of(self.db).ci.run(DEPOT, 801)
         self.assertEqual((row["status"], row["run_attempt"]), ("running", 2))
+        self.assertEqual(len(self.mails("dev-a")), 1)  # l'ancien échec n'est pas relu
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
         # l'attempt 2 échoue à son tour sur le même test : signalé
-        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=801)])]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=801)],
+                                          attempt=2)]
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", True)])
         # l'attempt 2 est suivi : rien de neuf au relevé suivant
@@ -547,9 +579,11 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self.api.live, self.api.done[811] = [], {"status": "completed", "conclusion": "cancelled"}
         self.watcher.tick(self.db)
-        # relance : test_1 passe, test_2 échoue
+        # relance : test_1 passe, test_2 échoue (le nouveau check, marqué de
+        # l'attempt 2, remplace celui de l'attempt 1)
         self.api.live = [run_view(811, sha, "lot/1-un", attempt=2)]
-        self.api.checks[sha] = [check_run([ev_test("tests.test_b.T.test_2", execution=811)])]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_b.T.test_2", execution=811)],
+                                          attempt=2)]
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["action"], o.get("tests"), o.get("urgent")) for o in out],
                          [("rerun", None, None), ("failures", ["tests.test_b.T.test_2"], True)])
@@ -567,6 +601,45 @@ class WatcherTest(PgTestCase):
                              " WHERE repo = %s AND run_id = 811 ORDER BY test", (DEPOT,))
         self.assertEqual([(r["test"], r["run_attempt"]) for r in rows],
                          [("tests.test_a.T.test_1", 1), ("tests.test_b.T.test_2", 2)])
+
+    def test_rerun_failed_ne_relit_pas_les_parts_non_rejouees(self):
+        """`gh run rerun --failed` ne rejoue que les jobs en échec : les parts
+        non rejouées gardent leur check run de l'attempt 1 (un échec toléré y
+        figure). Il est enregistré sous son attempt, jamais imputé à la
+        relance ni re-signalé."""
+        sha = "a8" * 20
+        self.api.live = [run_view(812, sha, "lot/1-un")]
+        self.api.checks[sha] = [
+            check_run([ev_test("tests.test_a.T.test_1", execution=812)]),
+            check_run([ev_test("tests.test_b.T.test_2", execution=812)],
+                      name="tests (flux) psycopg 2/4")]
+        self.watcher.tick(self.db)
+        self.assertEqual(len(self.mails("dev-a")), 1)  # les deux échecs, attempt 1
+        self.api.live, self.api.done[812] = [], {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)  # verdict
+        self.assertEqual(len(self.mails("dev-a")), 2)
+        # relance --failed : la part en échec republie (attempt 2), l'autre
+        # garde son check de l'attempt 1
+        self.api.live = [run_view(812, sha, "lot/1-un", attempt=2)]
+        self.api.checks[sha] = [
+            check_run([ev_test("tests.test_a.T.test_1", execution=812)], attempt=2),
+            check_run([ev_test("tests.test_b.T.test_2", execution=812)],
+                      name="tests (flux) psycopg 2/4")]
+        avant = len([m for m in self.mails("dev-a") if "test_2" in m["body"]])
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("tests")) for o in out],
+                         [("rerun", None), ("failures", ["tests.test_a.T.test_1"])])
+        # l'échec de la part non rejouée n'est pas re-signalé...
+        self.assertEqual(len([m for m in self.mails("dev-a") if "test_2" in m["body"]]), avant)
+        self.assertNotIn("test_2", self.mails("dev-a")[-1]["body"])
+        # ...et l'attempt courant ne charge que la part rejouée
+        failures = storage.of(self.db).ci.failures(DEPOT, 812)
+        self.assertEqual([(f["test"], f["run_attempt"]) for f in failures],
+                         [("tests.test_a.T.test_1", 2)])
+        rows = self.db.query("SELECT test, run_attempt FROM ci_test_failures"
+                             " WHERE repo = %s AND run_id = 812 ORDER BY test", (DEPOT,))
+        self.assertEqual([(r["test"], r["run_attempt"]) for r in rows],
+                         [("tests.test_a.T.test_1", 2), ("tests.test_b.T.test_2", 1)])
 
     def test_relance_d_une_execution_remplacee_ne_la_ressuscite_pas(self):
         """La relance d'un run périmé (une tête plus récente est suivie) ne

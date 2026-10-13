@@ -118,6 +118,10 @@ class CiResults(interface.CiResults):
 
     def add_failure(self, repo, run_id, *, run_attempt, part, test, module, status, inherited,
                     excerpt, replay, duration_s, failed_at) -> bool:
+        # `run_attempt < excluded` : un événement d'un attempt antérieur (le
+        # check run de l'attempt précédent, pas encore republié par la relance)
+        # ne réécrit jamais une ligne de l'attempt courant — le témoin ne
+        # recule pas (#901).
         rows = self.db.query(
             """
             INSERT INTO ci_test_failures
@@ -130,7 +134,7 @@ class CiResults(interface.CiResults):
                    excerpt = excluded.excerpt, replay = excluded.replay,
                    duration_s = excluded.duration_s, failed_at = excluded.failed_at,
                    message_id = NULL, recorded_at = now()
-             WHERE ci_test_failures.run_attempt <> excluded.run_attempt
+             WHERE ci_test_failures.run_attempt < excluded.run_attempt
             RETURNING test
             """,
             (repo, int(run_id), int(run_attempt), part or "", test, module or "",

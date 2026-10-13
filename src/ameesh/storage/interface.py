@@ -2852,7 +2852,9 @@ class CiResults(Domain):
                     duration_s: float | None, failed_at: str | None) -> bool:
         """Enregistre un échec de l'attempt `run_attempt` ; False s'il l'était
         déjà (même part, même test, même attempt). Un échec de l'attempt
-        précédent re-vu à la relance reprend la ligne et compte comme nouveau."""
+        précédent re-vu à la relance reprend la ligne et compte comme nouveau ;
+        un événement d'un attempt antérieur ne réécrit jamais la ligne d'un
+        attempt postérieur (#901)."""
 
     @abc.abstractmethod
     def set_failure_message(self, repo: str, run_id: int, run_attempt: int,
