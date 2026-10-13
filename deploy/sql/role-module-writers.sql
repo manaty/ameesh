@@ -2,6 +2,8 @@
 -- Apply after migration 0363, as the schema/migration owner.
 -- These NOLOGIN groups belong to separate protected service logins, NEVER
 -- to executor logins. Credentials and canon/code are isolated at the OS level.
+-- Revoke PUBLIC TEMP on the database separately before applying this script.
+-- The audit rejects effective TEMP, including grants inherited from PUBLIC.
 \set ON_ERROR_STOP on
 BEGIN;
 SELECT current_schema() AS schema \gset
@@ -42,6 +44,9 @@ BEGIN
         END IF;
         IF has_schema_privilege(r.oid, current_schema(), 'CREATE') THEN
             RAISE EXCEPTION 'module writer groups must not create or own schema objects';
+        END IF;
+        IF has_database_privilege(r.oid, current_database(), 'TEMP') THEN
+            RAISE EXCEPTION 'module writer groups must not create temporary objects (including PUBLIC grants)';
         END IF;
         IF EXISTS (SELECT 1 FROM pg_roles p WHERE p.oid <> r.oid AND pg_has_role(r.oid, p.oid, 'MEMBER')) THEN
             RAISE EXCEPTION 'module writer groups must not inherit another role';

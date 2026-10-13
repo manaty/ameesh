@@ -161,6 +161,22 @@ class RoleExecutorTest(PgTestCase):
                                        "-f", script], capture_output=True, text=True, timeout=60,
                                       env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
                 self.assertEqual(proc.returncode, 0, proc.stderr)
+            # This class has a private database: never mutate shared bench ACLs.
+            for grantee in (*names, "PUBLIC"):
+                with self.subTest(temp_grantee=grantee):
+                    target = "PUBLIC" if grantee == "PUBLIC" else q(grantee)
+                    self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                    (q(self.database), target))
+                    try:
+                        proc = subprocess.run(
+                            ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                             "-f", script], capture_output=True, text=True, timeout=60,
+                            env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                        self.assertNotEqual(proc.returncode, 0)
+                        self.assertIn("must not create temporary objects", proc.stderr)
+                    finally:
+                        self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                        (q(self.database), target))
             self.assertEqual(self.run_script(self.role).returncode, 0)
             for name in names:
                 self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
