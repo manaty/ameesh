@@ -2,6 +2,7 @@
 """Connection retention, transaction isolation and capacity warning (#653)."""
 import importlib.util
 import copy
+import contextlib
 from pathlib import Path
 import json
 import types
@@ -271,7 +272,7 @@ class OperatorRecipe(unittest.TestCase):
         except ImportError:
             self.skipTest('operator recipe requires psycopg')
         from ameesh import config as config_mod
-        for failure in ('dsn', 'version', 'write', 'verify', 'start'):
+        for failure in ('dsn', 'cleanup', 'version', 'write', 'verify', 'start'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory)
                 original = home / '.config/ameesh/config.json'
@@ -293,9 +294,39 @@ class OperatorRecipe(unittest.TestCase):
                 conn.pgconn.password = b'fake-secret'
                 conn.pgconn.ssl_in_use = True
 
-                def compile_fake(_home):
+                real_compile = self.recipe.compile_binary
+                real_temporary = tempfile.TemporaryDirectory
+                cleanup_failed = False
+
+                @contextlib.contextmanager
+                def temporary_with_failed_cleanup(*args, **kwargs):
+                    nonlocal cleanup_failed
+                    with real_temporary(*args, **kwargs) as directory:
+                        yield directory
+                    if not cleanup_failed:
+                        cleanup_failed = True
+                        raise OSError('simulated TemporaryDirectory cleanup failure')
+
+                def extract_fake(directory, **kwargs):
+                    source = Path(directory) / f'pgbouncer-{self.recipe.VERSION}'
+                    source.mkdir()
+                    (source / 'pgbouncer').write_bytes(b'fake pinned binary')
+
+                def compile_fake(_home, create):
+                    if failure == 'cleanup':
+                        # Exercise the real compile function, including binary
+                        # creation followed by an exception from context exit.
+                        with mock.patch.object(self.recipe.tempfile, 'TemporaryDirectory',
+                                               side_effect=temporary_with_failed_cleanup), \
+                                mock.patch.object(self.recipe, 'urlopen') as download, \
+                                mock.patch.object(self.recipe.hashlib, 'sha256') as digest, \
+                                mock.patch.object(self.recipe.tarfile, 'open') as archive:
+                            download.return_value.__enter__.return_value.read.return_value = b'archive'
+                            digest.return_value.hexdigest.return_value = self.recipe.SHA256
+                            archive.return_value.__enter__.return_value.extractall.side_effect = extract_fake
+                            return real_compile(_home, create)
                     binary.parent.mkdir(parents=True, exist_ok=True)
-                    self.recipe.write_new(binary, b'fake pinned binary', 0o755)
+                    create(binary, b'fake pinned binary', 0o755)
 
                 real_write = self.recipe.write_new
                 def fail_write(path, content, mode=0o600):
@@ -329,6 +360,10 @@ class OperatorRecipe(unittest.TestCase):
                     self.assertEqual(sentinel.read_text(), 'keep')
                     if failure == 'dsn':
                         build.assert_not_called()
+                    if failure == 'cleanup':
+                        self.assertTrue(cleanup_failed)
+                        self.assertFalse(any(call.args[0][0] == str(binary)
+                                             for call in version.call_args_list))
                     if failure == 'start':
                         self.assertIn(mock.call(['systemctl', '--user', 'stop',
                                                 'ameesh-pgbouncer.service']), command.call_args_list)
@@ -336,6 +371,7 @@ class OperatorRecipe(unittest.TestCase):
                     command.side_effect = None
                     self.recipe.install(home, state, config)
                     self.assertTrue(binary.exists())
+                    self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
                     self.assertTrue(unit.exists())
                     self.assertEqual(original.read_bytes(), raw)
 

@@ -84,7 +84,7 @@ def run(argv):
     subprocess.run(argv, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def compile_binary(home):
+def compile_binary(home, create):
     # A private on-disk TMPDIR is supplied by the operator, never a hardcoded
     # shared memory path. Source download is capped at 32 MiB.
     root = Path(os.environ['TMPDIR'])
@@ -106,7 +106,8 @@ def compile_binary(home):
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         destination = home / '.local/bin/pgbouncer'
         destination.parent.mkdir(parents=True, exist_ok=True)
-        write_new(destination, (source_dir / 'pgbouncer').read_bytes(), 0o755)
+        # Record ownership before TemporaryDirectory cleanup can raise.
+        create(destination, (source_dir / 'pgbouncer').read_bytes(), 0o755)
 
 
 def userlist_quote(value):
@@ -179,13 +180,12 @@ def install(home, state, config):
     created = []
     start_attempted = False
 
-    def create(path, content):
-        write_new(path, content)
+    def create(path, content, mode=0o600):
+        write_new(path, content, mode)
         created.append(path)
 
     try:
-        compile_binary(home)
-        created.append(binary)
+        compile_binary(home, create)
         # Only the binary just built from the pinned archive may be executed.
         result = subprocess.run([str(binary), '--version'],
                                 capture_output=True, text=True, check=True)
