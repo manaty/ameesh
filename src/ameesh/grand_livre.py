@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 
 from . import ledger as _ledger
+from .ledger import add_parser, main  # noqa: F401 - re-export the checker follows
 
 if __name__ == "__main__":
     print("usage: ameesh cost correct [--apply] [--since 30d] [--json]", file=sys.stderr)
