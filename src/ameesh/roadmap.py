@@ -163,21 +163,34 @@ def _date(text: str | None) -> _dt.date | None:
 _UNSET = object()
 
 
-def _hand_source(current: dict, dates: dict, source: str | None, actor: str) -> str | None:
-    """The source of a date set by hand on a task (#704).
+def _hand_source(db, current: dict, dates: dict, source: str | None,
+                 actor: str) -> tuple[str | None, str | None]:
+    """The source of a date set by hand on a task (#704), and a warning when
+    that date stays unprotected (#740).
 
     Without `--source`, the stored source is kept as it is. When the planner
     (`work schedule --apply`) dated the task, that source is the planner's, and
     its next pass would overwrite the date set by hand: the date then records
-    who set it. A source written by a person stays. Only the start and the
-    end count: the planner never writes the delivery date."""
+    who set it, if the start or the end really changes (resubmitting the
+    current dates pins nothing) and if the actor may pin a date: a human, an
+    orchestrator or a design agent (`work.pin_authority`). Another agent's
+    date is written and stays the planner's, with a warning. A source written
+    by a person stays. Only the start and the end count: the planner never
+    writes the delivery date."""
     from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
 
-    if source is not None or (dates.get("start") is None and dates.get("end") is None):
-        return source
-    if str(current.get("planned_source") or "").startswith(SOURCE):
-        return "set by %s" % (actor or "hand")
-    return source
+    if source is not None or not str(current.get("planned_source") or "").startswith(SOURCE):
+        return source, None
+    if not any(dates.get(key) is not None
+               and dates[key] != (str(current.get("planned_" + key) or "")[:10] or None)
+               for key in ("start", "end")):
+        return source, None
+    who = work_mod.pin_authority(getattr(db, "cfg", None), db, actor)
+    if who is None:
+        return source, ("date not protected: %s is neither a human, an orchestrator nor a "
+                        "design agent, so the next work schedule --apply may move it; ask "
+                        "the orchestrator to set it" % (actor or "this session"))
+    return "set by %s" % who, None
 
 
 def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str | None = None,
@@ -199,11 +212,14 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
         if current is None:
             raise RoadmapError("task %s not found" % text)
         _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
-        source = _hand_source(current, dates, source, actor)
+        source, warning = _hand_source(db, current, dates, source, actor)
         row = st.roadmap.plan_item(int(text), dates, source=source, actor=actor)
         if row is None:
             raise RoadmapError("task %s not found" % text)
-        return {"target": int(text), "kind": "task", "plan": row}
+        out = {"target": int(text), "kind": "task", "plan": row}
+        if warning:
+            out["warning"] = warning
+        return out
     package = st.packages.get(text)
     if package is None:
         raise RoadmapError("neither a task nor a WorkPackage: %r (a task: its number; a "

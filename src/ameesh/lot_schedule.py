@@ -32,7 +32,15 @@ analysis of past lots (the owner's rule, L157b). Without `--apply`, nothing
 is written. `--apply` writes the dates of the lots without planned dates or
 whose dates came from this schedule (`planned_source` starting with
 `SOURCE`); dates set by a person are kept (`--force` overwrites them) and
-their lot still takes its place in the queue.
+their lot still takes its place in the queue. A lot is written only while
+its dates are still those the schedule read (#740): a date set while the
+schedule was being applied stays.
+
+`--pin` (#740): a date set by hand before #704 still carries `SOURCE`, and
+nothing stored tells it from a date the schedule wrote. Without ids, the
+lots dated with `SOURCE` and who dated them (dry run); with ids, a human,
+an orchestrator or a design agent keeps those lots' dates (`set by <who
+dated them>`).
 
 `work add --assignee A` schedules the new lot this way when a reference
 table is published.
@@ -134,7 +142,8 @@ def plan_queue(lots: list[dict], plans: dict, body: dict | None, agent: dict | N
                  "pinned": pin is not None,
                  "current": {"planned_start": plan.get("planned_start"),
                              "planned_end": plan.get("planned_end"),
-                             "planned_source": plan.get("planned_source")}}
+                             "planned_source": plan.get("planned_source"),
+                             "planned_by": plan.get("planned_by")}}
         d = duration(lot, body, agent)
         if d is None:
             entry.update(basis=None, start_ts=None, end_ts=None, planned_start=None,
@@ -221,11 +230,57 @@ def apply(db, schedule: dict, *, force: bool = False, only=None, actor: str = ""
             source = "%s (%s)" % (
                 SOURCE, "table #%s" % ref["id"] if entry["basis"] == "reference" and ref
                 else "lot estimate")
-            st.roadmap.plan_item(entry["id"], {"start": entry["planned_start"],
-                                               "end": entry["planned_end"]},
-                                 source=source, actor=actor)
-            written.append(dict(entry, source=source))
+            row = st.roadmap.plan_item(entry["id"], {"start": entry["planned_start"],
+                                                     "end": entry["planned_end"]},
+                                       source=source, actor=actor, expect=entry["current"])
+            if row is not None:     # None: changed since the schedule read it (#740)
+                written.append(dict(entry, source=source))
     return written
+
+
+def _dated_by_schedule(plan: dict) -> bool:
+    return bool(plan.get("planned_start") or plan.get("planned_end")) \
+        and str(plan.get("planned_source") or "").startswith(SOURCE)
+
+
+def pin_candidates(schedule: dict) -> list[dict]:
+    """#740: the lots of the schedule whose dates carry `SOURCE` (written by
+    the schedule, or set by hand before #704), with who dated them and
+    whether the next `--apply` would move them. Reads only."""
+    return [{"id": e["id"], "title": e["title"], "state": e["state"],
+             "assignee": queue["assignee"], "planned_start": e["current"]["planned_start"],
+             "planned_end": e["current"]["planned_end"],
+             "planned_source": e["current"]["planned_source"],
+             "planned_by": e["current"].get("planned_by"), "moves": _writable(e, False)}
+            for queue in schedule["queues"] for e in queue["lots"]
+            if _dated_by_schedule(e["current"])]
+
+
+def pin(db, ids, *, actor: str = "") -> list[dict]:
+    """#740: keeps the dates of these lots from the schedule: their source
+    becomes `set by <who dated them>`. Only a lot dated with `SOURCE`, and
+    only if it did not change since it was read. WorkError unless the actor
+    is a human, an orchestrator or a design agent (`work.corrector`).
+    Returns `{id, status, …}` per lot: pinned, skipped, changed or unknown."""
+    actor = work_mod.corrector(getattr(db, "cfg", None), db, actor)
+    st = storage.of(db)
+    plans = {int(p["id"]): p for p in st.roadmap.item_plans([int(i) for i in ids])}
+    out = []
+    for lot in (int(i) for i in ids):
+        plan = plans.get(lot)
+        if plan is None:
+            out.append({"id": lot, "status": "unknown"})
+        elif not _dated_by_schedule(plan):
+            out.append({"id": lot, "status": "skipped",
+                        "reason": "not dated by the schedule (source: %s)"
+                                  % (plan.get("planned_source") or "none")})
+        else:
+            source = "set by %s" % (plan.get("planned_by") or actor)
+            row = st.roadmap.plan_item(lot, {}, source=source, actor=actor, expect=plan)
+            out.append({"id": lot, "status": "pinned", "source": source} if row is not None
+                       else {"id": lot, "status": "changed",
+                             "reason": "changed since it was read: run it again"})
+    return out
 
 
 def schedule_new(db, item: dict, *, actor: str = "", now: float | None = None) -> dict | None:

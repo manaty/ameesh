@@ -461,7 +461,8 @@ class PinRepairPgTest(PgTestCase):
         storage.of(self.db).roadmap.plan_item(self.legacy, {"start": "2030-01-01",
                                                             "end": "2030-01-02"},
                                               source=None, actor="orchestrateur")
-        storage.of(self.db).roadmap.plan_item(self.other, {"start": "2030-03-01"},
+        storage.of(self.db).roadmap.plan_item(self.other, {"start": "2030-03-01",
+                                                           "end": "2030-03-02"},
                                               source="decision #1", actor="orchestrateur")
 
     def _plan(self, lot):

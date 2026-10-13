@@ -171,6 +171,15 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
     raise WorkError(refus % text)
 
 
+def pin_authority(cfg, db, actor: str | None = None) -> str | None:
+    """#740: who may protect a date from the schedule (`work plan` without
+    --source, `work schedule --pin`): the actor `corrector` accepts, or None."""
+    try:
+        return corrector(cfg, db, actor)
+    except WorkError:
+        return None
+
+
 def add(
     db: Db,
     *,
