@@ -79,12 +79,16 @@ Pourquoi chaque clé (au regard des conditions de l'orchestrateur) :
 * `generated: backend/domains.json` — le fichier produit par
   `scripts/domains-export.mjs` est **régénéré à chaque fusion**, jamais pris
   d'une fusion ni de `rerere`, puis vérifié : une résolution `rerere` d'un
-  fichier généré serait fausse en silence (condition 3) ;
+  fichier généré serait fausse en silence (condition 3). Vérifié le 13/10 sur
+  l'instantané de `develop` `c3b51be63` : la régénération sans `--check`
+  réécrit `backend/domains.json` **à l'identique**, puis `--check` passe ;
 * `gates` — deux portes **locales courtes**, exécutées sur l'arbre fusionné
   (conditions 4, repli « portes locales ») : `domains-export --check`
   (backend/domains.json en phase) et `check-rollbacks.mjs` (chaque migration
-  numérotée a son document de retour). Pur Node, quelques secondes, aucun
-  accès base ; la CI GitHub reste le **préalable d'entrée en file** (une PR
+  numérotée a son document de retour). Pur Node, aucun accès base, aucun
+  `npm install` ; mesurées le 13/10 sur le même instantané : 0,09 s
+  (324 tables / 55 modules) et 0,05 s (385 migrations / 241 rollbacks), les
+  deux vertes. La CI GitHub reste le **préalable d'entrée en file** (une PR
   dont la CI n'est pas verte sur la tête gelée est refusée par
   `ameesh work queue add`) ;
 * `land: "pr"` — ameesh fusionne lui-même la tête de file par l'API, méthode
