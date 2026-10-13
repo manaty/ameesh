@@ -163,7 +163,6 @@ def _date(text: str | None) -> _dt.date | None:
 _UNSET = object()
 
 
-_MARKER = "set by "
 _AUTHORITY = ("only a human, an orchestrator or a design agent may: a person at a "
               "terminal passes --actor human:<id>, an agent asks the orchestrator")
 
@@ -189,14 +188,14 @@ def _hand_source(db, current: dict, dates: dict, source: str | None,
     "set by" marker, needs the same authority; without it the stored source
     stays, with a warning. Only the start and the end count: the planner
     never writes the delivery date."""
-    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+    from .lot_schedule import MARKER, SOURCE  # lot_schedule imports work, not this module
 
     stored = str(current.get("planned_source") or "")
     cfg = getattr(db, "cfg", None)
     warnings = []
     if source is not None and source != stored and (
             source.startswith(SOURCE) != stored.startswith(SOURCE)
-            or source.startswith(_MARKER) or stored.startswith(_MARKER)):
+            or source.startswith(MARKER) or stored.startswith(MARKER)):
         if work_mod.pin_authority(cfg, db, actor) is None:
             warnings.append("source %r not recorded: it would change who owns the dates, "
                             "and %s may not (%s)" % (source, actor or "this session",
@@ -213,7 +212,7 @@ def _hand_source(db, current: dict, dates: dict, source: str | None,
                         "schedule --apply may move it" % (actor or "this session",
                                                           _AUTHORITY))
         return None, "; ".join(warnings)
-    return _MARKER + who, "; ".join(warnings) or None
+    return MARKER + who, "; ".join(warnings) or None
 
 
 def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str | None = None,

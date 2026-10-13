@@ -56,6 +56,8 @@ from . import work as work_mod
 SCHEMA = "ameesh-schedule/1"
 #: `planned_source` of the dates written by the schedule
 SOURCE = "reference p80"
+#: `planned_source` of dates a person set, or cleared, on purpose (#704, #740)
+MARKER = "set by "
 #: open lots read at most per state
 LOT_LIMIT = 1000
 #: priority of a lot without one (normal)
@@ -177,8 +179,12 @@ def _writable(entry: dict, force: bool) -> bool:
     if force:
         return True
     source = cur.get("planned_source") or ""
-    return (not cur.get("planned_start") and not cur.get("planned_end")) \
-        or source.startswith(SOURCE)
+    if source.startswith(SOURCE):
+        return True
+    # a lot without dates is the schedule's, unless a person cleared them on
+    # purpose: its source then says who (#740)
+    return not cur.get("planned_start") and not cur.get("planned_end") \
+        and not source.startswith(MARKER)
 
 
 def build(db, *, assignee: str | None = None, now: float | None = None,
@@ -276,7 +282,7 @@ def pin(db, ids, *, actor: str = "") -> list[dict]:
                         "reason": "not dated by the schedule (source: %s)"
                                   % (plan.get("planned_source") or "none")})
         else:
-            source = "set by %s" % (plan.get("planned_by") or actor)
+            source = MARKER + (plan.get("planned_by") or actor)
             row = st.roadmap.plan_item(lot, {}, source=source, actor=actor, expect=plan)
             out.append({"id": lot, "status": "pinned", "source": source} if row is not None
                        else {"id": lot, "status": "changed",

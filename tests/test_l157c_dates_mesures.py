@@ -490,6 +490,15 @@ class PinAuthorityPgTest(PgTestCase):
         lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="orch")
         self.assertEqual(str(self._plan()["planned_start"])[:10], "2030-01-01")
 
+    def test_clearing_both_dates_by_hand_is_kept(self):
+        # r2: the "set by" marker protects an intentional clearing too
+        roadmap.plan(self.db, self.lot, start="-", end="-", actor="human:test")
+        self.assertEqual(self._plan()["planned_source"], "set by human:test")
+        lot_schedule.apply(self.db, lot_schedule.build(self.db), actor="orch")
+        plan = self._plan()
+        self.assertEqual((plan["planned_start"], plan["planned_end"], plan["planned_source"]),
+                         (None, None, "set by human:test"))
+
     def test_clearing_a_date_is_a_change(self):
         # r1 (3): `--end -` is a change of the end
         out = roadmap.plan(self.db, self.lot, end="-", actor="dev1")
