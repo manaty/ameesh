@@ -758,10 +758,15 @@ jobs:
       # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
       # restait in_progress pour toujours. On relit l'état terminal réel du job
       # et de l'exécution qui l'ont publié ; jamais `success` sans ligne `fin`,
-      # aucun check actif, d'une autre tête ou d'une autre tentative n'est touché.
+      # aucun check dont l'exécution est encore active, ni d'une autre tête,
+      # n'est touché.
       # `continue-on-error` : cette réconciliation ne change jamais le verdict
       # requis « tests » (comme la publication, elle n'est pas une cause d'échec).
+      # `if: always()` : un bilan rouge (une part requise tombée) ne doit pas
+      # sauter le checkout — sinon `sweep`, lancé en `always()`, n'a plus son
+      # script et aucun check orphelin n'est conclu.
       - uses: actions/checkout@v4
+        if: always()
         continue-on-error: true
       - name: conclusion des checks de flux orphelins
         if: always()

@@ -5,14 +5,15 @@ Un runner arrêté (saturation #747) tue le publisher de `scripts/ci-flow.py
 publish` *et* l'étape `close` : le check restait `in_progress` pour toujours et
 la PR ne pouvait plus paraître verte. `sweep` relit l'état terminal réel du job
 et de l'exécution qui ont publié le check (par son `details_url`) et conclut
-`cancelled` — jamais `success`, faute de ligne `fin`. Aucun check actif, d'une
-autre tête ou d'une autre tentative n'est touché.
+`cancelled` — jamais `success`, faute de ligne `fin`. Aucun check dont
+l'exécution est encore active, ni d'une autre tête, n'est touché.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import pathlib
+import re
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -170,9 +171,9 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual([m[0] for m in gh.maj], [11, 12])
         self.assertEqual(len(gh.lectures), 1)
 
-    def test_autre_tentative_active_non_touchee(self):
-        """Seul l'orphelin de la tentative terminale est conclu ; le check de
-        la tentative active qui porte le même nom reste ouvert."""
+    def test_autre_execution_active_non_touchee(self):
+        """Seul l'orphelin de l'exécution terminale est conclu ; le check de
+        l'exécution encore active qui porte le même nom reste ouvert."""
         ancienne = check(ident=11, execution=500)
         active = check(ident=12, execution=501)
         gh = FauxGitHub([ancienne, active], par_execution={
@@ -244,6 +245,29 @@ class PaginationTest(unittest.TestCase):
     def test_execution_lue_dans_le_details_url(self):
         self.assertEqual(ciflux._execution_of(check()), EXECUTION)
         self.assertIsNone(ciflux._execution_of(check(details=False)))
+
+
+class WorkflowTest(unittest.TestCase):
+    """Un bilan rouge ne saute pas la réconciliation (#856)."""
+
+    def test_bilan_rouge_laisse_le_checkout_puis_le_sweep_tourner(self):
+        texte = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        debut = texte.index("\n  tests:\n")
+        suivant = re.compile(r"\n  [#\w]").search(texte, debut + 1)
+        job = texte[debut:suivant.start() if suivant else len(texte)]
+        bilan = job.index("- name: bilan des parts")
+        sweep = job.index("- name: conclusion des checks de flux orphelins")
+        self.assertIn("if: always()", job[sweep:],
+                      "sweep doit tourner même quand le bilan est rouge")
+        checkouts = [m.start() for m in re.finditer(r"- uses: actions/checkout@v4", job)]
+        avant = [i for i in checkouts if i < sweep]
+        self.assertTrue(avant, "sweep lit scripts/ci-flow.py : un checkout doit précéder")
+        dernier = avant[-1]
+        # La garde implicite success() saute une étape après un échec : soit le
+        # checkout est placé avant le bilan, soit il lève la garde `if: always()`,
+        # sinon sweep (en always()) tourne sans son script et ne conclut rien.
+        self.assertTrue(dernier < bilan or "if: always()" in job[dernier:sweep],
+                        "bilan rouge : le checkout doit rester `if: always()`")
 
 
 if __name__ == "__main__":
