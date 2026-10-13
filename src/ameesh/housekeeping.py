@@ -910,7 +910,11 @@ def _prune_empty_dirs(top: str, device: int | None = None) -> None:
     plus haut, sans traverser un point de montage. Un dossier dont le `st_dev`
     n'est pas celui de la racine gérée (`device`) est laissé en place, lui et
     son sous-arbre : `os.rmdir` échoue de toute façon sur un point de montage,
-    mais on ne l'ouvre même pas."""
+    mais on ne l'ouvre même pas.
+
+    #500 r4 (codex P2 r3) : un dossier porteur d'un marqueur git — et tout son
+    sous-arbre — n'est ni parcouru ni retiré : une éviction ne doit pas vider
+    l'intérieur d'un arbre de travail protégé."""
     if device is None:
         try:
             device = os.lstat(top).st_dev
@@ -920,12 +924,14 @@ def _prune_empty_dirs(top: str, device: int | None = None) -> None:
     while stack:
         current, post = stack.pop()
         if post:
-            if current != top:
+            if current != top and not _git_protected(current):
                 try:
                     os.rmdir(current)    # échoue si le dossier n'est pas vide
                 except OSError:
                     pass
             continue
+        if _git_protected(current):
+            continue                     # arbre de travail : ni entré ni élagué
         stack.append((current, True))
         try:
             with os.scandir(current) as it:
@@ -996,6 +1002,22 @@ def _git_marker_at(fd: int, directory: str) -> str | None:
         return None
     gitdir = os.path.join(directory, line[len("gitdir:"):].strip())
     return "root" if os.path.isdir(gitdir) else None
+
+
+def _git_protected(directory: str) -> bool:
+    """#500 r4 (codex P2 r3) : `_prune_empty_dirs` doit laisser intact un
+    sous-arbre protégé par un marqueur git. Même règle que le scan
+    (`_git_marker_at` : un worktree mort reste évincable) ; fail-closed, un
+    dossier qu'on ne peut pas ouvrir n'est pas élagué."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return True
+    try:
+        return _git_marker_at(fd, directory) is not None
+    finally:
+        os.close(fd)
 
 
 def _check_open_dir(fd: int, directory: str, device: int | None) -> None:
@@ -1101,7 +1123,11 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     (`device`), and every candidate is re-verified just before its unlink
     (`_unlink_in_root`) — replaced, gone, under a `.git` marker that appeared,
     or on another filesystem: skipped, counted neither as evicted nor as
-    unremovable, and a git marker or a mount leaves its whole subtree alone."""
+    unremovable, and a git marker or a mount leaves its whole subtree alone.
+    #500 r4 (codex P2 r3): the bytes of a candidate that is gone or whose
+    subtree became protected leave `counted` with it, so the pass stops as
+    soon as what is still evictable fits the quota (and the empty-directory
+    pruning never enters such a subtree)."""
     now = time.time() if now is None else float(now)
     try:
         root_dev = os.stat(root).st_dev
@@ -1148,6 +1174,12 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 break
             if any(path == d or path.startswith(d.rstrip("/") + os.sep)
                    for d in protected):
+                # #500 r4 (codex P2 r3): the subtree became protected during
+                # the pass (`.git` appeared, mount point): its bytes are not
+                # evictable any more, so they leave `counted` too — otherwise
+                # newer files would be evicted although what is still
+                # evictable already fits the quota.
+                counted -= size
                 continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
                 continue
@@ -1168,8 +1200,14 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     # #500 r3: the candidate changed between the scan and the
                     # unlink: skipped, without being counted. A git marker or a
                     # mount protects every candidate of that subtree.
+                    # #500 r4 (codex P2 r3): a candidate gone, or under a
+                    # marker/mount that appeared, leaves `counted` as well; a
+                    # candidate merely replaced is still there and stays
+                    # counted (a later pass sees the replacement).
                     if exc.reason in ("git marker", "mount point"):
                         protected.append(exc.path)
+                    if exc.reason in ("gone", "git marker", "mount point"):
+                        counted -= size
                     continue
                 except OSError:
                     unremovable += size

@@ -308,6 +308,9 @@ class EvictionTest(unittest.TestCase):
     def test_git_marker_appearing_before_the_unlink_protects_the_subtree(self):
         # r3 (codex P1): a `.git` that appears in a directory opened on the way
         # to the unlink leaves that whole subtree out of the eviction
+        # r4 (codex P2 r3): the protected bytes leave `counted` too, so the
+        # newer `loose` is not evicted: what is still evictable (1 block)
+        # already fits the quota (1 block)
         repo = os.path.join(self.mine, "repo")
         files = [os.path.join(repo, "f%d" % i) for i in range(2)]
         for i, path in enumerate(files):
@@ -325,9 +328,32 @@ class EvictionTest(unittest.TestCase):
         with mock.patch.object(menage, "_unlink_in_root", appearing):
             result = menage.evict_lru([self.mine], self.root, B)
         self.assertTrue(all(os.path.exists(path) for path in files))
-        self.assertFalse(os.path.exists(loose))
-        self.assertEqual(result["files"], 1)
-        self.assertEqual(result["evicted"], B)
+        self.assertTrue(os.path.exists(loose))           # quota already held
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["evicted"], 0)
+        self.assertFalse(result["over_quota"])
+
+    def test_candidate_gone_mid_pass_frees_its_bytes(self):
+        # r4 (codex P2 r3): a candidate that disappeared between the scan and
+        # the unlink must not keep its bytes in `counted`: the next file is
+        # not evicted to make up for a file that is no longer there
+        ours = [os.path.join(self.mine, "o%d" % i) for i in range(2)]
+        for i, path in enumerate(ours):
+            _write(path, age_s=(10 - i) * HOUR)          # o0 is the oldest
+        real = menage._unlink_in_root
+
+        def vanishing(path, root, **kw):
+            if path == ours[0]:
+                os.unlink(path)                          # gone on its own
+            return real(path, root, **kw)
+
+        with mock.patch.object(menage, "_unlink_in_root", vanishing):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertFalse(os.path.exists(ours[0]))
+        self.assertTrue(os.path.exists(ours[1]))         # quota already held
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["evicted"], 0)
+        self.assertFalse(result["over_quota"])
 
     def test_scan_and_unlink_refuse_a_foreign_filesystem(self):
         # r3 (codex P1): every opened directory must be on the managed root's
@@ -363,6 +389,28 @@ class EvictionTest(unittest.TestCase):
         self.assertEqual(result["files"], 0)
         self.assertEqual(result["before"], 0)
         self.assertTrue(os.path.exists(outside))
+
+    def test_prune_never_enters_a_git_protected_tree(self):
+        # r4 (codex P2 r3): after an eviction, the empty-directory pruning must
+        # not touch a work tree protected by its `.git` marker; an unprotected
+        # empty directory is still pruned
+        repo = os.path.join(self.base, "repo-prune")
+        os.makedirs(repo)
+        _git("init", "-q", "-b", "main", cwd=repo)
+        _git("commit", "-q", "--allow-empty", "-m", "racine", cwd=repo)
+        tree = os.path.join(self.mine, "wt")
+        _git("worktree", "add", "-q", tree, cwd=repo)
+        keep = os.path.join(tree, "src", "empty")
+        os.makedirs(keep)
+        prune = os.path.join(self.mine, "scratch", "empty")
+        os.makedirs(prune)
+        loose = os.path.join(self.mine, "loose")
+        _write(loose)
+        result = menage.evict_lru([self.mine], self.root, 0)
+        self.assertEqual(result["files"], 1)
+        self.assertFalse(os.path.exists(loose))
+        self.assertTrue(os.path.isdir(keep), "the work tree was pruned")
+        self.assertFalse(os.path.exists(prune), "an unprotected empty directory is pruned")
 
     def test_sparse_file_counts_only_the_blocks_it_occupies(self):
         # r3 (codex P2): st_blocks*512 always, 0 meaning 0 — a 1 TB sparse file
