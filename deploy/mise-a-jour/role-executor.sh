@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Reapply an existing executor role after migrations, as the migration owner.
-# Usage: role-executor.sh '<owner DSN>' [executor-role]
+# Usage: [PGPASSWORD=…] role-executor.sh '<owner DSN>' [executor-role]
 # PGOPTIONS must select the mesh schema. Never prints the DSN or creates logins.
+# #518: give the DSN without its password, and the password in PGPASSWORD (or
+# ~/.pgpass), which psql reads: a command line is readable by every process of
+# the host. `poste.sh role` does so.
 set -euo pipefail
 owner_dsn=${1:?Usage: role-executor.sh '<owner DSN>' [executor-role]}
 executor_role=${2:-ameesh_executor}

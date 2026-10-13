@@ -757,47 +757,167 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
 # tailles, éviction et suppression sûre
 # --------------------------------------------------------------------------
 
-def _files(top: str, limit: int = WALK_LIMIT):
-    """(chemin, taille, mtime) des fichiers sous `top`, sans suivre les liens
-    ni changer de système de fichiers ; s'arrête à `limit` fichiers."""
-    try:
-        device = os.lstat(top).st_dev
-    except OSError:
-        return
-    count = 0
+def _used_bytes(st) -> int:
+    """#500 r3 (codex P2) : octets qu'un fichier occupe réellement.
+
+    Toujours `st_blocks * 512` : un 0 rapporté veut dire 0 (fichier vide ou
+    entièrement creux), jamais « inconnu » — l'ancien repli sur `st_size`
+    comptait un fichier creux d'1 To à sa taille logique, le faisait évincer
+    lui et tout ce qui le suivait. Sur une plateforme qui ne rapporte pas
+    `st_blocks` (Windows), la taille logique est la seule mesure."""
+    blocks = getattr(st, "st_blocks", None)
+    if blocks is None or platform.is_windows():
+        return st.st_size
+    return blocks * 512
+
+
+def _mount_points(root: str) -> set | None:
+    """#500 r5 (codex P1 r4) : les points de montage SOUS la racine gérée,
+    lus dans `/proc/self/mountinfo` (champ 5, `platform.mountinfo`). Un bind
+    mount d'un dossier extérieur, sur le MÊME système de fichiers, garde le
+    même `st_dev` : la table des montages est le seul moyen de le voir.
+
+    Rend `None` quand la table est illisible sur Linux : fail-closed, la
+    descente et l'élagage sont refusés (on ne peut pas distinguer un dossier
+    monté d'un dossier géré). Hors Linux, ensemble vide : pas de mountinfo, la
+    frontière reste `st_dev`."""
+    if not platform.is_linux():
+        return set()
+    entries = platform.mountinfo()
+    if not entries:
+        return None          # Linux a toujours au moins « / » : table illisible
+    real = os.path.realpath(root).rstrip(os.sep) or os.sep
+    prefix = real if real.endswith(os.sep) else real + os.sep
+    out: set = set()
+    for entry in entries:
+        point = str(entry.get("point") or "").rstrip(os.sep) or os.sep
+        if point != real and point.startswith(prefix):
+            out.add(point)
+    return out
+
+
+def _is_mount_point(directory: str, mounts: set | None) -> bool:
+    """#500 r5 : `directory` est un point de montage de `mounts` (comparaison
+    de chemins : on ne `stat` pas un dossier qu'un montage peut cacher).
+
+    #500 r6 (codex P1 r5) : `mounts` ne contient que des chemins canoniques
+    (mountinfo) ; `normpath` ne résout pas un ancêtre symbolique (`/state` →
+    `/disk/state`), donc la marche par `/state/...` ne verrait pas le montage.
+    Comparaison sur `realpath` : un dossier dont l'ancêtre est un lien est vu
+    comme le montage qu'il cache."""
+    if not mounts:
+        return False
+    return os.path.realpath(directory) in mounts
+
+
+def _files(top: str, limit: int | None = None, *, state: dict | None = None,
+           protect_git: bool = False, device: int | None = None,
+           mounts: set | None = None):
+    """(chemin, taille, mtime, stat) des fichiers sous `top`, sans suivre les
+    liens ni changer de système de fichiers ; s'arrête à `limit` entrées
+    comptées — fichiers rendus ET dossiers à ouvrir (#530) — (défaut
+    `WALK_LIMIT`) et le dit alors dans `state["truncated"]` si `state` est
+    fourni.
+
+    #500 : les octets d'un même inode (liens durs) ne comptent qu'une fois ;
+    la taille est celle des blocs occupés (`_used_bytes`). Avec `state`, tous
+    les noms de l'inode vus par la marche sont gardés dans `state["links"]`
+    (l'éviction les retire tous avant de compter les octets, #500 r6).
+    #530 : la racine et chaque dossier empilé consomment le budget comme un
+    fichier, sinon un arbre de 10 001 dossiers se parcourait entièrement avec
+    `WALK_LIMIT = 3`.
+    Avec `protect_git`, un dossier qui porte un marqueur git est reconnu AVANT
+    d'en lister les fichiers et n'est pas parcouru : sa racine est ajoutée à
+    `state["protected"]`, donc le sous-arbre n'est jamais évincé, même quand
+    la marche s'arrête à `limit` avant de l'avoir atteint.
+
+    #500 r3 (codex P1) : `device` (le `st_dev` de la racine gérée) est exigé
+    pour chaque entrée — un point de montage apparu dans le dossier n'est ni
+    parcouru ni compté. Le `stat` de l'entrée est rendu avec la taille, pour
+    que l'éviction le revérifie juste avant l'unlink.
+
+    #500 r5 (codex P1 r4) : `mounts` (`_mount_points`) nomme les points de
+    montage SOUS la racine gérée — un bind mount d'un dossier extérieur garde
+    le même `st_dev` ; un tel dossier n'est ni parcouru ni compté, et il est
+    ajouté à `state["protected"]` (marqueur `mount`)."""
+    limit = WALK_LIMIT if limit is None else limit
+    if device is None:
+        try:
+            device = os.lstat(top).st_dev
+        except OSError:
+            return
+    count = 1                          # #530 : la racine se consomme aussi
+    seen: set = set()
     stack = [top]
     while stack:
         current = stack.pop()
+        if _is_mount_point(current, mounts):
+            if state is not None:
+                state.setdefault("protected", []).append(
+                    {"path": current, "marker": "mount"})
+            continue
+        if protect_git:
+            marker = _git_marker(current)
+            if marker is not None:
+                if state is not None:
+                    state.setdefault("protected", []).append(
+                        {"path": marker[1], "marker": marker[0]})
+                continue
         try:
             with os.scandir(current) as it:
                 for entry in it:
+                    if count >= limit:
+                        # #530 : budget épuisé alors que des entrées restent à
+                        # lire : la liste est partielle
+                        if state is not None:
+                            state["truncated"] = True
+                            state.setdefault("truncated_paths", []).append(top)
+                        return
                     try:
                         st = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
-                    if stat.S_ISDIR(st.st_mode):
-                        if st.st_dev == device:
-                            stack.append(entry.path)
+                    if st.st_dev != device:  # #500 r3: mount point, never crossed
                         continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(entry.path)
+                        count += 1       # #530 : un dossier à ouvrir se consomme
+                        continue
+                    inode = (st.st_dev, st.st_ino)
+                    # #500 r6 (codex P2 r5): every name of the inode seen by
+                    # the walk is kept, so the eviction can remove them all
+                    # before counting the bytes (a link left behind means the
+                    # bytes were not freed).
+                    names = state.setdefault("links", {}).setdefault(inode, []) \
+                        if state is not None else None
+                    if names is not None:
+                        names.append(entry.path)
+                    if inode in seen:            # #500: hard link, counted once
+                        continue
+                    seen.add(inode)
                     count += 1
-                    yield entry.path, st.st_blocks * 512 if st.st_blocks else st.st_size, \
-                        st.st_mtime
-                    if count >= limit:
-                        return
+                    yield entry.path, _used_bytes(st), st.st_mtime, st
         except OSError:
             continue
 
 
 def size_of(path: str, limit: int = WALK_LIMIT) -> int:
     """Octets occupés sous `path` (fichier ou dossier), bornés à `limit`
-    fichiers ; 0 si illisible."""
+    entrées comptées (#530 : fichiers et dossiers) ; 0 si illisible."""
     try:
         st = os.lstat(path)
     except OSError:
         return 0
     if not stat.S_ISDIR(st.st_mode):
-        return st.st_blocks * 512 if st.st_blocks else st.st_size
-    return sum(size for _p, size, _m in _files(path, limit))
+        return _used_bytes(st)
+    return sum(size for _p, size, _m, _st in _files(path, limit))
+
+
+def _in_subtree(path: str, directory: str) -> bool:
+    """#500 r5 : `path` est `directory` lui-même ou l'un de ses descendants
+    (frontière de chemin, sans `stat`)."""
+    directory = directory.rstrip(os.sep)
+    return path == directory or path.startswith(directory + os.sep)
 
 
 def _located_in(path: str, root: str) -> bool:
@@ -813,6 +933,19 @@ def _located_in(path: str, root: str) -> bool:
 
 class RefusedDeletion(RuntimeError):
     """Suppression refusée : hors des dossiers gérés."""
+
+
+class StaleCandidate(Exception):
+    """#500 r3 : le candidat n'est plus ce que l'énumération a vu — contenu
+    remplacé ou disparu, marqueur `.git` apparu dans un dossier ouvert, ou
+    dossier sorti du système de fichiers de la racine. Il est sauté, sans être
+    compté (ni évincé, ni irrécupérable). `path` est le dossier à protéger
+    (marqueur git, montage) ou le candidat lui-même ; `reason` dit lequel."""
+
+    def __init__(self, path: str, reason: str):
+        super().__init__("%s: %s" % (reason, path))
+        self.path = path
+        self.reason = reason
 
 
 def _safe_rmtree(path: str, root: str) -> int:
@@ -846,13 +979,225 @@ def _clear_dir(directory: str, root: str) -> int:
     return freed
 
 
-def _prune_empty_dirs(top: str) -> None:
-    for current, dirs, files in os.walk(top, topdown=False):
-        if current != top and not dirs and not files:
+def _prune_empty_dirs(top: str, device: int | None = None, *,
+                      mounts: set | None = None,
+                      limit: int | None = None) -> None:
+    """#500 r3 : retire les dossiers vidés par une éviction, du plus profond au
+    plus haut, sans traverser un point de montage. Un dossier dont le `st_dev`
+    n'est pas celui de la racine gérée (`device`) est laissé en place, lui et
+    son sous-arbre : `os.rmdir` échoue de toute façon sur un point de montage,
+    mais on ne l'ouvre même pas.
+
+    #500 r4 (codex P2 r3) : un dossier porteur d'un marqueur git — et tout son
+    sous-arbre — n'est ni parcouru ni retiré : une éviction ne doit pas vider
+    l'intérieur d'un arbre de travail protégé.
+
+    #500 r5 (codex P1 r4) : `mounts` (`_mount_points`) nomme les points de
+    montage sous la racine gérée ; aucun n'est parcouru ni retiré, même quand
+    le bind mount garde le `st_dev` de la racine.
+
+    #530 : au plus `limit` dossiers ouverts (défaut `WALK_LIMIT`), la racine
+    comprise. Passé ce budget, l'élagage ne liste ni n'ouvre plus de dossier :
+    les dossiers déjà empilés restent candidats au `rmdir` (ils sont vides ou
+    non), les autres sont laissés en place. L'élagage est un nettoyage de
+    confort, jamais une condition de l'éviction."""
+    limit = WALK_LIMIT if limit is None else limit
+    if device is None:
+        try:
+            device = os.lstat(top).st_dev
+        except OSError:
+            return
+    visited = 1                          # #530 : la racine compte
+    stack = [(top, False)]
+    while stack:
+        current, post = stack.pop()
+        if post:
+            if current != top and not _git_protected(current) \
+                    and not _is_mount_point(current, mounts):
+                try:
+                    os.rmdir(current)    # échoue si le dossier n'est pas vide
+                except OSError:
+                    pass
+            continue
+        if _git_protected(current) or _is_mount_point(current, mounts):
+            continue         # arbre de travail ou montage : ni entré ni élagué
+        stack.append((current, True))
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if visited >= limit:
+                        break            # #530 : budget épuisé, on n'ouvre plus
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(st.st_mode) and st.st_dev == device:
+                        stack.append((entry.path, False))
+                        visited += 1
+        except OSError:
+            continue
+
+
+def _git_marker(directory: str) -> tuple[str, str] | None:
+    """#500 : le marqueur git d'un dossier, lu AVANT d'en lister les fichiers :
+    `("root", dossier)` pour un clone (`.git` est un dossier) ou un worktree
+    lié (`.git` est un fichier dont le `gitdir:` existe) ; `("symlink",
+    dossier)` pour un `.git` qui est un lien symbolique — jamais suivi, le
+    sous-arbre est protégé par prudence et signalé ; None sinon, dont un
+    worktree dont le gitdir a disparu (il est évincable, comme avant).
+    La règle est celle de `_git_marker_at`, lue ici relativement au chemin."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return None
+    try:
+        marker = _git_marker_at(fd, directory)
+    finally:
+        os.close(fd)
+    return (marker, directory) if marker else None
+
+
+def _git_marker_at(fd: int, directory: str) -> str | None:
+    """#500 r3 : le marqueur git du dossier ouvert `fd` (« root », « symlink »,
+    ou None), avec la MÊME règle que le scan : un `.git` régulier dont le
+    `gitdir:` a disparu n'est pas un marqueur (le worktree mort reste
+    évincable), un `.git` illisible est protecteur (fail-closed). Lu
+    relativement au descripteur, sans repasser par le chemin : un dossier
+    remplacé entre le scan et l'unlink ne peut pas tromper ce contrôle."""
+    try:
+        st = os.stat(".git", dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "symlink"               # illisible : protecteur, jamais suivi
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink"
+    if stat.S_ISDIR(st.st_mode):
+        return "root"
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    marker_fd = None
+    try:
+        marker_fd = os.open(".git", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=fd)
+        with os.fdopen(marker_fd, encoding="utf-8", errors="replace") as fh:
+            marker_fd = None           # fdopen owns it from here
+            line = fh.readline(4096).strip()
+    except OSError:
+        return "symlink"               # illisible : protecteur
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = os.path.join(directory, line[len("gitdir:"):].strip())
+    return "root" if os.path.isdir(gitdir) else None
+
+
+def _git_protected(directory: str) -> bool:
+    """#500 r4 (codex P2 r3) : `_prune_empty_dirs` doit laisser intact un
+    sous-arbre protégé par un marqueur git. Même règle que le scan
+    (`_git_marker_at` : un worktree mort reste évincable) ; fail-closed, un
+    dossier qu'on ne peut pas ouvrir n'est pas élagué."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return True
+    try:
+        return _git_marker_at(fd, directory) is not None
+    finally:
+        os.close(fd)
+
+
+def _check_open_dir(fd: int, directory: str, device: int | None) -> None:
+    """#500 r3 : le dossier ouvert `fd` est-il encore dans la racine gérée —
+    même système de fichiers (`device`), aucun marqueur `.git` apparu ? Sinon
+    `StaleCandidate` : on n'évince rien dans ce sous-arbre."""
+    if device is not None:
+        try:
+            current = os.fstat(fd).st_dev
+        except OSError:
+            current = None
+        if current != device:
+            raise StaleCandidate(directory, "mount point")
+    if _git_marker_at(fd, directory):
+        raise StaleCandidate(directory, "git marker")
+
+
+def _unlink_in_root(path: str, root: str, *, expected=None,
+                    device: int | None = None) -> bool:
+    """#500 : retire `path` relativement à `root` : chaque composant est ouvert
+    avec `O_DIRECTORY|O_NOFOLLOW`, puis `os.unlink(nom, dir_fd=fd)`. Un dossier
+    parent remplacé par un lien symbolique entre la vérification `_located_in`
+    et la suppression ne peut donc plus faire sortir la suppression de la
+    racine gérée (ELOOP/ENOTDIR, l'appelant reclasse le fichier). Lève OSError
+    aussi si `path` n'est pas sous `root`.
+
+    #500 r3 (codex P1) : juste avant l'unlink, `os.stat(nom, dir_fd=fd,
+    follow_symlinks=False)` est comparé à `expected` (`(st_dev, st_ino,
+    st_mtime_ns, st_size)` du scan) ; toute différence, un `.git` apparu dans
+    un dossier ouvert, ou un dossier dont le `st_dev` n'est plus celui de la
+    racine (`device`) lève `StaleCandidate` au lieu de supprimer.
+
+    #530 (codex r2 P2) : rend True quand l'allocation de l'inode est
+    réellement libérée — `st_nlink == 1` au contrôle frais, donc le nom retiré
+    était le dernier. False quand un autre lien dur garde l'inode (ou sans
+    `expected`, faute de preuve) : l'appelant ne crédite alors aucun octet.
+
+    Résiduels, hors modèle de menace : un montage substitué APRÈS ce contrôle
+    demanderait des droits de montage ; un dossier parent déplacé hors de la
+    racine après son ouverture demanderait un processus malveillant de même
+    UID dans le TMPDIR de l'agent (comme #414) ; de même, un lien dur créé
+    entre ce `stat` et l'unlink peut faire créditer des octets encore
+    occupés — la suppression, elle, reste dans la racine."""
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    parts = [part for part in rel.split(os.sep) if part]
+    if not parts or any(part == os.pardir for part in parts):
+        raise OSError("path outside the managed root: %s" % path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(root, flags)
+    freed = False
+    try:
+        opened = root
+        _check_open_dir(fd, opened, device)
+        for part in parts[:-1]:
+            following = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = following
+            opened = os.path.join(opened, part)
+            _check_open_dir(fd, opened, device)
+        if expected is not None:
+            target = os.path.join(root, *parts)
             try:
-                os.rmdir(current)
+                st = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
             except OSError:
-                pass
+                raise StaleCandidate(target, "gone") from None
+            if (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size) != (
+                    expected.st_dev, expected.st_ino, expected.st_mtime_ns,
+                    expected.st_size):
+                raise StaleCandidate(target, "changed")
+            freed = st.st_nlink == 1      # #530: dernier nom de l'inode ?
+        os.unlink(parts[-1], dir_fd=fd)
+    finally:
+        os.close(fd)
+    return freed
+
+
+def _removable(path: str, uid: int | None, writable: dict) -> bool:
+    """#500: this pass can unlink `path`: owned by us (any owner when the
+    platform has no uid) and its directory writable (cached in `writable`)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if uid is not None and st.st_uid != uid:
+        return False
+    parent = os.path.dirname(path)
+    if parent not in writable:
+        writable[parent] = os.access(parent, os.W_OK | os.X_OK)
+    return writable[parent]
 
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
@@ -861,37 +1206,369 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
 
     Un fichier modifié depuis moins de `min_age` n'est jamais évincé (il est
     peut-être en écriture) : le quota peut donc rester dépassé, et c'est dit
-    (`over_quota`). Rend `{before, after, evicted, files, over_quota}`."""
+    (`over_quota`).
+
+    #500: only what this pass can remove counts toward the quota (owned by
+    us, directory writable, outside a git work tree); the rest is reported
+    (`unremovable`, `worktrees`). When the unremovable part alone exceeds the
+    quota, nothing is evicted (`blocked`): before, root-owned leftovers kept
+    the total over the quota and every turn end emptied the agent's directory.
+    A git subtree is recognised before its files are listed (so WALK_LIMIT can
+    no longer hide it) and is never evicted. When the listing is truncated by
+    `WALK_LIMIT`, nothing is evicted at all (`truncated`, alerted): the pass
+    cannot prove what is removable. Rend `{before, after, evicted, files,
+    over_quota, unremovable, worktrees, worktree_symlinks, truncated,
+    truncated_paths, failed, blocked, mounts_unreadable}`.
+
+    #500 r3 (codex P1): the scan never leaves the managed root's filesystem
+    (`device`), and every candidate is re-verified just before its unlink
+    (`_unlink_in_root`) — replaced, gone, under a `.git` marker that appeared,
+    or on another filesystem: skipped, counted neither as evicted nor as
+    unremovable, and a git marker or a mount leaves its whole subtree alone.
+    #500 r4 (codex P2 r3): the bytes of a candidate that is gone or whose
+    subtree became protected leave `counted` with it, so the pass stops as
+    soon as what is still evictable fits the quota (and the empty-directory
+    pruning never enters such a subtree). #500 r5 (codex P1/P2 r4): a mount
+    point under the managed root (`_mount_points`, same `st_dev` for a bind
+    mount) is neither crossed nor pruned, and the whole remaining subtree of a
+    candidate that became protected leaves `counted` at once. When the mount
+    table is unreadable on Linux (`mounts_unreadable`), nothing is scanned,
+    evicted or pruned: fail-closed. #500 r6 (codex P1/P2 r5): a mount point is
+    recognised through a symlinked ancestor (`realpath`, mountinfo is
+    canonical), and every name of a hard-linked inode inside the root is
+    removed before its bytes leave `counted` — a link left behind frees
+    nothing.
+
+    #530 (codex r2): the unremovable bytes are classified and reported even
+    when the total is under the quota (they exist, so they are said, without
+    alerting when the quota holds); and the bytes of a hard-linked inode are
+    credited only when its LAST name goes (`st_nlink == 1` at the fresh check
+    before the unlink; dry-run reads it from the scan) — a name the walk did
+    not see (protected subtree, another root, another filesystem) keeps the
+    inode counted and reported as unremovable."""
     now = time.time() if now is None else float(now)
+    try:
+        root_dev = os.stat(root).st_dev
+    except OSError:
+        root_dev = None
+    mounts = _mount_points(root)
+    if mounts is None:
+        return {"before": 0, "after": 0, "evicted": 0, "files": 0,
+                "over_quota": False, "unremovable": 0, "worktrees": [],
+                "worktree_symlinks": [], "truncated": False,
+                "truncated_paths": [], "failed": [], "blocked": False,
+                "mounts_unreadable": True}
+    scan: dict = {}
     found = []
     for directory in directories:
+        if scan.get("truncated"):
+            break                      # the listing is partial: no eviction (below)
         if os.path.isdir(directory) and not os.path.islink(directory):
-            found.extend(_files(directory))
-    before = sum(size for _p, size, _m in found)
+            found.extend(_files(directory, state=scan, protect_git=True,
+                                device=root_dev, mounts=mounts))
+    before = sum(size for _p, size, _m, _st in found)
     total, evicted, files = before, 0, 0
-    if before > quota:
+    unremovable = 0
+    blocked = False
+    truncated = bool(scan.get("truncated"))
+    failed: list[str] = []
+    # a protected subtree is left out of the scan itself: one git root per
+    # subtree, the nested ones would never be reached (kept for safety)
+    roots = sorted({m["path"] for m in scan.get("protected", ()) if m["marker"] == "root"})
+    worktrees = [r for r in roots
+                 if not any(r.startswith(o + "/") for o in roots if o != r)]
+    symlinks = sorted({m["path"] for m in scan.get("protected", ())
+                       if m["marker"] == "symlink"})
+    counted = before
+    uid = os.geteuid() if hasattr(os, "geteuid") else None
+    writable: dict = {}
+    candidates: list = []
+    if not truncated:
+        # #530: classify even under the quota — the foreign bytes are reported
+        # as soon as they exist instead of reading as zero until the quota is
+        # exceeded (the journal line says them without raising the alert).
+        # A truncated listing is not classified: a partial walk proves nothing,
+        # and the `truncated` entry is the one that alerts.
+        for item in found:
+            if not _removable(item[0], uid, writable):
+                unremovable += item[1]
+            else:
+                candidates.append(item)
+        counted = before - unremovable
+    if not truncated and before > quota:
         if not dry_run and not _managed(root):
             raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
-        for path, size, mtime in sorted(found, key=lambda item: item[2]):
-            if total <= quota:
+        blocked = unremovable > quota
+        protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
+        uncounted: set = set()         # #500 r5: candidates already out of `counted`
+        order = sorted(candidates, key=lambda item: item[2])
+        for index, (path, size, mtime, st) in enumerate(order):
+            if blocked or counted <= quota:
                 break
+            if any(_in_subtree(path, d) for d in protected):
+                # #500 r4 (codex P2 r3): the subtree became protected during
+                # the pass (`.git` appeared, mount point): its bytes are not
+                # evictable any more, so they leave `counted` too — otherwise
+                # newer files would be evicted although what is still
+                # evictable already fits the quota. r5 excludes the remaining
+                # candidates of the subtree at once (below), so this branch
+                # normally sees bytes that are still counted.
+                if path not in uncounted:
+                    counted -= size
+                    uncounted.add(path)
+                continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
                 continue
+            # #500: a candidate whose deletion is refused (path no longer in
+            # the root, or unlink failed) is reclassified as unremovable and
+            # STOPS the eviction: never a more recent file deleted to make up
+            # for a failure.
             if not _located_in(path, root):
-                continue
+                unremovable += size
+                counted -= size
+                blocked = unremovable > quota
+                failed.append(path)
+                break
+            freed = st.st_nlink == 1   # #530: dry-run, read from the scan's stat
             if not dry_run:
+                # #500 r6 (codex P2 r5): an inode with hard links is counted
+                # once, but it can still have several names inside the managed
+                # root. Removing only one leaves the bytes in place while
+                # `counted` drops, so the pass stops believing it freed them.
+                # Every name the scan saw goes first; the bytes only leave
+                # `counted` once none is left. A name that cannot be removed
+                # keeps the whole inode counted, and stops the pass like any
+                # other refused deletion.
+                others = [p for p in (scan.get("links") or {}).get(
+                    (st.st_dev, st.st_ino), ()) if p != path and _located_in(p, root)]
+                kept = False
+                for other in others:
+                    try:
+                        _unlink_in_root(other, root, expected=st, device=root_dev)
+                    except StaleCandidate as exc:
+                        kept = kept or exc.reason != "gone"
+                    except OSError:
+                        kept = True
+                if kept:
+                    unremovable += size
+                    counted -= size
+                    blocked = unremovable > quota
+                    failed.append(path)
+                    break
                 try:
-                    os.unlink(path)
-                except OSError:
+                    freed = _unlink_in_root(path, root, expected=st,
+                                            device=root_dev)
+                except StaleCandidate as exc:
+                    # #500 r3: the candidate changed between the scan and the
+                    # unlink: skipped, without being counted. A git marker or a
+                    # mount protects every candidate of that subtree.
+                    # #500 r4 (codex P2 r3): a candidate gone, or under a
+                    # marker/mount that appeared, leaves `counted` as well; a
+                    # candidate merely replaced is still there and stays
+                    # counted (a later pass sees the replacement).
+                    # #500 r5 (codex P2 r4): the WHOLE remaining subtree leaves
+                    # `counted` at once — otherwise a later candidate of it
+                    # still counts and a file outside is evicted to make up for
+                    # bytes that are already out of reach.
+                    if exc.reason in ("git marker", "mount point"):
+                        protected.append(exc.path)
+                        for other, other_size, _m, _st in order[index:]:
+                            if _in_subtree(other, exc.path) and other not in uncounted:
+                                counted -= other_size
+                                uncounted.add(other)
+                    elif exc.reason == "gone" and path not in uncounted:
+                        counted -= size
+                        uncounted.add(path)
                     continue
-            total -= size
-            evicted += size
+                except OSError:
+                    unremovable += size
+                    counted -= size
+                    blocked = unremovable > quota
+                    failed.append(path)
+                    break
             files += 1
-        if not dry_run:
+            if freed:
+                # #530: a name removed from an inode another hard link still
+                # holds frees no byte; only the last link credits the quota.
+                total -= size
+                counted -= size
+                evicted += size
+            else:
+                # #530: every name the walk saw is gone, but the inode still
+                # has one it did not see (a protected subtree, another managed
+                # root, or outside the root): the bytes are not freed, so they
+                # leave `counted` and are reported as unremovable. Not in
+                # `failed`: the deletion itself was not refused.
+                unremovable += size
+                counted -= size
+                blocked = unremovable > quota
+        if not dry_run and files:
             for directory in directories:
-                _prune_empty_dirs(directory)
+                _prune_empty_dirs(directory, root_dev, mounts=mounts)
     return {"before": before, "after": total, "evicted": evicted, "files": files,
-            "over_quota": total > quota}
+            "over_quota": counted > quota, "unremovable": unremovable,
+            "worktrees": worktrees, "worktree_symlinks": symlinks,
+            "truncated": truncated, "truncated_paths": scan.get("truncated_paths") or [],
+            "failed": failed, "blocked": blocked, "mounts_unreadable": False}
+
+
+def tmp_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
+    """#500, #530: what the previous journal line for `path` says about the
+    episode this pass belongs to, so that `--follow` announces one alert per
+    episode and not one per pass:
+
+    * `since` — first observation of the episode (carried from line to line
+      while the previous line is the same episode: an `unremovable` one that
+      blocked, a `truncated` one, or a `mounts_unreadable` one), `now` when the
+      episode starts or the journal is unreadable;
+    * `resolved` — the kind (`unremovable`, `truncated` or `mounts_unreadable`)
+      of the episode this pass ends, when it has nothing else to report for the
+      path (no eviction, no unremovable bytes, no truncation): the alert must
+      be lifted, so an entry says it even though nothing was evicted; None when
+      there is nothing to lift, and always None when this pass could not read
+      the mount table (#718: it did not scan, so it proves nothing).
+
+    A journal that cannot be read never raises: the alert then just gets a new
+    `since`, as before."""
+    out = {"since": float(now), "resolved": None}
+    if db is None:
+        return out
+    try:
+        rows = storage.of(db).housekeeping.latest_by_path(host or None, "tmp")
+    except Exception:
+        return out
+    for row in rows:
+        if row.get("path") != path:
+            continue
+        data = row.get("data") or {}
+        action = row.get("action")
+        if action == "truncated":
+            previous = "truncated"
+        elif action == "mounts_unreadable":
+            previous = "mounts_unreadable"
+        elif action == "unremovable" and data.get("blocked", True) is not False:
+            previous = "unremovable"
+        else:
+            break
+        if result.get("mounts_unreadable"):
+            # #718: a pass that could not read the mount table never closes the
+            # previous episode — it says the alert again with the same `since`,
+            # and `eviction_entries` writes no `resolved` entry for it.
+            out["since"] = float(data.get("episode_since") or row.get("at_ts") or now)
+            break
+        current = ("truncated" if result.get("truncated") else
+                   "unremovable" if result.get("unremovable") else None)
+        if current == previous:
+            # #530: same episode (a second truncated listing, or the bytes
+            # still there): keep its first observation
+            out["since"] = float(data.get("episode_since") or row.get("at_ts") or now)
+        elif current is None and not result.get("files"):
+            # nothing else will be written for this path: say the episode is
+            # over (`resolved`), otherwise its last line would alert until the
+            # 24 h expiry
+            out["since"] = float(data.get("episode_since") or row.get("at_ts") or now)
+            out["resolved"] = previous
+        break
+    return out
+
+
+def eviction_entries(result: dict, *, kind: str, path: str, quota: int,
+                     agent: str | None = None, lot: str | None = None,
+                     since: float | None = None,
+                     resolved: str | None = None) -> list[dict]:
+    """#500: the log lines of one `evict_lru` result: the eviction, the files
+    this pass cannot remove (`unremovable`, reported as soon as they exist —
+    read by the `tmp_unremovable` alert when they block the quota), a
+    truncated listing (`truncated`, read by `tmp_unscanned`), a listing that
+    could not even start because the mount table is unreadable
+    (`mounts_unreadable`, #718, read by `tmp_unscanned`), the lifting of a
+    previous alert (`resolved`), and each git work tree left out (`signaled`).
+
+    `since` is the first observation of the episode (`tmp_episode`): it is
+    stored in the data so the next line carries it, and `--follow` does not
+    announce the same alert again at every pass. `resolved` names the episode
+    this pass ends (`unremovable`, `truncated` or `mounts_unreadable`), #530:
+    the truncated listing had no lifting entry before, so `tmp_unscanned`
+    stayed raised until its 24 h expiry even after a clean scan. A pass that
+    could not read the mount table never writes a `resolved` entry (#718):
+    it proves nothing about the files it did not scan."""
+    q = resources_mod.fmt_value("q", quota)
+    out = []
+    data = {"unremovable_bytes": result["unremovable"], "quota": quota,
+            "blocked": bool(result["blocked"]), "over_quota": bool(result["over_quota"])}
+    if since is not None:
+        data["episode_since"] = float(since)
+    if result.get("mounts_unreadable"):
+        # #718: fail-closed (r5) is said in the journal and alerts; it never
+        # resolves the episode of a previous line, since no file was listed.
+        resolved = None
+        out.append({"kind": kind, "action": "mounts_unreadable", "path": path,
+                    "bytes": 0, "agent": agent, "lot": lot,
+                    "data": dict(data, mounts_unreadable=True),
+                    "detail": "quota %s: mount table unreadable (platform layer), "
+                              "nothing was scanned or evicted; what is removable is "
+                              "unknown" % q})
+    if result["files"]:
+        out.append({"kind": kind, "action": "evicted", "path": path,
+                    "bytes": result["evicted"], "agent": agent, "lot": lot, "data": data,
+                    "detail": "quota %s: %d oldest file(s) evicted%s" % (
+                        q, result["files"],
+                        "; %s not removable by this pass" % resources_mod.fmt_value(
+                            "q", result["unremovable"]) if result["unremovable"] else "")})
+    if result["blocked"]:
+        detail = ("quota %s exceeded by %s of files this pass cannot remove "
+                  "(other owner or read-only directory): nothing evicted"
+                  % (q, resources_mod.fmt_value("q", result["unremovable"])))
+        if result.get("failed"):
+            detail += "; deletion refused for %s" % result["failed"][0]
+        out.append({"kind": kind, "action": "unremovable", "path": path,
+                    "bytes": result["unremovable"], "agent": agent, "lot": lot, "data": data,
+                    "detail": detail})
+    elif result["unremovable"]:
+        # the quota still holds (the unremovable part alone is under it), but
+        # the bytes exist: reported, without raising the alert (`blocked`
+        # false in the data)
+        detail = ("%s of files this pass cannot remove (other owner or "
+                  "read-only directory); the quota %s still holds"
+                  % (resources_mod.fmt_value("q", result["unremovable"]), q))
+        if result.get("failed"):
+            detail += "; deletion refused for %s" % result["failed"][0]
+        out.append({"kind": kind, "action": "unremovable", "path": path,
+                    "bytes": result["unremovable"], "agent": agent, "lot": lot, "data": data,
+                    "detail": detail})
+    if result["truncated"]:
+        out.append({"kind": kind, "action": "truncated", "path": path,
+                    "bytes": result["before"], "agent": agent, "lot": lot, "data": data,
+                    "detail": "listing of %s truncated at %d file(s) (WALK_LIMIT): nothing "
+                              "evicted, what is removable is unknown"
+                              % (", ".join(result["truncated_paths"]) or path,
+                                 WALK_LIMIT)})
+    if resolved:
+        # #530: a truncated episode ends as soon as the listing is complete
+        # again; an unremovable one when no file is left unremovable
+        if resolved == "truncated":
+            detail = ("quota %s: the listing is complete again; the previous "
+                      "`truncated` episode is over" % q)
+        elif resolved == "mounts_unreadable":
+            # #718: the mount table is readable again and the pass scanned
+            detail = ("quota %s: the mount table is readable again; the previous "
+                      "`mounts_unreadable` episode is over" % q)
+        else:
+            detail = ("quota %s: no file this pass cannot remove any more; the "
+                      "previous `unremovable` episode is over" % q)
+        out.append({"kind": kind, "action": "resolved", "path": path, "bytes": 0,
+                    "agent": agent, "lot": lot, "data": data,
+                    "detail": detail})
+    for tree in result["worktrees"]:
+        out.append({"kind": kind, "action": "signaled", "path": tree, "agent": agent,
+                    "lot": lot, "data": {"worktree": tree, "quota": quota},
+                    "detail": "git work tree inside %s left out of the quota eviction" % path})
+    for link in result.get("worktree_symlinks", ()):
+        out.append({"kind": kind, "action": "signaled", "path": link, "agent": agent,
+                    "lot": lot, "data": {"worktree": link, "symlink": True, "quota": quota},
+                    "detail": "git marker `.git` of %s is a symbolic link: not followed, "
+                              "the subtree is left out of the eviction" % link})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1637,14 +2314,12 @@ class Turn:
                 root = tmp_root(self.cfg, policy)
                 result = evict_lru([self.tmp], root, policy.tmp_quota,
                                    min_age=EVICT_MIN_AGE_S)
-                if result["files"]:
-                    self.entries.append({
-                        "kind": "tmp", "action": "evicted",
-                        "path": self.tmp,
-                        "bytes": result["evicted"], "agent": self.agent, "lot": lot,
-                        "detail": "quota %s: %d oldest file(s) evicted"
-                                  % (resources_mod.fmt_value("q", policy.tmp_quota),
-                                     result["files"])})
+                episode = tmp_episode(db, host, self.tmp, result,
+                                      now=time.time())
+                self.entries.extend(eviction_entries(
+                    result, kind="tmp", path=self.tmp, quota=policy.tmp_quota,
+                    agent=self.agent, lot=lot, since=episode["since"],
+                    resolved=episode["resolved"]))
         finally:
             if self.lock is not None:      # L219: the turn is over
                 self.lock.release()
@@ -2267,18 +2942,33 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
                                    dry_run=dry_run)
+                episode = tmp_episode(db, host, full, result, now=now)
                 if result["files"]:
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "éviction", "bytes": result["evicted"],
                                  "detail": "%d file(s), quota %s" % (
                                      result["files"],
                                      resources_mod.fmt_value("q", policy.tmp_quota))})
-                    if not dry_run:
-                        entries.append({"kind": "tmp", "action": "evicted", "path": full,
-                                        "bytes": result["evicted"], "agent": agent,
-                                        "detail": "quota %s: %d file(s) evicted" % (
-                                            resources_mod.fmt_value("q", policy.tmp_quota),
-                                            result["files"])})
+                if result.get("mounts_unreadable"):
+                    skipped.append("tmp %s: mount table unreadable "
+                                   "(platform layer), nothing evicted" % full)
+                elif result["truncated"]:
+                    skipped.append("tmp %s: listing truncated (%s file limit), nothing "
+                                   "evicted" % (full, WALK_LIMIT))
+                elif result["blocked"]:
+                    skipped.append("tmp %s: quota held by %s this pass cannot remove, "
+                                   "nothing evicted" % (full, resources_mod.fmt_value(
+                                       "q", result["unremovable"])))
+                for tree in result["worktrees"]:
+                    skipped.append("tmp %s: git work tree %s left out of the eviction"
+                                   % (full, tree))
+                for link in result["worktree_symlinks"]:
+                    skipped.append("tmp %s: git marker `.git` of %s is a symbolic link, "
+                                   "left out of the eviction" % (full, link))
+                if not dry_run:
+                    entries.extend(eviction_entries(
+                        result, kind="tmp", path=full, quota=policy.tmp_quota, agent=agent,
+                        since=episode["since"], resolved=episode["resolved"]))
             finally:
                 if lock is not None:
                     lock.close()
@@ -2299,7 +2989,16 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                 "detail": "quota %s: %d oldest file(s) evicted"
                                           % (resources_mod.fmt_value("q", policy.cache_quota),
                                              result["files"])})
-        if result["over_quota"]:
+        if result.get("mounts_unreadable"):
+            skipped.append("caches: mount table unreadable (platform layer), "
+                           "nothing evicted")
+        elif result["truncated"]:
+            skipped.append("caches: listing truncated (%s file limit), nothing evicted"
+                           % WALK_LIMIT)
+        elif result["blocked"]:
+            skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
+                           % resources_mod.fmt_value("q", result["unremovable"]))
+        elif result["over_quota"]:
             skipped.append("caches: quota still exceeded (files less than an hour old)")
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
     if policy.deps and registered is None:

@@ -183,7 +183,7 @@ runner is running.
 
 **Several canons** (manaty + Acme, L42): `canons` in
 `config.json` or `AMEESH_CANONS` — see
-[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-decision-0031). The first
+[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-l43--décision-0031). The first
 remains the default canon; a host with a single canon changes nothing. Since
 L44 (migration 0035), each canon synchronizes its humans' passkeys
 into its own registry: give a `ref` to each entry of `canons`, or

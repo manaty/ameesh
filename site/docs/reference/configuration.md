@@ -37,12 +37,18 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_IDLE_NUDGE` | `idle_nudge` | 1200 s | nudge after inactivity |
 | `AMEESH_EVENT_COALESCE` | `event_coalesce` | 120 s | at most one wake-up per window for events |
 | `AMEESH_MAIL_BATCH` | `mail_batch` | 90 s | batching window: an idle agent is woken this long after its oldest waiting message, in one turn for all of them; `--urgent` and human mail wake at once; per agent (local state of its host): `ameesh set <agent> mail_batch=…`; 0 = wake at once |
+| `AMEESH_LOT_WAKE`, `_MARGIN`, `_MAX` | `lot_wake`, `lot_wake_margin`, `lot_wake_max` | on, 60 s, 3 | the runner wakes an idle agent that holds an actionable lot (`intake`/`build`) after `mail_batch` + margin, with the instruction to resume it; at most N fruitless wake-ups per lot (doubling back-off in the database), then the auditor takes over (L165b); per agent `ameesh set <agent> lot_wake=off`, per host `AMEESH_LOT_WAKE=0` |
 | `AMEESH_INTERRUPT_SENDERS` | `interrupt_senders` | — | senders whose `--urgent` messages interrupt a turn |
 | `AMEESH_SESSION_MAX_TOKENS` | `session_max_tokens` | 150000 | rotate the session above this size |
 | `AMEESH_SESSION_MAX_TURN_SECONDS` | `session_max_turn_seconds` | 900 | rotate after a turn longer than this |
 | `AMEESH_CONTEXT_MAX_TOKENS` | `context_max_tokens` | 15000000 | close the turn at the next safe point and rotate the session when the turn re-reads more input tokens (cache included) than this; per agent: `ameesh set <agent> context_max_tokens=…`; 0 = off |
 | `AMEESH_TURN_MAX_SECONDS` | `turn_max_seconds` | 1800 | close a turn that runs longer at the next safe point (end of the running tool call); work resumes next turn, same session; per agent: `ameesh set <agent> turn_max_seconds=…`; 0 = no limit |
 | `AMEESH_TURN_MAIL_MAX` | `turn_mail_max` | 5 | messages the mail hook delivers during one runner-led turn; the rest wait for the next turn and the agent is asked to wrap up; per agent: `ameesh set <agent> turn_mail_max=…`; 0 = no bound |
+| `AMEESH_TURN_GRACE_SECONDS` | `turn_grace_seconds` | 1200 s | grace after a turn's end before a background resource held only by it is closed (`0` = immediate cleanup) |
+| `AMEESH_DRAIN_SECONDS` | `drain_seconds` | 1800 s | drainage left to the running turn and its background work when the **runner itself** stops (systemd `SIGTERM`, `SIGINT`): no new turn, then stop; `0` = immediate stop (the running turn is stopped and its instruction put back); a second signal stops at once, and the systemd unit keeps `TimeoutStopSec` above. A host withdrawal is separate: the `host_gate`/`host_gate_drain` settings and `ameesh host drain --for` |
+| `AMEESH_HOUSEKEEPING_INTERVAL` | `housekeeping_interval` | 600 s | cadence of the runner's housekeeping pass (L73) |
+| `AMEESH_THREAD_RETENTION_DAYS` | `thread_retention_days` | 365 | readable-thread retention: entries older than this are removed by `ameesh fil expire` and the runner's housekeeping (L361, decision 0033 §9); 0 = never |
+| `AMEESH_HEAVY_MAX_S` | `heavy_max_seconds` | 3600 s | duration cap of a heavy command (`ameesh heavy`, or a suite a turn launches), message then SIGTERM/SIGKILL and exit 124 (#453); 0 = none |
 | `AMEESH_SESSION_MIN_TURNS` | `session_min_turns` | 3 | minimum turns before a rotation |
 | `AMEESH_FAST_FAILURE_S` | `fast_failure_s` | 60 s | a failed turn shorter than this counts as a fast failure (1.4.1) |
 | `AMEESH_FAILURE_BACKOFF_MAX` | `failure_backoff_max` | 300 s | wait between failed turns doubles from 5 s up to this |
@@ -52,7 +58,9 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_HOST_RETRY_MAX` | `host_retry_max` | 300 s | "host not ready": the wait between two attempts doubles from 15 s up to this; the agent resumes by itself |
 | `AMEESH_POWER_STOP_GRACE` | `power_stop_grace` | 120 s | on critical battery, time left to running turns before a clean stop |
 | `AMEESH_WORKTREE_ROOTS` | `worktree_roots` | `~/development` | where to look for a moved working directory |
-| `AMEESH_BUDGET_USD_PER_HOUR` | `budget_usd_per_hour` | 10 | hourly cap of pay-per-token usage, summed over all pay-per-token agents; it pauses only those agents, never a subscription agent (0 disables the guard) |
+| `AMEESH_BUDGET_USD_PER_HOUR` | `budget_usd_per_hour` | 10 | hourly cap of pay-per-token usage, summed over all pay-per-token agents; it pauses only those agents, never a subscription agent; `0` disables the guard **and with it the daily ceiling below** (the daily cap is only checked while the hourly cap is > 0) |
+| `AMEESH_BUDGET_USD_PER_DAY` | `budget_usd_per_day` | 0 | sliding 24 h cap of pay-per-token usage; a cap set in the database (`ameesh budget set --per-day`) wins over it (L70); 0 = none; only enforced while the effective hourly cap is > 0 |
+| `AMEESH_CRITICAL_AGENTS`, `AMEESH_CRITICAL_FALLBACK_HARNESSES`, `AMEESH_NONCRITICAL_HOURLY_SHARE` | `critical_agents`, `critical_fallback_harnesses`, `noncritical_hourly_share` | —, —, 0.75 | named critical agents (in addition to the canon's orchestrator, design and auditor roles) are never paused on budget while an account has margin; a critical agent at threshold falls back to these harnesses (Codex, then DeepSeek) and comes back; a non-critical agent stops above this share of the hourly cap (L242b) |
 | `AMEESH_BUDGET_CHECK_INTERVAL` | `budget_check_interval` | 30 s | cadence of budget status updates |
 | `AMEESH_SESSION_POLICY` | `session_policy` | `par-lot` | default session policy (`par-lot`, `taille`, `jamais`) |
 | `AMEESH_BALANCE_INTERVAL` | `balance_interval` | 900 s | provider balance reading by the runner (0 = never; only with a key) |
@@ -66,13 +74,29 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_FORGE` | `forge` | — | forge used by the persona visibility check: `gh`, `git`, `auto`, or empty |
 | `AMEESH_FORGE_HOSTS` | `forge_hosts` | `github.com` | forge hosts `gh api --hostname` can query (comma-separated) |
 | `AMEESH_VISIBILITY_TTL`, `AMEESH_VISIBILITY_TIMEOUT` | `visibility_ttl`, `visibility_timeout` | 300 s, 10 s | cache duration and timeout of the visibility check |
-| `AMEESH_ALERT_LONG_TURN`, `_IDLE_MAIL`, `_DEAD_GRACE`, `_SESSION_TOKENS`, `_STALE_LOT`, `_ORPHAN_LOT`, `_DELEGATION_GRACE`, `_INTERVAL` | — | see `ameesh alerts` | alert thresholds (also used by `ameesh notify`) |
+| `AMEESH_ALERT_LONG_TURN`, `_IDLE_MAIL`, `_DEAD_GRACE`, `_SESSION_TOKENS`, `_STALE_LOT`, `_ORPHAN_LOT`, `_DELEGATION_GRACE`, `_MAIL_UNDELIVERABLE`, `_TURN_CHURN`, `_SHORT_TURN`, `_INTERVAL` | — | see `ameesh alerts` | alert thresholds (also used by `ameesh notify`) |
 | `AMEESH_ALERT_PLAN_TAIL`, `_PLAN_USED`, `_PLAN_PACE_GAP`, `_IDLE_CAPACITY`, `_ORCHESTRATOR_HELD`, `_ORCHESTRATORS`, `_HOST_UNDERUSED`, `_HOST_UNDERUSED_LOAD`, `_HOST_UNDERUSED_TURNS` | 86400, 50, 25, 1800, 1800, —, 3600, 0.25, 1 | see `ameesh alerts` | underuse alert thresholds (L94); 0 disables |
 | `AMEESH_ALERT_BACKLOG_EMPTY` | 1800 | see `ameesh alerts` | `backlog_empty`: idle agents and an empty improvement backlog (L119); 0 disables |
-| `AMEESH_TAKE_IDLE`, `AMEESH_TAKE_MAX_PER_HOUR`, `AMEESH_TAKE_PAID` | 1800, 2, — | see `ameesh notify` | auto-take from the improvement backlog by idle agents (L119, decision 0037); `AMEESH_TAKE_IDLE=0` disables, `AMEESH_TAKE_PAID=1` lets pay-per-token agents take |
+| `AMEESH_TAKE_IDLE`, `AMEESH_TAKE_MAX_PER_HOUR` | 1800, 2 | see `ameesh notify` | auto-take from the improvement backlog by idle agents (L119, decision 0037); `AMEESH_TAKE_IDLE=0` disables; subscription agents first, pay-per-token agents take what they leave (never during `balance_low`) |
+| `AMEESH_TAKE_LOT_IDLE`, `AMEESH_TAKE_LOT_MAX_PER_HOUR` | 900 s, 6 | see `ameesh notify` | an idle wakeable agent with no lot takes the highest-priority unassigned lot of its team after S seconds, at most N per rolling hour for the whole mesh (L165); `0` turns it off |
 | `AMEESH_ALERT_BALANCE_HOURS`, `_BALANCE_MIN`, `_BALANCE_WINDOW` | 48, 20, 21600 | see `ameesh alerts` | `balance_low`: runway at the real spend rate (from balance readings), USD floor, averaging window (L94) |
 | `AMEESH_PRICES` | — | built-in defaults | price table (JSON) |
 | `AMEESH_<HARNESS>_BIN`, `AMEESH_BIN_DIR` | — | `PATH` | harness binaries (`CLAUDE`, `CODEX`, `DSH`) |
+| `AMEESH_MAX_HEAVY_SUITES` | `max_heavy_suites` | 0 (auto) | heavy suites allowed at once on this host (L131); 0 = derived from the host's capacity |
+| `AMEESH_OFFLOAD_HOST` | — | — | SSH destination of the lending VM for `ameesh offload` (L159b); without it, nothing is offloaded |
+| `AMEESH_OFFLOAD_SSH` | — | `ssh` | ssh command used by `ameesh offload` (tests, extra options) |
+
+## Host lifecycle and handoff
+
+| Variable | Config key | Default | Meaning |
+|---|---|---|---|
+| `AMEESH_HOST_GATE`, `AMEESH_HOST_GATE_PATH` | `host_gate`, `host_gate_path` | —, — | host gate (`file` or `none`; L159f): the runner reads the host's gate state from this file |
+| `AMEESH_HOST_GATE_ACK`, `AMEESH_HOST_GATE_DRAIN` | `host_gate_ack`, `host_gate_drain` | —, 0 | acknowledgement file written by the runner, and drain duration applied when the gate says `draining` |
+| `AMEESH_HOST_GATE_FALLBACK` | `host_gate_fallback` | — | state assumed when the gate is unreadable: `available`, `draining` or `stopped` |
+| `AMEESH_HOST_MEDIATED` | `host_mediated` | off | declares this host a mediated host (L107–L114): provider and database credentials stay on the mesh server. It does **not** select the transport — `backend = "mediated"` (`AMEESH_BACKEND`) does; the flag also allows the `socket` host gate |
+| `AMEESH_HANDOFF_MAX_PER_HOUR`, `AMEESH_HANDOFF_IDLE`, `AMEESH_HANDOFF_ENABLE_WORKERS` | — | 4, 300 s, 4 | budget handoff (L233b): at most N lots per rolling hour leave a non-critical Claude agent paused on budget for a free DeepSeek agent of the same project, which takes one after S seconds idle; the workers bound concurrent held host handoffs (L232a) |
+| `AMEESH_GUARD_CONFIG` | — | `/etc/ameesh/guard.json` | capacity-guard configuration (`ameesh guard`, L159e) |
+| `AMEESH_GUEST_CGROUP` | — | detected | guest cgroups counted in the lendable capacity of the host measure (L159d) |
 
 ## Canon
 
@@ -189,3 +213,31 @@ overridden by `serve` options. Opening the API under the public host
 (`"api_via_public": true`) exists only in the JSON file. See
 [Host ameesh-approve for a team](../guides/host-ameesh-approve.md).
 It reads the database with `AMEESH_DSN` and `AMEESH_SCHEMA`.
+
+## Read API, mediated executor and relay
+
+| Variable | Config key | Meaning |
+|---|---|---|
+| `AMEESH_SERVE_TOKEN_FILE` | — | token file of the read API (`ameesh serve`, L84); default `~/.config/ameesh/serve-token` |
+| `AMEESH_EXEC_URL`, `AMEESH_EXEC_TOKEN_FILE` | `exec_url`, `exec_token_file` | mesh server URL and 0600 file holding the **executor's access token** of a mediated host (`backend = "mediated"`, L107–L114); the token itself comes from the executor's identity, not from a one-shot enrolment (L110) |
+| `AMEESH_EXEC_HOME` | — | executor home holding its key and stable per-agent work path (default `/var/lib/ameesh-exec`) |
+| `AMEESH_EXEC_SIGNER` | — | signing helper of the executor image |
+| `AMEESH_RELAY_URL`, `AMEESH_RELAY_BIND` | — | model relay of the mediated executor: upstream and bind address |
+| `AMEESH_RELAY_CONCURRENCY`, `AMEESH_RELAY_RATE`, `AMEESH_RELAY_MAX_BODY`, `AMEESH_RELAY_MAX_STREAM`, `AMEESH_RELAY_MAX_TOKENS`, `AMEESH_RELAY_UPSTREAM_TIMEOUT` | — | relay bounds: concurrency, rate, body size, stream size, tokens, upstream timeout |
+| `AMEESH_RELAY_VERIFIER` | — | relay token verifier, `module:object`: the object (or a no-argument factory) must expose `verify_token(token) -> Identity`; without it the relay refuses to start |
+| `AMEESH_RELAY_DEEPSEEK_KEY_FILE`, `AMEESH_RELAY_DEEPSEEK_UPSTREAM` | — | DeepSeek key file and upstream URL of the relayed provider (`DEEPSEEK_API_KEY` is the in-process alternative) |
+
+Operator procedure and exact relay values: `docs/EXECUTEUR-MEDIEE.md`.
+
+## Personas and session backups
+
+| Variable | Meaning |
+|---|---|
+| `AMEESH_BACKUP_S3_ENDPOINT`, `AMEESH_BACKUP_S3_REGION`, `AMEESH_BACKUP_S3_ACCESS_KEY`, `AMEESH_BACKUP_S3_SECRET_KEY` | S3 storage of session backups (L53): required when the host's `session_backup.target` is `s3://bucket/prefix`. A local backup needs an **absolute** path in `session_backup.target`; with no target there is no backup at all |
+
+## Shared dependencies
+
+| Variable | Config key | Meaning |
+|---|---|---|
+| `AMEESH_DEPS` | — | `ameesh deps` behaviour (L231): default shares one `node_modules` per lockfile; `allow-review` allows installs in a review worktree; `off` passes npm through |
+| `AMEESH_FILL_FROM` | — | package set a cache fill starts from |

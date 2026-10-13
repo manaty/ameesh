@@ -96,7 +96,8 @@ class Log:
             thread_text=full if thread_text is not None else None)
 
     def drain_threads(self, *, limit=32):
-        """At-least-once delivery; a failed post remains pending past retention."""
+        """At-least-once delivery; a failed post remains pending past detail
+        retention, until thread retention (`prune`)."""
         done = 0
         with self.db.transaction() as tx:
             store = storage.of(tx).conversations
@@ -113,11 +114,21 @@ class Log:
                 done += 1
         return done
 
-    def prune(self, *, now=None, days=DETAIL_DAYS):
+    def prune(self, *, now=None, days=DETAIL_DAYS, thread_days=None):
+        """Detail past `days`; an R12 entry never delivered goes only past
+        thread retention (L361): its thread entry would expire on arrival.
+        `thread_days`: `thread_retention_days` by default, 0 = kept until sent."""
         if not isinstance(days, (int, float)) or not math.isfinite(days) or days <= 0:
             raise ValueError("conversation retention must be positive")
-        return self.store.prune(self.agent, before_ts=(time.time() if now is None else now)
-                                - days * 86400)
+        if thread_days is None:
+            thread_days = getattr(self.cfg, "thread_retention_days", fil.THREAD_DAYS)
+        if not isinstance(thread_days, (int, float)) or not math.isfinite(thread_days) \
+                or thread_days < 0:
+            raise ValueError("thread retention must be zero or positive")
+        now = time.time() if now is None else now
+        return self.store.prune(
+            self.agent, before_ts=now - days * 86400,
+            thread_before_ts=now - max(days, thread_days) * 86400 if thread_days else None)
 
 
 def history(db, agent, *, after=0, limit=100):
@@ -360,8 +371,8 @@ class Recorder:
         try:
             db = self.connect()
             log = Log(db, self.cfg, agent=self.agent, project=self.project, lot=self.lot)
+            log.prune()  # before draining: no R12 entry posted already expired
             log.drain_threads()
-            log.prune()
             parts, size, deadline, clipped = [], 0, None, False
 
             def flush():

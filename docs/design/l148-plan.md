@@ -575,6 +575,11 @@ Zero-downtime recipe, no applied migration touched:
    `chantier_of` was already renamed by stage 2c; `stagnation.py` reads no `chantier`.
 3. **PR C (later)** — switch the hot files when their PRs merge, stop emitting `chantier`, then
    **Migration D** drops the trigger and the `chantier` column after one release.
+   **C1 (2026-10-12, #147)**: the last free readers switch first — `alert_briefs.py` reads
+   `workstream` with the `chantier` fallback, and `identity.py`'s last French locals plus
+   `write_alias`'s parameter are renamed (`chantier_of` stays the stage 2c alias, removed at
+   stage 7). Tested by `tests/test_l148_stage3c_workstream_free_files.py` (no database).
+   **C2**: the hot files, once the PRs that hold them have merged.
 
 The `lot` columns are **not renamed** (kept term, see §0.2). If mesh-design reverses that
 decision, the same recipe applies with `lot` → `work_item` and it must be scheduled with the
