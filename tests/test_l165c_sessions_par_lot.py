@@ -409,6 +409,93 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_session_sans_lot_n_est_jamais_adoptee_par_un_lot(self):
+        """#794 : une session ouverte par un tour dont le lot est inconnu (ici
+        deux lots actifs, aucune consigne ne tranche) n'est jamais adoptée par
+        le premier lot venu ; ce lot ouvre SA session, sur le brief minimal."""
+        worker = self._worker("w7")
+        try:
+            a = work.add(self.db, title="A", assignee="w7")["id"]
+            work.add(self.db, title="B", assignee="w7")
+            registry.set_pending_prompt(self.db, "w7", "veille : rien de neuf")
+            with self._env("sess-veille"):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertIsNone(spec["lot"], "deux lots actifs : lot inconnu")
+                self.assertTrue(worker.run_turn(spec))
+            agent = registry.get(self.db, "w7")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-veille", None))
+            mail.send(self.db, "orch", "w7", "prends A", work_item_id=str(a))
+            with self._env("sess-A"):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertEqual(spec["lot"], str(a))
+                self.assertTrue(worker.run_turn(spec))
+            argv = self.turns()[-1]["argv"]
+            self.assertNotIn("--resume", argv, "la session sans lot n'est pas reprise")
+            self.assertIn("dedicated to lot #%d" % a, " ".join(argv))
+            agent = registry.get(self.db, "w7")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             ("sess-A", str(a)))
+        finally:
+            worker.watchdog_stop.set()
+
+
+class BriefDeLotTest(_Base):
+    """#794 : le brief d'une session dédiée à un lot est MINIMAL — canon,
+    fiche du lot, diff de sa branche, fil du lot (décisions et messages non
+    lus) — jamais un transcript, jamais un autre lot, jamais un résumé."""
+
+    def test_fiche_diff_et_fil_du_lot_seulement(self):
+        import subprocess
+
+        from ameesh import reprise
+        self.bail("b1")
+        autre = work.add(self.db, title="Un autre lot", assignee="b1")["id"]
+        a = work.add(self.db, title="Le lot du brief", assignee="b1")["id"]
+        work.note(self.db, a, "une note du lot", actor="b1")
+        mail.send(self.db, "orch", "b1", "un message non lu sur le lot",
+                  work_item_id=str(a))
+        mail.send(self.db, "orch", "b1", "un message pour un autre lot",
+                  work_item_id=str(autre))
+        cwd = self._cwd("b1")
+
+        def git(*args):
+            subprocess.run(["git", "-C", cwd, *args], check=True,
+                           capture_output=True, text=True)
+
+        git("init", "-q")
+        git("config", "user.email", "banc@test")
+        git("config", "user.name", "banc")
+        with open(os.path.join(cwd, "base.txt"), "w", encoding="utf-8") as fh:
+            fh.write("base\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("branch", "-M", "main")
+        git("checkout", "-q", "-b", "lot/b1")
+        with open(os.path.join(cwd, "travail.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "travail du lot")
+        work.set_branch(self.db, a, "lot/b1", "main")
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b1"), a,
+                                 consigne="go")
+        self.assertIn("Session dedicated to lot #%d" % a, text)
+        self.assertIn("## Lot #%d — Le lot du brief" % a, text)
+        self.assertIn("une note du lot", text)
+        self.assertIn("## Diff of the lot's branch", text)
+        self.assertIn("lot/b1", text)
+        self.assertIn("travail.py", text)
+        self.assertIn("1 file changed", text)
+        self.assertIn("## Lot thread — decisions and unread messages", text)
+        self.assertIn("un message non lu sur le lot", text)
+        # jamais le contenu d'un autre lot, ni l'ancienne session, ni la liste
+        # des lots assignés du brief de reprise
+        self.assertNotIn("Un autre lot", text)
+        self.assertNotIn("un message pour un autre lot", text)
+        self.assertNotIn("Previous session", text)
+        self.assertNotIn("Work items assigned to you", text)
+
 
 class ReveilTest(_Base):
     """Règle 1 : l'exécuteur réveille l'agent au repos qui détient un lot
@@ -509,6 +596,44 @@ class PurgeTest(_Base):
         purges = runner.lot_sessions_purge(self.db)
         self.assertEqual([r["work_item_id"] for r in purges], [a])
         self.assertEqual([r["work_item_id"] for r in self.st.listing("p1")], [b])
+
+    def test_la_purge_oublie_la_session_active_du_lot_fini(self):
+        """#794 : fermer = oublier la session harnais. La session ACTIVE d'un
+        lot purgé est oubliée au registre et son fichier local retiré ; celle
+        d'un autre lot, ou d'un agent passé à un autre lot, reste."""
+        runner, lease = self.bail("p2")
+        a = work.add(self.db, title="A", assignee="p2")["id"]
+        storage.of(self.db).operations.set_session_work_item(
+            "p2", runner.runner_id, lease["lease_epoch"], str(a))
+        registry.set_session(self.db, "p2", "sess-A", None, harness="claude",
+                             cwd=self._cwd("p2"))
+        chemin = os.path.join(self.cfg.agent_dir("p2"), "session")
+        os.makedirs(os.path.dirname(chemin), exist_ok=True)
+        with open(chemin, "w", encoding="utf-8") as fh:
+            fh.write("sess-A\n")
+        work.close(self.db, a, abandoned=True, actor="test")
+        purges = runner.lot_sessions_purge(self.db)
+        self.assertEqual([r["forgotten_session"] for r in purges], ["sess-A"])
+        agent = registry.get(self.db, "p2")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None))
+        self.assertFalse(os.path.exists(chemin), "le fichier local ne ressuscite pas")
+
+    def test_la_purge_ne_touche_pas_un_agent_passe_a_un_autre_lot(self):
+        runner, lease = self.bail("p3")
+        a = work.add(self.db, title="A", assignee="p3")["id"]
+        b = work.add(self.db, title="B", assignee="p3")["id"]
+        storage.of(self.db).operations.set_session_work_item(
+            "p3", runner.runner_id, lease["lease_epoch"], str(b))
+        registry.set_session(self.db, "p3", "sess-B", None, harness="claude",
+                             cwd=self._cwd("p3"))
+        self.st.note_wake("p3", a, time.time())
+        work.close(self.db, a, abandoned=True, actor="test")
+        purges = runner.lot_sessions_purge(self.db)
+        self.assertEqual([r["work_item_id"] for r in purges], [a])
+        self.assertEqual([r["forgotten_session"] for r in purges], [None])
+        agent = registry.get(self.db, "p3")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                         ("sess-B", str(b)))
 
 
 class AlerteTest(_Base):

@@ -1552,14 +1552,19 @@ class AgentWorker(threading.Thread):
     def lot_rotation_due(self, lot: str | None) -> bool:
         """Changement de session au changement de lot dû ? (politique `par-lot`)
 
-        Seulement si le lot du tour est connu, que la session courante a un
-        lot noté et qu'il diffère. Jamais pendant un tour. #408 : même sans
-        session courante, celle mise de côté pour le lot du tour est reprise.
+        Seulement si le lot du tour est connu. La session courante est celle
+        d'un AUTRE lot (bascule), ou n'a AUCUN lot noté alors qu'elle a déjà
+        tourné : elle n'est jamais partagée entre lots, pas même adoptée par le
+        premier lot venu (#794, décision du bureau du 2026-10-13). Jamais
+        pendant un tour. #408 : même sans session courante, celle mise de côté
+        pour le lot du tour est reprise.
         """
         if not lot or self.proc is not None or self.session_policy() != "par-lot":
             return False
         courant = (self.agent or {}).get("session_work_item")
-        return bool(courant) and str(courant) != str(lot)
+        if courant:
+            return str(courant) != str(lot)
+        return bool(self.current_session())
 
     def rotate_for_lot(self, spec: dict | None) -> dict | None:
         """Avant un tour : passe à la session du lot du tour s'il change
@@ -1569,24 +1574,93 @@ class AgentWorker(threading.Thread):
         oubli : un retour sur ce lot (relecture, décision, déblocage) la
         reprendra avec `--resume`. Celle du lot du tour est reprise si elle a
         été ouverte sous le même harnais, le même compte et le même dossier ;
-        sinon une session neuve s'ouvre sur le brief déterministe (L39) du
-        lot. Bail perdu ou base injoignable : le tour part dans la session
-        courante, le nouveau lot y est noté (pas de nouvel essai à chaque tour).
+        sinon une session neuve s'ouvre sur le brief MINIMAL du lot (#794 :
+        canon, fiche, diff, fil du lot). Une session sans lot noté qui a déjà
+        tourné n'est jamais adoptée par un lot : elle est oubliée avant
+        d'ouvrir celle du lot (#794). Bail perdu ou base injoignable : le tour
+        part dans la session courante, le nouveau lot y est noté (pas de
+        nouvel essai à chaque tour).
         """
         if not spec:
             return spec
         lot = spec.get("lot")
-        if not self.lot_rotation_due(lot):
+        if not lot or self.proc is not None or self.session_policy() != "par-lot":
             return spec
         courant = (self.agent or {}).get("session_work_item")
-        if not self._switch_lot(str(courant), str(lot)):
+        if courant:
+            if str(courant) == str(lot):
+                return spec
+            if not self._switch_lot(str(courant), str(lot)):
+                try:
+                    if storage.of(self.db).operations.set_session_work_item(
+                            self.name, self.runner.runner_id, self.epoch, str(lot)):
+                        self.agent["session_work_item"] = str(lot)
+                except db_mod.DbError as exc:
+                    log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+            return spec
+        # aucun lot noté : une session qui a déjà tourné ne sera jamais
+        # partagée avec un lot ; celle qui va s'ouvrir est celle du lot.
+        if self.current_session() and not self._forget_lotless_session():
             try:
                 if storage.of(self.db).operations.set_session_work_item(
                         self.name, self.runner.runner_id, self.epoch, str(lot)):
                     self.agent["session_work_item"] = str(lot)
             except db_mod.DbError as exc:
                 log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+            return spec
+        self._open_lot_session(lot)
         return spec
+
+    def _forget_lotless_session(self) -> bool:
+        """#794 : oublie la session active qui n'a aucun lot noté.
+
+        Elle a été ouverte par un tour dont le lot était inconnu (reprise,
+        veille, courrier ambigu) : l'adopter pour un lot ferait porter à ce
+        lot le contexte d'un autre. Oubli fencé par le bail, comme une
+        rotation ; le fichier local suit, sinon `current_session` le relirait.
+        """
+        session = self.current_session()
+        try:
+            oubliee = registry.clear_session(self.db, self.name, self.runner.runner_id,
+                                             self.epoch)
+        except db_mod.DbError as exc:
+            log_async("[%s] lotless session %s not forgotten (%s)"
+                      % (self.name, session or "?", exc))
+            return False
+        if not oubliee:
+            log_async("[%s] lotless session not forgotten: lease lost" % self.name)
+            return False
+        try:
+            os.unlink(self._path("session"))
+        except OSError:
+            pass
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self._reset_session_counts()
+        self._state_note("session_harness", "")
+        self.resume_summary = None
+        log_async("[%s] session %s had no lot: forgotten, never shared with a lot"
+                  % (self.name, session or "?"))
+        self._fil_note("Session %s had no lot (opened by a turn whose lot was "
+                       "unknown): forgotten, it will never be shared between lots."
+                       % (session or "?"), meta={"action": "session-sans-lot",
+                                                 "session": session or ""})
+        return True
+
+    def _open_lot_session(self, lot: str) -> None:
+        """#794 : la session qui va s'ouvrir est dédiée au lot `lot` ; son
+        ouverture est le brief minimal du lot, jamais un résumé de rotation ni
+        un brief de reprise général."""
+        self.resume_summary = self._lot_brief(str(lot), "", {})
+        self.resume_origin = "ameesh"
+        self._reset_session_counts()
+        log_async("[%s] new session for lot %s: minimal lot brief" % (self.name, lot))
+
+    def _reset_session_counts(self) -> None:
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self.last_turn_reread = 0
+        self.last_turn_reread_session = None
+        self.last_turn_context = self.last_turn_context_session = None
 
     def _switch_lot(self, courant: str, lot: str) -> bool:
         """#408 : met de côté la session du lot `courant`, rend active celle
@@ -1623,11 +1697,7 @@ class AgentWorker(threading.Thread):
             except OSError:
                 pass
         self.agent = registry.get(self.db, self.name) or self.agent
-        self.session_turns = 0
-        self.session_tokens = 0.0
-        self.last_turn_reread = 0
-        self.last_turn_reread_session = None
-        self.last_turn_context = self.last_turn_context_session = None
+        self._reset_session_counts()
         if not repris:
             self.resume_summary = self._lot_brief(lot, courant, out)
             self.resume_origin = "ameesh"
@@ -1640,7 +1710,7 @@ class AgentWorker(threading.Thread):
                 "session %s put aside for lot %s" % (out["parked"], courant)
                 if out.get("parked") else "no session to put aside",
                 "session %s of lot %s resumed" % (repris, lot) if repris
-                else "new session for lot %s, opened on the resume brief" % lot,
+                else "new session for lot %s, opened on the lot brief" % lot,
                 " Session %s of lot %s not resumed (%s)." % (
                     out["discarded"], lot,
                     "lot finished or no longer assigned to the agent"
@@ -1652,13 +1722,15 @@ class AgentWorker(threading.Thread):
         return True
 
     def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
-        """Le brief déterministe (L39) d'une session neuve dédiée au lot `lot`."""
+        """#794 : le brief MINIMAL d'une session neuve dédiée au lot `lot` :
+        canon, fiche du lot, diff de sa branche, fil du lot réduit aux
+        décisions et messages non lus (décision du bureau, 2026-10-13)."""
         try:
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
             branche = (item or {}).get("branch")
-            return reprise.deterministic_brief(
-                self.cfg, self.db, self.agent, session=None,
+            return reprise.lot_brief(
+                self.cfg, self.db, self.agent, lot,
                 reason="new session dedicated to lot #%s" % lot,
                 consigne="This session is dedicated to lot #%s%s. Your other lots keep "
                          "their own sessions (the one of lot #%s is put aside and will "
@@ -5815,8 +5887,10 @@ class Runner:
 
     def lot_sessions_purge(self, db) -> list[dict]:
         """#408 : les sessions mises de côté (et les réveils) des lots
-        fusionnés, livrés, fermés ou réassignés sont oubliées ; les
-        transcripts du harnais restent au ménage. Ne lève jamais."""
+        fusionnés, livrés, fermés ou réassignés sont oubliées ; #794, la
+        session ACTIVE d'un lot purgé est oubliée du registre — « fermer =
+        oublier la session harnais » — et le fichier local qui la portait est
+        retiré. Les transcripts du harnais restent au ménage. Ne lève jamais."""
         try:
             purges = storage.of(db).lot_sessions.purge()
         except db_mod.DbError as exc:
@@ -5826,7 +5900,26 @@ class Runner:
             if row.get("session_id"):
                 log_async("[%s] session %s of lot #%s forgotten (lot finished or reassigned)"
                           % (row["agent"], row["session_id"], row["work_item_id"]))
+            self._forget_local_session_file(row)
         return purges
+
+    def _forget_local_session_file(self, row: dict) -> None:
+        """#794 : le fichier local d'une session oubliée est retiré ; sinon
+        `current_session` le relirait (le registre vidé ne suffit pas). Seul
+        le fichier qui porte EXACTEMENT la session oubliée est retiré."""
+        session = row.get("forgotten_session")
+        if not session:
+            return
+        chemin = os.path.join(self.cfg.agent_dir(row["agent"]), "session")
+        try:
+            with open(chemin, encoding="utf-8") as fh:
+                if fh.read().strip() != str(session):
+                    return
+            os.unlink(chemin)
+            log_async("[%s] local session file %s removed (lot #%s finished)"
+                      % (row["agent"], session, row["work_item_id"]))
+        except OSError:
+            pass
 
     def expire_threads_once(self, db, now: float | None = None,
                             clock: float | None = None) -> list | None:
