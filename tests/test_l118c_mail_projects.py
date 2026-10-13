@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L118c: mail-created lots keep their project and corrections are guarded."""
+"""L118c: mail-created lots keep their project and corrections are guarded;
+a lot-linked message is filed in the project thread of its lot (#515)."""
+import os
 from types import SimpleNamespace
 from unittest import mock
 
@@ -50,6 +52,61 @@ class MailProjectTests(_Base):
         proc = self.send_new()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "recipient")
+
+    # -- #515 : le fil d'un message lié à un lot est celui du projet du lot ---
+
+    def thread_path(self, project, lot):
+        return os.path.join(self.cfg.threads_root, project, "%s.md" % lot)
+
+    def lot_message(self, lot, dest="dev1"):
+        return self.cli("send", dest, "Message lié au lot.", "--from", "orch",
+                        "--lot", str(lot), env=self.env(AMEESH_ALERT_ORCHESTRATORS="orch"))
+
+    def test_lot_message_is_filed_in_the_lot_project_thread(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        lot = work.add(self.db, title="Fil du lot", app="B")
+        proc = self.lot_message(lot["id"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.thread_path("B", lot["id"]), encoding="utf-8") as fh:
+            self.assertIn("Message lié au lot.", fh.read())
+        self.assertFalse(os.path.exists(self.thread_path("A", lot["id"])))
+        [row] = self.db.query("SELECT project, lot FROM thread_index WHERE lot = %s",
+                              (str(lot["id"]),))
+        self.assertEqual((row["project"], row["lot"]), ("B", str(lot["id"])))
+
+    def test_lot_without_project_keeps_the_sender_thread(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        lot = work.add(self.db, title="Sans projet")
+        proc = self.lot_message(lot["id"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(self.thread_path("A", lot["id"])))
+        self.assertFalse(os.path.exists(self.thread_path("B", lot["id"])))
+
+    def test_free_label_keeps_the_sender_thread_without_warning(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        proc = self.lot_message("SUJET-LIBRE")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("project unreadable", proc.stderr)
+        with open(self.thread_path("A", "SUJET-LIBRE"), encoding="utf-8") as fh:
+            self.assertIn("Message lié au lot.", fh.read())
+        self.assertFalse(os.path.exists(self.thread_path("B", "SUJET-LIBRE")))
+
+    def test_all_broadcast_of_a_lot_is_grouped_in_the_lot_project(self):
+        self.project("orch", team="", chantier="")
+        self.project("dev1", chantier="A")
+        self.project("dev2", chantier="C")
+        lot = work.add(self.db, title="Diffusion", app="B")
+        proc = self.lot_message(lot["id"], dest="all")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.thread_path("B", lot["id"]), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("agent:dev1", text)
+        self.assertIn("agent:dev2", text)
+        for project in ("A", "C"):
+            self.assertFalse(os.path.exists(self.thread_path(project, lot["id"])))
 
     def test_no_project_refuses_without_lot_or_mail(self):
         proc = self.send_new()
