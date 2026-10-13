@@ -42,7 +42,9 @@ class BrokenLinksTest(unittest.TestCase):
     """One case per rule, on a throwaway tree."""
 
     def tree(self, text: str) -> tuple[pathlib.Path, pathlib.Path]:
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        tmp = pathlib.Path(tmp_dir.name)
         (tmp / "docs").mkdir()
         (tmp / "docs" / "target.md").write_text("# Section\n\n## Sous-section\n",
                                                 encoding="utf-8")
