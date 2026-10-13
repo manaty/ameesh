@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -155,6 +156,45 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(retention.prune(self.root, now=1000), [])
         self.assertTrue(unknown.exists())
 
+    def daily(self, name, *, age, content=b"daily dump", now=2_000_000):
+        path = self.root / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+        stamp = now - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_unregistered_daily_expiry_spares_catalogued_sets_and_recent_dumps(self):
+        self.artifact(rollback=0)
+        retention.protect(self.root, "old", accepted=True)
+        stale = self.daily("ameesh-host-2026-01-01-030000.dump", age=14 * 24 * 3600)
+        recent = self.daily("ameesh-host-2026-01-02-030000.dump", age=3600)
+        other = self.root / "notes.txt"
+        other.write_bytes(b"not a dump")
+        result = retention.expire_unregistered(self.root, now=2_000_000, max_age=14 * 24 * 3600)
+        self.assertEqual(result, {"deleted": ["ameesh-host-2026-01-01-030000.dump"], "refused": []})
+        self.assertFalse(stale.exists())
+        self.assertTrue(recent.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue((self.root / "old.dump").exists(), "a catalogued set is never expired by age")
+
+    def test_unregistered_daily_expiry_refuses_unsafe_candidates(self):
+        target = self.root / "target"
+        target.write_bytes(b"private target")
+        target.chmod(0o600)
+        link = self.root / "ameesh-link.dump"
+        link.symlink_to(target)
+        public = self.daily("ameesh-public.dump", age=14 * 24 * 3600)
+        public.chmod(0o644)
+        old = self.daily("ameesh-old.dump", age=14 * 24 * 3600)
+        result = retention.expire_unregistered(self.root, now=2_000_000, max_age=14 * 24 * 3600)
+        self.assertEqual(result["deleted"], ["ameesh-old.dump"])
+        self.assertEqual(sorted(result["refused"]), ["ameesh-link.dump", "ameesh-public.dump"])
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(public.exists())
+        self.assertTrue(target.exists())
+        self.assertFalse(old.exists())
+
     def server_script(self):
         helper = self.root / "fake-backup.py"
         helper.write_text("import os, sys\nfrom pathlib import Path\n"
@@ -171,10 +211,13 @@ class RetentionTest(unittest.TestCase):
     def test_server_failed_backup_never_starts_expiry(self):
         self.artifact(rollback=0)
         retention.protect(self.root, "old", accepted=True)
+        unregistered = self.daily("ameesh-host-2026-01-01-030000.dump", age=14 * 24 * 3600,
+                                  now=time.time())
         result = subprocess.run(["sh", "-c", self.server_script()], capture_output=True,
                                 env=dict(os.environ, BACKUP_FAIL="1"))
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue((self.root / "old.dump").exists())
+        self.assertTrue(unregistered.exists(), "a failed backup never starts expiry")
 
     def test_server_completed_backup_expires_only_unprotected_sets(self):
         self.artifact(rollback=0)
@@ -187,6 +230,16 @@ class RetentionTest(unittest.TestCase):
         self.assertFalse((self.root / "old.dump").exists())
         self.assertTrue((self.root / "held.dump").exists())
         self.assertEqual(len(list(self.root.glob("ameesh-*.dump"))), 1)
+
+    def test_server_completed_backup_expires_stale_unregistered_dumps(self):
+        stale = self.daily("ameesh-host-2026-01-01-030000.dump", age=15 * 24 * 3600, now=time.time())
+        fresh = self.daily("ameesh-host-2026-01-02-030000.dump", age=3600, now=time.time())
+        result = subprocess.run(["sh", "-c", self.server_script()], capture_output=True,
+                                env=dict(os.environ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual(len(list(self.root.glob("ameesh-*.dump"))), 2, "fresh and new dumps survive")
 
     def remote_artifact(self):
         path = self.root / "remote.dump"

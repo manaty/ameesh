@@ -85,10 +85,18 @@ this directory is not a security boundary against another process using the
 same Unix identity. Direct catalog edits are not supported.
 
 The server installer installs this helper and removes the former age-only
-`find -delete` path. Existing and daily backups are preserved until an enrolled
-controller registers their policy. This can increase retained disk use; disk
-admission must count these artifacts and hold a release when capacity is
-insufficient. No implicit 14-day policy or remote object deletion is introduced.
+`find -delete` path. A copy published by the daily server backup and named by
+no catalog record keeps its declared local window (`expire-unregistered
+--max-age`, 14 days for the daily dump) and is removed by age; a set
+registered in the catalog (for example by the release controller) is never
+touched by that age path, whatever its age or state. So expiry stays explicit
+and catalogued, while the daily dump cannot fill the database disk without
+bound. Unregistered artifacts that predate this rule are treated the same way
+and expire on the first completed run after the window. Disk admission must
+still count catalogued artifacts and hold a release when capacity is
+insufficient. No remote object deletion is introduced: the daily upload path
+keeps no version receipt, so its remote copies follow the operator's own
+bucket policy.
 An optional private `--remote-inventory FILE` registers exact `object_id`
 (`HOST/NAME`) and `sha256` entries for remote copies. Each digest must match
 a member of the local set, and object references cannot belong to two sets.

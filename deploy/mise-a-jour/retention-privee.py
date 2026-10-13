@@ -8,6 +8,7 @@ after health verification. This helper does not authenticate that controller.
 import argparse
 from contextlib import contextmanager
 import fcntl
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -359,6 +360,48 @@ def prune(root, *, now, remote_adapter=None, remote_provider=None):
         return list(candidates)
 
 
+# Files the daily server backup publishes. Only an artifact with one of these
+# names, referenced by no catalog record, ever expires by age.
+DAILY_ARTIFACTS = "ameesh-*.dump"
+
+
+def expire_unregistered(root, *, now, max_age):
+    """Bounded local retention for daily artifacts no catalog record governs.
+
+    The server's daily dump keeps its own declared window; an artifact named by
+    any catalog record belongs to a recovery set and is never touched here,
+    whatever its age or state. Candidates must be private owned regular files
+    with a single link: any other candidate is left in place and reported.
+    """
+    timestamp(now)
+    timestamp(max_age)
+    with locked(root) as (root, records):
+        protected = set()
+        for record in records.values():
+            protected.update(record["files"])
+        deleted, refused = [], []
+        for path in sorted(root.iterdir(), key=lambda entry: entry.name):
+            name = path.name
+            if name.startswith(".") or name in protected or not fnmatch.fnmatch(name, DAILY_ARTIFACTS):
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                refused.append(name)
+                continue
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1):
+                refused.append(name)
+                continue
+            if now - info.st_mtime < max_age:
+                continue
+            path.unlink()
+            deleted.append(name)
+        if deleted:
+            sync(root)
+        return {"deleted": deleted, "refused": refused}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -377,6 +420,9 @@ def main():
     expire = commands.add_parser("prune")
     expire.add_argument("--now", type=float, required=True)
     expire.add_argument("--provider-enrollment")
+    daily = commands.add_parser("expire-unregistered")
+    daily.add_argument("--now", type=float, required=True)
+    daily.add_argument("--max-age", type=float, required=True)
     args = parser.parse_args()
     try:
         if args.command == "register":
@@ -387,6 +433,8 @@ def main():
             protect(args.root, args.artifact, accepted=True)
         elif args.command == "hold":
             protect(args.root, args.artifact, hold=not args.release)
+        elif args.command == "expire-unregistered":
+            print(json.dumps(expire_unregistered(args.root, now=args.now, max_age=args.max_age)))
         else:
             provider = (lambda: provider_adapter(args.provider_enrollment)) if args.provider_enrollment else None
             print(json.dumps({"deleted": prune(args.root, now=args.now, remote_provider=provider)}))
