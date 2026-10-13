@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from urllib.parse import quote
 
 
 class BackupError(ValueError):
@@ -217,7 +218,31 @@ def verify_restore(config, archive, expected):
     return {"artifact_sha256": sha, "restore_verified": True, "disposable_database_removed": True}
 
 
-def upload(archive, host):
+def object_version(value):
+    if (not isinstance(value, str) or not 1 <= len(value) <= 1024
+            or value.lower() == "null" or any(ord(c) < 33 or ord(c) > 126 for c in value)):
+        raise BackupError("immutable non-null object version required")
+    return value
+
+
+def header_version(path):
+    with path.open("rb") as stream:
+        data = stream.read(65537)
+    if len(data) > 65536:
+        raise BackupError("oversized storage headers")
+    blocks = re.split(rb"\r?\n\r?\n", data)
+    block = next((part for part in reversed(blocks) if part.startswith(b"HTTP/")), b"")
+    values = []
+    for line in block.splitlines()[1:]:
+        key, sep, value = line.partition(b":")
+        if sep and key.lower() in (b"x-amz-version-id", b"versionid"):
+            values.append(value.strip().decode("ascii"))
+    if len(values) != 1:
+        raise BackupError("storage did not attest exact object version")
+    return object_version(values[0])
+
+
+def upload(archive, host, *, receipt=None):
     access, secret, bucket, region = (os.environ[name] for name in
                                      ("SCW_ACCESS_KEY", "SCW_SECRET_KEY", "SCW_BUCKET", "SCW_REGION"))
     if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value) for value in (bucket, region, host)):
@@ -227,6 +252,14 @@ def upload(archive, host):
     archive = Path(archive)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", archive.name):
         raise BackupError("invalid archive name")
+    if receipt is not None:
+        receipt = Path(receipt)
+        if receipt.parent.resolve() != archive.parent.resolve() or os.path.lexists(receipt):
+            raise BackupError("new upload receipt must share the private archive directory")
+        info = archive.parent.stat()
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise BackupError("private owned receipt directory required")
+        sha = digest(archive)
     # The caller provides TMPDIR on disk; never fall back to a shared tmpfs.
     staging_root = Path(os.environ["TMPDIR"])
     staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -236,13 +269,48 @@ def upload(archive, host):
         with credentials.open("x") as stream:
             credentials.chmod(0o600)
             stream.write("user = " + json.dumps(access + ":" + secret, ensure_ascii=False) + "\n")
-        env = {key: value for key, value in os.environ.items() if key not in ("SCW_ACCESS_KEY", "SCW_SECRET_KEY")}
+        env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+        headers = Path(staging) / "headers"
+        extra = ["--dump-header", str(headers)] if receipt is not None else []
+        if extra:
+            descriptor = os.open(headers, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
         run(["curl", "--disable", "--config", str(credentials), "--fail", "--silent", "--show-error", "--retry", "3",
-             "--upload-file", str(archive), "--aws-sigv4", "aws:amz:" + region + ":s3",
+             "--proto", "=https", *extra, "--upload-file", str(archive), "--aws-sigv4", "aws:amz:" + region + ":s3",
              "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + archive.name], env=env)
+        if receipt is not None:
+            version_id = header_version(headers)
+            if digest(archive) != sha:
+                raise BackupError("uploaded archive changed")
+            value = {"object_id": host + "/" + archive.name, "sha256": sha,
+                     "version_id": version_id, "bucket": bucket, "region": region}
+            candidate = Path(staging) / "receipt.json"
+            descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump(value, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Staging may be on another volume: copy into the destination
+            # directory before atomic no-replacement publication.
+            temporary = receipt.with_name("." + receipt.name + "-" + uuid.uuid4().hex)
+            try:
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(candidate.read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.link(temporary, receipt)
+                directory = os.open(receipt.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return value
 
 
-def retrieve(credentials, host, name, sha256, output):
+def retrieve(credentials, host, name, sha256, output, *, version_id=None):
     """Retrieve with the restore identity and publish only the pinned artifact.
 
     The credentials file belongs to the separate recovery identity; upload
@@ -264,6 +332,8 @@ def retrieve(credentials, host, name, sha256, output):
             or not all(isinstance(value, str) and value and not any(c in value for c in "\r\n\x00")
                        for value in (access, secret))):
         raise BackupError("invalid pinned recovery location or credentials")
+    if version_id is not None:
+        object_version(version_id)
     output = Path(output)
     output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     output.parent.chmod(0o700)
@@ -275,14 +345,22 @@ def retrieve(credentials, host, name, sha256, output):
         with curl_config.open("x") as stream:
             curl_config.chmod(0o600)
             stream.write("user = " + json.dumps(access + ":" + secret, ensure_ascii=False) + "\n")
-        env = {key: value for key, value in os.environ.items()
-               if key not in ("SCW_ACCESS_KEY", "SCW_SECRET_KEY")}
+        env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+        headers = private / "headers"
+        extra = ["--dump-header", str(headers)] if version_id is not None else []
+        if extra:
+            descriptor = os.open(headers, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+        url = "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + name
+        if version_id is not None:
+            url += "?versionId=" + quote(version_id, safe="")
         # No redirects: a recovery object is bound to this exact HTTPS origin
         # and key, and authentication must never be forwarded elsewhere.
         run(["curl", "--disable", "--config", str(curl_config), "--fail", "--silent", "--show-error",
              "--retry", "3", "--proto", "=https", "--aws-sigv4", "aws:amz:" + region + ":s3",
-             "--output", str(archive),
-             "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + name], env=env)
+             *extra, "--output", str(archive), url], env=env)
+        if version_id is not None and header_version(headers) != version_id:
+            raise BackupError("retrieved object version mismatch")
         if not archive.is_file() or archive.stat().st_size == 0 or digest(archive) != sha256:
             raise BackupError("retrieved recovery artifact digest mismatch")
         archive.chmod(0o600)
@@ -295,7 +373,8 @@ def retrieve(credentials, host, name, sha256, output):
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    return {"artifact_sha256": sha256, "retrieved": True}
+    return {"artifact_sha256": sha256, "retrieved": True,
+            **({"version_id": version_id} if version_id is not None else {})}
 
 
 def main():
@@ -313,12 +392,14 @@ def main():
     transfer = commands.add_parser("upload")
     transfer.add_argument("--file", required=True)
     transfer.add_argument("--host", required=True)
+    transfer.add_argument("--receipt")
     recovery = commands.add_parser("retrieve")
     recovery.add_argument("--credentials", required=True)
     recovery.add_argument("--host", required=True)
     recovery.add_argument("--name", required=True)
     recovery.add_argument("--sha256", required=True)
     recovery.add_argument("--output", required=True)
+    recovery.add_argument("--version-id")
     verify = commands.add_parser("verify-restore")
     verify.add_argument("--config", required=True)
     verify.add_argument("--file", required=True)
@@ -332,9 +413,9 @@ def main():
                                   tables=args.tables or ("agent_registry", "agent_mailbox"))
             print(json.dumps(proof))
         elif args.command == "upload":
-            upload(args.file, args.host)
+            upload(args.file, args.host, receipt=args.receipt)
         elif args.command == "retrieve":
-            print(json.dumps(retrieve(args.credentials, args.host, args.name, args.sha256, args.output)))
+            print(json.dumps(retrieve(args.credentials, args.host, args.name, args.sha256, args.output, version_id=args.version_id)))
         else:
             proof = verify_restore(args.config, args.file, json.loads(Path(args.expected).read_text()))
             print(json.dumps(proof))

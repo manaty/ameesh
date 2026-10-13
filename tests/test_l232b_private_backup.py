@@ -95,6 +95,77 @@ class PrivateBackupTest(unittest.TestCase):
             backup.upload(self.output, "host-1")
         self.assertFalse(seen[0].exists())
 
+    def test_upload_receipt_pins_non_null_version_and_never_replaces(self):
+        self.output.parent.mkdir(mode=0o700)
+        self.output.write_bytes(b"archive")
+        receipt = self.output.with_suffix(".upload.json")
+        def child(args, *, env=None):
+            self.assertEqual(env, {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            self.assertNotIn("CANARY-SECRET", str(args))
+            Path(args[args.index("--dump-header") + 1]).write_text(
+                "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nx-amz-version-id: pinned/+?version\r\n\r\n")
+        settings = {"SCW_ACCESS_KEY": "CANARY-ACCESS", "SCW_SECRET_KEY": "CANARY-SECRET",
+                    "SCW_BUCKET": "acme", "SCW_REGION": "fr-par", "TMPDIR": str(self.root)}
+        with mock.patch.dict(os.environ, settings), mock.patch.object(backup, "run", side_effect=child) as call:
+            value = backup.upload(self.output, "host-1", receipt=receipt)
+            self.assertEqual(value["version_id"], "pinned/+?version")
+            self.assertEqual(value["sha256"], backup.digest(self.output))
+            self.assertEqual(json.loads(receipt.read_text()), value)
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("CANARY-SECRET", receipt.read_text())
+            with self.assertRaises(backup.BackupError):
+                backup.upload(self.output, "host-1", receipt=receipt)
+            self.assertEqual(call.call_count, 1)
+
+    def test_upload_without_version_or_changed_archive_publishes_no_receipt(self):
+        self.output.parent.mkdir(mode=0o700)
+        self.output.write_bytes(b"archive")
+        receipt = self.output.with_suffix(".upload.json")
+        settings = {"SCW_ACCESS_KEY": "CANARY-ACCESS", "SCW_SECRET_KEY": "CANARY-SECRET",
+                    "SCW_BUCKET": "acme", "SCW_REGION": "fr-par", "TMPDIR": str(self.root)}
+        for header in ("", "x-amz-version-id: null", "x-amz-version-id: v1\r\nx-amz-version-id: v2"):
+            def child(args, *, env=None):
+                Path(args[args.index("--dump-header") + 1]).write_text("HTTP/1.1 200 OK\r\n" + header + "\r\n\r\n")
+            with self.subTest(header=header), mock.patch.dict(os.environ, settings), mock.patch.object(backup, "run", side_effect=child):
+                with self.assertRaises(backup.BackupError):
+                    backup.upload(self.output, "host-1", receipt=receipt)
+                self.assertFalse(receipt.exists())
+        def changed(args, *, env=None):
+            Path(args[args.index("--dump-header") + 1]).write_text("HTTP/1.1 200 OK\r\nx-amz-version-id: v1\r\n\r\n")
+            self.output.write_bytes(b"concurrent change")
+        with mock.patch.dict(os.environ, settings), mock.patch.object(backup, "run", side_effect=changed), self.assertRaisesRegex(backup.BackupError, "changed"):
+            backup.upload(self.output, "host-1", receipt=receipt)
+        self.assertFalse(receipt.exists())
+
+    def test_retrieval_pins_and_attests_exact_version_even_with_same_digest(self):
+        credentials, sha = self.recovery_fixture()
+        version = "pinned/+?version"
+        def child(args, *, env=None):
+            if args[0] == "curl":
+                self.assertTrue(args[-1].endswith("?versionId=pinned%2F%2B%3Fversion"))
+                Path(args[args.index("--output") + 1]).write_bytes(b"archive")
+                Path(args[args.index("--dump-header") + 1]).write_text("HTTP/1.1 200 OK\r\nx-amz-version-id: " + version + "\r\n\r\n")
+        with mock.patch.object(backup, "run", side_effect=child):
+            value = backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output, version_id=version)
+        self.assertEqual(value["version_id"], version)
+        self.assertEqual(self.output.read_bytes(), b"archive")
+
+    def test_retrieval_wrong_or_null_version_never_publishes(self):
+        credentials, sha = self.recovery_fixture()
+        def child(args, *, env=None):
+            if args[0] == "curl":
+                Path(args[args.index("--output") + 1]).write_bytes(b"archive")
+                Path(args[args.index("--dump-header") + 1]).write_text("HTTP/1.1 200 OK\r\nx-amz-version-id: different\r\n\r\n")
+        with mock.patch.object(backup, "run", side_effect=child) as call:
+            with self.assertRaisesRegex(backup.BackupError, "version mismatch"):
+                backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output, version_id="pinned")
+            self.assertFalse(self.output.exists())
+            self.assertEqual(call.call_count, 1)
+            for version in ("null", "", "bad\nversion"):
+                with self.subTest(version=version), self.assertRaises(backup.BackupError):
+                    backup.retrieve(credentials, "host-1", "remote.dump", sha, self.output, version_id=version)
+            self.assertEqual(call.call_count, 1)
+
     def test_subprocess_private_diagnostic_is_not_exposed(self):
         import subprocess
         with mock.patch.object(backup.subprocess, "run", side_effect=subprocess.CalledProcessError(

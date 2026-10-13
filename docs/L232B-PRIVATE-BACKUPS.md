@@ -134,5 +134,67 @@ Inference for the unfinished adapter: support for conditional uploads is
 insufficient evidence for safely deleting a digest-pinned recovery object.
 Either verify conditional-delete semantics for the enrolled backend or pin an
 immutable provider version through upload, retrieval, verification and expiry.
-The current name/digest inventory does not capture those version ids, and no
-bucket-versioning or storage-policy change has been made by this lot.
+Legacy name/digest inventories do not capture those version ids. The optional
+version-specific path below adds them; no bucket-versioning or storage-policy
+change has been made by this lot.
+
+## Version-specific storage preparation
+
+`upload --receipt FILE` optionally publishes a private no-replacement JSON
+receipt with the object key, SHA-256, bucket/region and non-null provider version
+reported by the completed upload. Missing/duplicate/null version headers or a
+changed archive produce no receipt. Upload completion still does not establish
+restoration. Failed or retried uploads may leave unregistered provider versions;
+these utilities do not delete them implicitly.
+
+`retrieve --version-id ID` addresses that exact provider version, validates the
+response version as well as the pinned SHA-256 and archive catalogue, and then
+publishes the private local artifact. A same-digest reply naming a different
+version is rejected. Use the isolated restore verification before registration.
+Curl children now receive a minimal environment; inherited upload credentials,
+proxy and certificate overrides cannot select another transfer identity/origin.
+
+A remote inventory item may include `version_id`. Registration preserves it;
+null versions, duplicate exact version references and mixing an unqualified
+reference with qualified versions at the same key are rejected. Distinct exact
+versions at one key can have separate holds and policy deadlines. Pruning passes
+the version to both adapter methods and requires it in the exact absence receipt.
+Legacy name/digest references still require an adapter capable of atomic
+conditional deletion; they cannot use the version-specific backend.
+
+`retention-scaleway.py.VersionRetention(credentials, staging_root, max_bytes=N)`
+implements version-specific GET/hash, DELETE and GET/absence confirmation against
+the fixed Scaleway HTTPS origin. Each request includes an encoded non-null
+`versionId`; returned retrieval headers must identify that exact version.
+The digest check remains safe between GET and DELETE by addressing an immutable
+version rather than the mutable latest key. It never creates a delete marker by
+issuing an unqualified deletion and never addresses a concurrent newer version.
+
+The separate private credential document has `access_key`, `secret_key`,
+`bucket`, `region`, `purpose: "retention-versions"` and `allowed_hosts`.
+Enrollment must bind that exact bucket/region and host allowlist to the approved
+retention policy and supply a dedicated identity scoped to version retrieval and
+deletion. The purpose marker checks configuration shape, not actual provider IAM
+permissions. Neither an upload nor recovery key is automatically reused.
+The backend performs no enrollment, bucket-versioning change or privilege grant.
+
+Credentials use short-lived `0600` curl configuration files under private owned
+on-disk staging. Explicit capacity and object-size budgets, bounded deadlines
+and curl 8.4+ are required; its
+[maximum-size option](https://curl.se/docs/manpage.html#--max-filesize)
+can then stop a transfer with initially unknown length. The controller must
+reserve concurrent staging capacity; the backend's free-space check is not that
+reservation. Errors contain categories, never raw provider diagnostics.
+Only a provider object/version-not-found response proves absence; missing bucket,
+redirect, access denied, corrupt headers, wrong hash, timeout and an unconfirmed
+DELETE preserve the local recovery set. Lost deletion replies resume under the
+catalog's already durable intent. Temporary response/configuration files are
+removed on success and failure.
+
+This backend is source code only: it is not installed/enrolled for the server
+CLI or daily job. These remain closed for remote expiry without an explicitly
+supplied adapter. Tests simulate the HTTP transport, including credentials and
+argv canaries, concurrent new versions, lost replies, quota/size failures and
+version holds. No authenticated Scaleway request or provider-policy pilot has
+been performed. Host enrollment and controller/installer integration remain
+unfinished; the presence of this module is not deployment authority.

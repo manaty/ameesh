@@ -29,6 +29,13 @@ def identifier(value):
     return value
 
 
+def version_identifier(value):
+    if (not isinstance(value, str) or not 1 <= len(value) <= 1024
+            or value.lower() == "null" or any(ord(c) < 33 or ord(c) > 126 for c in value)):
+        raise RetentionError("immutable non-null object version required")
+    return value
+
+
 def timestamp(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise RetentionError("invalid policy timestamp")
@@ -116,6 +123,7 @@ def validate(records):
         raise RetentionError("invalid retention catalog")
     names = set()
     objects = set()
+    unqualified = set()
     for artifact, record in records.items():
         identifier(artifact)
         if not isinstance(record, dict) or record.get("state") not in ("retained", "deleting", "deleted"):
@@ -147,12 +155,19 @@ def validate(records):
             host, name = object_id.split("/")
             identifier(host)
             identifier(name)
-            if (object_id in objects or item.get("sha256") not in record["files"].values()
+            if "version_id" in item:
+                version_identifier(item["version_id"])
+            reference = (object_id, item.get("version_id"))
+            if (reference in objects or object_id in unqualified
+                    or (item.get("version_id") is None and any(ref[0] == object_id for ref in objects))
+                    or item.get("sha256") not in record["files"].values()
                     or type(item.get("deleted")) is not bool
                     or (item["deleted"] and record["state"] == "retained")
                     or (not item["deleted"] and record["state"] == "deleted")):
                 raise RetentionError("invalid or shared remote recovery object")
-            objects.add(object_id)
+            objects.add(reference)
+            if item.get("version_id") is None:
+                unqualified.add(object_id)
 
 
 def register(root, artifact, files, *, expires_at, rollback_until, remote=()):
@@ -170,7 +185,8 @@ def register(root, artifact, files, *, expires_at, rollback_until, remote=()):
             hashes[name] = private_digest(root / name)
         records[artifact] = dict(files=hashes, expires_at=expires_at,
                                  rollback_until=rollback_until, accepted=False, hold=False, state="retained",
-                                 remote=[dict(object_id=item["object_id"], sha256=item["sha256"], deleted=False)
+                                 remote=[dict(object_id=item["object_id"], sha256=item["sha256"], deleted=False,
+                                              **({"version_id": item["version_id"]} if "version_id" in item else {}))
                                          for item in remote])
         validate(records)
         save(root, records)
@@ -217,7 +233,8 @@ def prune(root, *, now, remote_adapter=None):
                     continue
                 if remote_adapter is None:
                     raise RetentionError("remote retention adapter is not enrolled")
-                actual = remote_adapter.inspect(item["object_id"])
+                actual = remote_adapter.inspect(item["object_id"], **(
+                    {"version_id": item["version_id"]} if "version_id" in item else {}))
                 if actual != item["sha256"] and not (actual is None and record["state"] == "deleting"):
                     raise RetentionError("remote recovery artifact changed or missing")
         for artifact, record in candidates.items():
@@ -230,9 +247,10 @@ def prune(root, *, now, remote_adapter=None):
                 # Replay accepts already-absent objects only after durable
                 # intent. Exact receipts prevent a wrong object/SHA response
                 # from unlocking local deletion.
-                receipt = remote_adapter.delete_if_digest(item["object_id"], item["sha256"])
+                version = {"version_id": item["version_id"]} if "version_id" in item else {}
+                receipt = remote_adapter.delete_if_digest(item["object_id"], item["sha256"], **version)
                 if (not isinstance(receipt, dict) or receipt.get("absent") is not True
-                        or receipt != {"object_id": item["object_id"], "sha256": item["sha256"], "absent": True}):
+                        or receipt != {"object_id": item["object_id"], "sha256": item["sha256"], "absent": True, **version}):
                     raise RetentionError("remote deletion was not confirmed")
                 item["deleted"] = True
                 save(root, records)
