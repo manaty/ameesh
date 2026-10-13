@@ -45,6 +45,7 @@
 --   * clés publiques et identifiants d'authentificateurs — pas secrets, mais
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
+--       key_holders.public_key (et la vue mesh_keys, #330)
 --       authenticators.public_key, .credential_id
 --   * exécuteurs médiés (voie B, 0062 et 0063) — empreintes de jetons et de
 --     codes, identifiants d'assertions, clé et attestation d'appareil,
@@ -232,6 +233,20 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'decision', 'signature_key', 'created_at', 'expires_at',
         'consumed_at', 'consumed_by', 'unconsumed', 'unexpired',
         'key_known', 'key_live', 'key_matches', 'expires_ts', 'key_is_owner'
+    ]),
+    -- #330 (0364) : clés des humains, hors registre des agents
+    ('key_holders', ARRAY[
+        'name', 'human', 'public_key_fingerprint', 'key_role',
+        'key_updated_at', 'key_revoked_at', 'created_at'
+    ]),
+    ('mesh_keys', ARRAY[
+        'name', 'holder', 'public_key_fingerprint', 'key_role',
+        'key_updated_at', 'key_revoked_at'
+    ]),
+    -- #326 r2 (0364) : journal des clés, sans la clé (l'empreinte suffit)
+    ('key_events', ARRAY[
+        'id', 'at', 'name', 'holder', 'event', 'key_role', 'fingerprint',
+        'db_user', 'owner_gesture'
     ]),
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'approval_id', 'consumed_by', 'consumed_at'

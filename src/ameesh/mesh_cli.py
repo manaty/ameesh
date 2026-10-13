@@ -828,6 +828,22 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
 # clés
 # --------------------------------------------------------------------------
 
+def _note_owner_key(db: Db, result: dict) -> None:
+    """Une clé owner d'humain vient d'être enregistrée (#326 r1) : son chat
+    (`chat-<id>`, s'il existe) en reçoit la note, que le geste vienne du
+    propriétaire ou non ; `ameesh alerts` lève aussi `owner_key_registered`."""
+    chat = "chat-" + result["agent"]
+    if not storage.of(db).agents.get(chat):
+        return
+    mail.send(db, work.SYSTEM_SENDER, chat,
+              "An owner key was %s for %s: fingerprint %s. If this was not your "
+              "gesture, revoke it at once (ameesh key revoke %s) and register "
+              "yours with the owner's database role (key register --human %s "
+              "--replace)." % (result.get("status") or "registered", result["human"],
+                               result["fingerprint"], result["agent"], result["agent"]),
+              kind="event")
+
+
 def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -844,18 +860,49 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             print("private key: %s (0600 — keep it offline, never commit it)" % private_path)
             print("public key : %s" % public_path)
             print("fingerprint: %s" % fingerprint)
-            print("register it: agent-mesh key register <agent> --public-key %s" % public_path)
+            print("register it: ameesh key register --human %s --public-key %s --role owner"
+                  % (args.name, public_path))
             return 0
         if args.key_command == "register":
+            if bool(args.agent) == bool(args.human):
+                print(USAGE_HINT % "key register: give an agent, or --human <id> "
+                      "for a human's key (the owner's)", file=sys.stderr)
+                return 2
+            if args.replace and not args.human:
+                print(USAGE_HINT % "key register --replace: only with --human <id>",
+                      file=sys.stderr)
+                return 2
             public = signing.read_public(os.path.expanduser(args.public_key))
-            result = authority.register_key(
-                db, args.agent, public, role=args.role, note=args.note)
-            print("key of %s registered: %s (role %s)" % (
-                result["agent"], result["fingerprint"], result["role"]))
+            try:
+                if args.human:
+                    result = authority.register_human_key(
+                        db, args.human, public, role=args.role, replace=args.replace)
+                else:
+                    result = authority.register_key(
+                        db, args.agent, public, role=args.role, note=args.note)
+            except authority.AuthorityError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
+            print("key of %s %s: %s (role %s)%s" % (
+                result["agent"], "replaced" if result.get("status") == "replaced"
+                else "registered", result["fingerprint"], result["role"],
+                " — %s, key holder only (no agent)" % result["human"]
+                if result.get("human") else ""))
             if result["role"] == "owner":
                 print("warning: this key carries the owner's authority for %s; "
                       "its private key must exist only with the owner."
                       % result["agent"])
+                if result.get("human"):
+                    _note_owner_key(db, result)
+            return 0
+        if args.key_command == "confirm":
+            try:
+                event = authority.confirm_key(db, args.agent)
+            except authority.AuthorityError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
+            print("key of %s confirmed by the owner (event %d): its owner_key_registered "
+                  "alerts end" % (args.agent, event))
             return 0
         if args.key_command == "revoke":
             if not authority.revoke_key(db, args.agent):
@@ -871,7 +918,8 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(info, ensure_ascii=False, indent=2))
                 return 0
-            print("agent      : %s" % info["name"])
+            print("%-11s: %s" % ("human" if info.get("holder") == "human" else "agent",
+                                   info["name"]))
             print("fingerprint: %s" % info.get("public_key_fingerprint"))
             print("role       : %s%s" % (
                 info.get("key_role") or "agent",
@@ -891,8 +939,8 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 print("no key registered")
                 return 0
             for row in rows:
-                print("%-20s %-8s %s  %s" % (
-                    row["name"], row.get("key_role") or "agent",
+                print("%-20s %-6s %-8s %s  %s" % (
+                    row["name"], row.get("holder") or "agent", row.get("key_role") or "agent",
                     row["public_key_fingerprint"],
                     "revoked %s" % _fmt_moment(row["key_revoked_ts"])
                     if row.get("key_revoked_ts") else "registered %s"
@@ -1250,7 +1298,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import identity, work_projects
             binding = identity.resolve_binding(cfg, db)
             creator = binding.name if binding.ok else args.actor
-            args.app = work_projects.creation_project(cfg, db, creator, args.app)
+            if args.new_project and args.app is None:
+                raise work.WorkError("--new-project goes with --app <project>")
+            args.app = work_projects.creation_project(cfg, db, creator, args.app,
+                                                      new_project=args.new_project)
+            # #506: read before the lot exists (it makes its project known)
+            introduced = (work_projects.introduction(cfg, db, args.app, creator)
+                          if args.new_project and args.app else "")
             minutes = estimates.parse(args.estimate) if args.estimate else None
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
@@ -1261,7 +1315,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
-                estimate=minutes, estimate_source=args.estimate_source, size=args.size)
+                estimate=minutes, estimate_source=args.estimate_source, size=args.size,
+                note=introduced)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -2158,11 +2213,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="confirms that the owner is the one acting")
     p_gen.set_defaults(func=cmd_key)
     p_reg = key_sub.add_parser("register")
-    p_reg.add_argument("agent")
+    p_reg.add_argument("agent", nargs="?")
+    p_reg.add_argument("--human", metavar="ID",
+                       help="a human's key (human:ID or ID), held outside the agents (#330)")
     p_reg.add_argument("--public-key", required=True)
     p_reg.add_argument("--role", choices=list(authority.KEY_ROLES), default=authority.DEFAULT_KEY_ROLE,
                        help="owner = owner's authority; agent = provenance only")
     p_reg.add_argument("--note", default=None)
+    p_reg.add_argument("--replace", action="store_true",
+                       help="with --human: replace or rotate the key, even revoked — the "
+                            "owner's own gesture, refused by the database outside the "
+                            "owner's database role (#326)")
     p_reg.set_defaults(func=cmd_key)
     p_kshow = key_sub.add_parser("show")
     p_kshow.add_argument("agent")
@@ -2174,6 +2235,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_krev = key_sub.add_parser("revoke")
     p_krev.add_argument("agent")
     p_krev.set_defaults(func=cmd_key)
+    p_kconf = key_sub.add_parser(
+        "confirm", help="the owner confirms the registrations of a key: its "
+        "owner_key_registered alert ends (owner's database role, #326)")
+    p_kconf.add_argument("agent")
+    p_kconf.set_defaults(func=cmd_key)
 
     p_app = sub.add_parser("approve", help="sign an approval")
     p_app.add_argument("--key", required=True, help="owner's private key")
@@ -2211,6 +2277,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--source", default="")
     pw_add.add_argument("--app", default=None,
                         help="project; default: the creating agent's registry or own canon")
+    pw_add.add_argument("--new-project", action="store_true",
+                        help="#506: accept an --app project nobody declares yet "
+                             "(journaled on the lot); refused otherwise")
     pw_add.add_argument("--body", default=None)
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
