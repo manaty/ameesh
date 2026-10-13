@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, menage, notify, registry
+from ameesh import exploitation, menage, notify, platform, registry
 
 from .support import PgTestCase
 
@@ -412,6 +412,83 @@ class EvictionTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(keep), "the work tree was pruned")
         self.assertFalse(os.path.exists(prune), "an unprotected empty directory is pruned")
 
+    @unittest.skipUnless(platform.is_linux(), "mountinfo is Linux-only")
+    def test_a_bind_mount_of_the_same_filesystem_is_never_crossed(self):
+        # r5 (codex P1 r4): a bind mount of an outside directory keeps the same
+        # `st_dev`; /proc/self/mountinfo (field 5) alone tells it. Its files are
+        # not counted by the walk, and the prune removes no directory inside it
+        mount = os.path.join(self.mine, "bind")
+        inside = [os.path.join(mount, "sub", "f%d" % i) for i in range(2)]
+        for path in inside:
+            _write(path)
+        keep = os.path.join(mount, "sub", "empty")
+        os.makedirs(keep)
+        loose = [os.path.join(self.mine, "loose%d" % i) for i in range(2)]
+        for i, path in enumerate(loose):
+            _write(path, age_s=(10 - i) * HOUR)          # loose0 is the oldest
+        real = platform.mountinfo
+        dev = os.lstat(mount).st_dev
+
+        def with_bind(path=None):
+            listed = real(path)
+            listed.append({"id": 99999, "point": mount, "dev": dev,
+                           "fstype": "ext4", "source": "/dev/root"})
+            return listed
+
+        with mock.patch.object(platform, "mountinfo", with_bind):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertTrue(all(os.path.exists(path) for path in inside))
+        self.assertTrue(os.path.isdir(keep), "a directory inside the mount was pruned")
+        self.assertFalse(os.path.exists(loose[0]))
+        self.assertTrue(os.path.exists(loose[1]))
+        self.assertEqual(result["before"], 2 * B)        # the mount is out of the scan
+        self.assertEqual(result["files"], 1)
+
+    @unittest.skipUnless(platform.is_linux(), "mountinfo is Linux-only")
+    def test_unreadable_mount_table_evicts_and_prunes_nothing(self):
+        # r5 (codex P1 r4): fail-closed — without the mount table, no directory
+        # can be told from a bind mount: nothing is scanned, evicted or pruned
+        loose = os.path.join(self.mine, "loose")
+        _write(loose)
+        empty = os.path.join(self.mine, "empty", "sub")
+        os.makedirs(empty)
+        with mock.patch.object(platform, "mountinfo", return_value=[]):
+            result = menage.evict_lru([self.mine], self.root, 0)
+        self.assertTrue(result["mounts_unreadable"])
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["before"], 0)
+        self.assertTrue(os.path.exists(loose))
+        self.assertTrue(os.path.isdir(empty))
+
+    def test_a_protected_subtree_leaves_the_quota_at_once(self):
+        # r5 (codex P2 r4): interleaved order repo/a, loose, repo/b, quota one
+        # block: the `.git` that appears before a's unlink must take the WHOLE
+        # remaining subtree (a and b) out of `counted` at once, otherwise
+        # `loose` is evicted to make up for `b`, which is out of reach too
+        repo = os.path.join(self.mine, "repo")
+        first = os.path.join(repo, "a")
+        second = os.path.join(repo, "b")
+        _write(first, age_s=10 * HOUR)
+        _write(second, age_s=8 * HOUR)
+        loose = os.path.join(self.mine, "loose")
+        _write(loose, age_s=9 * HOUR)                    # between a and b
+        real = menage._unlink_in_root
+
+        def appearing(path, root, **kw):
+            marker = os.path.join(repo, ".git")
+            if not os.path.exists(marker):
+                os.mkdir(marker)
+            return real(path, root, **kw)
+
+        with mock.patch.object(menage, "_unlink_in_root", appearing):
+            result = menage.evict_lru([self.mine], self.root, B)
+        self.assertTrue(os.path.exists(first))
+        self.assertTrue(os.path.exists(second))
+        self.assertTrue(os.path.exists(loose))
+        self.assertEqual(result["files"], 0)
+        self.assertEqual(result["evicted"], 0)
+        self.assertFalse(result["over_quota"])
+
     def test_sparse_file_counts_only_the_blocks_it_occupies(self):
         # r3 (codex P2): st_blocks*512 always, 0 meaning 0 — a 1 TB sparse file
         # no longer counts its logical size and no longer evicts the others
@@ -583,6 +660,20 @@ class PassAndAlertTest(PgTestCase):
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["path"], tmp)
         self.assertIn("tmp_unscanned", notify.TYPE_LABELS)
+
+    @unittest.skipUnless(platform.is_linux(), "mountinfo is Linux-only")
+    def test_unreadable_mount_table_is_reported_and_evicts_nothing(self):
+        # r5 (codex P1 r4): fail-closed is visible in the pass report
+        tmp = menage.turn_env(self.mine, self.pol, "codex3", {})["TMPDIR"]
+        ours = os.path.join(tmp, "out.txt")
+        _write(ours)
+        with mock.patch.object(platform, "mountinfo", return_value=[]):
+            report = menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        self.assertTrue(os.path.exists(ours))
+        self.assertTrue(any("mount table unreadable" in note for note in report["skipped"]),
+                        report["skipped"])
+        self.assertNotIn(("tmp", "evicted"),
+                         [(e["kind"], e["action"]) for e in report["entries"]])
 
 
 if __name__ == "__main__":

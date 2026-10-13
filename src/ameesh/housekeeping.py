@@ -771,8 +771,40 @@ def _used_bytes(st) -> int:
     return blocks * 512
 
 
+def _mount_points(root: str) -> set | None:
+    """#500 r5 (codex P1 r4) : les points de montage SOUS la racine gérée,
+    lus dans `/proc/self/mountinfo` (champ 5, `platform.mountinfo`). Un bind
+    mount d'un dossier extérieur, sur le MÊME système de fichiers, garde le
+    même `st_dev` : la table des montages est le seul moyen de le voir.
+
+    Rend `None` quand la table est illisible sur Linux : fail-closed, la
+    descente et l'élagage sont refusés (on ne peut pas distinguer un dossier
+    monté d'un dossier géré). Hors Linux, ensemble vide : pas de mountinfo, la
+    frontière reste `st_dev`."""
+    if not platform.is_linux():
+        return set()
+    entries = platform.mountinfo()
+    if not entries:
+        return None          # Linux a toujours au moins « / » : table illisible
+    real = os.path.realpath(root).rstrip(os.sep) or os.sep
+    prefix = real if real.endswith(os.sep) else real + os.sep
+    out: set = set()
+    for entry in entries:
+        point = str(entry.get("point") or "").rstrip(os.sep) or os.sep
+        if point != real and point.startswith(prefix):
+            out.add(point)
+    return out
+
+
+def _is_mount_point(directory: str, mounts: set | None) -> bool:
+    """#500 r5 : `directory` est un point de montage de `mounts` (comparaison
+    de chemins : on ne `stat` pas un dossier qu'un montage peut cacher)."""
+    return bool(mounts) and os.path.normpath(directory) in mounts
+
+
 def _files(top: str, limit: int | None = None, *, state: dict | None = None,
-           protect_git: bool = False, device: int | None = None):
+           protect_git: bool = False, device: int | None = None,
+           mounts: set | None = None):
     """(chemin, taille, mtime, stat) des fichiers sous `top`, sans suivre les
     liens ni changer de système de fichiers ; s'arrête à `limit` fichiers
     (défaut `WALK_LIMIT`) et le dit alors dans `state["truncated"]` si `state`
@@ -788,7 +820,12 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
     #500 r3 (codex P1) : `device` (le `st_dev` de la racine gérée) est exigé
     pour chaque entrée — un point de montage apparu dans le dossier n'est ni
     parcouru ni compté. Le `stat` de l'entrée est rendu avec la taille, pour
-    que l'éviction le revérifie juste avant l'unlink."""
+    que l'éviction le revérifie juste avant l'unlink.
+
+    #500 r5 (codex P1 r4) : `mounts` (`_mount_points`) nomme les points de
+    montage SOUS la racine gérée — un bind mount d'un dossier extérieur garde
+    le même `st_dev` ; un tel dossier n'est ni parcouru ni compté, et il est
+    ajouté à `state["protected"]` (marqueur `mount`)."""
     limit = WALK_LIMIT if limit is None else limit
     if device is None:
         try:
@@ -800,6 +837,11 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
     stack = [top]
     while stack:
         current = stack.pop()
+        if _is_mount_point(current, mounts):
+            if state is not None:
+                state.setdefault("protected", []).append(
+                    {"path": current, "marker": "mount"})
+            continue
         if protect_git:
             marker = _git_marker(current)
             if marker is not None:
@@ -844,6 +886,13 @@ def size_of(path: str, limit: int = WALK_LIMIT) -> int:
     if not stat.S_ISDIR(st.st_mode):
         return _used_bytes(st)
     return sum(size for _p, size, _m, _st in _files(path, limit))
+
+
+def _in_subtree(path: str, directory: str) -> bool:
+    """#500 r5 : `path` est `directory` lui-même ou l'un de ses descendants
+    (frontière de chemin, sans `stat`)."""
+    directory = directory.rstrip(os.sep)
+    return path == directory or path.startswith(directory + os.sep)
 
 
 def _located_in(path: str, root: str) -> bool:
@@ -905,7 +954,8 @@ def _clear_dir(directory: str, root: str) -> int:
     return freed
 
 
-def _prune_empty_dirs(top: str, device: int | None = None) -> None:
+def _prune_empty_dirs(top: str, device: int | None = None, *,
+                      mounts: set | None = None) -> None:
     """#500 r3 : retire les dossiers vidés par une éviction, du plus profond au
     plus haut, sans traverser un point de montage. Un dossier dont le `st_dev`
     n'est pas celui de la racine gérée (`device`) est laissé en place, lui et
@@ -914,7 +964,11 @@ def _prune_empty_dirs(top: str, device: int | None = None) -> None:
 
     #500 r4 (codex P2 r3) : un dossier porteur d'un marqueur git — et tout son
     sous-arbre — n'est ni parcouru ni retiré : une éviction ne doit pas vider
-    l'intérieur d'un arbre de travail protégé."""
+    l'intérieur d'un arbre de travail protégé.
+
+    #500 r5 (codex P1 r4) : `mounts` (`_mount_points`) nomme les points de
+    montage sous la racine gérée ; aucun n'est parcouru ni retiré, même quand
+    le bind mount garde le `st_dev` de la racine."""
     if device is None:
         try:
             device = os.lstat(top).st_dev
@@ -924,14 +978,15 @@ def _prune_empty_dirs(top: str, device: int | None = None) -> None:
     while stack:
         current, post = stack.pop()
         if post:
-            if current != top and not _git_protected(current):
+            if current != top and not _git_protected(current) \
+                    and not _is_mount_point(current, mounts):
                 try:
                     os.rmdir(current)    # échoue si le dossier n'est pas vide
                 except OSError:
                     pass
             continue
-        if _git_protected(current):
-            continue                     # arbre de travail : ni entré ni élagué
+        if _git_protected(current) or _is_mount_point(current, mounts):
+            continue         # arbre de travail ou montage : ni entré ni élagué
         stack.append((current, True))
         try:
             with os.scandir(current) as it:
@@ -1117,7 +1172,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     `WALK_LIMIT`, nothing is evicted at all (`truncated`, alerted): the pass
     cannot prove what is removable. Rend `{before, after, evicted, files,
     over_quota, unremovable, worktrees, worktree_symlinks, truncated,
-    truncated_paths, failed, blocked}`.
+    truncated_paths, failed, blocked, mounts_unreadable}`.
 
     #500 r3 (codex P1): the scan never leaves the managed root's filesystem
     (`device`), and every candidate is re-verified just before its unlink
@@ -1127,12 +1182,24 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     #500 r4 (codex P2 r3): the bytes of a candidate that is gone or whose
     subtree became protected leave `counted` with it, so the pass stops as
     soon as what is still evictable fits the quota (and the empty-directory
-    pruning never enters such a subtree)."""
+    pruning never enters such a subtree). #500 r5 (codex P1/P2 r4): a mount
+    point under the managed root (`_mount_points`, same `st_dev` for a bind
+    mount) is neither crossed nor pruned, and the whole remaining subtree of a
+    candidate that became protected leaves `counted` at once. When the mount
+    table is unreadable on Linux (`mounts_unreadable`), nothing is scanned,
+    evicted or pruned: fail-closed."""
     now = time.time() if now is None else float(now)
     try:
         root_dev = os.stat(root).st_dev
     except OSError:
         root_dev = None
+    mounts = _mount_points(root)
+    if mounts is None:
+        return {"before": 0, "after": 0, "evicted": 0, "files": 0,
+                "over_quota": False, "unremovable": 0, "worktrees": [],
+                "worktree_symlinks": [], "truncated": False,
+                "truncated_paths": [], "failed": [], "blocked": False,
+                "mounts_unreadable": True}
     scan: dict = {}
     found = []
     for directory in directories:
@@ -1140,7 +1207,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             break                      # the listing is partial: no eviction (below)
         if os.path.isdir(directory) and not os.path.islink(directory):
             found.extend(_files(directory, state=scan, protect_git=True,
-                                device=root_dev))
+                                device=root_dev, mounts=mounts))
     before = sum(size for _p, size, _m, _st in found)
     total, evicted, files = before, 0, 0
     unremovable = 0
@@ -1169,17 +1236,22 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
         counted = before - unremovable
         blocked = unremovable > quota
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
-        for path, size, mtime, st in sorted(candidates, key=lambda item: item[2]):
+        uncounted: set = set()         # #500 r5: candidates already out of `counted`
+        order = sorted(candidates, key=lambda item: item[2])
+        for index, (path, size, mtime, st) in enumerate(order):
             if blocked or counted <= quota:
                 break
-            if any(path == d or path.startswith(d.rstrip("/") + os.sep)
-                   for d in protected):
+            if any(_in_subtree(path, d) for d in protected):
                 # #500 r4 (codex P2 r3): the subtree became protected during
                 # the pass (`.git` appeared, mount point): its bytes are not
                 # evictable any more, so they leave `counted` too — otherwise
                 # newer files would be evicted although what is still
-                # evictable already fits the quota.
-                counted -= size
+                # evictable already fits the quota. r5 excludes the remaining
+                # candidates of the subtree at once (below), so this branch
+                # normally sees bytes that are still counted.
+                if path not in uncounted:
+                    counted -= size
+                    uncounted.add(path)
                 continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
                 continue
@@ -1204,10 +1276,19 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     # marker/mount that appeared, leaves `counted` as well; a
                     # candidate merely replaced is still there and stays
                     # counted (a later pass sees the replacement).
+                    # #500 r5 (codex P2 r4): the WHOLE remaining subtree leaves
+                    # `counted` at once — otherwise a later candidate of it
+                    # still counts and a file outside is evicted to make up for
+                    # bytes that are already out of reach.
                     if exc.reason in ("git marker", "mount point"):
                         protected.append(exc.path)
-                    if exc.reason in ("gone", "git marker", "mount point"):
+                        for other, other_size, _m, _st in order[index:]:
+                            if _in_subtree(other, exc.path) and other not in uncounted:
+                                counted -= other_size
+                                uncounted.add(other)
+                    elif exc.reason == "gone" and path not in uncounted:
                         counted -= size
+                        uncounted.add(path)
                     continue
                 except OSError:
                     unremovable += size
@@ -1221,12 +1302,12 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             files += 1
         if not dry_run and files:
             for directory in directories:
-                _prune_empty_dirs(directory, root_dev)
+                _prune_empty_dirs(directory, root_dev, mounts=mounts)
     return {"before": before, "after": total, "evicted": evicted, "files": files,
             "over_quota": counted > quota, "unremovable": unremovable,
             "worktrees": worktrees, "worktree_symlinks": symlinks,
             "truncated": truncated, "truncated_paths": scan.get("truncated_paths") or [],
-            "failed": failed, "blocked": blocked}
+            "failed": failed, "blocked": blocked, "mounts_unreadable": False}
 
 
 def unremovable_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
@@ -2710,7 +2791,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                  "detail": "%d file(s), quota %s" % (
                                      result["files"],
                                      resources_mod.fmt_value("q", policy.tmp_quota))})
-                if result["truncated"]:
+                if result.get("mounts_unreadable"):
+                    skipped.append("tmp %s: mount table unreadable "
+                                   "(/proc/self/mountinfo), nothing evicted" % full)
+                elif result["truncated"]:
                     skipped.append("tmp %s: listing truncated (%s file limit), nothing "
                                    "evicted" % (full, WALK_LIMIT))
                 elif result["blocked"]:
@@ -2747,7 +2831,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                 "detail": "quota %s: %d oldest file(s) evicted"
                                           % (resources_mod.fmt_value("q", policy.cache_quota),
                                              result["files"])})
-        if result["truncated"]:
+        if result.get("mounts_unreadable"):
+            skipped.append("caches: mount table unreadable (/proc/self/mountinfo), "
+                           "nothing evicted")
+        elif result["truncated"]:
             skipped.append("caches: listing truncated (%s file limit), nothing evicted"
                            % WALK_LIMIT)
         elif result["blocked"]:
