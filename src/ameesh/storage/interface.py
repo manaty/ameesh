@@ -1213,7 +1213,9 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str) -> dict | None:
         """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
-        et journalise ; None (rien d'écrit) si le lot n'est plus en `qa`.
+        et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
+        son assigné est devenu le relecteur (la règle est relue dans
+        l'écriture, pas seulement avant : #705 r2, B1).
 
         La colonne vient de la migration 0421 : avant elle, la lecture s'en
         passe (`item_columns`) et l'écriture est refusée avec la marche à
@@ -1246,7 +1248,10 @@ class WorkItems(Domain):
                actor: str) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
-        L40 : efface la délégation en cours (issue `annulee`)."""
+        L40 : efface la délégation en cours (issue `annulee`). #705 : si le
+        nouvel assigné est le relecteur désigné, la désignation tombe dans la
+        même écriture (le journal la nomme) — un relecteur ne relit pas son
+        propre travail."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
@@ -1269,7 +1274,8 @@ class WorkItems(Domain):
         transaction : délégation en cours remplacée, lot au délégué avec
         délégant, début et échéance (`now + within_s`), ligne au registre des
         délégations, journal. Rend `{item, delegation, replaced}` ; None si
-        le lot a bougé."""
+        le lot a bougé. #705 : déléguer à son relecteur désigné retire la
+        désignation dans la même écriture (le journal la nomme)."""
 
     @abc.abstractmethod
     def current_delegation(self, item_id: int) -> dict | None:

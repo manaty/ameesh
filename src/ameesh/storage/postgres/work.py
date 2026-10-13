@@ -334,12 +334,15 @@ class WorkItems(interface.WorkItems):
 
     def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
-        ligne de journal ensemble."""
+        ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
+        pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
+        avant, un `assign` a pu la changer entre-temps."""
         rows = self.db.query(
             "UPDATE work_items SET reviewer = %%s, updated_at = now()"
             " WHERE id = %%s AND state = 'qa'"
+            "   AND assignee IS DISTINCT FROM %%s"
             " RETURNING %s" % item_columns(self.db),
-            (reviewer, int(item_id)))
+            (reviewer, int(item_id), reviewer))
         if not rows:
             return None
         self._event(int(item_id), "qa", "reviewer %s designated" % reviewer, actor)
@@ -354,17 +357,38 @@ class WorkItems(interface.WorkItems):
             return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
-        """`assign` dans la transaction ouverte ; `state` : celui exigé."""
+        """`assign` dans la transaction ouverte ; `state` : celui exigé.
+
+        #705 r2 (B1) : la règle « le relecteur n'est pas l'assigné » vaut
+        aussi quand l'assignation arrive après la désignation — la désignation
+        tombe alors dans la MÊME écriture (l'assignation et la désignation
+        peuvent se croiser), et le journal le dit."""
+        previous_reviewer = ""
+        reviewer_set = ""
+        params: list = [assignee]
+        if has_reviewer(self.db):
+            seen = self.db.query(
+                "SELECT reviewer FROM work_items WHERE id = %s FOR UPDATE",
+                (int(item_id),))
+            previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
+            reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
+                            " ELSE reviewer END")
+            params.append(assignee)
+        params += [int(item_id), current, state, state]
         rows = self.db.query(
-            "UPDATE work_items SET assignee = %%s, updated_at = now(),"
-            "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-            " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
-            "   AND state NOT IN ('merged', 'promoted', 'closed')"
-            "   AND (%%s::text IS NULL OR state = %%s)"
-            " RETURNING %s" % item_columns(self.db),
-            (assignee, int(item_id), current, state, state))
+            ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+             "       updated_at = now(),"
+             "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+             " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
+             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+             "   AND (%s::text IS NULL OR state = %s)"
+             " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
+            tuple(params))
         if not rows:
             return None
+        if previous_reviewer and previous_reviewer == assignee:
+            note = "%s; reviewer %s cleared (they now hold the lot)" % (
+                note, previous_reviewer)
         self.db.query(
             "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
             "       resolved_by = %s"
@@ -406,12 +430,18 @@ class WorkItems(interface.WorkItems):
         échéance, le registre reçoit la nouvelle ligne, le journal la note.
         Rend `{item, delegation, replaced}` ou None (lot modifié entre-temps)."""
         with self.db.transaction() as tx:
-            rows = tx.query(
-                "SELECT id FROM work_items WHERE id = %%s"
+            with_reviewer = has_reviewer(self.db)
+            seen = tx.query(
+                "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
-                " FOR NO KEY UPDATE" % _CLOSED, (int(item_id), current))
-            if not rows:
+                " FOR NO KEY UPDATE"
+                % (", reviewer" if with_reviewer else "", _CLOSED),
+                (int(item_id), current))
+            if not seen:
                 return None
+            # #705 r2 (B1) : déléguer à son relecteur retire la désignation
+            # (le relecteur relirait son propre travail), dans l'écriture même.
+            previous_reviewer = (seen[0]["reviewer"] or "") if with_reviewer else ""
             replaced = tx.query(
                 "UPDATE work_item_delegations SET outcome = 'remplacee', resolved_at = now(),"
                 "       resolved_by = %s"
@@ -419,11 +449,20 @@ class WorkItems(interface.WorkItems):
                 " RETURNING id, delegate, delegated_by,"
                 "           extract(epoch from due_at)::float8 AS due_ts",
                 (actor or "", int(item_id)))
+            reviewer_set = ""
+            params: list = [delegate, delegated_by, float(within_s), int(item_id)]
+            if with_reviewer:
+                reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
+                                " ELSE reviewer END")
+                params = [delegate, delegate, delegated_by, float(within_s),
+                          int(item_id)]
             rows = tx.query(
-                "UPDATE work_items SET assignee = %%s, delegated_by = %%s, delegated_at = now(),"
-                "       due_at = now() + make_interval(secs => %%s), updated_at = now()"
-                " WHERE id = %%s RETURNING %s" % item_columns(self.db),
-                (delegate, delegated_by, float(within_s), int(item_id)))
+                ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                 "       delegated_by = %s, delegated_at = now(),"
+                 "       due_at = now() + make_interval(secs => %s), updated_at = now()"
+                 " WHERE id = %s RETURNING __COLUMNS__"
+                 ).replace("__COLUMNS__", item_columns(self.db)),
+                tuple(params))
             item = rows[0]
             delegation = tx.query(
                 "INSERT INTO work_item_delegations AS d"
@@ -431,6 +470,9 @@ class WorkItems(interface.WorkItems):
                 " SELECT id, %%s, %%s, delegated_at, due_at FROM work_items WHERE id = %%s"
                 " RETURNING %s" % _DELEGATION_COLUMNS,
                 (delegate, delegated_by, int(item_id)))[0]
+            if previous_reviewer and previous_reviewer == delegate:
+                note = "%s; reviewer %s cleared (they now hold the lot)" % (
+                    note, previous_reviewer)
             WorkItems(tx)._event(int(item_id), item["state"], note, actor)
             return {"item": item, "delegation": delegation,
                     "replaced": replaced[0] if replaced else None}

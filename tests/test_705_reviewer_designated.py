@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 from ameesh import alert_briefs, exploitation, notify, plan, progress, storage, work
 
@@ -338,6 +339,113 @@ class ReviewerDesignationTest(PgTestCase):
                          "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 1)
         self.assertIn("not qa", proc.stderr)
+
+    # -- #705 r2 (B1) : la règle « le relecteur n'est pas l'assigné » tient
+    #    aussi APRÈS la désignation, dans l'écriture elle-même --------------
+
+    def test_work_reviewer_refuse_l_assigne(self):
+        """#705 r2 (B1) : désigner l'assigné du lot est refusé (l'assigné a pu
+        changer depuis la lecture : la règle est aussi dans l'écriture)."""
+        lot = self._lot()
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "auteur",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("holds lot", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+
+    def test_la_designation_relit_l_assigne_dans_l_ecriture(self):
+        """#705 r2 (B1) : `_designate_reviewer` revérifie l'assigné dans
+        l'UPDATE même (l'appelant a lu la ligne avant) : rien n'est écrit, et
+        la désignation en place reste."""
+        self.register("premier", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self._qa(lot, "--reviewer", "premier")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = storage.of(self.db).work.designate_reviewer(lot["id"], "auteur",
+                                                          actor="chef")
+        self.assertIsNone(row)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "premier")
+
+    def test_assign_au_relecteur_retire_la_designation(self):
+        """#705 r2 (B1) : assigner le lot à son relecteur retire la
+        désignation dans la même écriture (sinon il relirait son propre
+        travail) ; le journal le dit."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "assign", str(lot["id"]), "relecteur",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["assignee"], item["reviewer"]), ("relecteur", ""))
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("reviewer relecteur cleared (they now hold the lot)" in n
+                            for n in notes), notes)
+
+    def test_delegate_au_relecteur_retire_la_designation(self):
+        """#705 r2 (B1) : déléguer le lot à son relecteur retire la
+        désignation dans la même écriture ; le journal le dit."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "delegate", str(lot["id"]), "relecteur",
+                         "--within", "30m", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["assignee"], item["reviewer"]), ("relecteur", ""))
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("reviewer relecteur cleared (they now hold the lot)" in n
+                            for n in notes), notes)
+
+    # -- #705 r2 (N1, N2) : la désignation dans la foulée du move ------------
+
+    def test_move_reviewer_sans_la_migration_0421_refuse_avant_d_ecrire(self):
+        """#705 r2 (N1) : sans la colonne (migration 0421), `move … qa
+        --reviewer` refuse AVANT le move — jamais un lot à moitié désigné."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
+        self.addCleanup(self._restore_reviewer_column)
+        self.db.__dict__.pop("_has_reviewer", None)
+
+        proc = self.mesh("work", "move", str(lot["id"]), "qa",
+                         "--reviewer", "relecteur", "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("0421", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "build")
+
+    def test_move_dit_la_designation_qui_n_a_pas_eu_lieu(self):
+        """#705 r2 (N2) : si la désignation ne peut plus se faire (le lot a
+        quitté qa, ou l'assigné est devenu le relecteur), le move est écrit
+        mais l'échec est dit — `reviewer` n'est jamais affiché à tort."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self.mesh("work", "move", str(lot["id"]), "build", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        real = storage.of(self.db).work
+
+        class _NoDesignation:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def designate_reviewer(self, *args, **kwargs):
+                return None
+
+        with mock.patch("ameesh.work.storage.of",
+                        lambda db: mock.Mock(work=_NoDesignation())):
+            with self.assertRaises(work.WorkError) as caught:
+                work.move(self.db, lot["id"], "qa", reviewer="relecteur",
+                          actor="human:chef")
+        self.assertIn("was not designated", str(caught.exception))
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["state"], item["reviewer"]), ("qa", ""))
 
     def _restore_reviewer_column(self):
         self.db.execute("ALTER TABLE work_items ADD COLUMN IF NOT EXISTS"
