@@ -295,6 +295,9 @@ class PgBackend:
         else:
             targets = [dest]
         groups: dict[str, list[tuple[str, int]]] = {}
+        # #515 : un message lié à un lot se range dans le fil du projet du lot,
+        # quel que soit le projet de l'expéditeur ou des destinataires.
+        lot_project = fil.lot_project(self.db, work_item_id)
         for target in targets:
             # `signed` vient de authority.sign_message : signature, payload,
             # nonce, horodatage et échéance signés. Un envoi simple écrit son
@@ -305,7 +308,8 @@ class PgBackend:
                 kind=kind, payload=payload or None,
                 thread_meta=thread_meta, **dict(signed or {}))
             if dest == "all":
-                project = fil.project_for(self.cfg, projects.get(sender), projects.get(target))
+                project = fil.project_for(self.cfg, lot_project, projects.get(sender),
+                                          projects.get(target))
                 groups.setdefault(project, []).append((target, message_id))
         for project, sent in groups.items():
             fil.record(

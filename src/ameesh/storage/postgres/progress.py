@@ -120,7 +120,8 @@ class Progress(interface.Progress):
 
     def agents(self, project) -> list[dict]:
         sql = """
-            SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.provider,
+            SELECT r.name, r.workstream, r.workstream AS chantier,
+                   r.team, r.harness, r.host, r.model, r.provider,
                    r.credential_mode, r.status, r.status_text, r.current_prompt,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    r.turns, r.lease_owner, r.mode, r.stop_reason, r.responsible,
@@ -138,7 +139,7 @@ class Progress(interface.Progress):
         """
         params: tuple = ()
         if project:
-            sql += " WHERE r.chantier = %s OR r.team = %s"
+            sql += " WHERE r.workstream = %s OR r.team = %s"
             params = (project, project)
         sql += " ORDER BY r.name"
         return self.db.query(sql, params)

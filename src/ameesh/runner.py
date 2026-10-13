@@ -748,6 +748,15 @@ class AgentWorker(threading.Thread):
             proc = self.proc
         if proc is None:
             return
+        if not group and getattr(self, "_background_handles", None) is not None:
+            # Safe-point closure polls/reaps the harness here, before the main
+            # stream reader reaches its wait. Capture while it still owns PGID.
+            captured = self.runner.background.capture_before_wait(proc, wait=False)
+            for pid, handle in captured.items():
+                if pid in self._background_handles:
+                    handle.close()
+                else:
+                    self._background_handles[pid] = handle
         pgid = self._group(proc) if group else None
         if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
@@ -3444,7 +3453,8 @@ class AgentWorker(threading.Thread):
             log("[%s] could not attach the resources of turn %s (%s)"
                 % (self.name, turn_id[:8], exc))
 
-    def _close_turn_resource(self, turn_id: str, pgid: int | None) -> None:
+    def _close_turn_resource(self, turn_id: str, pgid: int | None, *,
+                             survives: bool = False) -> None:
         """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
 
         Un groupe encore vivant après l'arrêt escaladé, ou un conteneur qui
@@ -3460,7 +3470,7 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = bool(conteneurs) or bool(pgid and self._group_alive(pgid))
+        orphelin = survives or bool(conteneurs) or bool(pgid and self._group_alive(pgid))
         try:
             storage.of(self.db).turn_resources.close_turn(
                 turn_id, orphan=orphelin, containers=conteneurs or None)
@@ -3807,6 +3817,8 @@ class AgentWorker(threading.Thread):
         conversation_recorder = None
         conversation_usage = None
         proc = None
+        background_handles = {}
+        self._background_handles = background_handles
         #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
         #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
         stderr_debut = None
@@ -3982,6 +3994,14 @@ class AgentWorker(threading.Thread):
                         error = "lease lost during the turn"
                         self.stop_group_now("lease lost during the turn", grace=0, hard=True)
                         break
+            if (not self.runner.once and self.turn_grace_seconds() > 0
+                    and not self._urgent_end()):
+                captured = self.runner.background.capture_before_wait(proc)
+                for pid, handle in captured.items():
+                    if pid in background_handles:
+                        handle.close()
+                    else:
+                        background_handles[pid] = handle
             result_code = proc.wait()
         except _LancementImpossible as exc:
             echec_lancement = str(exc)
@@ -3995,15 +4015,19 @@ class AgentWorker(threading.Thread):
             # sans lot — garde un délai de grâce (`background`). Sinon, ou
             # sans délai, le nettoyage habituel, tout de suite.
             fond = None
+            handoff_failed = False
             try:
                 if (proc is not None and pgid and proc.poll() is not None
                         and not self.runner.once and self.turn_grace_seconds() > 0
                         and not self._urgent_end()):
-                    fond = self.runner.background.survivors(turn_id, pgid)
+                    fond = self.runner.background.survivors(
+                        turn_id, pgid, handles=background_handles)
             except Exception as exc:  # dans le doute, le nettoyage d'avant
                 log_async("[%s] background work of turn %s not examined (%s)"
                           % (self.name, turn_id[:8], exc))
+                handoff_failed = True
                 fond = None
+            cleanup_survives = handoff_failed
             if fond is None:
                 # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
                 # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
@@ -4017,9 +4041,22 @@ class AgentWorker(threading.Thread):
             if fond is not None:
                 self.runner.background.start(
                     agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
-                    containers=fond[1], grace_s=self.turn_grace_seconds())
+                    containers=fond[1], grace_s=self.turn_grace_seconds(),
+                    handles=background_handles)
             else:
-                self._close_turn_resource(turn_id, pgid)
+                if background_handles:
+                    from .background import Entry
+                    # A failed handoff must not discard detached live targets.
+                    # Clean through their pidfds and retain uncertainty even
+                    # when all known handles exit successfully.
+                    cleanup = Entry(agent=self.name, turn_id=turn_id, pgid=pgid,
+                                    ended=0, deadline=0, grace_s=0,
+                                    handles=background_handles,
+                                    unverified=handoff_failed or any(
+                                        h.live() for h in background_handles.values()))
+                    cleanup_survives |= self.runner.background._kill(cleanup)
+                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives)
+            self._background_handles = None
             self._menage_apres_tour(menage_tour, turn_id, spec)
             if conversation_recorder is not None:
                 interrupted = (self.lease_lost.is_set() or self.preempting.is_set()
@@ -5745,11 +5782,17 @@ class Runner:
         try:
             if getattr(self, "_radar_cache", None) is None:
                 self._radar_cache = radar.Cache()
-            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache):
+            owner = getattr(self, "runner_id", None) or None
+            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache, owner=owner):
                 if line.get("mail"):
                     log_async("radar %s: %d mail(s), including %d wake-up(s)" % (
                         line["project"], len(line["mail"]),
                         sum(1 for m in line["mail"] if m["level"] == "blocking")))
+                for one in line.get("land") or ():
+                    if one.get("result") != "busy":
+                        log_async("fusion %s #%s : %s%s" % (
+                            line["project"], one.get("lot") or "—", one["result"],
+                            " (%s)" % one["error"] if one.get("error") else ""))
                 if line["changes"] or line.get("error"):
                     log_async("radar %s: %s" % (line["project"], line.get("error") or (
                         "%d change(s), %d conflicting pair(s) (%.1f s)" % (

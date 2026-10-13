@@ -933,6 +933,15 @@ class Nonces(Domain):
 # lots (`work_items`, `work_item_events`)
 # --------------------------------------------------------------------------
 
+class ReservationContention(RuntimeError):
+    """L122, #478 : le budget de réessais d'une réservation automatique est
+    épuisé — le prochain numéro libre n'a pas pu être réservé à temps sous la
+    contention. L'appelant (`ameesh.work`) la rend en `WorkError` lisible
+    (« reservation contention, retry »), jamais en DbError brute. Levée
+    seulement quand `number` est absent : un numéro explicite déjà pris garde
+    la DbError de l'index."""
+
+
 class WorkItems(Domain):
     """Lots et journal de leurs transitions (ledger de reprise)."""
 
@@ -1035,9 +1044,11 @@ class WorkItems(Domain):
         ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
         de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
         l'index unique : deux réservations simultanées ne prennent jamais le
-        même numéro. `note` peut citer `%(number)04d`. None si le lot n'est
-        plus ouvert ; DbError si `number` est pris par un autre lot.
-        `release` libère la réservation."""
+        même numéro ; la perdante réessaie avec une attente aléatoire croissante,
+        dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
+        si le lot n'est plus ouvert ; DbError si `number` est pris par un autre
+        lot ; `ReservationContention` si le budget du prochain libre est
+        épuisé. `release` libère la réservation."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
@@ -1058,7 +1069,7 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str, source: str = "") -> dict | None:
+                  actor: str, source: str = "", frozen_id: int | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1068,15 +1079,37 @@ class WorkItems(Domain):
     def queue_update(self, item_id: int, *, state: str | None = None,
                      rank: int | None = None, reason: str | None = None,
                      landing_sha: str | None = None, note: str = "",
-                     actor: str = "", clear_rank: bool = False) -> dict | None:
+                     actor: str = "", clear_rank: bool = False,
+                     lease: tuple | None = None,
+                     freeze: tuple | None = None, entry: tuple | None = None) -> dict | None:
         """L160e (0058): changes the state, rank, reason or landing commit of
         a queued lot (`queued` and `ejected` clear the landing commit;
         `ejected` or `clear_rank` clear the rank); a journal line when
-        `note` is given. None if the lot is not queued."""
+        `note` is given. None if the lot is not queued. `lease` (#194 r5):
+        `(target key, owner, epoch)` — the write happens only while that
+        lease holds (`merge_locks`, not expired), in the same statement.
+        `freeze` (#194 r8): `(frozen_sha, landing_sha)` — the write happens
+        only while the lot is still `landing` on that freeze and that
+        landing commit (a merge that happened, recorded without its lease).
+        `entry` (#517): `(generation, target, frozen_id, frozen_sha)` compares
+        the admission identity and current latest freeze, with or without a
+        lease. Freeze insertion and this comparison share the lot row lock."""
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
         """L160e (0058): takes the lot out of the queue, with a journal line."""
+
+    @abc.abstractmethod
+    def land_lock(self, key: str, owner: str, ttl_s: float, *,
+                  epoch: int | None = None) -> int | None:
+        """L160e2 (0058): takes (or, with its `epoch`, renews) the merge lease
+        of `key` (project and target) for `owner`; returns its epoch, None if
+        another owner holds a lease that has not expired. Its own owner takes it
+        again at a new epoch (an executor restarted mid-landing)."""
+
+    @abc.abstractmethod
+    def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
+        """L160e2 (0058): frees the lease, if still held at that epoch."""
 
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
