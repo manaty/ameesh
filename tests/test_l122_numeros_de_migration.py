@@ -405,6 +405,104 @@ class ReservationTest(PgTestCase):
         notes = " ".join(e["note"] for e in work.events(self.db, old["id"]))
         self.assertIn("migration 9401 released (lot %d closed, #956)" % old["id"], notes)
 
+    def _attend_la_reprise(self, xid, timeout=30.0):
+        """Vrai quand une transaction attend le verrou de ligne de `xid` : le
+        témoin désigne la transaction, pas une requête qui y ressemble (le banc
+        est partagé)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = self.db.query(
+                "SELECT count(*) AS n FROM pg_locks"
+                " WHERE locktype = 'transactionid' AND transactionid = %s"
+                "   AND NOT granted", (int(xid),))
+            if rows[0]["n"]:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _ligne_verrouillee(self, lot_id, driver) -> bool:
+        """Vrai si la ligne est tenue par une autre transaction (NOWAIT)."""
+        conn = db_mod.connect(self.cfg, driver=driver)
+        try:
+            with conn.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE NOWAIT",
+                         (int(lot_id),))
+            return False
+        except DbError as exc:
+            if exc.sqlstate != "55P03":     # lock_not_available, pas autre chose
+                raise
+            return True
+        finally:
+            conn.close()
+
+    def test_ordre_de_verrouillage_des_reservations_heritees(self):
+        """#967 : les réservations héritées du même dépôt se verrouillent par id
+        croissant — l'ordre canonique du module. Témoin à deux transactions : T
+        tient la ligne d'id le plus GRAND (insérée la première : le scan comme
+        l'index (dépôt, numéro) la voient d'abord) ; la reprise doit avoir
+        verrouillé la plus PETITE avant de s'arrêter sur T. Sans ORDER BY, elle
+        attendrait T sans rien tenir et les deux transactions partiraient en
+        sens inverse (interblocage possible)."""
+        for k, driver in enumerate(_drivers()):
+            with self.subTest(driver=driver):
+                high, low = 9902 + 10 * k, 9901 + 10 * k
+                # insertion (et donc scan physique) : `high` d'abord ; index
+                # (dépôt, numéro) : `high` aussi (9501 < 9502) ; id : `low`.
+                for lot_id, number in ((high, 9501 + 10 * k), (low, 9502 + 10 * k)):
+                    self.db.execute(
+                        "INSERT INTO work_items (id, title, state, close_reason,"
+                        "                        migration, migration_repo)"
+                        " VALUES (%s, 'hérité', 'closed', 'abandoned', %s, 'manaty/nexlink')",
+                        (lot_id, number))
+                new = self._lot("nouveau", "manaty/nexlink", 171 + k)
+                held, release, out = threading.Event(), threading.Event(), {}
+
+                def hold():
+                    conn = db_mod.connect(self.cfg, driver=driver)
+                    try:
+                        with conn.transaction() as tx:
+                            tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE",
+                                     (high,))
+                            out["xid"] = tx.query("SELECT txid_current() AS xid")[0]["xid"]
+                            held.set()
+                            release.wait(60)
+                    finally:
+                        conn.close()
+
+                def reserve():
+                    conn = db_mod.connect(self.cfg, driver=driver)
+                    try:
+                        out["row"] = pg_work.WorkItems(conn).reserve_migration(
+                            new["id"], "manaty/nexlink", None, 9503 + 10 * k,
+                            note="migration %(number)s reserved (témoin)", actor="t")
+                    except Exception as exc:   # noqa: BLE001 - rapporté par l'assertion
+                        out["row"] = exc
+                    finally:
+                        conn.close()
+
+                ta = threading.Thread(target=hold)
+                ta.start()
+                self.assertTrue(held.wait(30), "le verrou témoin n'a pas été posé")
+                tb = threading.Thread(target=reserve)
+                tb.start()
+                try:
+                    self.assertTrue(self._attend_la_reprise(out["xid"]),
+                                    "la reprise n'a jamais attendu le verrou témoin")
+                    self.assertTrue(
+                        self._ligne_verrouillee(low, driver),
+                        "la reprise attend sans tenir la plus petite ligne : "
+                        "verrouillage dans l'ordre du scan, pas par id (#967)")
+                finally:
+                    release.set()
+                    ta.join(30)
+                    tb.join(60)
+                self.assertIsInstance(out.get("row"), dict, out.get("row"))
+                self.assertEqual(out["row"]["migration"], 9503 + 10 * k)
+                self.assertEqual(
+                    self.db.query("SELECT count(*) AS n FROM work_items"
+                                  " WHERE migration IS NOT NULL AND id IN (%s, %s)",
+                                  (low, high))[0]["n"], 0)
+
     def test_liberer_la_reservation_d_un_lot_terminal(self):
         """#956 : `--release` marche encore sur un lot déjà terminal (héritage)."""
         old = self._lot("tardif", n=7)

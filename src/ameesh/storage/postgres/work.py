@@ -720,12 +720,16 @@ class WorkItems(interface.WorkItems):
                         # elle est libérée dans la transaction de la
                         # réservation, avec sa ligne de journal. Les lignes
                         # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
-                        # valeur déjà effacée.
+                        # valeur déjà effacée. `ORDER BY id` : ordre de
+                        # verrouillage canonique (#967) — deux transactions qui
+                        # reprennent les réservations héritées du même dépôt
+                        # verrouillent ainsi les mêmes lignes dans le même
+                        # ordre, jamais en sens inverse (interblocage).
                         for old in tx.query(
                                 "SELECT id, migration, state FROM work_items"
                                 " WHERE migration_repo = %s"
                                 "   AND state IN ('merged', 'promoted', 'closed')"
-                                " FOR UPDATE", (repo,)):
+                                " ORDER BY id FOR UPDATE", (repo,)):
                             tx.execute(
                                 "UPDATE work_items SET migration = NULL,"
                                 "       migration_repo = NULL, updated_at = now()"
