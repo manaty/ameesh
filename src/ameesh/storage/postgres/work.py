@@ -20,6 +20,7 @@ from . import catalog as _catalog
 
 ITEM_COLUMNS = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
+    reviewer,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
@@ -268,11 +269,13 @@ class WorkItems(interface.WorkItems):
         return self.db.query(sql, tuple(params))
 
     def move(self, item_id, state, *, current, loops, note, actor,
-             held=False) -> dict | None:
+             held=False, reviewer=None) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
         d'écrit), puis journalise la transition. `held` (L233) : et si une
         demande de décision ouverte le tient — vérifiée dans la même
-        instruction, la demande verrouillée (voir l'interface)."""
+        instruction, la demande verrouillée (voir l'interface). `reviewer`
+        (#705) : le relecteur désigné, posé seulement en entrant en `qa` ;
+        None garde celui déjà connu (une revue suivante réutilise le nom)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
         rows = self.db.query(
             """
@@ -282,11 +285,13 @@ class WorkItems(interface.WorkItems):
                    updated_at = now(),
                    closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
                    started_at = CASE WHEN %s IN ('build', 'qa')
-                                     THEN coalesce(started_at, now()) ELSE started_at END
+                                     THEN coalesce(started_at, now()) ELSE started_at END,
+                   reviewer = CASE WHEN %s = 'qa' THEN coalesce(%s, reviewer)
+                                   ELSE reviewer END
              WHERE id = %s AND state = %s __HELD__
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", ITEM_COLUMNS).replace("__HELD__", _HELD if held else ""),
-            (state, loops, state, state, int(item_id), current)
+            (state, loops, state, state, state, reviewer, int(item_id), current)
             + ((str(int(item_id)),) if held else ()),
         )
         if not rows:

@@ -517,6 +517,33 @@ _ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> �
                   "an external session with a human owner, add --externe")
 
 
+def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
+    """#705 : le relecteur désigné d'une revue est un nom joignable.
+
+    Un agent du registre, ou un humain (`human:…`, ou un nom nu qui en désigne
+    un, normalisé comme pour l'assignation). Un nom inconnu est refusé : la
+    revue attendrait quelqu'un que ni le courrier ni l'alerte ne peuvent
+    joindre — le défaut que ce lot corrige. Un agent arrêté reste accepté : il
+    porte l'attente et sera relancé à sa reprise.
+    """
+    from . import registry
+
+    name = (reviewer or "").strip()
+    if not name:
+        raise WorkError("empty reviewer")
+    if name.startswith(HUMAN_PREFIX):
+        return name
+    if registry.get(db, name) is not None:
+        return name
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    human = known_human(db, name, cfg)
+    if human:
+        return human
+    raise WorkError("reviewer refused: %s is not in the registry (unknown agent): "
+                    "the review would wait for nobody; register it "
+                    "(agent-runner register …), or name a human (human:<id>)" % name)
+
+
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
     """L37 (0030, règle 2) : un lot ne va qu'à un agent qu'ameesh sait réveiller.
 
@@ -990,18 +1017,31 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
-         correct: str | None = None) -> dict:
+         correct: str | None = None, reviewer: str | None = None) -> dict:
     """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
 
     `correct` (la raison) : correction d'un état posé par erreur, hors machine
     à états, limitée à `CORRECTIONS` (un `promoted` à tort revient en
     `merged`) ; le journal la dit (« correction : promoted → merged — raison »).
-    L'appelant a vérifié qui corrige (`corrector`)."""
+    L'appelant a vérifié qui corrige (`corrector`).
+
+    `reviewer` (#705) : le relecteur désigné, seulement en entrant en `qa` —
+    il doit être joignable (`check_reviewer`). `waiting()`, la vue de progrès
+    et l'alerte `stale_lot` le nomment avant tout verdict."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id>")
+    reviewer = (reviewer or "").strip() or None
+    if reviewer is not None:
+        if state != "qa":
+            raise WorkError(
+                "--reviewer: a reviewer is designated for a review: "
+                "ameesh work move %s qa --reviewer %s" % (item_id, reviewer))
+        if correct is not None:
+            raise WorkError("--reviewer: a correction does not designate a reviewer")
+        reviewer = check_reviewer(db, reviewer)
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1041,9 +1081,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (MAX_QA_LOOPS, item_id))
 
     held = state == "waiting_human"
+    text = note or ("%s → %s" % (current, state))
+    if reviewer:
+        text = "%s — reviewer %s" % (text, reviewer)
     row = storage.of(db).work.move(
         item_id, state, current=current, loops=1 if returning_loop else 0,
-        note=note or ("%s → %s" % (current, state)), actor=actor, held=held)
+        note=text, actor=actor, held=held, reviewer=reviewer)
     if row is None:
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile

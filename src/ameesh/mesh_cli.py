@@ -1461,6 +1461,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            if item.get("reviewer"):
+                print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -1565,9 +1567,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
-                             correct=args.correct)
-            print("lot #%d → %s (loops %s)%s" % (
+                             correct=args.correct, reviewer=args.reviewer)
+            print("lot #%d → %s (loops %s)%s%s" % (
                 item["id"], item["state"], item["loops"],
+                " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
                 " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
             return 0
@@ -2394,6 +2397,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="correct a state set by mistake (promoted → merged), outside "
                               "the state machine, recorded in the log; reserved for humans and "
                               "for orchestrators or design agents")
+    pw_move.add_argument("--reviewer", default=None, metavar="AGENT",
+                         help="#705: designate the reviewer of the review that starts, only "
+                              "when moving to qa: waiting(), the progress view and the stale_lot "
+                              "alert name them before any verdict")
     pw_move.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "

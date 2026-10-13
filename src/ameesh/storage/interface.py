@@ -1201,14 +1201,17 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
-             actor: str, held: bool = False) -> dict | None:
+             actor: str, held: bool = False, reviewer: str | None = None) -> dict | None:
         """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et
         journalise ; None (rien d'écrit) s'il n'est plus en `current`.
 
         `held` (L233): also require an open decision request for the lot, in
         the same statement, the request row locked: an answer closing it
         concurrently waits for this move (then releases the lot) or makes it
-        fail (None) — the lot never ends waiting with no request."""
+        fail (None) — the lot never ends waiting with no request.
+
+        `reviewer` (#705): the reviewer designated when the lot enters `qa`;
+        None keeps the one already known (a later review reuses the name)."""
 
     @abc.abstractmethod
     def waiting_episodes(self, item_ids: Sequence[int]) -> dict[int, dict]:

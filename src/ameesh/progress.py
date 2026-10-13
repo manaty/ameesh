@@ -175,7 +175,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     * `requested`, `frozen` (PREMIER gel), `verdict` (verdict retenu = le
       plus récent), `merged` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
-    * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : son auteur ;
+    * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
+      verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
+      #705), sinon l'auteur du dernier verdict ;
     * `verdict_current` : le verdict retenu est-il postérieur au dernier gel ?
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
@@ -243,14 +245,23 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     verdicts.sort(key=lambda v: v[0])
     last = verdicts[-1] if verdicts else None
     last_frozen = freezes[-1] if freezes else None
+    verdict_current = bool(last) and (last_frozen is None or last[0] >= last_frozen)
+    # #705 : avant tout verdict — ou après un regel, le verdict précédent ne
+    # vaut plus — le relecteur DÉSIGNÉ (`work move … qa --reviewer`) est celui
+    # qu'on attend ; quand un verdict courant existe, c'est son auteur qui a
+    # réellement relu.
+    designated = (item.get("reviewer") or "").strip() or None
+    reviewer = last[2] if last else None
+    if designated and not verdict_current:
+        reviewer = designated
     return {
         "requested": requested,
         "frozen": freezes[0] if freezes else None,
         "last_frozen": last_frozen,
         "verdict": last[0] if last else None,
         "verdict_kind": last[1] if last else None,
-        "reviewer": last[2] if last else None,
-        "verdict_current": bool(last) and (last_frozen is None or last[0] >= last_frozen),
+        "reviewer": reviewer,
+        "verdict_current": verdict_current,
         "merged": merged,
         "blocked_verdicts": sum(1 for v in verdicts if v[1] == "blocked"),
         "blocks": blocks,
