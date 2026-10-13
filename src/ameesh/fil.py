@@ -739,6 +739,27 @@ def agent_project(row: dict | None) -> str:
     return str(row.get("chantier") or "").strip()
 
 
+def lot_project(db, lot) -> str:
+    """Projet du fil d'un lot (`work_items.app`, L118c) : vide si le lot est
+    inconnu, sans projet, si `lot` est une étiquette libre (pas un numéro), ou
+    si la base ne répond pas — l'appelant garde alors la règle historique
+    (expéditeur, destinataire, défaut). Un message lié à un lot se lit donc
+    dans le fil du projet de ce lot, pas dans celui de son expéditeur ; ne
+    lève jamais (l'écriture du fil ne doit rien perdre)."""
+    if db is None or lot in (None, ""):
+        return ""
+    try:
+        item_id = int(lot)
+    except (TypeError, ValueError):
+        return ""  # étiquette libre du fil : aucun lot à consulter
+    try:
+        item = storage.of(db).work.get(item_id)
+    except Exception as exc:
+        _warn("lot %s: project unreadable (%s)" % (lot, exc))
+        return ""
+    return str((item or {}).get("app") or "").strip()
+
+
 def _warn(text: str) -> None:
     try:
         print("ameesh fil: %s" % text, file=sys.stderr)

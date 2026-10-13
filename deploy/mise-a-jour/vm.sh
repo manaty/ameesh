@@ -233,18 +233,6 @@ controler_agents() {
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
 }
-lire_bail() { "$AMEESH" show "$1" --json; }  # persona → its registry row
-heure_base() {  # the clock of the mesh's database (the server's), epoch seconds
-  ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT extract(epoch FROM clock_timestamp())'"
-}
-proprietaire_de() {  # persona → the lease owner of ameesh-runner@<p>: --runner-id, else :<MainPID>
-  local sortie id
-  sortie=$(ssh_vm "systemctl show -p ExecStart --value ameesh-runner@$1") \
-    && id=$(bail_runner_id <<<"$sortie") \
-    || { echo "ameesh-runner@$1: ExecStart unreadable" >&2; return 1; }
-  if [ -n "$id" ]; then echo "$id"
-  else echo ":$(ssh_vm "systemctl show -p MainPID --value ameesh-runner@$1")"; fi
-}
 
 verifier() {
   local absentes
