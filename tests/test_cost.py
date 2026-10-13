@@ -20,6 +20,9 @@ from ameesh import cost
 
 from .support import PgTestCase
 
+#: the real racy window, for the tests that rewrite a journal in place
+RACY_CTIME_NS = cost.RACY_CTIME_NS
+
 # Un `result` Claude porte toujours l'usage du tour ; sans lui, le coût se lit
 # appel par appel au barème (L221), pas dans le cumul.
 U = {"input_tokens": 1}
@@ -41,6 +44,11 @@ class Sandbox:
 
     def setUp(self) -> None:
         super().setUp()                     # PgTestCase : schéma, TRUNCATE, dossiers
+        # journals written by a test count as settled, so caching is observable;
+        # the in-place rewrite tests restore the real racy window
+        racy = mock.patch.object(cost, "RACY_CTIME_NS", 0)
+        racy.start()
+        self.addCleanup(racy.stop)
         self.tmp_cost = tempfile.mkdtemp(prefix="ameesh-cost-")
         self.addCleanup(shutil.rmtree, self.tmp_cost, ignore_errors=True)
         self.state = os.path.join(self.tmp_cost, "state")
@@ -267,7 +275,9 @@ class AccountTailGaugeTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(book.claude_gauges('secondary', 'primary')[0].used, 0.42)
         self.assertEqual(book.claude_gauges('primary', 'primary'), [])
 
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
     def test_rewrite_same_size_and_mtime_invalidates_cache(self):
+        # in one clock tick ctime does not move: a fresh journal is never cached
         self.agent('long', 'claude')
         self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
         path = os.path.join(self.state, 'long', 'events.jsonl')

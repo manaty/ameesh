@@ -7,7 +7,7 @@ from unittest import mock
 
 from ameesh import cost
 from ameesh.gauge_cache import GaugeCache
-from .test_cost import Sandbox
+from .test_cost import RACY_CTIME_NS, Sandbox
 
 
 class CrossBookGaugeTest(Sandbox, unittest.TestCase):
@@ -46,6 +46,7 @@ class CrossBookGaugeTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(self.gauges('secondary')[0].used, 0.89)
         self.assertAlmostEqual(self.gauges()[0].used, 0.42)
 
+    @mock.patch.object(cost, 'RACY_CTIME_NS', RACY_CTIME_NS)
     def test_same_size_rewrite_restored_mtime_replacement_and_truncation(self):
         path = self.stream()
         self.gauges()
