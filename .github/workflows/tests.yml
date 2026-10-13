@@ -49,6 +49,13 @@
 # qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
 # lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
 # fourche), rien n'est publié et la part n'en est pas affectée.
+#
+# #856 — un runner arrêté (saturation #747) tue le publisher et l'étape
+# `close` : le check restait `in_progress` pour toujours. Le job `tests`
+# (indépendant des publishers) conclut les orphelins en relisant l'état
+# terminal réel du job et de l'exécution (`ci-flow.py sweep`) : `cancelled`,
+# jamais `success` sans ligne `fin`, et aucun check actif n'est touché. D'où
+# `actions: read` et `checks: write` sur le job `tests`.
 name: tests
 
 on:
@@ -376,6 +383,10 @@ jobs:
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # #856 : relire l'état terminal des jobs d'une exécution
+      checks: write   # #856 : conclure les checks « tests (flux) » orphelins
     steps:
       - name: bilan des parts
         run: |
@@ -402,3 +413,14 @@ jobs:
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
           test "${{ needs.platform-macos.result }}" = success
+      # #856 : réconciliation indépendante du publisher — un runner arrêté
+      # (#747) tue le publisher ET l'étape `close`, et le check « tests (flux) »
+      # restait in_progress pour toujours. On relit l'état terminal réel du job
+      # et de l'exécution qui l'ont publié ; jamais `success` sans ligne `fin`,
+      # aucun check actif, d'une autre tête ou d'une autre tentative n'est touché.
+      - uses: actions/checkout@v4
+      - name: conclusion des checks de flux orphelins
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-flow.py sweep
