@@ -841,7 +841,13 @@ class SyncTest(_CanonDbCase):
         report = self.sync()
         self.assertEqual(self.actions(report)["orchestre"], "laissé")
         self.assertEqual(self.row("orchestre")["status"], "idle")
-        self.assertIsNone(self.row("relecteur")["responsible"])
+        # L780 : une erreur globale (ici une fiche illisible, sans sujet) ne vide
+        # plus le dernier responsable RÉSOLU (« keep last_good ») — c'est ce
+        # vidage qui, le 13/10, a fait refuser les agents de l'hôte (« has no
+        # human owner »). La réclamation reste fermée par `canon_state` (§4.1 :
+        # le canon n'est pas `ok`), donc l'assertion suivante tient toujours ;
+        # la réparation du canon rouvre l'attribution sans réécriture manuelle.
+        self.assertEqual(self.row("relecteur")["responsible"], "human:alice")
         self.assertEqual(registry.claimable(self.db, "atelier", require_responsible=True), [])
 
     def test_deplacement_vers_un_autre_hote(self):
