@@ -70,6 +70,37 @@ and keeps the three hosts (pc-smichea, agents-1, agents-2) under the server's
 300 with 3 × 80 `max_db_connections`. Increasing agent count beyond this
 capacity requires review.
 
+An installation made before this sizing is raised **by hand**: the recipe
+refuses an existing installation, and a fresh installation elsewhere cannot
+raise the limits of a running one — an installation still carrying the earlier
+200/32/8/40 sizing is the case this covers. Back up
+`~/.config/pgbouncer/pgbouncer.ini` first (dated name, 0600), then set
+`max_client_conn = 250`, `default_pool_size = 64`, `reserve_pool_size = 16`,
+`max_db_connections = 80` and `server_idle_timeout = 30`. Reload without
+dropping clients:
+
+```sh
+systemctl --user kill -s HUP ameesh-pgbouncer.service
+```
+
+A reload applies the file to new decisions and keeps connected clients; a
+restart is not needed and must not happen in a release window. Verify on the
+admin console, which `max_client_conn` does not gate:
+
+```sh
+psql "host=$HOME/.local/state/pgbouncer/socket port=6432 user=ameesh dbname=pgbouncer" \
+  -c 'SHOW CONFIG;'
+```
+
+`SHOW CONFIG` must show the five values above.
+
+Known gap (2026-10-13): `pc-smichea` still carries the `server_idle_timeout = 600`
+written by hand at the first installation, while this recipe targets 30 s; its
+other four limits were raised during the incident (250/64/16/80). The gap only
+delays closing an idle server session, it does not affect correctness. It is to
+be reconciled at the next planned restart of the host — not during a release
+window — with the reload above or by writing these values at that restart.
+
 After the corrected runner release is available and installation verification
 passes, bureau switches and drains/restarts the runner units it manages:
 
