@@ -102,6 +102,13 @@ _DEFAULT_PORTS = {"ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418, "http": 
                   "https": 443}
 
 
+def normalize_source(source: str) -> str:
+    """Normalize a stored queue source, retaining server ports and fork identity."""
+    if source.partition("/")[0].split(":")[0].lower() == "github.com":
+        return source.lower()
+    return source
+
+
 def source_of(repo: str) -> str:
     """The repository a lot is queued from, as a radar pass compares it: its
     origin as `host/path` (`git@github.com:o/r.git` and
@@ -125,9 +132,7 @@ def source_of(repo: str) -> str:
         return os.path.realpath(os.path.join(repo, local))
     path = path.strip("/")
     path = path[:-len(".git")] if path.endswith(".git") else path
-    if host.lower() == "github.com":
-        path = path.lower()
-    return "%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path)
+    return normalize_source("%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path))
 
 
 def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
@@ -512,10 +517,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         scan decide it; only a row with no source, if any, falls back on the
         scan."""
         if row.get("source"):
-            queued_source = row["source"]
-            if queued_source.lower().startswith("github.com/"):
-                queued_source = queued_source.lower()
-            return queued_source == source
+            return normalize_source(row["source"]) == source
         return int(row["work_item_id"]) in branches
 
     mine = [r for r in rows if r["state"] in ("queued", "landing") and ours(r)]

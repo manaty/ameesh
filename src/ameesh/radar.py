@@ -787,6 +787,7 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
             or checks["total_count"] >= 100):
         raise plan_github.GithubError("commit checks: malformed or truncated response")
     external = {}
+    activity = {}
     for check in checks["check_runs"]:
         if (not isinstance(check, dict) or check.get("head_sha") != sha
                 or not isinstance(check.get("app"), dict)
@@ -795,9 +796,23 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
             raise plan_github.GithubError("commit checks: invalid identity or frozen SHA")
         if check["app"].get("slug") == "github-actions":
             continue  # workflow attempts above account for all their jobs
+        try:
+            stamps = [datetime.fromisoformat(check["started_at"].replace("Z", "+00:00"))]
+            if check.get("status") == "completed" or check.get("completed_at") is not None:
+                stamps.append(datetime.fromisoformat(check["completed_at"].replace("Z", "+00:00")))
+            if any(t.utcoffset() is None for t in stamps):
+                raise ValueError("timestamp lacks timezone")
+            if len(stamps) == 2 and stamps[1] < stamps[0]:
+                raise ValueError("completion precedes start")
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise plan_github.GithubError("commit checks: missing or invalid activity timestamp") from exc
         key = (check["app"]["id"], check["name"])
-        if key not in external or check["id"] > external[key]["id"]:
-            external[key] = check
+        # An unfinished attempt must not be hidden by any completed check.
+        at = (check.get("status") != "completed", max(stamps))
+        if key in activity and at == activity[key] and check != external[key]:
+            raise plan_github.GithubError("commit checks: ambiguous latest activity for %s/%s" % key)
+        if key not in activity or at > activity[key]:
+            activity[key], external[key] = at, check
     for check in external.values():
         label = "%s/%s" % (check["app"]["id"], check["name"])
         if check.get("status") != "completed":

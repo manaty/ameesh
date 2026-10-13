@@ -496,6 +496,12 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     from . import radar, resolutions
     locks = locks if locks is not None else {}
     lot = int(row["work_item_id"])
+    source = merge_queue.normalize_source(row.get("source") or "")
+    if not source or source != merge_queue.source_of(project.repo):
+        return {"lot": lot, "result": "error", "error": (
+            "queue source %s does not match project %s repository; select the source "
+            "project (or requeue a legacy entry without a source)"
+            % (source or "<missing>", project.name))}
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work

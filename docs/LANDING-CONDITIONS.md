@@ -65,6 +65,9 @@ and immediately before a PR merge. Workflows are grouped by their GitHub
 database ID, so identical display names cannot hide a failure. Run ordering
 uses the latest of creation, start and update timestamps, including reruns of
 older runs. Missing identities or invalid timestamps refuse certification.
+External checks are grouped by app identity and name and ordered by the latest
+start/completion time; unfinished attempts always block. Missing or invalid
+activity timestamps and ambiguous latest activity refuse certification.
 Every latest workflow and external app check must be completed and successful,
 neutral or skipped; classic statuses must be successful. At least one check
 must exist. Missing, running, failed, unreadable or potentially truncated
@@ -74,6 +77,9 @@ Ambiguous project configurations for the same repository are refused at
 admission and landing, even from an exact configured checkout without origin.
 GitHub repository path case is normalized for admission and queue ownership,
 including entries queued before normalization was introduced.
+Landing also requires the queue entry’s normalized source to match the selected
+project’s repository. A different or missing source refuses landing before any
+lock or queue mutation; select the correct project or requeue a legacy entry.
 Authentication uses the host's existing `gh` setup. The local gates then run
 on the actual merged tree before the target push. Trial-ref workflows are a
 separate future option; this configuration uses local gates plus frozen CI.

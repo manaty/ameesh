@@ -252,7 +252,9 @@ class CommitCiTest(unittest.TestCase):
             with self.subTest(status=status):
                 checks = [{"id": 42, "app": {"id": 99, "slug": "external-ci"},
                            "name": "quality", "head_sha": "a" * 40,
-                           "status": status, "conclusion": conclusion}]
+                           "status": status, "conclusion": conclusion,
+                           "started_at": "2026-10-12T10:00:00Z",
+                           "completed_at": "2026-10-12T11:00:00Z" if status == "completed" else None}]
                 self.assertFalse(radar.commit_ci(self.project, "a" * 40,
                                                 gh=_Gh([_run("ci")], checks=checks))["green"])
 
@@ -265,7 +267,8 @@ class CommitCiTest(unittest.TestCase):
 
     def test_external_green_can_certify_and_apps_with_same_name_stay_distinct(self):
         check = {"id": 1, "app": {"id": 9, "slug": "ci-app"}, "name": "ci",
-                 "head_sha": "a" * 40, "status": "completed", "conclusion": "success"}
+                 "head_sha": "a" * 40, "status": "completed", "conclusion": "success",
+                 "started_at": "2026-10-12T10:00:00Z", "completed_at": "2026-10-12T11:00:00Z"}
         self.assertTrue(radar.commit_ci(self.project, "a" * 40, gh=_Gh(checks=[check]))["green"])
         other = dict(check, id=2, app={"id": 10, "slug": "other"}, conclusion="failure")
         self.assertFalse(radar.commit_ci(self.project, "a" * 40,
@@ -285,6 +288,52 @@ class CommitCiTest(unittest.TestCase):
             gh.run = run
             with self.subTest(bad=bad), self.assertRaises(plan_github.GithubError):
                 radar.commit_ci(self.project, "a" * 40, gh=gh)
+
+
+    def test_older_external_check_updated_failure_or_pending_overrides_newer_id(self):
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status):
+                old = {"id": 41, "app": {"id": 99, "slug": "external-ci"},
+                       "name": "quality", "head_sha": "a" * 40,
+                       "status": status, "conclusion": conclusion,
+                       "started_at": "2026-10-12T10:00:00Z",
+                       "completed_at": "2026-10-12T12:00:00Z" if status == "completed" else None}
+                newer = dict(old, id=42, status="completed", conclusion="success",
+                             started_at="2026-10-12T11:00:00Z", completed_at="2026-10-12T11:30:00Z")
+                out = radar.commit_ci(self.project, "a" * 40, gh=_Gh([_run("ci")], checks=[old, newer]))
+                self.assertFalse(out["green"], out)
+                with mock.patch.object(radar, "commit_ci", return_value=out):
+                    with self.assertRaises(merge_queue.QueueError):
+                        merge_queue._required_ci(self.project, "a" * 40)
+
+    def test_missing_or_invalid_external_check_dates_refuse_certification(self):
+        check = {"id": 42, "app": {"id": 99, "slug": "external-ci"}, "name": "quality",
+                 "head_sha": "a" * 40, "status": "completed", "conclusion": "success",
+                 "started_at": "2026-10-12T10:00:00Z", "completed_at": "2026-10-12T11:00:00Z"}
+        for field in ("started_at", "completed_at"):
+            for value in (None, "", "yesterday", "2026-10-12T11:00:00"):
+                with self.subTest(field=field, value=value), self.assertRaises(plan_github.GithubError):
+                    radar.commit_ci(self.project, "a" * 40,
+                                    gh=_Gh([_run("ci")], checks=[dict(check, **{field: value})]))
+
+
+    def test_external_activity_supersedes_old_failure_but_unfinished_check_blocks(self):
+        old = {"id": 41, "app": {"id": 99, "slug": "external-ci"}, "name": "quality",
+               "head_sha": "a" * 40, "status": "completed", "conclusion": "failure",
+               "started_at": "2026-10-12T10:00:00Z", "completed_at": "2026-10-12T10:30:00Z"}
+        newer = dict(old, id=42, conclusion="success", started_at="2026-10-12T11:00:00Z",
+                     completed_at="2026-10-12T11:30:00Z")
+        self.assertTrue(radar.commit_ci(self.project, "a" * 40, gh=_Gh(checks=[old, newer]))["green"])
+        old.update(status="in_progress", conclusion=None, completed_at=None)
+        self.assertFalse(radar.commit_ci(self.project, "a" * 40, gh=_Gh(checks=[old, newer]))["green"])
+
+    def test_external_ambiguous_activity_is_refused(self):
+        check = {"id": 41, "app": {"id": 99, "slug": "external-ci"}, "name": "quality",
+                 "head_sha": "a" * 40, "status": "completed", "conclusion": "failure",
+                 "started_at": "2026-10-12T10:00:00Z", "completed_at": "2026-10-12T11:00:00Z"}
+        with self.assertRaisesRegex(plan_github.GithubError, "ambiguous"):
+            radar.commit_ci(self.project, "a" * 40,
+                            gh=_Gh(checks=[check, dict(check, id=42, conclusion="success")]))
 
 
 class GatesForTest(unittest.TestCase):
@@ -413,6 +462,33 @@ class RequiredCiLandTest(_Land):
         self.assertEqual(out["result"], "ejected", out)
         self.assertIn("ambiguous", self.fake.queue_rows[4]["reason"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+
+    def test_manual_landing_under_permissive_fork_refuses_strict_queue_source(self):
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        self.fake.queue_rows[4]["source"] = "github.com/acme/strict"
+        self.project = dataclasses.replace(self.project, ci_required=False, github="acme/fork")
+        with mock.patch.object(land, "_land", wraps=land._land) as merging:
+            out = self.land(4)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("source", out["error"])
+        merging.assert_not_called()
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+
+
+    def test_landing_accepts_matching_normalized_source_but_refuses_missing_source(self):
+        self.queued(4)
+        self.fake.queue_rows[4]["source"] = "github.com/ACME/Product"
+        with mock.patch.object(merge_queue, "source_of", return_value="github.com/acme/product"), \
+                mock.patch.object(land, "_land", return_value={"result": "landing"}) as merging:
+            self.assertEqual(self.land(4)["result"], "landing")
+            merging.assert_called_once()
+        self.fake.queue_rows[4]["source"] = ""
+        with mock.patch.object(land, "_land") as merging:
+            self.assertEqual(self.land(4)["result"], "error")
+            merging.assert_not_called()
 
 
 class PrFrozenCiR3Test(_Land):
