@@ -150,13 +150,34 @@ class PriseTest(_Base):
         self.assertEqual(self.take(budget_check=lambda a: "plafond atteint"), [])
         self.assertEqual(self.take(alerts=[{"type": "host_pressure", "host": self.cfg.host}]),
                          [])
-        # un agent du mesh en pause budget : aucune prise
+        # #754 : un agent du mesh en pause budget ne prend rien lui-même,
+        # mais il n'empêche plus les autres agents libres de prendre (un
+        # forfait au seuil ne doit pas arrêter ceux qui ont du budget).
         self.agent("claude2", status="blocked")
         self.db.execute("UPDATE agent_registry SET status_text = 'budget : plafond'"
                         " WHERE name = 'claude2'")
-        self.assertEqual(self.take(), [])
+        self.assertEqual([t["agent"] for t in self.take()], ["claude1"])
         self.db.execute("UPDATE agent_registry SET status_text = '' WHERE name = 'claude2'")
-        self.assertEqual(len(self.take()), 1)
+        # claude1 a pris le seul élément : la pause levée n'ouvre pas de prise
+        self.assertEqual(self.take(), [])
+
+    def test_prise_au_token_quand_le_forfait_est_au_seuil(self):
+        # #754 (owner, 13/10) : « quand les forfaits Claude sont au seuil, le
+        # travail passe à DeepSeek » — à défaut d'agent au forfait, l'agent
+        # au token de la même équipe prend l'élément.
+        self.agent("claude1", status="blocked")
+        self.db.execute("UPDATE agent_registry SET status_text = 'budget : plafond'"
+                        " WHERE name = 'claude1'")
+        self.agent("deepseek1", "deepseek")
+        item = self.element("dette", 50)
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("deepseek1", item["id"])])
+        # ... mais un forfait libre passe toujours devant
+        self.db.execute("UPDATE work_items SET assignee = NULL, state = 'intake',"
+                        " updated_at = now() WHERE id = %s", (item["id"],))
+        self.agent("claude3")
+        self.assertEqual([t["agent"] for t in self.take()], ["claude3"])
 
     def test_equipe_et_capacites(self):
         self.agent("web1", team="web", capabilities=["read"])

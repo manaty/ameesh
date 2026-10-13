@@ -347,7 +347,6 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     d'amélioration, L119). Les lots de l'équipe passent d'abord ; tant qu'un
     lot du projet attend, personne ne prend d'amélioration. Un seuil nul
     désactive la prise correspondante."""
-    from . import budget as budget_mod
     from . import mail, registry, sous_utilisation, work
 
     now = time.time() if now is None else float(now)
@@ -374,11 +373,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     except Exception:
         # Pas de prise quand le périmètre des rôles est illisible.
         return []
-    # un agent du mesh en pause budget : le plafond est atteint, on ne charge pas
-    if any(row.get("status") == "blocked"
-           and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX)
-           for row in listing):
-        return []
+    # #754 : un agent en pause budget ne prend rien — il n'est déjà pas un
+    # candidat (`idle_agents` écarte l'état `blocked`), et rien ici ne doit
+    # arrêter les autres : un forfait au seuil (Claude, Codex) privait tout le
+    # mesh de prise, y compris les agents au token qui avaient du budget
+    # (owner, 13/10 : « quand les forfaits Claude sont au seuil, le travail
+    # passe à DeepSeek et Codex »).
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
     # #254 : un hôte en pause ne prend pas de travail, ni ses agents
@@ -406,12 +406,26 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
-            if is_paid(row) and (not allow_paid or balance_low):
+            if is_paid(row) and balance_low:
                 continue
             out.append(row)
         # forfaits d'abord, puis le repos le plus long
         out.sort(key=lambda r: (is_paid(r), sous_utilisation.idle_since(r), r["name"]))
         return out
+
+    def paid_allowed(pool: list, team) -> bool:
+        """#754 (owner, 13/10) : quand les forfaits sont au seuil, le travail
+        passe aux agents au token. Un agent payant ne prend donc un lot que
+        si aucun agent au forfait disponible ne partage son équipe — ou si la
+        prise payante est demandée (`--take-paid`), jamais sous `balance_low`.
+        Le tri de `candidates` garde les forfaits devant, lot par lot."""
+        if balance_low:
+            return False
+        if allow_paid:
+            return True
+        team = (team or "").strip()
+        return not any(not is_paid(row) and (row.get("team") or "").strip() == team
+                       for row in pool)
 
     def within_budget(row) -> bool:
         try:
@@ -428,7 +442,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             except Exception:
                 orchestras = []
         # L165b : un agent dont tous les lots attendent un autre est libre
-        for row in candidates(lot_idle_s, skip=set(orchestras), waiting_free=True):
+        pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
+        for row in pool:
             if len(taken) >= lot_room or not lots:
                 break
             if not within_budget(row):
@@ -441,6 +456,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 continue
             auditors = auditor_mod.cards([agent], canons)
             for item in list(lots):
+                if is_paid(row) and not paid_allowed(pool, item["lot_team"]):
+                    continue
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"])):
                     continue
@@ -481,7 +498,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     # avant toute amélioration
     if taken or sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
         return taken
-    for row in candidates(idle_s):
+    pool = candidates(idle_s)
+    for row in pool:
         if len(taken) >= room or not queue:
             break
         if not within_budget(row):
@@ -494,6 +512,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             continue
         auditors = auditor_mod.cards([agent], canons)
         for item in list(queue):
+            if is_paid(row) and not paid_allowed(pool, item.get("lot_team")):
+                continue
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"])):
                 continue

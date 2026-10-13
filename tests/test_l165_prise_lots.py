@@ -70,6 +70,32 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(st.auto_takes_since(3600, backlog.LOT_TAKE_NOTE), 1)
         self.assertEqual(self.take(), [])
 
+    def test_forfait_au_seuil_laisse_le_lot_a_l_agent_au_token(self):
+        # #754 : quand le seul agent au forfait de l'équipe est en pause
+        # budget, l'agent au token de la même équipe prend le lot (owner,
+        # 13/10 : « quand les forfaits Claude sont au seuil, le travail passe
+        # à DeepSeek et Codex »).
+        self.agent("claude1", team="nexlink", status="blocked")
+        self.db.execute("UPDATE agent_registry SET status_text = 'budget : plafond'"
+                        " WHERE name = 'claude1'")
+        self.agent("deepseek7", "deepseek", team="nexlink")
+        self.agent("dev1", team="ameesh")
+        lot = self.lot("corriger l'export")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"], t["kind"]) for t in out],
+                         [("deepseek7", lot["id"], "lot")])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "deepseek7")
+
+    def test_forfait_libre_de_l_equipe_garde_le_lot(self):
+        # #754 : un forfait libre de l'équipe passe toujours avant un agent
+        # au token — le tri de `candidates` et `paid_allowed` le garantissent.
+        self.agent("claude1", team="nexlink")
+        self.agent("deepseek7", "deepseek", team="nexlink")
+        lot = self.lot("corriger l'export")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("claude1", lot["id"])])
+
     def test_seuil_de_repos_propre_aux_lots(self):
         self.agent("claude1", team="nexlink", since_s=20 * 60)
         lot = self.lot("lot")
