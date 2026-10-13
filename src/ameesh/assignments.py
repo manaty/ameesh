@@ -9,16 +9,22 @@ sous-utilisation se trompaient et la frise restait vide.
 * Un orchestrateur (même détection que `orchestrator_held`, L94 :
   déclaré, rôle au canon, ou agent qui a confié des lots) qui écrit à un
   agent SANS lot ouvert est averti (sortie d'erreur et fil du message).
-* `--lot <id|réf>` : le lot est rattaché au destinataire, et lui est
-  assigné s'il ne l'est pas déjà, par l'attribution gardée (L37). Un lot
-  qui appartient à un AUTRE agent n'est jamais repris en silence : le
-  courrier d'un relecteur sur le lot de l'auteur ne doit pas le lui voler.
+* `--lot <id|réf>` : le lot est rattaché au fil, et assigné au destinataire
+  par l'attribution gardée (L37) quand il n'a pas d'agent assigné (libre ou
+  tenu par un humain). Un lot déjà tenu par un AGENT n'est jamais remis par
+  la seule étiquette : ni celui d'un autre (le courrier d'un relecteur ne
+  vole pas le lot de l'auteur), ni celui de l'expéditeur lui-même (#1066,
+  incident #1046 : un courrier d'information a emporté le lot qu'il citait).
+  La remise est un geste explicite : `ameesh work assign`.
 * `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
 désigne aucun lot connu reste une simple étiquette du fil, comme avant.
 Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
 lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
+Correctif du 2026-10-13 (#1066) : la remise d'un lot tenu par l'expéditeur
+demandait déjà un geste, elle est désormais refusée comme celle du lot d'un
+autre agent (avertissement qui nomme `ameesh work assign`).
 """
 from __future__ import annotations
 
@@ -165,13 +171,24 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             else:
                 current = (item.get("assignee") or "").strip()
                 if current != recipient:
-                    if current and current != sender \
-                            and not current.startswith(work_mod.HUMAN_PREFIX):
-                        out["warnings"].append(
-                            "lot #%d belongs to %s: not reassigned to %s (to "
-                            "take it over: ameesh work assign %d %s)"
-                            % (int(item["id"]), current, recipient, int(item["id"]),
-                               recipient))
+                    if current and not current.startswith(work_mod.HUMAN_PREFIX):
+                        # #1066 (incident #1046) : un lot déjà tenu par un
+                        # agent ne se remet pas par la seule étiquette
+                        # `--lot`, même quand c'est l'expéditeur qui le tient.
+                        # La remise est un geste explicite (`ameesh work
+                        # assign`), jamais un effet de bord d'un courrier.
+                        if current == sender:
+                            out["warnings"].append(
+                                "lot #%d is yours: linked without reassignment to %s "
+                                "(to hand it over: ameesh work assign %d %s)"
+                                % (int(item["id"]), recipient, int(item["id"]),
+                                   recipient))
+                        else:
+                            out["warnings"].append(
+                                "lot #%d belongs to %s: not reassigned to %s (to "
+                                "take it over: ameesh work assign %d %s)"
+                                % (int(item["id"]), current, recipient, int(item["id"]),
+                                   recipient))
                     else:
                         done = work_mod.assign(db, int(item["id"]), recipient, actor=sender,
                                                cfg=cfg)

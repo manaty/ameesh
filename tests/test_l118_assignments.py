@@ -85,6 +85,22 @@ class MailLinksLotsTest(_Base):
         self.assertIn("belongs to dev1: not reassigned", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
+    def test_lot_tenu_par_l_expediteur_n_est_pas_remis_par_l_etiquette(self):
+        # #1066 (incident #1046) : un orchestrateur qui TIENT un lot et écrit
+        # au pilote en citant `--lot` comme étiquette de fil ne lui remet pas
+        # le lot — la remise est un geste explicite (`ameesh work assign`).
+        lot = work.add(self.db, title="goldens de l'exécuteur médié", assignee="orch")
+        proc = self.send("dev1", "Où en est ce lot ?", "--from", "orch", "--lot",
+                         str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("is yours: linked without reassignment to dev1", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "orch")
+        # le message part quand même, rattaché au fil du lot
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+        # la remise explicite, elle, aboutit
+        work.assign(self.db, lot["id"], "dev1", actor="orch")
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+
     def test_new_lot_cree_et_assigne(self):
         proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
                          "--new-lot", "CI plus rapide", "--estimate", "2h", "--app", "p",
