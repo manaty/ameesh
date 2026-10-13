@@ -26,6 +26,11 @@ def running_groups(pgids: Iterable[int] = ()) -> set[int] | None:
                     groups.add(row["pgid"])
             snapshots.append(members)
         first, second = snapshots
+        # Snapshot limitation (#472): a live member can fork, then setsid()
+        # before its stat is read, in both scans. Identical zombie sets can
+        # then hide a descendant still in the group. Excluding this fork +
+        # setsid race requires cgroup membership tracking; these read-only
+        # snapshots can only decide whether to settle a resource record.
         for pgid in first.keys() | second.keys():
             if first.get(pgid) != second.get(pgid):
                 groups.add(pgid)
