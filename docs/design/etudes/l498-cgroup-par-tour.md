@@ -208,14 +208,28 @@ Not fixed, or deliberately out of the first slice:
 - **Measurements** (mesh-design + owner agreement): orphan rate, cleanup
   latency, lease jitter, per-turn memory accounting.
 
-# Decisions needed
+# Decisions
 
-1. **mesh-design**: is this the route expected for L76c, and are the two
-   carve-outs (exempt/auditor turns, resident harness) the right first-slice
-   boundary?
-2. **owner**: authorization for the unit settings on a canary host
-   (`Delegate=yes`, `DelegateSubgroup=runner`; guest: `ProtectControlGroups=no`
-   on the runner unit) and for the measurement window. No unit, weight or
-   freeze change is part of this study.
-3. **First slice**: user runners on ameesh-agents-1 only, then the mesh server
-   and the guest.
+1. **mesh-design — answered (13/10 18:2x)**: yes, this is the route expected
+   for L76c: a per-turn cgroup delegated under the executor's unit, placement
+   before execution (trampoline + READY barrier; a refused placement refuses
+   the launch, with no silent fallback), stable ownership (members follow
+   `fork`/`exec`, no pid migration), closure by `cgroup.kill` verified on
+   `cgroup.events`, the path persisted in `turn_resources`, and reconciliation
+   of orphan `turn-*` at start-up. Both first-slice carve-outs are accepted and
+   each is named as a following slice: the exempt/auditor turn (its own
+   `systemd-run --scope`, sibling of the unit, outside it) and the resident
+   harness (the resident slice's decision). Non-Linux keeps PID/PGID;
+   containers keep the label route; mediated execution keeps the local code and
+   leaves remote process control unchanged. First target: the user runners on
+   ameesh-agents-1, then the mesh server and the guest.
+2. **owner — requested, pending** (grouped request attached to #498):
+   authorization for the unit settings on a canary host (`Delegate=yes`,
+   `DelegateSubgroup=runner`; guest: `ProtectControlGroups=no` on the runner
+   unit) and for the measurement window. No unit, weight or freeze change is
+   part of this study.
+3. **First slice — answered with 1**: user runners on ameesh-agents-1 only,
+   then the mesh server and the guest.
+
+Implementation starts after #490 merges; the measurement window is framed with
+mesh-design before any switch.
