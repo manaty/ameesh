@@ -9,14 +9,17 @@ retard : il est tu.
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 import unittest
 
 from ameesh import alert_briefs, exploitation, notify, registry, work, work_dependencies
 
-from .support import PgTestCase
+from .support import FAKEBIN, PgTestCase
 
 HEURE = 3600.0
+FAKE_NOTIFY_SEND = os.path.join(FAKEBIN, "notify-send")
 
 
 def _seuils(**kw):
@@ -143,6 +146,97 @@ class BriefsTest(_Base):
         self.assertEqual(sorted(out), ["auditeur", "bureau"])
         self.assertIn("bureau or auditor", out["bureau"])
         self.assertIn("the owner is notified", out["bureau"])
+
+
+class NotifyLivreTest(_Base):
+    """B1 (#1035 R1) : la livraison RÉELLE par le Notifier — un P1 atteint le
+    propriétaire même si son type est hors `notify.types`, un dépassement
+    ordinaire reste filtrable, le courrier d'agent porte l'urgence du P1, et
+    la clé de dédoublonnage change quand le niveau monte."""
+
+    def setUp(self):
+        super().setUp()
+        self.desk = os.path.join(self.tmp, "desktop-789-%s.log" % self._testMethodName)
+        self.logs: list = []
+        self.now = time.time()
+
+    def notifier(self, **raw):
+        raw.setdefault("default", ["desktop"])
+        raw.setdefault("default_human", "human:owner")
+        return notify.Notifier(
+            self.cfg, notify.parse_config(raw), None, log=self.logs.append,
+            clock=lambda: self.now,
+            sender=notify.Sender(env={
+                "AMEESH_NOTIFY_SEND_BIN": FAKE_NOTIFY_SEND,
+                "AMEESH_FAKE_NOTIFY_LOG": self.desk,
+                "PATH": os.environ.get("PATH", "")}))
+
+    def desktop(self):
+        if not os.path.exists(self.desk):
+            return []
+        with open(self.desk, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def payload(self, recipient):
+        rows = self.db.query("SELECT payload FROM agent_mailbox WHERE recipient = %s"
+                             " ORDER BY id DESC LIMIT 1", (recipient,))
+        self.assertTrue(rows, "aucun courrier pour %s" % recipient)
+        return rows[0]["payload"] or {}
+
+    def p1(self):
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        self.age(50 * 60)
+        alerts = [a for a in self.slo() if a["critical"]]
+        self.assertEqual(len(alerts), 1, alerts)
+        return alerts
+
+    def test_p1_livre_au_proprietaire_meme_type_hors_notify_types(self):
+        alerts = self.p1()
+        records = self.notifier(types=["long_turn"]).run_pass(self.db, current=alerts)
+        raised = [r for r in records if r["event"] == "raised" and r["type"] == "slo_breach"]
+        self.assertEqual([(r["human"], r["source"], r["delivery"]) for r in raised],
+                         [("human:owner", "defaut", "envoyee")])
+        argv = self.desktop()
+        self.assertEqual(len(argv), 1, argv)
+        self.assertIn("--urgency=critical", argv[0])
+        self.assertIn("work item #%d" % self.lot["id"], argv[0][-1])
+        self.assertIn("level 3", argv[0][-1])
+
+    def test_non_p1_reste_filtrable_puis_livre_si_configure(self):
+        self.age(1.5 * HEURE)
+        alerts = self.slo()
+        self.assertFalse(alerts[0]["critical"])
+        records = self.notifier(types=["long_turn"]).run_pass(self.db, current=alerts)
+        self.assertEqual([r for r in records if r["event"] == "raised"], [])
+        self.assertEqual(self.desktop(), [])
+        records = self.notifier(types=["long_turn", "slo_breach"]).run_pass(
+            self.db, current=alerts)
+        raised = [r for r in records if r["event"] == "raised"]
+        self.assertEqual([(r["type"], r["human"], r["delivery"]) for r in raised],
+                         [("slo_breach", "human:owner", "envoyee")])
+        self.assertEqual(len(self.desktop()), 1)
+
+    def test_courrier_agent_urgent_pour_un_p1_et_ordinaire_sinon(self):
+        self.p1()
+        self.notifier(types=["long_turn"]).run_pass(self.db, current=self.slo())
+        self.assertTrue(self.payload("bureau").get("urgent"))
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = now()")
+        self.db.execute("DELETE FROM agent_mailbox")
+        self.db.execute("UPDATE work_items SET priority = 2 WHERE id = %s",
+                        (self.lot["id"],))
+        self.age(1.5 * HEURE)
+        self.notifier(types=["long_turn"]).run_pass(self.db, current=self.slo())
+        self.assertNotIn("urgent", self.payload("dev1"))
+
+    def test_cle_de_dedoublonnage_change_avec_le_niveau(self):
+        self.age(1.5 * HEURE)
+        bas = self.slo()[0]
+        self.age(2.5 * HEURE)
+        haut = self.slo()[0]
+        self.assertEqual((bas["reason"], haut["reason"]),
+                         ("intake_started/level-1", "intake_started/level-2"))
+        self.assertNotEqual(notify.key_of(bas), notify.key_of(haut))
 
 
 if __name__ == "__main__":
