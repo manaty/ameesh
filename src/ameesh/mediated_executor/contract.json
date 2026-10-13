@@ -3195,7 +3195,7 @@
    },
    "rules": [
     "name = agent du jeton de session",
-    "rendu : {lease_owner, lease_epoch, status, live} (clés du pilote, lues par registry.lease_matches)"
+    "rendu : {name, lease_owner, lease_epoch, status, live} (name = nom primaire résolu ; clés du pilote, lues par registry.lease_matches)"
    ]
   },
   {
