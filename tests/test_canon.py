@@ -1783,6 +1783,37 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         self.assertEqual(git(self.clone, "rev-parse", "HEAD"), second)
         self.assertEqual(self.journal()[-1]["root_commit"], second)  # pas de ligne en plus
 
+    def test_floor_connu_sur_ref_de_suivi_perimee_rattrape_le_clone(self):
+        """#814 (R1 cx3) : le journal a appliqué B, B est DÉJÀ connu des objets
+        du clone (vu par une autre ref, un aperçu ou un fetch ciblé) mais son
+        `origin/main` est resté à A. Relire sans fetch retrouverait A et la
+        monotonie refuserait à chaque passe, sans jamais rattraper le clone :
+        le suivi distant est périmé, la passe fetch donc et rattrape le clone."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        self.assertEqual(self.journal()[-1]["root_commit"], first)
+        # un autre chemin (un autre clone) applique un commit de plus au journal
+        other = os.path.join(self.workspace, "autre-chemin")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        second = self.commit_members(other, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        self.assertEqual(self.sync(other).authenticators.status, "synced")
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+        # le clone principal a vu B par un fetch ciblé : l'objet est connu, mais
+        # ni son origin/main ni son checkout n'ont bougé
+        git(self.clone, "fetch", "-q", "origin", second)
+        self.assertEqual(git(self.clone, "rev-parse", "origin/main"), first)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), first)
+        done = self.sync().authenticators
+        self.assertEqual(done.status, "synced")
+        # le registre (global par canon) a déjà la passkey : la passe rattrape
+        # le clone sans rien réécrire
+        self.assertEqual({c for _, c in self.live()},
+                         {self.alice.credential_id, self.alice2.credential_id})
+        self.assertEqual(git(self.clone, "rev-parse", "origin/main"), second)
+        self.assertEqual(git(self.clone, "rev-parse", "HEAD"), second)
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+
     def test_checkout_divergent_refuse_le_registre(self):
         """#814 : quand le checkout du canon ne peut pas suivre la révision
         appliquée (clone divergé, fast-forward impossible), sync refuse

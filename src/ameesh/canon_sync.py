@@ -698,13 +698,37 @@ def _floor_commits(canon: Canon, last: dict) -> list[tuple[canon_mod.Source, str
     return pairs
 
 
+def _mutable_tracking_ref(source: canon_mod.Source) -> bool:
+    """La révision lue est-elle une ref de suivi distante, qu'un fetch avance ?
+
+    `origin/main`, la forme que `canon.load` donne au manifeste : oui. Un SHA,
+    une expression de révision, `HEAD`, une branche locale ou une ref explicite :
+    non — un fetch ne les avance pas, une relecture seule ne peut donc pas
+    rattraper le clone et le refus de monotonie doit rester tel quel (R1 #814)."""
+    tracked = canon_mod.remote_branch(source.repo, source.rev)
+    if not tracked:
+        return False
+    name = source.rev
+    if name.startswith("refs/remotes/"):
+        name = name[len("refs/remotes/"):]
+    return name == tracked
+
+
 def _catch_up_needed(canon: Canon, last: dict) -> tuple[bool, bool]:
     """(relire, fetcher) : ce clone est-il en retard sur le journal ?
 
-    `fetch` seulement quand un dernier commit appliqué est INCONNU du dépôt :
-    un commit connu mais absent de ce qui est lu (historique réécrit, `--ref`
-    d'une autre branche) ne sera pas apporté par un fetch ; relire suffit à
-    reprendre les références qu'un autre passage vient de fetcher (L814)."""
+    `fetch` quand un dernier commit appliqué est INCONNU du dépôt : un commit
+    connu mais absent de ce qui est lu (historique réécrit, `--ref` d'une autre
+    branche) ne sera pas apporté par un fetch ; relire suffit à reprendre les
+    références qu'un autre passage vient de fetcher (L814).
+
+    `fetch` AUSSI quand un floor CONNU descend strictement la révision lue sur
+    une ref de suivi distante : le suivi local est périmé (le commit du journal
+    a été vu par un autre chemin : autre ref, aperçu, fetch ciblé), et relire
+    sans fetch retrouverait la même révision — la monotonie refuserait à chaque
+    passe sans jamais rattraper le clone (R1 #814). Un floor connu absent d'une
+    révision divergente, d'un commit explicite ou d'une branche locale n'est pas
+    apporté par un fetch : la relecture seule et le refus restent."""
     reread = fetch = False
     for source, floor in _floor_commits(canon, last):
         if source.commit == floor:
@@ -713,6 +737,9 @@ def _catch_up_needed(canon: Canon, last: dict) -> tuple[bool, bool]:
             return True, True
         if not canon_mod.git_contains(source.repo, floor, source.commit):
             reread = True
+            if (canon_mod.git_contains(source.repo, source.commit, floor)
+                    and _mutable_tracking_ref(source)):
+                fetch = True
     return reread, fetch
 
 
@@ -760,7 +787,9 @@ def catch_up(db: Db, canon: Canon, host: str, key: str | None = None, *,
     pouvoir se rattraper, aucune passe ne fetchant d'elle-même. Ici, quand un
     dernier commit appliqué est inconnu du dépôt, les dépôts du canon sont
     fetchés et le canon relu UNE fois ; quand il est connu mais absent de ce
-    qui est lu, le canon est relu sans fetch.
+    qui est lu, le canon est relu — avec fetch si un floor connu descend la
+    révision lue sur une ref de suivi distante (suivi local périmé, `_catch_up_needed`),
+    sans fetch sinon (historique divergent, `--ref` explicite ou branche locale).
 
     Puis le checkout du clone canonique suit la révision lue
     (`canon.git_fast_forward`, fast-forward seulement) — mais seulement après
