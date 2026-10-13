@@ -13,8 +13,11 @@
 - `pin` registers that exact set in the private retention catalog with the
   release's rollback deadline and the enrolled retention window, before any
   migration. An unaccepted set is never expired;
-- `accept` records release acceptance for retention and drops the transient
-  receipt. An explicit operator hold is preserved.
+- `accept` records release acceptance for retention, drops the transient
+  receipt, then expires previously accepted sets whose policy window has
+  passed. Expiry is best-effort: a set whose remote members have no enrolled
+  deletion adapter, or whose deletion was interrupted, stays protected and is
+  retried at the next acceptance.
 
 `config` is the administrator-enrolled `backup.json` document (exact keys):
 `dsn` (backup identity), `restore_dsn` (separate restore identity),
@@ -51,6 +54,15 @@ IDENTIFIER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 OPERATION = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}')
 SHA256 = re.compile(r'[0-9a-f]{64}')
 MINIMUM_FREE_BYTES = 512 * 1024 * 1024
+# A verified restore copies the archive into the database cluster before the
+# disposable database is dropped. The release host keeps the cluster and the
+# release state on the same filesystem by default, so a fresh restore reserves
+# this multiple of the artifact on top of the release floor.
+RESTORE_SPACE_FACTOR = 2
+# A recovery artifact left by an interrupted attempt is only evidence of the
+# current pre-migration state for a bounded window; an older set is recreated
+# from the live source instead of being pinned stale.
+REUSE_SECONDS = 3600
 # Private staging left by a process killed mid-transfer is removed only after
 # this delay, so it can never race a live sibling.
 STAGING_SECONDS = 900
@@ -161,12 +173,15 @@ class RecoverySet:
             return self._registered_set(artifact)
         pending = self._pending(artifact)
         if pending is not None:
-            return self._reconcile(request, pending)
+            if self._stale(pending['files']):
+                self._discard(artifact)
+            else:
+                return self._reconcile(request, pending)
         self._clean_staging()
         archive = self.retention / (artifact + '.dump')
         inventory_path = self.retention / (artifact + '.inventory')
         proof_path = self.retention / (artifact + '.restore.json')
-        expected = self._complete_set(archive, inventory_path)
+        expected = self._complete_set(artifact, archive, inventory_path)
         if expected is False:
             return False
         if not self._restore(archive, proof_path, expected):
@@ -204,24 +219,24 @@ class RecoverySet:
                 self._write_pending(artifact, pending)
         return True
 
-    def _complete_set(self, archive, inventory_path):
+    def _complete_set(self, artifact, archive, inventory_path):
         """Reconcile a crash-interrupted publication or create the artifact."""
         for path in (archive, inventory_path):
             if os.path.lexists(path) and (path.is_symlink() or not path.is_file()):
                 raise RecoveryError('unsafe recovery artifact')
         if archive.is_file() and inventory_path.is_file():
             expected = self._read_inventory(inventory_path)
-            if expected is not None and backup.digest(archive) == expected['artifact_sha256']:
+            if (expected is not None and backup.digest(archive) == expected['artifact_sha256']
+                    and not self._stale([archive.name, inventory_path.name])):
                 return expected
-        # No catalog record and no verified proof exist for an incomplete pair:
-        # it is not a recovery set and is recreated from the live source.
-        for path in (archive, inventory_path):
-            if os.path.lexists(path):
-                path.unlink()
+        # No catalog record and no verified proof exist for an incomplete or
+        # stale pair: it is not current recovery evidence and is recreated from
+        # the live source.
+        self._discard(artifact)
         return self._dump(archive, inventory_path)
 
     def _dump(self, archive, inventory_path):
-        if shutil.disk_usage(self.retention).free < MINIMUM_FREE_BYTES:
+        if not self._room(self.retention):
             return False
         with self._config_file(self.config['dsn']) as config:
             try:
@@ -233,6 +248,55 @@ class RecoverySet:
             raise RecoveryError('incomplete recovery publication')
         return expected
 
+    def _discard(self, artifact):
+        """Drop the private members of an abandoned attempt.
+
+        A fresh dump must not collide with the abandoned attempt's upload
+        receipt, whose digest would no longer match. A remote object already
+        uploaded by that attempt has no enrolled deletion identity yet and is
+        not reclaimable here.
+        """
+        for path in (self.retention / (artifact + '.dump'),
+                     self.retention / (artifact + '.inventory'),
+                     self.retention / (artifact + '.restore.json'),
+                     self.retention / (artifact + '.remote.json'),
+                     self.root / (artifact + '.set.json')):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                raise RecoveryError('recovery artifact removal unavailable') from None
+
+    def _stale(self, names):
+        """True when any existing member predates the bounded reuse window."""
+        now = self.clock()
+        for name in names:
+            try:
+                info = (self.retention / name).lstat()
+            except OSError:
+                continue
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1):
+                continue
+            if now - info.st_mtime > REUSE_SECONDS:
+                return True
+        return False
+
+    @staticmethod
+    def _size(path):
+        try:
+            info = path.lstat()
+        except OSError:
+            return None
+        return info.st_size if stat.S_ISREG(info.st_mode) else None
+
+    @staticmethod
+    def _room(path, size=0, factor=1):
+        try:
+            free = shutil.disk_usage(path).free
+        except OSError:
+            return False
+        return free >= MINIMUM_FREE_BYTES + factor * size
+
     def _restore(self, archive, proof_path, expected):
         if os.path.lexists(proof_path):
             if proof_path.is_symlink() or not proof_path.is_file():
@@ -241,6 +305,9 @@ class RecoverySet:
             if proof is not None:
                 return True
             proof_path.unlink()
+        size = self._size(archive)
+        if size is None or not self._room(self.retention, size, RESTORE_SPACE_FACTOR):
+            return False
         with self._config_file(self.config['restore_dsn']) as config:
             try:
                 proof = backup.verify_restore(config, archive, expected)
@@ -301,6 +368,9 @@ class RecoverySet:
 
     def _remote_proof(self, artifact, item):
         remote = self.config['remote']
+        size = self._size(self.retention / (artifact + '.dump'))
+        if size is None or not self._room(self.root, size):
+            return False
         try:
             with tempfile.TemporaryDirectory(prefix='.verify-', dir=self.root) as staging:
                 target = Path(staging) / 'verify.dump'
@@ -363,6 +433,21 @@ class RecoverySet:
                 path.unlink()
             except OSError:
                 raise RecoveryError('recovery receipt removal unavailable') from None
+        self.expire()
+        return True
+
+    def expire(self):
+        """Expire accepted sets past their policy window; never fail acceptance.
+
+        Called after a release acceptance so retained sets do not accumulate
+        without bound. A definitive domain or filesystem refusal leaves every
+        remaining set protected, including one whose deletion was interrupted:
+        the durable intent resumes at the next acceptance.
+        """
+        try:
+            retention.prune(self.retention, now=self.clock())
+        except (retention.RetentionError, OSError):
+            return False
         return True
 
     # -- private catalog and receipts --------------------------------------

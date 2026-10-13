@@ -514,13 +514,21 @@ credential file, and no credential value enters a receipt, an argument, the
 child environment or an error. `backup` publishes the dump and its pinned row
 inventory in the private retention root, proves an isolated restore against
 that inventory, proves a configured remote copy can be retrieved with the
-recovery identity, and records the verified set in a private receipt. `pin`
+recovery identity, and records the verified set in a private receipt. A fresh
+restore and a remote retrieval are admitted only with room for the copy (twice
+the artifact for the cluster copy, once for private staging) on top of the
+release disk floor; insufficient space is a definitive refusal, never a partial
+copy. `pin`
 registers those exact bytes before migration with the manifest rollback deadline
 and the enrolled retention window; an unaccepted set is never expired. `accept`
-records release acceptance and drops the transient receipt, preserving an
-explicit operator hold. An interrupted publication is recreated from the live
-source; a verified receipt survives a lost reply without a second dump, restore
-or upload.
+records release acceptance, drops the transient receipt and then expires the
+previously accepted sets whose policy window has passed; a held set, or one
+whose remote members have no enrolled deletion adapter, stays protected and
+the expiry is retried at the next acceptance. An interrupted publication is
+recreated from the live source; an artifact left by an interrupted attempt is
+only reused while it is inside the bounded reuse window, then recreated from
+the live source instead of being pinned stale. A verified receipt survives a
+lost reply without a second dump, restore or upload.
 
 `HealthProbe` rederives the active release's own completed receipt, checks the
 versioned pointer (`health`: the activated release; `recovery_health`: the prior

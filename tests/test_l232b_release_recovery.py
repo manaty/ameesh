@@ -8,6 +8,7 @@ primitives are replaced by recording fakes.
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -60,12 +61,13 @@ class RecoverySetTest(unittest.TestCase):
     def inventory(self):
         return Path(self.retention) / 'release-fixture.inventory'
 
-    def write_inventory(self, archive, value=None):
+    def write_inventory(self, archive, value=None, inventory=None):
         digest = hashlib.sha256(Path(archive).read_bytes()).hexdigest()
         document = value or dict(schema='public', migrations=[[1, 'd' * 64]],
                                  row_counts={'agent_registry': 4}, artifact_sha256=digest)
-        Path(self.inventory()).write_text(json.dumps(document, sort_keys=True))
-        Path(self.inventory()).chmod(0o600)
+        path = Path(inventory) if inventory is not None else Path(self.inventory())
+        path.write_text(json.dumps(document, sort_keys=True))
+        path.chmod(0o600)
         return document
 
     def fake_dump(self, config, output, inventory):
@@ -73,7 +75,7 @@ class RecoverySetTest(unittest.TestCase):
         self.assertEqual(set(settings), {'dsn'})
         Path(output).write_bytes(b'archive-bytes')
         Path(output).chmod(0o600)
-        document = self.write_inventory(output)
+        document = self.write_inventory(output, inventory=inventory)
         return {'artifact_sha256': document['artifact_sha256'], 'inventory': str(inventory)}
 
     def fake_restore(self, config, archive, expected):
@@ -86,10 +88,10 @@ class RecoverySetTest(unittest.TestCase):
         path = Path(self.retention) / '.retention.json'
         return json.loads(path.read_text()) if path.exists() else {}
 
-    def backup(self, manifest=None):
+    def backup(self, manifest=None, operation='release-fixture'):
         with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
                 mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore):
-            return self.perform('backup', manifest=manifest)
+            return self.perform('backup', operation=operation, manifest=manifest)
 
     def test_backup_pin_accept_register_and_protect_the_exact_verified_set(self):
         self.assertTrue(self.backup())
@@ -295,6 +297,143 @@ class RecoverySetTest(unittest.TestCase):
                 if path.is_file() and 'CANARY' in path.read_text(errors='ignore'):
                     leftovers.append(path)
         self.assertEqual(leftovers, [])
+
+    # -- K3: a stale artifact is never pinned as the pre-migration state -----
+    def stale_stamp(self):
+        return self.clock() - recovery.REUSE_SECONDS - 1
+
+    def test_stale_publication_is_recreated_instead_of_pinned(self):
+        archive = self.archive()
+        archive.write_bytes(b'archive-bytes')
+        archive.chmod(0o600)
+        self.write_inventory(archive)
+        stale = self.stale_stamp()
+        for path in (archive, self.inventory()):
+            os.utime(path, (stale, stale))
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump) as dump, \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore):
+            self.assertTrue(self.perform('backup'))
+        self.assertEqual(dump.call_count, 1)
+        self.assertGreater(archive.stat().st_mtime, stale)
+
+    def test_stale_pending_receipt_is_not_reused(self):
+        self.assertTrue(self.backup())
+        stale = self.stale_stamp()
+        for name in self.value._pending('release-fixture')['files']:
+            os.utime(Path(self.retention) / name, (stale, stale))
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump) as dump, \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore) as restore:
+            self.assertTrue(self.perform('backup'))
+        self.assertEqual(dump.call_count, 1)
+        self.assertEqual(restore.call_count, 1)
+
+    def test_stale_remote_attempt_reuploads_instead_of_colliding(self):
+        upload_credentials, restore_credentials = self.credential_files()
+        self.value = self.remote_value(upload_credentials, restore_credentials)
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore), \
+                mock.patch.object(recovery.backup, 'upload', side_effect=self.fake_upload), \
+                mock.patch.object(recovery.backup, 'retrieve', side_effect=self.fake_retrieve):
+            self.assertTrue(self.perform('backup'))
+        stale = self.stale_stamp()
+        for name in self.value._pending('release-fixture')['files']:
+            os.utime(Path(self.retention) / name, (stale, stale))
+
+        def fresh_dump(config, output, inventory):
+            Path(output).write_bytes(b'fresh-archive')
+            Path(output).chmod(0o600)
+            document = self.write_inventory(output, inventory=inventory)
+            return {'artifact_sha256': document['artifact_sha256'], 'inventory': str(inventory)}
+
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=fresh_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore), \
+                mock.patch.object(recovery.backup, 'upload', side_effect=self.fake_upload) as upload, \
+                mock.patch.object(recovery.backup, 'retrieve', side_effect=self.fake_retrieve) as retrieve:
+            self.assertTrue(self.perform('backup'))
+        self.assertEqual(upload.call_count, 1)
+        self.assertEqual(retrieve.call_count, 1)
+
+    # -- K2: admission checks the space every real copy needs ---------------
+    def test_restore_refuses_when_the_cluster_filesystem_is_full(self):
+        real = recovery.shutil.disk_usage
+        calls = []
+
+        def usage(path):
+            calls.append(path)
+            return real(path)._replace(free=recovery.MINIMUM_FREE_BYTES if len(calls) == 1
+                                       else recovery.MINIMUM_FREE_BYTES - 1)
+
+        with mock.patch.object(recovery.shutil, 'disk_usage', side_effect=usage), \
+                mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore) as restore:
+            self.assertFalse(self.perform('backup'))
+        restore.assert_not_called()
+        self.assertTrue(self.archive().exists(), 'the published artifact stays for reconciliation')
+        self.assertFalse((Path(self.root) / 'release-fixture.set.json').exists())
+
+    def test_remote_verification_refuses_when_staging_has_no_room(self):
+        upload_credentials, restore_credentials = self.credential_files()
+        self.value = self.remote_value(upload_credentials, restore_credentials)
+        real = recovery.shutil.disk_usage
+        calls = []
+
+        def usage(path):
+            calls.append(path)
+            free = (recovery.MINIMUM_FREE_BYTES + 4096 if len(calls) <= 2
+                    else recovery.MINIMUM_FREE_BYTES - 1)
+            return real(path)._replace(free=free)
+
+        with mock.patch.object(recovery.shutil, 'disk_usage', side_effect=usage), \
+                mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore), \
+                mock.patch.object(recovery.backup, 'upload', side_effect=self.fake_upload), \
+                mock.patch.object(recovery.backup, 'retrieve', side_effect=self.fake_retrieve) as retrieve:
+            self.assertFalse(self.perform('backup'))
+        retrieve.assert_not_called()
+
+    # -- K1: acceptance expires accepted sets that reached their window -----
+    def advance_past_window(self):
+        self.value.clock = lambda: 2_000_000.0 + self.config['retention_seconds'] + 1
+
+    def test_acceptance_expires_only_eligible_accepted_sets(self):
+        self.assertTrue(self.backup())
+        self.assertTrue(self.perform('pin'))
+        self.assertTrue(self.perform('accept'))
+        self.advance_past_window()
+        self.assertTrue(self.backup(operation='second-release'))
+        self.assertTrue(self.perform('pin', operation='second-release'))
+        self.assertTrue(self.perform('accept', operation='second-release'))
+        self.assertEqual(self.catalog()['release-fixture']['state'], 'deleted')
+        self.assertFalse(self.archive().exists())
+        self.assertEqual(self.catalog()['second-release']['state'], 'retained')
+
+    def test_acceptance_leaves_held_sets_protected(self):
+        self.assertTrue(self.backup())
+        self.assertTrue(self.perform('pin'))
+        self.assertTrue(self.perform('accept'))
+        recovery.retention.protect(self.retention, 'release-fixture', hold=True)
+        self.advance_past_window()
+        self.assertTrue(self.backup(operation='second-release'))
+        self.assertTrue(self.perform('pin', operation='second-release'))
+        self.assertTrue(self.perform('accept', operation='second-release'))
+        self.assertEqual(self.catalog()['release-fixture']['state'], 'retained')
+        self.assertTrue(self.archive().exists())
+
+    def test_acceptance_keeps_a_remote_set_without_a_deletion_adapter(self):
+        upload_credentials, restore_credentials = self.credential_files()
+        self.value = self.remote_value(upload_credentials, restore_credentials)
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump), \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore), \
+                mock.patch.object(recovery.backup, 'upload', side_effect=self.fake_upload), \
+                mock.patch.object(recovery.backup, 'retrieve', side_effect=self.fake_retrieve):
+            self.assertTrue(self.perform('backup'))
+        self.assertTrue(self.perform('pin'))
+        self.assertTrue(self.perform('accept'))
+        self.advance_past_window()
+        self.assertTrue(self.perform('accept'))
+        self.assertFalse(self.value.expire())
+        self.assertEqual(self.catalog()['release-fixture']['state'], 'retained')
+        self.assertTrue(self.archive().exists())
 
 
 if __name__ == '__main__':
