@@ -45,6 +45,12 @@ def _team(by_name: dict, name) -> str:
     return ((by_name.get(name) or {}).get("team") or "").strip()
 
 
+def _workstream(row: dict) -> str:
+    """`workstream` d'abord ; `chantier` reste lu tant que les lecteurs chauds
+    ne l'ont pas remplacé (L148, stage 3 C1)."""
+    return row.get("workstream") or row.get("chantier") or ""
+
+
 def _of_teams(orchestras, by_name: dict, teams: set) -> list:
     """Les orchestrateurs d'une des équipes (ou sans équipe) ; sans équipe
     connue, tous."""
@@ -174,9 +180,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             return {}
         out = {o: text for o in orchestras
                if o in orchestrator_names and o in by_name
-               and by_name[o].get("chantier") == project}
+               and _workstream(by_name[o]) == project}
         for name in auditor_names or ():
-            if name in by_name and by_name[name].get("chantier") in (None, "", project):
+            if name in by_name and _workstream(by_name[name]) in ("", project):
                 out.setdefault(name, text)
         return out
     elif kind == "idle_actionable_lot":

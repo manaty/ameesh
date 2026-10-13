@@ -32,10 +32,12 @@ de son fichier (il les a importés).
 **La carte** (`ameesh-carte/1`, JSON compressé, clés triées) :
 
     commit, genere, outils     commit mesuré, date, versions (Python, coverage)
-    mesure                     parts, processus mesurés (dont sans contexte),
+    measure, mesure            parts, processus mesurés (dont sans contexte),
                                sous-processus Python lancés sans la mesure,
-                               surcoût
-    modules.<m>                durées par pilote, échecs sous mesure (14 jours)
+                               surcoût (L148 stage 6 : les deux graphies,
+                               l'anglaise d'abord, une release)
+    modules.<m>                durations et durees (mêmes valeurs), échecs sous
+                               mesure (14 jours)
     blocs.<fichier>.<bloc>     empreinte, lignes [début, fin], modules
     donnees.<fichier>          modules qui l'ont lu
     dossiers.<dossier>         modules qui l'ont listé
@@ -284,6 +286,12 @@ def _per_module(ensembles: dict) -> dict:
     return {k: sorted(v) for k, v in sorted(ensembles.items()) if v}
 
 
+def _module_out(infos: dict) -> dict:
+    """L148 stage 6 : `durations` (anglais) et l'ancienne `durees`, une release."""
+    return {"durations": infos["durations"], "durees": infos["durations"],
+            "echecs": infos["echecs"]}
+
+
 def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
               maintenant: datetime.datetime | None = None,
               table_durees: dict | None = None) -> dict:
@@ -344,12 +352,14 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
             sql.read_text(encoding="utf-8"))
 
     # modules : durées par pilote, échecs sous mesure (14 jours)
-    modules: dict = collections.defaultdict(lambda: {"durees": {}, "echecs": []})
+    # L148 stage 6 : la carte porte les deux graphies (`durations` et l'ancienne
+    # `durees`) pendant une release ; les lecteurs préfèrent l'anglaise.
+    modules: dict = collections.defaultdict(lambda: {"durations": {}, "echecs": []})
     for dossier in dossiers:
         for chemin in sorted(glob.glob(os.path.join(dossier, "durees*.json"))):
-            for pilote, durees in json.loads(pathlib.Path(chemin).read_text()).items():
-                for module, duree in durees.items():
-                    modules[module]["durees"][pilote] = duree
+            for pilote, par_module in json.loads(pathlib.Path(chemin).read_text()).items():
+                for module, duree in par_module.items():
+                    modules[module]["durations"][pilote] = duree
     limite = (maintenant - datetime.timedelta(days=FAILURE_DAYS)).isoformat()
     for module, infos in ((precedente or {}).get("modules") or {}).items():
         anciens = [e for e in infos.get("echecs", []) if e.get("ts", "") >= limite]
@@ -373,21 +383,24 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
         table_durees = json.loads(TABLE_DURATIONS.read_text(encoding="utf-8"))
     surcout = {}
     for pilote, reference in (table_durees or {}).items():
-        communs = [m for m in reference if pilote in modules.get(m, {}).get("durees", {})]
+        communs = [m for m in reference if pilote in modules.get(m, {}).get("durations", {})]
         base = sum(reference[m] for m in communs)
         if base > 0:
-            surcout[pilote] = round(sum(modules[m]["durees"][pilote] for m in communs) / base, 2)
+            surcout[pilote] = round(sum(modules[m]["durations"][pilote] for m in communs) / base, 2)
 
+    # L148 stage 6 : les deux graphies pendant une release, l'anglaise d'abord.
+    measure = {"parts": len(dossiers), "processus": processus,
+               "processus_sans_contexte": sans_contexte,
+               "sous_processus_sans_mesure": _per_module(sans_mesure),
+               "surcout": surcout}
     return {
         "schema": SCHEMA,
         "commit": commit,
         "genere": maintenant.isoformat(timespec="seconds"),
         "outils": {"python": platform.python_version(), "coverage": _version_coverage()},
-        "mesure": {"parts": len(dossiers), "processus": processus,
-                   "processus_sans_contexte": sans_contexte,
-                   "sous_processus_sans_mesure": _per_module(sans_mesure),
-                   "surcout": surcout},
-        "modules": {m: modules[m] for m in sorted(modules)},
+        "measure": measure,
+        "mesure": measure,
+        "modules": {m: _module_out(modules[m]) for m in sorted(modules)},
         "blocs": carte_blocs,
         "donnees": _per_module(donnees),
         "dossiers": _per_module(dossiers_lus),
@@ -414,7 +427,7 @@ def read(chemin: str) -> dict:
 def summary(carte: dict) -> str:
     """Résumé Markdown (résumé du job de la carte)."""
     blocs_ = [b for bs in carte["blocs"].values() for b in bs]
-    mesure = carte["mesure"]
+    mesure = carte.get("measure", carte.get("mesure", {}))
     lignes = [
         f"### Carte test → code ({carte['commit'][:12]})", "",
         f"* {len(carte['modules'])} modules de test, {len(carte['blocs'])} fichiers de code, "

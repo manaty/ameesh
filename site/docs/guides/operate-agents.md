@@ -35,6 +35,8 @@ has no key for it: the setting goes through `ameesh set` only.
 
 ```bash
 ameesh set <agent> model=… effort=… tier=… session_policy=… mode=execute|externe
+             lot_wake=on|off context_max_tokens=15M|0 turn_max_seconds=30m|2h|0
+             turn_mail_max=20|0 turn_grace_seconds=20m|0 mail_batch=90s|2m|0
 ```
 
 - `mode` (v1.4.0): `execute` (default) for an agent run by a runner under a
@@ -45,6 +47,14 @@ ameesh set <agent> model=… effort=… tier=… session_policy=… mode=execute
   `flex`). A harness that declares none ignores it, and `set` says so.
 - `effort` and `tier` are written in the host's local state **and** in the
   database, so `list --json` shows them whatever the host.
+- `context_max_tokens`, `turn_max_seconds` and `turn_mail_max` override the
+  host's defaults for this agent (`0` = the ceiling is off). `turn_grace_seconds`
+  and `mail_batch` also accept `0`, where it means *immediately*, not *off*:
+  `0` closes the turn's leftover background work at once, and wakes an idle
+  agent at once without a batching window; see
+  [Configuration](../reference/configuration.md#runner).
+- `lot_wake=off` stops the runner from waking this agent when an open lot of
+  its own becomes actionable (L165b).
 - Every setting takes effect at the **next turn**.
 
 ## Agent mode and stop reason
@@ -260,9 +270,9 @@ A new delegation replaces the previous one. `work list`, `work show` and
 it is made**, with its source:
 
 ```bash
-ameesh plan add "Separate accounts per organisation" --pour 2026-10-12 \
-    --projet ameesh --lot 65 --source "conversation of 2026-10-10"
-ameesh work plan 65 --debut 2026-10-10 --fin 2026-10-11 --livraison 2026-10-12
+ameesh plan add "Separate accounts per organisation" --due 2026-10-12 \
+    --project ameesh --lot 65 --source "conversation of 2026-10-10"
+ameesh work plan 65 --start 2026-10-10 --end 2026-10-11 --delivery 2026-10-12
 ```
 
 A date that only lives in a conversation or in the body of a task is neither
@@ -311,6 +321,87 @@ disk). Crossing a limit **holds new turns** (running turns finish); a critical
 crossing pauses the agents of lowest `priority` that have no running turn,
 never in the middle of a turn. See
 [Runner and leases](../concepts/runner-and-leases.md#host-resources-and-back-pressure).
+
+## Host lifecycle: drain, return and handoff
+
+```bash
+ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
+ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
+```
+
+A **drain** (L232e) durably withdraws a host: claims, turns and prompt
+consumption close while the current turn finishes, **critical agents first**.
+`undrain` returns the host; `status` reads the lifecycle state. The state is
+durable (migration 0380): an unplanned loss is recovered only after a proof
+scoped to the source, agent and lease epoch, and a host that stays `active` but
+never retakes its runner lease is not reported as a healthy restart (#477). A
+**handoff** (L232a) reserves a host move at a lot boundary and keeps a durable
+journal; `plan` reserves it (the repository is the enrolled Git remote
+identity, never inferred from a directory name), `show` reads an operation.
+
+## Budget caps and account failover
+
+```bash
+ameesh budget [show] [--last N] [--json]     # caps in force
+ameesh budget set --per-hour 20 [--per-day 40] [--agent A]
+ameesh budget unset --per-hour [--per-day] [--agent A]
+ameesh accounts list|use|auto|healthy|check
+```
+
+`ameesh budget` stores mesh caps in the database, reloaded live: an hourly cap
+on pay-per-token spend (guard 0019) and a sliding 24 h cap (L70). A database cap
+wins over `AMEESH_BUDGET_USD_PER_HOUR` / `_PER_DAY`; a subscription agent is
+never paused by it (L95). `ameesh accounts` shows the declared accounts, the
+active one, plan gauges and the switches: `use` forces an account, `auto` hands
+back to the automatic choice (decision 0034), `healthy` lifts an `auth_blocked`
+declared by the sentinel, and `check` probes every credential of the host
+(L226a). Credentials are read before the probe and health before all probes
+(L226c); a forced account never erases a concurrent human force (L226d).
+Critical agents switch account on their own, then fall back to Codex, then
+DeepSeek, and come back (L242b).
+
+## Heavy suites, the guard and the lending VM
+
+```bash
+ameesh heavy [--nice N] [--max-duration 90m] -- <command…> | --status [--json]
+ameesh guard check|run|drain
+ameesh offload run [--host H] [--profile P] [--fallback local|none] -- <command…>
+ameesh offload status [<job>] | cancel <job>
+```
+
+`ameesh heavy` runs a suite in one of the host's capped slots (`--status` lists
+the slots and their holders; slots go to whoever takes them first — no agent
+role has priority). The command runs under `nice` (default 10), so the runner
+and the orchestrator's short turns stay responsive.
+`--max-duration` caps the command (default `AMEESH_HEAVY_MAX_S`, then
+`heavy_max_seconds`, then 60 minutes; `0` = none): a message, then
+SIGTERM/SIGKILL, exit 124. A test suite a turn launches outside `ameesh heavy`
+gets the same cap, recognised on its argv and stopped through pidfd handles
+only (#453). `ameesh guard` is the capacity guard of a lending VM (L159e):
+`check` prints one measure, the decision and the state, `run` is the loop
+(offer, levels 0–4, enforcement, drain and stop), `drain` asks the running
+guard for a drain. `ameesh offload` runs a heavy command on the lending VM over
+SSH (L159b): a snapshot of the working tree travels as a thin pack (no history,
+the agent's index and refs do not move), the command runs in a throwaway
+checkout, and output and exit code come back unchanged. Without a reachable VM
+before the job starts, `--fallback local` (the default) runs it here.
+
+## Housekeeping and shared dependencies
+
+```bash
+ameesh housekeeping [--dry-run | --apply] [--by BY] [--json]   # ex menage (L73)
+ameesh deps link|local|unlink|status|entries                   # node_modules (L231)
+ameesh fil expire [--days N] [--dry-run]                       # thread retention (L361)
+```
+
+`housekeeping` (L148 renamed `menage`; the French spelling stays a hidden
+alias) frees the build output of idle worktrees and removes merged kept
+worktrees after 24 h (L230); `--apply` is reserved to a human or the runner,
+never an agent session. `deps` gives one `node_modules` per lockfile and per
+host, sealed read-only, and `local` (alias `unlink`) restores a local install
+before packaging (L231). `fil expire` applies the readable-thread retention
+(L361); the runner also runs it daily. See
+[Readable threads](../concepts/threads.md#retention).
 
 ## Fresh session on a brief: `ameesh restart`
 

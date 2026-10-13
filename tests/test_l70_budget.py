@@ -11,10 +11,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import tempfile
+import time
+import types
 import unittest
 from unittest import mock
 
 from ameesh import budget, cost, registry, storage
+from ameesh import db as db_mod
 from ameesh.config import CHANNEL_BUDGET, Config
 from ameesh.runner import AgentWorker, Runner
 
@@ -170,6 +174,26 @@ class BudgetBaseTest(PgTestCase):
             abo.close()
             autre.close()
 
+    def test_notify_immediat_apres_abonnement(self):
+        """#681 : un NOTIFY émis dès le retour de l'abonnement ne doit pas être
+        perdu. Le pilote psql exécute les LISTEN de façon asynchrone :
+        `subscribe` attend donc la sonde qui prouve qu'ils sont actifs."""
+        abo = storage.of(self.db).wakeups.subscribe([CHANNEL_BUDGET])
+        if abo is None:
+            self.skipTest("LISTEN/NOTIFY indisponible avec ce pilote")
+        autre = self.connect()
+        try:
+            storage.of(autre).budgets.put("", 3600, 12.0, actor="human:t")
+        finally:
+            autre.close()
+        try:
+            item = abo.wait(timeout=3.0)
+            self.assertIsNotNone(item, "réveil ameesh_budget perdu (course LISTEN/NOTIFY)")
+            self.assertEqual(item.get("channel"), CHANNEL_BUDGET)
+            self.assertEqual(json.loads(item["payload"])["window_s"], 3600)
+        finally:
+            abo.close()
+
     # -- exécuteur : relecture à chaud -------------------------------------
     def _worker(self, name: str = "b70", plafond: float = 100.0):
         cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=plafond,
@@ -282,6 +306,79 @@ class BudgetBaseTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("budget", "set", "--per-day", "3", env=env)   # mesh : non
         self.assertEqual(proc.returncode, 1)
+
+
+class PsqlReadyProbeTest(unittest.TestCase):
+    """#681 : le pilote psql n'annonce l'abonnement qu'une fois les LISTEN
+    actifs. Un faux psql lent répond à la sonde d'activation après un délai ;
+    sans base, seul le processus est simulé. Sans l'attente, l'abonnement
+    rendrait la main aussitôt et un NOTIFY émis juste après serait perdu."""
+
+    CHANNELS = ("ameesh_budget", "ameesh_wake")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.trace = os.path.join(self.tmp.name, "trace")
+        self.stub = os.path.join(self.tmp.name, "psql")
+        with open(self.stub, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                "# faux psql : note les instructions lues, répond à la sonde\n"
+                'while IFS= read -r line; do\n'
+                '  printf "%s\\n" "$line" >> "$FAKE_PSQL_TRACE"\n'
+                '  case "$line" in\n'
+                "    '\\q') exit 0 ;;\n"
+                '    *__ameesh_listener_ready__*)\n'
+                '      sleep "$FAKE_PSQL_DELAY"\n'
+                '      if [ -n "$FAKE_PSQL_READY" ]; then\n'
+                '        printf "%s\\n" "$FAKE_PSQL_READY"\n'
+                '      fi ;;\n'
+                '  esac\n'
+                'done\n')
+        os.chmod(self.stub, 0o755)
+
+    def _driver(self, ready, delay="0"):
+        env = dict(os.environ, FAKE_PSQL_TRACE=self.trace, FAKE_PSQL_DELAY=delay,
+                   FAKE_PSQL_READY=ready)
+        return types.SimpleNamespace(_interactive_args=[self.stub], env=env, _bootstrap="")
+
+    def _ready_line(self, channels):
+        return (db_mod._PsqlListener.READY_PREFIX
+                + db_mod._PsqlListener.READY_SEP.join(channels))
+
+    def test_sonde_attendue_avant_de_rendre_la_main(self):
+        start = time.monotonic()
+        listener = db_mod._PsqlListener(
+            self._driver(self._ready_line(self.CHANNELS), delay="0.5"),
+            list(self.CHANNELS))
+        elapsed = time.monotonic() - start
+        try:
+            self.assertGreaterEqual(elapsed, 0.35,
+                                    "l'abonnement a rendu la main avant la sonde")
+            self.assertTrue(listener._ready.is_set())
+            self.assertEqual(tuple(listener._ready_channels), self.CHANNELS)
+        finally:
+            listener.close()
+        with open(self.trace, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        probe = next(i for i, line in enumerate(lines) if "__ameesh_listener_ready__" in line)
+        for channel in self.CHANNELS:
+            listens = [i for i, line in enumerate(lines)
+                       if line.startswith("LISTEN") and channel in line]
+            self.assertTrue(listens and listens[0] < probe,
+                            "LISTEN %s n'a pas précédé la sonde" % channel)
+
+    def test_sonde_partielle_rend_unavailable(self):
+        with mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 0.5):
+            with self.assertRaises(db_mod.Unavailable):
+                db_mod._PsqlListener(self._driver(self._ready_line(self.CHANNELS[:1])),
+                                     list(self.CHANNELS))
+
+    def test_sonde_muette_rend_unavailable(self):
+        with mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 0.5):
+            with self.assertRaises(db_mod.Unavailable):
+                db_mod._PsqlListener(self._driver(""), list(self.CHANNELS))
 
 
 if __name__ == "__main__":

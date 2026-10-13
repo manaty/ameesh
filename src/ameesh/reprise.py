@@ -54,6 +54,33 @@ FIL_MAX_BYTES = 8000
 FIL_ENTRY_CHARS = 400
 LOTS_MAX = 40
 
+#: #538 : part qu'un texte accompagné de règles garde au plus du plafond. Le
+#: bloc de règles est réservé D'ABORD, le texte (résumé, brief préparé) est
+#: tronqué ensuite — jamais l'inverse, sinon un résumé plein fait disparaître
+#: les règles (verdict codex #510 r3, P2) ; mais les règles ne l'effacent pas
+#: pour autant : le texte plus court que cette part reste entier.
+BRIEF_TEXT_MIN_BYTES = BRIEF_MAX_BYTES // 4
+
+#: #538 : les règles de travail des fiches Process du canon ouvrent le brief
+#: (nouvelle session, rotation, reprise), avant le rôle et la consigne.
+PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
+
+#: #538 : pied du bloc de règles. Il marque la FIN du bloc : un brief préparé à
+#: l'avance (rotation, reprise) se laisse ainsi RELIRE au lancement, et une
+#: fiche retirée entre-temps ne reste pas dans le brief (verdict codex #510 r2, P2).
+PROCESS_RULES_FOOTER = "<!-- end of the canon Process rules -->"
+
+#: #538 : constats de lecture qui privent le canon de ses fiches. `readable`
+#: reste vrai quand la lecture des fiches échoue (`canon-git-error`) : le brief
+#: dit alors les règles indisponibles, jamais un silence trompeur.
+PROCESS_RULES_READ_ERRORS = ("canon-git-error", "canon-io-error",
+                             "canon-bundle-missing")
+
+#: #538 : canon configuré mais illisible (ou fiches illisibles) : le brief le
+#: dit, jamais silencieusement.
+PROCESS_RULES_UNAVAILABLE = ("(working rules unavailable: the agent's canon is "
+                             "not readable)")
+
 
 class RepriseError(ValueError):
     """Refus d'adoption ou de reprise : le message dit pourquoi et quoi faire."""
@@ -250,11 +277,169 @@ def _octets(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+#: #538 : marque de troncature ; sa place est comprise dans la borne de `_clip`.
+_CLIP_MARK = " […]"
+
+
 def _clip(text: str, limit: int) -> str:
+    """`text` borné à `limit` octets UTF-8, marque de troncature comprise."""
     data = text.encode("utf-8")
     if len(data) <= limit:
         return text
-    return data[: max(0, limit - 4)].decode("utf-8", "ignore") + " […]"
+    marge = len(_CLIP_MARK.encode("utf-8"))
+    if limit <= marge:
+        return data[: max(0, limit)].decode("utf-8", "ignore")
+    return data[: limit - marge].decode("utf-8", "ignore") + _CLIP_MARK
+
+
+def _rules_unreadable(charge) -> bool:
+    """#538 : ce canon ne peut pas fournir ses règles.
+
+    `readable` ne suffit pas : une erreur de lecture des fiches
+    (`canon-git-error`) le laisse vrai alors qu'aucune fiche n'est chargée —
+    l'absence de règles est alors DITE, jamais silencieuse (verdict codex
+    #510 r2, P3)."""
+    from . import canon as canon_mod
+    if not getattr(charge, "readable", False):
+        return True
+    return any(f.severity == canon_mod.ERROR and f.code in PROCESS_RULES_READ_ERRORS
+               for f in (getattr(charge, "load_findings", ()) or ()))
+
+
+def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
+                   host: str = "") -> str:
+    """#538 : le texte des fiches Process du canon DE L'AGENT, prêt pour un brief.
+
+    Le canon est celui qui **possède la ligne du registre** de l'agent
+    (`canon_id`, la colonne `canon` ; NULL = canon par défaut), comme le rôle
+    (`_role`) : un homonyme déclaré par un autre canon configuré ne fournit
+    jamais ses règles (L42/L43, isolation ; verdict codex #510 r2, P1). Le canon
+    doit être **approuvé** (lu depuis git, pas l'arbre de travail) et **validé
+    pour son hôte** (`canon sync` : ni erreur globale, ni erreur de sa fiche
+    Host) ; une fiche invalide n'est jamais injectée. Un canon illisible, ou
+    dont la lecture des fiches a échoué, est dit, pas tu."""
+    if not getattr(cfg, "canon", None):
+        return ""
+    try:
+        from . import canon as canon_mod
+        canons = canon_mod.load_configured(cfg)
+        # L42 (0031) : seules les lignes de CE canon ; le canon par défaut tient
+        # les lignes historiques (colonne `canon` NULL).
+        owns = [c for c in canons if c.owns(canon_id)]
+        charge = next((c for c in owns if agent and c.agent(agent) is not None), None)
+        if charge is None:
+            return PROCESS_RULES_UNAVAILABLE if any(_rules_unreadable(c) for c in owns) else ""
+        if _rules_unreadable(charge):
+            return PROCESS_RULES_UNAVAILABLE
+        if charge.untrusted:
+            return ""
+        from . import canon_sync
+        if canon_sync.assess(charge, host)[0] != canon_sync.CANON_OK:
+            return ""
+    except Exception:
+        return ""
+    blocs = []
+    for process in getattr(charge, "processes", ()) or ():
+        if not process.valid:
+            continue
+        entete = ["### %s" % process.title,
+                  "- responsible: %s" % process.responsible,
+                  "- updated: %s" % process.updated]
+        if process.expire:
+            entete.append("- expire: %s" % process.expire)
+        corps = (process.body or "").strip()
+        blocs.append("\n".join(entete) + ("\n\n" + corps if corps else ""))
+    return "\n\n".join(blocs).strip()
+
+
+def _clip_rules(rules: str, place: int) -> str:
+    """Les règles coupées pour occuper `place` octets au plus (marque comprise)."""
+    return _clip(rules, place) if _octets(rules) > place else rules
+
+
+def _rules_bloc(rules: str, limit: int) -> str:
+    """#538 : le bloc de règles (en-tête, règles, pied) borné à `limit` octets,
+    ou "" quand l'en-tête et le pied n'y tiennent déjà pas."""
+    entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
+    place = limit - _octets(entete) - _octets(pied)
+    if place <= 6:
+        return ""
+    return entete + _clip_rules(rules, place) + pied
+
+
+def process_rules_block(cfg: Config, *, agent: str = "", canon_id: str | None = None,
+                        host: str = "", limit: int = BRIEF_MAX_BYTES) -> str:
+    """#538 : le bloc de règles prêt à ouvrir une session neuve, ou "".
+
+    Le bloc entier (en-tête, règles, pied) tient dans `limit` octets : une
+    première session ne part jamais avec un préfixe non borné (verdict codex
+    #510 r2, P2). Ne lève jamais : une erreur de mise en forme laisse l'appelant
+    sans règles plutôt que d'interrompre l'ouverture de session (revue codex
+    #510 r1, P1)."""
+    try:
+        rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
+    except Exception:
+        return ""
+    return _rules_bloc(rules, limit) if rules else ""
+
+
+def _join_without_rules(avant: str, apres: str) -> str:
+    """Deux morceaux de texte recollés après retrait d'un bloc de règles."""
+    avant, apres = avant.rstrip("\n"), apres.lstrip("\n")
+    return avant + "\n\n" + apres if avant and apres else avant + apres
+
+
+def _strip_process_rules(text: str) -> str:
+    """#538 : le texte sans AUCUN bloc de règles déjà posé (`text` peut l'avoir
+    en tête, après une note d'ameesh, ou en porter plusieurs).
+
+    Un bloc délimité par le pied est retiré en entier. Un en-tête sans pied est
+    un bloc indélimitable : un texte forgé peut s'y faire passer pour les règles
+    du canon, il est donc retiré lui aussi (verdict codex #510 r3, P2) — jusqu'à
+    la prochaine section de premier niveau (`\\n## `) ou la fin, pour ne pas
+    emporter la consigne qui suit."""
+    out = text
+    while True:
+        debut = out.find(PROCESS_RULES_HEADER)
+        if debut < 0:
+            return out
+        fin = out.find(PROCESS_RULES_FOOTER, debut)
+        if fin >= 0:
+            coupe = fin + len(PROCESS_RULES_FOOTER)
+            out = _join_without_rules(out[:debut], out[coupe:])
+            continue
+        suite = out.find("\n## ", debut + len(PROCESS_RULES_HEADER))
+        out = _join_without_rules(out[:debut], out[suite:] if suite >= 0 else "")
+
+
+def with_process_rules(cfg: Config, text: str, *, agent: str = "",
+                       canon_id: str | None = None, host: str = "") -> str:
+    """#538 : ouvre `text` sur les règles du canon de `agent`, sans doubler ni
+    couper la consigne. Un bloc déjà posé est RELU (une fiche retirée ne reste
+    pas dans un brief préparé).
+
+    La place du bloc est réservée D'ABORD : le texte (résumé de rotation, brief
+    préparé) prend ce qui reste et se laisse tronquer, jamais les règles — un
+    résumé plein ne fait plus disparaître les règles en silence (verdict codex
+    #510 r3, P2). Le texte garde au plus `BRIEF_TEXT_MIN_BYTES` : les règles ne
+    l'effacent pas, la consigne d'un brief court reste entière.
+
+    Ne lève jamais (revue codex #510 r1, P1)."""
+    try:
+        corps = _strip_process_rules(text)
+        rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
+        if not rules:
+            return corps
+        garde = min(_octets(corps), BRIEF_TEXT_MIN_BYTES)
+        bloc = _rules_bloc(rules, BRIEF_MAX_BYTES - 2 - garde)
+        if not bloc:
+            return corps
+        reste = BRIEF_MAX_BYTES - _octets(bloc) - 2
+        if _octets(corps) > reste:
+            corps = _clip(corps, reste)
+        return bloc + "\n\n" + corps if corps else bloc
+    except Exception:
+        return text
 
 
 def _role(cfg: Config, name: str) -> list[str]:
@@ -405,7 +590,9 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
         fil_sec.append(line)
     text = "\n".join(head + ident + [""] + lots_sec + fil_sec + [""] + courrier + [""]
                      + ancienne + fin)
-    return _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES)
+    return with_process_rules(cfg, _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES),
+                              agent=name, canon_id=row.get("canon"),
+                              host=row.get("host") or "")
 
 
 # --------------------------------------------------------------------------

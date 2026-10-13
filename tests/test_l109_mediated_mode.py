@@ -131,7 +131,9 @@ class GardesTest(MedieBase):
         # L112 dans L109 : la porte relayée au serveur est celle du contrôleur
         runner.host_gate.gate = mock.Mock(state=lambda: gate.GateState("draining", 3))
         self.responder.script["leases.reap"] = []
-        runner.sweep()
+        with mock.patch.object(runner, "_note_gate_wait") as note:
+            runner.sweep()
+        note.assert_called_once_with("host gate: " + runner.host_gate.describe())
         self.assertNotIn("agents.claimable", self.transport.ops())
         self.assertNotIn("leases.claim", self.transport.ops())
 
@@ -393,6 +395,12 @@ class SessionTest(unittest.TestCase):
         self.responder.script["mailbox.send"] = {
             "id": 813, "created_ts": 1791640000.12, "sender_project": "site",
             "recipient_project": "site"}
+        # #515 : le fil d'un message lié à un lot suit le projet du lot ; la
+        # session lit ce projet par `work.get` (lecture bornée du contrat 1.1),
+        # après le dépôt et avant l'indexation du fil. Le lot scripté porte un
+        # projet autre que celui de l'expéditeur : c'est bien celui du lot qui
+        # range le message.
+        self.responder.script["work.get"] = {"id": 812, "app": "canon"}
         self.responder.script["threads.index"] = None
         code, out, err = self.ameesh("mail", "send", "coord", "PR prête pour relecture.",
                                      "--lot", "812")
@@ -400,13 +408,36 @@ class SessionTest(unittest.TestCase):
         self.assertIn("coord", out)
         # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
         self.assertEqual(self.server.ops(), ["leases.state", "agents.overview",
-                                             "mailbox.send", "threads.index"])
+                                             "mailbox.send", "work.get", "threads.index"])
         index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
         self.assertEqual(index["body"]["kwargs"]["author"], "agent:inge-front")
+        self.assertEqual(index["body"]["kwargs"]["project"], "canon")
+        self.assertEqual(index["body"]["kwargs"]["lot"], "812")
         self.assertEqual(index["body"]["fence"]["epoch"], 42)
         req = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.send"][-1]
         self.assertEqual(req["body"]["args"][:2], ["inge-front", "coord"])
         self.assertTrue(req["headers"].get(C.IDEMPOTENCY_HEADER))
+        self.assert_session_only()
+
+    def test_mail_send_lot_d_un_autre_projet_retombe_sur_l_expediteur(self):
+        # #515 : `work.get` est borné, sous jeton de session, au lot de l'agent
+        # (le sien, un lot qui lui est délégué, ou le projet de son équipe) ;
+        # le lot d'un autre projet se lit `null` — le fil garde alors la règle
+        # historique (projet de l'expéditeur), sans échouer ni perdre le
+        # message.
+        self.responder.script["mailbox.send"] = {
+            "id": 814, "created_ts": 1791640000.12, "sender_project": "site",
+            "recipient_project": "canon"}
+        self.responder.script["work.get"] = None
+        self.responder.script["threads.index"] = None
+        code, out, err = self.ameesh("mail", "send", "coord", "Lot d'un autre projet.",
+                                     "--lot", "900")
+        self.assertEqual(code, 0, err)
+        self.assertIn("coord", out)
+        self.assertIn("work.get", self.server.ops())
+        index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
+        self.assertEqual(index["body"]["kwargs"]["project"], "site")
+        self.assertEqual(index["body"]["kwargs"]["lot"], "900")
         self.assert_session_only()
 
     def test_new_work_item_refused_before_mail_is_sent(self):

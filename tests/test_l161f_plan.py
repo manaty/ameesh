@@ -638,7 +638,7 @@ class ProvisionalGreenTest(unittest.TestCase):
         d = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d)
         flux = parts.Flow(d / "flux.jsonl", {"part": "psycopg 1/1"})
-        cls = type("_R", (parts._Result,), {"flux": flux, "classes": {},
+        cls = type("_R", (parts._Result,), {"flow": flux, "classes": {},
                                               "impactes": impacted})
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(c)
                                    for c in cases)

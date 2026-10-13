@@ -115,7 +115,7 @@ class FluxTest(unittest.TestCase):
         chemin = pathlib.Path(tempfile.mkdtemp()) / "flux.jsonl"
         flux = parts.Flow(chemin, {"depot": "manaty/ameesh", "part": "psql 1/1"})
         classes = {__name__.rsplit(".", 1)[-1]: ("P1", "src/ameesh/x.py")}
-        cls = type("_R", (parts._Result,), {"flux": flux, "classes": classes})
+        cls = type("_R", (parts._Result,), {"flow": flux, "classes": classes})
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(c)
                                    for c in classes_de_test)
         unittest.TextTestRunner(stream=io.StringIO(), resultclass=cls).run(suite)
