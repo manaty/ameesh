@@ -1176,8 +1176,14 @@ class AgentWorker(threading.Thread):
             return False
         if self.session_turns < self.runner.session_min_turns:
             return False
+        # #706 : la latence d'un tour autorisé ne suffit pas à oublier la
+        # session. Le plancher suit aussi un plafond propre à l'agent ; le
+        # facteur 2 laisse une marge pour atteindre le point sûr après la
+        # borne du tour. Sans plafond, garder le seuil de latence configuré.
+        latency_threshold = max(self.runner.session_max_turn_seconds,
+                                2 * self.turn_max_seconds())
         return (self.session_tokens >= self.runner.session_max_tokens
-                or self.last_turn_seconds >= self.runner.session_max_turn_seconds)
+                or self.last_turn_seconds >= latency_threshold)
 
     def context_max_tokens(self) -> int:
         """Plafond de contexte effectif (L60) : réglage de l'agent
