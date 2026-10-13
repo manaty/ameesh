@@ -274,19 +274,102 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         db.close()
 
 
+def _print_hold(hold: dict | None) -> None:
+    if hold:
+        print("  ON HOLD    until %s, by %s: %s (alerts about its agents muted; "
+              "ameesh hosts %s --release)" % (
+                  time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hold["until_ts"]))),
+                  hold["author"], hold["reason"], hold["host"]))
+
+
+def _host_hold(cfg: Config, args: argparse.Namespace) -> int:
+    """#254 : `ameesh hosts HOST --hold --until … --reason …` / `--release`."""
+    from . import host_holds
+
+    if not args.host:
+        print("ameesh hosts: --hold and --release name a host", file=sys.stderr)
+        return 2
+    if args.hold and args.release:
+        print("ameesh hosts: --hold or --release, not both", file=sys.stderr)
+        return 2
+    if args.hold:
+        if not args.until or not (args.reason or "").strip():
+            print("ameesh hosts: --hold needs --until (a hold always ends) and --reason",
+                  file=sys.stderr)
+            return 2
+        try:
+            seconds, until_ts = host_holds.parse_until(args.until)
+        except host_holds.HoldError as exc:
+            print("ameesh hosts: %s" % exc, file=sys.stderr)
+            return 2
+    db = _open(cfg)
+    try:
+        # as for `work set-app`: a human, an orchestrator or a design agent
+        try:
+            author = work.corrector(cfg, db, args.actor)
+        except work.WorkError as exc:
+            print("ameesh hosts: %s" % str(exc).replace("correction refused",
+                                                        "hold refused").replace(
+                      "correction: say who corrects", "hold: say who holds"),
+                  file=sys.stderr)
+            return 1
+        hosts = storage.of(db).hosts
+        if args.hold:
+            if not host_holds.known(cfg, db, args.host):
+                print("ameesh hosts: %s is neither a Host of the canon nor a host of the "
+                      "registry" % args.host, file=sys.stderr)
+                return 1
+            # the bounds are the database's (its clock, not the caller's)
+            hold = hosts.hold(args.host, seconds=seconds, until_ts=until_ts,
+                              reason=args.reason.strip(), author=author)
+            if hold is None:
+                print("ameesh hosts: %s" % (
+                    host_holds.TOO_LONG if seconds is not None else
+                    "--until: %s is past, or more than %d h ahead (database time)"
+                    % (args.until.strip(), host_holds.MAX_HOLD_S // 3600)), file=sys.stderr)
+                return 2
+            text = "host %s on hold until %s: %s — alerts about its agents muted, no new " \
+                "work placed there" % (
+                    args.host, time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(float(hold["until_ts"]))),
+                    hold["reason"])
+            if args.json:
+                print(json.dumps(dict(hold, action="hold"), ensure_ascii=False))
+        else:
+            if not hosts.release(args.host, author=author):
+                print("ameesh hosts: %s is not on hold" % args.host, file=sys.stderr)
+                return 1
+            text = "host %s: hold lifted — its alerts are back" % args.host
+            if args.json:
+                print(json.dumps({"host": args.host, "action": "release"}))
+        if not args.json:
+            print(text)
+        # the history is `host_hold_events` (same transaction); the project
+        # thread keeps a readable copy, and its loss is said
+        if fil.record(cfg, db, sender=author, recipients=(), text=text) is None:
+            print("ameesh hosts: done and kept in host_hold_events, but not written "
+                  "to the project thread", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        db.close()
+
+
 def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list[dict]:
     """What `ameesh hosts` shows of each host (all, or `only`), by name."""
     from . import canon as canon_mod
+    from . import host_holds
     from . import menage as menage_mod
     from . import placement as placement_mod
     from . import resources as res
 
+    holds = host_holds.live(db)
     latest_by_host = {row["host"]: row for row in res.current(db)}
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping
     measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
-    names = set(latest_by_host) | set(measure_by_host)
+    names = set(latest_by_host) | set(measure_by_host) | set(holds)
     for canon in canons:
         names |= {h.title for h in canon.hosts}
     if only:
@@ -310,6 +393,8 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
             "history": res.history(db, name, history),
             "menage": _host_menage(hk, name, menage_mod.effective(canons, name),
                                    measure_by_host.get(name), latest),
+            # #254: the owner's hold on the host, if any
+            "hold": holds.get(name),
         })
     return parts
 
@@ -344,6 +429,7 @@ def _host_json(part: dict) -> dict:
         "unmeasured": res.unmeasured(latest),
         "history": part["history"],
         "housekeeping": part["menage"],
+        "hold": part["hold"],
     }
 
 
@@ -369,6 +455,11 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     from . import canon as canon_mod
     from . import resources as res
 
+    if args.hold or args.release:
+        return _host_hold(cfg, args)
+    if args.until or args.reason:
+        print("ameesh hosts: --until and --reason go with --hold", file=sys.stderr)
+        return 2
     db = _open(cfg)
     try:
         # L42 (0031) : les fiches Host de tous les canons configurés (le canon
@@ -396,11 +487,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 else "host without a Host card" if host is None else "responsible unknown"
             if latest is None:
                 print("%s — %s; no published measurement" % (name, resp))
+                _print_hold(part["hold"])
                 _print_host_fiches(fiches, physical, admissions, many=many)
                 _print_host_menage(menage)
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s; measured %s" % (name, resp, age))
+            _print_hold(part["hold"])
             _print_host_fiches(fiches, physical, admissions, many=many)
 
             def tag(key: str) -> str:
@@ -735,6 +828,22 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
 # clés
 # --------------------------------------------------------------------------
 
+def _note_owner_key(db: Db, result: dict) -> None:
+    """Une clé owner d'humain vient d'être enregistrée (#326 r1) : son chat
+    (`chat-<id>`, s'il existe) en reçoit la note, que le geste vienne du
+    propriétaire ou non ; `ameesh alerts` lève aussi `owner_key_registered`."""
+    chat = "chat-" + result["agent"]
+    if not storage.of(db).agents.get(chat):
+        return
+    mail.send(db, work.SYSTEM_SENDER, chat,
+              "An owner key was %s for %s: fingerprint %s. If this was not your "
+              "gesture, revoke it at once (ameesh key revoke %s) and register "
+              "yours with the owner's database role (key register --human %s "
+              "--replace)." % (result.get("status") or "registered", result["human"],
+                               result["fingerprint"], result["agent"], result["agent"]),
+              kind="event")
+
+
 def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -751,18 +860,49 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             print("private key: %s (0600 — keep it offline, never commit it)" % private_path)
             print("public key : %s" % public_path)
             print("fingerprint: %s" % fingerprint)
-            print("register it: agent-mesh key register <agent> --public-key %s" % public_path)
+            print("register it: ameesh key register --human %s --public-key %s --role owner"
+                  % (args.name, public_path))
             return 0
         if args.key_command == "register":
+            if bool(args.agent) == bool(args.human):
+                print(USAGE_HINT % "key register: give an agent, or --human <id> "
+                      "for a human's key (the owner's)", file=sys.stderr)
+                return 2
+            if args.replace and not args.human:
+                print(USAGE_HINT % "key register --replace: only with --human <id>",
+                      file=sys.stderr)
+                return 2
             public = signing.read_public(os.path.expanduser(args.public_key))
-            result = authority.register_key(
-                db, args.agent, public, role=args.role, note=args.note)
-            print("key of %s registered: %s (role %s)" % (
-                result["agent"], result["fingerprint"], result["role"]))
+            try:
+                if args.human:
+                    result = authority.register_human_key(
+                        db, args.human, public, role=args.role, replace=args.replace)
+                else:
+                    result = authority.register_key(
+                        db, args.agent, public, role=args.role, note=args.note)
+            except authority.AuthorityError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
+            print("key of %s %s: %s (role %s)%s" % (
+                result["agent"], "replaced" if result.get("status") == "replaced"
+                else "registered", result["fingerprint"], result["role"],
+                " — %s, key holder only (no agent)" % result["human"]
+                if result.get("human") else ""))
             if result["role"] == "owner":
                 print("warning: this key carries the owner's authority for %s; "
                       "its private key must exist only with the owner."
                       % result["agent"])
+                if result.get("human"):
+                    _note_owner_key(db, result)
+            return 0
+        if args.key_command == "confirm":
+            try:
+                event = authority.confirm_key(db, args.agent)
+            except authority.AuthorityError as exc:
+                print("refused: %s" % exc, file=sys.stderr)
+                return 1
+            print("key of %s confirmed by the owner (event %d): its owner_key_registered "
+                  "alerts end" % (args.agent, event))
             return 0
         if args.key_command == "revoke":
             if not authority.revoke_key(db, args.agent):
@@ -778,7 +918,8 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(info, ensure_ascii=False, indent=2))
                 return 0
-            print("agent      : %s" % info["name"])
+            print("%-11s: %s" % ("human" if info.get("holder") == "human" else "agent",
+                                   info["name"]))
             print("fingerprint: %s" % info.get("public_key_fingerprint"))
             print("role       : %s%s" % (
                 info.get("key_role") or "agent",
@@ -798,8 +939,8 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 print("no key registered")
                 return 0
             for row in rows:
-                print("%-20s %-8s %s  %s" % (
-                    row["name"], row.get("key_role") or "agent",
+                print("%-20s %-6s %-8s %s  %s" % (
+                    row["name"], row.get("holder") or "agent", row.get("key_role") or "agent",
                     row["public_key_fingerprint"],
                     "revoked %s" % _fmt_moment(row["key_revoked_ts"])
                     if row.get("key_revoked_ts") else "registered %s"
@@ -1080,47 +1221,55 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 
 def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import plan
-    item = work.get(db, lot_id)
-    if item is None:
-        return None
-    item["events"] = work.events(db, lot_id)
-    item["milestones"] = work.milestones(db, lot_id)
-    from .modules.storage import ModuleStore
-    item["module_milestones"] = ModuleStore(db).milestones(lot_id)
-    item["delays"] = work.timeline(db, lot_id)
-    plan.annotate(db, [item])
-    # L96 : dates prévues (feuille de route)
-    planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
-    item["planned"] = {k: planned.get("planned_" + k)
-                       for k in ("start", "end", "delivery", "source", "by")}
-    # L157 : durée estimée, réel mesuré, écart ; historique des estimations
-    from . import estimates
-    item["estimate"] = estimates.view(
-        item, merged_ts=(item["delays"] or {}).get("merged_ts"))
-    item["estimates"] = storage.of(db).work.estimates(lot_id)
-    # L157b : estimation de référence (lecture de la table publiée)
-    item["estimate_reference"] = estimates.proposal(
-        db, type=item.get("type"), size=item.get("change_size"),
-        assignee=item.get("assignee"))
-    # L160d : résolutions préparées où le lot est l'un des deux côtés
-    from . import resolutions
-    item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
-    if error:  # e.g. a database without migration 0057
-        item["resolutions_error"] = error
-    # L160e : place du lot dans la file de fusion de sa cible
-    try:
-        item["queue"] = next((r for r in storage.of(db).work.queue()
-                              if int(r["work_item_id"]) == lot_id), None)
-    except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
-        item["queue"] = None
-    # L157c: actual time by phase and merged diff size, once delivered
-    from . import lot_measures
-    item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
-    # L317c: the auditor's automatic deep analysis and its measured delay
-    from . import deep_analysis
-    item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
-    return item
+    from . import canon as canon_mod, plan
+
+    def lire(db):
+        item = work.get(db, lot_id)
+        if item is None:
+            return None
+        item["events"] = work.events(db, lot_id)
+        item["milestones"] = work.milestones(db, lot_id)
+        from .modules.storage import ModuleStore
+        item["module_milestones"] = ModuleStore(db).milestones(lot_id)
+        item["delays"] = work.timeline(db, lot_id)
+        plan.annotate(db, [item])
+        # L96 : dates prévues (feuille de route)
+        planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
+        item["planned"] = {k: planned.get("planned_" + k)
+                           for k in ("start", "end", "delivery", "source", "by")}
+        # L157 : durée estimée, réel mesuré, écart ; historique des estimations
+        from . import estimates
+        item["estimate"] = estimates.view(
+            item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+        item["estimates"] = storage.of(db).work.estimates(lot_id)
+        # L157b : estimation de référence (lecture de la table publiée)
+        item["estimate_reference"] = estimates.proposal(
+            db, type=item.get("type"), size=item.get("change_size"),
+            assignee=item.get("assignee"))
+        # L160d : résolutions préparées où le lot est l'un des deux côtés
+        from . import resolutions
+        item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
+        if error:  # e.g. a database without migration 0057
+            item["resolutions_error"] = error
+        # L160e : place du lot dans la file de fusion de sa cible
+        try:
+            item["queue"] = next((r for r in storage.of(db).work.queue()
+                                  if int(r["work_item_id"]) == lot_id), None)
+        except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
+            item["queue"] = None
+        # L157c: actual time by phase and merged diff size, once delivered
+        from . import lot_measures
+        item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
+        # L317c: the auditor's automatic deep analysis and its measured delay
+        from . import deep_analysis
+        item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
+        return item
+
+    # L61/L521: the detail's independent reads travel together (one query per
+    # section before: 23 round trips, ~7 s from a laptop), and the canon read
+    # by the sub-calls is read once per command, not once per dry pass.
+    with canon_mod.configured_cache():
+        return db_mod.batched(db, lire)
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
@@ -1157,7 +1306,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import identity, work_projects
             binding = identity.resolve_binding(cfg, db)
             creator = binding.name if binding.ok else args.actor
-            args.app = work_projects.creation_project(cfg, db, creator, args.app)
+            if args.new_project and args.app is None:
+                raise work.WorkError("--new-project goes with --app <project>")
+            args.app = work_projects.creation_project(cfg, db, creator, args.app,
+                                                      new_project=args.new_project)
+            # #506: read before the lot exists (it makes its project known)
+            introduced = (work_projects.introduction(cfg, db, args.app, creator)
+                          if args.new_project and args.app else "")
             minutes = estimates.parse(args.estimate) if args.estimate else None
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
@@ -1168,7 +1323,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
-                estimate=minutes, estimate_source=args.estimate_source, size=args.size)
+                estimate=minutes, estimate_source=args.estimate_source, size=args.size,
+                note=introduced)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -1988,6 +2144,16 @@ def build_parser() -> argparse.ArgumentParser:
                               "turns, lendable capacity, per day (L159g)")
     p_hosts.add_argument("--days", type=float, default=7.0,
                          help="window of --report, in days (default 7)")
+    p_hosts.add_argument("--hold", action="store_true",
+                         help="hold HOST on purpose (#254): alerts and nudges about its "
+                              "agents stay quiet until --until (required, 24 h at most)")
+    p_hosts.add_argument("--release", action="store_true", help="lift the hold of HOST")
+    p_hosts.add_argument("--until", default=None,
+                         help="end of the hold: a span (90m, 2h) or an ISO date")
+    p_hosts.add_argument("--reason", default=None, help="why the host is held (required)")
+    p_hosts.add_argument("--actor", default=None,
+                         help="who holds or releases, without a session identity "
+                              "(human:<id>); a human, an orchestrator or a design agent")
     p_hosts.set_defaults(func=cmd_hosts)
 
     p_housekeeping = sub.add_parser(
@@ -2074,11 +2240,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="confirms that the owner is the one acting")
     p_gen.set_defaults(func=cmd_key)
     p_reg = key_sub.add_parser("register")
-    p_reg.add_argument("agent")
+    p_reg.add_argument("agent", nargs="?")
+    p_reg.add_argument("--human", metavar="ID",
+                       help="a human's key (human:ID or ID), held outside the agents (#330)")
     p_reg.add_argument("--public-key", required=True)
     p_reg.add_argument("--role", choices=list(authority.KEY_ROLES), default=authority.DEFAULT_KEY_ROLE,
                        help="owner = owner's authority; agent = provenance only")
     p_reg.add_argument("--note", default=None)
+    p_reg.add_argument("--replace", action="store_true",
+                       help="with --human: replace or rotate the key, even revoked — the "
+                            "owner's own gesture, refused by the database outside the "
+                            "owner's database role (#326)")
     p_reg.set_defaults(func=cmd_key)
     p_kshow = key_sub.add_parser("show")
     p_kshow.add_argument("agent")
@@ -2090,6 +2262,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_krev = key_sub.add_parser("revoke")
     p_krev.add_argument("agent")
     p_krev.set_defaults(func=cmd_key)
+    p_kconf = key_sub.add_parser(
+        "confirm", help="the owner confirms the registrations of a key: its "
+        "owner_key_registered alert ends (owner's database role, #326)")
+    p_kconf.add_argument("agent")
+    p_kconf.set_defaults(func=cmd_key)
 
     p_app = sub.add_parser("approve", help="sign an approval")
     p_app.add_argument("--key", required=True, help="owner's private key")
@@ -2127,6 +2304,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--source", default="")
     pw_add.add_argument("--app", default=None,
                         help="project; default: the creating agent's registry or own canon")
+    pw_add.add_argument("--new-project", action="store_true",
+                        help="#506: accept an --app project nobody declares yet "
+                             "(journaled on the lot); refused otherwise")
     pw_add.add_argument("--body", default=None)
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)

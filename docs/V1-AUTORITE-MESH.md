@@ -113,6 +113,96 @@ base64 of the 32-byte seed or key). Rules:
   immediately invalidates all signatures of that agent. The default role
   is `agent`; passing `--role owner` delegates the owner's authority and
   displays a warning.
+* the owner's own key (a human, not an agent, #330) is registered without
+  any agent:
+  `ameesh key register --human smichea --public-key ~/.config/ameesh/owner.key/smichea.pub --role owner`.
+  It goes to `key_holders`, an identity that holds a key and nothing else:
+  never executable, never woken, in no project, alert or L165 take, out of
+  reach of `attach`, hook sessions and canon cards (none of them reads that
+  table). Its name is the one `ameesh decide --key` signs under by default
+  (`human:smichea` → `smichea`). It is refused when an agent already has
+  that name (the owner's authority never sits on an agent's identity), and
+  an agent key can no longer be registered under a key holder's name. The
+  key lookups read both through the `mesh_keys` view, the human's key first.
+  Migration 0364 copies the stopgap registry row of 2026-10-12 there —
+  exactly the row `smichea` (harness `none`, mode `externe`, responsible
+  `human:smichea`, no turn, session, lease or canon card), if a key had been
+  registered on it; `key register --human smichea` then removes that row
+  and no other from the registry (an additive migration deletes nothing).
+* who may write a key holder (#326 r1). Every agent shares the executor's
+  database role, so the rules sit in the table itself, a trigger of 0364
+  that the executor can neither disable nor drop (it owns nothing and has
+  no `TRIGGER` right — `deploy/sql/role-executor.sql` audits both):
+  * a **first** key only: an existing key, live or revoked, is never
+    overwritten; a first `owner` key only while no owner key exists at all
+    (revoked ones count), and a unique index keeps `key_holders` to one
+    owner key holder — two transactions registering one at once cannot both
+    commit, whatever their isolation level. That first owner key is a
+    bootstrap that happens **once** (#326 r4): once `key_events` has
+    recorded an owner key, any later one is the owner's gesture, even after
+    the first was revoked, cleared or removed. The CLI writes a note to the
+    owner's chat (`chat-<id>`) if it exists;
+  * a **revocation** (`key revoke`) is open to all: it only removes
+    authority;
+  * replacing or rotating a key, re-registering after a revocation,
+    removing a holder: the **owner's own gesture**,
+    `ameesh key register --human <id> --public-key … --role owner --replace`
+    run with the owner's database role (a member of the role owning the
+    tables, the one that runs the migrations — never the executor's). The
+    CLI sets `ameesh.owner_gesture` in its transaction and the trigger also
+    checks the role: the setting alone, from the executor, is refused;
+  * an **owner key on an agent** (`key register <agent> --role owner`, the
+    owner's authority delegated) is the same gesture (#326 r2): setting,
+    changing, renaming or un-revoking it is refused outside the owner's
+    role, and so is taking it away, revoked or not (#326 r4): clearing it,
+    turning it into an agent key, deleting its row. Revoking it stays free.
+    The only exception is the stopgap row whose key a holder of that name
+    holds as its owner key: that row may be deleted or have its key cleared,
+    but it never gets another key and never becomes an agent key (#326 r5,
+    r7). The name stays protected after cleanup: clearing the key does not
+    permit a later replacement.
+    An `agent` key stays free;
+  * no agent is created under a key holder's name or renamed to it, nor a
+    key holder created under an agent's (triggers on both tables, #326 r3,
+    r4): a holder's rotation is
+    never blocked by an agent that took its name meanwhile, and a holder
+    never shadows an agent's key. A first owner key holder also counts the
+    agents' owner keys. Should a name still be both with two different live
+    keys (a row that slipped past the triggers), `mesh_keys` gives it no key
+    at all until the agent's key is revoked. Both triggers check the name
+    under a transaction lock on it (`pg_advisory_xact_lock`, #326 r5, r7),
+    derived from the trigger table schema (`TG_TABLE_SCHEMA`) and the
+    normalized name. The key functions pin their `search_path` to the mesh
+    schema followed by `pg_temp`; the caller cannot change name locking or
+    table resolution with its own `search_path`. An
+    insert still open in one table therefore holds back the other table's
+    insert until it ends, and the check then sees it. The check only sees
+    it at read committed, so any other isolation level is refused to every
+    role except the tables' owner;
+  * dates are the server's clock at the event: `key_updated_at`,
+    `created_at` and `key_revoked_at` are set by the triggers to
+    `clock_timestamp()` (not the transaction's start), whatever the writer
+    sends. Every key event (registered, replaced, revoked, removed;
+    holder or agent; the database role; whether it was the owner's gesture)
+    goes to `key_events`, append-only and written by the triggers only (no
+    update, no delete, no direct insert). `ameesh alerts` raises
+    `owner_key_registered` from it, pushed to `notify.default_human`
+    (urgent): for 7 days when it was the owner's gesture; otherwise until
+    the owner confirms it with their database role
+    (`ameesh key confirm <name>`, with no time limit). A confirmation
+    names each key it covers (an event `confirmed` per fingerprint the
+    owner can see then) and covers only that key's registrations before it,
+    by the server's clock, never by the event's id: the executor can no
+    longer move the id sequence (`setval`; `role-executor.sql` revokes and
+    audits it, #326 r4).
+    A backdated row, a revocation right after use or a transaction held open
+    for days hides nothing. Registering your own first owner key with the
+    executor's DSN therefore alerts until you confirm it.
+
+  A rotation signed by the current owner key was considered and left out:
+  a rotation is rare, and the owner holds the owner database role anyway;
+  a signed rotation would need a function running with more rights than the
+  executor (`SECURITY DEFINER`), which the executor role's audit forbids.
 
 ### What it looks like in a hook
 

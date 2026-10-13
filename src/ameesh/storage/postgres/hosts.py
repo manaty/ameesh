@@ -88,7 +88,55 @@ TURN_COLUMNS = (
 )
 
 
+_HOLD_COLUMNS = ("host, reason, author, extract(epoch from created_at)::float8 AS created_ts, "
+                 "extract(epoch from until)::float8 AS until_ts")
+
+
 class Hosts(interface.HostResources):
+
+    def holds(self) -> list[dict]:
+        return self.db.query("SELECT " + _HOLD_COLUMNS + " FROM host_holds "
+                             "WHERE until > now() ORDER BY host")
+
+    def hold(self, host, *, reason, author, seconds=None, until_ts=None) -> dict | None:
+        # #254 r2: the end is computed and bounded on database time, and the
+        # history row is written in the same transaction
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                INSERT INTO host_holds (host, reason, author, created_at, until)
+                SELECT %s, %s, %s, t.at, t.until
+                  FROM (SELECT now() AS at,
+                               coalesce(now() + make_interval(secs => %s::float8),
+                                        to_timestamp(%s::float8)) AS until) AS t
+                 WHERE t.until > t.at AND t.until <= t.at + interval '24 hours'
+                ON CONFLICT (host) DO UPDATE SET
+                    reason = excluded.reason, author = excluded.author,
+                    created_at = excluded.created_at, until = excluded.until
+                RETURNING """ + _HOLD_COLUMNS,
+                (host, reason, author, None if seconds is None else float(seconds),
+                 None if until_ts is None else float(until_ts)))
+            if rows:
+                tx.execute("INSERT INTO host_hold_events (host, action, author, reason, until) "
+                           "SELECT host, 'hold', author, reason, until FROM host_holds "
+                           "WHERE host = %s", (host,))
+        return rows[0] if rows else None
+
+    def release(self, host, *, author) -> bool:
+        with self.db.transaction() as tx:
+            gone = bool(tx.query("DELETE FROM host_holds WHERE host = %s RETURNING host",
+                                 (host,)))
+            if gone:
+                tx.execute("INSERT INTO host_hold_events (host, action, author) "
+                           "VALUES (%s, 'release', %s)", (host, author))
+        return gone
+
+    def hold_events(self, host=None) -> list[dict]:
+        return self.db.query(
+            "SELECT id, host, action, author, reason, extract(epoch from until)::float8 "
+            "AS until_ts, extract(epoch from at)::float8 AS at_ts FROM host_hold_events"
+            + (" WHERE host = %s" if host else "") + " ORDER BY id",
+            (host,) if host else ())
 
     @contextmanager
     def gate_guard(self, host):

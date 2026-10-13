@@ -226,7 +226,7 @@ def plan_underused(db, listing: list, now: float, *,
                    tail_s: float = DEFAULT_PLAN_TAIL_S,
                    used_pct: float = DEFAULT_PLAN_USED_PCT,
                    pace_gap_pct: float = DEFAULT_PLAN_PACE_GAP_PCT,
-                   paid=None) -> list:
+                   paid=None, held=()) -> list:
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -256,6 +256,12 @@ def plan_underused(db, listing: list, now: float, *,
                 reason = "sous_rythme"
             if reason is None:
                 continue
+            # #254 : les agents de ce harnais tous arrêtés par une pause
+            # d'hôte voulue — rien n'est perdu par négligence
+            agents = [row["name"] for row in listing if row.get("harness") == harness
+                      and (row.get("mode") or "execute") == "execute"]
+            if held and agents and all(name in held for name in agents):
+                continue
             # projection linéaire : au rythme actuel, l'utilisation à la remise à zéro
             at_pace = min(1.0, used / elapsed) if elapsed > 0 else used
             lost_at_pace = max(0.0, 1.0 - at_pace)
@@ -274,7 +280,8 @@ def plan_underused(db, listing: list, now: float, *,
             idle = sorted(row["name"] for row in listing
                           if row.get("harness") == harness
                           and (row.get("mode") or "execute") == "execute"
-                          and _state(row) == "idle" and _awake_runner(row))
+                          and _state(row) == "idle" and _awake_runner(row)
+                          and row["name"] not in held)
             if idle:
                 detail += "; idle %s agents: %s" % (harness, ", ".join(idle))
             if paid and harness not in paid:
@@ -465,11 +472,24 @@ def waiting_project_lots(lots: list) -> list:
 
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
-                  lots: list | None = None, designers=()) -> list:
+                  lots: list | None = None, designers=(), held=(), held_hosts=(),
+                  pressured: dict | None = None) -> list:
+    """#254 : `held`, les agents d'un hôte en pause, ni comptés ni à
+    réveiller ; `held_hosts` (hôtes en pause) et `pressured` ({hôte:
+    verdict} des hôtes sous pression, relevé frais) ne sont jamais proposés :
+    leurs agents sont laissés de côté et nommés."""
     if idle_s <= 0:
         return []
+    pressured = pressured or {}
     # L165b : un agent dont tous les lots attendent un autre est au repos
-    idle = idle_agents(listing, now, idle_s, waiting_free=True)
+    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True)
+            if row["name"] not in held]
+    on_hold = sorted((row["name"], row.get("host")) for row in idle
+                     if row.get("host") in held_hosts)
+    idle = [row for row in idle if row.get("host") not in held_hosts]
+    spared = sorted((row["name"], row.get("host")) for row in idle
+                    if row.get("host") in pressured)
+    idle = [row for row in idle if row.get("host") not in pressured]
     if not idle:
         return []
     if lots is None:
@@ -496,18 +516,28 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if backlog:
         parts.append("mail waiting at %s" % ", ".join(
             sorted(row["name"] for row in backlog)))
+    if on_hold:
+        parts.append("left out, their host on hold: %s" % ", ".join(
+            "%s on %s" % pair for pair in on_hold))
+    if spared:
+        parts.append("left out, their host under pressure: %s" % "; ".join(
+            "%s on %s (%s)" % (name, host, ", ".join(
+                "%s %s, threshold %s" % (b["label"], b["value"], b["limit"])
+                for b in pressured[host]["breaches"][:2]))
+            for name, host in spared))
     if aggravating:
         parts.append("plan agents idle (%s) while per-token agents "
                      "are working (%s)" % (", ".join(sorted(r["name"] for r in plan_idle)),
                                           ", ".join(paid_working)))
     by_name = {row["name"]: row for row in listing}
-    held = [n for n in orchestras if _attached(by_name.get(n) or {})]
-    asleep = [n for n in orchestras if n not in held
+    # #254 : un orchestrateur arrêté avec son hôte en pause n'est pas à réveiller
+    attached = [n for n in orchestras if _attached(by_name.get(n) or {})]
+    asleep = [n for n in orchestras if n not in attached and n not in held
               and _state(by_name.get(n) or {}) in ("stopped", "paused")]
-    if held:
+    if attached:
         action = ("wake the orchestrator: %s is held by an interactive session "
                   "(attach), hand it back; or dispatch by hand "
-                  "(ameesh work assign <lot> <agent>)" % ", ".join(held))
+                  "(ameesh work assign <lot> <agent>)" % ", ".join(attached))
     elif asleep:
         action = ("wake the orchestrator %s (stopped or paused), or dispatch by hand "
                   "(ameesh work assign <lot> <agent>)" % ", ".join(asleep))
@@ -515,7 +545,7 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         action = "dispatch: ameesh work assign <lot> <agent>, or write to the orchestrator"
     detail = "; ".join(parts) + ". Action: " + action
     responsible = None
-    for name in held + asleep + list(orchestras):
+    for name in attached + asleep + list(orchestras):
         responsible = (by_name.get(name) or {}).get("responsible")
         if responsible:
             break
@@ -568,6 +598,28 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
 # host_underused
 # --------------------------------------------------------------------------
 
+def host_verdicts(db, canons) -> dict:
+    """{hôte: (dernier relevé, verdict de pression)}, aux limites physiques
+    des fiches Host de tous les canons."""
+    from . import resources as resources_mod
+    verdicts = {}
+    for reading in storage.of(db).hosts.current(None):
+        try:
+            limits = resources_mod.host_limits(canons, reading["host"])["limits"]
+        except Exception:
+            limits = None
+        verdicts[reading["host"]] = (reading, resources_mod.pressure(reading, limits=limits))
+    return verdicts
+
+
+def pressured_hosts(verdicts: dict, now: float) -> dict:
+    """#254 : {hôte: verdict} des hôtes sous pression d'après un relevé
+    frais (un relevé vieux ne dit rien de l'hôte maintenant)."""
+    return {host: verdict for host, (reading, verdict) in verdicts.items()
+            if verdict["blocked"] and reading.get("sampled_ts") is not None
+            and now - float(reading["sampled_ts"]) <= HOST_FRESH_S}
+
+
 def host_underused(cfg, db, listing: list, now: float, *,
                    window_s: float = DEFAULT_HOST_UNDERUSED_S,
                    load_max: float = DEFAULT_HOST_UNDERUSED_LOAD,
@@ -575,22 +627,14 @@ def host_underused(cfg, db, listing: list, now: float, *,
                    idle_mail_s: float = 300.0, canons=None) -> list:
     if window_s <= 0 or load_max <= 0:
         return []
-    from . import resources as resources_mod
     hosts = storage.of(db).hosts
-    readings = hosts.current(None)
     if canons is None:
         from . import canon as canon_mod
         try:
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    verdicts = {}
-    for reading in readings:
-        try:
-            limits = resources_mod.host_limits(canons, reading["host"])["limits"]
-        except Exception:
-            limits = None
-        verdicts[reading["host"]] = (reading, resources_mod.pressure(reading, limits=limits))
+    verdicts = host_verdicts(db, canons)
     out = []
     for host, (reading, verdict) in sorted(verdicts.items()):
         if verdict["blocked"]:
@@ -767,8 +811,9 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
            balance_min_usd: float = DEFAULT_BALANCE_MIN_USD,
            balance_window_s: float = DEFAULT_BALANCE_WINDOW_S,
            backlog_empty_s: float = DEFAULT_IDLE_CAPACITY_S,
-           idle_mail_s: float = 300.0) -> list:
-    """Les alertes de sous-utilisation en cours (non triées)."""
+           idle_mail_s: float = 300.0, held=(), held_hosts=()) -> list:
+    """Les alertes de sous-utilisation en cours (non triées). `held` (#254) :
+    les agents d'un hôte en pause voulue."""
     now = time.time() if now is None else float(now)
     from . import canon as canon_mod
     try:
@@ -777,7 +822,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         canons = []
     paid = paid_harnesses(getattr(cfg, "host", None))
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
-                         pace_gap_pct=plan_pace_gap_pct, paid=paid)
+                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held)
     orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
                                canons=canons)
     for alert in out:
@@ -786,8 +831,13 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     out += orchestrator_held(listing, now, orchestras, held_s=orchestrator_held_s)
     names = {row["name"] for row in listing}
     designers = sorted(n for n in role_orchestrators(canons, DESIGN_ROLES) if n in names)
+    try:
+        pressured = pressured_hosts(host_verdicts(db, canons), now)
+    except Exception:
+        pressured = {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
-                         designers=designers)
+                         designers=designers, held=held, held_hosts=held_hosts,
+                         pressured=pressured)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons)

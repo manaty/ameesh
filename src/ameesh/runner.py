@@ -3462,6 +3462,7 @@ class AgentWorker(threading.Thread):
         supprimé** ici."""
         if not getattr(self, "_turn_open", False):
             return
+        from .turn_processes import group_running
         self._turn_open = False
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
@@ -3470,7 +3471,7 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = survives or bool(conteneurs) or bool(pgid and self._group_alive(pgid))
+        orphelin = survives or bool(conteneurs) or group_running(pgid)
         try:
             storage.of(self.db).turn_resources.close_turn(
                 turn_id, orphan=orphelin, containers=conteneurs or None)
@@ -6424,9 +6425,10 @@ class Runner:
         (`AMEESH_TURN_ID`, hérité même après `setsid`), ni un conteneur
         étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
         Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
-        réutilisé), processus à l'environnement illisible lancé après la
-        ligne, moteur muet, table des processus ou démarrage de l'hôte
-        inconnus. Pas avant le feu vert du démarrage (`_boot_settle_ready` :
+        réutilisé ; les zombies seuls ne comptent pas), processus à
+        l'environnement illisible lancé après la ligne, moteur muet, table
+        des processus ou démarrage de l'hôte inconnus. Pas avant le feu vert
+        du démarrage (`_boot_settle_ready` :
         un conteneur relancé par sa politique peut manquer encore). Une ligne
         n'est soldée que si elle n'a pas changé depuis sa lecture
         (`settle_unchanged`). Rien n'est supprimé ; au plus
@@ -6434,6 +6436,7 @@ class Runner:
         Rend les lignes soldées. Ne lève jamais."""
         from . import containers as containers_mod, platform as os_layer
         from . import resources as resources_mod
+        from .turn_processes import running_groups
         self.live_review_at = time.monotonic() + LIVE_REVIEW_EVERY_S
         boot = resources_mod.boot_time()
         if not boot or not self._boot_settle_ready(time.time() - boot):
@@ -6457,8 +6460,13 @@ class Runner:
             self._live_review_after = after if more else 0
             if more:
                 self.live_review_at = time.monotonic()  # la suite sans attendre
+            if not rows:
+                return []
+            groups = running_groups(int(row["pgid"]) for row in rows if row.get("pgid"))
+            if groups is None:
+                return []  # unknown membership never proves a turn dead
             candidates = [row for row in rows
-                          if row.get("pgid") and not AgentWorker._group_alive(int(row["pgid"]))]
+                          if row.get("pgid") and int(row["pgid"]) not in groups]
             if not candidates:
                 return []
             try:
@@ -7045,6 +7053,16 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         lease = registry.attach_claim(db, name, owner, ttl)
         if lease:
             break
+        from . import host_holds
+        hold = host_holds.live(db).get(agent.get("host") or "")
+        if hold:
+            # #254 : un hôte en pause ne prend aucun bail, interactif compris
+            print("agent %s not claimable: host %s on hold until %s (%s); lift it: "
+                  "ameesh hosts %s --release" % (
+                      name, hold["host"],
+                      time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hold["until_ts"]))),
+                      hold["reason"], hold["host"]), file=sys.stderr)
+            return 1
         print("agent %s not claimable (owner unresolved, ephemeral expired, or status)"
               % name, file=sys.stderr)
         return 1
