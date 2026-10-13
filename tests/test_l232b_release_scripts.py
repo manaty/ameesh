@@ -70,6 +70,9 @@ class MigrationPinningTest(unittest.TestCase):
         self.module.mkdir(parents=True)
         (self.module / "__init__.py").write_text("")
         (self.module / "__main__.py").write_text(FAKE_MODULE)
+        # poste.sh splits the DSN's password through the deployed commit's
+        # src/ameesh/dsn.py (#518); a real snapshot carries it, so the fixture does.
+        shutil.copy(ROOT / "src/ameesh/dsn.py", self.module / "dsn.py")
         self.a = self.commit("A")
         self.b = self.commit("B")
         (self.root / "bascule.env").write_text("VM=simulation\n")

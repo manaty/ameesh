@@ -81,6 +81,11 @@ TEST_DSN = os.environ.get(
 )
 REQUIRE_DB = os.environ.get(
     "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
+#: L142 : le banc ne dépend pas non plus de l'umask de la session appelante
+#: (0002 sur certains hôtes, 0022 en CI). Les fixtures d'arbres de confiance
+#: créent répertoires 0700 et fichiers 0644 et les vérifient ; un umask
+#: permissif rendait leurs sous-répertoires groupables et la suite rouge.
+os.umask(0o022)
 
 
 def apply_authenticators(db, members, **kwargs) -> dict:
