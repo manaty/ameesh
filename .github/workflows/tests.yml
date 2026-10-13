@@ -162,12 +162,13 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
-      # environnement Python en cache : la clé suit pyproject.toml
+      # environnement Python en cache : la clé suit pyproject.toml et le type de
+      # runner (un venv de runner hébergé pointe vers /opt/hostedtoolcache)
       - id: venv
         uses: actions/cache@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
+          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
       - name: dépendances (pilote psycopg)
         if: steps.venv.outputs.cache-hit != 'true'
         run: |
