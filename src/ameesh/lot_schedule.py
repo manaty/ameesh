@@ -260,9 +260,10 @@ def pin(db, ids, *, actor: str = "") -> list[dict]:
     """#740: keeps the dates of these lots from the schedule: their source
     becomes `set by <who dated them>`. Only a lot dated with `SOURCE`, and
     only if it did not change since it was read. WorkError unless the actor
-    is a human, an orchestrator or a design agent (`work.corrector`).
+    is a human, an orchestrator or a design agent by a declared role
+    (`work.corrector` without the assignment history, as `work.pin_authority`).
     Returns `{id, status, …}` per lot: pinned, skipped, changed or unknown."""
-    actor = work_mod.corrector(getattr(db, "cfg", None), db, actor)
+    actor = work_mod.corrector(getattr(db, "cfg", None), db, actor, history=False)
     st = storage.of(db)
     plans = {int(p["id"]): p for p in st.roadmap.item_plans([int(i) for i in ids])}
     out = []
